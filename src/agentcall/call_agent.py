@@ -335,8 +335,10 @@ class CallAgentService:
         pcm_baudrate: int = 921600,
         tx_gain: float = 1.0,
         hub: EventHub | None = None,
+        modem: Eg25Modem | None = None,
     ) -> None:
-        self.modem = Eg25Modem(modem_port, baudrate)
+        # modem 参数供测试注入 FakeModem；默认按串口配置自建。
+        self.modem = modem or Eg25Modem(modem_port, baudrate)
         self.audio_keyword = audio_keyword
         self.provider = provider
         self.audio_mode = audio_mode
