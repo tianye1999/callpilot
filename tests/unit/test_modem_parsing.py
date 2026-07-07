@@ -101,6 +101,54 @@ def test_ring_urc_with_clip_carries_caller():
     assert rings == ["13600000000"]
 
 
+# ---- 断连自愈：_send 写失败后重连并重试 ----
+
+def test_send_reconnects_and_retries_on_io_error():
+    """模拟 USB 桥重连导致的写失败：_send 应触发一次重连后重试成功。"""
+    import serial
+
+    modem = make_modem()
+    calls = {"write": 0, "reconnect": 0}
+
+    def fake_write_command(cmd: str) -> str:
+        calls["write"] += 1
+        if calls["write"] == 1:
+            raise serial.SerialException("write failed: [Errno 5] Input/output error")
+        return "OK"
+
+    def fake_reconnect() -> None:
+        calls["reconnect"] += 1
+
+    modem._write_command = fake_write_command
+    modem._reconnect = fake_reconnect
+
+    assert modem._send("ATD10086;") == "OK"
+    assert calls["reconnect"] == 1  # 触发了一次重连
+    assert calls["write"] == 2      # 首次失败 + 重连后重试
+
+
+def test_send_during_init_does_not_self_reconnect():
+    """初始化序列中（_opening=True）写失败应直接抛出，不自触发重连（防死锁）。"""
+    import serial
+
+    modem = make_modem()
+    modem._opening = True
+    reconnected = {"n": 0}
+    modem._reconnect = lambda: reconnected.__setitem__("n", reconnected["n"] + 1)
+
+    def always_fail(cmd: str) -> str:
+        raise serial.SerialException("boom")
+
+    modem._write_command = always_fail
+
+    try:
+        modem._send("AT")
+        assert False, "应抛出异常"
+    except serial.SerialException:
+        pass
+    assert reconnected["n"] == 0  # 初始化期间不重连
+
+
 def test_no_carrier_triggers_hangup():
     modem = make_modem()
     hangups: list[bool] = []

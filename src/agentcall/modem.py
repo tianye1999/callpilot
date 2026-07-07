@@ -163,6 +163,12 @@ class Eg25Modem:
         self._reader_thread: threading.Thread | None = None
         self._poll_thread: threading.Thread | None = None
         self._serial_lock = threading.RLock()
+        # 串口重连串行化：多线程（读循环/CLCC 轮询/发送）可能同时发现断连，
+        # 只让一个真正重连，其余等它完成。
+        self._reconnect_lock = threading.Lock()
+        # 初始化序列进行中：此时 _send 失败不自触发重连（交给 _reconnect 的重试循环），
+        # 避免同线程重入 _reconnect 造成死锁。
+        self._opening = False
         self._running = False
         self._on_ring: Callable[[str | None], None] | None = None
         self._on_hangup: Callable[[], None] | None = None
@@ -180,19 +186,60 @@ class Eg25Modem:
         self._pcm_ready_event.set()
 
     def connect(self) -> None:
-        self._ser = serial.Serial(
-            port=self.port,
-            baudrate=self.baudrate,
-            timeout=0.2,
-            write_timeout=2,
-        )
-        time.sleep(0.5)
-        self._drain()
-        self._send("AT")
-        self._send("ATE0")
-        self._send("AT+CLIP=1")
-        self._init_sms()
+        self._open_serial()
         logger.info("模组已连接: %s", self.port)
+
+    def _open_serial(self) -> None:
+        """打开串口并跑初始化序列（connect 与断线重连共用）。"""
+        with self._serial_lock:
+            self._opening = True
+            try:
+                self._ser = serial.Serial(
+                    port=self.port,
+                    baudrate=self.baudrate,
+                    timeout=0.2,
+                    write_timeout=2,
+                )
+                time.sleep(0.5)
+                self._drain()
+                self._send("AT")
+                self._send("ATE0")
+                self._send("AT+CLIP=1")
+                self._init_sms()
+            finally:
+                self._opening = False
+
+    def _reconnect(self) -> None:
+        """串口断连后重开（USB→PTY 桥重插会换新的 /dev/ttys，需重开才能拿到新 fd）。
+
+        多线程可能同时触发，只让第一个真正重连，其余等它完成后返回。
+        带指数退避重试，直到成功或服务停止。
+        """
+        if not self._reconnect_lock.acquire(blocking=False):
+            # 已有线程在重连，等它完成即可。
+            with self._reconnect_lock:
+                return
+        try:
+            with self._serial_lock:
+                try:
+                    if self._ser and self._ser.is_open:
+                        self._ser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ser = None
+                self._buffer = ""
+            delay = 1.0
+            while self._running:
+                try:
+                    self._open_serial()
+                    logger.info("串口已重连: %s", self.port)
+                    return
+                except (serial.SerialException, OSError) as exc:
+                    logger.warning("串口重连失败，%.0fs 后重试: %s", delay, exc)
+                    time.sleep(delay)
+                    delay = min(delay * 2, 10.0)
+        finally:
+            self._reconnect_lock.release()
 
     def _init_sms(self) -> None:
         """开启短信文本模式并让模组主动上报新短信 (+CMTI)。"""
@@ -380,9 +427,20 @@ class Eg25Modem:
         return False
 
     def _send(self, cmd: str) -> str:
-        if not self._ser:
-            raise RuntimeError("模组未连接")
+        try:
+            return self._write_command(cmd)
+        except (serial.SerialException, OSError, RuntimeError) as exc:
+            # 初始化序列中失败不自触发重连（由 _reconnect 的重试循环兜底），避免死锁。
+            if self._opening:
+                raise
+            logger.warning("串口发送失败，尝试重连后重试: %s", exc)
+            self._reconnect()
+            return self._write_command(cmd)
+
+    def _write_command(self, cmd: str) -> str:
         with self._serial_lock:
+            if not self._ser or not self._ser.is_open:
+                raise RuntimeError("模组未连接")
             line = cmd if cmd.endswith("\r") else f"{cmd}\r"
             self._ser.write(line.encode("ascii"))
             return self._read_response(timeout=3)
@@ -407,13 +465,18 @@ class Eg25Modem:
             self._ser.reset_input_buffer()
 
     def _read_loop(self) -> None:
-        while self._running and self._ser and self._ser.is_open:
-            with self._serial_lock:
-                try:
+        while self._running:
+            try:
+                with self._serial_lock:
+                    if not self._ser or not self._ser.is_open:
+                        raise serial.SerialException("串口未打开")
                     raw = self._ser.read(self._ser.in_waiting or 1)
-                except serial.SerialException as exc:
-                    logger.error("串口读取失败: %s", exc)
+            except (serial.SerialException, OSError) as exc:
+                if not self._running:
                     break
+                logger.warning("串口读取失败，尝试重连: %s", exc)
+                self._reconnect()
+                continue
             if not raw:
                 continue
             text = raw.decode("ascii", errors="ignore")
