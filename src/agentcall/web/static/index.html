@@ -25,7 +25,7 @@
     font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
     background: var(--bg);
     color: var(--text);
-    height: 100vh;
+    min-height: 100vh;
     display: flex;
     flex-direction: column;
   }
@@ -46,13 +46,20 @@
   }
   .status-dot.on { background: var(--ok); }
   main {
-    flex: 1;
     display: grid;
     grid-template-columns: 300px 1fr 380px;
     gap: 14px;
     padding: 14px;
-    min-height: 0;
+    height: 58vh;
+    min-height: 400px;
   }
+  .row2 {
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr 1.2fr;
+    gap: 14px;
+    padding: 0 14px 14px;
+  }
+  .row2 .panel { height: 46vh; min-height: 360px; }
   .panel {
     background: var(--panel);
     border: 1px solid var(--line);
@@ -124,6 +131,54 @@
   .empty { color: var(--muted); font-size: 13px; text-align: center; margin-top: 30px; }
   .body::-webkit-scrollbar { width: 8px; }
   .body::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+
+  /* 通话历史 */
+  .hist-item {
+    padding: 9px 11px; border-radius: 10px; margin-bottom: 9px;
+    background: var(--panel-2); border: 1px solid var(--line); cursor: pointer;
+  }
+  .hist-item .head { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
+  .hist-item .num { font-size: 14px; font-weight: 600; color: var(--text); }
+  .hist-item .dir.in { color: var(--ok); }
+  .hist-item .dir.out { color: var(--accent); }
+  .hist-item .st.completed { color: var(--ok); }
+  .hist-item .st.failed { color: var(--err); }
+  .hist-item .sum { font-size: 12px; color: var(--muted); margin-top: 5px; white-space: pre-wrap; word-break: break-word; }
+  .timeline { display: none; margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 6px; }
+  .hist-item.open .timeline { display: block; }
+  .tl-row { display: flex; gap: 8px; font-size: 11px; color: var(--muted); padding: 2px 0; }
+  .tl-row .t { color: var(--accent); min-width: 62px; flex-shrink: 0; }
+  .tl-row .ty { color: var(--text); min-width: 84px; flex-shrink: 0; }
+  .tl-row .detail { white-space: pre-wrap; word-break: break-word; }
+
+  /* 外呼队列 */
+  .q-stat { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .q-num {
+    display: inline-block; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 2px 8px; margin: 2px 4px 2px 0; font-size: 12px;
+  }
+  .q-num.cur { border-color: var(--accent); color: var(--accent); }
+  .q-num.ok { color: var(--ok); }
+  .q-num.fail { color: var(--err); }
+
+  /* 设置面板 */
+  .cfg-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 7px 0; border-bottom: 1px solid var(--line);
+  }
+  .cfg-row label { font-size: 13px; flex: 1; }
+  .cfg-row .key { display: block; font-size: 10px; color: var(--muted); }
+  .cfg-row input[type=text], .cfg-row select {
+    width: 190px; background: var(--panel-2); border: 1px solid var(--line);
+    color: var(--text); border-radius: 6px; padding: 5px 8px; font-size: 13px; font-family: inherit;
+  }
+  .cfg-row input:disabled, .cfg-row select:disabled { opacity: .45; }
+  .tag-restart { font-size: 10px; color: var(--warn); margin-left: 4px; }
+  .tag-secret {
+    font-size: 11px; padding: 2px 10px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+  }
+  .tag-secret.set { color: var(--ok); }
 </style>
 </head>
 <body>
@@ -172,6 +227,39 @@
     </section>
   </main>
 
+  <div class="row2">
+    <section class="panel">
+      <h2>通话历史</h2>
+      <div class="body" id="historyList">
+        <div class="empty">暂无通话记录</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>批量外呼</h2>
+      <div class="body" id="queueStatus">
+        <div class="q-stat">队列空闲</div>
+      </div>
+      <div class="send-form">
+        <textarea id="batchNumbers" placeholder="每行一个号码，可批量粘贴"></textarea>
+        <input id="batchTask" type="text" placeholder="本批次外呼任务说明（可选）" />
+        <button id="batchDialBtn">加入外呼队列</button>
+        <div class="toast" id="batchToast"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>设置</h2>
+      <div class="body" id="configForm">
+        <div class="empty">正在加载配置…</div>
+      </div>
+      <div class="send-form">
+        <button id="configSave">保存设置</button>
+        <div class="toast" id="configToast"></div>
+      </div>
+    </section>
+  </div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const badgeText = { ringing: "振铃中", dialing: "拨号中", answered: "通话中", ended: "已结束", idle: "空闲" };
@@ -218,10 +306,13 @@ function addSms(event) {
 function handleEvent(ev) {
   if (ev.type === "call") {
     setCall(ev.status, ev.caller);
+    if (ev.status === "ended") setTimeout(loadHistory, 1200);
   } else if (ev.type === "transcript") {
     addTranscript(ev.role, ev.text, ev.ts);
   } else if (ev.type === "sms_in" || ev.type === "sms_out") {
     addSms(ev);
+  } else if (ev.type === "call_summary") {
+    loadHistory();
   }
 }
 
@@ -286,8 +377,260 @@ $("dialBtn").addEventListener("click", async () => {
   } finally { btn.disabled = false; }
 });
 
+// ---- 通话历史 ----
+const dirText = { inbound: "呼入", outbound: "呼出" };
+const statusText = { completed: "已完成", failed: "异常" };
+const openCalls = new Set(); // 记住展开状态，刷新列表后恢复
+
+function fmtDateTime(ts) {
+  if (!ts) return "-";
+  return new Date(ts * 1000).toLocaleString("zh-CN", {
+    hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+  });
+}
+
+function evTypeText(ev) {
+  const m = {
+    call_started: "通话开始", dialing: "拨号", connected: "接通", answered: "已接听",
+    bridge_started: "音频桥就绪", agent_started: "Agent 就绪", greeting_sent: "开场白",
+    latency: "延迟打点", summary: "生成摘要", ended: "会话收尾", call_finished: "通话结束",
+  };
+  if (ev.type === "transcript") return ev.role === "user" ? "对方说" : "助手说";
+  return m[ev.type] || ev.type;
+}
+
+function evDetail(ev) {
+  if (ev.type === "transcript") return ev.text || "";
+  if (ev.type === "latency") return `${ev.stage || ""} ${Math.round(ev.ms || 0)}ms`;
+  if (ev.type === "call_finished") return statusText[ev.status] || ev.status || "";
+  if (ev.type === "dialing") return ev.number || "";
+  return "";
+}
+
+async function loadTimeline(tl, id) {
+  try {
+    const r = await fetch(`/api/history/${encodeURIComponent(id)}/events`);
+    if (!r.ok) return;
+    const events = await r.json();
+    tl.innerHTML = "";
+    for (const ev of events) {
+      const row = document.createElement("div");
+      row.className = "tl-row";
+      row.innerHTML = `<span class="t">${ev.ts ? fmtTime(ev.ts) : ""}</span>`
+        + `<span class="ty"></span><span class="detail"></span>`;
+      row.querySelector(".ty").textContent = evTypeText(ev);
+      row.querySelector(".detail").textContent = evDetail(ev);
+      tl.appendChild(row);
+    }
+    tl.dataset.loaded = "1";
+  } catch (e) {}
+}
+
+async function toggleHistItem(item, id) {
+  if (item.classList.contains("open")) {
+    item.classList.remove("open");
+    openCalls.delete(id);
+    return;
+  }
+  const tl = item.querySelector(".timeline");
+  if (!tl.dataset.loaded) await loadTimeline(tl, id);
+  item.classList.add("open");
+  openCalls.add(id);
+}
+
+async function loadHistory() {
+  try {
+    const r = await fetch("/api/history?limit=50");
+    if (!r.ok) return;
+    const calls = await r.json();
+    const list = $("historyList");
+    list.innerHTML = "";
+    if (!calls.length) {
+      list.innerHTML = '<div class="empty">暂无通话记录</div>';
+      return;
+    }
+    for (const c of calls) {
+      const item = document.createElement("div");
+      item.className = "hist-item";
+      const dirCls = c.direction === "inbound" ? "in" : "out";
+      const summaryText = c.summary && c.summary.summary ? c.summary.summary : "";
+      item.innerHTML = `<div class="head"><span class="num"></span>`
+        + `<span><span class="dir ${dirCls}">${dirText[c.direction] || c.direction || "?"}</span> `
+        + `<span class="st ${c.status || ""}">${statusText[c.status] || c.status || ""}</span></span></div>`
+        + `<div class="head"><span>${fmtDateTime(c.started_at)}</span></div>`
+        + `<div class="sum"></div><div class="timeline"></div>`;
+      item.querySelector(".num").textContent = c.number || "未知号码";
+      const sum = item.querySelector(".sum");
+      if (summaryText) sum.textContent = summaryText; else sum.remove();
+      item.addEventListener("click", () => toggleHistItem(item, c.id));
+      list.appendChild(item);
+      if (openCalls.has(c.id)) {
+        loadTimeline(item.querySelector(".timeline"), c.id);
+        item.classList.add("open");
+      }
+    }
+  } catch (e) {}
+}
+
+// ---- 批量外呼 ----
+function queueChip(parent, text, cls) {
+  const chip = document.createElement("span");
+  chip.className = "q-num" + (cls ? " " + cls : "");
+  chip.textContent = text;
+  parent.appendChild(chip);
+}
+
+async function refreshQueue() {
+  try {
+    const r = await fetch("/api/call/queue");
+    if (!r.ok) return;
+    const q = await r.json();
+    const el = $("queueStatus");
+    el.innerHTML = "";
+    const stat = document.createElement("div");
+    stat.className = "q-stat";
+    stat.textContent = q.active
+      ? `队列进行中：待拨 ${q.pending.length} 个，已完成 ${(q.done || []).length} 次`
+      : ((q.done || []).length ? `队列空闲，本轮已拨 ${q.done.length} 次` : "队列空闲");
+    el.appendChild(stat);
+    if (q.current) queueChip(el, `${q.current}（拨打中）`, "cur");
+    for (const n of q.pending) queueChip(el, n);
+    for (const d of (q.done || []).slice(-12)) {
+      queueChip(el, `${d.number} ${d.ok ? "✓" : "✗ " + (d.error || "失败")}`, d.ok ? "ok" : "fail");
+    }
+  } catch (e) {}
+}
+
+$("batchDialBtn").addEventListener("click", async () => {
+  const numbers = $("batchNumbers").value
+    .split(/[\r\n,，;；]+/).map((s) => s.trim()).filter(Boolean);
+  const task = $("batchTask").value.trim();
+  const toast = $("batchToast");
+  if (!numbers.length) { toast.className = "toast err"; toast.textContent = "请填写至少一个号码"; return; }
+  const btn = $("batchDialBtn");
+  btn.disabled = true; toast.className = "toast"; toast.textContent = "正在入队…";
+  try {
+    const r = await fetch("/api/call/batch_dial", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ numbers, task: task || null }),
+    });
+    const res = await r.json();
+    if (r.ok) {
+      let msg = `已入队 ${res.accepted.length} 个`;
+      if (res.rejected.length) msg += `，拒绝 ${res.rejected.length} 个（${res.rejected.join("、")}）`;
+      toast.className = "toast " + (res.accepted.length ? "ok" : "err");
+      toast.textContent = msg;
+      if (res.accepted.length) $("batchNumbers").value = "";
+      refreshQueue();
+    } else {
+      toast.className = "toast err"; toast.textContent = "入队失败：" + (res.error || "未知错误");
+    }
+  } catch (err) {
+    toast.className = "toast err"; toast.textContent = "请求出错：" + err;
+  } finally { btn.disabled = false; }
+});
+
+// ---- 设置面板 ----
+let cfgSpecs = [];
+const truthy = ["true", "1", "yes"];
+
+function boolChecked(value) { return truthy.includes(String(value).trim().toLowerCase()); }
+
+async function loadConfig() {
+  try {
+    const r = await fetch("/api/config");
+    if (!r.ok) return;
+    cfgSpecs = await r.json();
+    const form = $("configForm");
+    form.innerHTML = "";
+    for (const c of cfgSpecs) {
+      const row = document.createElement("div");
+      row.className = "cfg-row";
+      const label = document.createElement("label");
+      label.textContent = c.label;
+      if (c.requires_restart) {
+        const tag = document.createElement("span");
+        tag.className = "tag-restart"; tag.textContent = "改后需重启";
+        label.appendChild(tag);
+      }
+      const key = document.createElement("span");
+      key.className = "key"; key.textContent = c.key;
+      label.appendChild(key);
+      row.appendChild(label);
+
+      let ctrl;
+      if (c.secret) {
+        ctrl = document.createElement("span");
+        ctrl.className = "tag-secret" + (c.value === "已设置" ? " set" : "");
+        ctrl.textContent = c.value;
+      } else if (c.kind === "bool") {
+        ctrl = document.createElement("input");
+        ctrl.type = "checkbox";
+        ctrl.checked = boolChecked(c.value);
+      } else if (c.kind === "select") {
+        ctrl = document.createElement("select");
+        for (const ch of c.choices) {
+          const opt = document.createElement("option");
+          opt.value = ch; opt.textContent = ch;
+          ctrl.appendChild(opt);
+        }
+        ctrl.value = c.value;
+      } else {
+        ctrl = document.createElement("input");
+        ctrl.type = "text";
+        ctrl.value = c.value;
+      }
+      if (!c.secret) {
+        ctrl.disabled = !c.editable;
+        ctrl.dataset.key = c.key;
+      }
+      row.appendChild(ctrl);
+      form.appendChild(row);
+    }
+  } catch (e) {}
+}
+
+$("configSave").addEventListener("click", async () => {
+  const updates = {};
+  for (const c of cfgSpecs) {
+    if (!c.editable || c.secret) continue;
+    const ctrl = document.querySelector(`#configForm [data-key="${c.key}"]`);
+    if (!ctrl) continue;
+    const val = c.kind === "bool" ? (ctrl.checked ? "true" : "false") : ctrl.value;
+    const orig = c.kind === "bool" ? (boolChecked(c.value) ? "true" : "false") : String(c.value);
+    if (val !== orig) updates[c.key] = val;
+  }
+  const toast = $("configToast");
+  if (!Object.keys(updates).length) {
+    toast.className = "toast"; toast.textContent = "没有需要保存的修改"; return;
+  }
+  const btn = $("configSave");
+  btn.disabled = true; toast.className = "toast"; toast.textContent = "保存中…";
+  try {
+    const r = await fetch("/api/config", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    });
+    const res = await r.json();
+    if (r.ok) {
+      let msg = `已保存 ${res.updated.length} 项`;
+      if (res.requires_restart.length) msg += `，其中 ${res.requires_restart.length} 项需重启后生效`;
+      toast.className = "toast ok"; toast.textContent = msg;
+      loadConfig();
+    } else {
+      toast.className = "toast err"; toast.textContent = "保存失败：" + (res.error || "未知错误");
+    }
+  } catch (err) {
+    toast.className = "toast err"; toast.textContent = "请求出错：" + err;
+  } finally { btn.disabled = false; }
+});
+
 loadMeta();
 connect();
+loadHistory();
+refreshQueue();
+loadConfig();
+setInterval(refreshQueue, 2000);
 </script>
 </body>
 </html>
