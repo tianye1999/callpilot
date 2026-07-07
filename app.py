@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from aiohttp import web
 
+from agentcall import config
 from agentcall.call_agent import CallAgentService
 from agentcall.events import EventHub
 from agentcall.web.server import build_app
@@ -53,14 +54,31 @@ def main() -> None:
     logger = logging.getLogger("app")
     logger.info("日志文件: %s", log_file)
 
-    provider = os.getenv("AGENT_PROVIDER", "qwen")
-    if provider == "qwen" and not os.getenv("DASHSCOPE_API_KEY"):
-        print("错误: 使用千问需设置 DASHSCOPE_API_KEY", file=sys.stderr)
+    provider = config.get_str("AGENT_PROVIDER")
+    credential_errors = config.validate_provider_credentials(provider)
+    if credential_errors:
+        for message in credential_errors:
+            print(f"错误: {message}", file=sys.stderr)
         sys.exit(1)
 
-    host = os.getenv("WEB_HOST", "127.0.0.1")
-    port = int(os.getenv("WEB_PORT", "8000"))
-    modem_port = os.getenv("MODEM_PORT", "COM3")
+    # Qwen 连接预热：提前建好 TLS 连接，降低首通接听延迟。
+    # start_prewarm_keepalive 由 W2 实现，未就绪时跳过即可，不阻塞启动。
+    if provider == "qwen" and config.get_bool("QWEN_PREWARM"):
+        try:
+            from agentcall.agents.qwen_agent import start_prewarm_keepalive
+
+            prewarm_thread = start_prewarm_keepalive()
+            logger.info("Qwen 连接预热已启动")
+        except Exception as exc:  # noqa: BLE001
+            prewarm_thread = None
+            logger.warning("Qwen 连接预热启动失败，已跳过: %s", exc)
+    else:
+        prewarm_thread = None
+
+    # 统一从 config 注册表读（默认值单一来源），避免与注册默认漂移。
+    host = config.get_str("WEB_HOST")
+    port = config.get_int("WEB_PORT")
+    modem_port = config.get_str("MODEM_PORT")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -70,13 +88,13 @@ def main() -> None:
 
     service = CallAgentService(
         modem_port=modem_port,
-        audio_keyword=os.getenv("MODEM_AUDIO_KEYWORD", "EC20"),
+        audio_keyword=config.get_str("MODEM_AUDIO_KEYWORD"),
         provider=provider,
-        baudrate=int(os.getenv("MODEM_BAUD", "115200")),
-        audio_mode=os.getenv("MODEM_AUDIO_MODE", "uac"),
+        baudrate=config.get_int("MODEM_BAUD"),
+        audio_mode=config.get_str("MODEM_AUDIO_MODE"),
         pcm_port=os.getenv("MODEM_PCM_PORT"),
         pcm_baudrate=int(os.getenv("MODEM_PCM_BAUD", "921600")),
-        tx_gain=float(os.getenv("MODEM_TX_GAIN", "1.0")),
+        tx_gain=config.get_float("MODEM_TX_GAIN"),
         hub=hub,
     )
 
@@ -96,6 +114,16 @@ def main() -> None:
         logger.exception("模组启动失败: %s", exc)
         sys.exit(1)
 
+    dial_whitelist = config.get_str("DIAL_WHITELIST").strip()
+    logger.info(
+        "功能开关: 录音=%s(保留%s天) 摘要=%s 本地监听=%s 外呼白名单=%s",
+        "开" if config.get_bool("RECORDING_ENABLED") else "关",
+        config.get_int("RECORDING_RETENTION_DAYS"),
+        "开" if config.get_bool("SUMMARY_ENABLED") else "关",
+        "开" if service.monitor is not None else "关",
+        dial_whitelist or "未设置(全部放行)",
+    )
+
     app = build_app(hub, service.modem, service=service, meta=meta)
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())
@@ -111,7 +139,11 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("收到退出信号，正在关闭…")
     finally:
+        if prewarm_thread is not None:
+            prewarm_thread.stop_event.set()
         service.session.stop()
+        if service.monitor is not None:
+            service.monitor.stop()
         service.modem.close()
         loop.run_until_complete(runner.cleanup())
         loop.close()

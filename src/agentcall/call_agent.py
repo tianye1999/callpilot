@@ -10,7 +10,9 @@ import re
 from queue import Empty, Queue
 import threading
 import time
+from typing import Callable
 
+from . import config
 from .agents.factory import create_agent
 from .agents.tools import (
     HANGUP_SPEC,
@@ -24,8 +26,12 @@ from .audio_bridge import (
     SerialPcmAudioBridge,
     create_audio_bridge,
 )
+from .call_log import CallLogger, CallRecord
+from .dial_queue import DialQueue
 from .events import EventHub
 from .modem import Eg25Modem
+from .monitor_playback import MonitorPlayback
+from .summarizer import summarize_call
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +44,15 @@ DEFAULT_OUTBOUND_TASK = (
 )
 
 # Agent 说话结束后，再屏蔽上行这么久，吸收模组回采的尾音回声。
+# （仅作缺省值；每通会话开始时从 config.HALF_DUPLEX_HANGOVER_SECONDS 重新读取。）
 HALF_DUPLEX_HANGOVER_SECONDS = 0.5
+
+# 挂断工具触发后延迟这么久再真正挂断，先让 Agent 播完告别语。
+# （仅作缺省值；每通会话开始时从 config.HANGUP_TOOL_DELAY_SECONDS 重新读取。）
+HANGUP_TOOL_DELAY_SECONDS = 4.5
+
+# 通话记录根目录（可用 CALL_LOG_DIR 环境变量覆盖）。
+DEFAULT_CALL_LOG_DIR = "data/recordings"
 
 
 class CallSession:
@@ -52,6 +66,9 @@ class CallSession:
         pcm_baudrate: int,
         tx_gain: float,
         hub: EventHub | None = None,
+        call_logger: CallLogger | None = None,
+        monitor: MonitorPlayback | None = None,
+        on_ended: Callable[[], None] | None = None,
     ) -> None:
         self.modem = modem
         self.audio_keyword = audio_keyword
@@ -61,12 +78,20 @@ class CallSession:
         self.pcm_baudrate = pcm_baudrate
         self.tx_gain = tx_gain
         self.hub = hub
+        self.call_logger = call_logger
+        self.monitor = monitor
+        self._on_ended = on_ended
         self.current_caller: str | None = None
         self._outbound_number: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._active = False
         self._outgoing_audio: Queue[bytes] = Queue()
+        self._record: CallRecord | None = None
+        self._summary_thread: threading.Thread | None = None
+        # 会话级可调参数：每通会话开始时从 config 重新读取，支持不重启改参。
+        self._hangover_seconds = HALF_DUPLEX_HANGOVER_SECONDS
+        self._hangup_delay_seconds = HANGUP_TOOL_DELAY_SECONDS
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -100,101 +125,233 @@ class CallSession:
         finally:
             self._active = False
             self._loop.close()
+            # 会话结束通知（含异常/未接通路径）：驱动外呼队列拨下一个等。
+            if self._on_ended is not None:
+                try:
+                    self._on_ended()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("会话结束回调异常: %s", exc)
 
     async def _handle_call(self) -> None:
         self._clear_outgoing_audio()
+        self._load_session_config()
 
-        if self._outbound_number:
-            logger.info("开始外呼: %s", self._outbound_number)
-            self.current_caller = self._outbound_number
-            self.modem.dial(self._outbound_number)
-            self._publish(
-                {"type": "call", "status": "dialing", "caller": self.current_caller}
-            )
-            connected = await self._wait_connected(timeout=45.0)
-            if not connected:
-                logger.info("外呼未接通（无人接听/拒接/超时）")
-                self._publish(
-                    {"type": "call", "status": "ended", "caller": self.current_caller}
-                )
-                self.modem.hangup()
-                return
-        else:
-            logger.info("开始处理来电...")
-            self.modem.answer()
-
-        self._publish(
-            {"type": "call", "status": "answered", "caller": self.current_caller}
-        )
-
-        await asyncio.sleep(1.0)
-
-        # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
-        # 否则第二通开始模组无 PCM 流（双向无声）。
-        self.modem.initialize_for_voice(self.audio_mode)
-
-        bridge = create_audio_bridge(
-            mode=self.audio_mode,
-            device_keyword=self.audio_keyword,
-            pcm_port=self.pcm_port,
-            pcm_baudrate=self.pcm_baudrate,
-            tx_gain=self.tx_gain,
-        )
-        agent = create_agent(self.provider)
+        session_t0 = time.monotonic()
         direction = "outbound" if self._outbound_number else "inbound"
-        agent.set_session_instructions(self._build_agent_instructions(direction))
-        agent.set_transcript_handler(
-            lambda role, text: self._publish(
-                {
-                    "type": "transcript",
-                    "role": role,
-                    "text": text,
-                    "caller": self.current_caller,
-                }
-            )
-        )
-        agent.set_tools(self._build_tools())
-        if isinstance(bridge, SerialPcmAudioBridge):
-            bridge.set_ready_check(self.modem.pcm_ready)
-        bridge.start()
+        number = self._outbound_number or self.current_caller
+        record = self._begin_record(direction, number)
+        self._record = record
+        transcripts: list[tuple[str, str]] = []
 
-        def on_agent_audio(pcm_agent: bytes) -> None:
-            pcm_8k = bridge.agent_to_modem(pcm_agent, agent.output_rate)
-            if hasattr(bridge, "amplify_for_modem"):
-                pcm_8k = bridge.amplify_for_modem(pcm_8k)
-            if pcm_8k:
-                self._outgoing_audio.put(pcm_8k)
-
-        await agent.start(on_agent_audio)
-        await agent.say(self._opening_instructions(direction))
-
-        last_play_at = 0.0
-        try:
-            while self._active:
-                self._drain_agent_audio(bridge)
-
-                now = time.monotonic()
-                pending = (
-                    bridge.pending_output_bytes()
-                    if hasattr(bridge, "pending_output_bytes")
-                    else 0
+        def mark(event_type: str, **fields) -> None:
+            """记录一个会话节点事件，附带相对会话开始的耗时（毫秒）。"""
+            if record is not None:
+                record.log_event(
+                    event_type,
+                    t_ms=round((time.monotonic() - session_t0) * 1000, 1),
+                    **fields,
                 )
-                agent_speaking = pending > 0 or not self._outgoing_audio.empty()
-                if agent_speaking:
-                    last_play_at = now
-                # 半双工防回环：Agent 说话期间（含挂尾窗口）丢弃上行，
-                # 避免模组把下行音频回采给千问导致自循环。
-                suppress_uplink = agent_speaking or (
-                    now - last_play_at
-                ) < HALF_DUPLEX_HANGOVER_SECONDS
 
-                pcm_8k = bridge.read_modem_chunk()
-                if pcm_8k and not suppress_uplink:
-                    pcm_agent = bridge.modem_to_agent(pcm_8k, agent.input_rate)
-                    await agent.send_audio(pcm_agent)
-                await asyncio.sleep(0.01)
+        status = "completed"
+        try:
+            if self._outbound_number:
+                logger.info("开始外呼: %s", self._outbound_number)
+                self.current_caller = self._outbound_number
+                self.modem.dial(self._outbound_number)
+                mark("dialing", number=self._outbound_number)
+                self._publish(
+                    {"type": "call", "status": "dialing", "caller": self.current_caller}
+                )
+                connected = await self._wait_connected(timeout=45.0)
+                if not connected:
+                    logger.info("外呼未接通（无人接听/拒接/超时）")
+                    status = "not_connected"
+                    mark("not_connected")
+                    self._publish(
+                        {
+                            "type": "call",
+                            "status": "ended",
+                            "caller": self.current_caller,
+                        }
+                    )
+                    self.modem.hangup()
+                    return
+                mark("connected")
+            else:
+                logger.info("开始处理来电...")
+                self.modem.answer()
+
+            self._publish(
+                {"type": "call", "status": "answered", "caller": self.current_caller}
+            )
+            mark("answered")
+
+            await asyncio.sleep(1.0)
+
+            # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
+            # 否则第二通开始模组无 PCM 流（双向无声）。
+            self.modem.initialize_for_voice(self.audio_mode)
+
+            bridge = create_audio_bridge(
+                mode=self.audio_mode,
+                device_keyword=self.audio_keyword,
+                pcm_port=self.pcm_port,
+                pcm_baudrate=self.pcm_baudrate,
+                tx_gain=self.tx_gain,
+            )
+            agent = create_agent(self.provider)
+            agent.set_session_instructions(self._build_agent_instructions(direction))
+
+            def on_transcript(role: str, text: str) -> None:
+                transcripts.append((role, text))
+                if record is not None:
+                    record.log_event("transcript", role=role, text=text)
+                self._publish(
+                    {
+                        "type": "transcript",
+                        "role": role,
+                        "text": text,
+                        "caller": self.current_caller,
+                    }
+                )
+
+            agent.set_transcript_handler(on_transcript)
+            agent.set_tools(self._build_tools())
+            if isinstance(bridge, SerialPcmAudioBridge):
+                bridge.set_ready_check(self.modem.pcm_ready)
+            bridge.start()
+            mark("bridge_started")
+
+            def on_agent_audio(pcm_agent: bytes) -> None:
+                monitor = self.monitor
+                if monitor is not None:
+                    monitor.feed(pcm_agent)
+                pcm_8k = bridge.agent_to_modem(pcm_agent, agent.output_rate)
+                if hasattr(bridge, "amplify_for_modem"):
+                    pcm_8k = bridge.amplify_for_modem(pcm_8k)
+                if pcm_8k:
+                    if record is not None:
+                        record.write_downlink(pcm_8k)
+                    self._outgoing_audio.put(pcm_8k)
+
+            await agent.start(on_agent_audio)
+            mark("agent_started")
+            await agent.say(self._opening_instructions(direction))
+            mark("greeting_sent")
+
+            last_play_at = 0.0
+            try:
+                # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
+                # 结束整通电话而非让对方听沉默。
+                while self._active and not agent.fatal:
+                    self._drain_agent_audio(bridge)
+
+                    now = time.monotonic()
+                    pending = (
+                        bridge.pending_output_bytes()
+                        if hasattr(bridge, "pending_output_bytes")
+                        else 0
+                    )
+                    agent_speaking = pending > 0 or not self._outgoing_audio.empty()
+                    if agent_speaking:
+                        last_play_at = now
+                    # 半双工防回环：Agent 说话期间（含挂尾窗口）丢弃上行，
+                    # 避免模组把下行音频回采给千问导致自循环。
+                    suppress_uplink = agent_speaking or (
+                        now - last_play_at
+                    ) < self._hangover_seconds
+
+                    pcm_8k = bridge.read_modem_chunk()
+                    if pcm_8k:
+                        # 录音不受半双工屏蔽影响（内存追加，非磁盘 IO）。
+                        if record is not None:
+                            record.write_uplink(pcm_8k)
+                        if not suppress_uplink:
+                            pcm_agent = bridge.modem_to_agent(pcm_8k, agent.input_rate)
+                            await agent.send_audio(pcm_agent)
+                    await asyncio.sleep(0.01)
+            finally:
+                await self._shutdown_agent(agent, bridge)
+        except BaseException:
+            status = "failed"
+            raise
         finally:
-            await self._shutdown_agent(agent, bridge)
+            mark("ended", status=status)
+            self._finalize_record(record, status, transcripts, direction, number)
+
+    def _load_session_config(self) -> None:
+        """每通会话开始时重读可调参数，支持不重启改参。"""
+        self._hangover_seconds = config.get_float("HALF_DUPLEX_HANGOVER_SECONDS")
+        self._hangup_delay_seconds = config.get_float("HANGUP_TOOL_DELAY_SECONDS")
+
+    def _begin_record(self, direction: str, number: str | None) -> CallRecord | None:
+        """创建通话记录；失败只告警不影响通话。"""
+        if self.call_logger is None:
+            return None
+        try:
+            return self.call_logger.begin_call(direction, number)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("创建通话记录失败: %s", exc)
+            return None
+
+    def _finalize_record(
+        self,
+        record: CallRecord | None,
+        status: str,
+        transcripts: list[tuple[str, str]],
+        direction: str,
+        number: str | None,
+    ) -> None:
+        """收尾：落盘通话记录，并按需在后台线程生成通话摘要。"""
+        if record is None:
+            return
+        try:
+            record.finish(status)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("落盘通话记录 %s 失败: %s", record.id, exc)
+        self._maybe_summarize(record, transcripts, direction, number)
+
+    def _maybe_summarize(
+        self,
+        record: CallRecord,
+        transcripts: list[tuple[str, str]],
+        direction: str,
+        number: str | None,
+    ) -> None:
+        """通话摘要开关打开且对方说过话时，起后台线程生成摘要。"""
+        try:
+            if not config.get_bool("SUMMARY_ENABLED"):
+                return
+            if not any(role == "user" and text.strip() for role, text in transcripts):
+                return
+            thread = threading.Thread(
+                target=self._summarize_worker,
+                args=(record, list(transcripts), direction, number),
+                daemon=True,
+                name="call-summary",
+            )
+            self._summary_thread = thread
+            thread.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("启动通话摘要线程失败: %s", exc)
+
+    def _summarize_worker(
+        self,
+        record: CallRecord,
+        transcripts: list[tuple[str, str]],
+        direction: str,
+        number: str | None,
+    ) -> None:
+        """后台线程：调大模型生成结构化摘要并写盘/推送。"""
+        try:
+            result = summarize_call(transcripts, direction, number)
+            if result.get("ok"):
+                record.set_summary(result)
+                self._publish({"type": "call_summary", "call_id": record.id, **result})
+            else:
+                logger.warning("通话摘要生成失败: %s", result.get("error"))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("通话摘要线程异常: %s", exc)
 
     def _build_tools(self) -> ToolRegistry:
         registry = ToolRegistry()
@@ -210,8 +367,8 @@ class CallSession:
         common = (
             f"当前真实日期时间是 {now_str}，这是准确信息；对方询问日期、时间、"
             "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份。\n"
-            "语音风格：普通话，自然电话口吻，语速正常略慢，声音沉稳亲和，"
-            "清晰但不要喊，不要播音腔、客服腔或机器人腔。\n"
+            "语音风格：普通话，自然电话口吻，语速比正常稍慢，节奏从容，"
+            "声音低沉、稳重、沉稳亲和，清晰但不要喊，不要播音腔、客服腔或机器人腔。\n"
             "回复适合电话播放：先回应对方刚说的话，再推进当前任务；一般只说一句话，"
             "最多两句话，别长篇、别加引号、别分段、别解释推理过程。\n"
             "安全边界：不索要验证码、密码、银行卡、转账、身份证完整号码等敏感信息；"
@@ -298,9 +455,10 @@ class CallSession:
     def _tool_hangup(self, args: dict) -> dict:
         """工具处理：Agent 请求挂断当前通话。
 
-        延迟挂断，先让 Agent 把告别语播完，避免话没说完线路就断了。
+        延迟挂断（HANGUP_TOOL_DELAY_SECONDS，每通会话开始时读取），
+        先让 Agent 把告别语播完，避免话没说完线路就断了。
         """
-        threading.Timer(4.5, self._deferred_hangup).start()
+        threading.Timer(self._hangup_delay_seconds, self._deferred_hangup).start()
         return {"success": True, "message": "好的，马上为您挂断电话"}
 
     def _deferred_hangup(self) -> None:
@@ -412,14 +570,30 @@ class CallAgentService:
         tx_gain: float = 1.0,
         hub: EventHub | None = None,
         modem: Eg25Modem | None = None,
+        call_logger: CallLogger | None = None,
     ) -> None:
-        # modem 参数供测试注入 FakeModem；默认按串口配置自建。
+        # modem/call_logger 参数供测试注入；默认按串口/环境配置自建。
         self.modem = modem or Eg25Modem(modem_port, baudrate)
         self.audio_keyword = audio_keyword
         self.provider = provider
         self.audio_mode = audio_mode
         self.hub = hub
         self._ring_lock = threading.Lock()
+        self.call_logger = call_logger or CallLogger(
+            base_dir=os.getenv("CALL_LOG_DIR", DEFAULT_CALL_LOG_DIR),
+            recording_enabled=config.get_bool("RECORDING_ENABLED"),
+            retention_days=config.get_int("RECORDING_RETENTION_DAYS"),
+        )
+        self.monitor = self._create_monitor()
+        self.dial_queue = DialQueue(
+            self.dial,
+            whitelist=tuple(
+                part.strip()
+                for part in config.get_str("DIAL_WHITELIST").split(",")
+                if part.strip()
+            ),
+            interval_seconds=config.get_float("DIAL_INTERVAL_SECONDS"),
+        )
         self.session = CallSession(
             modem=self.modem,
             audio_keyword=audio_keyword,
@@ -429,8 +603,33 @@ class CallAgentService:
             pcm_baudrate=pcm_baudrate,
             tx_gain=tx_gain,
             hub=hub,
+            call_logger=self.call_logger,
+            monitor=self.monitor,
+            on_ended=self._handle_session_ended,
         )
         self._setup_callbacks()
+
+    @staticmethod
+    def _create_monitor() -> MonitorPlayback | None:
+        """按 MONITOR_AI_PLAYBACK 开关构造并启动本地监听播放器（默认关）。
+
+        MonitorPlayback.start() 找不到设备/起进程失败时只告警自禁用，不抛异常。
+        """
+        if not config.get_bool("MONITOR_AI_PLAYBACK"):
+            return None
+        monitor = MonitorPlayback(
+            config.get_str("MONITOR_OUTPUT_DEVICE"),
+            gain=config.get_float("MONITOR_AI_GAIN"),
+        )
+        monitor.start()
+        return monitor
+
+    def _handle_session_ended(self) -> None:
+        """每次会话结束（含来电/外呼/未接通）驱动外呼队列；队列空则 no-op。"""
+        try:
+            self.dial_queue.on_session_ended()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("外呼队列会话结束回调异常: %s", exc)
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -473,8 +672,27 @@ class CallAgentService:
             self.session.start(outbound_number=number)
         return True, None
 
+    def batch_dial(self, numbers: list[str], task: str | None = None) -> dict:
+        """批量外呼：号码入队后按 DIAL_INTERVAL_SECONDS 间隔依次拨打。
+
+        返回 {"accepted": [已入队号码], "rejected": [被拒号码]}；
+        白名单（DIAL_WHITELIST）不放行、空号码、重复号码会被拒。
+        task 非空时作为本批次的外呼任务指令（AGENT_OUTBOUND_TASK）。
+        """
+        return self.dial_queue.enqueue(numbers, task)
+
+    def dial_queue_status(self) -> dict:
+        """外呼队列状态：{"pending", "current", "done", "active"}（供 web 层查询）。"""
+        return self.dial_queue.status()
+
     def start(self) -> None:
         """非阻塞启动：连接模组、启用语音、开始监听（供网页模式调用）。"""
+        try:
+            purged = self.call_logger.purge_expired()
+            if purged:
+                logger.info("已清理 %d 条过期通话记录", purged)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("清理过期通话记录失败: %s", exc)
         self.modem.connect()
         self.modem.initialize_for_voice(self.audio_mode)
         self.modem.start_listener()
