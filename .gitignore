@@ -11,3 +11,4 @@ data/
 
 # Claude Code 会话产物
 .claude/
+.DS_Store

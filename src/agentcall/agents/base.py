@@ -15,6 +15,7 @@ class VoiceAgent(ABC):
 
     _on_transcript: "Callable[[str, str], None] | None" = None
     _tools: "ToolRegistry | None" = None
+    _session_instructions: str | None = None
 
     def set_transcript_handler(
         self, handler: "Callable[[str, str], None] | None"
@@ -25,6 +26,10 @@ class VoiceAgent(ABC):
     def set_tools(self, registry: "ToolRegistry | None") -> None:
         """注册可调用工具（function calling）；不支持的实现可忽略。"""
         self._tools = registry
+
+    def set_session_instructions(self, instructions: str | None) -> None:
+        """设置本通电话的系统提示词。"""
+        self._session_instructions = instructions
 
     def _emit_transcript(self, role: str, text: str) -> None:
         if self._on_transcript and text:

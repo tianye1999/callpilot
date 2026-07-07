@@ -244,7 +244,8 @@ class Eg25Modem:
     def initialize_for_voice(self, audio_mode: str = "uac") -> None:
         """启用 EG25 语音 PCM 通道。"""
         selected = audio_mode.lower()
-        if selected == "uac":
+        # uac_ffmpeg 只是宿主侧换 ffmpeg 实现，模组侧同 UAC（AT+QPCMV=1,2）。
+        if selected in ("uac", "uac_ffmpeg"):
             self._send('AT+QCFG="USBCFG",0x2C7C,0x0125,1,1,1,1,1,1,1')
             self._send("AT+QPCMV=1,2")
             logger.info("UAC 语音通道已启用 (AT+QPCMV=1,2)")
@@ -255,7 +256,7 @@ class Eg25Modem:
             self._send("AT+QPCMV=1,0")
             logger.info("NMEA PCM 语音通道已启用 (AT+QPCMV=1,0)")
             return
-        raise ValueError("audio_mode 只能是 uac 或 nmea")
+        raise ValueError("audio_mode 只能是 uac、uac_ffmpeg 或 nmea")
 
     def on_ring(self, callback: Callable[[str | None], None]) -> None:
         self._on_ring = callback

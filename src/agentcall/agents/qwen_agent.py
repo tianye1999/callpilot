@@ -86,7 +86,7 @@ class QwenVoiceAgent(VoiceAgent):
         api_key: str,
         model: str,
         model_display_name: str,
-        voice: str = "Chelsie",
+        voice: str = "Raymond",
         realtime_url: str | None = None,
     ) -> None:
         dashscope.api_key = api_key
@@ -110,9 +110,8 @@ class QwenVoiceAgent(VoiceAgent):
         now = datetime.now()
         now_str = f"{now:%Y年%m月%d日 %H:%M}（{weekdays[now.weekday()]}）"
 
-        instructions = (
-            f"你叫红茶语音助手，是接入电话的语音 Agent。接通后请先用中文简短自我介绍，"
-            f"说明你是红茶语音助手。"
+        instructions = self._session_instructions or (
+            "你是接入电话的语音 Agent。接通后请先用中文简短自我介绍。"
             "之后用口语化、简洁的方式回答对方问题，每次回答控制在两三句话以内。"
             f"当前真实日期时间是 {now_str}，这是准确信息；对方询问日期、时间、"
             "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份。"

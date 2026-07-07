@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import logging
+import os
 import re
 from queue import Empty, Queue
 import threading
@@ -16,14 +18,24 @@ from .agents.tools import (
     SEND_SMS_SPEC,
     ToolRegistry,
 )
-from .audio_bridge import ModemAudioBridge, SerialPcmAudioBridge, create_audio_bridge
+from .audio_bridge import (
+    FfmpegAudioBridge,
+    ModemAudioBridge,
+    SerialPcmAudioBridge,
+    create_audio_bridge,
+)
 from .events import EventHub
 from .modem import Eg25Modem
 
 logger = logging.getLogger(__name__)
 
 
-AudioBridge = ModemAudioBridge | SerialPcmAudioBridge
+AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge
+OWNER_NAME = "田野"
+AGENT_PERSONA = "数字分身"
+DEFAULT_OUTBOUND_TASK = (
+    "代表田野主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。"
+)
 
 # Agent 说话结束后，再屏蔽上行这么久，吸收模组回采的尾音回声。
 HALF_DUPLEX_HANGOVER_SECONDS = 0.5
@@ -117,6 +129,10 @@ class CallSession:
 
         await asyncio.sleep(1.0)
 
+        # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
+        # 否则第二通开始模组无 PCM 流（双向无声）。
+        self.modem.initialize_for_voice(self.audio_mode)
+
         bridge = create_audio_bridge(
             mode=self.audio_mode,
             device_keyword=self.audio_keyword,
@@ -125,6 +141,8 @@ class CallSession:
             tx_gain=self.tx_gain,
         )
         agent = create_agent(self.provider)
+        direction = "outbound" if self._outbound_number else "inbound"
+        agent.set_session_instructions(self._build_agent_instructions(direction))
         agent.set_transcript_handler(
             lambda role, text: self._publish(
                 {
@@ -148,12 +166,7 @@ class CallSession:
                 self._outgoing_audio.put(pcm_8k)
 
         await agent.start(on_agent_audio)
-        model_name = getattr(agent, "model_display_name", "当前语音模型")
-        await agent.say(
-            "请用中文说：您好，我是红茶语音助手，已经接入电话。"
-            f"我的底层模型是{model_name}。"
-            "请问有什么可以帮您？"
-        )
+        await agent.say(self._opening_instructions(direction))
 
         last_play_at = 0.0
         try:
@@ -189,6 +202,69 @@ class CallSession:
         registry.register(HANGUP_SPEC, self._tool_hangup)
         registry.register(QUERY_CODE_SPEC, self._tool_query_code)
         return registry
+
+    def _build_agent_instructions(self, direction: str) -> str:
+        weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        now = datetime.now()
+        now_str = f"{now:%Y年%m月%d日 %H:%M}（{weekdays[now.weekday()]}）"
+        common = (
+            f"当前真实日期时间是 {now_str}，这是准确信息；对方询问日期、时间、"
+            "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份。\n"
+            "语音风格：普通话，自然电话口吻，语速正常略慢，声音沉稳亲和，"
+            "清晰但不要喊，不要播音腔、客服腔或机器人腔。\n"
+            "回复适合电话播放：先回应对方刚说的话，再推进当前任务；一般只说一句话，"
+            "最多两句话，别长篇、别加引号、别分段、别解释推理过程。\n"
+            "安全边界：不索要验证码、密码、银行卡、转账、身份证完整号码等敏感信息；"
+            f"不掌握或无法核实的信息不要编造，自然说不太清楚，会转告{OWNER_NAME}。\n"
+            "可用工具：发送短信(send_sms，发给本人时号码留空)、挂断电话(hangup_call，"
+            "挂断前先说一句告别语)、查询最近收到的短信验证码(query_verification_code)。"
+            "需要时主动调用对应工具，操作完成后用一句话口头确认结果。"
+        )
+
+        if direction == "outbound":
+            task = self._outbound_task()
+            return (
+                f"你是{OWNER_NAME}的{AGENT_PERSONA}，正在代表{OWNER_NAME}主动外呼对方。\n"
+                f"本通电话主题：{task}\n"
+                "外呼规则：\n"
+                f"1. 对方接起后自然说明：你是{OWNER_NAME}的{AGENT_PERSONA}，"
+                f"{OWNER_NAME}让你打来，并带出来意。\n"
+                f"2. 你不是客服，不要问对方“有什么可以帮您”；不要冒充{OWNER_NAME}本人。\n"
+                "3. 像真人电话沟通一样，围绕本通电话主题推进；如果对方不方便，礼貌收束。\n"
+                f"4. 涉及需要{OWNER_NAME}本人确认或你无法处理的事项，就说会转告{OWNER_NAME}。\n"
+                + common
+            )
+
+        return (
+            f"你是{OWNER_NAME}的{AGENT_PERSONA}，正在替{OWNER_NAME}接听打进来的电话，"
+            f"{OWNER_NAME}现在不方便接。\n"
+            "来电任务：自然接待，了解对方是谁、找田野什么事、急不急、"
+            f"是否需要{OWNER_NAME}回拨，并记下要点转告{OWNER_NAME}。\n"
+            "来电规则：\n"
+            f"1. 不要冒充{OWNER_NAME}本人；被问身份时说你是{OWNER_NAME}的{AGENT_PERSONA}。\n"
+            f"2. 不要暗示是{OWNER_NAME}主动联系对方。\n"
+            f"3. 不承诺回拨时间、不替{OWNER_NAME}做决定；只说会转告{OWNER_NAME}。\n"
+            "4. 对方明显是广告、骚扰、诈骗或机器人话术时，问一两句确认后礼貌收束并记录。\n"
+            + common
+        )
+
+    def _opening_instructions(self, direction: str) -> str:
+        if direction == "outbound":
+            task = self._outbound_task()
+            return (
+                "请直接用中文说一句自然电话开场白，不要解释："
+                f"你好，我是{OWNER_NAME}的{AGENT_PERSONA}，{OWNER_NAME}让我打这个电话。"
+                f"这次主要是{task} 你现在方便说两句吗？"
+            )
+        return (
+            "请直接用中文说一句自然电话开场白，不要解释："
+            f"喂，你好，我是{OWNER_NAME}的{AGENT_PERSONA}，"
+            f"{OWNER_NAME}现在不方便接，你说。"
+        )
+
+    @staticmethod
+    def _outbound_task() -> str:
+        return (os.getenv("AGENT_OUTBOUND_TASK") or DEFAULT_OUTBOUND_TASK).strip()
 
     def _tool_send_sms(self, args: dict) -> dict:
         """工具处理：Agent 在通话中请求发送短信。"""

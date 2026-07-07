@@ -149,6 +149,8 @@ def test_inbound_call_full_lifecycle(monkeypatch):
 
     assert "answer" in modem.call_names()  # ATA 接听
     assert agent.started and agent.said  # 开场白已发
+    assert "田野的数字分身" in agent._session_instructions
+    assert "不方便接" in agent.said[0]
     assert bridge.downlink  # 开场白 PCM 写回模组
     assert agent.stopped and bridge.stopped  # 会话收尾
     assert "hangup" in modem.call_names()  # 物理挂断兜底
@@ -157,3 +159,36 @@ def test_inbound_call_full_lifecycle(monkeypatch):
     assert statuses[0] == "ringing"
     assert "answered" in statuses
     assert statuses[-1] == "ended"
+
+
+def test_outbound_call_uses_digital_twin_prompt(monkeypatch):
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+
+    monkeypatch.setenv("AGENT_OUTBOUND_TASK", "查询本机套餐和剩余流量")
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    service = make_service(modem)
+    ok, err = service.dial("10000")
+    assert ok, err
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not bridge.downlink:
+        time.sleep(0.05)
+
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    assert ("dial", ("10000",)) in modem.calls
+    assert "田野的数字分身" in agent._session_instructions
+    assert "查询本机套餐和剩余流量" in agent._session_instructions
+    assert "不要问对方“有什么可以帮您”" in agent._session_instructions
+    assert "田野让我打这个电话" in agent.said[0]
+    assert "查询本机套餐和剩余流量" in agent.said[0]
