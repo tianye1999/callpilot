@@ -154,6 +154,73 @@ def test_service_start_purges_expired_once(tmp_path, monkeypatch):
     assert calls == [True]
 
 
+# ---- P0-4 延迟挂断 Timer：会话复用时不得误伤下一通 ----
+
+def test_stale_hangup_timer_does_not_stop_next_call(tmp_path, monkeypatch):
+    """第一通排下延迟挂断后对方先挂断，第二通开始后旧 Timer 不得停掉它。"""
+    monkeypatch.setenv("HANGUP_TOOL_DELAY_SECONDS", "0.4")
+    modem = FakeModem()
+    bridges: list[FakeAudioBridge] = []
+
+    def new_bridge(**kw):
+        bridge = FakeAudioBridge()
+        bridges.append(bridge)
+        return bridge
+
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", new_bridge)
+    monkeypatch.setattr(
+        "agentcall.call_agent.create_agent", lambda provider: FakeAgent()
+    )
+    service = make_service(modem, call_logger=CallLogger(tmp_path / "rec"))
+    session = service.session
+
+    # 第一通：接起后 Agent 调用挂断工具，排下延迟挂断
+    modem.trigger_ring("13800000000")
+    assert wait_until(lambda: bridges and bridges[0].downlink), "第一通未跑起来"
+    session._tool_hangup({})
+    timer_fires_at = time.monotonic() + 0.4
+
+    # 延迟窗口内对方先挂断，第一通收尾
+    modem.trigger_hangup()
+    assert session._thread is not None
+    session._thread.join(timeout=5)
+
+    # 第二通随即开始；越过旧 Timer 的触发点后会话必须仍在进行
+    modem.trigger_ring("13900000000")
+    assert wait_until(lambda: len(bridges) >= 2 and bridges[1].downlink), "第二通未跑起来"
+    time.sleep(max(0.0, timer_fires_at - time.monotonic()) + 0.2)
+    assert session.is_active, "上一通遗留的挂断 Timer 停掉了新会话"
+
+    session.stop()
+    session._thread.join(timeout=5)
+    assert not session.is_active
+
+
+def test_deferred_hangup_ignores_stale_generation(monkeypatch):
+    """cancel 挡不住已在执行的 Timer 回调，世代号校验必须兜底。"""
+    session = make_service(FakeModem()).session
+    monkeypatch.setattr(session, "_run", lambda: None)  # 只做状态切换，不跑真实会话
+
+    session.start()
+    stale = session._session_generation
+    session._active = False  # 本通结束
+    session.start()  # 新会话开始，世代号推进
+
+    session._deferred_hangup(stale)  # 旧 Timer 回调此刻才执行
+    assert session.is_active, "过期的延迟挂断回调不得停掉新会话"
+
+
+def test_tool_hangup_stops_current_session(monkeypatch):
+    """延迟挂断对本通会话仍然生效（防止修复过度）。"""
+    session = make_service(FakeModem()).session
+    monkeypatch.setattr(session, "_run", lambda: None)
+    session._hangup_delay_seconds = 0.05
+
+    session.start()
+    session._tool_hangup({})
+    assert wait_until(lambda: not session.is_active), "延迟挂断未停掉本通会话"
+
+
 # ---- P1-4 通话摘要：后台线程 + summary.json + hub 推送 ----
 
 class TalkativeCallerAgent(FakeAgent):
@@ -456,6 +523,7 @@ def test_start_does_not_raise_when_modem_absent():
 
     modem.connect = boom  # type: ignore[method-assign]
     service = make_service(modem)
+    service.modem_connected = False  # 注入 fake 默认视为已连；此处模拟设备尚未接入
     service.start()  # 不抛
     service._service_running = False  # 停 supervisor
     assert service.modem_connected is False
@@ -466,6 +534,7 @@ def test_supervisor_connects_then_publishes_status():
     modem = FakeModem()
     hub = make_hub()
     service = make_service(modem, hub=hub)
+    service.modem_connected = False  # 注入 fake 默认视为已连；此处模拟设备尚未接入
     service.start()
 
     deadline = time.monotonic() + 3
@@ -496,6 +565,7 @@ def test_supervisor_retries_until_modem_available(monkeypatch):
 
     modem.connect = flaky_connect  # type: ignore[method-assign]
     service = make_service(modem)
+    service.modem_connected = False  # 注入 fake 默认视为已连；此处模拟设备尚未接入
     service.start()
 
     deadline = time.monotonic() + 3
@@ -514,6 +584,7 @@ def test_stop_service_halts_supervisor():
 
     modem.connect = boom  # type: ignore[method-assign]
     service = make_service(modem)
+    service.modem_connected = False  # 注入 fake 默认视为已连；此处模拟设备尚未接入
     service.start()
     service.stop_service()
     assert service._service_running is False
@@ -525,6 +596,7 @@ def test_modem_status_not_spammed_on_repeated_failure():
     hub = make_hub()
     modem = FakeModem()
     service = make_service(modem, hub=hub)
+    service.modem_connected = False  # 注入 fake 默认视为已连；此处从未连接状态起测
     # 直接驱动内部状态转换函数，绕过真实线程
     service._set_modem_connected(False)
     service._set_modem_connected(False)
@@ -535,3 +607,17 @@ def test_modem_status_not_spammed_on_repeated_failure():
     service._set_modem_connected(True)
     events = [e for e in hub.history() if e.get("type") == "modem_status"]
     assert len(events) == 1 and events[0]["connected"] is True
+
+
+def test_dial_rejected_when_modem_not_connected(monkeypatch):
+    """模组未连接时拨打必须立即拒绝，而不是假装"已发起呼叫"。"""
+    from agentcall.call_agent import CallAgentService
+
+    service = CallAgentService(
+        modem_port="unused", audio_keyword="unused", provider="qwen",
+    )  # 不注入 modem：等同真机上桥没起、supervisor 还没连上
+    assert service.modem_connected is False
+
+    ok, err = service.dial("10000")
+    assert not ok
+    assert "模组未连接" in (err or "")

@@ -9,7 +9,7 @@
 - 白名单为空 => 一律放行（产品决策：宽松，白名单只做可选过滤）；
   非空 => 精确匹配 或 前缀通配（如 ``"138*"``）。
 
-环境变量（均有默认值，供 ``DialQueue.from_env`` 使用）：
+环境变量（读取与默认值统一走 config 注册表，供 ``DialQueue.from_env`` 使用）：
 - ``DIAL_WHITELIST``：逗号分隔的白名单，如 ``"13800000000,139*"``；默认空（放行全部）。
 - ``DIAL_INTERVAL_SECONDS``：两通电话之间的间隔秒数；默认 5.0。
 """
@@ -22,12 +22,13 @@ import threading
 from collections import deque
 from typing import Any, Callable
 
+from . import config
+
 logger = logging.getLogger(__name__)
 
-# 环境变量名与默认值
+# 环境变量名（与 config 注册表中的 key 一致）
 ENV_WHITELIST = "DIAL_WHITELIST"
 ENV_INTERVAL = "DIAL_INTERVAL_SECONDS"
-DEFAULT_INTERVAL_SECONDS = 5.0
 
 DialFn = Callable[[str], "tuple[bool, str | None]"]
 
@@ -57,20 +58,21 @@ def number_allowed(number: str, whitelist: tuple[str, ...]) -> bool:
 
 def whitelist_from_env() -> tuple[str, ...]:
     """从 ``DIAL_WHITELIST`` 读取白名单（逗号分隔），默认空元组。"""
-    raw = os.getenv(ENV_WHITELIST, "")
+    raw = config.get_str(ENV_WHITELIST)
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def interval_from_env() -> float:
-    """从 ``DIAL_INTERVAL_SECONDS`` 读取拨号间隔，非法值回退默认。"""
-    raw = os.getenv(ENV_INTERVAL, "")
-    try:
-        value = float(raw)
-    except ValueError:
-        if raw:
-            logger.warning("%s=%r 不是合法数字，使用默认 %s", ENV_INTERVAL, raw, DEFAULT_INTERVAL_SECONDS)
-        return DEFAULT_INTERVAL_SECONDS
-    return value if value >= 0 else DEFAULT_INTERVAL_SECONDS
+    """从 ``DIAL_INTERVAL_SECONDS`` 读取拨号间隔；非法值由 config 回退默认，负值同样回退。"""
+    value = config.get_float(ENV_INTERVAL)
+    # 用 not (value >= 0) 而非 value < 0：float("nan") 能通过 config 校验，
+    # 两种比较对 NaN 都为 False，前者才能把 NaN 也拦进回退分支
+    # （NaN 传给 threading.Timer 会立即触发，拨号节流实质归零）。
+    if not (value >= 0):
+        default = float(config.get_spec(ENV_INTERVAL).default)
+        logger.warning("%s=%s 非法（负数/NaN），使用默认 %s", ENV_INTERVAL, value, default)
+        return default
+    return value
 
 
 class DialQueue:

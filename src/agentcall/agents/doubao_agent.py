@@ -169,3 +169,10 @@ class DoubaoVoiceAgent(VoiceAgent):
             logger.info("豆包连接已关闭")
         except Exception as exc:  # noqa: BLE001
             logger.error("豆包接收循环异常: %s", exc)
+        finally:
+            # 豆包实现无重连机制：通话进行中接收循环退出（服务端关闭/异常）
+            # 即会话不可恢复，置 fatal 让 CallSession 主循环结束整通电话，
+            # 避免"电话活着但 AI 已死"。主动 stop() 已先置 _running=False，
+            # 不会误伤正常收尾路径。
+            if self._running:
+                self.fatal = True

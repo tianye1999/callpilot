@@ -234,7 +234,21 @@ def test_from_env_defaults(monkeypatch):
 
 
 def test_from_env_bad_interval_falls_back(monkeypatch):
+    # 非法值由 config.get_float 回退注册表默认值。
     monkeypatch.setenv("DIAL_INTERVAL_SECONDS", "not-a-number")
+    queue = DialQueue.from_env(FakeDial())
+    assert queue._interval == 5.0
+
+
+def test_from_env_negative_interval_falls_back(monkeypatch):
+    monkeypatch.setenv("DIAL_INTERVAL_SECONDS", "-3")
+    queue = DialQueue.from_env(FakeDial())
+    assert queue._interval == 5.0
+
+
+def test_from_env_nan_interval_falls_back(monkeypatch):
+    """NaN 能通过 config 的 float() 校验，必须同负值一样回退默认。"""
+    monkeypatch.setenv("DIAL_INTERVAL_SECONDS", "nan")
     queue = DialQueue.from_env(FakeDial())
     assert queue._interval == 5.0
 

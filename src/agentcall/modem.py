@@ -387,11 +387,15 @@ class Eg25Modem:
         return True
 
     def hangup(self) -> None:
-        self._send("ATH")
-        self._send("AT+QPCMV=0")
-        self._pcm_ready_event.set()
-        self._call_connected_event.clear()
-        self._connected_call_ids.clear()
+        # 两条指令与状态清理须原子：否则 CLCC 轮询线程可能插进 ATH 与
+        # AT+QPCMV=0 之间，扰乱指令/响应配对。_pcm_ready_event.set() 只置位
+        # 不等待，持锁调用无死锁风险。
+        with self._serial_lock:
+            self._send("ATH")
+            self._send("AT+QPCMV=0")
+            self._pcm_ready_event.set()
+            self._call_connected_event.clear()
+            self._connected_call_ids.clear()
         logger.info("已挂断并关闭语音 PCM 通道")
 
     def close(self) -> None:

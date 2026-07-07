@@ -36,6 +36,8 @@ class EventHub:
         self._clients: set[web.WebSocketResponse] = set()
         self._history: deque[dict[str, Any]] = deque(maxlen=history_limit)
         self._lock = threading.Lock()
+        # 推送 task 需持强引用直至完成，否则可能被 GC 提前回收导致 WS 丢事件。
+        self._tasks: set[asyncio.Task[None]] = set()
         self._store_path = Path(store_path) if store_path else None
         if self._store_path:
             self._load_persisted()
@@ -67,8 +69,11 @@ class EventHub:
             pass
 
     def _broadcast(self, event: dict[str, Any]) -> None:
+        # 经 call_soon_threadsafe 调度，始终在 loop 线程内执行，故操作 _tasks 无需加锁。
         for ws in list(self._clients):
-            asyncio.create_task(self._safe_send(ws, event))
+            task = asyncio.create_task(self._safe_send(ws, event))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
 
     async def _safe_send(self, ws: web.WebSocketResponse, event: dict[str, Any]) -> None:
         try:

@@ -417,6 +417,26 @@
     margin-top: 9px; font-family: var(--mono); font-size: 12px; color: var(--ok);
     min-height: 15px; letter-spacing: .22em; text-align: center;
   }
+
+  /* ========= 语言选择菜单 ========= */
+  #langBtn { display: inline-flex; align-items: center; gap: 5px; }
+  #langBtn svg { display: block; }
+  .lang-menu {
+    display: none; position: fixed; z-index: 50;
+    min-width: 132px; padding: 6px;
+    background: rgba(18, 24, 35, .95); border: 1px solid var(--border-strong);
+    border-radius: 12px; backdrop-filter: blur(20px);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, .6);
+  }
+  .lang-menu.show { display: block; }
+  .lang-menu button {
+    display: flex; align-items: center; justify-content: space-between;
+    width: 100%; padding: 8px 11px; border: 0; border-radius: 8px;
+    background: none; color: var(--text); font-size: 13px; cursor: pointer;
+    transition: background .12s;
+  }
+  .lang-menu button:hover { background: var(--blue-dim); }
+  .lang-menu button .check { color: var(--blue); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -432,7 +452,13 @@
     </div>
     <span class="spacer"></span>
     <div class="meta">
-      <button class="btn sm ghost" id="langBtn" style="padding:4px 10px;font-size:11px">中文</button>
+      <button class="btn sm ghost" id="langBtn" style="padding:4px 8px" title="Language" aria-haspopup="menu">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <circle cx="12" cy="12" r="9"/>
+          <path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/>
+        </svg>
+      </button>
+      <div class="lang-menu" id="langMenu" role="menu"></div>
       <span><span id="dot" class="conn-dot"></span><span id="conn"></span></span>
       <span><span id="modemDot" class="conn-dot"></span><span id="modemState"></span></span>
       <span>MODEL <b id="model">-</b></span>
@@ -658,7 +684,8 @@ function applyI18n() {
   document.querySelectorAll("[data-i18n]").forEach((n) => { n.textContent = t(n.dataset.i18n); });
   document.querySelectorAll("[data-i18n-ph]").forEach((n) => { n.placeholder = t(n.dataset.i18nPh); });
   $("slogan").textContent = t("slogan");
-  $("langBtn").textContent = LANG === "en" ? "中文" : "EN";
+  renderLangMenu();
+  $("stateText").textContent = t("st_" + callStatus) !== "st_" + callStatus ? t("st_" + callStatus) : callStatus;
   $("modemState").textContent = t(modemConnected ? "modem_on" : "modem_off");
   $("liveSub").textContent = callActive ? ($("stateNum").textContent || "") : t("live_sub_idle");
 }
@@ -705,9 +732,11 @@ document.querySelectorAll(".dock button").forEach((b) =>
 
 /* ========= 全局通话状态 ========= */
 let callActive = false;
+let callStatus = "idle";
 let backTimer = null;
 function setCall(status, caller) {
   const chip = $("stateChip");
+  callStatus = status;
   chip.className = "state-chip " + status;
   $("stateText").textContent = t("st_" + status) !== "st_" + status ? t("st_" + status) : status;
   $("stateNum").textContent = status === "idle" ? "" : (caller || "");
@@ -1119,14 +1148,43 @@ $("configSave").addEventListener("click", async () => {
   finally { btn.disabled = false; }
 });
 
-$("langBtn").addEventListener("click", () => {
-  LANG = LANG === "en" ? "zh" : "en";
+/* 语言菜单：数组驱动，新语言在 LANGS 与 I18N 各加一项即可 */
+const LANGS = [
+  { code: "en", label: "English" },
+  { code: "zh", label: "中文" },
+];
+function renderLangMenu() {
+  const menu = $("langMenu");
+  menu.textContent = "";
+  LANGS.forEach(({ code, label }) => {
+    const item = el("button", null, label);
+    item.setAttribute("role", "menuitem");
+    if (code === LANG) item.appendChild(el("span", "check", "✓"));
+    item.addEventListener("click", () => setLang(code));
+    menu.appendChild(item);
+  });
+}
+function setLang(code) {
+  $("langMenu").classList.remove("show");
+  if (code === LANG) return;
+  LANG = code;
   localStorage.setItem("cp_lang", LANG);
   applyI18n();
   loadHistory().then(loadRecent);  // 重渲染带翻译的动态列表
   loadConfig();
   refreshQueue();
   if (window._lastTask) updateTaskPlaceholder(window._lastTask);
+}
+$("langBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const menu = $("langMenu");
+  const r = $("langBtn").getBoundingClientRect();
+  menu.style.top = `${r.bottom + 8}px`;
+  menu.style.left = `${Math.max(8, r.right - 132)}px`;
+  menu.classList.toggle("show");
+});
+document.addEventListener("click", (e) => {
+  if (!$("langMenu").contains(e.target)) $("langMenu").classList.remove("show");
 });
 applyI18n();
 setModem(false);   // 默认显示模组未连接，连上后由 modem_status 事件翻绿

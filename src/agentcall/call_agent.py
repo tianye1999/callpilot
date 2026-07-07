@@ -99,6 +99,12 @@ class CallSession:
         self._outgoing_audio: Queue[bytes] = Queue()
         self._record: CallRecord | None = None
         self._summary_thread: threading.Thread | None = None
+        # 延迟挂断（hangup 工具）状态：CallSession 跨通复用，上一通排下的
+        # Timer 必须可取消；世代号兜住已越过 cancel、正在执行的回调，
+        # 避免它 stop() 误伤下一通会话。
+        self._hangup_timer: threading.Timer | None = None
+        self._session_generation = 0
+        self._hangup_lock = threading.Lock()
         # 会话级可调参数：每通会话开始时从 config 重新读取，支持不重启改参。
         self._hangover_seconds = HALF_DUPLEX_HANGOVER_SECONDS
         self._hangup_delay_seconds = HANGUP_TOOL_DELAY_SECONDS
@@ -116,7 +122,13 @@ class CallSession:
             logger.warning("已有通话进行中，忽略新的呼叫请求")
             return
         self._outbound_number = outbound_number
-        self._active = True
+        # 世代号推进与置活必须同锁原子完成：与 _deferred_hangup 的
+        # 「校验世代号 → stop()」互斥，保证旧回调要么在新会话置活前跑完
+        # （只影响已结束的旧会话），要么校验失败直接放弃。
+        with self._hangup_lock:
+            self._cancel_hangup_timer()
+            self._session_generation += 1
+            self._active = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -134,6 +146,8 @@ class CallSession:
             logger.exception("通话处理异常: %s", exc)
         finally:
             self._active = False
+            # 会话收尾统一取消未触发的延迟挂断，不让它跨到下一通。
+            self._cancel_hangup_timer()
             self._loop.close()
             # 会话结束通知（含异常/未接通路径）：驱动外呼队列拨下一个等。
             if self._on_ended is not None:
@@ -482,12 +496,31 @@ class CallSession:
         延迟挂断（HANGUP_TOOL_DELAY_SECONDS，每通会话开始时读取），
         先让 Agent 把告别语播完，避免话没说完线路就断了。
         """
-        threading.Timer(self._hangup_delay_seconds, self._deferred_hangup).start()
+        with self._hangup_lock:
+            self._cancel_hangup_timer()
+            timer = threading.Timer(
+                self._hangup_delay_seconds,
+                self._deferred_hangup,
+                args=(self._session_generation,),
+            )
+            self._hangup_timer = timer
+            timer.start()
         return {"success": True, "message": "好的，马上为您挂断电话"}
 
-    def _deferred_hangup(self) -> None:
-        logger.info("工具触发挂断通话")
-        self.stop()
+    def _deferred_hangup(self, generation: int) -> None:
+        with self._hangup_lock:
+            # 世代号不匹配 = 排定本 Timer 的那通已结束：不得 stop() 新会话。
+            if generation != self._session_generation:
+                logger.info("延迟挂断已过期（会话已更替），忽略")
+                return
+            logger.info("工具触发挂断通话")
+            self.stop()
+
+    def _cancel_hangup_timer(self) -> None:
+        timer = self._hangup_timer
+        if timer is not None:
+            timer.cancel()
+            self._hangup_timer = None
 
     def _tool_send_dtmf(self, args: dict) -> dict:
         """工具处理：Agent 请求发送 DTMF 按键（IVR 导航）。"""
@@ -623,7 +656,8 @@ class CallAgentService:
         self._ring_lock = threading.Lock()
         # 模组连接状态与后台 supervisor：首启时模组不在也不阻塞 Web，
         # supervisor 反复重连直到成功（首次连上后由 modem 读循环自愈接管）。
-        self.modem_connected = False
+        # 注入 modem（测试/直连）视为已就绪；自建的由 supervisor 连上后置 True。
+        self.modem_connected = modem is not None
         self._service_running = False
         self._supervisor_thread: threading.Thread | None = None
         self.call_logger = call_logger or CallLogger(
@@ -735,6 +769,8 @@ class CallAgentService:
         number = (number or "").strip()
         if not number:
             return False, "号码不能为空"
+        if not self.modem_connected:
+            return False, "模组未连接（检查 USB 桥与 EC20）"
         self._remember_outbound_task(task)
         with self._ring_lock:
             if self.session.is_active:

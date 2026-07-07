@@ -16,7 +16,8 @@
 环境变量（均有默认值，供 ``CallLogger.from_env()`` 使用）：
 
 - ``CALL_LOG_DIR``：通话记录根目录，默认 ``data/recordings``
-- ``RECORDING_ENABLED``：是否保存录音（1/true/yes/on），默认开
+- ``RECORDING_ENABLED``：是否保存录音，默认开（判定走 ``config.get_bool``，
+  与设置面板同一套语义）
 - ``RECORDING_RETENTION_DAYS``：保留天数，默认 30；<=0 表示不自动清理
 """
 
@@ -34,6 +35,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import config
+
 logger = logging.getLogger(__name__)
 
 # 录音固定格式：8kHz 16bit 单声道（EC20 语音通道的原生采样率）。
@@ -41,26 +44,7 @@ SAMPLE_RATE = 8000
 SAMPLE_WIDTH = 2
 CHANNELS = 1
 
-_TRUTHY = {"1", "true", "yes", "on"}
 _ID_TS_RE = re.compile(r"^(\d{8}-\d{6})")
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().lower() in _TRUTHY
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return int(raw.strip())
-    except ValueError:
-        logger.warning("环境变量 %s=%r 不是整数，使用默认值 %d", name, raw, default)
-        return default
 
 
 def _sanitize_number(number: str | None) -> str:
@@ -229,11 +213,11 @@ class CallLogger:
 
     @classmethod
     def from_env(cls) -> CallLogger:
-        """从环境变量构造（与 config 注册表同名：CALL_LOG_DIR / RECORDING_ENABLED / RECORDING_RETENTION_DAYS）。"""
+        """从环境变量构造；CALL_LOG_DIR 未进 config 注册表（不上面板），单独读。"""
         return cls(
             base_dir=os.getenv("CALL_LOG_DIR", "data/recordings"),
-            recording_enabled=_env_bool("RECORDING_ENABLED", True),
-            retention_days=_env_int("RECORDING_RETENTION_DAYS", 30),
+            recording_enabled=config.get_bool("RECORDING_ENABLED"),
+            retention_days=config.get_int("RECORDING_RETENTION_DAYS"),
         )
 
     def begin_call(self, direction: str, number: str | None) -> CallRecord:

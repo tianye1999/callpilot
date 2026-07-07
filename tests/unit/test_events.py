@@ -35,6 +35,37 @@ def test_sms_events_persisted_and_reloaded(tmp_path):
     assert [e["type"] for e in reloaded.history()] == ["sms_in"]
 
 
+def test_broadcast_tasks_referenced_until_done():
+    loop = make_loop()
+    try:
+        hub = EventHub(loop)
+
+        async def scenario():
+            gate = asyncio.Event()
+
+            class SlowWS:
+                async def send_json(self, event):
+                    await gate.wait()
+
+            hub.register(SlowWS())
+            hub.publish({"type": "system", "text": "hi"})
+            # publish 经 call_soon_threadsafe 调度 _broadcast，让出一轮使其执行
+            await asyncio.sleep(0)
+
+            pending = list(hub._tasks)
+            assert len(pending) == 1
+            assert not pending[0].done()
+
+            gate.set()
+            await asyncio.gather(*pending)
+            await asyncio.sleep(0)  # 等 done_callback 把 task 从集合中清掉
+            assert not hub._tasks
+
+        loop.run_until_complete(scenario())
+    finally:
+        loop.close()
+
+
 def test_reload_repairs_legacy_pdu_sms(tmp_path):
     # 迁移前遗留的未解码 PDU 短信（sender 为空、正文是 PDU hex）
     pdu = "00040D91683108000000F0000862707021030023044F60597D"

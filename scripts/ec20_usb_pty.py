@@ -386,8 +386,11 @@ def main() -> int:
         reset_first = consecutive_fast_fail > 0
         try:
             run_bridges_once(dev, args.map, stop, reset_first=reset_first)
-        except RuntimeError as exc:
-            logger.error("%s", exc)
+        except (RuntimeError, usb.core.USBError) as exc:
+            # USBError：设备僵死/枚举中时 set_configuration 等处会抛，
+            # 不捕获会炸穿进程，launchd 每 10s 重启一次形成崩溃风暴；
+            # 捕获后走快速失败退避，下一轮自动带 dev.reset() 清 stall。
+            logger.error("桥接失败: %s", exc)
             if args.once:
                 return 1
         if stop.is_set() or args.once:

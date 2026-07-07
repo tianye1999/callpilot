@@ -223,6 +223,15 @@ def test_from_env_reads_config(tmp_path, monkeypatch):
     assert clog.retention_days == 7
 
 
+def test_from_env_bool_matches_config_panel(tmp_path, monkeypatch):
+    """布尔判定统一走 config.get_bool：``on`` 不在真值集合内，与设置面板一致。"""
+    monkeypatch.setenv("CALL_LOG_DIR", str(tmp_path / "calls"))
+    monkeypatch.setenv("RECORDING_ENABLED", "on")
+    assert CallLogger.from_env().recording_enabled is False
+    monkeypatch.setenv("RECORDING_ENABLED", "yes")
+    assert CallLogger.from_env().recording_enabled is True
+
+
 # ---- 多线程冒烟 ----
 
 

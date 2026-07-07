@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 from agentcall.modem import Eg25Modem, parse_sms_pdu
 
 
@@ -194,3 +197,73 @@ def test_send_dtmf_rejects_invalid(monkeypatch):
     monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
     assert modem.send_dtmf("12x") is False
     assert modem.send_dtmf("") is False
+
+
+# ---- hangup 原子性：指令序列不被并发 _send 插队 ----
+
+
+class FakeSerial:
+    """记录写入顺序的假串口：每次 write 后排一条 OK 响应供 _read_response 读取。"""
+
+    def __init__(self) -> None:
+        self.is_open = True
+        self.writes: list[str] = []
+        self._pending = b""
+        self._lock = threading.Lock()
+
+    @property
+    def in_waiting(self) -> int:
+        return len(self._pending)
+
+    def write(self, data: bytes) -> int:
+        with self._lock:
+            self.writes.append(data.decode("ascii").strip())
+            self._pending = b"\r\nOK\r\n"
+        return len(data)
+
+    def read(self, size: int = 1) -> bytes:
+        with self._lock:
+            out, self._pending = self._pending[:size], self._pending[size:]
+        return out
+
+    def reset_input_buffer(self) -> None:
+        with self._lock:
+            self._pending = b""
+
+
+def test_hangup_commands_not_interleaved_by_concurrent_send():
+    """hangup 持锁期间，并发线程的 _send（如 CLCC 轮询）不得插进 ATH 与 AT+QPCMV=0 之间。"""
+    modem = make_modem()
+    fake = FakeSerial()
+    modem._ser = fake
+
+    ath_sent = threading.Event()
+    orig_send = modem._send
+
+    def send_with_race_window(cmd: str) -> str:
+        response = orig_send(cmd)
+        if cmd == "ATH":
+            # 撑大 ATH 与 AT+QPCMV=0 之间的窗口：若 hangup 未整体持有
+            # _serial_lock，竞争线程会在此窗口内拿到锁插队。
+            ath_sent.set()
+            time.sleep(0.1)
+        return response
+
+    modem._send = send_with_race_window
+
+    def contender() -> None:
+        ath_sent.wait(timeout=2)
+        orig_send("AT+CLCC")  # 模拟 CLCC 轮询线程的并发指令
+
+    thread = threading.Thread(target=contender)
+    thread.start()
+    modem.hangup()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+    writes = fake.writes
+    assert "AT+CLCC" in writes  # 竞争线程的指令最终发出，未被饿死
+    ath_idx = writes.index("ATH")
+    assert writes[ath_idx + 1] == "AT+QPCMV=0"  # 两条挂断指令相邻
+    assert modem.pcm_ready()
+    assert not modem.is_call_connected()

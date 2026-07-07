@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 from .base import VoiceAgent
 from .doubao_agent import DoubaoVoiceAgent
 from .qwen_agent import QwenVoiceAgent
+
+logger = logging.getLogger(__name__)
 
 
 def create_agent(provider: str | None = None) -> VoiceAgent:
@@ -22,6 +25,11 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
         )
 
     if selected == "doubao":
+        # 豆包 realtime 二进制协议中未确认与 qwen create_response 等价的
+        # 文本指令注入消息格式，say() 保持 base 默认 no-op（详见 roadmap P3-5）。
+        logger.warning(
+            "豆包 provider 暂不支持外呼开场白（say 未实现），外呼请用 qwen"
+        )
         return DoubaoVoiceAgent(
             app_id=os.getenv("DOUBAO_APP_ID", ""),
             access_key=os.getenv("DOUBAO_ACCESS_KEY", ""),

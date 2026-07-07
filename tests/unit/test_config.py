@@ -78,6 +78,29 @@ def test_unknown_key_raises_keyerror():
         get_str("NO_SUCH_KEY")
 
 
+def test_call_log_and_dial_queue_follow_config_semantics(tmp_path, monkeypatch):
+    """call_log/dial_queue 的 from_env 解析必须与 config 判定逐值一致。
+
+    历史上 call_log 自带的真值集合多了 ``on``，导致 RECORDING_ENABLED=on
+    在录音层为真、在设置面板为假；本测试锁定三个模块共用同一套语义。
+    """
+    from agentcall.call_log import CallLogger
+    from agentcall.dial_queue import DialQueue
+
+    monkeypatch.setenv("CALL_LOG_DIR", str(tmp_path / "calls"))
+    for raw in ("true", "TRUE", "1", "yes", "on", "ON", "false", "0", "no", ""):
+        monkeypatch.setenv("RECORDING_ENABLED", raw)
+        assert CallLogger.from_env().recording_enabled is get_bool("RECORDING_ENABLED"), raw
+
+    monkeypatch.setenv("DIAL_WHITELIST", "138*, 10086 ,")
+    monkeypatch.setenv("DIAL_INTERVAL_SECONDS", "not-a-number")
+    queue = DialQueue.from_env(lambda number: (True, None))
+    assert queue._interval == get_float("DIAL_INTERVAL_SECONDS")
+    assert queue._whitelist == tuple(
+        part.strip() for part in get_str("DIAL_WHITELIST").split(",") if part.strip()
+    )
+
+
 # ---- provider 凭证校验 ----
 
 
