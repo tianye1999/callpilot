@@ -9,7 +9,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from src.call_agent import CallAgentService
+from agentcall.call_agent import CallAgentService
 
 
 def main() -> None:

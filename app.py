@@ -18,9 +18,9 @@ from dotenv import load_dotenv
 
 from aiohttp import web
 
-from src.call_agent import CallAgentService
-from src.events import EventHub
-from src.web.server import build_app
+from agentcall.call_agent import CallAgentService
+from agentcall.events import EventHub
+from agentcall.web.server import build_app
 
 
 def _force_utf8() -> None:
