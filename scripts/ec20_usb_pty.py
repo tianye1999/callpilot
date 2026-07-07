@@ -1,0 +1,306 @@
+"""Expose Quectel EC20 USB vendor serial interfaces as macOS PTYs.
+
+macOS can see EC20/EG25 USB interfaces but does not create /dev/cu.* ports for
+Quectel vendor-specific serial functions. This bridge talks to the bulk USB
+endpoints with libusb/PyUSB and presents a pseudo terminal for pyserial.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pty
+import select
+import signal
+import sys
+import termios
+import threading
+import time
+import tty
+from dataclasses import dataclass
+from pathlib import Path
+
+import usb.core
+import usb.util
+
+VID = 0x2C7C
+PID = 0x0125
+
+
+@dataclass(frozen=True)
+class UsbPort:
+    interface: int
+    bulk_in: int
+    bulk_out: int
+    max_packet: int
+
+
+@dataclass
+class BridgeHandle:
+    dev: usb.core.Device
+    port: UsbPort
+    link: str
+    master_fd: int
+    slave_fd: int
+    stop: threading.Event
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.stop.set()
+        try:
+            usb.util.release_interface(self.dev, self.port.interface)
+        except Exception:
+            pass
+        for fd in (self.master_fd, self.slave_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        path = Path(self.link)
+        if path.is_symlink():
+            path.unlink()
+
+
+def find_device() -> usb.core.Device:
+    dev = usb.core.find(idVendor=VID, idProduct=PID)
+    if dev is None:
+        raise RuntimeError("未找到 Quectel EC20/EG25 USB 设备 (2c7c:0125)")
+    return dev
+
+
+def discover_ports(dev: usb.core.Device) -> dict[int, UsbPort]:
+    try:
+        cfg = dev.get_active_configuration()
+    except usb.core.USBError:
+        dev.set_configuration()
+        cfg = dev.get_active_configuration()
+    ports: dict[int, UsbPort] = {}
+    for intf in cfg:
+        bulk_in = None
+        bulk_out = None
+        max_packet = 512
+        for ep in intf:
+            attrs = usb.util.endpoint_type(ep.bmAttributes)
+            direction = usb.util.endpoint_direction(ep.bEndpointAddress)
+            if attrs != usb.util.ENDPOINT_TYPE_BULK:
+                continue
+            if direction == usb.util.ENDPOINT_IN:
+                bulk_in = ep.bEndpointAddress
+                max_packet = ep.wMaxPacketSize
+            elif direction == usb.util.ENDPOINT_OUT:
+                bulk_out = ep.bEndpointAddress
+        if bulk_in is not None and bulk_out is not None:
+            ports[intf.bInterfaceNumber] = UsbPort(
+                interface=intf.bInterfaceNumber,
+                bulk_in=bulk_in,
+                bulk_out=bulk_out,
+                max_packet=max_packet,
+            )
+    return ports
+
+
+def read_response(dev: usb.core.Device, port: UsbPort, timeout: float) -> bytes:
+    deadline = time.monotonic() + timeout
+    chunks: list[bytes] = []
+    while time.monotonic() < deadline:
+        try:
+            data = dev.read(port.bulk_in, port.max_packet, timeout=200)
+        except usb.core.USBTimeoutError:
+            continue
+        if data:
+            chunks.append(bytes(data))
+            joined = b"".join(chunks)
+            if b"\r\nOK\r\n" in joined or b"\r\nERROR\r\n" in joined:
+                break
+    return b"".join(chunks)
+
+
+def probe_at(dev: usb.core.Device, port: UsbPort) -> bytes:
+    try:
+        usb.util.claim_interface(dev, port.interface)
+    except usb.core.USBError as exc:
+        raise RuntimeError(
+            f"无法占用 USB interface {port.interface}: {exc}. "
+            "请确认没有另一个 ec20_usb_pty.py 正在运行；如刚异常退出，重插 EC20 USB 后再试。"
+        ) from exc
+    try:
+        while True:
+            try:
+                dev.read(port.bulk_in, port.max_packet, timeout=50)
+            except Exception:
+                break
+        dev.write(port.bulk_out, b"AT\r", timeout=1000)
+        return read_response(dev, port, 1.5)
+    finally:
+        usb.util.release_interface(dev, port.interface)
+
+
+def make_raw(fd: int) -> None:
+    tty.setraw(fd)
+    attrs = termios.tcgetattr(fd)
+    attrs[3] = attrs[3] & ~(termios.ECHO | termios.ICANON)
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
+def link_pty(slave_name: str, link: str) -> None:
+    path = Path(link)
+    if path.exists() or path.is_symlink():
+        path.unlink()
+    path.symlink_to(slave_name)
+
+
+def bridge_port(
+    dev: usb.core.Device,
+    port: UsbPort,
+    link: str,
+) -> BridgeHandle:
+    master_fd, slave_fd = pty.openpty()
+    stop = threading.Event()
+    handle = BridgeHandle(dev, port, link, master_fd, slave_fd, stop)
+    try:
+        # Keep the slave side open so the master does not see EIO before a client opens it.
+        make_raw(slave_fd)
+        slave_name = os.ttyname(slave_fd)
+        try:
+            usb.util.claim_interface(dev, port.interface)
+        except usb.core.USBError as exc:
+            raise RuntimeError(
+                f"无法占用 USB interface {port.interface}: {exc}. "
+                "请确认没有另一个 ec20_usb_pty.py 正在运行；如刚异常退出，重插 EC20 USB 后再试。"
+            ) from exc
+        link_pty(slave_name, link)
+    except Exception:
+        handle.close()
+        raise
+    print(
+        f"interface {port.interface}: {link} -> {slave_name} "
+        f"(in=0x{port.bulk_in:02x}, out=0x{port.bulk_out:02x})",
+        flush=True,
+    )
+
+    def usb_to_pty() -> None:
+        while not stop.is_set():
+            try:
+                data = dev.read(port.bulk_in, port.max_packet, timeout=100)
+            except usb.core.USBTimeoutError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if not stop.is_set():
+                    print(f"interface {port.interface} USB read failed: {exc}", file=sys.stderr)
+                stop.set()
+                return
+            if data:
+                try:
+                    os.write(master_fd, bytes(data))
+                except OSError as exc:
+                    if not stop.is_set():
+                        print(f"interface {port.interface} PTY write failed: {exc}", file=sys.stderr)
+                    stop.set()
+                    return
+
+    def pty_to_usb() -> None:
+        while not stop.is_set():
+            try:
+                ready, _, _ = select.select([master_fd], [], [], 0.1)
+                if not ready:
+                    continue
+                data = os.read(master_fd, port.max_packet)
+            except OSError as exc:
+                if not stop.is_set():
+                    print(f"interface {port.interface} PTY read failed: {exc}", file=sys.stderr)
+                stop.set()
+                return
+            if data:
+                try:
+                    dev.write(port.bulk_out, data, timeout=1000)
+                except Exception as exc:  # noqa: BLE001
+                    if not stop.is_set():
+                        print(f"interface {port.interface} USB write failed: {exc}", file=sys.stderr)
+                    stop.set()
+                    return
+
+    threading.Thread(target=usb_to_pty, name=f"ec20-usb-to-pty-{port.interface}", daemon=True).start()
+    threading.Thread(target=pty_to_usb, name=f"ec20-pty-to-usb-{port.interface}", daemon=True).start()
+    return handle
+
+
+def parse_map(value: str) -> tuple[int, str]:
+    try:
+        iface_text, link = value.split(":", 1)
+        iface = int(iface_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--map 格式应为 IFACE:LINK，例如 2:/tmp/ec20-at") from exc
+    if not link:
+        raise argparse.ArgumentTypeError("--map 的 LINK 不能为空")
+    return iface, link
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="EC20 USB vendor serial PTY bridge for macOS")
+    parser.add_argument("--list", action="store_true", help="列出 USB bulk 接口后退出")
+    parser.add_argument("--probe", action="store_true", help="对每个 bulk 接口发送 AT 探测后退出")
+    parser.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        type=parse_map,
+        metavar="IFACE:LINK",
+        help="桥接接口到 symlink，例如 2:/tmp/ec20-at；可重复",
+    )
+    args = parser.parse_args()
+
+    dev = find_device()
+    ports = discover_ports(dev)
+    if args.list:
+        for port in ports.values():
+            print(
+                f"interface {port.interface}: "
+                f"in=0x{port.bulk_in:02x} out=0x{port.bulk_out:02x} max={port.max_packet}"
+            )
+        return 0
+    if args.probe:
+        for port in ports.values():
+            try:
+                response = probe_at(dev, port).decode("ascii", "ignore").replace("\r\n", " | ")
+            except RuntimeError as exc:
+                print(f"interface {port.interface}: {exc}")
+                continue
+            print(f"interface {port.interface}: {response or '(no response)'}")
+        return 0
+    if not args.map:
+        parser.error("需要 --list、--probe 或至少一个 --map IFACE:LINK")
+
+    stop = threading.Event()
+
+    def handle_signal(_signum: int, _frame: object) -> None:
+        stop.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    handles: list[BridgeHandle] = []
+    try:
+        for iface, link in args.map:
+            if iface not in ports:
+                raise RuntimeError(f"接口 {iface} 不存在，可用接口: {sorted(ports)}")
+            handles.append(bridge_port(dev, ports[iface], link))
+
+        while not stop.is_set() and any(not handle.stop.is_set() for handle in handles):
+            time.sleep(0.2)
+    finally:
+        stop.set()
+        for handle in handles:
+            handle.close()
+        usb.util.dispose_resources(dev)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Agent助手 控制台</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #182031;
+    --panel-2: #1f2940;
+    --line: #2a3550;
+    --text: #e6ebf5;
+    --muted: #8a96b0;
+    --accent: #4f8cff;
+    --user: #2b7a5b;
+    --agent: #35406b;
+    --ok: #37c871;
+    --warn: #f0b429;
+    --err: #ef5350;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .meta { color: var(--muted); font-size: 13px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .meta b { color: var(--text); font-weight: 500; }
+  .status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--err); display: inline-block; margin-right: 6px;
+  }
+  .status-dot.on { background: var(--ok); }
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 300px 1fr 380px;
+    gap: 14px;
+    padding: 14px;
+    min-height: 0;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .panel h2 {
+    font-size: 14px; margin: 0; padding: 12px 16px;
+    border-bottom: 1px solid var(--line); color: var(--muted);
+    font-weight: 600; letter-spacing: .3px;
+  }
+  .panel .body { padding: 14px 16px; overflow-y: auto; flex: 1; }
+
+  /* 来电卡片 */
+  .call-state { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .call-number { font-size: 26px; font-weight: 700; letter-spacing: 1px; }
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; margin-top: 12px;
+  }
+  .badge.ringing { background: #3a2f10; color: var(--warn); }
+  .badge.dialing { background: #10233f; color: var(--accent); }
+  .badge.answered { background: #10331f; color: var(--ok); }
+  .badge.ended { background: #341a1a; color: var(--err); }
+  .badge.idle { background: var(--panel-2); color: var(--muted); }
+
+  /* 对话气泡 */
+  .bubble { margin-bottom: 12px; max-width: 88%; }
+  .bubble .who { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+  .bubble .text {
+    padding: 9px 12px; border-radius: 12px; font-size: 14px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .bubble.user { margin-left: auto; text-align: right; }
+  .bubble.user .text { background: var(--user); border-bottom-right-radius: 3px; display: inline-block; text-align: left; }
+  .bubble.agent .text { background: var(--agent); border-bottom-left-radius: 3px; }
+  .bubble .time { font-size: 10px; color: var(--muted); margin-top: 3px; }
+
+  /* 短信 */
+  .sms-item {
+    padding: 9px 11px; border-radius: 10px; margin-bottom: 9px;
+    background: var(--panel-2); border: 1px solid var(--line);
+  }
+  .sms-item .head { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .sms-item .dir { font-weight: 700; }
+  .sms-item.in .dir { color: var(--ok); }
+  .sms-item.out .dir { color: var(--accent); }
+  .sms-item .content { font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+  .sms-item .st { font-size: 10px; }
+  .sms-item .st.failed, .sms-item .st.error { color: var(--err); }
+
+  .send-form { border-top: 1px solid var(--line); padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .send-form input, .send-form textarea {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 8px 10px; font-size: 14px; font-family: inherit; resize: vertical;
+  }
+  .send-form textarea { min-height: 56px; }
+  .send-form button {
+    background: var(--accent); color: #fff; border: none; border-radius: 8px;
+    padding: 9px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  .send-form button:disabled { opacity: .5; cursor: default; }
+  .toast { font-size: 12px; min-height: 16px; }
+  .toast.ok { color: var(--ok); }
+  .toast.err { color: var(--err); }
+  .empty { color: var(--muted); font-size: 13px; text-align: center; margin-top: 30px; }
+  .body::-webkit-scrollbar { width: 8px; }
+  .body::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Agent助手 控制台</h1>
+    <div class="meta">
+      <span><span id="dot" class="status-dot"></span><span id="conn">连接中…</span></span>
+      <span>模型 <b id="model">-</b></span>
+      <span>端口 <b id="port">-</b></span>
+      <span>Provider <b id="provider">-</b></span>
+    </div>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>通话</h2>
+      <div class="body">
+        <div class="call-state">最近通话</div>
+        <div class="call-number" id="callNumber">—</div>
+        <span class="badge idle" id="callBadge">空闲</span>
+      </div>
+      <div class="send-form">
+        <input id="dialNumber" type="text" placeholder="要拨打的号码，如 18600000000" />
+        <button id="dialBtn">拨打电话</button>
+        <div class="toast" id="dialToast"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>对话内容</h2>
+      <div class="body" id="chat">
+        <div class="empty" id="chatEmpty">通话开始后，这里会实时显示对话转写</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>短信</h2>
+      <div class="body" id="smsList">
+        <div class="empty" id="smsEmpty">暂无短信</div>
+      </div>
+      <div class="send-form">
+        <input id="smsNumber" type="text" placeholder="对方号码，如 18600000000" />
+        <textarea id="smsText" placeholder="短信内容（支持中文）"></textarea>
+        <button id="smsSend">发送短信</button>
+        <div class="toast" id="smsToast"></div>
+      </div>
+    </section>
+  </main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const badgeText = { ringing: "振铃中", dialing: "拨号中", answered: "通话中", ended: "已结束", idle: "空闲" };
+
+function fmtTime(ts) {
+  const d = ts ? new Date(ts * 1000) : new Date();
+  return d.toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function setCall(status, caller) {
+  $("callNumber").textContent = caller || "未知号码";
+  if (status === "idle") $("callNumber").textContent = "—";
+  const badge = $("callBadge");
+  badge.className = "badge " + status;
+  badge.textContent = badgeText[status] || status;
+}
+
+function addTranscript(role, text, ts) {
+  $("chatEmpty")?.remove();
+  const chat = $("chat");
+  const b = document.createElement("div");
+  b.className = "bubble " + (role === "user" ? "user" : "agent");
+  b.innerHTML = `<div class="who">${role === "user" ? "对方" : "红茶助手"}</div>`
+    + `<div class="text"></div><div class="time">${fmtTime(ts)}</div>`;
+  b.querySelector(".text").textContent = text;
+  chat.appendChild(b);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function addSms(event) {
+  $("smsEmpty")?.remove();
+  const list = $("smsList");
+  const isIn = event.type === "sms_in";
+  const item = document.createElement("div");
+  item.className = "sms-item " + (isIn ? "in" : "out");
+  const who = isIn ? (event.sender || "未知") : (event.number || "");
+  const st = event.status ? `<span class="st ${event.status}">${event.status}</span>` : "";
+  item.innerHTML = `<div class="head"><span class="dir">${isIn ? "收到 ← " + who : "发送 → " + who}</span>`
+    + `<span>${fmtTime(event.ts)} ${st}</span></div><div class="content"></div>`;
+  item.querySelector(".content").textContent = event.text || "";
+  list.insertBefore(item, list.firstChild);
+}
+
+function handleEvent(ev) {
+  if (ev.type === "call") {
+    setCall(ev.status, ev.caller);
+  } else if (ev.type === "transcript") {
+    addTranscript(ev.role, ev.text, ev.ts);
+  } else if (ev.type === "sms_in" || ev.type === "sms_out") {
+    addSms(ev);
+  }
+}
+
+async function loadMeta() {
+  try {
+    const r = await fetch("/api/meta");
+    const m = await r.json();
+    $("model").textContent = m.model || "-";
+    $("port").textContent = m.port || "-";
+    $("provider").textContent = m.provider || "-";
+  } catch (e) {}
+}
+
+let ws;
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => { $("dot").classList.add("on"); $("conn").textContent = "已连接"; };
+  ws.onclose = () => {
+    $("dot").classList.remove("on"); $("conn").textContent = "已断开，重连中…";
+    setTimeout(connect, 2000);
+  };
+  ws.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (err) {} };
+}
+
+$("smsSend").addEventListener("click", async () => {
+  const number = $("smsNumber").value.trim();
+  const text = $("smsText").value;
+  const toast = $("smsToast");
+  if (!number || !text.trim()) { toast.className = "toast err"; toast.textContent = "请填写号码和内容"; return; }
+  const btn = $("smsSend");
+  btn.disabled = true; toast.className = "toast"; toast.textContent = "发送中…";
+  try {
+    const r = await fetch("/api/sms/send", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ number, text }),
+    });
+    const res = await r.json();
+    if (res.ok) { toast.className = "toast ok"; toast.textContent = "已发送"; $("smsText").value = ""; }
+    else { toast.className = "toast err"; toast.textContent = "发送失败：" + (res.error || "未知错误"); }
+  } catch (err) {
+    toast.className = "toast err"; toast.textContent = "请求出错：" + err;
+  } finally { btn.disabled = false; }
+});
+
+$("dialBtn").addEventListener("click", async () => {
+  const number = $("dialNumber").value.trim();
+  const toast = $("dialToast");
+  if (!number) { toast.className = "toast err"; toast.textContent = "请填写号码"; return; }
+  const btn = $("dialBtn");
+  btn.disabled = true; toast.className = "toast"; toast.textContent = "正在发起呼叫…";
+  try {
+    const r = await fetch("/api/call/dial", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ number }),
+    });
+    const res = await r.json();
+    if (res.ok) { toast.className = "toast ok"; toast.textContent = "已发起呼叫"; }
+    else { toast.className = "toast err"; toast.textContent = "呼叫失败：" + (res.error || "未知错误"); }
+  } catch (err) {
+    toast.className = "toast err"; toast.textContent = "请求出错：" + err;
+  } finally { btn.disabled = false; }
+});
+
+loadMeta();
+connect();
+</script>
+</body>
+</html>

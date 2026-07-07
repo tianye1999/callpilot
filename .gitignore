@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# 运行时数据（含短信记录/日志，可能包含隐私）
+data/
+
+# 生成的音频文件
+*.wav
+
+# Claude Code 会话产物
+.claude/
