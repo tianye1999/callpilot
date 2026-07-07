@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentcall.app</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/tianye/AgentCall/.venv/bin/python</string>
+        <string>/Users/tianye/AgentCall/app.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/tianye/AgentCall</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/tianye/AgentCall/data/launchd-app.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/tianye/AgentCall/data/launchd-app.err.log</string>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+</dict>
+</plist>

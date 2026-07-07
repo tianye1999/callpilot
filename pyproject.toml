@@ -12,6 +12,7 @@ dependencies = [
     "dashscope>=1.25.6",
     "websockets>=13.0",
     "aiohttp>=3.9.0",
+    "pywebview>=5.0",
 ]
 
 [project.optional-dependencies]
