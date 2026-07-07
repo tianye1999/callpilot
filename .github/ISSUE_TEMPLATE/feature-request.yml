@@ -1,0 +1,32 @@
+name: "Feature request / 功能建议"
+description: "Suggest a new capability or improvement. / 提议一项新能力或改进。"
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Please describe the problem first, then the proposal.
+        感谢你的想法！请先描述问题，再给出提议。
+  - type: textarea
+    id: scenario
+    attributes:
+      label: "Use case / 使用场景"
+      description: "What are you trying to do, and why is it hard today? / 你想做什么，为什么现在难以实现？"
+      placeholder: "As a user I want ... so that ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "Proposed solution / 提议方案"
+      description: "How you imagine it working. / 你设想的工作方式。"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "Alternatives considered / 替代方案"
+      description: "Other approaches or existing workarounds you weighed. / 你考虑过的其他做法或现有绕过办法。"
+    validations:
+      required: false

@@ -1,0 +1,62 @@
+name: "Bug report / 缺陷报告"
+description: "Something is broken or behaves incorrectly. / 有功能损坏或行为不符合预期。"
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please give us enough to reproduce it.
+        感谢反馈！请提供足够的信息让我们复现。
+
+        > Do **not** paste your API key, phone number, or SIM number.
+        > 请**不要**贴 API Key、手机号或 SIM 卡号码。
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Steps to reproduce / 复现步骤"
+      description: "Numbered steps from a clean start. / 从干净状态开始的编号步骤。"
+      placeholder: |
+        1. Start the USB bridge: .venv/bin/python scripts/ec20_usb_pty.py --map 2:/tmp/ec20-at
+        2. Start the service: .venv/bin/python app.py
+        3. Place an outbound call to my own number
+        4. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Expected behavior / 期望行为"
+      placeholder: "The AI should answer and I should hear it on the caller side."
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: "Actual behavior / 实际行为"
+      placeholder: "The call connects but there is silence for the caller."
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: "Environment / 环境"
+      description: >
+        OS + chip, Python version, agent provider (qwen/doubao), audio mode, and
+        modem model if hardware is involved. /
+        操作系统+芯片、Python 版本、Agent 提供方（qwen/doubao）、音频模式，涉及硬件时附模组型号。
+      placeholder: |
+        macOS 14.4 (Apple Silicon), Python 3.12.4
+        AGENT_PROVIDER=qwen, MODEM_AUDIO_MODE=uac_ffmpeg
+        Modem: EC20CEFAGR08A03M4G
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Logs / 日志"
+      description: "Relevant console output or traceback. Redact numbers and keys. / 相关控制台输出或堆栈。请脱敏号码与 Key。"
+      render: shell
+    validations:
+      required: false

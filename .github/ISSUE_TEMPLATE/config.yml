@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Questions & discussion / 提问与讨论"
+    url: "https://github.com/tianye1999/callpilot/discussions"
+    about: "For usage questions, setup help, and open-ended discussion, please start a Discussion. For hardware results, use the Hardware reproduction report. / 使用问题、搭建求助与开放式讨论请开 Discussion；硬件结果请用「硬件复现报告」模板。"
+  - name: "README & Roadmap / 说明与路线图"
+    url: "https://github.com/tianye1999/callpilot#readme"
+    about: "Setup, safety notes, and what's planned. / 搭建步骤、安全须知与规划。"

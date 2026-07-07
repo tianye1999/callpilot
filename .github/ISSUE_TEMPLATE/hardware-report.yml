@@ -1,0 +1,95 @@
+name: "Hardware reproduction report / 硬件复现报告"
+description: "Report whether CallPilot runs on your EC20/EG25 setup. / 报告 CallPilot 在你的 EC20/EG25 上是否跑通。"
+title: "[Hardware] "
+labels: ["hardware-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing CallPilot on real hardware! This is the single most
+        valuable contribution in v0.1. Please fill in as much as you can — even a
+        partial report helps us map which modem/firmware combos work.
+
+        感谢在真机上测试 CallPilot！这是 v0.1 阶段最有价值的贡献。请尽量填写，
+        哪怕只是部分成功的报告，也能帮我们摸清哪些模组/固件组合可用。
+
+        > Do **not** paste your API key, phone number, or SIM number in this
+        > report. / 请**不要**在报告里贴 API Key、你的手机号或 SIM 卡号码。
+  - type: input
+    id: modem-model
+    attributes:
+      label: "Modem model & firmware / 模组型号与固件版本"
+      description: "Output of `ATI` and `AT+CGMR` (firmware revision). / `ATI` 与 `AT+CGMR`（固件版本）的输出。"
+      placeholder: "e.g. EC20CEFAGR08A03M4G  (AT+CGMR: EC20CEFAGR08A03M4G)"
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: "macOS version & chip / macOS 版本与芯片"
+      description: "e.g. macOS 14.4 (Apple Silicon M2) or macOS 13.6 (Intel). / 例如 macOS 14.4（Apple Silicon M2）或 macOS 13.6（Intel）。"
+      placeholder: "macOS 14.4, Apple Silicon M2"
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: "Python version / Python 版本"
+      description: "Output of `.venv/bin/python --version`. / `.venv/bin/python --version` 的输出。"
+      placeholder: "Python 3.12.4"
+    validations:
+      required: true
+  - type: input
+    id: usb-mapping
+    attributes:
+      label: "USB interface mapping / USB interface 映射"
+      description: >
+        The `--map` you passed to `scripts/ec20_usb_pty.py` (which USB interface
+        number became the AT PTY). /
+        你传给 `scripts/ec20_usb_pty.py` 的 `--map`（哪个 USB interface 号映射成了 AT PTY）。
+      placeholder: "--map 2:/tmp/ec20-at"
+    validations:
+      required: true
+  - type: dropdown
+    id: audio-mode
+    attributes:
+      label: "Audio mode / 音频模式"
+      description: "Value of `MODEM_AUDIO_MODE`. / `MODEM_AUDIO_MODE` 的取值。"
+      options:
+        - "uac_ffmpeg (ffmpeg via UAC sound card / 经 ffmpeg 走 UAC 声卡)"
+        - "uac (PortAudio / sounddevice)"
+        - "nmea (USB serial PCM / USB 串口 PCM)"
+        - "other / 其他（请在备注说明）"
+    validations:
+      required: true
+  - type: checkboxes
+    id: features-working
+    attributes:
+      label: "Features that WORKED / 成功的功能"
+      description: "Check everything you confirmed working end to end. / 勾选所有你确认端到端跑通的功能。"
+      options:
+        - label: "Incoming call auto-answer / 来电自动接听"
+        - label: "Outbound dialing / 外呼"
+        - label: "SMS send & receive / 短信收发"
+        - label: "DTMF keypad / DTMF 按键"
+        - label: "Call recording / 录音"
+        - label: "Call summary / 摘要"
+  - type: textarea
+    id: features-failed
+    attributes:
+      label: "Features that FAILED + logs / 失败的功能与日志"
+      description: >
+        Which features broke, what you saw, and the relevant log lines. Redact
+        phone numbers and keys. /
+        哪些功能失败、你看到的现象、以及相关日志行。请脱敏手机号与 Key。
+      placeholder: |
+        Outbound dialing: AI connected but no downlink audio to the caller.
+        Log: ...
+      render: shell
+  - type: textarea
+    id: notes
+    attributes:
+      label: "Other notes / 其他备注"
+      description: "SIM carrier, VoLTE status, workarounds, anything else. / SIM 运营商、VoLTE 状态、绕过办法、任何其他信息。"
+    validations:
+      required: false

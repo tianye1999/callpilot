@@ -1,5 +1,10 @@
 # CallPilot
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform: macOS](https://img.shields.io/badge/Platform-macOS-000000.svg?logo=apple&logoColor=white)](#hardware--platform-support)
+[![Status: Developer Preview](https://img.shields.io/badge/Status-Developer_Preview-orange.svg)](docs/roadmap.md)
+
 **Your calls, handled by AI.** An open-source AI phone agent that runs on a
 Quectel EC20/EG25 4G modem: it auto-answers incoming calls and talks to the
 caller with a realtime voice AI, places outbound calls, sends/receives SMS,
@@ -62,7 +67,7 @@ USB→PTY bridge (`scripts/ec20_usb_pty.py`) exposes `/tmp/ec20-at`.
 ### Quick start (macOS)
 
 ```bash
-git clone <repo-url> callpilot && cd callpilot
+git clone https://github.com/tianye1999/callpilot.git callpilot && cd callpilot
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 cp .env.example .env          # then edit .env (see below)
@@ -177,7 +182,7 @@ macOS 没有 Quectel 厂商串口的原生设备，需先跑 USB→PTY 桥（`sc
 ### 快速开始（macOS）
 
 ```bash
-git clone <仓库地址> callpilot && cd callpilot
+git clone https://github.com/tianye1999/callpilot.git callpilot && cd callpilot
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 cp .env.example .env          # 编辑 .env
