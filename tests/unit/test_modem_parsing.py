@@ -267,3 +267,105 @@ def test_hangup_commands_not_interleaved_by_concurrent_send():
     assert writes[ath_idx + 1] == "AT+QPCMV=0"  # 两条挂断指令相邻
     assert modem.pcm_ready()
     assert not modem.is_call_connected()
+
+
+# ---- P0 会话僵尸：串口断连期通话消失，CLCC 恢复后必须触发 on_hangup ----
+# 真机事故（2026-07-08）：通话中 USB 断死→NO CARRIER 收不到→重连后 CLCC
+# 每 2s 返回空却无人处理，会话僵尸直到手动挂断。
+
+
+CLCC_ACTIVE_OUTBOUND = '+CLCC: 1,0,0,0,0,"10000",129\r\nOK\r\n'
+CLCC_EMPTY_OK = "OK\r\n"
+
+
+def _connected_modem() -> tuple[Eg25Modem, list[str]]:
+    """返回「外呼已接通」状态的 modem 与挂断回调记录。"""
+    modem = make_modem()
+    hangups: list[str] = []
+    modem.on_hangup(lambda: hangups.append("hangup"))
+    modem._process_clcc_response(CLCC_ACTIVE_OUTBOUND)
+    assert modem.is_call_connected()
+    return modem, hangups
+
+
+def test_clcc_absent_twice_fires_hangup():
+    """有效 CLCC 连续两次无通话行 → 判定通话丢失，触发一次 on_hangup。"""
+    modem, hangups = _connected_modem()
+    modem._process_clcc_response(CLCC_EMPTY_OK)
+    assert hangups == []  # 第一次不判死（滤瞬变）
+    modem._process_clcc_response(CLCC_EMPTY_OK)
+    assert hangups == ["hangup"]
+    assert not modem.is_call_connected()
+    # 已收尾后继续空响应不再重复触发
+    modem._process_clcc_response(CLCC_EMPTY_OK)
+    assert hangups == ["hangup"]
+
+
+def test_clcc_absent_reset_when_call_reappears():
+    """一次空响应后通话行重新出现 → 计数复位，不误挂。"""
+    modem, hangups = _connected_modem()
+    modem._process_clcc_response(CLCC_EMPTY_OK)
+    modem._process_clcc_response(CLCC_ACTIVE_OUTBOUND)
+    modem._process_clcc_response(CLCC_EMPTY_OK)
+    assert hangups == []
+    assert modem.is_call_connected()
+
+
+def test_clcc_invalid_response_not_counted():
+    """无 OK 的响应（超时/垃圾）不参与消失判定。"""
+    modem, hangups = _connected_modem()
+    modem._process_clcc_response("")
+    modem._process_clcc_response("\r\n+QIND: something\r\n")
+    modem._process_clcc_response(CLCC_EMPTY_OK)
+    assert hangups == []  # 只累计到 1 次有效空响应
+
+
+def test_clcc_absent_without_active_call_is_noop():
+    """无通话在线时空 CLCC 属正常待机，绝不触发挂断。"""
+    modem = make_modem()
+    hangups: list[str] = []
+    modem.on_hangup(lambda: hangups.append("hangup"))
+    for _ in range(5):
+        modem._process_clcc_response(CLCC_EMPTY_OK)
+    assert hangups == []
+
+
+def test_answer_marks_call_connected_for_loss_detection():
+    """来电 ATA 后同样进入消失判定保护。"""
+    modem = make_modem()
+
+    sent: list[str] = []
+    modem._send = lambda cmd, **kw: sent.append(cmd) or "OK"  # type: ignore[method-assign]
+    hangups: list[str] = []
+    modem.on_hangup(lambda: hangups.append("hangup"))
+
+    modem.answer()
+    assert modem.is_call_connected()
+    modem._process_clcc_response(CLCC_EMPTY_OK)
+    modem._process_clcc_response(CLCC_EMPTY_OK)
+    assert hangups == ["hangup"]
+
+
+def test_poll_failure_threshold_fires_hangup(monkeypatch):
+    """通话在线期串口持续失联达阈值 → 放弃等待，收尾会话（跑真实轮询循环）。"""
+    modem, hangups = _connected_modem()
+
+    def boom(cmd, **kw):
+        raise OSError("串口已死")
+
+    modem._send = boom  # type: ignore[method-assign]
+    monkeypatch.setattr(type(modem), "_CLCC_FAIL_THRESHOLD", 3)
+
+    ticks = {"n": 0}
+
+    def fake_sleep(_s):
+        ticks["n"] += 1
+        if ticks["n"] >= 6:  # 越过阈值后再跑几轮，验证不重复触发
+            modem._running = False
+
+    monkeypatch.setattr("agentcall.modem.time.sleep", fake_sleep)
+    modem._running = True
+    modem._poll_call_status()  # 同步跑完（fake_sleep 负责终止）
+
+    assert hangups == ["hangup"]
+    assert not modem.is_call_connected()

@@ -186,8 +186,16 @@ class Eg25Modem:
         self._last_dialed: str | None = None
         self._incoming_call_ids: set[str] = set()
         self._connected_call_ids: set[str] = set()
-        # 外呼接通标志：拨号后清除，检测到 CLCC dir=0 stat=0(active) 时置位。
+        # 通话在线标志：拨号后清除，外呼接通（CLCC dir=0 stat=0）或来电
+        # 接听（ATA）时置位。除 _wait_connected 外，还是 CLCC「通话消失」
+        # 判定的前提（见 _process_clcc_response）。
         self._call_connected_event = threading.Event()
+        # CLCC 消失/失联计数：通话在线期间，有效 CLCC 连续无活跃通话、或
+        # 轮询连续异常达到阈值，判定通话已丢并触发 on_hangup 收尾会话。
+        # 真机事故（2026-07-08）：通话中串口断死，NO CARRIER 永远收不到，
+        # 重连后 CLCC 每 2s 返回空却无人处理，会话僵尸直到手动挂断。
+        self._clcc_absent_count = 0
+        self._clcc_fail_count = 0
         # EC20 NMEA PCM 上行流控：默认允许发送，仅在收到 +QPCMV:0,0 时暂停。
         self._pcm_ready_event = threading.Event()
         self._pcm_ready_event.set()
@@ -358,6 +366,8 @@ class Eg25Modem:
 
     def answer(self) -> None:
         self._send("ATA")
+        # 置「通话在线」：让来电同样受 CLCC 消失判定保护（串口死亡场景）。
+        self._call_connected_event.set()
         logger.info("已发送 ATA 接听来电")
 
     def dial(self, number: str) -> str:
@@ -371,6 +381,8 @@ class Eg25Modem:
         with self._serial_lock:
             self._call_connected_event.clear()
             self._connected_call_ids.clear()
+            self._clcc_absent_count = 0
+            self._clcc_fail_count = 0
             self._last_dialed = number
             response = self._send(f"ATD{number};")
         logger.info("已拨号 -> %s", number)
@@ -414,6 +426,8 @@ class Eg25Modem:
             self._pcm_ready_event.set()
             self._call_connected_event.clear()
             self._connected_call_ids.clear()
+            self._clcc_absent_count = 0
+            self._clcc_fail_count = 0
         logger.info("已挂断并关闭语音 PCM 通道")
 
     def close(self) -> None:
@@ -589,15 +603,33 @@ class Eg25Modem:
                 self._buffer = self._buffer[-1024:]
             break
 
+    # 通话在线期间 CLCC 轮询连续异常达到该阈值（×2s ≈ 60s），判定串口
+    # 已无法恢复、通话必然丢失，放弃等待并收尾会话（覆盖桥永久死亡场景）。
+    _CLCC_FAIL_THRESHOLD = 30
+
     def _poll_call_status(self) -> None:
         while self._running:
             try:
                 response = self._send("AT+CLCC")
             except Exception as exc:  # noqa: BLE001
                 logger.debug("轮询 CLCC 失败: %s", exc)
+                if self._call_connected_event.is_set():
+                    self._clcc_fail_count += 1
+                    if self._clcc_fail_count >= self._CLCC_FAIL_THRESHOLD:
+                        with self._serial_lock:
+                            self._clcc_fail_count = 0
+                            self._call_connected_event.clear()
+                            self._connected_call_ids.clear()
+                        logger.warning(
+                            "串口失联超 %d 秒且通话在线，判定通话已丢失，收尾会话",
+                            self._CLCC_FAIL_THRESHOLD * 2,
+                        )
+                        if self._on_hangup:
+                            self._on_hangup()
                 time.sleep(2)
                 continue
 
+            self._clcc_fail_count = 0
             self._process_clcc_response(response)
             time.sleep(2)
 
@@ -608,8 +640,11 @@ class Eg25Modem:
         # 状态判定+改写在 _serial_lock 内完成，回调收集后到锁外触发（避免持锁回调）。
         pending_ring: list[str | None] = []
         pending_connected: list[str | None] = []
+        call_lost = False
         with self._serial_lock:
+            has_call_line = False
             for match in CLCC_PATTERN.finditer(response):
+                has_call_line = True
                 call_id = match.group("idx")
                 direction = match.group("dir")
                 status = match.group("stat")
@@ -634,12 +669,31 @@ class Eg25Modem:
 
             self._incoming_call_ids.intersection_update(seen_incoming_ids)
 
+            # 通话消失判定：会话认为通话在线，而一次**有效**的 CLCC（回了 OK）
+            # 却没有任何通话行——正常挂断走读循环的 NO CARRIER，但串口死亡
+            # 期间收不到该事件，重连后只有这里能发现通话早已结束。连续两次
+            # 才判死，滤掉模组状态瞬变。
+            if self._call_connected_event.is_set() and "OK" in response:
+                if has_call_line:
+                    self._clcc_absent_count = 0
+                else:
+                    self._clcc_absent_count += 1
+                    if self._clcc_absent_count >= 2:
+                        self._clcc_absent_count = 0
+                        self._call_connected_event.clear()
+                        self._connected_call_ids.clear()
+                        call_lost = True
+
         for number in pending_ring:
             if self._on_ring:
                 self._on_ring(number)
         for connected_number in pending_connected:
             if self._on_call_connected:
                 self._on_call_connected(connected_number)
+        if call_lost:
+            logger.warning("CLCC 连续无通话记录，判定通话已丢失（串口断连期挂断？），收尾会话")
+            if self._on_hangup:
+                self._on_hangup()
 
     def _read_sms(self, mem: str, index: str) -> None:
         """收到 +CMTI 后，按存储位读取短信并解析内容。"""

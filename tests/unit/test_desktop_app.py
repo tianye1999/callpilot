@@ -156,7 +156,9 @@ def test_ensure_starts_service(monkeypatch, tmp_path):
 
     popen_calls = []
 
-    def fake_popen(argv, cwd=None, stdout=None, stderr=None, start_new_session=False):
+    # **extra 兜住平台差异 kwargs（Windows 下多传 creationflags）
+    def fake_popen(argv, cwd=None, stdout=None, stderr=None,
+                   start_new_session=False, **extra):
         popen_calls.append(
             {
                 "argv": argv,
