@@ -23,6 +23,9 @@ from .base import VoiceAgent
 
 logger = logging.getLogger(__name__)
 
+# 千问 Realtime 连接重试次数（SDK connect 硬超时 5s，冷连接抖动会踩线）。
+QWEN_CONNECT_MAX_ATTEMPTS = 3
+
 
 class _QwenCallback(OmniRealtimeCallback):
     def __init__(
@@ -127,9 +130,25 @@ class QwenVoiceAgent(VoiceAgent):
         if self.realtime_url:
             conversation_kwargs["url"] = self.realtime_url
 
-        self._conversation = OmniRealtimeConversation(**conversation_kwargs)
-        self._callback._conversation = self._conversation  # noqa: SLF001
-        self._conversation.connect()
+        # dashscope 的 connect 硬超时 5s，冷连接(TLS 冷启)遇网络抖动会踩线失败。
+        # 重试若干次：第二次起复用热 DNS/TLS，通常 <1s 连上，避免整通电话因一次
+        # 瞬时超时而失败。
+        last_exc: Exception | None = None
+        for attempt in range(1, QWEN_CONNECT_MAX_ATTEMPTS + 1):
+            self._conversation = OmniRealtimeConversation(**conversation_kwargs)
+            self._callback._conversation = self._conversation  # noqa: SLF001
+            try:
+                self._conversation.connect()
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning(
+                    "千问 Realtime 连接失败(第 %d/%d 次): %s",
+                    attempt, QWEN_CONNECT_MAX_ATTEMPTS, exc,
+                )
+        if last_exc is not None:
+            raise last_exc
 
         tool_kwargs: dict = {}
         if self._tools is not None and self._tools.has_tools():
