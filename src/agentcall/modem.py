@@ -352,6 +352,31 @@ class Eg25Modem:
     def is_call_connected(self) -> bool:
         return self._call_connected_event.is_set()
 
+    def send_dtmf(self, digits: str) -> bool:
+        """通话中发送 DTMF 按键音（AT+QVTS），用于 IVR 菜单导航。
+
+        digits 允许 0-9、*、#、A-D；逐位发送（模组一次一音更可靠）。
+        任一位失败即返回 False（已发出的按键无法撤回）。
+        """
+        digits = (digits or "").strip().upper()
+        if not digits:
+            return False
+        valid = set("0123456789*#ABCD")
+        if any(ch not in valid for ch in digits):
+            logger.warning("DTMF 含非法字符: %r", digits)
+            return False
+        for ch in digits:
+            # Quectel EC20/EG25 用 AT+QVTS（部分固件也接受 AT+VTS）。
+            response = self._send(f'AT+QVTS="{ch}"')
+            if "OK" not in response:
+                response = self._send(f'AT+VTS="{ch}"')
+            if "OK" not in response:
+                logger.warning("DTMF 按键 %s 发送失败: %r", ch, response.strip())
+                return False
+            time.sleep(0.15)  # 位间间隔，防止连音被 IVR 吞掉
+        logger.info("已发送 DTMF: %s", digits)
+        return True
+
     def hangup(self) -> None:
         self._send("ATH")
         self._send("AT+QPCMV=0")

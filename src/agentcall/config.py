@@ -74,7 +74,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 本地监听 ----
     ConfigSpec("MONITOR_AI_PLAYBACK", "本地监听 AI 语音", "bool", "false"),
     ConfigSpec("MONITOR_OUTPUT_DEVICE", "监听输出设备", "str", "MacBook Air扬声器"),
-    ConfigSpec("MONITOR_AI_GAIN", "监听增益", "float", "1.0"),
+    ConfigSpec("MONITOR_AI_GAIN", "监听增益（AI 下行）", "float", "1.0"),
+    # 电话上行是窄带信号且电平偏低，监听需大幅放大（真机调到 15 倍才够听清）。
+    ConfigSpec("MONITOR_UPLINK_GAIN", "监听增益（对方上行）", "float", "8.0"),
     # ---- 白名单与节流 ----
     ConfigSpec("DIAL_WHITELIST", "外呼白名单", "str", ""),
     ConfigSpec("DIAL_INTERVAL_SECONDS", "连续拨号间隔（秒）", "float", "5.0"),

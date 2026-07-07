@@ -56,6 +56,30 @@ HANGUP_SPEC: dict[str, Any] = {
 }
 
 
+# 发送 DTMF 按键工具规格（IVR 电话菜单导航）
+SEND_DTMF_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "send_dtmf",
+        "description": (
+            "在通话中发送电话按键音（DTMF），用于电话菜单/IVR 导航。"
+            "当对方是自动语音系统并提示“请按1”“查话费请按2”之类时，"
+            "调用本工具发送对应按键。digits 可以是多位，如 \"1\" 或 \"103#\"。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "digits": {
+                    "type": "string",
+                    "description": "要发送的按键序列，仅允许 0-9、*、#。",
+                },
+            },
+            "required": ["digits"],
+        },
+    },
+}
+
+
 # 查询最近短信验证码工具规格
 QUERY_CODE_SPEC: dict[str, Any] = {
     "type": "function",

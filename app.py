@@ -144,6 +144,8 @@ def main() -> None:
         service.session.stop()
         if service.monitor is not None:
             service.monitor.stop()
+        if service.uplink_monitor is not None:
+            service.uplink_monitor.stop()
         service.modem.close()
         loop.run_until_complete(runner.cleanup())
         loop.close()

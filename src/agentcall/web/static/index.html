@@ -160,7 +160,31 @@
   .btn-hangup { background: var(--red-dim); color: var(--red); border: 1px solid rgba(255,93,108,.45); display: none; }
   .btn-hangup.show { display: inline-block; }
   .btn-hangup:hover { background: rgba(255, 93, 108, .24); }
+  .btn-keypad { background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(79,200,232,.4); display: none; }
+  .btn-keypad.show { display: inline-block; }
+  .btn-keypad:hover { background: rgba(79, 200, 232, .22); }
   .ops-toast { font-size: 12px; min-width: 120px; }
+  .dialbox .task-input { width: 210px; font-family: var(--disp); font-size: 13px; letter-spacing: normal; }
+
+  /* DTMF 小键盘：header 下方右侧浮出 */
+  .keypad {
+    display: none; position: absolute; right: 130px; top: 100%; z-index: 30;
+    background: var(--panel-solid); border: 1px solid var(--line-strong); border-radius: 12px;
+    padding: 12px; box-shadow: 0 18px 44px rgba(0, 0, 0, .55);
+  }
+  .keypad.show { display: block; }
+  .keypad .keys { display: grid; grid-template-columns: repeat(3, 56px); gap: 7px; }
+  .keypad .keys button {
+    height: 44px; font-family: var(--mono); font-size: 17px; font-weight: 700;
+    background: var(--well); border: 1px solid var(--line); color: var(--ink);
+    border-radius: 9px; cursor: pointer; transition: background .12s, border-color .12s;
+  }
+  .keypad .keys button:hover { border-color: var(--cyan); color: var(--cyan); }
+  .keypad .keys button:active { background: var(--cyan-dim); }
+  .keypad .sent {
+    margin-top: 8px; font-family: var(--mono); font-size: 12px; color: var(--signal);
+    min-height: 15px; letter-spacing: .2em; text-align: center;
+  }
 
   /* ========= 三栏主舞台（全视口，面板内滚动） ========= */
   main {
@@ -374,9 +398,15 @@
       <div class="dialbox">
         <span class="ops-toast toast" id="dialToast"></span>
         <input id="dialNumber" type="text" placeholder="拨打号码，如 10000" />
+        <input id="dialTask" type="text" class="task-input" placeholder="外呼主题（空=沿用上次）" title="本通电话的目的；留空则沿用上次主题" />
         <button class="act btn-dial" id="dialBtn">拨打</button>
+        <button class="act btn-keypad" id="keypadBtn" title="发送按键（IVR）">⌗ 按键</button>
         <button class="act btn-hangup" id="hangupBtn">挂断</button>
       </div>
+    </div>
+    <div class="keypad" id="keypad">
+      <div class="keys"></div>
+      <div class="sent" id="dtmfSent"></div>
     </div>
   </header>
 
@@ -465,6 +495,8 @@ function setCall(status, caller) {
   $("core").className = "core " + status;
   callActive = (status === "ringing" || status === "dialing" || status === "answered");
   $("hangupBtn").classList.toggle("show", callActive);
+  $("keypadBtn").classList.toggle("show", callActive);
+  if (!callActive) { $("keypad").classList.remove("show"); $("dtmfSent").textContent = ""; }
 }
 
 /* ---- 实时对话 ---- */
@@ -548,15 +580,48 @@ function setToast(id, cls, text) {
 async function doDial() {
   const number = $("dialNumber").value.trim();
   if (!number) { setToast("dialToast", "err", "请填写号码"); return; }
+  const task = $("dialTask").value.trim();
   const btn = $("dialBtn");
   btn.disabled = true; setToast("dialToast", "", "呼叫中…");
   try {
-    const { res } = await postJson("/api/call/dial", { number });
-    if (res.ok) setToast("dialToast", "ok", "已发起");
+    const { res } = await postJson("/api/call/dial", { number, task: task || null });
+    if (res.ok) {
+      setToast("dialToast", "ok", "已发起");
+      if (task) { updateTaskPlaceholder(task); $("dialTask").value = ""; }
+    }
     else setToast("dialToast", "err", res.error || "呼叫失败");
   } catch (err) { setToast("dialToast", "err", "请求出错"); }
   finally { btn.disabled = false; }
 }
+/* 主题输入的 placeholder 显示当前默认（上次主题），一眼可见"不填会用什么" */
+function updateTaskPlaceholder(task) {
+  const t = (task || "").trim();
+  if (t) $("dialTask").placeholder = "主题（空=沿用）：" + (t.length > 18 ? t.slice(0, 18) + "…" : t);
+}
+async function loadDefaultTask() {
+  try {
+    const specs = await (await fetch("/api/config")).json();
+    const spec = specs.find((c) => c.key === "AGENT_OUTBOUND_TASK");
+    if (spec) updateTaskPlaceholder(spec.value);
+  } catch (e) {}
+}
+
+/* ---- DTMF 小键盘 ---- */
+(function initKeypad() {
+  const keys = document.querySelector("#keypad .keys");
+  for (const k of ["1","2","3","4","5","6","7","8","9","*","0","#"]) {
+    const b = el("button", "", k);
+    b.addEventListener("click", async () => {
+      try {
+        const { res } = await postJson("/api/call/dtmf", { digits: k });
+        if (res.ok) $("dtmfSent").textContent = ($("dtmfSent").textContent + k).slice(-16);
+        else $("dtmfSent").textContent = "发送失败";
+      } catch (e) { $("dtmfSent").textContent = "请求出错"; }
+    });
+    keys.appendChild(b);
+  }
+})();
+$("keypadBtn").addEventListener("click", () => $("keypad").classList.toggle("show"));
 $("dialBtn").addEventListener("click", doDial);
 $("dialNumber").addEventListener("keydown", (e) => { if (e.key === "Enter") doDial(); });
 
@@ -828,6 +893,7 @@ connect();
 loadHistory();
 refreshQueue();
 loadConfig();
+loadDefaultTask();
 setInterval(refreshQueue, 2000);
 </script>
 </body>

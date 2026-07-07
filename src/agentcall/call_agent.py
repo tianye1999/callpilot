@@ -17,6 +17,7 @@ from .agents.factory import create_agent
 from .agents.tools import (
     HANGUP_SPEC,
     QUERY_CODE_SPEC,
+    SEND_DTMF_SPEC,
     SEND_SMS_SPEC,
     ToolRegistry,
 )
@@ -68,6 +69,7 @@ class CallSession:
         hub: EventHub | None = None,
         call_logger: CallLogger | None = None,
         monitor: MonitorPlayback | None = None,
+        uplink_monitor: MonitorPlayback | None = None,
         on_ended: Callable[[], None] | None = None,
     ) -> None:
         self.modem = modem
@@ -80,6 +82,7 @@ class CallSession:
         self.hub = hub
         self.call_logger = call_logger
         self.monitor = monitor
+        self.uplink_monitor = uplink_monitor
         self._on_ended = on_ended
         self.current_caller: str | None = None
         self._outbound_number: str | None = None
@@ -266,6 +269,9 @@ class CallSession:
                         # 录音不受半双工屏蔽影响（内存追加，非磁盘 IO）。
                         if record is not None:
                             record.write_uplink(pcm_8k)
+                        # 本机监听对方声音（8k 旁路，入队即返回）。
+                        if self.uplink_monitor is not None:
+                            self.uplink_monitor.feed(pcm_8k)
                         if not suppress_uplink:
                             pcm_agent = bridge.modem_to_agent(pcm_8k, agent.input_rate)
                             await agent.send_audio(pcm_agent)
@@ -358,6 +364,7 @@ class CallSession:
         registry.register(SEND_SMS_SPEC, self._tool_send_sms)
         registry.register(HANGUP_SPEC, self._tool_hangup)
         registry.register(QUERY_CODE_SPEC, self._tool_query_code)
+        registry.register(SEND_DTMF_SPEC, self._tool_send_dtmf)
         return registry
 
     def _build_agent_instructions(self, direction: str) -> str:
@@ -389,6 +396,12 @@ class CallSession:
                 f"2. 你不是客服，不要问对方“有什么可以帮您”；不要冒充{OWNER_NAME}本人。\n"
                 "3. 像真人电话沟通一样，围绕本通电话主题推进；如果对方不方便，礼貌收束。\n"
                 f"4. 涉及需要{OWNER_NAME}本人确认或你无法处理的事项，就说会转告{OWNER_NAME}。\n"
+                "5. 【IVR 应对】若对方是自动语音菜单（提示“查话费请按1”“人工服务请按0”等），"
+                "它不是真人：不要自我介绍、不要反复说话，安静听完菜单提示，"
+                "然后调用 send_dtmf 工具按对应数字键导航；听不清就等它重播。"
+                "达成主题目标（如听到播报的话费金额）后调用挂断工具结束。\n"
+                "6. 【收束】主题目标已达成、或对方明确表示结束、或对话超过 10 轮仍无进展时，"
+                "说一句告别语并调用 hangup_call 挂断，不要无限继续。\n"
                 + common
             )
 
@@ -464,6 +477,24 @@ class CallSession:
     def _deferred_hangup(self) -> None:
         logger.info("工具触发挂断通话")
         self.stop()
+
+    def _tool_send_dtmf(self, args: dict) -> dict:
+        """工具处理：Agent 请求发送 DTMF 按键（IVR 导航）。"""
+        digits = (args.get("digits") or "").strip()
+        if not digits:
+            return {"success": False, "message": "按键序列为空"}
+        try:
+            ok = self.modem.send_dtmf(digits)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("工具发送 DTMF 失败: %s", exc)
+            return {"success": False, "message": f"按键发送失败: {exc}"}
+        if ok and self._record is not None:
+            self._record.log_event("dtmf", digits=digits)
+        return {
+            "success": ok,
+            "digits": digits,
+            "message": f"已按 {digits}" if ok else "按键发送失败",
+        }
 
     def _tool_query_code(self, args: dict) -> dict:
         """工具处理：从最近收到的短信里查验证码。"""
@@ -585,6 +616,7 @@ class CallAgentService:
             retention_days=config.get_int("RECORDING_RETENTION_DAYS"),
         )
         self.monitor = self._create_monitor()
+        self.uplink_monitor = self._create_uplink_monitor()
         self.dial_queue = DialQueue(
             self.dial,
             whitelist=tuple(
@@ -605,6 +637,7 @@ class CallAgentService:
             hub=hub,
             call_logger=self.call_logger,
             monitor=self.monitor,
+            uplink_monitor=self.uplink_monitor,
             on_ended=self._handle_session_ended,
         )
         self._setup_callbacks()
@@ -620,6 +653,23 @@ class CallAgentService:
         monitor = MonitorPlayback(
             config.get_str("MONITOR_OUTPUT_DEVICE"),
             gain=config.get_float("MONITOR_AI_GAIN"),
+        )
+        monitor.start()
+        return monitor
+
+    @staticmethod
+    def _create_uplink_monitor() -> MonitorPlayback | None:
+        """对方声音（上行 8kHz）的本机监听，独立 ffmpeg 实例，系统自动混音。
+
+        与 AI 下行监听共用 MONITOR_AI_PLAYBACK 开关——用户要听的是"对话"，
+        两个方向一起开才成立。
+        """
+        if not config.get_bool("MONITOR_AI_PLAYBACK"):
+            return None
+        monitor = MonitorPlayback(
+            config.get_str("MONITOR_OUTPUT_DEVICE"),
+            sample_rate=8000,
+            gain=config.get_float("MONITOR_UPLINK_GAIN"),
         )
         monitor.start()
         return monitor
@@ -660,11 +710,16 @@ class CallAgentService:
         self.modem.on_hangup(on_hangup)
         self.modem.on_sms(on_sms)
 
-    def dial(self, number: str) -> tuple[bool, str | None]:
-        """发起外呼：让 Agent 主动拨打指定号码。"""
+    def dial(self, number: str, task: str | None = None) -> tuple[bool, str | None]:
+        """发起外呼：让 Agent 主动拨打指定号码。
+
+        task 非空时作为本通外呼主题并持久化为默认（下次不填主题即沿用）；
+        为空则沿用当前 AGENT_OUTBOUND_TASK。
+        """
         number = (number or "").strip()
         if not number:
             return False, "号码不能为空"
+        self._remember_outbound_task(task)
         with self._ring_lock:
             if self.session.is_active:
                 return False, "当前正在通话中，请稍后再拨"
@@ -672,13 +727,27 @@ class CallAgentService:
             self.session.start(outbound_number=number)
         return True, None
 
+    @staticmethod
+    def _remember_outbound_task(task: str | None) -> None:
+        """把外呼主题写入运行环境并持久化到 .env（成为下次默认）。"""
+        task = (task or "").strip()
+        if not task:
+            return
+        os.environ["AGENT_OUTBOUND_TASK"] = task
+        try:
+            config.update_env_file({"AGENT_OUTBOUND_TASK": task})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("外呼主题持久化失败（本通仍生效）: %s", exc)
+
     def batch_dial(self, numbers: list[str], task: str | None = None) -> dict:
         """批量外呼：号码入队后按 DIAL_INTERVAL_SECONDS 间隔依次拨打。
 
         返回 {"accepted": [已入队号码], "rejected": [被拒号码]}；
         白名单（DIAL_WHITELIST）不放行、空号码、重复号码会被拒。
-        task 非空时作为本批次的外呼任务指令（AGENT_OUTBOUND_TASK）。
+        task 非空时作为本批次的外呼任务指令（AGENT_OUTBOUND_TASK），
+        并持久化为下次默认主题。
         """
+        self._remember_outbound_task(task)
         return self.dial_queue.enqueue(numbers, task)
 
     def dial_queue_status(self) -> dict:

@@ -159,3 +159,38 @@ def test_no_carrier_triggers_hangup():
 
     assert hangups == [True]
     assert modem._buffer == ""  # 挂断后缓冲清空
+
+
+# ---- DTMF 发送 ----
+
+
+def test_send_dtmf_sends_each_digit(monkeypatch):
+    modem = make_modem()
+    sent_cmds = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent_cmds.append(cmd) or "OK")
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+
+    assert modem.send_dtmf("1a#") is True  # 小写自动转大写
+    assert sent_cmds == ['AT+QVTS="1"', 'AT+QVTS="A"', 'AT+QVTS="#"']
+
+
+def test_send_dtmf_falls_back_to_vts(monkeypatch):
+    modem = make_modem()
+    sent_cmds = []
+
+    def fake_send(cmd):
+        sent_cmds.append(cmd)
+        return "OK" if cmd.startswith("AT+VTS") else "ERROR"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+
+    assert modem.send_dtmf("5") is True
+    assert sent_cmds == ['AT+QVTS="5"', 'AT+VTS="5"']
+
+
+def test_send_dtmf_rejects_invalid(monkeypatch):
+    modem = make_modem()
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    assert modem.send_dtmf("12x") is False
+    assert modem.send_dtmf("") is False

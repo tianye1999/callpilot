@@ -40,6 +40,7 @@ def build_app(
     app.router.add_post("/api/sms/send", _send_sms)
     app.router.add_post("/api/call/dial", _dial)
     app.router.add_post("/api/call/hangup", _hangup)
+    app.router.add_post("/api/call/dtmf", _dtmf)
     app.router.add_post("/api/call/batch_dial", _batch_dial)
     app.router.add_get("/api/call/queue", _queue_status)
     app.router.add_get("/api/history", _history)
@@ -52,7 +53,11 @@ def build_app(
 
 async def _index(request: web.Request) -> web.Response:
     index_file = STATIC_DIR / "index.html"
-    return web.FileResponse(index_file)
+    # 禁缓存：界面迭代频繁，避免浏览器用旧页面（曾致用户看不到新 UI）。
+    return web.FileResponse(
+        index_file,
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 async def _meta(request: web.Request) -> web.Response:
@@ -127,8 +132,11 @@ async def _dial(request: web.Request) -> web.Response:
     number = (data.get("number") or "").strip()
     if not number:
         return web.json_response({"ok": False, "error": "号码不能为空"}, status=400)
+    task = data.get("task")
+    if task is not None and not isinstance(task, str):
+        return web.json_response({"ok": False, "error": "task 必须是字符串"}, status=400)
 
-    ok, err = service.dial(number)
+    ok, err = service.dial(number, task=task)
     if not ok:
         return web.json_response({"ok": False, "error": err}, status=409)
     return web.json_response({"ok": True})
@@ -144,6 +152,26 @@ async def _hangup(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "当前没有进行中的通话"}, status=409)
     session.stop()
     return web.json_response({"ok": True})
+
+
+async def _dtmf(request: web.Request) -> web.Response:
+    """通话中人工发送 DTMF 按键（IVR 菜单导航）。"""
+    service = request.app["service"]
+    if service is None:
+        return web.json_response({"ok": False, "error": "服务不可用"}, status=500)
+    if not service.session.is_active:
+        return web.json_response({"ok": False, "error": "当前没有进行中的通话"}, status=409)
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        return web.json_response({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
+    digits = (data.get("digits") or "").strip()
+    if not digits or any(ch not in "0123456789*#" for ch in digits):
+        return web.json_response({"ok": False, "error": "digits 仅允许 0-9、*、#"}, status=400)
+
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, service.modem.send_dtmf, digits)
+    return web.json_response({"ok": bool(ok)})
 
 
 async def _batch_dial(request: web.Request) -> web.Response:

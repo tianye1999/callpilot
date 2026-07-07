@@ -330,25 +330,32 @@ def test_monitor_feed_receives_raw_agent_audio(tmp_path, monkeypatch):
 
 
 def test_service_creates_and_starts_monitor_from_config(monkeypatch):
-    created: dict = {}
+    """监听开启时创建两个实例：AI 下行(24k, AI_GAIN) + 对方上行(8k, UPLINK_GAIN)。"""
+    created: list[dict] = []
 
     class SpyMonitor:
         def __init__(self, device_keyword, *, sample_rate=24000, gain=1.0):
-            created["device"] = device_keyword
-            created["gain"] = gain
+            self.info = {"device": device_keyword, "rate": sample_rate,
+                         "gain": gain, "started": False}
+            created.append(self.info)
 
         def start(self) -> None:
-            created["started"] = True
+            self.info["started"] = True
 
     monkeypatch.setattr("agentcall.call_agent.MonitorPlayback", SpyMonitor)
     monkeypatch.setenv("MONITOR_AI_PLAYBACK", "true")
     monkeypatch.setenv("MONITOR_OUTPUT_DEVICE", "外接音箱")
     monkeypatch.setenv("MONITOR_AI_GAIN", "0.5")
+    monkeypatch.setenv("MONITOR_UPLINK_GAIN", "4.0")
 
     service = make_service(FakeModem())
 
-    assert created == {"device": "外接音箱", "gain": 0.5, "started": True}
+    assert created == [
+        {"device": "外接音箱", "rate": 24000, "gain": 0.5, "started": True},
+        {"device": "外接音箱", "rate": 8000, "gain": 4.0, "started": True},
+    ]
     assert service.session.monitor is service.monitor
+    assert service.session.uplink_monitor is service.uplink_monitor
 
 
 def test_monitor_disabled_by_default(monkeypatch):
@@ -369,3 +376,69 @@ def test_session_reloads_tunables_from_env(monkeypatch):
 
     assert service.session._hangover_seconds == 0.9
     assert service.session._hangup_delay_seconds == 1.5
+
+
+# ---- 外呼主题：持久化为下次默认 ----
+
+
+def test_dial_with_task_persists_as_default(monkeypatch, tmp_path):
+    from fakes import FakeModem
+
+    from agentcall import config
+    from agentcall.call_agent import CallAgentService
+
+    written = {}
+    monkeypatch.setattr(config, "update_env_file", lambda updates: written.update(updates) or list(updates))
+    service = CallAgentService(
+        modem_port="unused", audio_keyword="unused", provider="qwen",
+        modem=FakeModem(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(service.session, "start", lambda outbound_number=None: None)
+
+    ok, _ = service.dial("10000", task="查询本月话费")
+    assert ok
+    assert os.environ["AGENT_OUTBOUND_TASK"] == "查询本月话费"
+    assert written == {"AGENT_OUTBOUND_TASK": "查询本月话费"}
+
+
+def test_dial_without_task_keeps_previous(monkeypatch):
+    from fakes import FakeModem
+
+    from agentcall import config
+    from agentcall.call_agent import CallAgentService
+
+    monkeypatch.setenv("AGENT_OUTBOUND_TASK", "上次的主题")
+    called = []
+    monkeypatch.setattr(config, "update_env_file", lambda updates: called.append(updates))
+    service = CallAgentService(
+        modem_port="unused", audio_keyword="unused", provider="qwen",
+        modem=FakeModem(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(service.session, "start", lambda outbound_number=None: None)
+
+    ok, _ = service.dial("10000")
+    assert ok
+    assert os.environ["AGENT_OUTBOUND_TASK"] == "上次的主题"
+    assert called == []  # 未持久化任何变更
+
+
+# ---- DTMF 工具 ----
+
+
+def test_tool_send_dtmf_dispatches_to_modem(monkeypatch):
+    from fakes import FakeModem
+
+    from agentcall.call_agent import CallAgentService
+
+    modem = FakeModem()
+    sent = []
+    modem.send_dtmf = lambda digits: sent.append(digits) or True  # type: ignore[attr-defined]
+    service = CallAgentService(
+        modem_port="unused", audio_keyword="unused", provider="qwen",
+        modem=modem,  # type: ignore[arg-type]
+    )
+    result = service.session._tool_send_dtmf({"digits": "103#"})
+    assert result["success"] is True
+    assert sent == ["103#"]
+
+    assert service.session._tool_send_dtmf({"digits": ""})["success"] is False
