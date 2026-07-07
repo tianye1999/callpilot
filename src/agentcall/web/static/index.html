@@ -1129,6 +1129,7 @@ $("langBtn").addEventListener("click", () => {
   if (window._lastTask) updateTaskPlaceholder(window._lastTask);
 });
 applyI18n();
+setModem(false);   // 默认显示模组未连接，连上后由 modem_status 事件翻绿
 loadMeta();
 connect();
 loadHistory().then(loadRecent);

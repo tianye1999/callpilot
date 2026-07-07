@@ -809,13 +809,18 @@ class CallAgentService:
                     time.sleep(0.1)
                 delay = min(delay * 2, 30.0)
                 continue
+            # 复查：初始化序列执行期间若已 stop_service()，立即收拾干净退出，
+            # 不让本轮 start_listener() 复活出的读线程去重连一个本该关停的模组。
+            if not self._service_running:
+                self.modem.close()
+                return
             self._set_modem_connected(True)
             logger.info("模组已连接，等待来电…")
             return
 
     def _set_modem_connected(self, connected: bool, error: str | None = None) -> None:
-        """更新模组连接状态并广播给 UI（状态变化时才记日志/发事件）。"""
-        if connected == self.modem_connected and connected:
+        """更新模组连接状态并广播给 UI（仅状态翻转时发事件，避免重连期刷屏）。"""
+        if connected == self.modem_connected:
             return
         self.modem_connected = connected
         event = {"type": "modem_status", "connected": connected}

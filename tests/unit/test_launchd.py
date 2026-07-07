@@ -42,7 +42,7 @@ def test_program_arguments_all_absolute(labeled_plist):
     # --log-file 的值也应是绝对路径。这里逐项检查：flag 本身跳过，
     # IFACE:LINK 检查 LINK 部分，其余一律要求绝对路径。
     for arg in args:
-        if arg.startswith("--"):
+        if arg.startswith("-"):
             continue
         if ":" in arg and not arg.startswith("/"):
             _, link = arg.split(":", 1)
@@ -76,8 +76,11 @@ def test_common_keys(labeled_plist):
 def test_bridge_program_arguments_exact():
     data = load_plist(PLIST_SPECS["com.agentcall.bridge"])
     args = data["ProgramArguments"]
-    assert args[0] == str(PROJECT_ROOT / ".venv" / "bin" / "python")
-    assert args[1] == str(PROJECT_ROOT / "scripts" / "ec20_usb_pty.py")
+    # caffeinate -s 包裹：进程存活期间阻止系统睡眠（USB 掉线风暴的首要诱因）
+    assert args[0] == "/usr/bin/caffeinate"
+    assert args[1] == "-s"
+    assert args[2] == str(PROJECT_ROOT / ".venv" / "bin" / "python")
+    assert args[3] == str(PROJECT_ROOT / "scripts" / "ec20_usb_pty.py")
     assert args.count("--map") == 3
     assert "2:/tmp/ec20-at" in args
     assert "1:/tmp/ec20-nmea" in args
@@ -89,6 +92,8 @@ def test_app_program_arguments_exact():
     data = load_plist(PLIST_SPECS["com.agentcall.app"])
     args = data["ProgramArguments"]
     assert args == [
+        "/usr/bin/caffeinate",
+        "-s",
         str(PROJECT_ROOT / ".venv" / "bin" / "python"),
         str(PROJECT_ROOT / "app.py"),
     ]

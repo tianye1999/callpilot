@@ -279,9 +279,23 @@ def wait_for_device(stop: threading.Event, poll_seconds: float = 2.0) -> usb.cor
 
 
 def run_bridges_once(
-    dev: usb.core.Device, maps: list[tuple[int, str]], stop: threading.Event
+    dev: usb.core.Device,
+    maps: list[tuple[int, str]],
+    stop: threading.Event,
+    reset_first: bool = False,
 ) -> None:
-    """建立全部桥并阻塞运行，直到 stop 置位或任一桥断开（如设备被拔出）。"""
+    """建立全部桥并阻塞运行，直到 stop 置位或任一桥断开（如设备被拔出）。
+
+    reset_first=True 时先 dev.reset()：macOS 睡眠/重枚举后 bulk 端点常处于 stall，
+    不复位则重连后每次 read 立即 [Errno 5] 死循环（见 docs/roadmap.md USB 排查）。
+    """
+    if reset_first:
+        try:
+            dev.reset()
+            logger.info("已复位 USB 设备（清除 stall 端点）")
+            time.sleep(1.0)  # 复位后设备重新枚举需片刻
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("USB 复位失败（继续尝试桥接）: %s", exc)
     ports = discover_ports(dev)
     handles: list[BridgeHandle] = []
     try:
@@ -358,22 +372,49 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    # 连续快速失败计数：超阈值则 sys.exit 交 launchd 冷启（含全新 libusb 上下文），
+    # 比原地自旋更可能复位；手动运行（无 launchd）时同样退出，避免抖动风暴。
+    consecutive_fast_fail = 0
+    fail_threshold = int(os.environ.get("EC20_BRIDGE_FAIL_THRESHOLD", "6"))
+    backoff = 1.0
     while not stop.is_set():
         dev = wait_for_device(stop)
         if dev is None:
             break
+        started_at = time.monotonic()
+        # 非首轮（重连）先复位设备，清除重枚举后的 stall 端点。
+        reset_first = consecutive_fast_fail > 0
         try:
-            run_bridges_once(dev, args.map, stop)
+            run_bridges_once(dev, args.map, stop, reset_first=reset_first)
         except RuntimeError as exc:
             logger.error("%s", exc)
             if args.once:
                 return 1
-            stop.wait(2.0)
-            continue
         if stop.is_set() or args.once:
             break
-        logger.warning("桥已断开（设备可能被拔出），等待重插后自动重连…")
-        stop.wait(1.0)
+
+        # 判定本轮是否"秒挂"：桥接维持不足 5s 视为快速失败，触发退避。
+        ran_seconds = time.monotonic() - started_at
+        if ran_seconds < 5.0:
+            consecutive_fast_fail += 1
+            if consecutive_fast_fail >= fail_threshold:
+                logger.error(
+                    "桥连续 %d 次快速失败，退出交由 launchd 冷启（或请重插 EC20 / 检查睡眠）",
+                    consecutive_fast_fail,
+                )
+                return 3
+            logger.warning(
+                "桥断开（第 %d 次快速失败），%.0fs 后带 USB 复位重连…",
+                consecutive_fast_fail, backoff,
+            )
+            stop.wait(backoff)
+            backoff = min(backoff * 2, 30.0)
+        else:
+            # 曾正常运行过一段时间，属偶发掉线：重置退避。
+            consecutive_fast_fail = 0
+            backoff = 1.0
+            logger.warning("桥已断开（设备可能被拔出），等待重插后自动重连…")
+            stop.wait(1.0)
 
     logger.info("桥已退出，symlink 已清理")
     return 0

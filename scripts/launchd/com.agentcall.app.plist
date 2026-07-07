@@ -6,6 +6,8 @@
     <string>com.agentcall.app</string>
     <key>ProgramArguments</key>
     <array>
+      <string>/usr/bin/caffeinate</string>
+      <string>-s</string>
         <string>/Users/tianye/AgentCall/.venv/bin/python</string>
         <string>/Users/tianye/AgentCall/app.py</string>
     </array>

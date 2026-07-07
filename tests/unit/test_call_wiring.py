@@ -518,3 +518,20 @@ def test_stop_service_halts_supervisor():
     service.stop_service()
     assert service._service_running is False
     assert "close" in modem.call_names()
+
+
+def test_modem_status_not_spammed_on_repeated_failure():
+    """重连期多次失败不重复广播 disconnect（仅状态翻转才发事件）。"""
+    hub = make_hub()
+    modem = FakeModem()
+    service = make_service(modem, hub=hub)
+    # 直接驱动内部状态转换函数，绕过真实线程
+    service._set_modem_connected(False)
+    service._set_modem_connected(False)
+    service._set_modem_connected(False)
+    events = [e for e in hub.history() if e.get("type") == "modem_status"]
+    assert events == []  # 起始即 False，无翻转，不发
+    service._set_modem_connected(True)
+    service._set_modem_connected(True)
+    events = [e for e in hub.history() if e.get("type") == "modem_status"]
+    assert len(events) == 1 and events[0]["connected"] is True

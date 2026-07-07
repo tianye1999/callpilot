@@ -114,6 +114,7 @@ service from this repo). A self-contained installer is v0.3 on the roadmap.
 | Symptom | Likely cause / fix |
 |---------|-------------------|
 | App can't open `/tmp/ec20-at` | USB bridge not running, or modem replugged (bridge auto-reconnects; the service also re-opens the serial port) |
+| Modem drops off USB repeatedly | #1 cause: **system sleep** re-enumerates USB and stalls the modem's endpoints. The launchd plists wrap both processes in `caffeinate -s`; if you run manually, `caffeinate -s .venv/bin/python ...` or set `pmset -a sleep 0`. The bridge also does a `dev.reset()` on reconnect and backs off 1→30 s; after 6 fast failures it exits so launchd can cold-restart it |
 | No audio at all on macOS | `MODEM_AUDIO_MODE` must be `uac_ffmpeg`; `PortAudio`/`nmea` don't work here |
 | PortAudio `-9986 / -66740` | stuck `coreaudiod`: `sudo killall coreaudiod` |
 | Can't hear the AI in the room | enable **Monitor on this Mac** in Settings; raise `MONITOR_UPLINK_GAIN` for the caller side |
@@ -217,6 +218,7 @@ bash scripts/build_app.sh          # → dist/CallPilot.app
 | 现象 | 可能原因 / 解决 |
 |------|----------------|
 | 打不开 `/tmp/ec20-at` | 桥没跑或模组重插（桥会自动重连，服务也会重开串口） |
+| 模组反复从 USB 掉线 | 首要诱因是**系统睡眠**导致 USB 重枚举、端点 stall。launchd plist 已用 `caffeinate -s` 包裹进程；手动运行请加 `caffeinate -s` 前缀或 `pmset -a sleep 0`。桥重连时会先 `dev.reset()` 并指数退避（1→30s），连续快速失败达阈值后退出交给 launchd 冷重启 |
 | macOS 完全没声音 | `MODEM_AUDIO_MODE` 必须是 `uac_ffmpeg` |
 | PortAudio 报 `-9986 / -66740` | coreaudiod 卡死：`sudo killall coreaudiod` |
 | 电脑上听不到 AI | 设置里开「本机监听」；对方声音小就调大 `MONITOR_UPLINK_GAIN` |

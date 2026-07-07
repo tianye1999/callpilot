@@ -162,6 +162,9 @@ class Eg25Modem:
         self._ser: serial.Serial | None = None
         self._reader_thread: threading.Thread | None = None
         self._poll_thread: threading.Thread | None = None
+        # close() 是终态：置位后 start_listener/_reconnect 拒绝再启动，
+        # 防止 stop 与后台 supervisor 首连之间的"资源复活"竞态。
+        self._closed = False
         self._serial_lock = threading.RLock()
         # 串口重连串行化：多线程（读循环/CLCC 轮询/发送）可能同时发现断连，
         # 只让一个真正重连，其余等它完成。
@@ -229,7 +232,7 @@ class Eg25Modem:
                 self._ser = None
                 self._buffer = ""
             delay = 1.0
-            while self._running:
+            while self._running and not self._closed:
                 try:
                     self._open_serial()
                     logger.info("串口已重连: %s", self.port)
@@ -318,6 +321,8 @@ class Eg25Modem:
         self._on_call_connected = callback
 
     def start_listener(self) -> None:
+        if self._closed:
+            return
         if self._reader_thread and self._reader_thread.is_alive():
             return
         self._running = True
@@ -342,10 +347,14 @@ class Eg25Modem:
         number = (number or "").strip()
         if not number:
             raise ValueError("拨号号码为空")
-        self._call_connected_event.clear()
-        self._connected_call_ids.clear()
-        self._last_dialed = number
-        response = self._send(f"ATD{number};")
+        # 清接通状态与发拨号命令须原子：否则 CLCC 轮询线程可能在两次 clear
+        # 之间 set 事件/加 call_id，导致 _wait_connected 永远等不到接通而误判未接。
+        # _serial_lock 是 RLock，_send 内部再取同锁可重入。
+        with self._serial_lock:
+            self._call_connected_event.clear()
+            self._connected_call_ids.clear()
+            self._last_dialed = number
+            response = self._send(f"ATD{number};")
         logger.info("已拨号 -> %s", number)
         return response
 
@@ -386,6 +395,7 @@ class Eg25Modem:
         logger.info("已挂断并关闭语音 PCM 通道")
 
     def close(self) -> None:
+        self._closed = True  # 终态：阻止后续 start_listener/_reconnect 复活
         self.stop_listener()
         if self._ser and self._ser.is_open:
             self._ser.close()
@@ -572,32 +582,42 @@ class Eg25Modem:
     def _process_clcc_response(self, response: str) -> None:
         self._scan_qpcmv(response)
         seen_incoming_ids: set[str] = set()
-        for match in CLCC_PATTERN.finditer(response):
-            call_id = match.group("idx")
-            direction = match.group("dir")
-            status = match.group("stat")
-            number = match.group("number") or None
+        # 与 dial() 对 _connected_call_ids/_call_connected_event 的清除互斥：
+        # 状态判定+改写在 _serial_lock 内完成，回调收集后到锁外触发（避免持锁回调）。
+        pending_ring: list[str | None] = []
+        pending_connected: list[str | None] = []
+        with self._serial_lock:
+            for match in CLCC_PATTERN.finditer(response):
+                call_id = match.group("idx")
+                direction = match.group("dir")
+                status = match.group("stat")
+                number = match.group("number") or None
 
-            if direction == "1" and status == "4":
-                seen_incoming_ids.add(call_id)
-                if call_id not in self._incoming_call_ids:
-                    self._incoming_call_ids.add(call_id)
-                    self._last_caller = number
-                    logger.info("检测到 CLCC 来电, 号码=%s", number or "未知")
-                    if self._on_ring:
-                        self._on_ring(number)
+                if direction == "1" and status == "4":
+                    seen_incoming_ids.add(call_id)
+                    if call_id not in self._incoming_call_ids:
+                        self._incoming_call_ids.add(call_id)
+                        self._last_caller = number
+                        logger.info("检测到 CLCC 来电, 号码=%s", number or "未知")
+                        pending_ring.append(number)
 
-            # 外呼(dir=0)转为 active(stat=0) 即对方已接听。
-            if direction == "0" and status == "0":
-                if call_id not in self._connected_call_ids:
-                    self._connected_call_ids.add(call_id)
-                    connected_number = number or self._last_dialed
-                    self._call_connected_event.set()
-                    logger.info("外呼已接通, 号码=%s", connected_number or "未知")
-                    if self._on_call_connected:
-                        self._on_call_connected(connected_number)
+                # 外呼(dir=0)转为 active(stat=0) 即对方已接听。
+                if direction == "0" and status == "0":
+                    if call_id not in self._connected_call_ids:
+                        self._connected_call_ids.add(call_id)
+                        connected_number = number or self._last_dialed
+                        self._call_connected_event.set()
+                        logger.info("外呼已接通, 号码=%s", connected_number or "未知")
+                        pending_connected.append(connected_number)
 
-        self._incoming_call_ids.intersection_update(seen_incoming_ids)
+            self._incoming_call_ids.intersection_update(seen_incoming_ids)
+
+        for number in pending_ring:
+            if self._on_ring:
+                self._on_ring(number)
+        for connected_number in pending_connected:
+            if self._on_call_connected:
+                self._on_call_connected(connected_number)
 
     def _read_sms(self, mem: str, index: str) -> None:
         """收到 +CMTI 后，按存储位读取短信并解析内容。"""

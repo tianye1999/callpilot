@@ -60,11 +60,11 @@ coll = COLLECT(exe, a.binaries, a.datas, name="CallPilot")
 app = BUNDLE(
     coll,
     name="CallPilot.app",
+    icon=str(project_root / "packaging" / "CallPilot.icns"),
     bundle_identifier="ai.bondings.callpilot",
     info_plist={
         "CFBundleDisplayName": "CallPilot",
         "CFBundleShortVersionString": "0.1.0",
         "NSHighResolutionCapable": True,
-        "CFBundleIconFile": "CallPilot.icns",
     },
 )
