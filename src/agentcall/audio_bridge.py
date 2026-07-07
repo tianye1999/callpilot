@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
+import subprocess
 import threading
 import time
 from typing import Callable, Iterable
 
 import numpy as np
 import serial
-import sounddevice as sd
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,10 @@ NMEA_WRITE_INTERVAL_SECONDS = 0.1
 
 
 def find_device_index(keyword: str, kind: str | None = None) -> int | None:
+    # sounddevice 延迟导入：import 即初始化 CoreAudio/PortAudio，NMEA 串口
+    # 模式完全用不到；顶层导入曾在 coreaudiod 异常时把整个进程卡死在启动。
+    import sounddevice as sd
+
     keyword_lower = keyword.lower()
     for idx, dev in enumerate(sd.query_devices()):
         name = str(dev.get("name", "")).lower()
@@ -67,11 +73,13 @@ class ModemAudioBridge:
             raise RuntimeError(
                 f"未找到包含 '{device_keyword}' 的 UAC 输入/输出设备，请检查 EG25 UAC 是否启用"
             )
-        self._input_stream: sd.RawInputStream | None = None
-        self._output_stream: sd.RawOutputStream | None = None
+        self._input_stream = None
+        self._output_stream = None
         self._block_size = int(MODEM_RATE * MODEM_BLOCK_MS / 1000)
 
     def start(self) -> None:
+        import sounddevice as sd
+
         self._input_stream = sd.RawInputStream(
             samplerate=MODEM_RATE,
             blocksize=self._block_size,
@@ -281,18 +289,169 @@ class SerialPcmAudioBridge:
         return apply_pcm_gain(pcm_8k, self.tx_gain)
 
 
+class FfmpegAudioBridge:
+    """经 ffmpeg 子进程与 EG25 UAC 声卡收发 PCM（macOS）。
+
+    macOS 上 PortAudio 打不开 EC20 的 UAC 声卡（AUHAL -66740），但
+    AVFoundation（采集）与 AudioToolbox（播放）路径正常，故用两个
+    ffmpeg 子进程做搬运：采集→stdout 管道；stdin 管道→播放。
+    下行由写线程按 100ms 实时节奏喂给 ffmpeg，pending_output_bytes
+    因此能反映真实积压。
+    """
+
+    def __init__(self, device_keyword: str, tx_gain: float = 1.0) -> None:
+        self.device_keyword = device_keyword
+        self.tx_gain = tx_gain
+        self.input_index = self._find_avfoundation_input(device_keyword)
+        from .coreaudio import find_output_index
+
+        self.output_index = find_output_index(device_keyword)
+        if self.input_index is None or self.output_index is None:
+            raise RuntimeError(
+                f"未找到含 '{device_keyword}' 的 UAC 采集/播放设备，"
+                "请检查 EG25 UAC 是否启用 (AT+QPCMV=1,2)"
+            )
+        self._cap: subprocess.Popen | None = None
+        self._play: subprocess.Popen | None = None
+        self._tx_buffer = bytearray()
+        self._tx_lock = threading.Lock()
+        self._writer_thread: threading.Thread | None = None
+        self._running = False
+
+    @staticmethod
+    def _find_avfoundation_input(keyword: str) -> int | None:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "avfoundation",
+             "-list_devices", "true", "-i", ""],
+            capture_output=True, text=True, timeout=10,
+        )
+        in_audio_section = False
+        for line in result.stderr.splitlines():
+            if "audio devices" in line:
+                in_audio_section = True
+                continue
+            if not in_audio_section:
+                continue
+            match = re.search(r"\[(\d+)\]\s+(.*)$", line)
+            if match and keyword.lower() in match.group(2).lower():
+                logger.info("找到 UAC 采集设备 [%s]: %s", match.group(1), match.group(2))
+                return int(match.group(1))
+        return None
+
+    def start(self) -> None:
+        common = ["-hide_banner", "-loglevel", "error"]
+        self._cap = subprocess.Popen(
+            ["ffmpeg", *common, "-f", "avfoundation", "-i", f":{self.input_index}",
+             "-f", "s16le", "-ar", str(MODEM_RATE), "-ac", "1", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        os.set_blocking(self._cap.stdout.fileno(), False)
+        self._play = subprocess.Popen(
+            ["ffmpeg", *common, "-f", "s16le", "-ar", str(MODEM_RATE), "-ac", "1",
+             "-i", "pipe:0", "-f", "audiotoolbox",
+             "-audio_device_index", str(self.output_index), "none"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        self._running = True
+        self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
+        self._writer_thread.start()
+        logger.info(
+            "ffmpeg UAC 音频桥已启动 (采集 avfoundation:%s → 播放 audiotoolbox:%s)",
+            self.input_index, self.output_index,
+        )
+
+    def stop(self) -> None:
+        self._running = False
+        if self._writer_thread:
+            self._writer_thread.join(timeout=2)
+        for proc in (self._cap, self._play):
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:  # noqa: BLE001
+                    proc.kill()
+        self._cap = None
+        self._play = None
+        with self._tx_lock:
+            self._tx_buffer.clear()
+
+    def read_modem_chunk(self) -> bytes:
+        if not self._cap or not self._cap.stdout:
+            return b""
+        try:
+            return self._cap.stdout.read(NMEA_READ_SIZE) or b""
+        except (BlockingIOError, ValueError):
+            return b""
+
+    def pending_output_bytes(self) -> int:
+        with self._tx_lock:
+            return len(self._tx_buffer)
+
+    def write_modem_chunks(self, chunks: Iterable[bytes]) -> None:
+        with self._tx_lock:
+            for chunk in chunks:
+                if chunk:
+                    self._tx_buffer.extend(chunk)
+
+    def _write_loop(self) -> None:
+        """按 100ms 实时节奏喂给播放进程，空闲时也补静音保持 UAC 下行时钟。"""
+        next_write_at = time.monotonic()
+        silence = b"\x00" * NMEA_WRITE_SIZE
+        while self._running:
+            now = time.monotonic()
+            if now < next_write_at:
+                time.sleep(min(0.01, next_write_at - now))
+                continue
+            payload = self._next_write_payload(silence)
+            if self._play and self._play.stdin:
+                try:
+                    self._play.stdin.write(payload)
+                    self._play.stdin.flush()
+                except (BrokenPipeError, ValueError):
+                    logger.error("ffmpeg 播放进程管道断开")
+                    self._running = False
+                    return
+            next_write_at += NMEA_WRITE_INTERVAL_SECONDS
+
+    def _next_write_payload(self, silence: bytes) -> bytes:
+        with self._tx_lock:
+            if len(self._tx_buffer) >= NMEA_WRITE_SIZE:
+                payload = bytes(self._tx_buffer[:NMEA_WRITE_SIZE])
+                del self._tx_buffer[:NMEA_WRITE_SIZE]
+                return payload
+            if self._tx_buffer:
+                payload = bytes(self._tx_buffer)
+                self._tx_buffer.clear()
+                return payload + silence[: NMEA_WRITE_SIZE - len(payload)]
+        return silence
+
+    @staticmethod
+    def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:
+        return resample_pcm(pcm_8k, MODEM_RATE, agent_rate)
+
+    @staticmethod
+    def agent_to_modem(pcm_agent: bytes, agent_rate: int) -> bytes:
+        return resample_pcm(pcm_agent, agent_rate, MODEM_RATE)
+
+    def amplify_for_modem(self, pcm_8k: bytes) -> bytes:
+        return apply_pcm_gain(pcm_8k, self.tx_gain)
+
+
 def create_audio_bridge(
     mode: str,
     device_keyword: str,
     pcm_port: str | None,
     pcm_baudrate: int,
     tx_gain: float = 1.0,
-) -> ModemAudioBridge | SerialPcmAudioBridge:
+) -> "ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge":
     selected = mode.lower()
     if selected == "uac":
         return ModemAudioBridge(device_keyword)
+    if selected == "uac_ffmpeg":
+        return FfmpegAudioBridge(device_keyword, tx_gain=tx_gain)
     if selected == "nmea":
         if not pcm_port:
             raise RuntimeError("NMEA PCM 模式需要配置 MODEM_PCM_PORT")
         return SerialPcmAudioBridge(pcm_port, pcm_baudrate, tx_gain=tx_gain)
-    raise ValueError("MODEM_AUDIO_MODE 只能是 uac 或 nmea")
+    raise ValueError("MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg 或 nmea")
