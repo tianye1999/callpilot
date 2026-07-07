@@ -17,7 +17,7 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
             api_key=os.environ["DASHSCOPE_API_KEY"],
             model=os.getenv("QWEN_REALTIME_MODEL", "qwen3.5-omni-flash-realtime"),
             model_display_name=os.getenv("AGENT_MODEL_NAME", "通义千问 Qwen3.5-Omni"),
-            voice=os.getenv("QWEN_VOICE", "Ethan"),
+            voice=os.getenv("QWEN_VOICE", "Raymond"),
             realtime_url=os.getenv("DASHSCOPE_REALTIME_URL"),
         )
 

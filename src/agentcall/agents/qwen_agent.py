@@ -6,10 +6,15 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import socket
+import ssl
 import threading
+import time
 from datetime import datetime
 from queue import Empty, Queue
 from typing import Callable
+from urllib.parse import urlparse
 
 import dashscope
 from dashscope.audio.qwen_omni import (
@@ -26,6 +31,98 @@ logger = logging.getLogger(__name__)
 # 千问 Realtime 连接重试次数（SDK connect 硬超时 5s，冷连接抖动会踩线）。
 QWEN_CONNECT_MAX_ATTEMPTS = 3
 
+# 运行中断线后的最大重连次数默认值（env QWEN_RECONNECT_MAX 可覆盖）。
+QWEN_RECONNECT_MAX_DEFAULT = 2
+
+# 重连成功后让 Agent 主动安抚对方的提示词。
+RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继续。"
+
+# Realtime 端点默认 host/port（与 dashscope SDK 内置的 wss 地址一致）。
+DEFAULT_PREWARM_HOST = "dashscope.aliyuncs.com"
+DEFAULT_PREWARM_PORT = 443
+
+# 预热握手超时秒数默认值（env QWEN_PREWARM_TIMEOUT 可覆盖）。
+QWEN_PREWARM_TIMEOUT_DEFAULT = 5.0
+
+
+def _reconnect_max() -> int:
+    """读取运行中断线的最大重连次数（env QWEN_RECONNECT_MAX，默认 2）。"""
+    try:
+        return int(os.getenv("QWEN_RECONNECT_MAX", str(QWEN_RECONNECT_MAX_DEFAULT)))
+    except ValueError:
+        return QWEN_RECONNECT_MAX_DEFAULT
+
+
+def _resolve_prewarm_target() -> tuple[str, int]:
+    """解析预热目标 host/port。
+
+    优先解析 env DASHSCOPE_REALTIME_URL 的 host（兼容缺 scheme 的裸 host 写法），
+    否则回落到 dashscope 官方 Realtime 端点。
+    """
+    url = os.getenv("DASHSCOPE_REALTIME_URL", "").strip()
+    if url:
+        if "://" not in url:
+            url = "//" + url
+        parsed = urlparse(url)
+        if parsed.hostname:
+            return parsed.hostname, parsed.port or DEFAULT_PREWARM_PORT
+        logger.warning("DASHSCOPE_REALTIME_URL 无法解析 host: %s", url)
+    return DEFAULT_PREWARM_HOST, DEFAULT_PREWARM_PORT
+
+
+def prewarm_connection(timeout: float | None = None) -> float | None:
+    """对 Realtime 端点做一次 TCP+TLS 握手后立即关闭，预热 DNS/TLS 缓存。
+
+    返回握手耗时（秒）；失败时记 warning 并返回 None，不抛异常。
+    """
+    if timeout is None:
+        try:
+            timeout = float(
+                os.getenv("QWEN_PREWARM_TIMEOUT", str(QWEN_PREWARM_TIMEOUT_DEFAULT))
+            )
+        except ValueError:
+            timeout = QWEN_PREWARM_TIMEOUT_DEFAULT
+    host, port = _resolve_prewarm_target()
+    started = time.monotonic()
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+            with context.wrap_socket(raw_sock, server_hostname=host):
+                pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("千问 Realtime 连接预热失败(%s:%d): %s", host, port, exc)
+        return None
+    elapsed = time.monotonic() - started
+    logger.debug("千问 Realtime 连接预热完成(%s:%d): %.3fs", host, port, elapsed)
+    return elapsed
+
+
+def start_prewarm_keepalive(
+    interval_seconds: float = 240.0,
+    stop_event: threading.Event | None = None,
+) -> threading.Thread:
+    """启动 daemon 线程周期性预热 Realtime 连接，返回线程对象便于测试/管理。
+
+    interval_seconds 可被 env QWEN_PREWARM_INTERVAL 覆盖；传入 stop_event
+    可随时停止循环（线程也挂在返回对象的 stop_event 属性上）。
+    """
+    event = stop_event if stop_event is not None else threading.Event()
+    try:
+        interval = float(os.getenv("QWEN_PREWARM_INTERVAL", str(interval_seconds)))
+    except ValueError:
+        interval = interval_seconds
+
+    def _worker() -> None:
+        while not event.is_set():
+            prewarm_connection()
+            if event.wait(interval):
+                break
+
+    thread = threading.Thread(target=_worker, daemon=True, name="qwen-prewarm")
+    thread.stop_event = event  # type: ignore[attr-defined]
+    thread.start()
+    return thread
+
 
 class _QwenCallback(OmniRealtimeCallback):
     def __init__(
@@ -41,7 +138,13 @@ class _QwenCallback(OmniRealtimeCallback):
 
     def on_close(self, close_status_code, close_msg) -> None:
         logger.info("千问 Realtime 连接关闭: %s %s", close_status_code, close_msg)
-        self._audio_queue.put(None)
+        agent = self._agent
+        if agent is not None and agent._running:  # noqa: SLF001
+            # 通话进行中被动断线：先标记，等下一次 send_audio 触发重连；
+            # 不投 None，保持下行泵线程存活以便重连后继续放音。
+            agent._mark_disconnected()  # noqa: SLF001
+        else:
+            self._audio_queue.put(None)
 
     def on_event(self, response: dict) -> None:
         event_type = response.get("type", "")
@@ -104,16 +207,28 @@ class QwenVoiceAgent(VoiceAgent):
         self._pump_thread: threading.Thread | None = None
         self._running = False
         self._handled_tool_calls: set[str] = set()
+        self._instructions: str | None = None
+        # 断线重连状态：_disconnected 由回调线程置位、send_audio 消费；
+        # _reconnecting/_reconnect_attempts 由 _reconnect_lock 保护。
+        self._disconnected = threading.Event()
+        self._reconnect_lock = threading.Lock()
+        self._reconnecting = False
+        self._reconnect_attempts = 0
+        self._reconnect_thread: threading.Thread | None = None
 
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
         self._on_audio_out = on_audio_out
         self._running = True
+        self._disconnected.clear()
+        with self._reconnect_lock:
+            self._reconnecting = False
+            self._reconnect_attempts = 0
 
         weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
         now = datetime.now()
         now_str = f"{now:%Y年%m月%d日 %H:%M}（{weekdays[now.weekday()]}）"
 
-        instructions = self._session_instructions or (
+        self._instructions = self._session_instructions or (
             "你是接入电话的语音 Agent。接通后请先用中文简短自我介绍。"
             "之后用口语化、简洁的方式回答对方问题，每次回答控制在两三句话以内。"
             f"当前真实日期时间是 {now_str}，这是准确信息；对方询问日期、时间、"
@@ -123,6 +238,18 @@ class QwenVoiceAgent(VoiceAgent):
             "(query_verification_code)。需要时主动调用对应工具，操作完成后用一句话口头确认结果。"
         )
 
+        self._connect_session()
+
+        self._pump_thread = threading.Thread(target=self._pump_audio_out, daemon=True)
+        self._pump_thread.start()
+        logger.info("千问 Agent 已启动: %s", self.model)
+
+    def _connect_session(self) -> None:
+        """新建 conversation 并完成 connect + update_session（含连接重试）。
+
+        start() 与断线重连共用；全部成功后才把新 conversation 挂到
+        self._conversation 上，失败则抛出最后一次异常。
+        """
         conversation_kwargs = {
             "model": self.model,
             "callback": self._callback,
@@ -133,12 +260,13 @@ class QwenVoiceAgent(VoiceAgent):
         # dashscope 的 connect 硬超时 5s，冷连接(TLS 冷启)遇网络抖动会踩线失败。
         # 重试若干次：第二次起复用热 DNS/TLS，通常 <1s 连上，避免整通电话因一次
         # 瞬时超时而失败。
+        conversation: OmniRealtimeConversation | None = None
         last_exc: Exception | None = None
         for attempt in range(1, QWEN_CONNECT_MAX_ATTEMPTS + 1):
-            self._conversation = OmniRealtimeConversation(**conversation_kwargs)
-            self._callback._conversation = self._conversation  # noqa: SLF001
+            conversation = OmniRealtimeConversation(**conversation_kwargs)
+            self._callback._conversation = conversation  # noqa: SLF001
             try:
-                self._conversation.connect()
+                conversation.connect()
                 last_exc = None
                 break
             except Exception as exc:  # noqa: BLE001
@@ -147,8 +275,8 @@ class QwenVoiceAgent(VoiceAgent):
                     "千问 Realtime 连接失败(第 %d/%d 次): %s",
                     attempt, QWEN_CONNECT_MAX_ATTEMPTS, exc,
                 )
-        if last_exc is not None:
-            raise last_exc
+        if last_exc is not None or conversation is None:
+            raise last_exc if last_exc is not None else RuntimeError("连接失败")
 
         tool_kwargs: dict = {}
         if self._tools is not None and self._tools.has_tools():
@@ -156,7 +284,7 @@ class QwenVoiceAgent(VoiceAgent):
             tool_kwargs["tools"] = self._tools.specs()
             logger.info("已为会话注册 %d 个工具", len(self._tools.specs()))
 
-        self._conversation.update_session(
+        conversation.update_session(
             output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
             voice=self.voice,
             input_audio_format=AudioFormat.PCM_16000HZ_MONO_16BIT,
@@ -166,22 +294,101 @@ class QwenVoiceAgent(VoiceAgent):
             enable_turn_detection=True,
             turn_detection_type="server_vad",
             turn_detection_silence_duration_ms=600,
-            instructions=instructions,
+            instructions=self._instructions,
             **tool_kwargs,
         )
 
-        self._pump_thread = threading.Thread(target=self._pump_audio_out, daemon=True)
-        self._pump_thread.start()
-        logger.info("千问 Agent 已启动: %s", self.model)
+        self._conversation = conversation
+
+    def _mark_disconnected(self) -> None:
+        """回调线程通知：运行中连接被动关闭，等待 send_audio 触发重连。"""
+        if not self._disconnected.is_set():
+            logger.warning("千问 Realtime 运行中断线，等待下一帧音频触发重连")
+        self._disconnected.set()
+
+    def _maybe_start_reconnect(self) -> None:
+        """若当前无重连在进行且未超限，启动后台重连线程（幂等）。"""
+        with self._reconnect_lock:
+            if not self._running or self._reconnecting:
+                return
+            if self._reconnect_attempts >= _reconnect_max():
+                return
+            self._reconnecting = True
+        self._reconnect_thread = threading.Thread(
+            target=self._reconnect_worker, daemon=True, name="qwen-reconnect"
+        )
+        self._reconnect_thread.start()
+
+    def _reconnect_worker(self) -> None:
+        max_attempts = _reconnect_max()
+        try:
+            while self._running:
+                with self._reconnect_lock:
+                    if self._reconnect_attempts >= max_attempts:
+                        break
+                    self._reconnect_attempts += 1
+                    attempt = self._reconnect_attempts
+                logger.warning(
+                    "千问 Realtime 尝试重连(第 %d/%d 次)", attempt, max_attempts
+                )
+                try:
+                    self._connect_session()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "千问 Realtime 重连失败(第 %d/%d 次): %s",
+                        attempt, max_attempts, exc,
+                    )
+                    continue
+                # stop() 可能在 _connect_session 期间执行完毕：在锁内复查
+                # _running，若会话已停止则立刻关闭刚建立的新连接，防止
+                # 连接泄漏 / 死连接挂回 _conversation（codex review P0）。
+                with self._reconnect_lock:
+                    if not self._running:
+                        stale = self._conversation
+                        self._conversation = None
+                        if stale is not None:
+                            try:
+                                stale.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        logger.info("重连完成时会话已停止，已关闭新建连接")
+                        return
+                    self._disconnected.clear()
+                logger.info("千问 Realtime 重连成功(第 %d/%d 次)", attempt, max_attempts)
+                try:
+                    asyncio.run(self.say(RECONNECT_NOTICE))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("重连后安抚语发送失败: %s", exc)
+                return
+            # 重连超限或会话已停止：置 fatal 让 CallSession 主循环感知并
+            # 收尾整通电话（否则电话"活着但 AI 已死"，对方只听到沉默）。
+            logger.error("千问 Realtime 重连全部失败，标记会话不可恢复")
+            self.fatal = True
+            self._audio_queue.put(None)
+        finally:
+            with self._reconnect_lock:
+                self._reconnecting = False
 
     async def send_audio(self, pcm: bytes) -> None:
-        if not self._conversation or not pcm:
+        if not pcm:
+            return
+        if self._disconnected.is_set():
+            # 断线中：静默丢弃本帧，同时（幂等地）拉起后台重连。
+            self._maybe_start_reconnect()
+            return
+        conversation = self._conversation
+        if not conversation:
             return
         audio_b64 = base64.b64encode(pcm).decode("ascii")
-        self._conversation.append_audio(audio_b64)
+        try:
+            conversation.append_audio(audio_b64)
+        except Exception as exc:  # noqa: BLE001
+            # 连接可能刚死但 on_close 未及时触发：标记断线，下一帧走重连。
+            logger.warning("发送音频失败，标记断线: %s", exc)
+            self._disconnected.set()
 
     async def say(self, instructions: str) -> None:
-        if not self._conversation:
+        if not self._conversation or self._disconnected.is_set():
             return
         self._conversation.create_response(
             instructions=instructions,
@@ -224,16 +431,21 @@ class QwenVoiceAgent(VoiceAgent):
         threading.Thread(target=worker, daemon=True).start()
 
     async def stop(self) -> None:
-        self._running = False
-        if self._conversation:
+        # 与重连线程的"连接成功挂载"在同一把锁下串行：先置 _running=False
+        # 再摘取连接，保证重连线程随后要么看到已停止（自行关闭新连接），
+        # 要么其新连接在此处被关闭。
+        with self._reconnect_lock:
+            self._running = False
+            conversation = self._conversation
+            self._conversation = None
+        if conversation:
             try:
-                self._conversation.close()
+                conversation.close()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("关闭千问连接异常: %s", exc)
         self._audio_queue.put(None)
         if self._pump_thread:
             self._pump_thread.join(timeout=3)
-        self._conversation = None
 
     def _pump_audio_out(self) -> None:
         while self._running:

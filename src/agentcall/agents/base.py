@@ -13,6 +13,10 @@ class VoiceAgent(ABC):
     input_rate: int = 16000
     output_rate: int = 24000
 
+    # 会话不可恢复标志：实现（如断线重连全败）置 True 后，
+    # CallSession 主循环会结束整通电话，避免"电话活着但 AI 已死"。
+    fatal: bool = False
+
     _on_transcript: "Callable[[str, str], None] | None" = None
     _tools: "ToolRegistry | None" = None
     _session_instructions: str | None = None
