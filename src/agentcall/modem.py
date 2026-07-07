@@ -10,6 +10,8 @@ from typing import Callable
 
 import serial
 
+from . import platforms, port_detect
+
 logger = logging.getLogger(__name__)
 
 RING_PATTERN = re.compile(r"(?:^|\r\n)RING(?:\r\n|$)", re.MULTILINE)
@@ -159,6 +161,8 @@ class Eg25Modem:
     def __init__(self, port: str, baudrate: int = 115200) -> None:
         self.port = port
         self.baudrate = baudrate
+        # port 为 auto 哨兵时每次打开都重新探测，这里存本次解析出的实际端口（供日志）。
+        self._active_port: str | None = None
         self._ser: serial.Serial | None = None
         self._reader_thread: threading.Thread | None = None
         self._poll_thread: threading.Thread | None = None
@@ -190,15 +194,29 @@ class Eg25Modem:
 
     def connect(self) -> None:
         self._open_serial()
-        logger.info("模组已连接: %s", self.port)
+        logger.info("模组已连接: %s", self._active_port)
+
+    def _resolve_port(self) -> str:
+        """把 auto 哨兵解析为实际串口；每次打开都重扫（Windows 重插后 COM 号会变）。
+
+        探测不到时抛连接异常，交给 supervisor/_reconnect 的退避重试，
+        设备后插也能连上。
+        """
+        if self.port != platforms.AUTO_PORT:
+            return self.port
+        detected = port_detect.detect_at_port()
+        if detected is None:
+            raise serial.SerialException("MODEM_PORT=auto 未探测到 Quectel AT 串口")
+        return detected
 
     def _open_serial(self) -> None:
         """打开串口并跑初始化序列（connect 与断线重连共用）。"""
         with self._serial_lock:
             self._opening = True
             try:
+                self._active_port = self._resolve_port()
                 self._ser = serial.Serial(
-                    port=self.port,
+                    port=self._active_port,
                     baudrate=self.baudrate,
                     timeout=0.2,
                     write_timeout=2,
@@ -235,7 +253,7 @@ class Eg25Modem:
             while self._running and not self._closed:
                 try:
                     self._open_serial()
-                    logger.info("串口已重连: %s", self.port)
+                    logger.info("串口已重连: %s", self._active_port)
                     return
                 except (serial.SerialException, OSError) as exc:
                     logger.warning("串口重连失败，%.0fs 后重试: %s", delay, exc)
@@ -306,7 +324,7 @@ class Eg25Modem:
             self._send("AT+QPCMV=1,0")
             logger.info("NMEA PCM 语音通道已启用 (AT+QPCMV=1,0)")
             return
-        raise ValueError("audio_mode 只能是 uac、uac_ffmpeg 或 nmea")
+        raise ValueError("audio_mode 只能是 uac、uac_ffmpeg（仅 macOS）或 nmea")
 
     def on_ring(self, callback: Callable[[str | None], None]) -> None:
         self._on_ring = callback

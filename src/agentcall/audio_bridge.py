@@ -13,6 +13,9 @@ from typing import Callable, Iterable
 import numpy as np
 import serial
 
+# 导入模块而非 from-import 常量：让测试能 monkeypatch platforms.IS_MACOS。
+from . import platforms
+
 logger = logging.getLogger(__name__)
 
 MODEM_RATE = 8000
@@ -64,7 +67,14 @@ def apply_pcm_gain(pcm: bytes, gain: float) -> bytes:
 
 
 class ModemAudioBridge:
-    """在 EG25 USB 声卡与 Agent 之间转发 PCM 音频。"""
+    """在 EG25 USB 声卡与 Agent 之间转发 PCM 音频（PortAudio 直连）。
+
+    Windows（WASAPI）/ Linux（ALSA）的标准路径；macOS 上 PortAudio 打不开
+    EC20 UAC（AUHAL -66740），须改用 FfmpegAudioBridge。设备按驱动上报的
+    名称做子串匹配：Windows 官方驱动下 UAC 设备名可能与 macOS/Linux 不同，
+    且 MME host API 会把名称截断到 31 字符，必要时调整 MODEM_AUDIO_KEYWORD。
+    Windows/WASAPI 行为待硬件验证。
+    """
 
     def __init__(self, device_keyword: str) -> None:
         self.input_device_index = find_device_index(device_keyword, "input")
@@ -290,16 +300,25 @@ class SerialPcmAudioBridge:
 
 
 class FfmpegAudioBridge:
-    """经 ffmpeg 子进程与 EG25 UAC 声卡收发 PCM（macOS）。
+    """经 ffmpeg 子进程与 EG25 UAC 声卡收发 PCM（仅 macOS）。
 
     macOS 上 PortAudio 打不开 EC20 的 UAC 声卡（AUHAL -66740），但
     AVFoundation（采集）与 AudioToolbox（播放）路径正常，故用两个
     ffmpeg 子进程做搬运：采集→stdout 管道；stdin 管道→播放。
     下行由写线程按 100ms 实时节奏喂给 ffmpeg，pending_output_bytes
     因此能反映真实积压。
+
+    macOS 专属：avfoundation/audiotoolbox 是 ffmpeg 的 macOS-only 设备，
+    且设备枚举依赖本项目的 CoreAudio 绑定；其他平台 PortAudio 本身可用，
+    直接走 ModemAudioBridge（uac 模式）即可，无需此 workaround。
     """
 
     def __init__(self, device_keyword: str, tx_gain: float = 1.0) -> None:
+        if not platforms.IS_MACOS:
+            raise RuntimeError(
+                "uac_ffmpeg 音频模式仅支持 macOS（依赖 ffmpeg 的 "
+                "avfoundation/audiotoolbox 设备），本平台请改用 MODEM_AUDIO_MODE=uac"
+            )
         self.device_keyword = device_keyword
         self.tx_gain = tx_gain
         self.input_index = self._find_avfoundation_input(device_keyword)
@@ -454,4 +473,4 @@ def create_audio_bridge(
         if not pcm_port:
             raise RuntimeError("NMEA PCM 模式需要配置 MODEM_PCM_PORT")
         return SerialPcmAudioBridge(pcm_port, pcm_baudrate, tx_gain=tx_gain)
-    raise ValueError("MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg 或 nmea")
+    raise ValueError("MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg（仅 macOS）或 nmea")

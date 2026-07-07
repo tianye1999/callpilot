@@ -50,8 +50,10 @@ Phone call → EC20 modem ──(AT: RING/ATA/CLCC)── CallPilot
 |------|--------|
 | Quectel EC20 (this build tested against `EC20CEFAGR08A03M4G`) | ✅ verified |
 | macOS (Apple Silicon & Intel via Rosetta) | ✅ verified |
-| Windows / Linux (native serial port) | ⚠️ code paths exist, **not verified** |
-| Audio: `uac_ffmpeg` (ffmpeg via UAC sound card) | ✅ only mode verified on macOS |
+| Windows 10/11 (official Quectel driver, native COM port) | 🧪 full support implemented, **awaiting hardware reports** |
+| Linux (native serial port) | ⚠️ code paths exist, **not verified** |
+| Audio: `uac_ffmpeg` (ffmpeg via UAC sound card) | ✅ verified — **macOS only** |
+| Audio: `uac` (PortAudio/WASAPI) | 🧪 the Windows path, awaiting verification (broken on macOS) |
 | Audio: `nmea` (USB serial PCM) | ❌ crashes USB on macOS — do not use |
 | SIM | needs voice + SMS service; VoLTE/CS voice depends on carrier |
 
@@ -92,11 +94,35 @@ OWNER_NAME=Your Name        # shown to callers; blank = neutral "the owner"
 Then call the modem's SIM number — the AI should auto-answer. All settings are
 editable live in the **Settings** panel of the UI.
 
+### Quick start (Windows) — awaiting hardware reports
+
+Windows needs **no USB bridge**: install the official Quectel EC20 Windows
+driver and the modem shows up as native COM ports. `MODEM_PORT=auto` (the
+Windows default) scans for the Quectel AT port by USB VID; audio uses
+`MODEM_AUDIO_MODE=uac` (PortAudio/WASAPI — `uac_ffmpeg` is macOS-only).
+
+```powershell
+git clone https://github.com/tianye1999/callpilot.git callpilot; cd callpilot
+python -m venv .venv
+.venv\Scripts\pip install -e ".[dev]"
+copy .env.example .env             # then edit .env
+.venv\Scripts\python app.py
+# auto-start at logon (Task Scheduler):
+powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1 install
+```
+
+Details in [`scripts/windows/README.md`](scripts/windows/README.md). This path
+is code-complete and CI-tested but **not yet verified on real hardware** — if
+you have an EC20 on Windows, please [report back](.github/ISSUE_TEMPLATE)!
+
 ### Desktop app (optional)
 
 ```bash
+# macOS
 .venv/bin/pip install pyinstaller pywebview
 bash scripts/build_app.sh          # → dist/CallPilot.app
+# Windows
+powershell -ExecutionPolicy Bypass -File scripts\windows\build_app.ps1   # → dist\CallPilot\CallPilot.exe
 ```
 
 The current `.app` is a **thin window over your local checkout** (it launches the
@@ -167,8 +193,10 @@ Quectel EC20/EG25，来电自动接听并与对方对话，可外呼、收发短
 |----|------|
 | Quectel EC20（本版本对 `EC20CEFAGR08A03M4G` 验证） | ✅ 已验证 |
 | macOS（Apple Silicon 与 Intel/Rosetta） | ✅ 已验证 |
-| Windows / Linux（原生串口） | ⚠️ 代码路径存在，**未验证** |
-| 音频 `uac_ffmpeg`（ffmpeg 走 UAC 声卡） | ✅ macOS 上唯一验证可用 |
+| Windows 10/11（Quectel 官方驱动，原生 COM 口） | 🧪 已完整支持，**待硬件复现反馈** |
+| Linux（原生串口） | ⚠️ 代码路径存在，**未验证** |
+| 音频 `uac_ffmpeg`（ffmpeg 走 UAC 声卡） | ✅ 已验证——**仅 macOS** |
+| 音频 `uac`（PortAudio/WASAPI） | 🧪 Windows 主路径，待验证（macOS 上不可用） |
 | 音频 `nmea`（USB 串口 PCM） | ❌ macOS 会崩 USB，勿用 |
 | SIM 卡 | 需语音+短信服务；VoLTE/CS 语音取决于运营商 |
 
@@ -198,11 +226,33 @@ cp .env.example .env          # 编辑 .env
 `.env` 最小配置见上方英文段。之后拨打模组 SIM 卡号码即可，AI 应自动接听；
 所有配置都能在界面「设置」面板里实时修改。
 
+### 快速开始（Windows）—— 待硬件复现反馈
+
+Windows **不需要 USB 桥**：装 Quectel 官方 EC20 Windows 驱动后模组直接暴露原生
+COM 口。`MODEM_PORT=auto`（Windows 默认）按 USB VID 自动扫描 AT 口；音频用
+`MODEM_AUDIO_MODE=uac`（PortAudio/WASAPI，`uac_ffmpeg` 仅 macOS）。
+
+```powershell
+git clone https://github.com/tianye1999/callpilot.git callpilot; cd callpilot
+python -m venv .venv
+.venv\Scripts\pip install -e ".[dev]"
+copy .env.example .env             # 编辑 .env
+.venv\Scripts\python app.py
+# 开机常驻（计划任务）：
+powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1 install
+```
+
+详见 [`scripts/windows/README.md`](scripts/windows/README.md)。该路径代码完备且
+过 CI，但**尚未真机验证**——如果你有 EC20 + Windows，欢迎提 issue 反馈！
+
 ### 桌面 App（可选）
 
 ```bash
+# macOS
 .venv/bin/pip install pyinstaller pywebview
 bash scripts/build_app.sh          # → dist/CallPilot.app
+# Windows
+powershell -ExecutionPolicy Bypass -File scripts\windows\build_app.ps1   # → dist\CallPilot\CallPilot.exe
 ```
 
 当前 `.app` 是**你本地代码仓库的薄壳窗口**（从本仓库拉起服务）。真正独立的安装包

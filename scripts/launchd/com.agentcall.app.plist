@@ -11,6 +11,12 @@
         <string>/Users/tianye/AgentCall/.venv/bin/python</string>
         <string>/Users/tianye/AgentCall/app.py</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <!-- launchd 不继承用户 shell 的 PATH；ffmpeg（Homebrew）必须可寻址 -->
+      <key>PATH</key>
+      <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
     <key>WorkingDirectory</key>
     <string>/Users/tianye/AgentCall</string>
     <key>RunAtLoad</key>

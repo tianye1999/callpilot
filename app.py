@@ -61,6 +61,18 @@ def main() -> None:
             print(f"错误: {message}", file=sys.stderr)
         sys.exit(1)
 
+    # 启动期 fail-fast：uac_ffmpeg 仅 macOS 可用。不在这里拦，守卫要到
+    # 通话建桥时才抛，对端每通都是「接通即挂」，远比启动报错难排查。
+    from agentcall import platforms
+
+    if config.get_str("MODEM_AUDIO_MODE").lower() == "uac_ffmpeg" and not platforms.IS_MACOS:
+        print(
+            "错误: MODEM_AUDIO_MODE=uac_ffmpeg 仅支持 macOS，"
+            "本平台请改用 MODEM_AUDIO_MODE=uac",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Qwen 连接预热：提前建好 TLS 连接，降低首通接听延迟。
     # start_prewarm_keepalive 由 W2 实现，未就绪时跳过即可，不阻塞启动。
     if provider == "qwen" and config.get_bool("QWEN_PREWARM"):

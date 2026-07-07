@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -64,9 +65,14 @@ class FakePopen:
 
 @pytest.fixture(autouse=True)
 def fake_env(monkeypatch):
-    """默认夹具：设备可找到(序号 3)、Popen 被替换、每测重置实例记录。"""
+    """默认夹具：视作 macOS、设备可找到(序号 3)、Popen 被替换、每测重置实例记录。
+
+    IS_MACOS 固定为 True 让主体用例在任意 CI 平台上行为一致；
+    非 macOS 降级路径由专门用例显式改回 False 覆盖。
+    """
     FakePopen.instances = []
     FakePopen.block_stdin = False
+    monkeypatch.setattr(monitor_playback.platforms, "IS_MACOS", True)
     monkeypatch.setattr(coreaudio, "find_output_index", lambda keyword: 3)
     monkeypatch.setattr(monitor_playback.subprocess, "Popen", FakePopen)
     yield
@@ -114,6 +120,27 @@ def test_start_disabled_when_device_enum_raises(monkeypatch):
 
     assert not mp.active
     assert FakePopen.instances == []
+
+
+def test_start_degrades_to_noop_on_non_macos(monkeypatch, caplog):
+    """非 macOS：start 只告警不抛，且不触碰 CoreAudio / 不起子进程。"""
+    monkeypatch.setattr(monitor_playback.platforms, "IS_MACOS", False)
+    monkeypatch.setattr(
+        coreaudio,
+        "find_output_index",
+        lambda keyword: pytest.fail("非 macOS 不应触碰 CoreAudio"),
+    )
+    mp = MonitorPlayback("MacBook")
+
+    with caplog.at_level(logging.WARNING):
+        mp.start()
+
+    assert not mp.active
+    assert FakePopen.instances == []
+    assert any("暂不支持" in rec.message for rec in caplog.records)
+    mp.feed(b"\x01\x02")  # no-op 实例 feed/stop 全程安全
+    mp.stop()
+    mp.stop()
 
 
 def test_start_disabled_when_popen_fails(monkeypatch):

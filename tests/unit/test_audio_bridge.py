@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import threading
 
-from agentcall.audio_bridge import FfmpegAudioBridge, NMEA_WRITE_SIZE
+import pytest
+
+import agentcall.audio_bridge as audio_bridge
+import agentcall.coreaudio as coreaudio
+from agentcall.audio_bridge import FfmpegAudioBridge, NMEA_WRITE_SIZE, create_audio_bridge
 
 
 def make_ffmpeg_bridge() -> FfmpegAudioBridge:
@@ -45,3 +49,39 @@ def test_ffmpeg_uac_write_payload_consumes_one_realtime_frame():
 
     assert payload == first_frame
     assert bridge.pending_output_bytes() == len(remainder)
+
+
+# ---- 平台约束：uac_ffmpeg 仅 macOS（Windows 路径待硬件验证）----
+
+
+def test_ffmpeg_bridge_rejected_on_non_macos(monkeypatch):
+    monkeypatch.setattr(audio_bridge.platforms, "IS_MACOS", False)
+
+    with pytest.raises(RuntimeError, match="仅支持 macOS.*MODEM_AUDIO_MODE=uac"):
+        FfmpegAudioBridge("Interface")
+
+
+def test_create_audio_bridge_uac_ffmpeg_rejected_on_non_macos(monkeypatch):
+    monkeypatch.setattr(audio_bridge.platforms, "IS_MACOS", False)
+
+    with pytest.raises(RuntimeError, match="仅支持 macOS"):
+        create_audio_bridge("uac_ffmpeg", "Interface", None, 921600)
+
+
+def test_ffmpeg_bridge_constructs_on_macos(monkeypatch):
+    """平台检查不误伤 macOS：设备探测打桩后应正常完成构造。"""
+    monkeypatch.setattr(audio_bridge.platforms, "IS_MACOS", True)
+    monkeypatch.setattr(
+        FfmpegAudioBridge, "_find_avfoundation_input", staticmethod(lambda keyword: 1)
+    )
+    monkeypatch.setattr(coreaudio, "find_output_index", lambda keyword: 2)
+
+    bridge = FfmpegAudioBridge("Interface")
+
+    assert bridge.input_index == 1
+    assert bridge.output_index == 2
+
+
+def test_create_audio_bridge_invalid_mode_mentions_macos_constraint():
+    with pytest.raises(ValueError, match="仅 macOS"):
+        create_audio_bridge("bogus", "Interface", None, 921600)

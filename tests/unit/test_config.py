@@ -6,11 +6,13 @@ import os
 
 import pytest
 
+from agentcall import platforms
 from agentcall.config import (
     CONFIG_SPECS,
     get_bool,
     get_float,
     get_int,
+    get_spec,
     get_str,
     read_panel_values,
     update_env_file,
@@ -76,6 +78,15 @@ def test_get_bool_default(monkeypatch):
 def test_unknown_key_raises_keyerror():
     with pytest.raises(KeyError):
         get_str("NO_SUCH_KEY")
+
+
+def test_modem_defaults_follow_platforms(monkeypatch):
+    """MODEM_PORT/MODEM_AUDIO_MODE 默认值必须与 platforms 单一出处一致。"""
+    _unset(monkeypatch, "MODEM_PORT", "MODEM_AUDIO_MODE")
+    assert get_str("MODEM_PORT") == platforms.default_modem_port()
+    assert get_str("MODEM_AUDIO_MODE") == platforms.default_audio_mode()
+    # 音频模式的三个可选值不因平台默认变化而缩水
+    assert get_spec("MODEM_AUDIO_MODE").choices == ("uac_ffmpeg", "uac", "nmea")
 
 
 def test_call_log_and_dial_queue_follow_config_semantics(tmp_path, monkeypatch):

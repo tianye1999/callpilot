@@ -16,6 +16,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import platforms
+
 logger = logging.getLogger(__name__)
 
 # get_bool 认定为真的取值（大小写不敏感）。
@@ -59,9 +61,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("AGENT_OUTBOUND_TASK", "外呼任务指令", "str",
                "代表机主主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。"),
     # ---- 模组 ----
-    ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", "/tmp/ec20-at", requires_restart=True),
+    # 默认值按当前平台在模块加载时定死（Windows 为 auto 哨兵，连接时扫描）。
+    ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", platforms.default_modem_port(),
+               requires_restart=True),
     ConfigSpec("MODEM_BAUD", "串口波特率", "int", "115200", requires_restart=True),
-    ConfigSpec("MODEM_AUDIO_MODE", "模组音频模式", "select", "uac_ffmpeg",
+    ConfigSpec("MODEM_AUDIO_MODE", "模组音频模式", "select", platforms.default_audio_mode(),
                choices=("uac_ffmpeg", "uac", "nmea"), requires_restart=True),
     ConfigSpec("MODEM_AUDIO_KEYWORD", "UAC 声卡匹配关键字", "str", "Interface",
                requires_restart=True),

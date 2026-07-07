@@ -76,6 +76,29 @@ def _no_sleep(monkeypatch):
     monkeypatch.setattr(desktop_app.time, "sleep", lambda _s: None)
 
 
+# ---- _launch_config 平台差异 ----
+
+def test_launch_config_windows_python_path(monkeypatch):
+    """Windows 下默认解释器应为 .venv\\Scripts\\python.exe（经 platforms.venv_python）。"""
+    monkeypatch.setattr(desktop_app.platforms, "IS_WINDOWS", True)
+    python_exe, _app_script, _log_path = desktop_app._launch_config()
+    assert Path(python_exe).parts[-3:] == (".venv", "Scripts", "python.exe")
+    assert Path(python_exe).is_relative_to(desktop_app.PROJECT_ROOT)
+
+
+def test_launch_config_posix_python_path(monkeypatch):
+    monkeypatch.setattr(desktop_app.platforms, "IS_WINDOWS", False)
+    python_exe, _app_script, _log_path = desktop_app._launch_config()
+    assert Path(python_exe).parts[-3:] == (".venv", "bin", "python")
+
+
+def test_launch_config_env_override_beats_platform_default(monkeypatch):
+    monkeypatch.setattr(desktop_app.platforms, "IS_WINDOWS", True)
+    monkeypatch.setenv("AGENTCALL_PYTHON", "/custom/python")
+    python_exe, _app_script, _log_path = desktop_app._launch_config()
+    assert python_exe == "/custom/python"
+
+
 # ---- probe_service ----
 
 def test_probe_service_ok(monkeypatch):

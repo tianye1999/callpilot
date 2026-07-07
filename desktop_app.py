@@ -1,22 +1,25 @@
 """AgentCall 桌面窗口：pywebview 薄前端，"打开查看"网页仪表盘。
 
-产品架构：桥+服务由 launchd 常驻，本窗口只是查看入口，关窗不影响服务。
+产品架构：桥+服务由系统常驻机制（macOS launchd / Windows 计划任务）托管，
+本窗口只是查看入口，关窗不影响服务。
 启动流程：
     1. 探测 ``<AGENTCALL_WEB_URL>/api/meta`` 判断服务是否已在运行；
     2. 在跑 → 直接开窗指向服务地址；
-    3. 没跑 → 用 ``.venv/bin/python app.py`` 拉起服务（stdout/stderr 追加到
+    3. 没跑 → 用项目 venv 的 python 拉起 app.py（stdout/stderr 追加到
        ``data/app_console.log``），轮询等待就绪后开窗；
     4. 拉起失败或等待超时 → 开一个错误提示窗，说明手动启动命令。
 
 用法：
-    .venv/bin/python desktop_app.py
+    macOS / Linux:  .venv/bin/python desktop_app.py
+    Windows:        .venv\\Scripts\\python desktop_app.py
 
 可配置环境变量（均有默认值）：
     AGENTCALL_WEB_URL        服务地址，默认 http://127.0.0.1:8000
     AGENTCALL_PROBE_TIMEOUT  单次探测超时秒数，默认 2
     AGENTCALL_STARTUP_WAIT   拉起后等待就绪的最长秒数，默认 15
     AGENTCALL_POLL_INTERVAL  就绪轮询间隔秒数，默认 0.5
-    AGENTCALL_PYTHON         拉起服务用的 Python 解释器，默认 <项目>/.venv/bin/python
+    AGENTCALL_PYTHON         拉起服务用的 Python 解释器，默认项目 venv 内解释器
+                             （POSIX=.venv/bin/python，Windows=.venv\\Scripts\\python.exe）
     AGENTCALL_APP_SCRIPT     服务入口脚本，默认 <项目>/app.py
     AGENTCALL_CONSOLE_LOG    服务控制台日志文件，默认 <项目>/data/app_console.log
     AGENTCALL_WINDOW_WIDTH   窗口宽度，默认 1100
@@ -50,6 +53,13 @@ def _resolve_project_root() -> Path:
 
 
 PROJECT_ROOT = _resolve_project_root()
+
+# agentcall 包在 src/ 下（src 布局）：为了未 pip install -e 时也能直跑本入口
+# 脚本，显式把 src 加进 sys.path；冻结（PyInstaller）时包已内嵌进可执行文件
+# （spec 的 pathex 含 src），跳过插入以免误引仓库源码。
+if not getattr(sys, "_MEIPASS", None):
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from agentcall import platforms  # noqa: E402
 
 WINDOW_TITLE = "CallPilot"
 ERROR_WINDOW_TITLE = "CallPilot — 服务未启动"
@@ -85,7 +95,7 @@ def _env_int(name: str, default: int) -> int:
 def _launch_config() -> tuple[str, str, str]:
     """返回拉起服务所需的 (python 解释器, 入口脚本, 控制台日志路径)。"""
     python_exe = os.getenv(
-        "AGENTCALL_PYTHON", str(PROJECT_ROOT / ".venv" / "bin" / "python")
+        "AGENTCALL_PYTHON", str(platforms.venv_python(PROJECT_ROOT))
     )
     app_script = os.getenv("AGENTCALL_APP_SCRIPT", str(PROJECT_ROOT / "app.py"))
     log_path = os.getenv(
@@ -170,6 +180,12 @@ def ensure_service_running(
     log_file = Path(log_path)
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        # Windows 下 GUI 进程（打包后 console=False）拉起 python.exe 会弹出
+        # 黑色控制台窗口，用户误关即杀死服务；CREATE_NO_WINDOW 抑制分配。
+        # start_new_session 在 Windows 被 stdlib 静默忽略，无需分支。
+        popen_kwargs: dict = {}
+        if platforms.IS_WINDOWS:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         with log_file.open("ab") as out:
             proc = subprocess.Popen(
                 [str(python_exe), str(app_script)],
@@ -177,6 +193,7 @@ def ensure_service_running(
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                **popen_kwargs,
             )
     except OSError as exc:
         logger.error("拉起服务进程失败: %s", exc)
@@ -223,9 +240,12 @@ def _import_webview():
     try:
         import webview
     except ImportError:
+        pip_hint = (
+            r".venv\Scripts\pip" if platforms.IS_WINDOWS else ".venv/bin/pip"
+        )
         print(
             "未安装 pywebview，无法打开桌面窗口。\n"
-            "请先安装依赖: .venv/bin/pip install 'pywebview>=5.0'\n"
+            f"请先安装依赖: {pip_hint} install \"pywebview>=5.0\"\n"
             f"或直接用浏览器访问 {os.getenv('AGENTCALL_WEB_URL', DEFAULT_WEB_URL)}",
             file=sys.stderr,
         )
@@ -248,7 +268,8 @@ def main() -> None:
     status = ensure_service_running(meta_url)
     if status == "failed":
         python_exe, app_script, log_path = _launch_config()
-        start_cmd = f"cd {PROJECT_ROOT} && {python_exe} {app_script}"
+        # Windows PowerShell 5.1 不认 &&，且路径可能含空格；分号 + 引号两平台通吃
+        start_cmd = f'cd "{PROJECT_ROOT}"; "{python_exe}" "{app_script}"'
         webview.create_window(
             ERROR_WINDOW_TITLE,
             html=build_error_html(web_url, log_path, start_cmd),

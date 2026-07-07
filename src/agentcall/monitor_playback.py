@@ -1,9 +1,11 @@
-"""AI 下行音频镜像到 Mac 扬声器（监听旁路）。
+"""AI 下行音频镜像到 Mac 扬声器（监听旁路，仅 macOS）。
 
 把发往模组的 Agent 下行 PCM 复制一份，经 ffmpeg audiotoolbox 播放到
 本机输出设备（如内置扬声器），方便调试时旁听 AI 在说什么。
 
 监听是纯旁路，永远不能影响通话链路：
+- 非 macOS 平台（audiotoolbox 是 ffmpeg 的 macOS-only 输出，设备枚举也
+  依赖 CoreAudio 绑定）→ start() log warning 后保持禁用，实例整体 no-op；
 - 找不到输出设备 / ffmpeg 起不来 → log warning 后自动禁用，不抛异常；
 - ffmpeg 进程中途死亡 / 管道断裂 → log error 后自动禁用；
 - ``feed()`` 绝不阻塞：只往有界 deque 追加，满了丢最旧帧（保持低延迟），
@@ -22,6 +24,8 @@ import subprocess
 import threading
 from collections import deque
 
+# 导入模块而非 from-import 常量：让测试能 monkeypatch platforms.IS_MACOS。
+from . import platforms
 from .audio_bridge import apply_pcm_gain
 
 logger = logging.getLogger(__name__)
@@ -36,7 +40,11 @@ _FEED_WAIT_SECONDS = 0.1
 
 
 class MonitorPlayback:
-    """把 AI 下行 PCM 镜像播放到本机输出设备（macOS）。"""
+    """把 AI 下行 PCM 镜像播放到本机输出设备（仅 macOS）。
+
+    非 macOS 上 start() 只告警不生效，实例保持 no-op——监听是调试旁路，
+    平台不支持时静默降级而非阻断通话（调用方无需感知平台差异）。
+    """
 
     def __init__(
         self,
@@ -81,6 +89,12 @@ class MonitorPlayback:
         保持禁用状态，不抛异常。
         """
         if self._active:
+            return
+        # 平台检查必须在导入 coreaudio 之前：该模块是 macOS 专用绑定。
+        if not platforms.IS_MACOS:
+            logger.warning(
+                "本机监听播放依赖 macOS 的 ffmpeg audiotoolbox，当前平台暂不支持，监听已禁用"
+            )
             return
         # 与 FfmpegAudioBridge 相同的延迟导入姿势，避免 import 副作用。
         from .coreaudio import find_output_index
