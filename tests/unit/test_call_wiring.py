@@ -621,3 +621,23 @@ def test_dial_rejected_when_modem_not_connected(monkeypatch):
     ok, err = service.dial("10000")
     assert not ok
     assert "模组未连接" in (err or "")
+
+
+def test_dial_rejects_malformed_number():
+    """非号码输入直接拒绝，不占用会话等 45s 超时。"""
+    from fakes import FakeModem
+
+    from agentcall.call_agent import CallAgentService
+
+    service = CallAgentService(
+        modem_port="unused", audio_keyword="unused", provider="qwen",
+        modem=FakeModem(),  # type: ignore[arg-type]
+    )
+    for bad in ("invalid-abc", "123; DROP", "１００００", "+"):
+        ok, err = service.dial(bad)
+        assert not ok and "格式不合法" in (err or ""), bad
+    # 合法形态不受影响（不真正拨出：session.start 打桩）
+    service.session.start = lambda outbound_number=None: None  # type: ignore[method-assign]
+    for good in ("10000", "+8613800138000", "*57#"):
+        ok, _ = service.dial(good)
+        assert ok, good

@@ -769,6 +769,10 @@ class CallAgentService:
         number = (number or "").strip()
         if not number:
             return False, "号码不能为空"
+        # ATD 合法字符集：数字与 +（国际前缀）、*/#（补充业务码）。提前拦住
+        # 乱输入，否则占用会话直到 45s 接通超时才释放。
+        if not re.fullmatch(r"\+?[0-9*#]{1,32}", number):
+            return False, f"号码格式不合法: {number}"
         if not self.modem_connected:
             return False, "模组未连接（检查 USB 桥与 EC20）"
         self._remember_outbound_task(task)
