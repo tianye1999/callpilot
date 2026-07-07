@@ -38,7 +38,18 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+
+def _resolve_project_root() -> Path:
+    """定位仓库根：PyInstaller 打包后优先读内嵌 project_root.txt（poc 同款）。"""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        marker = Path(meipass) / "project_root.txt"
+        if marker.exists():
+            return Path(marker.read_text(encoding="utf-8").strip())
+    return Path(__file__).resolve().parent
+
+
+PROJECT_ROOT = _resolve_project_root()
 
 WINDOW_TITLE = "AgentCall — 数字分身"
 ERROR_WINDOW_TITLE = "AgentCall — 服务未启动"
