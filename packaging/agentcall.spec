@@ -50,19 +50,21 @@ exe = EXE(
     pyz,
     a.scripts,
     exclude_binaries=True,
-    name="AgentCall",
+    name="CallPilot",
     console=False,
+    icon=str(project_root / "packaging" / "CallPilot.icns"),
     argv_emulation=False,
 )
-coll = COLLECT(exe, a.binaries, a.datas, name="AgentCall")
+coll = COLLECT(exe, a.binaries, a.datas, name="CallPilot")
 
 app = BUNDLE(
     coll,
-    name="AgentCall.app",
-    bundle_identifier="ai.bondings.agentcall",
+    name="CallPilot.app",
+    bundle_identifier="ai.bondings.callpilot",
     info_plist={
-        "CFBundleDisplayName": "AgentCall",
+        "CFBundleDisplayName": "CallPilot",
         "CFBundleShortVersionString": "0.1.0",
         "NSHighResolutionCapable": True,
+        "CFBundleIconFile": "CallPilot.icns",
     },
 )

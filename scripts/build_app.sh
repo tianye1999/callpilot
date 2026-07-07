@@ -8,7 +8,7 @@ DIST_DIR="$ROOT/dist"
 BUILD_DIR="$ROOT/build/pyinstaller"
 ROOT_FILE_DIR="$ROOT/build/app"
 ROOT_FILE="$ROOT_FILE_DIR/project_root.txt"
-APP_PATH="$DIST_DIR/AgentCall.app"
+APP_PATH="$DIST_DIR/CallPilot.app"
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "error: 需要 macOS" >&2; exit 2; }
 [[ -x "$PYTHON" ]] || { echo "error: 未找到 $PYTHON" >&2; exit 2; }

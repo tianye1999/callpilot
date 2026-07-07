@@ -210,7 +210,7 @@ def test_main_service_already_running(monkeypatch):
 
     assert len(fake.windows) == 1
     win = fake.windows[0]
-    assert win["title"] == "AgentCall — 数字分身"
+    assert win["title"] == "CallPilot"
     assert win["url"] == "http://127.0.0.1:8000"
     assert win["html"] is None
     assert win["kwargs"] == {"width": 1100, "height": 780}
@@ -275,7 +275,7 @@ def test_main_startup_timeout_shows_error_window(monkeypatch, tmp_path):
 
     assert len(fake.windows) == 1
     win = fake.windows[0]
-    assert win["title"] == "AgentCall — 服务未启动"
+    assert win["title"] == "CallPilot — 服务未启动"
     assert win["url"] is None
     assert win["html"] is not None
     assert "app.py" in win["html"]  # 提示了手动启动命令

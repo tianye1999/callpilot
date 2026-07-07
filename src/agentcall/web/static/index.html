@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<title>AgentCall · 数字分身</title>
+<title>CallPilot</title>
 <style>
   /* ========= 设计基座：iOS 深色玻璃态（借鉴 Agent for Call.app）========= */
   :root {
@@ -333,7 +333,8 @@
     display: flex; align-items: center; justify-content: space-between; gap: 14px;
     padding: 10px 0; border-bottom: 1px solid rgba(255, 255, 255, .04);
   }
-  .cfg-row label { font-size: 13.5px; flex: 1; }
+  .cfg-row > label:not(.switch) { font-size: 13.5px; flex: 1; }
+  .cfg-row label.switch { flex: 0 0 48px; }
   .cfg-row .key { display: block; font-size: 10px; color: var(--dim); font-family: var(--mono); }
   .tag-restart { font-size: 10px; color: var(--warn); margin-left: 6px; }
   .cfg-row input[type=text], .cfg-row select {
@@ -421,17 +422,18 @@
 <body>
   <header>
     <div class="logo">📞</div>
-    <div class="titlebox"><b>AgentCall</b><span>田野的数字分身</span></div>
+    <div class="titlebox"><b>CallPilot</b><span id="slogan"></span></div>
     <span class="state-chip idle" id="stateChip">
       <span class="sdot"></span><span id="stateText">待命</span><span class="num" id="stateNum"></span>
     </span>
     <div class="quick-acts" id="quickActs">
-      <button class="btn sm ghost" id="keypadBtn">⌗ 按键</button>
-      <button class="btn sm danger" id="hangupBtn">挂断</button>
+      <button class="btn sm ghost" id="keypadBtn">⌗ <span data-i18n="keypad"></span></button>
+      <button class="btn sm danger" id="hangupBtn" data-i18n="hangup"></button>
     </div>
     <span class="spacer"></span>
     <div class="meta">
-      <span><span id="dot" class="conn-dot"></span><span id="conn">连接中</span></span>
+      <button class="btn sm ghost" id="langBtn" style="padding:4px 10px;font-size:11px">中文</button>
+      <span><span id="dot" class="conn-dot"></span><span id="conn"></span></span>
       <span>MODEL <b id="model">-</b></span>
       <span>PROVIDER <b id="provider">-</b></span>
     </div>
@@ -444,28 +446,28 @@
         <section class="card">
           <div class="home-grid">
             <div class="dial-col">
-              <div class="col-label">拨打电话</div>
-              <input id="dialNumber" class="dial-input" type="text" placeholder="输入号码" />
-              <input id="dialTask" class="task-input" type="text" placeholder="外呼主题（空=沿用上次）" />
+              <div class="col-label" data-i18n="dial_label"></div>
+              <input id="dialNumber" class="dial-input" type="text" data-i18n-ph="ph_number" />
+              <input id="dialTask" class="task-input" type="text" data-i18n-ph="ph_task" />
               <div class="dial-actions">
-                <button class="btn primary" id="dialBtn">拨打</button>
+                <button class="btn primary" id="dialBtn" data-i18n="dial"></button>
               </div>
               <div class="toast" id="dialToast"></div>
               <div class="batch-zone">
-                <div class="col-label">批量外呼</div>
-                <textarea id="batchNumbers" placeholder="每行一个号码，可批量粘贴"></textarea>
-                <input id="batchTask" type="text" placeholder="本批次任务说明（可选）" />
+                <div class="col-label" data-i18n="batch_label"></div>
+                <textarea id="batchNumbers" data-i18n-ph="ph_batch_numbers"></textarea>
+                <input id="batchTask" type="text" data-i18n-ph="ph_batch_task" />
                 <div class="batch-actions">
-                  <button class="btn sm ghost" id="batchDialBtn">加入队列</button>
+                  <button class="btn sm ghost" id="batchDialBtn" data-i18n="enqueue"></button>
                   <span class="toast" id="batchToast" style="margin:0"></span>
                 </div>
-                <div class="q-chips" id="queueStatus"><div class="q-stat">队列空闲</div></div>
+                <div class="q-chips" id="queueStatus"><div class="q-stat" data-i18n="q_idle"></div></div>
               </div>
             </div>
             <div class="recent-col">
-              <div class="col-label">最近通话</div>
-              <div id="recentList"><div class="empty">暂无通话</div></div>
-              <span class="recent-more" id="recentMore">查看全部历史 →</span>
+              <div class="col-label" data-i18n="recent_label"></div>
+              <div id="recentList"><div class="empty" data-i18n="empty_calls"></div></div>
+              <span class="recent-more" id="recentMore"><span data-i18n="view_all"></span> →</span>
             </div>
           </div>
         </section>
@@ -476,9 +478,9 @@
     <div class="panel-page" id="page-live">
       <div class="wrap">
         <section class="card">
-          <h2>实时对话
+          <h2><span data-i18n="live_title"></span>
             <span class="live-tag" id="liveTag" style="display:none"><span class="ldot"></span>LIVE</span>
-            <span class="sub" id="liveSub">通话开始后自动进入本页</span>
+            <span class="sub" id="liveSub"></span>
           </h2>
           <div id="chat"></div>
         </section>
@@ -489,13 +491,13 @@
     <div class="panel-page" id="page-sms">
       <div class="wrap">
         <section class="card">
-          <h2>短信</h2>
-          <div id="smsList"><div class="empty" id="smsEmpty">暂无短信</div></div>
+          <h2 data-i18n="sms_title"></h2>
+          <div id="smsList"><div class="empty" id="smsEmpty" data-i18n="empty_sms"></div></div>
           <div class="sms-form">
-            <input id="smsNumber" type="text" placeholder="对方号码" />
-            <textarea id="smsText" placeholder="短信内容（支持中文）"></textarea>
+            <input id="smsNumber" type="text" data-i18n-ph="ph_number" />
+            <textarea id="smsText" data-i18n-ph="ph_sms_text"></textarea>
             <div class="row">
-              <button class="btn primary sm" id="smsSend">发送短信</button>
+              <button class="btn primary sm" id="smsSend" data-i18n="sms_send"></button>
               <span class="toast" id="smsToast" style="margin:0"></span>
             </div>
           </div>
@@ -507,8 +509,8 @@
     <div class="panel-page" id="page-history">
       <div class="wrap">
         <section class="card">
-          <h2>通话历史<span class="sub">点击展开事件时间线</span></h2>
-          <div id="historyList"><div class="empty">暂无通话记录</div></div>
+          <h2><span data-i18n="hist_title"></span><span class="sub" data-i18n="hist_sub"></span></h2>
+          <div id="historyList"><div class="empty" data-i18n="empty_history"></div></div>
         </section>
       </div>
     </div>
@@ -517,10 +519,10 @@
     <div class="panel-page" id="page-settings">
       <div class="wrap">
         <section class="card">
-          <h2>系统设置<span class="sub" id="portSub"></span></h2>
-          <div id="configForm"><div class="empty">正在加载配置…</div></div>
+          <h2><span data-i18n="settings_title"></span><span class="sub" id="portSub"></span></h2>
+          <div id="configForm"><div class="empty" data-i18n="cfg_loading"></div></div>
           <div class="cfg-save">
-            <button class="btn primary sm" id="configSave">保存设置</button>
+            <button class="btn primary sm" id="configSave" data-i18n="cfg_save"></button>
             <span class="toast" id="configToast" style="margin:0"></span>
           </div>
         </section>
@@ -530,11 +532,11 @@
 
   <!-- 底部胶囊 dock -->
   <nav class="dock" id="dock">
-    <button data-page="phone" class="active"><span class="ico">📞</span>电话<span class="dot"></span></button>
-    <button data-page="live"><span class="ico">💬</span>对话<span class="dot"></span></button>
-    <button data-page="sms"><span class="ico">✉️</span>短信<span class="dot"></span></button>
-    <button data-page="history"><span class="ico">🕘</span>历史<span class="dot"></span></button>
-    <button data-page="settings"><span class="ico">⚙️</span>设置<span class="dot"></span></button>
+    <button data-page="phone" class="active"><span class="ico">📞</span><span data-i18n="nav_phone"></span><span class="dot"></span></button>
+    <button data-page="live"><span class="ico">💬</span><span data-i18n="nav_live"></span><span class="dot"></span></button>
+    <button data-page="sms"><span class="ico">✉️</span><span data-i18n="nav_sms"></span><span class="dot"></span></button>
+    <button data-page="history"><span class="ico">🕘</span><span data-i18n="nav_history"></span><span class="dot"></span></button>
+    <button data-page="settings"><span class="ico">⚙️</span><span data-i18n="nav_settings"></span><span class="dot"></span></button>
   </nav>
 
   <div class="keypad" id="keypad">
@@ -544,7 +546,118 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const stateText = { ringing: "振铃中", dialing: "拨号中", answered: "通话中", ended: "已结束", idle: "待命" };
+/* ========= i18n（默认英文，localStorage 记忆） ========= */
+const I18N = {
+  en: {
+    slogan: "Your calls, handled by AI",
+    nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_settings: "Settings",
+    st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
+    conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
+    keypad: "Keys", hangup: "Hang up",
+    dial_label: "MAKE A CALL", dial: "Call", ph_number: "Phone number",
+    ph_task: "Call topic (blank = reuse last)", task_prefix: "Topic (blank = reuse): ",
+    calling: "Calling…", call_sent: "Call started", call_fail: "Call failed",
+    need_number: "Enter a number", req_error: "Request error",
+    batch_label: "BATCH DIALING", ph_batch_numbers: "One number per line",
+    ph_batch_task: "Task for this batch (optional)", enqueue: "Enqueue",
+    enqueuing: "Enqueuing…", enq_ok: (n) => `Queued ${n}`, enq_rej: (n) => `, rejected ${n}`,
+    enq_fail: "Enqueue failed: ",
+    q_idle: "Queue idle", q_done: (n) => `Queue idle · ${n} dialed`,
+    q_active: (p, d) => `In progress · ${p} pending · ${d} dialed`, q_current: " dialing",
+    recent_label: "RECENT CALLS", empty_calls: "No calls yet", view_all: "View all history",
+    live_title: "Live Transcript", live_sub_idle: "Opens automatically when a call starts",
+    who_user: "Caller", who_agent: "AI Pilot",
+    sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
+    sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
+    need_sms: "Enter number and text", sms_in: "IN ← ", sms_out: "OUT → ",
+    hist_title: "Call History", hist_sub: "Click to expand timeline", empty_history: "No call records",
+    dir_in: "Inbound", dir_out: "Outbound",
+    stc_completed: "Completed", stc_failed: "Failed", stc_not_connected: "No answer",
+    unknown_number: "Unknown",
+    ev: { call_started: "Call started", dialing: "Dialing", connected: "Connected", answered: "Answered",
+      bridge_started: "Audio bridge up", agent_started: "Agent ready", greeting_sent: "Greeting",
+      latency: "Latency", summary: "Summary", ended: "Wrap-up", call_finished: "Call finished",
+      not_connected: "No answer", dtmf: "DTMF keys", transcript_user: "Caller said", transcript_agent: "AI said" },
+    settings_title: "Settings", cfg_loading: "Loading…", cfg_save: "Save",
+    cfg_nochange: "Nothing to save", cfg_saving: "Saving…",
+    cfg_saved: (n) => `Saved ${n} item(s)`, cfg_restart: (n) => `, ${n} need restart`,
+    cfg_savefail: "Save failed: ", tag_restart: "restart required",
+    secret_set: "Set", secret_unset: "Not set", modem_prefix: "Modem ",
+    grp_ai: "AI & PERSONA", grp_modem: "MODEM & AUDIO", grp_call: "CALL & RECORDS",
+    grp_monitor: "LOCAL MONITOR", grp_dial: "DIALING & SMS", grp_sys: "SYSTEM",
+    cfg: {
+      AGENT_PROVIDER: "Agent provider", DASHSCOPE_API_KEY: "DashScope API key",
+      QWEN_REALTIME_MODEL: "Qwen realtime model", QWEN_VOICE: "Qwen voice",
+      AGENT_OUTBOUND_TASK: "Default outbound topic",
+      MODEM_PORT: "Modem AT port", MODEM_BAUD: "Baud rate",
+      MODEM_AUDIO_MODE: "Audio mode", MODEM_AUDIO_KEYWORD: "UAC device keyword",
+      MODEM_TX_GAIN: "TX gain",
+      HALF_DUPLEX_HANGOVER_SECONDS: "Half-duplex hangover (s)",
+      HANGUP_TOOL_DELAY_SECONDS: "Hangup tool delay (s)",
+      RECORDING_ENABLED: "Call recording", RECORDING_RETENTION_DAYS: "Recording retention (days)",
+      SUMMARY_ENABLED: "Call summary", SUMMARY_MODEL: "Summary model",
+      MONITOR_AI_PLAYBACK: "Monitor on this Mac", MONITOR_OUTPUT_DEVICE: "Monitor output device",
+      MONITOR_AI_GAIN: "Monitor gain (AI)", MONITOR_UPLINK_GAIN: "Monitor gain (caller)",
+      DIAL_WHITELIST: "Dial whitelist", DIAL_INTERVAL_SECONDS: "Dial interval (s)",
+      SMS_WHITELIST: "SMS whitelist",
+      QWEN_PREWARM: "Qwen connection prewarm", QWEN_RECONNECT_MAX: "Max reconnects",
+      WEB_HOST: "Web host", WEB_PORT: "Web port",
+    },
+  },
+  zh: {
+    slogan: "电话，交给 AI",
+    nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_settings: "设置",
+    st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
+    conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
+    keypad: "按键", hangup: "挂断",
+    dial_label: "拨打电话", dial: "拨打", ph_number: "输入号码",
+    ph_task: "外呼主题（空=沿用上次）", task_prefix: "主题（空=沿用）：",
+    calling: "呼叫中…", call_sent: "已发起呼叫", call_fail: "呼叫失败",
+    need_number: "请填写号码", req_error: "请求出错",
+    batch_label: "批量外呼", ph_batch_numbers: "每行一个号码，可批量粘贴",
+    ph_batch_task: "本批次任务说明（可选）", enqueue: "加入队列",
+    enqueuing: "入队中…", enq_ok: (n) => `已入队 ${n} 个`, enq_rej: (n) => `，拒绝 ${n} 个`,
+    enq_fail: "入队失败：",
+    q_idle: "队列空闲", q_done: (n) => `队列空闲 · 本轮已拨 ${n}`,
+    q_active: (p, d) => `队列进行中 · 待拨 ${p} · 已拨 ${d}`, q_current: " 拨打中",
+    recent_label: "最近通话", empty_calls: "暂无通话", view_all: "查看全部历史",
+    live_title: "实时对话", live_sub_idle: "通话开始后自动进入本页",
+    who_user: "对方", who_agent: "AI 副驾",
+    sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
+    sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
+    need_sms: "请填写号码和内容", sms_in: "收 ← ", sms_out: "发 → ",
+    hist_title: "通话历史", hist_sub: "点击展开事件时间线", empty_history: "暂无通话记录",
+    dir_in: "呼入", dir_out: "呼出",
+    stc_completed: "已完成", stc_failed: "异常", stc_not_connected: "未接通",
+    unknown_number: "未知号码",
+    ev: { call_started: "通话开始", dialing: "拨号", connected: "接通", answered: "已接听",
+      bridge_started: "音频桥就绪", agent_started: "Agent 就绪", greeting_sent: "开场白",
+      latency: "延迟打点", summary: "生成摘要", ended: "会话收尾", call_finished: "通话结束",
+      not_connected: "未接通", dtmf: "发送按键", transcript_user: "对方说", transcript_agent: "分身说" },
+    settings_title: "系统设置", cfg_loading: "正在加载配置…", cfg_save: "保存设置",
+    cfg_nochange: "没有需要保存的修改", cfg_saving: "保存中…",
+    cfg_saved: (n) => `已保存 ${n} 项`, cfg_restart: (n) => `，其中 ${n} 项需重启生效`,
+    cfg_savefail: "保存失败：", tag_restart: "改后需重启",
+    secret_set: "已设置", secret_unset: "未设置", modem_prefix: "模组 ",
+    grp_ai: "AI 与人设", grp_modem: "模组与音频", grp_call: "通话与记录",
+    grp_monitor: "本机监听", grp_dial: "外呼与短信", grp_sys: "系统",
+    cfg: {},  // 中文用后端 label
+  },
+};
+let LANG = localStorage.getItem("cp_lang") || "en";
+const t = (key) => {
+  const v = I18N[LANG][key] !== undefined ? I18N[LANG][key] : I18N.en[key];
+  return v !== undefined ? v : key;
+};
+function applyI18n() {
+  document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
+  document.querySelectorAll("[data-i18n]").forEach((n) => { n.textContent = t(n.dataset.i18n); });
+  document.querySelectorAll("[data-i18n-ph]").forEach((n) => { n.placeholder = t(n.dataset.i18nPh); });
+  $("slogan").textContent = t("slogan");
+  $("langBtn").textContent = LANG === "en" ? "中文" : "EN";
+  $("liveSub").textContent = callActive ? ($("stateNum").textContent || "") : t("live_sub_idle");
+}
+
 
 function el(tag, cls, text) {
   const n = document.createElement(tag);
@@ -591,12 +704,12 @@ let backTimer = null;
 function setCall(status, caller) {
   const chip = $("stateChip");
   chip.className = "state-chip " + status;
-  $("stateText").textContent = stateText[status] || status;
+  $("stateText").textContent = t("st_" + status) !== "st_" + status ? t("st_" + status) : status;
   $("stateNum").textContent = status === "idle" ? "" : (caller || "");
   callActive = (status === "ringing" || status === "dialing" || status === "answered");
   $("quickActs").classList.toggle("show", callActive);
   $("liveTag").style.display = callActive ? "inline-flex" : "none";
-  $("liveSub").textContent = callActive ? (caller || "") : "通话开始后自动进入本页";
+  $("liveSub").textContent = callActive ? (caller || "") : t("live_sub_idle");
   if (!callActive) { $("keypad").classList.remove("show"); $("dtmfSent").textContent = ""; }
 
   if (callActive) {
@@ -614,7 +727,7 @@ function setCall(status, caller) {
 function addTranscript(role, text, ts) {
   const chat = $("chat");
   const b = el("div", "bubble " + (role === "user" ? "user" : "agent"));
-  b.appendChild(el("div", "who", role === "user" ? "对方" : "数字分身"));
+  b.appendChild(el("div", "who", role === "user" ? t("who_user") : t("who_agent")));
   b.appendChild(el("div", "text", text));
   b.appendChild(el("div", "time", fmtTime(ts)));
   chat.appendChild(b);
@@ -631,7 +744,7 @@ function addSms(event) {
   const item = el("div", "sms-item " + (isIn ? "in" : "out"));
   const head = el("div", "head");
   const who = isIn ? (event.sender || "未知") : (event.number || "");
-  head.appendChild(el("span", "dir", (isIn ? "收 ← " : "发 → ") + who));
+  head.appendChild(el("span", "dir", (isIn ? t("sms_in") : t("sms_out")) + who));
   const right = el("span");
   right.appendChild(el("span", "", fmtTime(event.ts) + " "));
   if (event.status) right.appendChild(el("span", "st " + event.status, event.status));
@@ -661,9 +774,9 @@ let ws;
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => { $("dot").classList.add("on"); $("conn").textContent = "已连接"; };
+  ws.onopen = () => { $("dot").classList.add("on"); $("conn").textContent = t("conn_on"); };
   ws.onclose = () => {
-    $("dot").classList.remove("on"); $("conn").textContent = "重连中";
+    $("dot").classList.remove("on"); $("conn").textContent = t("conn_retry");
     setTimeout(connect, 2000);
   };
   ws.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (err) {} };
@@ -673,32 +786,33 @@ async function loadMeta() {
     const m = await (await fetch("/api/meta")).json();
     $("model").textContent = m.model || "-";
     $("provider").textContent = m.provider || "-";
-    $("portSub").textContent = "模组 " + (m.port || "-");
+    $("portSub").textContent = t("modem_prefix") + (m.port || "-");
   } catch (e) {}
 }
 
 /* ========= 拨打 / 挂断 / 键盘 ========= */
 async function doDial() {
   const number = $("dialNumber").value.trim();
-  if (!number) { setToast("dialToast", "err", "请填写号码"); return; }
+  if (!number) { setToast("dialToast", "err", t("need_number")); return; }
   const task = $("dialTask").value.trim();
   const btn = $("dialBtn");
-  btn.disabled = true; setToast("dialToast", "", "呼叫中…");
+  btn.disabled = true; setToast("dialToast", "", t("calling"));
   try {
     const { res } = await postJson("/api/call/dial", { number, task: task || null });
     if (res.ok) {
-      setToast("dialToast", "ok", "已发起呼叫");
+      setToast("dialToast", "ok", t("call_sent"));
       if (task) { updateTaskPlaceholder(task); $("dialTask").value = ""; }
-    } else setToast("dialToast", "err", res.error || "呼叫失败");
-  } catch (err) { setToast("dialToast", "err", "请求出错"); }
+    } else setToast("dialToast", "err", res.error || t("call_fail"));
+  } catch (err) { setToast("dialToast", "err", t("req_error")); }
   finally { btn.disabled = false; }
 }
 $("dialBtn").addEventListener("click", doDial);
 $("dialNumber").addEventListener("keydown", (e) => { if (e.key === "Enter") doDial(); });
 
 function updateTaskPlaceholder(task) {
-  const t = (task || "").trim();
-  if (t) $("dialTask").placeholder = "主题（空=沿用）：" + (t.length > 22 ? t.slice(0, 22) + "…" : t);
+  const t2 = (task || "").trim();
+  window._lastTask = t2 || window._lastTask;
+  if (t2) $("dialTask").placeholder = t("task_prefix") + (t2.length > 22 ? t2.slice(0, 22) + "…" : t2);
 }
 async function loadDefaultTask() {
   try {
@@ -735,37 +849,32 @@ $("keypadBtn").addEventListener("click", () => $("keypad").classList.toggle("sho
 $("smsSend").addEventListener("click", async () => {
   const number = $("smsNumber").value.trim();
   const text = $("smsText").value;
-  if (!number || !text.trim()) { setToast("smsToast", "err", "请填写号码和内容"); return; }
+  if (!number || !text.trim()) { setToast("smsToast", "err", t("need_sms")); return; }
   const btn = $("smsSend");
-  btn.disabled = true; setToast("smsToast", "", "发送中…");
+  btn.disabled = true; setToast("smsToast", "", t("sending"));
   try {
     const { res } = await postJson("/api/sms/send", { number, text });
-    if (res.ok) { setToast("smsToast", "ok", "已发送"); $("smsText").value = ""; }
-    else setToast("smsToast", "err", "发送失败：" + (res.error || "未知错误"));
-  } catch (err) { setToast("smsToast", "err", "请求出错"); }
+    if (res.ok) { setToast("smsToast", "ok", t("sent")); $("smsText").value = ""; }
+    else setToast("smsToast", "err", t("send_fail") + (res.error || ""));
+  } catch (err) { setToast("smsToast", "err", t("req_error")); }
   finally { btn.disabled = false; }
 });
 
 /* ========= 历史 + 最近通话 ========= */
-const dirText = { inbound: "呼入", outbound: "呼出" };
-const statusText = { completed: "已完成", failed: "异常", not_connected: "未接通" };
+const dirText = () => ({ inbound: t("dir_in"), outbound: t("dir_out") });
+const statusText = () => ({ completed: t("stc_completed"), failed: t("stc_failed"), not_connected: t("stc_not_connected") });
 const openCalls = new Set();
 let historyCache = [];
 
 function evTypeText(ev) {
-  const m = {
-    call_started: "通话开始", dialing: "拨号", connected: "接通", answered: "已接听",
-    bridge_started: "音频桥就绪", agent_started: "Agent 就绪", greeting_sent: "开场白",
-    latency: "延迟打点", summary: "生成摘要", ended: "会话收尾",
-    call_finished: "通话结束", not_connected: "未接通", dtmf: "发送按键",
-  };
-  if (ev.type === "transcript") return ev.role === "user" ? "对方说" : "分身说";
+  const m = t("ev");
+  if (ev.type === "transcript") return ev.role === "user" ? m.transcript_user : m.transcript_agent;
   return m[ev.type] || ev.type;
 }
 function evDetail(ev) {
   if (ev.type === "transcript") return ev.text || "";
   if (ev.type === "latency") return `${ev.stage || ""} ${Math.round(ev.ms || 0)}ms`;
-  if (ev.type === "call_finished") return statusText[ev.status] || ev.status || "";
+  if (ev.type === "call_finished") return statusText()[ev.status] || ev.status || "";
   if (ev.type === "dialing") return ev.number || "";
   if (ev.type === "dtmf") return ev.digits || "";
   return "";
@@ -803,16 +912,16 @@ async function loadHistory() {
     const calls = await fetchHistory();
     const list = $("historyList");
     list.textContent = "";
-    if (!calls.length) { list.appendChild(el("div", "empty", "暂无通话记录")); return; }
+    if (!calls.length) { list.appendChild(el("div", "empty", t("empty_history"))); return; }
     for (const c of calls) {
       const item = el("div", "hist-item");
       const head1 = el("div", "head");
-      head1.appendChild(el("span", "num", c.number || "未知号码"));
+      head1.appendChild(el("span", "num", c.number || t("unknown_number")));
       const right = el("span");
       right.appendChild(el("span", "dir " + (c.direction === "inbound" ? "in" : "out"),
-        dirText[c.direction] || c.direction || "?"));
+        dirText()[c.direction] || c.direction || "?"));
       right.appendChild(document.createTextNode(" "));
-      right.appendChild(el("span", "st " + (c.status || ""), statusText[c.status] || c.status || ""));
+      right.appendChild(el("span", "st " + (c.status || ""), statusText()[c.status] || c.status || ""));
       head1.appendChild(right);
       item.appendChild(head1);
       const head2 = el("div", "head");
@@ -836,14 +945,14 @@ async function loadRecent() {
     const calls = historyCache.length ? historyCache : await fetchHistory();
     const list = $("recentList");
     list.textContent = "";
-    if (!calls.length) { list.appendChild(el("div", "empty", "暂无通话")); return; }
+    if (!calls.length) { list.appendChild(el("div", "empty", t("empty_calls"))); return; }
     for (const c of calls.slice(0, 6)) {
       const item = el("div", "recent-item");
       const isIn = c.direction === "inbound";
       item.appendChild(el("div", "ric " + (isIn ? "in" : "out"), isIn ? "↓" : "↑"));
       const main = el("div", "rmain");
-      main.appendChild(el("div", "rnum", c.number || "未知号码"));
-      const sub = (c.summary && c.summary.summary) || statusText[c.status] || "";
+      main.appendChild(el("div", "rnum", c.number || t("unknown_number")));
+      const sub = (c.summary && c.summary.summary) || statusText()[c.status] || "";
       main.appendChild(el("div", "rsub", sub));
       item.appendChild(main);
       item.appendChild(el("div", "rtime", fmtDateTime(c.started_at)));
@@ -866,10 +975,10 @@ async function refreshQueue() {
     const box = $("queueStatus");
     box.textContent = "";
     const statText = q.active
-      ? `队列进行中 · 待拨 ${q.pending.length} · 已拨 ${(q.done || []).length}`
-      : ((q.done || []).length ? `队列空闲 · 本轮已拨 ${q.done.length}` : "队列空闲");
+      ? t("q_active")(q.pending.length, (q.done || []).length)
+      : ((q.done || []).length ? t("q_done")(q.done.length) : t("q_idle"));
     box.appendChild(el("div", "q-stat", statText));
-    if (q.current) queueChip(box, `${q.current} 拨打中`, "cur");
+    if (q.current) queueChip(box, `${q.current}${t("q_current")}`, "cur");
     for (const n of q.pending) queueChip(box, n);
     for (const d of (q.done || []).slice(-10)) {
       queueChip(box, `${d.number} ${d.ok ? "✓" : "✗" + (d.error ? " " + d.error : "")}`, d.ok ? "ok" : "fail");
@@ -880,20 +989,20 @@ $("batchDialBtn").addEventListener("click", async () => {
   const numbers = $("batchNumbers").value
     .split(/[\r\n,，;；]+/).map((s) => s.trim()).filter(Boolean);
   const task = $("batchTask").value.trim();
-  if (!numbers.length) { setToast("batchToast", "err", "请填写至少一个号码"); return; }
+  if (!numbers.length) { setToast("batchToast", "err", t("need_number")); return; }
   const btn = $("batchDialBtn");
-  btn.disabled = true; setToast("batchToast", "", "入队中…");
+  btn.disabled = true; setToast("batchToast", "", t("enqueuing"));
   try {
     const { httpOk, res } = await postJson("/api/call/batch_dial", { numbers, task: task || null });
     if (httpOk) {
-      let msg = `已入队 ${res.accepted.length} 个`;
-      if (res.rejected.length) msg += `，拒绝 ${res.rejected.length} 个`;
+      let msg = t("enq_ok")(res.accepted.length);
+      if (res.rejected.length) msg += t("enq_rej")(res.rejected.length);
       setToast("batchToast", res.accepted.length ? "ok" : "err", msg);
       if (res.accepted.length) $("batchNumbers").value = "";
       if (task) updateTaskPlaceholder(task);
       refreshQueue();
-    } else setToast("batchToast", "err", "入队失败：" + (res.error || "未知错误"));
-  } catch (err) { setToast("batchToast", "err", "请求出错"); }
+    } else setToast("batchToast", "err", t("enq_fail") + (res.error || ""));
+  } catch (err) { setToast("batchToast", "err", t("req_error")); }
   finally { btn.disabled = false; }
 });
 
@@ -902,12 +1011,16 @@ let cfgSpecs = [];
 const truthy = ["true", "1", "yes"];
 const boolChecked = (v) => truthy.includes(String(v).trim().toLowerCase());
 function cfgGroup(key) {
-  if (/^(AGENT_PROVIDER|QWEN_|AGENT_MODEL|AGENT_OUTBOUND|DASHSCOPE)/.test(key)) return "AI 与人设";
-  if (/^MODEM_/.test(key)) return "模组与音频";
-  if (/^(RECORDING_|SUMMARY_|CALL_LOG|HALF_DUPLEX|HANGUP_)/.test(key)) return "通话与记录";
-  if (/^MONITOR_/.test(key)) return "本机监听";
-  if (/^(DIAL_|SMS_)/.test(key)) return "外呼与短信";
-  return "系统";
+  if (/^(AGENT_PROVIDER|QWEN_|AGENT_MODEL|AGENT_OUTBOUND|DASHSCOPE)/.test(key)) return t("grp_ai");
+  if (/^MODEM_/.test(key)) return t("grp_modem");
+  if (/^(RECORDING_|SUMMARY_|CALL_LOG|HALF_DUPLEX|HANGUP_)/.test(key)) return t("grp_call");
+  if (/^MONITOR_/.test(key)) return t("grp_monitor");
+  if (/^(DIAL_|SMS_)/.test(key)) return t("grp_dial");
+  return t("grp_sys");
+}
+function cfgLabel(c) {
+  if (LANG === "en" && I18N.en.cfg[c.key]) return I18N.en.cfg[c.key];
+  return c.label;
 }
 async function loadConfig() {
   try {
@@ -926,14 +1039,14 @@ async function loadConfig() {
         form.appendChild(wrap);
       }
       const row = el("div", "cfg-row");
-      const label = el("label", "", c.label);
-      if (c.requires_restart) label.appendChild(el("span", "tag-restart", "改后需重启"));
+      const label = el("label", "", cfgLabel(c));
+      if (c.requires_restart) label.appendChild(el("span", "tag-restart", t("tag_restart")));
       label.appendChild(el("span", "key", c.key));
       row.appendChild(label);
 
       let ctrl;
       if (c.secret) {
-        ctrl = el("span", "tag-secret" + (c.value === "已设置" ? " set" : ""), c.value);
+        ctrl = el("span", "tag-secret" + (c.value === "已设置" ? " set" : ""), c.value === "已设置" ? t("secret_set") : t("secret_unset"));
         row.appendChild(ctrl);
       } else if (c.kind === "bool") {
         const sw = el("label", "switch");
@@ -978,21 +1091,31 @@ $("configSave").addEventListener("click", async () => {
     const orig = c.kind === "bool" ? (boolChecked(c.value) ? "true" : "false") : String(c.value);
     if (val !== orig) updates[c.key] = val;
   }
-  if (!Object.keys(updates).length) { setToast("configToast", "", "没有需要保存的修改"); return; }
+  if (!Object.keys(updates).length) { setToast("configToast", "", t("cfg_nochange")); return; }
   const btn = $("configSave");
-  btn.disabled = true; setToast("configToast", "", "保存中…");
+  btn.disabled = true; setToast("configToast", "", t("cfg_saving"));
   try {
     const { httpOk, res } = await postJson("/api/config", updates);
     if (httpOk) {
-      let msg = `已保存 ${res.updated.length} 项`;
-      if (res.requires_restart.length) msg += `，其中 ${res.requires_restart.length} 项需重启生效`;
+      let msg = t("cfg_saved")(res.updated.length);
+      if (res.requires_restart.length) msg += t("cfg_restart")(res.requires_restart.length);
       setToast("configToast", "ok", msg);
       loadConfig();
-    } else setToast("configToast", "err", "保存失败：" + (res.error || "未知错误"));
-  } catch (err) { setToast("configToast", "err", "请求出错"); }
+    } else setToast("configToast", "err", t("cfg_savefail") + (res.error || ""));
+  } catch (err) { setToast("configToast", "err", t("req_error")); }
   finally { btn.disabled = false; }
 });
 
+$("langBtn").addEventListener("click", () => {
+  LANG = LANG === "en" ? "zh" : "en";
+  localStorage.setItem("cp_lang", LANG);
+  applyI18n();
+  loadHistory().then(loadRecent);  // 重渲染带翻译的动态列表
+  loadConfig();
+  refreshQueue();
+  if (window._lastTask) updateTaskPlaceholder(window._lastTask);
+});
+applyI18n();
 loadMeta();
 connect();
 loadHistory().then(loadRecent);

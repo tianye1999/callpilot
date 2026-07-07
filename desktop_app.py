@@ -51,8 +51,8 @@ def _resolve_project_root() -> Path:
 
 PROJECT_ROOT = _resolve_project_root()
 
-WINDOW_TITLE = "AgentCall — 数字分身"
-ERROR_WINDOW_TITLE = "AgentCall — 服务未启动"
+WINDOW_TITLE = "CallPilot"
+ERROR_WINDOW_TITLE = "CallPilot — 服务未启动"
 DEFAULT_WEB_URL = "http://127.0.0.1:8000"
 
 ServiceStatus = Literal["already", "started", "failed"]
