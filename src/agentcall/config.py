@@ -54,8 +54,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
                "qwen3.5-omni-flash-realtime", requires_restart=True),
     ConfigSpec("QWEN_VOICE", "Qwen 音色", "str", "Raymond"),
+    ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
+    ConfigSpec("AGENT_PERSONA", "AI 人设称谓", "str", "AI 助理"),
     ConfigSpec("AGENT_OUTBOUND_TASK", "外呼任务指令", "str",
-               "代表田野主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。"),
+               "代表机主主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。"),
     # ---- 模组 ----
     ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", "/tmp/ec20-at", requires_restart=True),
     ConfigSpec("MODEM_BAUD", "串口波特率", "int", "115200", requires_restart=True),

@@ -128,6 +128,8 @@ def test_tool_query_code_no_sms():
 # ---- 来电全链路：接听 → 开场白 → 下行音频 → 挂断收尾 ----
 
 def test_inbound_call_full_lifecycle(monkeypatch):
+    monkeypatch.setenv("OWNER_NAME", "田野")
+    monkeypatch.setenv("AGENT_PERSONA", "数字分身")
     modem = FakeModem()
     hub = make_hub()
     bridge = FakeAudioBridge()
@@ -162,6 +164,8 @@ def test_inbound_call_full_lifecycle(monkeypatch):
 
 
 def test_outbound_call_uses_digital_twin_prompt(monkeypatch):
+    monkeypatch.setenv("OWNER_NAME", "田野")
+    monkeypatch.setenv("AGENT_PERSONA", "数字分身")
     modem = FakeModem()
     bridge = FakeAudioBridge()
     agent = FakeAgent()

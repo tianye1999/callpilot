@@ -13,3 +13,10 @@ data/
 .claude/
 .DS_Store
 packaging/icon_work/CallPilot.iconset/
+
+# 打包与图标产物（不入源码库）
+build/
+dist/
+*.pkg
+packaging/icon_work/
+packaging/*.icns

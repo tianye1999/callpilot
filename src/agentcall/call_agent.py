@@ -38,10 +38,17 @@ logger = logging.getLogger(__name__)
 
 
 AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge
-OWNER_NAME = "田野"
-AGENT_PERSONA = "数字分身"
+# 机主与人设：从 config 读（OWNER_NAME 未设置时用中性称谓，公开产品去个人化）。
+def _owner_name() -> str:
+    return config.get_str("OWNER_NAME").strip() or "机主"
+
+
+def _agent_persona() -> str:
+    return config.get_str("AGENT_PERSONA").strip() or "AI 助理"
+
+
 DEFAULT_OUTBOUND_TASK = (
-    "代表田野主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。"
+    "代表机主主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。"
 )
 
 # Agent 说话结束后，再屏蔽上行这么久，吸收模组回采的尾音回声。
@@ -368,6 +375,8 @@ class CallSession:
         return registry
 
     def _build_agent_instructions(self, direction: str) -> str:
+        OWNER_NAME = _owner_name()
+        AGENT_PERSONA = _agent_persona()
         weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
         now = datetime.now()
         now_str = f"{now:%Y年%m月%d日 %H:%M}（{weekdays[now.weekday()]}）"
@@ -408,7 +417,7 @@ class CallSession:
         return (
             f"你是{OWNER_NAME}的{AGENT_PERSONA}，正在替{OWNER_NAME}接听打进来的电话，"
             f"{OWNER_NAME}现在不方便接。\n"
-            "来电任务：自然接待，了解对方是谁、找田野什么事、急不急、"
+            f"来电任务：自然接待，了解对方是谁、找{OWNER_NAME}什么事、急不急、"
             f"是否需要{OWNER_NAME}回拨，并记下要点转告{OWNER_NAME}。\n"
             "来电规则：\n"
             f"1. 不要冒充{OWNER_NAME}本人；被问身份时说你是{OWNER_NAME}的{AGENT_PERSONA}。\n"
@@ -419,6 +428,8 @@ class CallSession:
         )
 
     def _opening_instructions(self, direction: str) -> str:
+        OWNER_NAME = _owner_name()
+        AGENT_PERSONA = _agent_persona()
         if direction == "outbound":
             task = self._outbound_task()
             return (

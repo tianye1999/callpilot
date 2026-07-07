@@ -1,10 +1,26 @@
-# AgentCall 需求与路线图（Realtime 优先，单一 SSOT）
+# CallPilot 需求与路线图（Realtime 优先，单一 SSOT）
 
-> 版本：v2.0（2026-07-07）
+> 版本：v2.1（2026-07-07）
 > 本文合并原 `01-requirements.md` / `02-task-breakdown.md` / `03-gap-analysis-vs-poc.md`，
 > 是当前唯一的计划文档。**本地三段式（VAD→STT→LLM→TTS）方案已整体延后**，本文只覆盖
 > 云端 realtime 路线下要做的功能，按优先级组织。三段式方案见文末附录 A（暂缓）。
 > codex 评审全过程留存于 `.codex_dialog.md`；旧版三份文档留存于 git 历史（commit 08754fc）。
+
+## 0. 发布路线（开源 + 商业化免费）
+
+| 版本 | 目标 | 面向 | 状态 |
+|------|------|------|------|
+| **v0.1 Developer Preview** | 源码开源，开发者按 README 手动跑通，收集同型号 EC20 硬件反馈 | 会装 Python/填 Key/跑命令的开发者 | 🚧 本轮交付：Apache-2.0、去个人化、双语 README、风险声明、仓库清理 |
+| **v0.2 Mac Beta** | 有 `.app`，仍需装依赖或跑安装脚本 | 技术用户 | 计划 |
+| **v0.3 One-click Mac Beta** | 真正 `.pkg` 安装、首次启动向导、内置 runtime、自动 launchd、Developer ID 签名+公证 | 普通用户 | 计划 |
+| **v1.0** | 稳定硬件矩阵、隐私说明、故障恢复、完整文档 | 通用 | 计划 |
+
+v0.1 原则（codex 建议，已采纳）：不追求一键安装，追求"陌生开发者 30 分钟能跑通、能提
+issue、能贡献"；先让 3-5 个同硬件开发者复现成功，再进大众分发。
+
+**v0.3 独立 App 尚缺**（当前 `.app` 是本地仓库薄壳）：内置 Python runtime、固定安装路径、
+自动建 venv/装依赖、自动装卸 launchd、首启向导（检测 EC20 / 填 Key / 设机主名 / 选音色 /
+测麦克风与下行 / 测试短信）、硬件兼容矩阵、Developer ID 签名与 notarization。
 
 ---
 

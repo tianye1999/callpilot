@@ -32,15 +32,15 @@ _DIRECTION_LABELS = {
 }
 
 _SYSTEM_PROMPT = (
-    "你是通话记录分析助手。机主叫田野，通话中的 AI 是田野的数字分身，"
-    "代替田野接打电话。下面给你一通电话的完整转写，请从田野的视角分析并总结。\n"
+    "你是通话记录分析助手。通话中的 AI 是机主{owner}的电话助理，"
+    "代替{owner}接打电话。下面给你一通电话的完整转写，请从{owner}的视角分析并总结。\n"
     "必须只输出一个严格合法的 JSON 对象（不要输出任何解释、markdown 围栏或多余文字），"
     "字段如下：\n"
     '- "caller_identity": 字符串，对方是谁（如"快递员""银行客服""朋友张三"），'
     '判断不出写"未知"\n'
     '- "intent": 字符串，对方来意/通话目的，一句话\n'
     '- "urgency": 字符串，紧急程度，只能是"高"、"中"、"低"之一\n'
-    '- "callback_needed": 布尔值，田野本人是否需要回电或跟进\n'
+    '- "callback_needed": 布尔值，机主本人是否需要回电或跟进\n'
     '- "summary": 字符串，2~3 句话的通话摘要，写清结论和待办\n'
 )
 
@@ -78,8 +78,9 @@ def _build_messages(
         f"对方号码：{number or '未知'}\n"
         f"通话转写：\n" + "\n".join(lines)
     )
+    owner = os.environ.get("OWNER_NAME", "").strip() or "机主"
     return [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": _SYSTEM_PROMPT.format(owner=owner)},
         {"role": "user", "content": user_content},
     ]
 
