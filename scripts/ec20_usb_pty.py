@@ -8,6 +8,8 @@ endpoints with libusb/PyUSB and presents a pseudo terminal for pyserial.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import logging
 import os
 import pty
 import select
@@ -23,8 +25,33 @@ from pathlib import Path
 import usb.core
 import usb.util
 
+logger = logging.getLogger("ec20_usb_pty")
+
 VID = 0x2C7C
 PID = 0x0125
+
+LOCK_PATH = Path("/tmp/ec20-usb-pty.lock")
+
+
+def acquire_instance_lock() -> object:
+    """进程唯一锁：防止两个桥实例争抢 USB claim 导致双双不可用。
+
+    返回持有的文件对象（进程退出自动释放）；已有实例时报错。
+    """
+    lock_file = LOCK_PATH.open("a+")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.seek(0)
+        holder = lock_file.read().strip() or "未知"
+        raise RuntimeError(
+            f"另一个 ec20_usb_pty 实例正在运行 (pid={holder})；"
+            "同一时刻只能有一个桥占用 EC20 USB 接口。"
+        ) from None
+    lock_file.truncate(0)
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
 
 
 @dataclass(frozen=True)
@@ -175,10 +202,9 @@ def bridge_port(
     except Exception:
         handle.close()
         raise
-    print(
-        f"interface {port.interface}: {link} -> {slave_name} "
-        f"(in=0x{port.bulk_in:02x}, out=0x{port.bulk_out:02x})",
-        flush=True,
+    logger.info(
+        "interface %d: %s -> %s (in=0x%02x, out=0x%02x)",
+        port.interface, link, slave_name, port.bulk_in, port.bulk_out,
     )
 
     def usb_to_pty() -> None:
@@ -189,7 +215,7 @@ def bridge_port(
                 continue
             except Exception as exc:  # noqa: BLE001
                 if not stop.is_set():
-                    print(f"interface {port.interface} USB read failed: {exc}", file=sys.stderr)
+                    logger.error("interface %d USB read failed: %s", port.interface, exc)
                 stop.set()
                 return
             if data:
@@ -197,7 +223,7 @@ def bridge_port(
                     os.write(master_fd, bytes(data))
                 except OSError as exc:
                     if not stop.is_set():
-                        print(f"interface {port.interface} PTY write failed: {exc}", file=sys.stderr)
+                        logger.error("interface %d PTY write failed: %s", port.interface, exc)
                     stop.set()
                     return
 
@@ -210,7 +236,7 @@ def bridge_port(
                 data = os.read(master_fd, port.max_packet)
             except OSError as exc:
                 if not stop.is_set():
-                    print(f"interface {port.interface} PTY read failed: {exc}", file=sys.stderr)
+                    logger.error("interface %d PTY read failed: %s", port.interface, exc)
                 stop.set()
                 return
             if data:
@@ -218,7 +244,7 @@ def bridge_port(
                     dev.write(port.bulk_out, data, timeout=1000)
                 except Exception as exc:  # noqa: BLE001
                     if not stop.is_set():
-                        print(f"interface {port.interface} USB write failed: {exc}", file=sys.stderr)
+                        logger.error("interface %d USB write failed: %s", port.interface, exc)
                     stop.set()
                     return
 
@@ -238,6 +264,40 @@ def parse_map(value: str) -> tuple[int, str]:
     return iface, link
 
 
+def wait_for_device(stop: threading.Event, poll_seconds: float = 2.0) -> usb.core.Device | None:
+    """阻塞等待 EC20 出现（模组重插场景）；stop 置位时返回 None。"""
+    announced = False
+    while not stop.is_set():
+        try:
+            return find_device()
+        except RuntimeError:
+            if not announced:
+                logger.warning("未检测到 EC20 (2c7c:0125)，等待设备接入…")
+                announced = True
+            stop.wait(poll_seconds)
+    return None
+
+
+def run_bridges_once(
+    dev: usb.core.Device, maps: list[tuple[int, str]], stop: threading.Event
+) -> None:
+    """建立全部桥并阻塞运行，直到 stop 置位或任一桥断开（如设备被拔出）。"""
+    ports = discover_ports(dev)
+    handles: list[BridgeHandle] = []
+    try:
+        for iface, link in maps:
+            if iface not in ports:
+                raise RuntimeError(f"接口 {iface} 不存在，可用接口: {sorted(ports)}")
+            handles.append(bridge_port(dev, ports[iface], link))
+
+        while not stop.is_set() and all(not handle.stop.is_set() for handle in handles):
+            time.sleep(0.2)
+    finally:
+        for handle in handles:
+            handle.close()
+        usb.util.dispose_resources(dev)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="EC20 USB vendor serial PTY bridge for macOS")
     parser.add_argument("--list", action="store_true", help="列出 USB bulk 接口后退出")
@@ -250,18 +310,34 @@ def main() -> int:
         metavar="IFACE:LINK",
         help="桥接接口到 symlink，例如 2:/tmp/ec20-at；可重复",
     )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="桥断开（设备拔出）后直接退出，不等待重插自动重连",
+    )
+    parser.add_argument("--log-file", help="同时把日志写入指定文件")
     args = parser.parse_args()
 
-    dev = find_device()
-    ports = discover_ports(dev)
-    if args.list:
-        for port in ports.values():
-            print(
-                f"interface {port.interface}: "
-                f"in=0x{port.bulk_in:02x} out=0x{port.bulk_out:02x} max={port.max_packet}"
-            )
-        return 0
-    if args.probe:
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+    )
+
+    _lock = acquire_instance_lock()  # noqa: F841  # 持有到进程退出
+
+    if args.list or args.probe:
+        dev = find_device()
+        ports = discover_ports(dev)
+        if args.list:
+            for port in ports.values():
+                print(
+                    f"interface {port.interface}: "
+                    f"in=0x{port.bulk_in:02x} out=0x{port.bulk_out:02x} max={port.max_packet}"
+                )
+            return 0
         for port in ports.values():
             try:
                 response = probe_at(dev, port).decode("ascii", "ignore").replace("\r\n", " | ")
@@ -270,6 +346,7 @@ def main() -> int:
                 continue
             print(f"interface {port.interface}: {response or '(no response)'}")
         return 0
+
     if not args.map:
         parser.error("需要 --list、--probe 或至少一个 --map IFACE:LINK")
 
@@ -281,20 +358,24 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    handles: list[BridgeHandle] = []
-    try:
-        for iface, link in args.map:
-            if iface not in ports:
-                raise RuntimeError(f"接口 {iface} 不存在，可用接口: {sorted(ports)}")
-            handles.append(bridge_port(dev, ports[iface], link))
+    while not stop.is_set():
+        dev = wait_for_device(stop)
+        if dev is None:
+            break
+        try:
+            run_bridges_once(dev, args.map, stop)
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            if args.once:
+                return 1
+            stop.wait(2.0)
+            continue
+        if stop.is_set() or args.once:
+            break
+        logger.warning("桥已断开（设备可能被拔出），等待重插后自动重连…")
+        stop.wait(1.0)
 
-        while not stop.is_set() and any(not handle.stop.is_set() for handle in handles):
-            time.sleep(0.2)
-    finally:
-        stop.set()
-        for handle in handles:
-            handle.close()
-        usb.util.dispose_resources(dev)
+    logger.info("桥已退出，symlink 已清理")
     return 0
 
 
