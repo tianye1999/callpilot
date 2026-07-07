@@ -434,6 +434,7 @@
     <div class="meta">
       <button class="btn sm ghost" id="langBtn" style="padding:4px 10px;font-size:11px">中文</button>
       <span><span id="dot" class="conn-dot"></span><span id="conn"></span></span>
+      <span><span id="modemDot" class="conn-dot"></span><span id="modemState"></span></span>
       <span>MODEL <b id="model">-</b></span>
       <span>PROVIDER <b id="provider">-</b></span>
     </div>
@@ -553,6 +554,7 @@ const I18N = {
     nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_settings: "Settings",
     st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
     conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
+    modem_on: "Modem ready", modem_off: "Modem offline",
     keypad: "Keys", hangup: "Hang up",
     dial_label: "MAKE A CALL", dial: "Call", ph_number: "Phone number",
     ph_task: "Call topic (blank = reuse last)", task_prefix: "Topic (blank = reuse): ",
@@ -610,6 +612,7 @@ const I18N = {
     nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_settings: "设置",
     st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
     conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
+    modem_on: "模组就绪", modem_off: "模组未连接",
     keypad: "按键", hangup: "挂断",
     dial_label: "拨打电话", dial: "拨打", ph_number: "输入号码",
     ph_task: "外呼主题（空=沿用上次）", task_prefix: "主题（空=沿用）：",
@@ -656,6 +659,7 @@ function applyI18n() {
   document.querySelectorAll("[data-i18n-ph]").forEach((n) => { n.placeholder = t(n.dataset.i18nPh); });
   $("slogan").textContent = t("slogan");
   $("langBtn").textContent = LANG === "en" ? "中文" : "EN";
+  $("modemState").textContent = t(modemConnected ? "modem_on" : "modem_off");
   $("liveSub").textContent = callActive ? ($("stateNum").textContent || "") : t("live_sub_idle");
 }
 
@@ -759,8 +763,16 @@ function addSms(event) {
 }
 
 /* ========= WebSocket ========= */
+let modemConnected = false;
+function setModem(connected) {
+  modemConnected = connected;
+  $("modemDot").classList.toggle("on", connected);
+  $("modemState").textContent = t(connected ? "modem_on" : "modem_off");
+}
 function handleEvent(ev) {
-  if (ev.type === "call") {
+  if (ev.type === "modem_status") {
+    setModem(!!ev.connected);
+  } else if (ev.type === "call") {
     setCall(ev.status, ev.caller);
     if (ev.status === "ended") setTimeout(() => { loadHistory(); loadRecent(); }, 1200);
   } else if (ev.type === "transcript") {

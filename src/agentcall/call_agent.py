@@ -621,6 +621,11 @@ class CallAgentService:
         self.audio_mode = audio_mode
         self.hub = hub
         self._ring_lock = threading.Lock()
+        # 模组连接状态与后台 supervisor：首启时模组不在也不阻塞 Web，
+        # supervisor 反复重连直到成功（首次连上后由 modem 读循环自愈接管）。
+        self.modem_connected = False
+        self._service_running = False
+        self._supervisor_thread: threading.Thread | None = None
         self.call_logger = call_logger or CallLogger(
             base_dir=os.getenv("CALL_LOG_DIR", DEFAULT_CALL_LOG_DIR),
             recording_enabled=config.get_bool("RECORDING_ENABLED"),
@@ -766,18 +771,65 @@ class CallAgentService:
         return self.dial_queue.status()
 
     def start(self) -> None:
-        """非阻塞启动：连接模组、启用语音、开始监听（供网页模式调用）。"""
+        """非阻塞启动：Web 服务不依赖模组，模组连接交给后台 supervisor 反复重试。
+
+        模组不在/桥没起时不再抛错——界面照常可用并显示"模组未连接"，
+        supervisor 连上后自动开始接听。首次连上后，后续掉线由 modem 读循环
+        的自愈重连（P0-1）接管。
+        """
         try:
             purged = self.call_logger.purge_expired()
             if purged:
                 logger.info("已清理 %d 条过期通话记录", purged)
         except Exception as exc:  # noqa: BLE001
             logger.warning("清理过期通话记录失败: %s", exc)
-        self.modem.connect()
-        self.modem.initialize_for_voice(self.audio_mode)
-        self.modem.start_listener()
-        logger.info("Agent助手 服务已启动，等待来电...")
-        self._publish({"type": "system", "text": "服务已启动，等待来电"})
+        self._service_running = True
+        self._supervisor_thread = threading.Thread(
+            target=self._modem_supervisor, name="modem-supervisor", daemon=True
+        )
+        self._supervisor_thread.start()
+
+    def _modem_supervisor(self) -> None:
+        """后台反复尝试连接模组直到成功，期间向 UI 广播连接状态。"""
+        delay = 2.0
+        while self._service_running:
+            try:
+                self.modem.connect()
+                self.modem.initialize_for_voice(self.audio_mode)
+                self.modem.start_listener()
+            except Exception as exc:  # noqa: BLE001
+                if not self._service_running:
+                    return
+                self._set_modem_connected(False, str(exc))
+                logger.warning("模组连接失败，%.0fs 后重试: %s", delay, exc)
+                # 可被 stop() 打断的等待
+                for _ in range(int(delay * 10)):
+                    if not self._service_running:
+                        return
+                    time.sleep(0.1)
+                delay = min(delay * 2, 30.0)
+                continue
+            self._set_modem_connected(True)
+            logger.info("模组已连接，等待来电…")
+            return
+
+    def _set_modem_connected(self, connected: bool, error: str | None = None) -> None:
+        """更新模组连接状态并广播给 UI（状态变化时才记日志/发事件）。"""
+        if connected == self.modem_connected and connected:
+            return
+        self.modem_connected = connected
+        event = {"type": "modem_status", "connected": connected}
+        if error:
+            event["error"] = error
+        self._publish(event)
+        if connected:
+            self._publish({"type": "system", "text": "服务已启动，等待来电"})
+
+    def stop_service(self) -> None:
+        """停止 supervisor 与当前会话，关闭模组（供退出时调用）。"""
+        self._service_running = False
+        self.session.stop()
+        self.modem.close()
 
     def run(self) -> None:
         self.start()
@@ -786,5 +838,4 @@ class CallAgentService:
         except KeyboardInterrupt:
             logger.info("收到退出信号")
         finally:
-            self.session.stop()
-            self.modem.close()
+            self.stop_service()

@@ -108,11 +108,8 @@ def main() -> None:
         "port": modem_port,
     }
 
-    try:
-        service.start()
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("模组启动失败: %s", exc)
-        sys.exit(1)
+    # 韧性启动：模组连接交给后台 supervisor 反复重试，Web 服务不因模组缺席而退出。
+    service.start()
 
     dial_whitelist = config.get_str("DIAL_WHITELIST").strip()
     logger.info(
@@ -141,12 +138,11 @@ def main() -> None:
     finally:
         if prewarm_thread is not None:
             prewarm_thread.stop_event.set()
-        service.session.stop()
+        service.stop_service()
         if service.monitor is not None:
             service.monitor.stop()
         if service.uplink_monitor is not None:
             service.uplink_monitor.stop()
-        service.modem.close()
         loop.run_until_complete(runner.cleanup())
         loop.close()
 

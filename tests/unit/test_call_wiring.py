@@ -442,3 +442,79 @@ def test_tool_send_dtmf_dispatches_to_modem(monkeypatch):
     assert sent == ["103#"]
 
     assert service.session._tool_send_dtmf({"digits": ""})["success"] is False
+
+
+# ---- 韧性启动：模组不在也起服务，后台 supervisor 反复重连 ----
+
+
+def test_start_does_not_raise_when_modem_absent():
+    """模组 connect 抛错时，start() 不得抛出（Web 服务照常起）。"""
+    modem = FakeModem()
+
+    def boom() -> None:
+        raise OSError("could not open port /tmp/ec20-at")
+
+    modem.connect = boom  # type: ignore[method-assign]
+    service = make_service(modem)
+    service.start()  # 不抛
+    service._service_running = False  # 停 supervisor
+    assert service.modem_connected is False
+
+
+def test_supervisor_connects_then_publishes_status():
+    """模组可连时，supervisor 应完成 connect/init/listen 并广播 modem_status=connected。"""
+    modem = FakeModem()
+    hub = make_hub()
+    service = make_service(modem, hub=hub)
+    service.start()
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not service.modem_connected:
+        time.sleep(0.02)
+
+    service._service_running = False
+    assert service.modem_connected is True
+    assert "connect" in modem.call_names()
+    assert "initialize_for_voice" in modem.call_names()
+    assert "start_listener" in modem.call_names()
+    statuses = [e for e in hub.history() if e.get("type") == "modem_status"]
+    assert statuses and statuses[-1]["connected"] is True
+
+
+def test_supervisor_retries_until_modem_available(monkeypatch):
+    """首次 connect 失败后 supervisor 重试，最终连上。"""
+    monkeypatch.setattr("agentcall.call_agent.time.sleep", lambda s: None)
+    modem = FakeModem()
+    calls = {"n": 0}
+    orig_connect = modem.connect
+
+    def flaky_connect() -> None:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError("I/O error")
+        orig_connect()
+
+    modem.connect = flaky_connect  # type: ignore[method-assign]
+    service = make_service(modem)
+    service.start()
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not service.modem_connected:
+        time.sleep(0.02)
+    service._service_running = False
+    assert service.modem_connected is True
+    assert calls["n"] >= 3
+
+
+def test_stop_service_halts_supervisor():
+    modem = FakeModem()
+
+    def boom() -> None:
+        raise OSError("nope")
+
+    modem.connect = boom  # type: ignore[method-assign]
+    service = make_service(modem)
+    service.start()
+    service.stop_service()
+    assert service._service_running is False
+    assert "close" in modem.call_names()
