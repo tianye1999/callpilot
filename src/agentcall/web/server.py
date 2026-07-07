@@ -39,6 +39,7 @@ def build_app(
     app.router.add_get("/ws", _websocket)
     app.router.add_post("/api/sms/send", _send_sms)
     app.router.add_post("/api/call/dial", _dial)
+    app.router.add_post("/api/call/hangup", _hangup)
     app.router.add_post("/api/call/batch_dial", _batch_dial)
     app.router.add_get("/api/call/queue", _queue_status)
     app.router.add_get("/api/history", _history)
@@ -130,6 +131,18 @@ async def _dial(request: web.Request) -> web.Response:
     ok, err = service.dial(number)
     if not ok:
         return web.json_response({"ok": False, "error": err}, status=409)
+    return web.json_response({"ok": True})
+
+
+async def _hangup(request: web.Request) -> web.Response:
+    """挂断进行中的通话（AI 与 IVR 互相不挂断时的人工兜底）。"""
+    service = request.app["service"]
+    if service is None:
+        return web.json_response({"ok": False, "error": "服务不可用"}, status=500)
+    session = service.session
+    if not session.is_active:
+        return web.json_response({"ok": False, "error": "当前没有进行中的通话"}, status=409)
+    session.stop()
     return web.json_response({"ok": True})
 
 
