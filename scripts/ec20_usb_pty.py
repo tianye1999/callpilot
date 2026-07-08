@@ -22,8 +22,8 @@ import tty
 from dataclasses import dataclass
 from pathlib import Path
 
-import usb.core
 import usb.backend.libusb1
+import usb.core
 import usb.util
 
 logger = logging.getLogger("ec20_usb_pty")

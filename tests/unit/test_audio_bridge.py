@@ -8,7 +8,7 @@ import pytest
 
 import agentcall.audio_bridge as audio_bridge
 import agentcall.coreaudio as coreaudio
-from agentcall.audio_bridge import FfmpegAudioBridge, NMEA_WRITE_SIZE, create_audio_bridge
+from agentcall.audio_bridge import NMEA_WRITE_SIZE, FfmpegAudioBridge, create_audio_bridge
 
 
 def make_ffmpeg_bridge() -> FfmpegAudioBridge:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from functools import partial
 import io
 import json
 import logging
@@ -12,6 +11,7 @@ import secrets
 import subprocess
 import sys
 import wave
+from functools import partial
 from pathlib import Path
 
 from aiohttp import WSMsgType, web

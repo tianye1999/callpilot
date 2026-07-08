@@ -14,11 +14,11 @@ import logging
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-import urllib.error
-import urllib.request
 
 from . import platforms
 

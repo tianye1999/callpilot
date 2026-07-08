@@ -11,10 +11,9 @@ caller with a realtime voice AI, places outbound calls, sends/receives SMS,
 navigates IVR menus (DTMF), and records + summarizes every call — all on your
 own hardware and API keys.
 
-> **Status: Developer Preview (v0.2).** Runs on macOS with a Quectel EC20 today.
-> This release targets developers who can read a README, install Python, provide
-> an API key, and run commands. It is **not** a one-click app yet — the goal is
-> reproducibility and hardware feedback. See [Roadmap](docs/roadmap.md).
+> **Status: Mac Beta (v0.2).** Runs on macOS with a Quectel EC20 today. Developers
+> can run from source; regular users can install the unsigned macOS DMG from a
+> GitHub Release once attached. See [Roadmap](docs/roadmap.md).
 
 [English](#english) · [中文](#中文)
 
@@ -75,15 +74,33 @@ or Taobao for "EC20 USB adapter".
 
 ### Requirements
 
-- Python 3.12+, a working `ffmpeg` on PATH, an EC20/EG25 modem with an active SIM.
-- **macOS:** `brew install libusb` — the USB→PTY bridge's `pyusb` needs this system library.
+- For the DMG path: an EC20/EG25 modem with an active SIM. The app bundles its
+  Python runtime, CallPilot code, `ffmpeg`, and `libusb`.
+- For the developer path: Python 3.12+, a working `ffmpeg` on PATH, and on
+  macOS `brew install libusb` for the USB→PTY bridge.
 - A **DashScope API key** (for Qwen). Get one at
   <https://dashscope.console.aliyun.com/>. International users go through Alibaba Cloud's
   **Model Studio** (a different endpoint — advanced users can point at it via the
   `DASHSCOPE_REALTIME_URL` env var in `.env`).
   (Doubao is experimental; outbound calls may be silent. OpenAI credentials are optional.)
 
-### Quick start (macOS)
+### Install for regular users (macOS DMG)
+
+Download `CallPilot.dmg` from GitHub Releases, open it, and drag
+`CallPilot.app` to `/Applications`. The DMG is built by
+[`packaging/build_installer.sh`](packaging/build_installer.sh); release builds
+will attach the generated `dist/CallPilot.dmg`.
+
+Unsigned builds are blocked by Gatekeeper the first time. Right-click
+`CallPilot.app` in `/Applications`, choose **Open**, and confirm once; later
+launches can use the normal double-click/open flow.
+
+On first launch, open <http://127.0.0.1:47100> from the menu bar app. The setup
+wizard guides you through hardware status, provider credentials, owner/persona
+settings, and an optional test SMS, so you do not need to hand-edit `.env` for
+normal installation.
+
+### Developer path (macOS from source)
 
 ```bash
 git clone https://github.com/tianye1999/callpilot.git callpilot && cd callpilot
@@ -118,8 +135,9 @@ OWNER_NAME=Your Name        # shown to callers; blank = neutral "the owner"
 AGENT_LANGUAGE=en           # language the AI speaks on calls & summaries (zh|en); default zh
 ```
 
-Then call the modem's SIM number — the AI should auto-answer. All settings are
-editable live in the **Settings** panel of the UI.
+Then open <http://127.0.0.1:47100> and follow the first-run wizard, or edit
+`.env` manually if you prefer. Call the modem's SIM number — the AI should
+auto-answer. All settings are editable live in the **Settings** panel of the UI.
 
 ### Quick start (Windows) — awaiting hardware reports
 
@@ -151,21 +169,24 @@ Details in [`scripts/windows/README.md`](scripts/windows/README.md). This path
 is code-complete and CI-tested but **not yet verified on real hardware** — if
 you have an EC20 on Windows, please [report back](.github/ISSUE_TEMPLATE)!
 
-### Desktop app (optional)
+### Desktop app vs installer
 
 ```bash
 # macOS
 .venv/bin/pip install pyinstaller   # pywebview is already a core dependency
 bash scripts/build_app.sh          # → dist/CallPilot.app
+# standalone installer
+bash packaging/build_installer.sh  # → dist/CallPilot.app + dist/CallPilot.dmg
 # Windows
 powershell -ExecutionPolicy Bypass -File scripts\windows\build_app.ps1   # → dist\CallPilot\CallPilot.exe
 ```
 
 On macOS `CallPilot.app` is a **menu-bar app**: a phone icon sits in the menu bar
 (green = service running, gray = stopped) with *Open dashboard / Restart service /
-Quit*. It's a thin control panel over your local checkout — the call-answering
-service runs in the background (launchd), so closing the dashboard window never
-drops a call. A self-contained installer is v0.3 on the roadmap.
+Quit*. `scripts/build_app.sh` builds a thin app over your local checkout for
+development. `packaging/build_installer.sh` builds the standalone DMG with the
+runtime and native dependencies bundled; signing and notarization are optional
+and still pending for official distribution.
 
 ### Verify it works, without a human on the line
 
@@ -258,12 +279,26 @@ macOS 没有 Quectel 厂商串口的原生设备，需先跑 USB→PTY 桥（`sc
 
 ### 前置
 
-- Python 3.12+、PATH 里有 `ffmpeg`、一张有效 SIM 的 EC20/EG25 模组。
-- macOS 还需 `brew install libusb`（USB→PTY 桥的 pyusb 依赖系统库）。
+- 普通用户 DMG 路径：一张有效 SIM 的 EC20/EG25 模组；App 已内置 Python runtime、
+  CallPilot 代码、`ffmpeg` 与 `libusb`。
+- 开发者源码路径：Python 3.12+、PATH 里有 `ffmpeg`；macOS 还需
+  `brew install libusb`（USB→PTY 桥的 pyusb 依赖系统库）。
 - **DashScope API Key**（Qwen 用），申请：<https://dashscope.console.aliyun.com/>。
   豆包 provider 仍为 experimental，外呼可能不出声；OpenAI 凭证可选。
 
-### 快速开始（macOS）
+### 普通用户安装（macOS DMG）
+
+从 GitHub Releases 下载 `CallPilot.dmg`，打开后把 `CallPilot.app` 拖到
+`/Applications`。这个 DMG 由 [`packaging/build_installer.sh`](packaging/build_installer.sh)
+构建，发布时会附带生成的 `dist/CallPilot.dmg`。
+
+未签名构建首次启动会被 Gatekeeper 拦截：在 `/Applications` 里右键
+`CallPilot.app` → **打开**，确认一次；之后即可正常双击/打开。
+
+首次启动后，从菜单栏 App 打开 <http://127.0.0.1:47100>。首启向导会引导检查硬件、
+填写 provider 凭证、设置机主/人设，并可发送一条测试短信；普通安装无需手改 `.env`。
+
+### 开发者路径（macOS 源码运行）
 
 ```bash
 git clone https://github.com/tianye1999/callpilot.git callpilot && cd callpilot
@@ -287,8 +322,8 @@ cp .env.example .env          # 编辑 .env
 
 </details>
 
-`.env` 最小配置见上方英文段。之后拨打模组 SIM 卡号码即可，AI 应自动接听；
-所有配置都能在界面「设置」面板里实时修改。
+打开 <http://127.0.0.1:47100> 跟随首启向导，或按上方英文段手动写最小 `.env`。
+之后拨打模组 SIM 卡号码即可，AI 应自动接听；所有配置都能在界面「设置」面板里实时修改。
 
 ### 快速开始（Windows）—— 待硬件复现反馈
 
@@ -318,12 +353,14 @@ copy .env.example .env             # 编辑 .env
 详见 [`scripts/windows/README.md`](scripts/windows/README.md)。该路径代码完备且
 过 CI，但**尚未真机验证**——如果你有 EC20 + Windows，欢迎提 issue 反馈！
 
-### 桌面 App（可选）
+### 桌面 App 与安装包
 
 ```bash
 # macOS
 .venv/bin/pip install pyinstaller   # pywebview 已是核心依赖
 bash scripts/build_app.sh          # → dist/CallPilot.app
+# 独立安装包
+bash packaging/build_installer.sh  # → dist/CallPilot.app + dist/CallPilot.dmg
 # Windows
 powershell -ExecutionPolicy Bypass -File scripts\windows\build_app.ps1   # → dist\CallPilot\CallPilot.exe
 ```
@@ -331,7 +368,8 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\build_app.ps1   # → d
 macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=服务运行中，
 灰=已停止），菜单含「打开控制台 / 重启服务 / 退出」。它只是本地代码仓库的薄壳
 控制面板——接电话的服务在后台常驻（launchd），关掉面板窗口不影响接打电话。
-真正独立的安装包是路线图 v0.3。
+`scripts/build_app.sh` 适合开发调试；`packaging/build_installer.sh` 会把 runtime 和原生依赖
+打进独立 DMG。官方分发仍缺签名与公证。
 
 ### 无需真人也能自测
 

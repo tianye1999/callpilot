@@ -10,7 +10,6 @@ from agentcall.prompts import (
     owner_name,
 )
 
-
 # ---- 机主与人设：config 读取与中性缺省 ----
 
 def test_owner_and_persona_from_env(monkeypatch):
@@ -184,7 +183,7 @@ def test_owner_persona_fallback_per_language(monkeypatch):
 
 
 def test_agent_language_reads_config(monkeypatch):
-    from agentcall import prompts, config
+    from agentcall import prompts
     monkeypatch.setenv("AGENT_LANGUAGE", "en")
     assert prompts.agent_language() == "en"
     monkeypatch.setenv("AGENT_LANGUAGE", "zh")

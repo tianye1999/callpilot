@@ -10,7 +10,6 @@ from queue import Empty
 
 from agentcall.agents import qwen_agent
 
-
 # ---------------------------------------------------------------------------
 # 夹具：伪造 OmniRealtimeConversation
 # ---------------------------------------------------------------------------

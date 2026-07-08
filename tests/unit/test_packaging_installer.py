@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BUILD_SCRIPT = PROJECT_ROOT / "packaging" / "build_installer.sh"
 PACKAGING_README = PROJECT_ROOT / "packaging" / "README.md"

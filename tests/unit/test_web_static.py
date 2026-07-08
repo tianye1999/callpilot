@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 INDEX = Path(__file__).resolve().parents[2] / "src" / "agentcall" / "web" / "static" / "index.html"
 
 

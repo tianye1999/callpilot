@@ -16,7 +16,6 @@ from agentcall.agents import factory, openai_agent
 from agentcall.agents.openai_agent import OpenAIVoiceAgent
 from agentcall.agents.tools import ToolRegistry
 
-
 # ---------------------------------------------------------------------------
 # 夹具：伪造 websocket 与 websockets.connect
 # ---------------------------------------------------------------------------

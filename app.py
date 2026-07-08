@@ -14,9 +14,8 @@ import sys
 import threading
 import webbrowser
 
-from dotenv import load_dotenv
-
 from aiohttp import web
+from dotenv import load_dotenv
 
 from agentcall import config
 from agentcall.call_agent import CallAgentService

@@ -7,7 +7,7 @@ import time
 
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
-from agentcall.call_agent import CallAgentService, CallSession
+from agentcall.call_agent import CallAgentService
 from agentcall.events import EventHub
 
 

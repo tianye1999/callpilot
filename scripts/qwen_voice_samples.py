@@ -20,7 +20,6 @@ sys.path.insert(0, str(ROOT / "src"))
 from agentcall.agents.qwen_agent import QwenVoiceAgent  # noqa: E402
 from agentcall.audio_bridge import resample_pcm  # noqa: E402
 
-
 DEFAULT_VOICES = ["Alek", "Andre", "Raymond", "Dylan"]
 DEFAULT_TEXT = (
     "你好，我是红茶语音助手。现在正在试听 {voice} 音色。"

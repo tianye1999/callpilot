@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 import argparse
-import math
 import audioop
+import math
 import sys
 import threading
 import time

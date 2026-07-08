@@ -6,9 +6,9 @@ import asyncio
 import logging
 import os
 import re
-from queue import Empty, Queue
 import threading
 import time
+from queue import Empty, Queue
 from typing import Callable
 
 from . import config

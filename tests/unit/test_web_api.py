@@ -225,7 +225,15 @@ def test_validate_key_endpoint_valid_invalid_and_network(monkeypatch):
 
 def test_setup_complete_marks_setup_done(monkeypatch, tmp_path):
     env_file = tmp_path / ".env"
-    monkeypatch.setattr(config, "mark_setup_done", lambda env_path=None: config.update_env_file({"SETUP_DONE": "true"}, env_path=env_file, allow_hidden=True))
+    monkeypatch.setattr(
+        config,
+        "mark_setup_done",
+        lambda env_path=None: config.update_env_file(
+            {"SETUP_DONE": "true"},
+            env_path=env_file,
+            allow_hidden=True,
+        ),
+    )
     app = make_app(FakeService())
 
     async def fn(client):
@@ -936,6 +944,7 @@ def test_restart_without_event_returns_501():
 def test_restart_sets_event_and_returns_ok():
     """注入 restart_event 时：置位事件并返回 ok（主循环据此 execv 重启）。"""
     import threading
+
     from agentcall.web.server import build_app as _build
     ev = threading.Event()
     app = _build(hub=None, modem=None, service=FakeService(), restart_event=ev)

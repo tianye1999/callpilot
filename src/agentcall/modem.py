@@ -732,7 +732,7 @@ class Eg25Modem:
             return
 
         cmgr_line = next(
-            (l for l in response.splitlines() if l.strip().startswith("+CMGR:")),
+            (line for line in response.splitlines() if line.strip().startswith("+CMGR:")),
             "",
         )
         sender, timestamp, body = self._interpret_sms(

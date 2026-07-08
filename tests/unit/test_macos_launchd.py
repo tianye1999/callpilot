@@ -124,7 +124,10 @@ def test_install_launch_agents_bootstraps_existing_plist_when_unit_not_loaded(tm
         support_dir=tmp_path / "Support",
         launch_dir=tmp_path / "LaunchAgents",
     )
-    macos_launchd.install_launch_agents(layout, runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "", ""))
+    macos_launchd.install_launch_agents(
+        layout,
+        runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
 
     calls.clear()
     assert macos_launchd.install_launch_agents(layout, runner=fake_run) == [

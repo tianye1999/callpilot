@@ -25,6 +25,8 @@ Issues = "https://github.com/tianye1999/callpilot/issues"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "ruff>=0.15",
+    "mypy>=1.10",
 ]
 
 [build-system]
@@ -39,3 +41,33 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Ad-hoc recording analysis script kept in its compact exploratory style for now;
+# production code and tests still use the normal E/F/W/I gate.
+"scripts/analyze_recording.py" = ["E401", "E702", "I001"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+files = ["src/agentcall"]
+
+[[tool.mypy.overrides]]
+# Initial mypy adoption: these modules need runtime-preserving type narrowing later.
+module = [
+    "agentcall.agents.doubao_agent",
+    "agentcall.agents.openai_agent",
+    "agentcall.agents.qwen_agent",
+    "agentcall.audio_bridge",
+    "agentcall.call_agent",
+    "agentcall.monitor_playback",
+    "agentcall.web.server",
+]
+ignore_errors = true

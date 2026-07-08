@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import plistlib
 import subprocess
 import time
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
