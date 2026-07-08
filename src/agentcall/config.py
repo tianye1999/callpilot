@@ -63,11 +63,13 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                "qwen3.5-omni-flash-realtime", requires_restart=True),
     ConfigSpec("QWEN_VOICE", "Qwen 音色", "str", "Raymond"),
     # 模型显示名只用于 /api/meta 与豆包自我介绍提示词，属内部项不进面板。
+    # 显示名用语言中性的品牌名（Qwen/Doubao 是同款产品的国际名），
+    # 避免英文界面右上角出现「通义千问」这类中文品牌串。
     ConfigSpec("AGENT_MODEL_NAME", "Qwen 模型显示名", "str",
-               "通义千问 Qwen3.5-Omni", editable=False, hidden=True,
+               "Qwen3.5-Omni", editable=False, hidden=True,
                requires_restart=True),
     ConfigSpec("AGENT_MODEL_NAME_DOUBAO", "豆包模型显示名", "str",
-               "豆包实时语音大模型", editable=False, hidden=True,
+               "Doubao Realtime", editable=False, hidden=True,
                requires_restart=True),
     # 豆包接入的固定资源参数（火山引擎文档给定，一般无需改动）。
     ConfigSpec("DOUBAO_RESOURCE_ID", "豆包资源 ID", "str", "volc.speech.dialog",

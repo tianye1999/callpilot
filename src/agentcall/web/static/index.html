@@ -244,7 +244,7 @@
     box-shadow: 0 0 9px var(--ok); animation: breathe 1.2s infinite;
   }
   #chat { min-height: 300px; max-height: calc(100vh - 300px); overflow-y: auto; padding: 18px 20px; }
-  #chat:empty::before { content: "等待通话转写…"; color: var(--dim); font-size: 13px; display: block; text-align: center; padding: 40px 0; }
+  #chat:empty::before { content: attr(data-empty); color: var(--dim); font-size: 13px; display: block; text-align: center; padding: 40px 0; }
   .bubble { margin-bottom: 14px; max-width: 82%; animation: rise .25s ease both; }
   @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
   .bubble .who { font-size: 10.5px; letter-spacing: .1em; color: var(--muted); margin-bottom: 4px; }
@@ -337,10 +337,11 @@
   .cfg-row label.switch { flex: 0 0 48px; }
   .cfg-row .key { display: block; font-size: 10px; color: var(--dim); font-family: var(--mono); }
   .tag-restart { font-size: 10px; color: var(--warn); margin-left: 6px; }
-  .cfg-row input[type=text], .cfg-row select {
+  .cfg-row input[type=text], .cfg-row input[type=number], .cfg-row select {
     width: 200px; background: var(--well); border: 1px solid var(--border);
     color: var(--text); border-radius: 9px; padding: 7px 10px; font-size: 13px; font-family: var(--mono);
   }
+  .cfg-row input[type=number] { color-scheme: dark; }  /* 步进箭头也用深色 */
   .cfg-row input:disabled, .cfg-row select:disabled { opacity: .4; }
   .tag-secret {
     font-size: 11px; padding: 3px 12px; border-radius: 999px;
@@ -594,6 +595,7 @@ const I18N = {
     q_active: (p, d) => `In progress · ${p} pending · ${d} dialed`, q_current: " dialing",
     recent_label: "RECENT CALLS", empty_calls: "No calls yet", view_all: "View all history",
     live_title: "Live Transcript", live_sub_idle: "Opens automatically when a call starts",
+    live_empty: "Waiting for transcript…", dtmf_send_fail: "Send failed",
     who_user: "Caller", who_agent: "AI Pilot",
     sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
@@ -616,9 +618,12 @@ const I18N = {
     cfg: {
       AGENT_PROVIDER: "Agent provider", DASHSCOPE_API_KEY: "DashScope API key",
       QWEN_REALTIME_MODEL: "Qwen realtime model", QWEN_VOICE: "Qwen voice",
+      OPENAI_REALTIME_MODEL: "OpenAI realtime model", OPENAI_VOICE: "OpenAI voice",
+      OPENAI_REALTIME_URL: "OpenAI endpoint override", OPENAI_RECONNECT_MAX: "OpenAI max reconnects",
       AGENT_OUTBOUND_TASK: "Default outbound topic",
       OWNER_NAME: "Owner name", AGENT_PERSONA: "AI persona title",
       MODEM_PORT: "Modem AT port", MODEM_BAUD: "Baud rate",
+      MODEM_PCM_PORT: "Modem PCM port", MODEM_PCM_BAUD: "PCM baud rate",
       MODEM_AUDIO_MODE: "Audio mode", MODEM_AUDIO_KEYWORD: "UAC device keyword",
       MODEM_TX_GAIN: "TX gain",
       HALF_DUPLEX_HANGOVER_SECONDS: "Half-duplex hangover (s)",
@@ -652,6 +657,7 @@ const I18N = {
     q_active: (p, d) => `队列进行中 · 待拨 ${p} · 已拨 ${d}`, q_current: " 拨打中",
     recent_label: "最近通话", empty_calls: "暂无通话", view_all: "查看全部历史",
     live_title: "实时对话", live_sub_idle: "通话开始后自动进入本页",
+    live_empty: "等待通话转写…", dtmf_send_fail: "发送失败",
     who_user: "对方", who_agent: "AI 副驾",
     sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
@@ -688,6 +694,7 @@ function applyI18n() {
   $("stateText").textContent = t("st_" + callStatus) !== "st_" + callStatus ? t("st_" + callStatus) : callStatus;
   $("modemState").textContent = t(modemConnected ? "modem_on" : "modem_off");
   $("liveSub").textContent = callActive ? ($("stateNum").textContent || "") : t("live_sub_idle");
+  $("chat").dataset.empty = t("live_empty");  // 空转写占位（CSS ::before 读取）
 }
 
 
@@ -777,7 +784,7 @@ function addSms(event) {
   const isIn = event.type === "sms_in";
   const item = el("div", "sms-item " + (isIn ? "in" : "out"));
   const head = el("div", "head");
-  const who = isIn ? (event.sender || "未知") : (event.number || "");
+  const who = isIn ? (event.sender || t("unknown_number")) : (event.number || "");
   head.appendChild(el("span", "dir", (isIn ? t("sms_in") : t("sms_out")) + who));
   const right = el("span");
   right.appendChild(el("span", "", fmtTime(event.ts) + " "));
@@ -879,8 +886,8 @@ $("hangupBtn").addEventListener("click", async () => {
       try {
         const { res } = await postJson("/api/call/dtmf", { digits: k });
         if (res.ok) $("dtmfSent").textContent = ($("dtmfSent").textContent + k).slice(-16);
-        else $("dtmfSent").textContent = "发送失败";
-      } catch (e) { $("dtmfSent").textContent = "请求出错"; }
+        else $("dtmfSent").textContent = t("dtmf_send_fail");
+      } catch (e) { $("dtmfSent").textContent = t("req_error"); }
     });
     keys.appendChild(b);
   }
@@ -1050,6 +1057,11 @@ $("batchDialBtn").addEventListener("click", async () => {
 
 /* ========= 设置 ========= */
 let cfgSpecs = [];
+// 音色建议：datalist 非限制性，仅作下拉便利；provider 新增音色仍可手打。
+const CFG_SUGGEST = {
+  OPENAI_VOICE: ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"],
+  QWEN_VOICE: ["Cherry", "Serena", "Ethan", "Chelsie"],
+};
 const truthy = ["true", "1", "yes"];
 const boolChecked = (v) => truthy.includes(String(v).trim().toLowerCase());
 function cfgGroup(key) {
@@ -1116,12 +1128,36 @@ async function loadConfig() {
         ctrl.disabled = !c.editable;
         ctrl.dataset.key = c.key;
         row.appendChild(ctrl);
+      } else if (c.kind === "int" || c.kind === "float") {
+        // 数值项用 number 输入框：带步进/校验，比自由文本更合适。
+        ctrl = document.createElement("input");
+        ctrl.type = "number";
+        ctrl.step = c.kind === "int" ? "1" : "any";
+        if (!/GAIN/.test(c.key)) ctrl.min = "0";  // 增益外的数值均非负
+        ctrl.value = c.value;
+        ctrl.disabled = !c.editable;
+        ctrl.dataset.key = c.key;
+        row.appendChild(ctrl);
       } else {
         ctrl = document.createElement("input");
         ctrl.type = "text";
         ctrl.value = c.value;
         ctrl.disabled = !c.editable;
         ctrl.dataset.key = c.key;
+        // 音色等「可枚举但会新增」的项：给 datalist 建议但不限制（仍可手打）。
+        const suggest = CFG_SUGGEST[c.key];
+        if (suggest) {
+          const listId = "dl-" + c.key;
+          ctrl.setAttribute("list", listId);
+          const dl = document.createElement("datalist");
+          dl.id = listId;
+          for (const opt of suggest) {
+            const o = document.createElement("option");
+            o.value = opt;
+            dl.appendChild(o);
+          }
+          row.appendChild(dl);
+        }
         row.appendChild(ctrl);
       }
       groups.get(g).appendChild(row);
