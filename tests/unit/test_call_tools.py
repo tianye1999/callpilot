@@ -35,6 +35,7 @@ def make_tools(
     record: SpyRecord | None = None,
     on_hangup=None,
     sms_gate=None,
+    send_dtmf=None,
 ) -> tuple[CallTools, FakeModem, list]:
     modem = modem or FakeModem()
     hangups: list[bool] = []
@@ -45,6 +46,7 @@ def make_tools(
         get_record=lambda: record,
         schedule_hangup=on_hangup or (lambda: hangups.append(True)),
         is_sms_target_allowed=sms_gate,
+        send_dtmf=send_dtmf,
     )
     return tools, modem, hangups
 
@@ -228,7 +230,23 @@ def test_send_dtmf_dispatches_to_modem_and_logs_record():
 
     assert result["success"] is True
     assert sent == ["103#"]
-    assert record.events == [("dtmf", {"digits": "103#"})]  # 审计日志
+    assert record.events == [("dtmf", {"digits": "103#", "mode": "qvts"})]  # 审计日志
+
+
+def test_send_dtmf_uses_injected_session_sender_and_logs_mode():
+    record = SpyRecord()
+    sent: list[str] = []
+    tools, modem, _ = make_tools(
+        record=record,
+        send_dtmf=lambda digits: sent.append(digits) or (True, "inband"),
+    )
+
+    result = tools._send_dtmf({"digits": "9"})
+
+    assert result["success"] is True
+    assert sent == ["9"]
+    assert modem.calls == []
+    assert record.events == [("dtmf", {"digits": "9", "mode": "inband"})]
 
 
 def test_send_dtmf_rejects_empty_digits():

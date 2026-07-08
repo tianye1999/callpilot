@@ -187,6 +187,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 通话行为 ----
     ConfigSpec("HALF_DUPLEX_HANGOVER_SECONDS", "半双工挂尾时长（秒）", "float", "0.5"),
     ConfigSpec("HANGUP_TOOL_DELAY_SECONDS", "挂断工具延迟（秒）", "float", "4.5"),
+    ConfigSpec("DTMF_MODE", "DTMF 发送模式", "select", "inband",
+               choices=("inband", "qvts", "both")),
     ConfigSpec("REPEAT_SUPPRESS_SIMILARITY", "复读抑制相似度阈值", "float", "0.9"),
     # 外呼硬时限（秒）：LLM 收尾裁判失灵/漏判时的最后防线，到点自动道别挂断；
     # 0 = 不限制。（正常收尾由 summarizer.judge_wrap_up 提前判定。）

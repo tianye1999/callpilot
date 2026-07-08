@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from .events import EventHub
     from .modem import Eg25Modem
 
+DtmfSender = Callable[[str], tuple[bool, str]]
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,6 +48,7 @@ class CallTools:
         get_record: Callable[[], "CallRecord | None"],
         schedule_hangup: Callable[[], None],
         is_sms_target_allowed: Callable[[str], bool] | None = None,
+        send_dtmf: DtmfSender | None = None,
     ) -> None:
         self._modem = modem
         self._hub = hub
@@ -55,6 +58,7 @@ class CallTools:
         # 发短信目标限制:只允许回复已联系过的号码(由 CallSession 注入)。
         # None = 不限制(直接构造 CallTools 的单测保持旧行为)。
         self._is_sms_target_allowed = is_sms_target_allowed
+        self._send_dtmf_impl = send_dtmf or self._send_dtmf_via_modem
 
     def register(self) -> ToolRegistry:
         registry = ToolRegistry()
@@ -179,18 +183,21 @@ class CallTools:
         if not digits:
             return {"success": False, "message": "按键序列为空"}
         try:
-            ok = self._modem.send_dtmf(digits)
+            ok, mode = self._send_dtmf_impl(digits)
         except Exception as exc:  # noqa: BLE001
             logger.warning("工具发送 DTMF 失败: %s", exc)
             return {"success": False, "message": f"按键发送失败: {exc}"}
         record = self._get_record()
         if ok and record is not None:
-            record.log_event("dtmf", digits=digits)
+            record.log_event("dtmf", digits=digits, mode=mode)
         return {
             "success": ok,
             "digits": digits,
             "message": f"已按 {digits}" if ok else "按键发送失败",
         }
+
+    def _send_dtmf_via_modem(self, digits: str) -> tuple[bool, str]:
+        return self._modem.send_dtmf(digits), "qvts"
 
     def _query_code(self, args: dict) -> dict:
         """工具处理：从最近收到的短信里查验证码。"""

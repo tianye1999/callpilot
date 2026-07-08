@@ -15,6 +15,7 @@ from . import config
 from .agents.factory import create_agent
 from .agents.tools import ToolRegistry
 from .audio_bridge import (
+    MODEM_RATE,
     FfmpegAudioBridge,
     ModemAudioBridge,
     SerialPcmAudioBridge,
@@ -25,6 +26,7 @@ from .call_log import CallLogger, CallRecord
 from .call_tools import CallTools
 from .contacts import is_reply_target_allowed
 from .dial_queue import DialQueue, whitelist_from_env
+from .dtmf import dtmf_tone
 from .events import EventHub
 from .modem import Eg25Modem
 from .monitor_playback import MonitorPlayback
@@ -486,6 +488,7 @@ class CallSession:
             get_record=lambda: self._record,
             schedule_hangup=self._schedule_deferred_hangup,
             is_sms_target_allowed=self._sms_target_allowed,
+            send_dtmf=self._send_dtmf_raw,
         )
         return tools.register()
 
@@ -556,6 +559,41 @@ class CallSession:
             )
             self._hangup_timer = timer
             timer.start()
+
+    def send_dtmf(self, digits: str) -> tuple[bool, str | None]:
+        """发送 DTMF；UAC 模式默认把双音作为带内 PCM 注入下行队列。"""
+        try:
+            ok, mode = self._send_dtmf_raw(digits)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("发送 DTMF 失败: %s", exc)
+            return False, "按键发送失败"
+        if ok and self._record is not None:
+            self._record.log_event("dtmf", digits=digits, mode=mode)
+        return (True, None) if ok else (False, "按键发送失败")
+
+    def _send_dtmf_raw(self, digits: str) -> tuple[bool, str]:
+        mode = self._resolve_dtmf_mode()
+        ok = True
+        if mode in {"inband", "both"}:
+            tone = dtmf_tone(digits, MODEM_RATE)
+            if not tone:
+                return False, mode
+            # 与 Agent 语音共用 _outgoing_audio，后续由 _drain_agent_audio
+            # 按既有下行链路送入桥；半双工 pending 判定也会自然把它当成正在说话。
+            if self._record is not None:
+                self._record.write_downlink(tone)
+            self._outgoing_audio.put(tone)
+        if mode in {"qvts", "both"}:
+            ok = self.modem.send_dtmf(digits)
+        return ok, mode
+
+    def _resolve_dtmf_mode(self) -> str:
+        configured = config.get_str("DTMF_MODE").strip().lower()
+        if configured not in {"inband", "qvts", "both"}:
+            configured = "inband"
+        if self.audio_mode not in {"uac", "uac_ffmpeg"}:
+            return "qvts"
+        return configured
 
     def _deferred_hangup(self, generation: int) -> None:
         with self._hangup_lock:
@@ -809,8 +847,7 @@ class CallAgentService:
         """通话中人工发送 DTMF 按键（IVR 菜单导航）。"""
         if not self.session.is_active:
             return False, "当前没有进行中的通话"
-        ok = self.modem.send_dtmf(digits)
-        return (True, None) if ok else (False, "按键发送失败")
+        return self.session.send_dtmf(digits)
 
     @staticmethod
     def _remember_outbound_task(task: str | None) -> None:

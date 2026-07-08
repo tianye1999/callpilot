@@ -11,11 +11,16 @@ from agentcall.call_agent import CallAgentService
 from agentcall.events import EventHub
 
 
-def make_service(modem: FakeModem, hub: EventHub | None = None) -> CallAgentService:
+def make_service(
+    modem: FakeModem,
+    hub: EventHub | None = None,
+    audio_mode: str = "uac",
+) -> CallAgentService:
     return CallAgentService(
         modem_port="unused",
         audio_keyword="unused",
         provider="qwen",
+        audio_mode=audio_mode,
         hub=hub,
         modem=modem,  # type: ignore[arg-type]  # FakeModem 与 Eg25Modem 同形
     )
@@ -104,7 +109,7 @@ def test_service_send_dtmf_requires_active_call():
     modem = FakeModem()
     sent: list[str] = []
     modem.send_dtmf = lambda digits: sent.append(digits) or True  # type: ignore[attr-defined]
-    service = make_service(modem)
+    service = make_service(modem, audio_mode="nmea")
 
     ok, err = service.send_dtmf("103#")
     assert not ok and "没有进行中的通话" in (err or "")
@@ -116,10 +121,55 @@ def test_service_send_dtmf_requires_active_call():
     assert sent == ["103#"]
 
 
+def test_service_send_dtmf_uses_inband_audio_for_uac(monkeypatch):
+    class SpyRecord:
+        def __init__(self) -> None:
+            self.downlink: list[bytes] = []
+            self.events: list[tuple[str, dict]] = []
+
+        def write_downlink(self, pcm: bytes) -> None:
+            self.downlink.append(pcm)
+
+        def log_event(self, type: str, **fields) -> None:  # noqa: A002
+            self.events.append((type, fields))
+
+    monkeypatch.setenv("DTMF_MODE", "inband")
+    modem = FakeModem()
+    service = make_service(modem, audio_mode="uac")
+    service.session._active = True
+    record = SpyRecord()
+    service.session._record = record  # type: ignore[assignment]
+
+    ok, err = service.send_dtmf("5")
+
+    assert ok and err is None
+    assert modem.calls == []
+    bridge = FakeAudioBridge()
+    service.session._drain_agent_audio(bridge)
+    assert len(bridge.downlink) == 1
+    tone = bridge.downlink[0]
+    assert len(tone) == int(8000 * 0.2) * 2
+    assert record.downlink == [tone]
+    assert record.events == [("dtmf", {"digits": "5", "mode": "inband"})]
+
+
+def test_service_send_dtmf_keeps_qvts_for_nmea(monkeypatch):
+    monkeypatch.setenv("DTMF_MODE", "inband")
+    modem = FakeModem()
+    service = make_service(modem, audio_mode="nmea")
+    service.session._active = True
+
+    ok, err = service.send_dtmf("5")
+
+    assert ok and err is None
+    assert ("send_dtmf", ("5",)) in modem.calls
+    assert service.session._outgoing_audio.empty()
+
+
 def test_service_send_dtmf_reports_modem_failure():
     modem = FakeModem()
     modem.send_dtmf = lambda digits: False  # type: ignore[attr-defined]
-    service = make_service(modem)
+    service = make_service(modem, audio_mode="nmea")
     service.session._active = True
 
     ok, err = service.send_dtmf("1")

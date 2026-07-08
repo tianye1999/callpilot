@@ -54,6 +54,10 @@ class FakeModem:
         self.calls.append(("send_sms", (number, text)))
         return self.sms_should_succeed
 
+    def send_dtmf(self, digits: str) -> bool:
+        self.calls.append(("send_dtmf", (digits,)))
+        return bool(digits)
+
     def is_call_connected(self) -> bool:
         return self.connected_flag.is_set()
 
