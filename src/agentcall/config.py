@@ -79,7 +79,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # Realtime 端点覆写（调试用）；留空走 dashscope SDK 内置 wss 地址。
     ConfigSpec("DASHSCOPE_REALTIME_URL", "Qwen Realtime 端点覆写", "str", "",
                editable=False, hidden=True),
-    # OpenAI Realtime（凭证 OPENAI_API_KEY 不进注册表，见 PROVIDER_REQUIRED_KEYS）。
+    # OpenAI Realtime。API Key 仍从环境变量读（凭证校验见 PROVIDER_REQUIRED_KEYS），
+    # 此处登记只为在设置面板显示「已设置/未设置」状态（editable=False，不回传真值）。
+    ConfigSpec("OPENAI_API_KEY", "OpenAI API Key", "str", "",
+               editable=False, secret=True, requires_restart=True),
     ConfigSpec("OPENAI_REALTIME_MODEL", "OpenAI 实时模型", "str",
                "gpt-realtime-mini", requires_restart=True),
     ConfigSpec("OPENAI_VOICE", "OpenAI 音色", "str", "alloy"),

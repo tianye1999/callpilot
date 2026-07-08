@@ -596,6 +596,7 @@ const I18N = {
     recent_label: "RECENT CALLS", empty_calls: "No calls yet", view_all: "View all history",
     live_title: "Live Transcript", live_sub_idle: "Opens automatically when a call starts",
     live_empty: "Waiting for transcript…", dtmf_send_fail: "Send failed",
+    cfg_leave_save: "You have unsaved settings. Save them before leaving?  (OK = save, Cancel = discard)",
     who_user: "Caller", who_agent: "AI Pilot",
     sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
@@ -618,6 +619,7 @@ const I18N = {
     cfg: {
       AGENT_PROVIDER: "Agent provider", DASHSCOPE_API_KEY: "DashScope API key",
       QWEN_REALTIME_MODEL: "Qwen realtime model", QWEN_VOICE: "Qwen voice",
+      OPENAI_API_KEY: "OpenAI API key",
       OPENAI_REALTIME_MODEL: "OpenAI realtime model", OPENAI_VOICE: "OpenAI voice",
       OPENAI_REALTIME_URL: "OpenAI endpoint override", OPENAI_RECONNECT_MAX: "OpenAI max reconnects",
       AGENT_OUTBOUND_TASK: "Default outbound topic",
@@ -659,6 +661,7 @@ const I18N = {
     recent_label: "最近通话", empty_calls: "暂无通话", view_all: "查看全部历史",
     live_title: "实时对话", live_sub_idle: "通话开始后自动进入本页",
     live_empty: "等待通话转写…", dtmf_send_fail: "发送失败",
+    cfg_leave_save: "有未保存的设置修改，离开前保存吗？（确定 = 保存，取消 = 放弃）",
     who_user: "对方", who_agent: "AI 副驾",
     sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
@@ -735,8 +738,16 @@ function switchPage(name) {
   });
   if (name === "history") loadHistory();
 }
+function navTo(name) {
+  // 离开设置页且有未保存修改：确认=保存后离开，取消=放弃后离开。
+  if (currentPage === "settings" && name !== "settings" && cfgDirty) {
+    if (confirm(t("cfg_leave_save"))) $("configSave").click();
+    cfgDirty = false;
+  }
+  switchPage(name);
+}
 document.querySelectorAll(".dock button").forEach((b) =>
-  b.addEventListener("click", () => switchPage(b.dataset.page)));
+  b.addEventListener("click", () => navTo(b.dataset.page)));
 
 /* ========= 全局通话状态 ========= */
 let callActive = false;
@@ -1058,6 +1069,7 @@ $("batchDialBtn").addEventListener("click", async () => {
 
 /* ========= 设置 ========= */
 let cfgSpecs = [];
+let cfgDirty = false;  // 设置有未保存修改（离开页面时据此提示）
 // 音色建议：datalist 非限制性，仅作下拉便利；provider 新增音色仍可手打。
 const CFG_SUGGEST = {
   OPENAI_VOICE: ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"],
@@ -1167,8 +1179,13 @@ async function loadConfig() {
     for (const wrap of groups.values()) {
       if (wrap.childElementCount <= 1) wrap.remove();
     }
+    cfgDirty = false;  // 刚从服务端同步，视为无未保存修改
   } catch (e) { console.warn("[config] 加载设置面板失败", e); }
 }
+// 任一字段被改动即标记「脏」（离开页面时据此提示保存）。
+$("configForm").addEventListener("input", () => { cfgDirty = true; });
+$("configForm").addEventListener("change", () => { cfgDirty = true; });
+
 $("configSave").addEventListener("click", async () => {
   const updates = {};
   for (const c of cfgSpecs) {
@@ -1188,6 +1205,7 @@ $("configSave").addEventListener("click", async () => {
       let msg = t("cfg_saved")(res.updated.length);
       if (res.requires_restart.length) msg += t("cfg_restart")(res.requires_restart.length);
       setToast("configToast", "ok", msg);
+      cfgDirty = false;
       loadConfig();
     } else setToast("configToast", "err", t("cfg_savefail") + (res.error || ""));
   } catch (err) { setToast("configToast", "err", t("req_error")); }
