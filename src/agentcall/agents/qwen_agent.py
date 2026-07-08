@@ -165,6 +165,7 @@ class _QwenCallback(OmniRealtimeCallback):
                 logger.info("[上行·用户] %s", transcript)
                 if self._agent:
                     self._agent._emit_transcript("user", transcript)  # noqa: SLF001
+                    self._agent._on_user_transcription_completed()  # noqa: SLF001
         elif event_type == "conversation.item.input_audio_transcription.delta":
             delta = (response.get("delta") or "").strip()
             if delta:
@@ -188,9 +189,13 @@ class _QwenCallback(OmniRealtimeCallback):
                 self._agent._dispatch_tool_call(  # noqa: SLF001
                     name, call_id, arguments
                 )
+        elif event_type == "response.created":
+            if self._agent:
+                self._agent._on_response_created()  # noqa: SLF001
         elif event_type == "response.done":
             if self._agent:
                 self._agent._audio_gate.complete_response(_response_id(response))  # noqa: SLF001
+                self._agent._on_response_done()  # noqa: SLF001
             logger.debug("千问回复轮次完成")
         elif event_type == "error":
             logger.error("千问 Realtime 错误: %s", response)
@@ -224,6 +229,8 @@ class QwenVoiceAgent(VoiceAgent):
         self._callback = _QwenCallback(self._audio_queue, agent=self)
         self._on_audio_out: Callable[[bytes], None] | None = None
         self._pump_thread: threading.Thread | None = None
+        # _running 的无锁读取只做快速短路；CPython 下 bool 引用读写原子，
+        # 资源摘取/状态转移仍由各自锁保护，避免把回调热路径全串行化。
         self._running = False
         self._handled_tool_calls: set[str] = set()
         self._instructions: str | None = None
@@ -234,10 +241,21 @@ class QwenVoiceAgent(VoiceAgent):
         self._reconnecting = False
         self._reconnect_attempts = 0
         self._reconnect_thread: threading.Thread | None = None
+        self._manual_response_enabled = False
+        self._manual_response_lock = threading.Lock()
+        self._manual_response_timer: threading.Timer | None = None
+        self._manual_response_generation = 0
+        self._manual_response_watchdog_timer: threading.Timer | None = None
+        self._manual_response_watchdog_generation = 0
+        self._manual_response_first_at: float | None = None
+        self._manual_response_outstanding = 0
+        self._manual_response_pending_after_flight = False
 
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
         self._on_audio_out = on_audio_out
         self._running = True
+        self._manual_response_enabled = config.get_bool("MANUAL_RESPONSE_CONTROL")
+        self._reset_manual_response_state()
         self._disconnected.clear()
         with self._reconnect_lock:
             self._reconnecting = False
@@ -303,19 +321,22 @@ class QwenVoiceAgent(VoiceAgent):
             tool_kwargs["tools"] = self._tools.specs()
             logger.info("已为会话注册 %d 个工具", len(self._tools.specs()))
 
-        conversation.update_session(
-            output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
-            voice=self.voice,
-            input_audio_format=AudioFormat.PCM_16000HZ_MONO_16BIT,
-            output_audio_format=AudioFormat.PCM_24000HZ_MONO_16BIT,
-            enable_input_audio_transcription=True,
-            input_audio_transcription_model="qwen3-asr-flash-realtime",
-            enable_turn_detection=True,
-            turn_detection_type="server_vad",
-            turn_detection_silence_duration_ms=600,
-            instructions=self._instructions,
+        session_kwargs = {
+            "output_modalities": [MultiModality.AUDIO, MultiModality.TEXT],
+            "voice": self.voice,
+            "input_audio_format": AudioFormat.PCM_16000HZ_MONO_16BIT,
+            "output_audio_format": AudioFormat.PCM_24000HZ_MONO_16BIT,
+            "enable_input_audio_transcription": True,
+            "input_audio_transcription_model": "qwen3-asr-flash-realtime",
+            "enable_turn_detection": True,
+            "turn_detection_type": "server_vad",
+            "turn_detection_silence_duration_ms": 600,
+            "instructions": self._instructions,
             **tool_kwargs,
-        )
+        }
+        if self._manual_response_enabled:
+            session_kwargs["turn_detection_param"] = {"create_response": False}
+        conversation.update_session(**session_kwargs)
 
         self._conversation = conversation
 
@@ -323,6 +344,7 @@ class QwenVoiceAgent(VoiceAgent):
         """回调线程通知：运行中连接被动关闭，等待 send_audio 触发重连。"""
         if not self._disconnected.is_set():
             logger.warning("千问 Realtime 运行中断线，等待下一帧音频触发重连")
+        self._cancel_manual_response_control()
         self._disconnected.set()
 
     def _maybe_start_reconnect(self) -> None:
@@ -404,7 +426,7 @@ class QwenVoiceAgent(VoiceAgent):
         except Exception as exc:  # noqa: BLE001
             # 连接可能刚死但 on_close 未及时触发：标记断线，下一帧走重连。
             logger.warning("发送音频失败，标记断线: %s", exc)
-            self._disconnected.set()
+            self._mark_disconnected()
 
     async def say(self, instructions: str) -> None:
         if not self._conversation or self._disconnected.is_set():
@@ -413,6 +435,160 @@ class QwenVoiceAgent(VoiceAgent):
             instructions=instructions,
             output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
         )
+
+    def _reset_manual_response_state(self) -> None:
+        with self._manual_response_lock:
+            self._cancel_manual_response_timer_locked()
+            self._cancel_manual_response_watchdog_locked()
+            self._manual_response_first_at = None
+            self._manual_response_outstanding = 0
+            self._manual_response_pending_after_flight = False
+
+    def _cancel_manual_response_control(self) -> None:
+        with self._manual_response_lock:
+            self._cancel_manual_response_timer_locked()
+            self._cancel_manual_response_watchdog_locked()
+            self._manual_response_first_at = None
+            self._manual_response_outstanding = 0
+            self._manual_response_pending_after_flight = False
+
+    def _cancel_manual_response_timer_locked(self) -> None:
+        timer = self._manual_response_timer
+        self._manual_response_timer = None
+        self._manual_response_generation += 1
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_manual_response_watchdog_locked(self) -> None:
+        timer = self._manual_response_watchdog_timer
+        self._manual_response_watchdog_timer = None
+        self._manual_response_watchdog_generation += 1
+        if timer is not None:
+            timer.cancel()
+
+    def _on_user_transcription_completed(self) -> None:
+        if not self._manual_response_enabled:
+            return
+        self._schedule_manual_response_timer()
+
+    def _schedule_manual_response_timer(self) -> None:
+        now = time.monotonic()
+        with self._manual_response_lock:
+            if not self._running or self._disconnected.is_set():
+                return
+            if self._manual_response_first_at is None:
+                self._manual_response_first_at = now
+            timer = self._manual_response_timer
+            if timer is not None:
+                timer.cancel()
+            self._manual_response_generation += 1
+            generation = self._manual_response_generation
+            delay = self._manual_response_delay_locked(now)
+            next_timer = threading.Timer(
+                delay, self._fire_manual_response_timer, args=(generation,)
+            )
+            next_timer.daemon = True
+            self._manual_response_timer = next_timer
+            next_timer.start()
+
+    def _manual_response_delay_locked(self, now: float) -> float:
+        silence_seconds = max(0, config.get_int("MANUAL_RESPONSE_SILENCE_MS")) / 1000
+        max_wait_seconds = max(0, config.get_int("MANUAL_RESPONSE_MAX_WAIT_MS")) / 1000
+        if max_wait_seconds <= 0 or self._manual_response_first_at is None:
+            return silence_seconds
+        elapsed = now - self._manual_response_first_at
+        return min(silence_seconds, max(0.0, max_wait_seconds - elapsed))
+
+    def _fire_manual_response_timer(self, generation: int) -> None:
+        conversation: OmniRealtimeConversation | None
+        with self._manual_response_lock:
+            if (
+                generation != self._manual_response_generation
+                or not self._running
+                or self._disconnected.is_set()
+            ):
+                return
+            self._manual_response_timer = None
+            if self._manual_response_outstanding > 0:
+                self._manual_response_pending_after_flight = True
+                self._manual_response_first_at = None
+                return
+            conversation = self._conversation
+            if conversation is None:
+                self._manual_response_first_at = None
+                return
+            self._manual_response_first_at = None
+
+        try:
+            conversation.create_response(
+                output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("手动触发千问回复失败: %s", exc)
+
+    def _on_response_created(self) -> None:
+        if not self._manual_response_enabled:
+            return
+        with self._manual_response_lock:
+            if not self._running:
+                return
+            self._manual_response_outstanding += 1
+            if self._manual_response_outstanding == 1:
+                self._start_manual_response_watchdog_locked()
+
+    def _start_manual_response_watchdog_locked(self) -> None:
+        timer = self._manual_response_watchdog_timer
+        if timer is not None:
+            timer.cancel()
+        self._manual_response_watchdog_generation += 1
+        generation = self._manual_response_watchdog_generation
+        max_wait_seconds = max(0, config.get_int("MANUAL_RESPONSE_MAX_WAIT_MS")) / 1000
+        if max_wait_seconds <= 0:
+            return
+        next_timer = threading.Timer(
+            max_wait_seconds, self._fire_manual_response_watchdog, args=(generation,)
+        )
+        next_timer.daemon = True
+        self._manual_response_watchdog_timer = next_timer
+        next_timer.start()
+
+    def _fire_manual_response_watchdog(self, generation: int) -> None:
+        should_schedule = False
+        with self._manual_response_lock:
+            if (
+                generation != self._manual_response_watchdog_generation
+                or not self._running
+                or self._disconnected.is_set()
+                or self._manual_response_outstanding <= 0
+            ):
+                return
+            logger.warning("手动应答控制等待 response.done 超时，清理 in-flight 状态")
+            self._manual_response_watchdog_timer = None
+            self._manual_response_outstanding = 0
+            if self._manual_response_pending_after_flight:
+                self._manual_response_pending_after_flight = False
+                should_schedule = True
+        if should_schedule:
+            self._schedule_manual_response_timer()
+
+    def _on_response_done(self) -> None:
+        if not self._manual_response_enabled:
+            return
+        should_schedule = False
+        with self._manual_response_lock:
+            if self._manual_response_outstanding > 0:
+                self._manual_response_outstanding -= 1
+            if self._manual_response_outstanding == 0:
+                self._cancel_manual_response_watchdog_locked()
+            if (
+                self._manual_response_outstanding == 0
+                and self._manual_response_pending_after_flight
+                and self._running
+            ):
+                self._manual_response_pending_after_flight = False
+                should_schedule = True
+        if should_schedule:
+            self._schedule_manual_response_timer()
 
     def _nudge_after_repeat_suppressed(self, _transcript: str) -> None:
         instructions = repeat_nudge_instructions(agent_language())
@@ -471,6 +647,13 @@ class QwenVoiceAgent(VoiceAgent):
         # 与重连线程的"连接成功挂载"在同一把锁下串行：先置 _running=False
         # 再摘取连接，保证重连线程随后要么看到已停止（自行关闭新连接），
         # 要么其新连接在此处被关闭。
+        with self._manual_response_lock:
+            self._running = False
+            self._cancel_manual_response_timer_locked()
+            self._cancel_manual_response_watchdog_locked()
+            self._manual_response_first_at = None
+            self._manual_response_pending_after_flight = False
+            self._manual_response_outstanding = 0
         with self._reconnect_lock:
             self._running = False
             conversation = self._conversation

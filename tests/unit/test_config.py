@@ -215,6 +215,18 @@ def test_tool_security_config_defaults(monkeypatch):
     assert get_bool("TOOL_QUERY_CODE_ENABLED") is True
 
 
+def test_manual_response_control_defaults(monkeypatch):
+    _unset(
+        monkeypatch,
+        "MANUAL_RESPONSE_CONTROL",
+        "MANUAL_RESPONSE_SILENCE_MS",
+        "MANUAL_RESPONSE_MAX_WAIT_MS",
+    )
+    assert get_bool("MANUAL_RESPONSE_CONTROL") is False
+    assert get_int("MANUAL_RESPONSE_SILENCE_MS") == 1000
+    assert get_int("MANUAL_RESPONSE_MAX_WAIT_MS") == 8000
+
+
 # ---- update_env_file ----
 
 

@@ -28,6 +28,7 @@ def _make_fake_conversation_cls():
             self.closed = False
             self.appended: list[str] = []
             self.responses: list[dict] = []
+            self.items: list[dict] = []
             self.session_kwargs: dict | None = None
             type(self).instances.append(self)
 
@@ -45,6 +46,9 @@ def _make_fake_conversation_cls():
         def create_response(self, **kwargs) -> None:
             self.responses.append(kwargs)
 
+        def create_item(self, item: dict) -> None:
+            self.items.append(item)
+
         def close(self) -> None:
             self.closed = True
 
@@ -60,6 +64,15 @@ def _start_agent(monkeypatch, fake_cls) -> qwen_agent.QwenVoiceAgent:
     )
     asyncio.run(agent.start(lambda chunk: None))
     return agent
+
+
+def _wait_until(cond, timeout: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.005)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +166,219 @@ def test_on_close_after_stop_keeps_original_behavior(monkeypatch):
     agent._callback.on_close(1000, "normal closure")
     assert not agent._disconnected.is_set()
     assert agent._reconnect_thread is None
+
+
+# ---------------------------------------------------------------------------
+# B2-2 手动应答控制
+# ---------------------------------------------------------------------------
+
+
+def test_manual_response_control_off_keeps_session_and_completed_path(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "false")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    transcripts: list[tuple[str, str]] = []
+    agent.set_transcript_handler(lambda role, text: transcripts.append((role, text)))
+    try:
+        conv = fake_cls.instances[-1]
+        assert conv.session_kwargs is not None
+        assert "turn_detection_param" not in conv.session_kwargs
+
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "请按一查询套餐",
+        })
+        time.sleep(0.03)
+
+        assert transcripts == [("user", "请按一查询套餐")]
+        assert conv.responses == []
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_manual_response_control_debounces_completed_events(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "30")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        conv = fake_cls.instances[-1]
+        assert conv.session_kwargs is not None
+        assert conv.session_kwargs["turn_detection_param"] == {"create_response": False}
+
+        for text in ("第一段菜单", "第二段菜单", "第三段菜单"):
+            agent._callback.on_event({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": text,
+            })
+            time.sleep(0.01)
+
+        assert _wait_until(lambda: len(conv.responses) == 1)
+        assert conv.responses[0]["output_modalities"] == [
+            qwen_agent.MultiModality.AUDIO,
+            qwen_agent.MultiModality.TEXT,
+        ]
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_manual_response_control_fires_after_silence_window(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "20")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        conv = fake_cls.instances[-1]
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "请说出您的需求",
+        })
+
+        assert _wait_until(lambda: len(conv.responses) == 1)
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_manual_response_control_max_wait_forces_response(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "1000")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "45")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        conv = fake_cls.instances[-1]
+        for i in range(5):
+            agent._callback.on_event({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": f"连续播报 {i}",
+            })
+            time.sleep(0.01)
+
+        assert _wait_until(lambda: len(conv.responses) == 1)
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_manual_response_control_stop_cancels_pending_timer(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "80")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    conv = fake_cls.instances[-1]
+
+    agent._callback.on_event({
+        "type": "conversation.item.input_audio_transcription.completed",
+        "transcript": "稍后才该回复",
+    })
+    asyncio.run(agent.stop())
+    time.sleep(0.12)
+
+    assert conv.responses == []
+
+
+def test_manual_response_control_disconnect_cancels_pending_timer(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "80")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    conv = fake_cls.instances[-1]
+    try:
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "断线前未到静默窗口",
+        })
+        agent._callback.on_close(1006, "abnormal closure")
+        time.sleep(0.12)
+
+        assert conv.responses == []
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_manual_response_control_waits_for_active_response_done(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "20")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        conv = fake_cls.instances[-1]
+        asyncio.run(agent.say("开场白"))
+        agent._callback.on_event({"type": "response.created", "response": {"id": "r1"}})
+        assert len(conv.responses) == 1
+
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "AI 说话期间对方继续播报",
+        })
+        time.sleep(0.04)
+        assert len(conv.responses) == 1
+
+        agent._callback.on_event({"type": "response.done", "response_id": "r1"})
+        assert _wait_until(lambda: len(conv.responses) == 2)
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_manual_response_control_tool_response_blocks_overlap(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "20")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        conv = fake_cls.instances[-1]
+        agent._callback.on_event({
+            "type": "response.function_call_arguments.done",
+            "name": "send_sms",
+            "call_id": "call-1",
+            "arguments": '{"content":"测试"}',
+        })
+        assert _wait_until(lambda: len(conv.responses) == 1)
+        agent._callback.on_event({
+            "type": "response.created",
+            "response": {"id": "tool-response"},
+        })
+
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "工具应答期间 IVR 继续播报",
+        })
+        time.sleep(0.04)
+        assert len(conv.responses) == 1
+
+        agent._callback.on_event({
+            "type": "response.done",
+            "response": {"id": "tool-response"},
+        })
+        assert _wait_until(lambda: len(conv.responses) == 2)
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_manual_response_control_watchdog_recovers_missing_done(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "20")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "40")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        conv = fake_cls.instances[-1]
+        agent._callback.on_event({"type": "response.created", "response": {"id": "r1"}})
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "done 丢失后仍需恢复",
+        })
+        time.sleep(0.03)
+        assert conv.responses == []
+
+        assert _wait_until(lambda: len(conv.responses) == 1)
+    finally:
+        asyncio.run(agent.stop())
 
 
 # ---------------------------------------------------------------------------

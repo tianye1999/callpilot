@@ -175,6 +175,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                editable=False, hidden=True),
     ConfigSpec("PROMPT_GEN_WAIT_SECONDS", "动态场景提示词等待（秒）", "float", "3.0",
                editable=False, hidden=True),
+    ConfigSpec("MANUAL_RESPONSE_CONTROL", "手动应答控制", "bool", "false"),
+    ConfigSpec("MANUAL_RESPONSE_SILENCE_MS", "手动应答静默窗口（毫秒）", "int", "1000"),
+    ConfigSpec("MANUAL_RESPONSE_MAX_WAIT_MS", "手动应答最长等待（毫秒）", "int", "8000"),
     # ---- 模组 ----
     # 默认值按当前平台在模块加载时定死（Windows 为 auto 哨兵，连接时扫描）。
     ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", platforms.default_modem_port(),
