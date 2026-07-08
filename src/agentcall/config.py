@@ -103,6 +103,7 @@ class ConfigSpec:
     secret: bool = False
     requires_restart: bool = False
     hidden: bool = False
+    choice_labels: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +116,8 @@ class KeyValidationResult:
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- Agent ----
     ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "qwen",
-               choices=("qwen", "doubao", "openai"), requires_restart=True),
+               choices=("qwen", "doubao", "openai"), requires_restart=True,
+               choice_labels={"doubao": "doubao (experimental)"}),
     ConfigSpec("DASHSCOPE_API_KEY", "DashScope API Key", "str", "",
                secret=True, requires_restart=True),
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
@@ -206,6 +208,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 白名单与节流 ----
     ConfigSpec("DIAL_WHITELIST", "外呼白名单", "str", ""),
     ConfigSpec("DIAL_INTERVAL_SECONDS", "连续拨号间隔（秒）", "float", "5.0"),
+    ConfigSpec("SMS_RATE_LIMIT_PER_HOUR", "短信发送频控（每小时）", "int", "10"),
+    ConfigSpec("TOOL_QUERY_CODE_ENABLED", "启用验证码查询工具", "bool", "true",
+               requires_restart=True),
     # 发短信目标限制改为「只能回复已联系过的号码」(见 contacts.py),
     # 不再用静态白名单,故移除原 SMS_WHITELIST 配置项。
     # ---- 连接管理 ----
@@ -409,6 +414,7 @@ def read_panel_values() -> list[dict]:
             "kind": spec.kind,
             "default": spec.default,
             "choices": list(spec.choices),
+            "choice_labels": dict(spec.choice_labels or {}),
             "editable": spec.editable,
             "secret": spec.secret,
             "requires_restart": spec.requires_restart,

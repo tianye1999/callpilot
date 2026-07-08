@@ -23,6 +23,7 @@ from ..contacts import is_reply_target_allowed
 from ..events import EventHub
 from ..modem import Eg25Modem
 from ..port_detect import QUECTEL_VID
+from ..rate_limit import acquire_sms_send_slot
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,9 @@ def build_app(
     app.router.add_post("/api/call/batch_dial", _batch_dial)
     app.router.add_get("/api/call/queue", _queue_status)
     app.router.add_get("/api/history", _history)
+    app.router.add_delete("/api/history", _history_clear)
+    app.router.add_post("/api/history/{call_id}", _history_delete)
+    app.router.add_delete("/api/history/{call_id}", _history_delete)
     app.router.add_get("/api/history/{call_id}/events", _history_events)
     app.router.add_get("/api/history/{call_id}/audio/{track}", _history_audio)
     app.router.add_get("/api/config", _get_config)
@@ -308,6 +312,21 @@ async def _send_sms(request: web.Request) -> web.Response:
             {"ok": False, "error": "只能给来过电或发过短信的号码发送短信"},
             status=403,
         )
+    slot = acquire_sms_send_slot(config.get_int("SMS_RATE_LIMIT_PER_HOUR"))
+    if not slot.allowed:
+        logger.warning(
+            "Web 发短信被频控拦截: to=%s retry_after=%.1fs",
+            number,
+            slot.retry_after,
+        )
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "短信发送触发频控，请稍后再试",
+                "retry_after": round(slot.retry_after, 1),
+            },
+            status=429,
+        )
 
     loop = asyncio.get_running_loop()
     try:
@@ -416,6 +435,52 @@ async def _history(request: web.Request) -> web.Response:
     loop = asyncio.get_running_loop()
     calls = await loop.run_in_executor(None, service.call_logger.list_calls, limit)
     return web.json_response(calls)
+
+
+def _active_call_ids(service) -> set[str]:
+    session = getattr(service, "session", None)
+    if session is None or not getattr(session, "is_active", False):
+        return set()
+    record = getattr(session, "_record", None)
+    call_id = getattr(record, "id", None)
+    if isinstance(call_id, str) and _CALL_ID_RE.fullmatch(call_id):
+        return {call_id}
+    return set()
+
+
+async def _history_clear(request: web.Request) -> web.Response:
+    """删除全部通话历史；正在进行中的通话跳过。"""
+    service = require_call_logger(request)
+    active_ids = _active_call_ids(service)
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, partial(service.call_logger.clear_calls, active_ids=active_ids)
+        )
+    except OSError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+    return web.json_response({"ok": True, **result})
+
+
+async def _history_delete(request: web.Request) -> web.Response:
+    """删除单条通话历史；正在进行中的通话跳过。"""
+    service = require_call_logger(request)
+    call_id = request.match_info["call_id"]
+    if not _CALL_ID_RE.fullmatch(call_id):
+        return web.json_response({"ok": False, "error": "非法的通话 ID"}, status=400)
+    active_ids = _active_call_ids(service)
+    loop = asyncio.get_running_loop()
+    try:
+        status = await loop.run_in_executor(
+            None, partial(service.call_logger.delete_call, call_id, active_ids=active_ids)
+        )
+    except OSError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+    if status == "missing":
+        return web.json_response({"ok": False, "error": "通话记录不存在"}, status=404)
+    deleted = [call_id] if status == "deleted" else []
+    skipped = [call_id] if status == "skipped" else []
+    return web.json_response({"ok": True, "deleted": deleted, "skipped": skipped})
 
 
 async def _history_events(request: web.Request) -> web.Response:

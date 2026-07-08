@@ -15,7 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from agentcall import config, platforms
 from agentcall.call_log import CallLogger
 from agentcall.web import server
-from agentcall.web.server import _history_audio, _history_events, build_app
+from agentcall.web.server import _history_audio, _history_delete, _history_events, build_app
 
 
 class _SessionStub:
@@ -396,6 +396,74 @@ def test_history_events_call_id_validation(tmp_path):
 
     resp = asyncio.run(run("20260707-183000-inbound-100"))
     assert resp.status == 404
+
+
+def test_history_delete_single_and_missing(tmp_path):
+    call_logger = CallLogger(base_dir=tmp_path / "calls")
+    rec = call_logger.begin_call("inbound", "13800000000")
+    rec.finish("completed")
+    app = make_app(FakeService(call_logger=call_logger))
+
+    async def fn(client):
+        resp = await client.delete(f"/api/history/{rec.id}")
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True, "deleted": [rec.id], "skipped": []}
+        assert not (call_logger.base_dir / rec.id).exists()
+
+        resp = await client.delete(f"/api/history/{rec.id}")
+        assert resp.status == 404
+
+    api(app, fn)
+
+
+def test_history_delete_rejects_bad_id_and_skips_active(tmp_path):
+    call_logger = CallLogger(base_dir=tmp_path / "calls")
+    rec = call_logger.begin_call("inbound", "13800000000")
+    service = FakeService(
+        call_logger=call_logger,
+        session=SimpleNamespace(is_active=True, _record=SimpleNamespace(id=rec.id)),
+    )
+    app = make_app(service)
+
+    async def run_bad(call_id: str):
+        request = make_mocked_request(
+            "DELETE",
+            f"/api/history/{call_id}",
+            match_info={"call_id": call_id},
+            app=app,
+        )
+        return await _history_delete(request)
+
+    async def fn(client):
+        resp = await client.delete(f"/api/history/{rec.id}")
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True, "deleted": [], "skipped": [rec.id]}
+        assert (call_logger.base_dir / rec.id).exists()
+
+    resp = asyncio.run(run_bad("../secret"))
+    assert resp.status == 400
+    api(app, fn)
+
+
+def test_history_clear_all_deletes_finished_and_skips_active(tmp_path):
+    call_logger = CallLogger(base_dir=tmp_path / "calls")
+    active = call_logger.begin_call("inbound", "13800000000")
+    done = call_logger.begin_call("outbound", "10086")
+    done.finish("completed")
+    service = FakeService(
+        call_logger=call_logger,
+        session=SimpleNamespace(is_active=True, _record=SimpleNamespace(id=active.id)),
+    )
+    app = make_app(service)
+
+    async def fn(client):
+        resp = await client.delete("/api/history")
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True, "deleted": [done.id], "skipped": [active.id]}
+
+    api(app, fn)
+    assert (call_logger.base_dir / active.id).exists()
+    assert not (call_logger.base_dir / done.id).exists()
 
 
 # ---- /api/history/{id}/audio/{track}：录音回放（浏览器播放）----
@@ -827,6 +895,30 @@ def test_send_sms_current_caller_bypass_requires_active_session():
 
     api(app2, allowed)
     assert active_modem.sms_calls == [("18800000000", "x")]
+
+
+def test_send_sms_api_uses_shared_rate_limit(monkeypatch):
+    monkeypatch.setenv("SMS_RATE_LIMIT_PER_HOUR", "1")
+    from agentcall import rate_limit
+
+    rate_limit.reset_sms_rate_limit_state()
+    hub = FakeHub(history=[{"type": "sms_in", "sender": "10086", "text": "余额"}])
+    modem = FakeModem(send_result=True)
+    app = build_app(hub=hub, modem=modem, service=FakeService())  # type: ignore[arg-type]
+
+    async def fn(client):
+        resp = await client.post("/api/sms/send", json={"number": "10086", "text": "one"})
+        assert resp.status == 200
+
+        resp = await client.post("/api/sms/send", json={"number": "10086", "text": "two"})
+        assert resp.status == 429
+        body = await resp.json()
+        assert body["ok"] is False
+        assert "频控" in body["error"]
+
+    api(app, fn)
+    assert modem.sms_calls == [("10086", "one")]
+    rate_limit.reset_sms_rate_limit_state()
 
 
 # ---- /api/restart ----

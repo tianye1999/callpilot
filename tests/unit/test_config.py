@@ -209,6 +209,12 @@ def test_agent_provider_choices_include_openai():
     assert get_spec("AGENT_PROVIDER").choices == ("qwen", "doubao", "openai")
 
 
+def test_tool_security_config_defaults(monkeypatch):
+    _unset(monkeypatch, "SMS_RATE_LIMIT_PER_HOUR", "TOOL_QUERY_CODE_ENABLED")
+    assert get_int("SMS_RATE_LIMIT_PER_HOUR") == 10
+    assert get_bool("TOOL_QUERY_CODE_ENABLED") is True
+
+
 # ---- update_env_file ----
 
 
@@ -365,6 +371,13 @@ def test_panel_reflects_env_value(monkeypatch):
     rows = {row["key"]: row for row in read_panel_values()}
     assert rows["QWEN_VOICE"]["value"] == "Cherry"
     assert rows["QWEN_VOICE"]["default"] == "Raymond"
+
+
+def test_panel_marks_doubao_choice_experimental():
+    rows = {row["key"]: row for row in read_panel_values()}
+    provider = rows["AGENT_PROVIDER"]
+    assert provider["choice_labels"]["doubao"] == "doubao (experimental)"
+    assert provider["choices"] == ["qwen", "doubao", "openai"]
 
 
 # ---- 收口回归护栏 ----

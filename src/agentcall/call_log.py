@@ -282,6 +282,39 @@ class CallLogger:
             results.append(entry)
         return results
 
+    def delete_call(self, call_id: str, *, active_ids: set[str] | None = None) -> str:
+        """删除单条通话目录；返回 ``deleted``/``skipped``/``missing``。"""
+        if active_ids and call_id in active_ids:
+            return "skipped"
+        path = self.base_dir / call_id
+        if not path.is_dir():
+            return "missing"
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            logger.warning("删除通话目录 %s 失败: %s", call_id, exc)
+            raise
+        return "deleted"
+
+    def clear_calls(self, *, active_ids: set[str] | None = None) -> dict[str, list[str]]:
+        """删除全部通话目录，跳过正在进行中的通话。"""
+        deleted: list[str] = []
+        skipped: list[str] = []
+        if not self.base_dir.is_dir():
+            return {"deleted": deleted, "skipped": skipped}
+        for path in sorted(p for p in self.base_dir.iterdir() if p.is_dir()):
+            call_id = path.name
+            if active_ids and call_id in active_ids:
+                skipped.append(call_id)
+                continue
+            try:
+                shutil.rmtree(path)
+                deleted.append(call_id)
+            except OSError as exc:
+                logger.warning("删除通话目录 %s 失败: %s", call_id, exc)
+                raise
+        return {"deleted": deleted, "skipped": skipped}
+
     def inbound_numbers(self) -> set[str]:
         """所有来电方号码集合（direction==inbound），供发短信目标校验用。
 

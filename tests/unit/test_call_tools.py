@@ -58,6 +58,16 @@ def test_register_exposes_all_four_tools():
     assert names == {"send_sms", "hangup_call", "query_verification_code", "send_dtmf"}
 
 
+def test_query_code_tool_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("TOOL_QUERY_CODE_ENABLED", "false")
+    tools, _, _ = make_tools()
+
+    registry = tools.register()
+
+    names = {spec["function"]["name"] for spec in registry.specs()}
+    assert "query_verification_code" not in names
+
+
 # ---- send_sms ----
 
 def test_send_sms_uses_current_caller_when_to_empty():
@@ -109,6 +119,62 @@ def test_send_sms_allowed_when_target_permitted():
 
     assert result["success"] is True
     assert ("send_sms", ("10086", "hi")) in modem.calls
+
+
+def test_send_sms_rate_limited_before_modem(monkeypatch):
+    monkeypatch.setenv("SMS_RATE_LIMIT_PER_HOUR", "1")
+    from agentcall import rate_limit
+
+    rate_limit.reset_sms_rate_limit_state()
+    tools, modem, _ = make_tools(sms_gate=lambda n: True)
+
+    assert tools._send_sms({"to": "10086", "content": "hi"})["success"] is True
+    result = tools._send_sms({"to": "10086", "content": "again"})
+
+    assert result["success"] is False
+    assert "频控" in result["message"]
+    assert modem.calls == [("send_sms", ("10086", "hi"))]
+    rate_limit.reset_sms_rate_limit_state()
+
+
+def test_send_sms_rate_limit_zero_unlimited(monkeypatch):
+    monkeypatch.setenv("SMS_RATE_LIMIT_PER_HOUR", "0")
+    from agentcall import rate_limit
+
+    rate_limit.reset_sms_rate_limit_state()
+    tools, modem, _ = make_tools(sms_gate=lambda n: True)
+
+    for i in range(3):
+        assert tools._send_sms({"to": "10086", "content": f"hi {i}"})["success"] is True
+
+    assert len(modem.calls) == 3
+    rate_limit.reset_sms_rate_limit_state()
+
+
+def test_tool_calls_write_sanitized_audit_events():
+    hub = make_hub()
+    hub.publish({"type": "sms_in", "sender": "95588", "text": "您的验证码是 482913"})
+    record = SpyRecord()
+    tools, _, hangups = make_tools(hub=hub, caller="10086", record=record)
+
+    tools._send_sms({"content": "secret body"})
+    tools._hangup({})
+    tools._query_code({})
+
+    audits = [fields for typ, fields in record.events if typ == "tool_call"]
+    assert [audit["tool"] for audit in audits] == [
+        "send_sms",
+        "hangup_call",
+        "query_verification_code",
+    ]
+    assert audits[0]["args"] == {"to": "10086", "content_length": 11}
+    assert audits[0]["result"] == {"success": True}
+    assert audits[1]["args"] == {}
+    assert audits[1]["result"] == {"success": True}
+    assert audits[2]["result"] == {"success": True, "hit": True}
+    assert "secret body" not in str(audits)
+    assert "482913" not in str(audits)
+    assert hangups == [True]
 
 
 def test_send_sms_no_gate_allows_all():

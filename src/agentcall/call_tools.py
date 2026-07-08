@@ -12,6 +12,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Callable
 
+from . import config
 from .agents.tools import (
     HANGUP_SPEC,
     QUERY_CODE_SPEC,
@@ -19,6 +20,7 @@ from .agents.tools import (
     SEND_SMS_SPEC,
     ToolRegistry,
 )
+from .rate_limit import acquire_sms_send_slot
 
 if TYPE_CHECKING:
     from .call_log import CallRecord
@@ -58,7 +60,8 @@ class CallTools:
         registry = ToolRegistry()
         registry.register(SEND_SMS_SPEC, self._send_sms)
         registry.register(HANGUP_SPEC, self._hangup)
-        registry.register(QUERY_CODE_SPEC, self._query_code)
+        if config.get_bool("TOOL_QUERY_CODE_ENABLED"):
+            registry.register(QUERY_CODE_SPEC, self._query_code)
         registry.register(SEND_DTMF_SPEC, self._send_dtmf)
         return registry
 
@@ -66,26 +69,72 @@ class CallTools:
         if self._hub:
             self._hub.publish(event)
 
+    def _audit_tool(
+        self,
+        tool: str,
+        *,
+        args: dict,
+        result: dict,
+    ) -> None:
+        record = self._get_record()
+        if record is not None:
+            record.log_event("tool_call", tool=tool, args=args, result=result)
+
     def _send_sms(self, args: dict) -> dict:
         """工具处理：Agent 在通话中请求发送短信。"""
         number = (args.get("to") or "").strip() or (self._get_caller() or "").strip()
         content = (args.get("content") or "").strip()
         if not number:
+            self._audit_tool(
+                "send_sms",
+                args={"to": "", "content_length": len(content)},
+                result={"success": False},
+            )
             return {"success": False, "message": "没有可用的收件号码"}
         if not content:
+            self._audit_tool(
+                "send_sms",
+                args={"to": number, "content_length": 0},
+                result={"success": False},
+            )
             return {"success": False, "message": "短信内容为空"}
         if self._is_sms_target_allowed is not None and not self._is_sms_target_allowed(
             number
         ):
             logger.warning("发短信被拦截(非已联系号码): %s", number)
-            return {
+            result = {
                 "success": False,
                 "message": "只能给来过电或发过短信的号码回复短信",
             }
+            self._audit_tool(
+                "send_sms",
+                args={"to": number, "content_length": len(content)},
+                result={"success": False},
+            )
+            return result
+        slot = acquire_sms_send_slot(config.get_int("SMS_RATE_LIMIT_PER_HOUR"))
+        if not slot.allowed:
+            logger.warning("发短信被频控拦截: to=%s retry_after=%.1fs", number, slot.retry_after)
+            result = {
+                "success": False,
+                "message": "短信发送触发频控，请稍后再试",
+                "retry_after": round(slot.retry_after, 1),
+            }
+            self._audit_tool(
+                "send_sms",
+                args={"to": number, "content_length": len(content)},
+                result={"success": False},
+            )
+            return result
         try:
             ok = self._modem.send_sms(number, content)
         except Exception as exc:  # noqa: BLE001
             logger.warning("工具发送短信失败: %s", exc)
+            self._audit_tool(
+                "send_sms",
+                args={"to": number, "content_length": len(content)},
+                result={"success": False},
+            )
             return {"success": False, "message": f"发送失败: {exc}"}
         if ok:
             self._publish(
@@ -96,12 +145,18 @@ class CallTools:
                     "status": "sent",
                 }
             )
-        return {
+        result = {
             "success": ok,
             "to": number,
             "content": content,
             "message": "短信已发送" if ok else "短信发送失败",
         }
+        self._audit_tool(
+            "send_sms",
+            args={"to": number, "content_length": len(content)},
+            result={"success": bool(ok)},
+        )
+        return result
 
     def _hangup(self, args: dict) -> dict:
         """工具处理：Agent 请求挂断当前通话。
@@ -110,7 +165,13 @@ class CallTools:
         先让 Agent 把告别语播完，避免话没说完线路就断了。
         """
         self._schedule_hangup()
-        return {"success": True, "message": "好的，马上为您挂断电话"}
+        result = {"success": True, "message": "好的，马上为您挂断电话"}
+        self._audit_tool(
+            "hangup_call",
+            args={},
+            result={"success": True},
+        )
+        return result
 
     def _send_dtmf(self, args: dict) -> dict:
         """工具处理：Agent 请求发送 DTMF 按键（IVR 导航）。"""
@@ -135,14 +196,26 @@ class CallTools:
         """工具处理：从最近收到的短信里查验证码。"""
         code, text, sender = self._find_latest_code()
         if code:
-            return {
+            result = {
                 "success": True,
                 "code": code,
                 "sender": sender,
                 "sms_text": text,
                 "message": f"最近收到的验证码是 {code}",
             }
-        return {"success": False, "message": "最近没有收到含验证码的短信"}
+            self._audit_tool(
+                "query_verification_code",
+                args={},
+                result={"success": True, "hit": True},
+            )
+            return result
+        result = {"success": False, "message": "最近没有收到含验证码的短信"}
+        self._audit_tool(
+            "query_verification_code",
+            args={},
+            result={"success": False, "hit": False},
+        )
+        return result
 
     def _find_latest_code(self) -> tuple[str | None, str | None, str | None]:
         """在已收到的短信中查找最近的数字验证码。

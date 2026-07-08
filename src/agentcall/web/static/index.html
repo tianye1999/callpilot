@@ -309,6 +309,9 @@
   /* ========= 历史面板 ========= */
   #page-history .wrap { max-width: 900px; margin: 0 auto; }
   #historyList { padding: 14px 20px; }
+  .history-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .history-title .title-main { min-width: 0; }
+  .hist-delete { margin-left: 8px; padding: 5px 8px; border-radius: 8px; font-size: 11px; }
   .rec-audio { margin: 4px 0 10px; }
   .rec-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
   .rec-label { font-size: 12px; color: var(--muted); min-width: 68px; font-family: var(--mono); }
@@ -703,7 +706,10 @@
     <div class="panel-page" id="page-history">
       <div class="wrap">
         <section class="card">
-          <h2><span data-i18n="hist_title"></span><span class="sub" data-i18n="hist_sub"></span></h2>
+          <h2 class="history-title">
+            <span class="title-main"><span data-i18n="hist_title"></span><span class="sub" data-i18n="hist_sub"></span></span>
+            <button class="btn sm danger" id="historyClear" data-i18n="hist_clear"></button>
+          </h2>
           <div id="historyList"><div class="empty" data-i18n="empty_history"></div></div>
         </section>
       </div>
@@ -912,6 +918,11 @@ const I18N = {
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
     need_sms: "Enter number and text", sms_in: "IN ← ", sms_out: "OUT → ",
     hist_title: "Call History", hist_sub: "Click to expand timeline", empty_history: "No call records",
+    hist_clear: "Clear all", hist_clear_title: "Clear all call history?",
+    hist_clear_msg: "Finished call records and recordings will be deleted. Active calls are kept.",
+    hist_delete: "Delete", hist_delete_title: "Delete this call record?",
+    hist_delete_msg: "This call's timeline and recordings will be deleted.",
+    hist_deleted: "Deleted", hist_delete_fail: "Delete failed: ",
     rec_ai: "AI voice", rec_peer: "Caller",
     dir_in: "Inbound", dir_out: "Outbound",
     stc_completed: "Completed", stc_failed: "Failed", stc_not_connected: "No answer",
@@ -1017,6 +1028,11 @@ const I18N = {
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
     need_sms: "请填写号码和内容", sms_in: "收 ← ", sms_out: "发 → ",
     hist_title: "通话历史", hist_sub: "点击展开事件时间线", empty_history: "暂无通话记录",
+    hist_clear: "清除全部", hist_clear_title: "清除全部通话历史？",
+    hist_clear_msg: "已结束的通话记录和录音会被删除，进行中的通话会保留。",
+    hist_delete: "删除", hist_delete_title: "删除这条通话记录？",
+    hist_delete_msg: "这条通话的事件和录音会被删除。",
+    hist_deleted: "已删除", hist_delete_fail: "删除失败：",
     rec_ai: "AI 下行", rec_peer: "对方上行",
     dir_in: "呼入", dir_out: "呼出",
     stc_completed: "已完成", stc_failed: "异常", stc_not_connected: "未接通",
@@ -1497,6 +1513,13 @@ async function loadHistory() {
         dirText()[c.direction] || c.direction || "?"));
       right.appendChild(document.createTextNode(" "));
       right.appendChild(el("span", "st " + (c.status || ""), statusText()[c.status] || c.status || ""));
+      const del = el("button", "btn danger hist-delete", t("hist_delete"));
+      del.type = "button";
+      del.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        deleteHistoryItem(c.id);
+      });
+      right.appendChild(del);
       head1.appendChild(right);
       item.appendChild(head1);
       const head2 = el("div", "head");
@@ -1514,6 +1537,48 @@ async function loadHistory() {
     }
   } catch (e) { console.warn("[history] 加载通话历史失败", e); }
 }
+
+async function deleteHistoryItem(id) {
+  const choice = await showModal({
+    tone: "danger",
+    title: t("hist_delete_title"), message: t("hist_delete_msg"),
+    actions: [
+      { key: "ok", label: t("hist_delete"), kind: "danger" },
+      { key: "cancel", label: t("modal_cancel"), kind: "ghost" },
+    ],
+  });
+  if (choice !== "ok") return;
+  try {
+    const r = await fetch(`/api/history/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const res = await r.json();
+    if (!r.ok || !res.ok) throw new Error(res.error || "");
+    openCalls.delete(id);
+    historyCache = [];
+    await loadHistory();
+    loadRecent();
+  } catch (e) { console.warn("[history] 删除通话记录失败", e); }
+}
+
+$("historyClear").addEventListener("click", async () => {
+  const choice = await showModal({
+    tone: "danger",
+    title: t("hist_clear_title"), message: t("hist_clear_msg"),
+    actions: [
+      { key: "ok", label: t("hist_clear"), kind: "danger" },
+      { key: "cancel", label: t("modal_cancel"), kind: "ghost" },
+    ],
+  });
+  if (choice !== "ok") return;
+  try {
+    const r = await fetch("/api/history", { method: "DELETE" });
+    const res = await r.json();
+    if (!r.ok || !res.ok) throw new Error(res.error || "");
+    openCalls.clear();
+    historyCache = [];
+    await loadHistory();
+    loadRecent();
+  } catch (e) { console.warn("[history] 清除通话历史失败", e); }
+});
 /* 电话主页右列：最近 6 条 */
 async function loadRecent() {
   try {
@@ -1940,7 +2005,7 @@ async function loadConfig() {
         ctrl = document.createElement("select");
         for (const ch of c.choices) {
           const opt = document.createElement("option");
-          opt.value = ch; opt.textContent = ch;
+          opt.value = ch; opt.textContent = (c.choice_labels && c.choice_labels[ch]) || ch;
           ctrl.appendChild(opt);
         }
         ctrl.value = c.value;

@@ -81,7 +81,7 @@ or Taobao for "EC20 USB adapter".
   <https://dashscope.console.aliyun.com/>. International users go through Alibaba Cloud's
   **Model Studio** (a different endpoint — advanced users can point at it via the
   `DASHSCOPE_REALTIME_URL` env var in `.env`).
-  (Doubao / OpenAI credentials optional.)
+  (Doubao is experimental; outbound calls may be silent. OpenAI credentials are optional.)
 
 ### Quick start (macOS)
 
@@ -261,6 +261,7 @@ macOS 没有 Quectel 厂商串口的原生设备，需先跑 USB→PTY 桥（`sc
 - Python 3.12+、PATH 里有 `ffmpeg`、一张有效 SIM 的 EC20/EG25 模组。
 - macOS 还需 `brew install libusb`（USB→PTY 桥的 pyusb 依赖系统库）。
 - **DashScope API Key**（Qwen 用），申请：<https://dashscope.console.aliyun.com/>。
+  豆包 provider 仍为 experimental，外呼可能不出声；OpenAI 凭证可选。
 
 ### 快速开始（macOS）
 
