@@ -89,7 +89,7 @@ Write-Host "  1. Edit .env — set DASHSCOPE_API_KEY (get one at https://dashsco
 Write-Host "     on Windows also set MODEM_PORT=auto and MODEM_AUDIO_MODE=uac"
 Write-Host "  2. Install the official Quectel EC20 Windows driver, then plug in the modem"
 Write-Host "     (it shows up as native COM ports — no USB bridge needed; see scripts\windows\README.md)"
-Write-Host "  3. Start the service:  .venv\Scripts\python app.py   -> http://127.0.0.1:8000"
+Write-Host "  3. Start the service:  .venv\Scripts\python app.py   -> http://127.0.0.1:47100"
 if ($FfmpegMissing) {
     Write-Warn "Don't forget to install ffmpeg before making calls (see above)."
 }

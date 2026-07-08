@@ -19,7 +19,7 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
 - **Three-platform CI**: every change now runs the full zero-hardware test
   suite on Ubuntu, macOS, and Windows.
 - **Language menu**: UI language switching moved to a globe-icon dropdown,
-  making room for more languages beyond English/中文.
+  making room for more languages beyond English and Chinese.
 
 ### Fixed
 
@@ -45,17 +45,23 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
   in-call AI tools split into their own modules, outbound call tasks passed
   explicitly instead of through the environment (batch dialing no longer
   rewrites `.env` on every call), and web API error handling unified. No
-  intended behavior changes; the automated test suite now stands at 255 tests.
+  intended behavior changes, backed by the full offline test suite.
 - **Configuration consolidated into a single registry**: every setting's
   default value lives in one place, `.env.example` documents all editable
   settings, and a regression test keeps the two from drifting apart.
 - **Platform differences centralized** in one module — per-OS defaults and
   paths are no longer scattered through the code.
+- **macOS app is now a menu-bar tray** (phone-handset icon — green when the
+  service is running, grey when stopped — with an open-console / restart-service
+  / quit menu) instead of a standalone desktop window.
+- **Outbound wind-down polish**: on reaching the goal, the AI now speaks a full
+  goodbye *before* it invokes hang-up, and stays silent during the hang-up delay
+  (no stray "call ended" line played to the other side).
 
 ## [0.1.0] — 2026-07-08 · Developer Preview
 
 First public release. Verified end-to-end on real hardware: a Quectel EC20
-(`EC20CEFAGR08A03M4G`) on macOS, talking to China Telecom's `10000` IVR in both
+(`EC20CEFAGR08A03M4G`) on macOS, talking to a carrier's `10000` IVR in both
 directions and exchanging SMS.
 
 ### Telephony (Quectel EC20/EG25)
@@ -83,7 +89,7 @@ directions and exchanging SMS.
 
 - CallPilot desktop app (PyInstaller `.app`, thin shell over local checkout)
   with phosphor-green dark UI, dock navigation (phone / live / SMS / history /
-  settings), bilingual EN/中文 (English default).
+  settings), bilingual English/Chinese (English default).
 - Local speaker monitoring of both call directions with adjustable gain.
 - Call recordings (`events.jsonl` + uplink/downlink WAV + metadata), latency
   metrics, call history, live settings editing.

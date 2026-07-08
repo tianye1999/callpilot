@@ -45,8 +45,7 @@ to contribute code or run tests.
 .venv/bin/pytest
 ```
 
-- **No hardware, no network, no API key needed.** The suite (160 tests today)
-  runs fully offline.
+- **No hardware, no network, no API key needed.** The full suite runs offline.
 - Tests use in-memory **fakes** in `tests/fakes/` that are duck-typed to the real
   components: `FakeModem` (mimics `Eg25Modem`, records AT calls and lets tests
   trigger `RING`/hangup/SMS), `FakeAudioBridge` (in-memory audio loopback,

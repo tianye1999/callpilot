@@ -100,7 +100,7 @@ if [ "$OS" = "Darwin" ]; then
 else
     echo "  2. Plug in the EC20, then set MODEM_PORT in .env to its AT serial port (e.g. /dev/ttyUSB2)"
 fi
-echo "  3. Start the service:  .venv/bin/python app.py   -> http://127.0.0.1:8000"
+echo "  3. Start the service:  .venv/bin/python app.py   -> http://127.0.0.1:47100"
 if [ -n "$FFMPEG_MISSING" ]; then
     warn "Don't forget to install ffmpeg before making calls (see above)."
 fi

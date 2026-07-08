@@ -5,6 +5,10 @@
 （textContent 防注入、路径穿越白名单）上乘；真问题集中在个别正确性 bug、
 CallSession/server.py 两处职责膨胀、配置多头真相、以及零 lint/CI 的工程化欠账。**
 
+> **状态（截至 2026-07-08）**：下列 **P0 全 5 项、P1 全 5 项** 均已在「P1 架构重构」commit
+> `07c2865` 及后续提交落地；CI 已补齐（`.github/workflows/ci.yml`），仅 ruff/mypy 配置（P2-11）
+> 仍未做。本文档保留作历史审查记录，逐条修复细节见 git 历史。
+
 ## P0 正确性 bug（尽快修）
 
 1. **豆包 provider 外呼静默失效** — `DoubaoVoiceAgent` 未实现 `say()`（外呼开场白

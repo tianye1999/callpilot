@@ -110,8 +110,8 @@ def test_probe_service_ok(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(desktop_app.urllib.request, "urlopen", fake_urlopen)
-    assert desktop_app.probe_service("http://127.0.0.1:8000/api/meta", timeout=2.0)
-    assert seen == {"url": "http://127.0.0.1:8000/api/meta", "timeout": 2.0}
+    assert desktop_app.probe_service("http://127.0.0.1:47100/api/meta", timeout=2.0)
+    assert seen == {"url": "http://127.0.0.1:47100/api/meta", "timeout": 2.0}
 
 
 def test_probe_service_down(monkeypatch):
@@ -119,7 +119,7 @@ def test_probe_service_down(monkeypatch):
         raise urllib.error.URLError("connection refused")
 
     monkeypatch.setattr(desktop_app.urllib.request, "urlopen", fake_urlopen)
-    assert not desktop_app.probe_service("http://127.0.0.1:8000/api/meta")
+    assert not desktop_app.probe_service("http://127.0.0.1:47100/api/meta")
 
 
 # ---- wait_service_ready ----

@@ -42,7 +42,7 @@ Phone call → EC20 modem ──(AT: RING/ATA/CLCC)── CallPilot
 - **Features:** auto-answer, outbound dialing (single + batch with whitelist),
   SMS send/receive (Chinese UCS2), AI tool-calling (send SMS / hang up / read OTP /
   **DTMF keypad**), per-call recording + latency metrics + LLM summary, live
-  transcript, local speaker monitoring, bilingual (EN/中文) desktop UI.
+  transcript, local speaker monitoring, bilingual (English/Chinese) desktop UI.
 
 ### Hardware & platform support
 
@@ -67,8 +67,8 @@ You need a **Quectel EC20 or EG25** 4G modem (this build is verified against
 
 - a **USB adapter board with a SIM slot** (turns the mini-PCIe module into a USB device),
 - a **4G antenna**,
-- a **SIM with voice + SMS service** (verified on China Telecom; VoLTE / CS voice depends
-  on your carrier).
+- a **SIM with voice + SMS service** (voice + SMS confirmed working; VoLTE / CS voice
+  depends on your carrier).
 
 A full EC20 module + adapter kit is roughly **¥100–200 / $15–30** — search AliExpress
 or Taobao for "EC20 USB adapter".
@@ -79,7 +79,8 @@ or Taobao for "EC20 USB adapter".
 - **macOS:** `brew install libusb` — the USB→PTY bridge's `pyusb` needs this system library.
 - A **DashScope API key** (for Qwen). Get one at
   <https://dashscope.console.aliyun.com/>. International users go through Alibaba Cloud's
-  **Model Studio** (different endpoint — override with `DASHSCOPE_REALTIME_URL` if needed).
+  **Model Studio** (a different endpoint — advanced users can point at it via the
+  `DASHSCOPE_REALTIME_URL` env var in `.env`).
   (Doubao / OpenAI credentials optional.)
 
 ### Quick start (macOS)
@@ -171,9 +172,9 @@ drops a call. A self-contained installer is v0.3 on the roadmap.
 - **Dial your own mobile**: the simplest check — pick up and you hear the AI talk.
 - **Dial your carrier's customer-service hotline** (an IVR that speaks back): if the AI
   holds a coherent multi-turn exchange with the voice menu, both audio directions work.
-  `10000` is the China Telecom IVR; use whatever hotline your carrier provides.
-- **SMS `查余额` (balance) to `10000`** (China Telecom): you should receive a reply SMS —
-  proves send + receive + Chinese decoding.
+  `10000` is one carrier's service hotline; use whatever hotline your carrier provides.
+- **SMS a balance query to your carrier's service number**: you should receive a reply
+  SMS — proves send + receive, including non-ASCII (UCS2) decoding.
 
 ### Troubleshooting
 
@@ -221,8 +222,8 @@ CallPilot 把 4G 模组接到云端实时语音大模型，让 AI「助理」替
 Quectel EC20/EG25，来电自动接听并与对方对话，可外呼、收发短信、按 IVR 菜单键、
 每通电话录音+延迟打点+AI 摘要——全部跑在你自己的硬件和 API Key 上。
 
-- **AI 大脑**：云端端到端实时语音（默认阿里 **Qwen Omni**，可选字节 **Doubao**），
-  无需安装本地模型。
+- **AI 大脑**：云端端到端实时语音（默认阿里 **Qwen Omni**，可选字节 **Doubao** 或
+  **OpenAI Realtime**），无需安装本地模型。
 - **电话通道**：EC20/EG25 模组的硬件 AT 事件（`RING → ATA`），非屏幕自动化。
 - **能力**：自动接听、外呼（单个+批量带白名单）、中文短信收发、AI 工具调用
   （发短信/挂断/查验证码/**DTMF 按键**）、通话录音+摘要、实时转写、本机监听、
@@ -248,7 +249,7 @@ macOS 没有 Quectel 厂商串口的原生设备，需先跑 USB→PTY 桥（`sc
 
 需要一个 **Quectel EC20 或 EG25** 4G 模组（本版本对 `EC20CEFAGR08A03M4G` 验证）。
 常见的 mini-PCIe 模组还需要：**带 SIM 卡座的 USB 转接板**（把模组变成 USB 设备）、
-**4G 天线**、一张**开通语音+短信的 SIM**（中国电信已验证；VoLTE 取决于运营商）。
+**4G 天线**、一张**开通语音+短信的 SIM**（已在真机验证；VoLTE 取决于运营商）。
 模组+转接板全套约 **¥100–200**，淘宝搜「EC20 USB 转接板」。
 
 ### 前置

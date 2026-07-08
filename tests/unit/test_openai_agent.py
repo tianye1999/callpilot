@@ -174,7 +174,7 @@ def test_session_instructions_override_default(monkeypatch):
 
 
 def test_realtime_url_override(monkeypatch):
-    """OPENAI_REALTIME_URL 覆盖 base（大陆用户反代/Azure 兼容端点）。"""
+    """OPENAI_REALTIME_URL 覆盖 base（反向代理/Azure 兼容端点）。"""
     _instances, calls = _patch_connect(monkeypatch)
     agent = _make_agent(realtime_url="wss://proxy.example.com/v1/realtime")
 
