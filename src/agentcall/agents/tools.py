@@ -94,6 +94,13 @@ QUERY_CODE_SPEC: dict[str, Any] = {
 }
 
 
+# 终结性工具：调用后会话即将结束，不应再让模型生成后续回复。
+# hangup_call 已要求「先说完告别再调用」，此时告别语已播出；若回传结果后再
+# 触发 response.create，模型会在挂断延迟里多说一句（如“电话已经挂断…”），
+# 对端听到多余的话。故对这类工具只回传 function_call_output、不再要新回复。
+TERMINAL_TOOLS: frozenset[str] = frozenset({"hangup_call"})
+
+
 def _tool_name(spec: dict[str, Any]) -> str | None:
     """兼容扁平与 function 嵌套两种规格，取出工具名。"""
     if "function" in spec and isinstance(spec["function"], dict):

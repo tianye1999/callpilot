@@ -348,6 +348,45 @@ def test_tool_call_round_trip(monkeypatch):
     assert ws.sent[idx + 1] == {"type": "response.create"}
 
 
+def test_terminal_tool_skips_response_create(monkeypatch):
+    """hangup_call 是终结性工具：回传结果后不得再 response.create。
+
+    否则模型会在挂断延迟里多说一句（如“电话已经挂断…”），对端听到多余的话。
+    告别语已按提示词要求在调用 hangup_call 之前说完。
+    """
+    from agentcall.agents.tools import HANGUP_SPEC
+
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    registry = ToolRegistry()
+    registry.register(HANGUP_SPEC, lambda args: {"success": True, "message": "ok"})
+    agent.set_tools(registry)
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            instances[0].feed({
+                "type": "response.function_call_arguments.done",
+                "name": "hangup_call",
+                "call_id": "call-bye",
+                "arguments": "{}",
+            })
+            await _drain()
+            await asyncio.sleep(0.05)  # 等 to_thread 的工具执行完
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+    ws = instances[0]
+    # 工具结果照常回传
+    outputs = [m for m in ws.sent if m["type"] == "conversation.item.create"]
+    assert len(outputs) == 1
+    assert outputs[0]["item"]["type"] == "function_call_output"
+    # 但绝不能再要新回复（本会话开场没有 say，故整通 sent 里不应出现 response.create）
+    assert "response.create" not in ws.sent_types()
+
+
 def test_tool_result_dropped_when_connection_replaced(monkeypatch):
     """工具执行期间断线重连：旧 call_id 的结果不得发进新会话（codex review P1）。"""
     import threading
