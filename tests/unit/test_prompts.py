@@ -39,6 +39,16 @@ def test_outbound_instructions_inject_owner_persona_task():
     assert "hangup_call" in text
     assert "【IVR 应对】" in text
     assert "【必须主动挂断】" in text
+    # 「立场」框定：事项围绕机主、对方是协助方（防 OpenAI 把对端当被查询对象）
+    assert "【立场】" in text
+    assert "帮我查/办" in text and "查您的" in text  # 明确「不要说成查您的X」
+
+
+def test_outbound_standpoint_framing_english():
+    text = build_instructions("outbound", "Alex", "AI assistant", "check data usage", "en")
+    assert "[Standpoint]" in text
+    assert "on Alex's account" in text
+    assert "your X" in text  # 明确禁止「your X」措辞
 
 
 def test_winddown_instructions_bilingual():

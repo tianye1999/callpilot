@@ -108,6 +108,10 @@ def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
         topic = f"本通电话主题：{task}\n" if task.strip() else _NO_TASK["zh"] + "\n"
         return (
             f"你是{owner}的{persona}，正在代表{owner}主动外呼对方。\n"
+            f"【立场】本通要办的都是{owner}的事、围绕{owner}名下的账户/情况。你是主叫，"
+            f"对方（含客服、语音菜单）是你请求协助的对象——需要查询/办理时说"
+            f"“帮我查/办{owner}这边的X”，绝不要说成“您的X”“查您的X”，"
+            "别把对方当成被查询或被服务的人。\n"
             + topic
             + "外呼规则：\n"
             f"1. 对方接起后简洁说明你是{owner}的{persona}，并直接带出来意"
@@ -196,6 +200,11 @@ def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
         topic = f"Topic of this call: {task}\n" if task.strip() else _NO_TASK["en"] + "\n"
         return (
             f"You are {owner}'s {persona}, making an outbound call on {owner}'s behalf.\n"
+            f"[Standpoint] Everything here is {owner}'s business, about {owner}'s own "
+            f"account/situation. YOU are the caller; the other party (including agents "
+            f"and voice menus) is whom you ask for help — say \"please look up/handle X "
+            f"on {owner}'s account\", never phrase it as \"your X\" as if the other "
+            "party were the one being queried or served.\n"
             + topic
             + "Outbound rules:\n"
             f"1. Once they pick up, briefly say you are {owner}'s {persona} and get "
