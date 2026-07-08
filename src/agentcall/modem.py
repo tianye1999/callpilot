@@ -182,6 +182,7 @@ class Eg25Modem:
         self._on_sms: Callable[[str | None, str], None] | None = None
         self._on_call_connected: Callable[[str | None], None] | None = None
         self._buffer = ""
+        self._processing_response_cmti = False
         self._last_caller: str | None = None
         self._last_dialed: str | None = None
         self._incoming_call_ids: set[str] = set()
@@ -522,7 +523,10 @@ class Eg25Modem:
                 raise RuntimeError("模组未连接")
             line = cmd if cmd.endswith("\r") else f"{cmd}\r"
             self._ser.write(line.encode("ascii"))
-            return self._read_response(timeout=3)
+            response = self._read_response(timeout=3)
+            if not cmd.strip().upper().startswith("AT+CLCC"):
+                self._process_response_urcs(response)
+            return response
 
     def _read_response(self, timeout: float = 2) -> str:
         if not self._ser:
@@ -577,6 +581,20 @@ class Eg25Modem:
                 if self._pcm_ready_event.is_set():
                     logger.warning("模组上行忙，暂停发送 (+QPCMV: 0,0)")
                 self._pcm_ready_event.clear()
+
+    def _process_response_urcs(self, text: str) -> None:
+        self._scan_qpcmv(text)
+        if self._processing_response_cmti:
+            return
+        matches = list(CMTI_PATTERN.finditer(text))
+        if not matches:
+            return
+        self._processing_response_cmti = True
+        try:
+            for match in matches:
+                self._read_sms(match.group(1), match.group(2))
+        finally:
+            self._processing_response_cmti = False
 
     def _process_buffer(self) -> None:
         self._scan_qpcmv(self._buffer)
@@ -642,7 +660,7 @@ class Eg25Modem:
             time.sleep(2)
 
     def _process_clcc_response(self, response: str) -> None:
-        self._scan_qpcmv(response)
+        self._process_response_urcs(response)
         seen_incoming_ids: set[str] = set()
         # 与 dial() 对 _connected_call_ids/_call_connected_event 的清除互斥：
         # 状态判定+改写在 _serial_lock 内完成，回调收集后到锁外触发（避免持锁回调）。

@@ -91,6 +91,36 @@ def test_clcc_outbound_connected_sets_event():
     assert connected == ["13700000000"]
 
 
+def test_clcc_response_with_cmti_reads_sms():
+    modem = make_modem()
+    messages: list[tuple[str | None, str]] = []
+    modem.on_sms(lambda sender, body: messages.append((sender, body)))
+    sent: list[str] = []
+
+    def fake_send(cmd: str) -> str:
+        sent.append(cmd)
+        if cmd == 'AT+CPMS="SM"':
+            return "\r\nOK\r\n"
+        if cmd == "AT+CMGR=5":
+            return (
+                '\r\n+CMGR: "REC UNREAD","+8613800000000",,"26/07/01,14:20:07+32"\r\n'
+                "hello from cmti\r\n"
+                "OK\r\n"
+            )
+        return "\r\nOK\r\n"
+
+    modem._send = fake_send  # type: ignore[method-assign]
+
+    modem._process_clcc_response(
+        '\r\n+CLCC: 1,1,4,0,0,"13900000000",129\r\n'
+        '+CMTI: "SM",5\r\n'
+        "OK\r\n"
+    )
+
+    assert sent == ['AT+CPMS="SM"', "AT+CMGR=5"]
+    assert messages == [("+8613800000000", "hello from cmti")]
+
+
 # ---- URC 缓冲处理：RING / CLIP / NO CARRIER ----
 
 def test_ring_urc_with_clip_carries_caller():
@@ -279,6 +309,55 @@ def test_send_command_returns_raw_response():
     resp = modem.send_command("AT+CSQ")
     assert "OK" in resp
     assert modem._ser.writes == ["AT+CSQ"]
+
+
+class CMTIFakeSerial(FakeSerial):
+    """假串口：普通 AT 响应里夹带 CMTI，随后支持真实 _read_sms 指令序列。"""
+
+    def write(self, data: bytes) -> int:
+        cmd = data.decode("ascii").strip()
+        with self._lock:
+            self.writes.append(cmd)
+            if cmd == "AT+CSQ":
+                self._pending = (
+                    b'\r\n+CSQ: 20,99\r\n+CMTI: "SM",5\r\nOK\r\n'
+                )
+            elif cmd == 'AT+CPMS="SM"':
+                self._pending = b"\r\nOK\r\n"
+            elif cmd == "AT+CMGR=5":
+                self._pending = (
+                    b'\r\n+CMGR: "REC UNREAD","+8613800000000",,"26/07/01,14:20:07+32"\r\n'
+                    b"hello from send\r\nOK\r\n"
+                )
+            else:
+                self._pending = b"\r\nOK\r\n"
+        return len(data)
+
+
+def test_send_response_with_cmti_reads_sms():
+    modem = make_modem()
+    modem._ser = CMTIFakeSerial()
+    messages: list[tuple[str | None, str]] = []
+    modem.on_sms(lambda sender, body: messages.append((sender, body)))
+
+    response = modem.send_command("AT+CSQ")
+
+    assert "+CSQ:" in response
+    assert modem._ser.writes == ["AT+CSQ", 'AT+CPMS="SM"', "AT+CMGR=5"]
+    assert messages == [("+8613800000000", "hello from send")]
+
+
+def test_response_without_cmti_has_no_sms_side_effect():
+    modem = make_modem()
+    modem._ser = FakeSerial()
+    messages: list[tuple[str | None, str]] = []
+    modem.on_sms(lambda sender, body: messages.append((sender, body)))
+
+    response = modem.send_command("AT")
+
+    assert "OK" in response
+    assert modem._ser.writes == ["AT"]
+    assert messages == []
 
 
 # ---- P0 会话僵尸：串口断连期通话消失，CLCC 恢复后必须触发 on_hangup ----

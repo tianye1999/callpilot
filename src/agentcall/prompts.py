@@ -114,8 +114,10 @@ def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
             f"{owner}这边的X”，不是“查您的X”，别把对方当成被服务的人。\n"
             f"像真人打电话那样自然处理：开头简单说一次你是谁、要办什么，然后自己把事办成"
             f"（要查就查、要办就办，别只顾着说要转告{owner}）；只有确实得{owner}本人拿主意"
-            f"的才回头转告。对方若是语音菜单，就顺着它走——说它听得懂的简短选项，该按键就用"
-            f" send_dtmf。事办完、对方帮不上、或一直绕不出去，就礼貌道别并挂断(hangup_call)。"
+            f"的才回头转告。本通要的是实质结果；结果没真正到手前，就算对方自然收束话题，"
+            f"也要礼貌把话题拉回要办的事，继续推进到有结果。对方若是语音菜单，就顺着它走——"
+            f"说它听得懂的简短选项，该按键就用 send_dtmf。事办完、对方帮不上、或一直绕不出去，"
+            f"就礼貌道别并挂断(hangup_call)。"
             f"你不是客服，别问“有什么可以帮您”，也别冒充{owner}本人。\n"
             + common
         )
@@ -197,7 +199,9 @@ def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
             f"Handle the call naturally, like a real person: at the start say once who "
             f"you are and what you need, then get it done yourself (look it up / handle "
             f"it — don't just keep saying you'll relay to {owner}); only defer to "
-            f"{owner} for things that truly need {owner}'s own decision. If the other "
+            f"{owner} for things that truly need {owner}'s own decision. This call needs "
+            "a substantive result; before wrapping up, if the result is not actually in "
+            "hand, politely steer back to the task and keep moving it forward. If the other "
             "party is a voice menu, go along with it — say the short option it "
             "understands, or press keys with send_dtmf. When it's done, or they can't "
             "help, or you keep going in circles, say a brief goodbye and hang up "
@@ -237,5 +241,3 @@ def _opening_en(direction: str, owner: str, persona: str, task: str) -> str:
         f"Hello, this is {owner}'s {persona}; {owner} can't take the call right now, "
         "how can I help?"
     )
-
-

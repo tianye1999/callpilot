@@ -49,6 +49,29 @@ def test_outbound_standpoint_framing_english():
     assert "your X" in text  # 明确禁止「your X」措辞
 
 
+def test_outbound_requires_substantive_result_before_wrapping_up():
+    text = build_instructions("outbound", "李明", "数字分身", "查询本月话费")
+    assert "实质结果" in text
+    assert "没真正到手" in text
+    assert "礼貌把话题拉回" in text
+
+
+def test_outbound_requires_substantive_result_before_wrapping_up_english():
+    text = build_instructions("outbound", "Alex", "AI assistant", "check data usage", "en")
+    assert "substantive result" in text
+    assert "politely steer back" in text
+    assert "before wrapping up" in text
+
+
+def test_inbound_prompt_does_not_get_outbound_result_persistence():
+    text = build_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
+    assert "实质结果" not in text
+    assert "礼貌把话题拉回" not in text
+    en = build_instructions("inbound", "Alex", "AI assistant", "", "en")
+    assert "substantive result" not in en
+    assert "politely steer back" not in en
+
+
 def test_winddown_instructions_bilingual():
     from agentcall.prompts import winddown_instructions
     assert "告别" in winddown_instructions("zh") and "再见" in winddown_instructions("zh")
