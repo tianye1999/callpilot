@@ -65,9 +65,38 @@ def list_devices() -> list[tuple[int, int, str, int]]:
     return devices
 
 
+_KA_DEFAULT_OUTPUT = _fourcc("dOut")  # kAudioHardwarePropertyDefaultOutputDevice
+
+
 def find_output_index(keyword: str) -> int | None:
     """名字含 keyword 且有输出流的设备的数组序号（供 ffmpeg audiotoolbox）。"""
     for idx, _dev_id, name, out_streams in list_devices():
         if keyword.lower() in name.lower() and out_streams > 0:
+            return idx
+    return None
+
+
+def default_output_index() -> int | None:
+    """系统默认输出设备的数组序号（供 ffmpeg audiotoolbox）。
+
+    比按名字匹配更稳健、可移植：跟随用户在系统里选的输出（内置扬声器/耳机/
+    外接音箱），不依赖机型或语言特定的设备名。查不到返回 None。
+    """
+    try:
+        ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+        addr = _PropertyAddress(_KA_DEFAULT_OUTPUT, _KA_SCOPE_GLOBAL, 0)
+        dev = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(4)
+        status = ca.AudioObjectGetPropertyData(
+            ctypes.c_uint32(_KA_SYSTEM_OBJECT), ctypes.byref(addr), 0, None,
+            ctypes.byref(size), ctypes.byref(dev),
+        )
+        if status != 0:
+            return None
+        default_id = dev.value
+    except OSError:
+        return None
+    for idx, dev_id, _name, out_streams in list_devices():
+        if dev_id == default_id and out_streams > 0:
             return idx
     return None

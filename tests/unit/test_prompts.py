@@ -74,8 +74,31 @@ def test_inbound_opening_injects_owner():
     text = opening_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
     assert "我是李明的数字分身" in text
     assert "李明现在不方便接" in text
-    # 来电开场白不应带外呼主题
-    assert DEFAULT_OUTBOUND_TASK not in text
+    # 来电开场白不应带外呼专属措辞
+    assert "这次主要是" not in text
+
+
+# ---- 无预设任务（空 task）：不塞元指令、强化「你是主叫不是客服」----
+
+def test_outbound_empty_task_uses_no_agenda_frame():
+    text = build_instructions("outbound", "李明", "数字分身", "", "zh")
+    assert "本通电话主题：" not in text          # 不硬塞主题行
+    assert "没有预设具体事项" in text            # 走优雅兜底
+    assert "绝不要充当客服" in text              # 强化主叫身份
+    assert "不要问对方“有什么可以帮您”" in text
+    en = build_instructions("outbound", "Alex", "AI assistant", "", "en")
+    assert "Topic of this call:" not in en
+    assert "no preset agenda" in en
+    assert "never act like\ncustomer service" in en or "customer service" in en
+
+
+def test_outbound_empty_task_opening_no_meta():
+    text = opening_instructions("outbound", "李明", "数字分身", "", "zh")
+    assert "有件事想跟您沟通一下" in text        # 空任务用自然措辞
+    assert "这次主要是" not in text              # 不注入空/元任务
+    en = opening_instructions("outbound", "Alex", "AI assistant", "", "en")
+    assert "There's something I'd like to go over" in en
+    assert "It's mainly about" not in en
 
 
 # ---- 多语言（AGENT_LANGUAGE=en）----

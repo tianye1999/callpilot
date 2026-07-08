@@ -101,8 +101,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 与前端 UI 语言（localStorage）相互独立。改动需重启会话。
     ConfigSpec("AGENT_LANGUAGE", "AI 通话语言", "select", "zh",
                choices=("zh", "en"), requires_restart=True),
-    ConfigSpec("AGENT_OUTBOUND_TASK", "外呼任务指令", "str",
-               "代表机主主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。"),
+    # 默认留空 = 无预设事项（提示词走「无预设」优雅分支，不会硬塞元指令当主题）；
+    # 外呼时通常在页面临时填具体主题。
+    ConfigSpec("AGENT_OUTBOUND_TASK", "外呼任务指令", "str", ""),
     # ---- 模组 ----
     # 默认值按当前平台在模块加载时定死（Windows 为 auto 哨兵，连接时扫描）。
     ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", platforms.default_modem_port(),
@@ -130,7 +131,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                editable=False, hidden=True),
     # ---- 本地监听 ----
     ConfigSpec("MONITOR_AI_PLAYBACK", "本地监听 AI 语音", "bool", "false"),
-    ConfigSpec("MONITOR_OUTPUT_DEVICE", "监听输出设备", "str", "MacBook Air扬声器"),
+    # 默认留空 = 跟随系统默认输出设备（可移植；填设备名则按名匹配）。
+    ConfigSpec("MONITOR_OUTPUT_DEVICE", "监听输出设备", "str", ""),
     ConfigSpec("MONITOR_AI_GAIN", "监听增益（AI 下行）", "float", "1.0"),
     # 电话上行是窄带信号且电平偏低，监听需大幅放大（真机调到 15 倍才够听清）。
     ConfigSpec("MONITOR_UPLINK_GAIN", "监听增益（对方上行）", "float", "8.0"),

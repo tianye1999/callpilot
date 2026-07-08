@@ -17,19 +17,22 @@ from . import config
 _OWNER_FALLBACK = {"zh": "机主", "en": "the owner"}
 _PERSONA_FALLBACK = {"zh": "AI 助理", "en": "AI assistant"}
 
-_DEFAULT_OUTBOUND_TASK = {
-    "zh": "代表机主主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。",
+# 无预设任务时的兜底措辞（不再塞「元指令」当主题——那会让模型漂移成客服）。
+_NO_TASK = {
+    "zh": "本次外呼没有预设具体事项：礼貌说明你是代打电话的、问对方是否方便，"
+          "有无需要转达的事。记住是你主动打过去的，绝不要充当客服问对方需要什么。",
     "en": (
-        "Make an outbound call on the owner's behalf; once the other party picks "
-        "up, naturally explain why you're calling and keep the conversation brief "
-        "and on-topic."
+        "There is no preset agenda for this call: politely explain you're calling "
+        "on the owner's behalf, ask if it's a good time, and whether there's "
+        "anything to pass on. Remember YOU placed this call — never act like "
+        "customer service asking what they need."
     ),
 }
 
 _WEEKDAYS_ZH = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
-# 向后兼容：旧代码 `from .prompts import DEFAULT_OUTBOUND_TASK` 仍可用（中文默认）。
-DEFAULT_OUTBOUND_TASK = _DEFAULT_OUTBOUND_TASK["zh"]
+# 向后兼容：旧代码 `from .prompts import DEFAULT_OUTBOUND_TASK` 仍可用。
+DEFAULT_OUTBOUND_TASK = ""
 
 
 def normalize_lang(lang: str | None) -> str:
@@ -53,8 +56,8 @@ def agent_persona(lang: str = "zh") -> str:
 
 
 def default_outbound_task(lang: str = "zh") -> str:
-    """外呼默认主题（用户未指定时的兜底），按语言。"""
-    return _DEFAULT_OUTBOUND_TASK[normalize_lang(lang)]
+    """外呼默认主题：无预设任务时返回空串（提示词会走「无预设事项」优雅分支）。"""
+    return ""
 
 
 def _now_str(lang: str) -> str:
@@ -102,10 +105,11 @@ def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
     )
 
     if direction == "outbound":
+        topic = f"本通电话主题：{task}\n" if task.strip() else _NO_TASK["zh"] + "\n"
         return (
             f"你是{owner}的{persona}，正在代表{owner}主动外呼对方。\n"
-            f"本通电话主题：{task}\n"
-            "外呼规则：\n"
+            + topic
+            + "外呼规则：\n"
             f"1. 对方接起后自然说明：你是{owner}的{persona}，"
             f"{owner}让你打来，并带出来意。\n"
             f"2. 你不是客服，不要问对方“有什么可以帮您”；不要冒充{owner}本人。\n"
@@ -136,10 +140,11 @@ def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
 
 def _opening_zh(direction: str, owner: str, persona: str, task: str) -> str:
     if direction == "outbound":
+        purpose = f"这次主要是{task}" if task.strip() else "有件事想跟您沟通一下"
         return (
             "请直接用中文说一句自然电话开场白，不要解释："
             f"你好，我是{owner}的{persona}，{owner}让我打这个电话。"
-            f"这次主要是{task} 你现在方便说两句吗？"
+            f"{purpose} 你现在方便说两句吗？"
         )
     return (
         "请直接用中文说一句自然电话开场白，不要解释："
@@ -173,10 +178,11 @@ def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
     )
 
     if direction == "outbound":
+        topic = f"Topic of this call: {task}\n" if task.strip() else _NO_TASK["en"] + "\n"
         return (
             f"You are {owner}'s {persona}, making an outbound call on {owner}'s behalf.\n"
-            f"Topic of this call: {task}\n"
-            "Outbound rules:\n"
+            + topic
+            + "Outbound rules:\n"
             f"1. Once they pick up, naturally explain: you are {owner}'s {persona}, "
             f"{owner} asked you to call, and state your purpose.\n"
             f"2. You are not a call-center agent — don't ask \"how can I help you\"; "
@@ -217,10 +223,11 @@ def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
 
 def _opening_en(direction: str, owner: str, persona: str, task: str) -> str:
     if direction == "outbound":
+        purpose = f"It's mainly about {task}" if task.strip() else "There's something I'd like to go over with you"
         return (
             "Say one natural phone opening line directly in English, no explanation: "
             f"Hi, this is {owner}'s {persona}, {owner} asked me to make this call. "
-            f"It's mainly about {task} Is now a good time to talk?"
+            f"{purpose} Is now a good time to talk?"
         )
     return (
         "Say one natural phone opening line directly in English, no explanation: "

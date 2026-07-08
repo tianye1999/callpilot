@@ -97,15 +97,23 @@ class MonitorPlayback:
             )
             return
         # 与 FfmpegAudioBridge 相同的延迟导入姿势，避免 import 副作用。
-        from .coreaudio import find_output_index
+        from .coreaudio import default_output_index, find_output_index
 
         try:
-            output_index = find_output_index(self.device_keyword)
+            keyword = (self.device_keyword or "").strip()
+            if keyword:
+                # 指定了设备名：按名匹配（用户显式选设备）。
+                output_index = find_output_index(keyword)
+                which = f"含 '{keyword}'"
+            else:
+                # 未指定：跟随系统默认输出（可移植、不依赖机型/语言特定名字）。
+                output_index = default_output_index()
+                which = "系统默认输出"
         except Exception as exc:  # noqa: BLE001
             logger.warning("枚举 CoreAudio 输出设备失败: %s，监听已禁用", exc)
             return
         if output_index is None:
-            logger.warning("未找到含 '%s' 的输出设备，监听已禁用", self.device_keyword)
+            logger.warning("未找到%s的输出设备，监听已禁用", which)
             return
         try:
             self._proc = subprocess.Popen(
@@ -235,7 +243,7 @@ def create_monitor_playback() -> MonitorPlayback | None:
     if enabled not in _TRUE_VALUES:
         return None
     return MonitorPlayback(
-        os.environ.get("MONITOR_OUTPUT_DEVICE", "MacBook Air扬声器"),
+        os.environ.get("MONITOR_OUTPUT_DEVICE", ""),  # 空 = 系统默认输出
         sample_rate=int(os.environ.get("MONITOR_PLAYBACK_RATE", "24000")),
         gain=float(os.environ.get("MONITOR_AI_GAIN", "1.0")),
     )

@@ -168,6 +168,29 @@ def test_start_builds_expected_ffmpeg_command():
     mp.stop()
 
 
+def test_empty_keyword_uses_system_default_output(monkeypatch):
+    """未指定设备名（空）→ 跟随系统默认输出（default_output_index），不按名匹配。"""
+    called = {"default": 0, "find": 0}
+
+    def fake_default():
+        called["default"] += 1
+        return 5
+
+    def fake_find(keyword):
+        called["find"] += 1
+        return 3
+
+    monkeypatch.setattr(coreaudio, "default_output_index", fake_default)
+    monkeypatch.setattr(coreaudio, "find_output_index", fake_find)
+    mp = MonitorPlayback("")  # 空关键字
+    mp.start()
+    assert mp.active
+    assert called == {"default": 1, "find": 0}  # 走默认输出，不走按名匹配
+    cmd = FakePopen.instances[-1].cmd
+    assert cmd[cmd.index("-audio_device_index") + 1] == "5"
+    mp.stop()
+
+
 # ---- feed：非阻塞 + 丢帧 ----
 
 
