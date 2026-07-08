@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import threading
 import time
+from queue import Empty
 
 from agentcall.agents import qwen_agent
 
@@ -307,3 +309,48 @@ def test_stop_during_reconnect_closes_new_connection(monkeypatch):
     live = [c for c in SlowConversation.instances if not c.closed]
     assert not live, "重连线程泄漏了未关闭的新连接"
     assert first_conn.closed
+
+
+def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
+    """下行转写命中复读判重时，该 response 已缓存音频不得进入下行队列。"""
+    monkeypatch.setenv("REPEAT_SUPPRESS_SIMILARITY", "0.9")
+    agent = qwen_agent.QwenVoiceAgent(
+        api_key="test-key",
+        model="qwen-omni-turbo-realtime",
+        model_display_name="千问测试",
+    )
+    callback = agent._callback
+    first = "您好，我是张三的数字分身，想咨询一下套餐情况。"
+    repeated = "您好！我是张三的数字分身，想咨询一下套餐情况"
+
+    callback.on_event({
+        "type": "response.audio.delta",
+        "response_id": "r1",
+        "delta": base64.b64encode(b"first").decode("ascii"),
+    })
+    callback.on_event({
+        "type": "response.audio_transcript.done",
+        "response_id": "r1",
+        "transcript": first,
+    })
+    assert agent._audio_queue.get_nowait() == b"first"
+
+    with caplog.at_level("INFO"):
+        callback.on_event({
+            "type": "response.audio.delta",
+            "response_id": "r2",
+            "delta": base64.b64encode(b"repeat").decode("ascii"),
+        })
+        callback.on_event({
+            "type": "response.audio_transcript.done",
+            "response_id": "r2",
+            "transcript": repeated,
+        })
+
+    try:
+        agent._audio_queue.get_nowait()
+    except Empty:
+        pass
+    else:
+        raise AssertionError("复读响应音频不应进入下行队列")
+    assert "抑制复读" in caplog.text

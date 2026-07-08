@@ -21,6 +21,7 @@ from typing import Any, Callable
 import websockets
 
 from .. import config
+from ..repeat_suppression import ResponseAudioGate
 from .base import VoiceAgent
 from .tools import TERMINAL_TOOLS
 
@@ -34,6 +35,17 @@ TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 
 # 重连成功后让 Agent 主动安抚对方的提示词（与 qwen_agent 语义一致）。
 RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继续。"
+
+
+def _response_id(event: dict) -> str | None:
+    response = event.get("response") if isinstance(event.get("response"), dict) else {}
+    raw = (
+        event.get("response_id")
+        or event.get("item_id")
+        or event.get("id")
+        or response.get("id")
+    )
+    return str(raw) if raw else None
 
 
 def _reconnect_max() -> int:
@@ -78,6 +90,7 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._ws: Any = None
         self._recv_task: asyncio.Task | None = None
         self._on_audio_out: Callable[[bytes], None] | None = None
+        self._audio_gate = ResponseAudioGate("openai", self._emit_audio_out)
         self._running = False
         self._handled_tool_calls: set[str] = set()
         self._instructions: str | None = None
@@ -190,6 +203,10 @@ class OpenAIVoiceAgent(VoiceAgent):
 
     # ---- 收发 ----
 
+    def _emit_audio_out(self, pcm: bytes) -> None:
+        if self._on_audio_out:
+            self._on_audio_out(pcm)
+
     async def send_audio(self, pcm: bytes) -> None:
         ws = self._ws
         if not ws or not pcm:
@@ -280,8 +297,10 @@ class OpenAIVoiceAgent(VoiceAgent):
         if event_type in ("response.audio.delta", "response.output_audio.delta"):
             # beta 与 GA 两代事件名的下行音频增量
             delta = event.get("delta", "")
-            if delta and self._on_audio_out:
-                self._on_audio_out(base64.b64decode(delta))
+            if delta:
+                self._audio_gate.push_audio(
+                    _response_id(event), base64.b64decode(delta)
+                )
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (event.get("transcript") or "").strip()
             if transcript:
@@ -294,7 +313,11 @@ class OpenAIVoiceAgent(VoiceAgent):
             transcript = (event.get("transcript") or "").strip()
             if transcript:
                 logger.info("[下行·Agent] %s", transcript)
-                self._emit_transcript("agent", transcript)
+                suppressed = self._audio_gate.complete_transcript(
+                    _response_id(event), transcript
+                )
+                if not suppressed:
+                    self._emit_transcript("agent", transcript)
         elif event_type == "response.function_call_arguments.done":
             name = event.get("name")
             call_id = event.get("call_id")
@@ -316,6 +339,7 @@ class OpenAIVoiceAgent(VoiceAgent):
                 # 记 error 便于排查"通着但沉默"。
                 logger.error("OpenAI 回复轮次异常结束: %s", event.get("response"))
             else:
+                self._audio_gate.complete_response(_response_id(event))
                 logger.debug("OpenAI 回复轮次完成")
         elif event_type == "error":
             logger.error("OpenAI Realtime 错误: %s", event)

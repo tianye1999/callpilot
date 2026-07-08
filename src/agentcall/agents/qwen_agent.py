@@ -25,6 +25,7 @@ from dashscope.audio.qwen_omni import (
 )
 
 from .. import config
+from ..repeat_suppression import ResponseAudioGate
 from .base import VoiceAgent
 from .tools import TERMINAL_TOOLS
 
@@ -39,6 +40,17 @@ RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继
 # Realtime 端点默认 host/port（与 dashscope SDK 内置的 wss 地址一致）。
 DEFAULT_PREWARM_HOST = "dashscope.aliyuncs.com"
 DEFAULT_PREWARM_PORT = 443
+
+
+def _response_id(event: dict) -> str | None:
+    response = event.get("response") if isinstance(event.get("response"), dict) else {}
+    raw = (
+        event.get("response_id")
+        or event.get("item_id")
+        or event.get("id")
+        or response.get("id")
+    )
+    return str(raw) if raw else None
 
 
 def _reconnect_max() -> int:
@@ -141,7 +153,11 @@ class _QwenCallback(OmniRealtimeCallback):
         if event_type == "response.audio.delta":
             delta = response.get("delta", "")
             if delta:
-                self._audio_queue.put(base64.b64decode(delta))
+                chunk = base64.b64decode(delta)
+                if self._agent:
+                    self._agent._audio_gate.push_audio(_response_id(response), chunk)  # noqa: SLF001
+                else:
+                    self._audio_queue.put(chunk)
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (response.get("transcript") or "").strip()
             if transcript:
@@ -157,7 +173,11 @@ class _QwenCallback(OmniRealtimeCallback):
             if transcript:
                 logger.info("[下行·Agent] %s", transcript)
                 if self._agent:
-                    self._agent._emit_transcript("agent", transcript)  # noqa: SLF001
+                    suppressed = self._agent._audio_gate.complete_transcript(  # noqa: SLF001
+                        _response_id(response), transcript
+                    )
+                    if not suppressed:
+                        self._agent._emit_transcript("agent", transcript)  # noqa: SLF001
         elif event_type == "response.function_call_arguments.done":
             name = response.get("name")
             call_id = response.get("call_id")
@@ -168,6 +188,8 @@ class _QwenCallback(OmniRealtimeCallback):
                     name, call_id, arguments
                 )
         elif event_type == "response.done":
+            if self._agent:
+                self._agent._audio_gate.complete_response(_response_id(response))  # noqa: SLF001
             logger.debug("千问回复轮次完成")
         elif event_type == "error":
             logger.error("千问 Realtime 错误: %s", response)
@@ -192,6 +214,10 @@ class QwenVoiceAgent(VoiceAgent):
         self.realtime_url = realtime_url
         self._conversation: OmniRealtimeConversation | None = None
         self._audio_queue: Queue[bytes | None] = Queue()
+        self._audio_gate = ResponseAudioGate(
+            "qwen",
+            lambda chunk: self._audio_queue.put(chunk),
+        )
         self._callback = _QwenCallback(self._audio_queue, agent=self)
         self._on_audio_out: Callable[[bytes], None] | None = None
         self._pump_thread: threading.Thread | None = None

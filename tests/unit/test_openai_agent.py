@@ -291,6 +291,51 @@ def test_transcripts_emitted_for_user_and_agent(monkeypatch):
     ]
 
 
+def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
+    """下行转写命中复读判重时，该 response 已缓存音频不得输出。"""
+    monkeypatch.setenv("REPEAT_SUPPRESS_SIMILARITY", "0.9")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    received: list[bytes] = []
+    first = "您好，我是张三的数字分身，想咨询一下套餐情况。"
+    repeated = "您好！我是张三的数字分身，想咨询一下套餐情况"
+
+    async def scenario():
+        await agent.start(received.append)
+        try:
+            instances[0].feed({
+                "type": "response.output_audio.delta",
+                "response_id": "r1",
+                "delta": base64.b64encode(b"first").decode("ascii"),
+            })
+            instances[0].feed({
+                "type": "response.output_audio_transcript.done",
+                "response_id": "r1",
+                "transcript": first,
+            })
+            await _drain()
+            assert received == [b"first"]
+
+            with caplog.at_level("INFO"):
+                instances[0].feed({
+                    "type": "response.output_audio.delta",
+                    "response_id": "r2",
+                    "delta": base64.b64encode(b"repeat").decode("ascii"),
+                })
+                instances[0].feed({
+                    "type": "response.output_audio_transcript.done",
+                    "response_id": "r2",
+                    "transcript": repeated,
+                })
+                await _drain()
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+    assert received == [b"first"]
+    assert "抑制复读" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # 工具调用往返
 # ---------------------------------------------------------------------------

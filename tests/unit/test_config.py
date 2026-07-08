@@ -373,13 +373,15 @@ def test_panel_reflects_env_value(monkeypatch):
 def test_registered_defaults_match_original_call_sites(monkeypatch):
     """本轮收口的配置项，注册表默认值必须与原调用点硬编码一致。"""
     _unset(monkeypatch, "MODEM_PCM_PORT", "MODEM_PCM_BAUD", "SUMMARY_TIMEOUT",
-           "QWEN_PREWARM_TIMEOUT", "QWEN_PREWARM_INTERVAL", "DASHSCOPE_REALTIME_URL")
+           "QWEN_PREWARM_TIMEOUT", "QWEN_PREWARM_INTERVAL", "DASHSCOPE_REALTIME_URL",
+           "REPEAT_SUPPRESS_SIMILARITY")
     assert get_str("MODEM_PCM_PORT") == ""            # app.py 原 os.getenv 无默认
     assert get_int("MODEM_PCM_BAUD") == 921600        # app.py 原硬编码 "921600"
     assert get_float("SUMMARY_TIMEOUT") == pytest.approx(30.0)   # summarizer 原 "30"
     assert get_float("QWEN_PREWARM_TIMEOUT") == pytest.approx(5.0)    # 原模块常量
     assert get_float("QWEN_PREWARM_INTERVAL") == pytest.approx(240.0)  # 原函数入参默认
     assert get_str("DASHSCOPE_REALTIME_URL") == ""    # 留空走 SDK 内置端点
+    assert get_float("REPEAT_SUPPRESS_SIMILARITY") == pytest.approx(0.9)
 
 
 def test_editable_specs_covered_by_env_example():
