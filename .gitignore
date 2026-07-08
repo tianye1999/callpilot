@@ -11,6 +11,9 @@ data/
 
 # Claude Code 会话产物
 .claude/
+# codex 配对对话记录（会话产物，含本机路径/内部信息 —— 铁律：永不提交）
+.codex_dialog.md
+*.codex_dialog.md
 .DS_Store
 packaging/icon_work/CallPilot.iconset/
 
