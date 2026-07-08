@@ -135,7 +135,11 @@ def main() -> None:
         dial_whitelist or "未设置(全部放行)",
     )
 
-    app = build_app(hub, service.modem, service=service, meta=meta)
+    # 需重启配置的自愈重启：/api/restart 置位该事件 → 停 loop → 清理后 os.execv。
+    restart_event = threading.Event()
+    app = build_app(
+        hub, service.modem, service=service, meta=meta, restart_event=restart_event
+    )
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, host, port)
@@ -159,6 +163,11 @@ def main() -> None:
             service.uplink_monitor.stop()
         loop.run_until_complete(runner.cleanup())
         loop.close()
+
+    # 端口已随 runner.cleanup() 释放；此时原地重启（重读 .env）可干净重新绑定。
+    if restart_event.is_set():
+        logger.info("按请求重启服务以应用需重启的配置…")
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 if __name__ == "__main__":

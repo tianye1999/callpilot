@@ -472,6 +472,14 @@
     from { opacity: 0; transform: translateY(10px) scale(.96); }
     to { opacity: 1; transform: translateY(0) scale(1); }
   }
+  /* 重启过场转圈（磷光绿） */
+  .spinner {
+    width: 46px; height: 46px; margin: 4px auto 18px; border-radius: 50%;
+    border: 3px solid rgba(48,209,88,.18); border-top-color: var(--ok);
+    animation: spin .8s linear infinite;
+    box-shadow: 0 0 22px rgba(48,209,88,.22);
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* ========= 语言选择菜单 ========= */
   #langBtn { display: inline-flex; align-items: center; gap: 5px; }
@@ -639,6 +647,14 @@
     </div>
   </div>
 
+  <div class="modal-overlay" id="restartOverlay">
+    <div class="modal-card" style="max-width:340px">
+      <div class="spinner"></div>
+      <div class="modal-title" id="restartTitle"></div>
+      <div class="modal-msg" id="restartMsg" style="margin-bottom:4px"></div>
+    </div>
+  </div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 /* ========= i18n（默认英文，localStorage 记忆） ========= */
@@ -673,6 +689,9 @@ const I18N = {
     batch_title: "Start batch calling?",
     batch_msg: (n) => `CallPilot will place ${n} call${n > 1 ? "s" : ""}, one at a time.`,
     batch_ok: "Start dialing",
+    restart_title: "Restarting service…",
+    restart_msg: "Applying settings that need a restart. This takes a few seconds.",
+    restart_timeout: "Taking longer than expected — please reload the page manually.",
     who_user: "Caller", who_agent: "AI Pilot",
     sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
@@ -747,6 +766,9 @@ const I18N = {
     batch_title: "开始批量外呼？",
     batch_msg: (n) => `将逐个拨打 ${n} 个号码。`,
     batch_ok: "开始拨打",
+    restart_title: "正在重启服务…",
+    restart_msg: "正在应用需要重启的设置，请稍候几秒。",
+    restart_timeout: "重启耗时较长，请手动刷新页面。",
     who_user: "对方", who_agent: "AI 副驾",
     sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
@@ -1324,6 +1346,24 @@ async function loadConfig() {
     cfgDirty = false;  // 刚从服务端同步，视为无未保存修改
   } catch (e) { console.warn("[config] 加载设置面板失败", e); }
 }
+// 保存了「需重启」配置后自动重启服务：过场遮罩 + 轮询 /api/meta 复活后自动刷新。
+async function restartService() {
+  $("restartTitle").textContent = t("restart_title");
+  $("restartMsg").textContent = t("restart_msg");
+  $("restartOverlay").classList.add("show");
+  try { await postJson("/api/restart", {}); } catch (e) { console.warn("[restart] 请求失败", e); }
+  const deadline = Date.now() + 40000;
+  const poll = async () => {
+    try {
+      const r = await fetch("/api/meta", { cache: "no-store" });
+      if (r.ok) { location.reload(); return; }
+    } catch (e) { /* 重启窗口内连接中断属正常 */ }
+    if (Date.now() < deadline) setTimeout(poll, 1200);
+    else $("restartMsg").textContent = t("restart_timeout");
+  };
+  setTimeout(poll, 2500);  // 给进程 execv 重启留出时间再开始轮询
+}
+
 // 任一字段被改动即标记「脏」（离开页面时据此提示保存）。
 $("configForm").addEventListener("input", () => { cfgDirty = true; });
 $("configForm").addEventListener("change", () => { cfgDirty = true; });
@@ -1348,7 +1388,9 @@ $("configSave").addEventListener("click", async () => {
       if (res.requires_restart.length) msg += t("cfg_restart")(res.requires_restart.length);
       setToast("configToast", "ok", msg);
       cfgDirty = false;
-      loadConfig();
+      // 含「需重启」项且当前无通话：自动重启服务应用（通话中则留待用户手动，不打断）。
+      if (res.requires_restart.length && !callActive) restartService();
+      else loadConfig();
     } else setToast("configToast", "err", t("cfg_savefail") + (res.error || ""));
   } catch (err) { setToast("configToast", "err", t("req_error")); }
   finally { btn.disabled = false; }

@@ -544,3 +544,29 @@ def test_send_sms_success_and_validation():
 
     api(app, fn)
     assert modem.sms_calls == [("10086", "余额查询")]
+
+
+# ---- /api/restart ----
+
+def test_restart_without_event_returns_501():
+    """未注入 restart_event（如非受管运行）时优雅拒绝，不假装成功。"""
+    app = make_app(FakeService())  # build_app 不带 restart_event
+    async def fn(client):
+        resp = await client.post("/api/restart", json={})
+        assert resp.status == 501
+        assert (await resp.json())["ok"] is False
+    api(app, fn)
+
+
+def test_restart_sets_event_and_returns_ok():
+    """注入 restart_event 时：置位事件并返回 ok（主循环据此 execv 重启）。"""
+    import threading
+    from agentcall.web.server import build_app as _build
+    ev = threading.Event()
+    app = _build(hub=None, modem=None, service=FakeService(), restart_event=ev)
+    async def fn(client):
+        resp = await client.post("/api/restart", json={})
+        assert resp.status == 200
+        assert (await resp.json())["ok"] is True
+    api(app, fn)
+    assert ev.is_set()

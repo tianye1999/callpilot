@@ -70,12 +70,15 @@ def build_app(
     modem: Eg25Modem,
     service=None,
     meta: dict | None = None,
+    restart_event=None,
 ) -> web.Application:
     app = web.Application(middlewares=[_error_middleware])
     app["hub"] = hub
     app["modem"] = modem
     app["service"] = service
     app["meta"] = meta or {}
+    # 由 app.py 传入的 threading.Event；置位后主循环停止并 os.execv 自重启。
+    app["restart_event"] = restart_event
 
     app.router.add_get("/", _index)
     app.router.add_get("/api/meta", _meta)
@@ -90,6 +93,7 @@ def build_app(
     app.router.add_get("/api/history/{call_id}/events", _history_events)
     app.router.add_get("/api/config", _get_config)
     app.router.add_post("/api/config", _post_config)
+    app.router.add_post("/api/restart", _restart)
     app.router.add_static("/static/", STATIC_DIR)
     return app
 
@@ -279,6 +283,23 @@ async def _history_events(request: web.Request) -> web.Response:
 async def _get_config(request: web.Request) -> web.Response:
     """设置面板数据：全部配置项 + 当前生效值（secret 已掩码）。"""
     return web.json_response(config.read_panel_values())
+
+
+async def _restart(request: web.Request) -> web.Response:
+    """重启服务以应用需重启的配置。
+
+    置位 restart_event 后延迟停止事件循环——app.py 主循环随即清理并
+    os.execv 原地重启（重读 .env）。延迟 0.4s 是为了让本响应先发回前端。
+    """
+    restart_event = request.app.get("restart_event")
+    if restart_event is None:
+        return web.json_response(
+            {"ok": False, "error": "当前运行方式不支持自动重启"}, status=501
+        )
+    restart_event.set()
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.4, loop.stop)
+    return web.json_response({"ok": True})
 
 
 async def _post_config(request: web.Request) -> web.Response:
