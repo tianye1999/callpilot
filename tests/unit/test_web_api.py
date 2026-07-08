@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+from types import SimpleNamespace
 
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
-from agentcall import config
+from agentcall import config, platforms
 from agentcall.call_log import CallLogger
+from agentcall.web import server
 from agentcall.web.server import _history_audio, _history_events, build_app
 
 
@@ -124,6 +126,115 @@ def test_meta_reports_missing_credentials_without_blocking(monkeypatch):
     meta = api(app, fn)
     assert meta["credentials"]["ok"] is False
     assert any("DASHSCOPE_API_KEY" in err for err in meta["credentials"]["errors"])
+
+
+def test_meta_includes_setup_and_hardware_status(monkeypatch):
+    monkeypatch.delenv("SETUP_DONE", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.delenv("DOUBAO_APP_ID", raising=False)
+    monkeypatch.delenv("DOUBAO_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+    service = FakeService()
+    service.modem_connected = False
+    app = build_app(
+        hub=None,  # type: ignore[arg-type]
+        modem=None,  # type: ignore[arg-type]
+        service=service,
+        meta=config.runtime_meta(provider="qwen", model="Qwen3.5-Omni", port="/tmp/ec20-at"),
+    )
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        assert resp.status == 200
+        return await resp.json()
+
+    meta = api(app, fn)
+    assert meta["setup_required"] is True
+    assert meta["hardware"] == {
+        "usb_online": True,
+        "modem_connected": False,
+        "port": "/tmp/ec20-at",
+    }
+
+
+def test_quectel_usb_detection_on_macos_uses_usb_scan(monkeypatch):
+    monkeypatch.setattr(platforms, "IS_MACOS", True)
+    monkeypatch.setattr(server, "_detect_quectel_usb_pyusb", lambda: True)
+    monkeypatch.setattr(server, "_detect_quectel_usb_system_profiler", lambda: False)
+    monkeypatch.setattr(
+        server.list_ports,
+        "comports",
+        lambda: [SimpleNamespace(vid=None)],
+    )
+
+    assert server.detect_quectel_usb_online() is True
+
+
+def test_quectel_usb_detection_on_macos_falls_back_to_system_profiler(monkeypatch):
+    monkeypatch.setattr(platforms, "IS_MACOS", True)
+    monkeypatch.setattr(server, "_detect_quectel_usb_pyusb", lambda: False)
+    monkeypatch.setattr(server, "_detect_quectel_usb_system_profiler", lambda: True)
+
+    assert server.detect_quectel_usb_online() is True
+
+
+def test_quectel_usb_detection_on_non_macos_keeps_serial_scan(monkeypatch):
+    monkeypatch.setattr(platforms, "IS_MACOS", False)
+
+    def fail_pyusb():
+        raise AssertionError("non-mac path must not use pyusb")
+
+    monkeypatch.setattr(server, "_detect_quectel_usb_pyusb", fail_pyusb)
+    monkeypatch.setattr(
+        server.list_ports,
+        "comports",
+        lambda: [SimpleNamespace(vid=server.QUECTEL_VID)],
+    )
+
+    assert server.detect_quectel_usb_online() is True
+
+
+def test_validate_key_endpoint_valid_invalid_and_network(monkeypatch):
+    outcomes = {
+        "good": config.KeyValidationResult(True, "valid"),
+        "bad": config.KeyValidationResult(False, "invalid"),
+        "net": config.KeyValidationResult(False, "network"),
+    }
+    monkeypatch.setattr(config, "validate_provider_key_online", lambda provider, secret, timeout=5.0: outcomes[secret])
+    app = make_app(FakeService())
+
+    async def fn(client):
+        resp = await client.post("/api/config/validate_key", json={"provider": "qwen", "api_key": "good"})
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True, "status": "valid"}
+
+        resp = await client.post("/api/config/validate_key", json={"provider": "qwen", "api_key": "bad"})
+        assert resp.status == 200
+        assert await resp.json() == {"ok": False, "status": "invalid"}
+
+        resp = await client.post("/api/config/validate_key", json={"provider": "qwen", "api_key": "net"})
+        assert resp.status == 200
+        assert await resp.json() == {"ok": False, "status": "network"}
+
+        resp = await client.post("/api/config/validate_key", json={"provider": "qwen"})
+        assert resp.status == 400
+
+    api(app, fn)
+
+
+def test_setup_complete_marks_setup_done(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(config, "mark_setup_done", lambda env_path=None: config.update_env_file({"SETUP_DONE": "true"}, env_path=env_file, allow_hidden=True))
+    app = make_app(FakeService())
+
+    async def fn(client):
+        resp = await client.post("/api/setup/complete", json={})
+        assert resp.status == 200
+        return await resp.json()
+
+    assert api(app, fn) == {"ok": True, "updated": ["SETUP_DONE"]}
+    assert "SETUP_DONE=true" in env_file.read_text(encoding="utf-8")
 
 
 def test_config_get_returns_all_visible_specs():
@@ -454,7 +565,12 @@ def test_endpoints_without_service_return_500():
 # ---- /api/meta ----
 
 
-def test_meta_returns_injected_metadata():
+def test_meta_returns_injected_metadata(monkeypatch):
+    monkeypatch.delenv("SETUP_DONE", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.delenv("DOUBAO_APP_ID", raising=False)
+    monkeypatch.delenv("DOUBAO_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     app = build_app(hub=None, modem=None, service=FakeService(), meta={"model": "qwen-x"})  # type: ignore[arg-type]
 
     async def fn(client):
@@ -462,7 +578,11 @@ def test_meta_returns_injected_metadata():
         assert resp.status == 200
         return await resp.json()
 
-    assert api(app, fn) == {"model": "qwen-x"}
+    meta = api(app, fn)
+    assert meta["model"] == "qwen-x"
+    assert meta["credentials"]["ok"] is False
+    assert meta["setup_required"] is True
+    assert set(meta["hardware"]) == {"usb_online", "modem_connected", "port"}
 
 
 # ---- /api/call/dial ----

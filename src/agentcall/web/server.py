@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 import io
 import json
 import logging
 import re
+import secrets
+import subprocess
+import sys
 import wave
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
+from serial.tools import list_ports
 
-from .. import config
+from .. import config, platforms
 from ..audio_bridge import apply_pcm_gain
 from ..contacts import is_reply_target_allowed
 from ..events import EventHub
 from ..modem import Eg25Modem
+from ..port_detect import QUECTEL_VID
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +30,100 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 # 通话 ID 白名单字符（call_log 生成的目录名），防路径穿越。
 _CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _bundled_libusb_path() -> Path | None:
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return None
+    candidate = Path(base) / "lib" / "libusb-1.0.0.dylib"
+    return candidate if candidate.is_file() else None
+
+
+def _pyusb_backend():
+    bundled = _bundled_libusb_path()
+    if bundled is None:
+        return None
+
+    def find_library(_name: str) -> str:
+        return str(bundled)
+
+    try:
+        import usb.backend.libusb1
+    except Exception:  # noqa: BLE001
+        return None
+    return usb.backend.libusb1.get_backend(find_library=find_library)
+
+
+def _detect_quectel_usb_pyusb() -> bool:
+    try:
+        import usb.core
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("PyUSB unavailable for Quectel scan: %s", exc)
+        return False
+    try:
+        return any(
+            True
+            for _dev in usb.core.find(
+                find_all=True,
+                idVendor=QUECTEL_VID,
+                backend=_pyusb_backend(),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("PyUSB Quectel scan failed: %s", exc)
+        return False
+
+
+def _usb_tree_has_quectel(node) -> bool:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "vendor_id":
+                if isinstance(value, int) and value == QUECTEL_VID:
+                    return True
+                if isinstance(value, str) and "0x2c7c" in value.lower():
+                    return True
+            if _usb_tree_has_quectel(value):
+                return True
+    elif isinstance(node, list):
+        return any(_usb_tree_has_quectel(item) for item in node)
+    return False
+
+
+def _detect_quectel_usb_system_profiler() -> bool:
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPUSBDataType", "-json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("system_profiler Quectel scan failed: %s", exc)
+        return False
+    if result.returncode != 0:
+        logger.debug("system_profiler Quectel scan exited %s", result.returncode)
+        return False
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        logger.debug("system_profiler Quectel scan JSON invalid: %s", exc)
+        return False
+    return _usb_tree_has_quectel(data)
+
+
+def detect_quectel_usb_online() -> bool:
+    """Best-effort EC20/EG25 USB VID presence check for the setup wizard."""
+    if platforms.IS_MACOS:
+        if _detect_quectel_usb_pyusb():
+            return True
+        return _detect_quectel_usb_system_profiler()
+    try:
+        return any(getattr(port, "vid", None) == QUECTEL_VID for port in list_ports.comports())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Quectel USB scan failed: %s", exc)
+        return False
 
 
 def require_service(request: web.Request):
@@ -83,6 +183,7 @@ def build_app(
     app["meta"] = meta or {}
     # 由 app.py 传入的 threading.Event；置位后主循环停止并 os.execv 自重启。
     app["restart_event"] = restart_event
+    app["setup_sms_token"] = [secrets.token_urlsafe(24)]
 
     app.router.add_get("/", _index)
     app.router.add_get("/api/meta", _meta)
@@ -99,6 +200,9 @@ def build_app(
     app.router.add_get("/api/history/{call_id}/audio/{track}", _history_audio)
     app.router.add_get("/api/config", _get_config)
     app.router.add_post("/api/config", _post_config)
+    app.router.add_post("/api/config/validate_key", _validate_key)
+    app.router.add_post("/api/setup/complete", _setup_complete)
+    app.router.add_post("/api/setup/test_sms", _setup_test_sms)
     app.router.add_post("/api/restart", _restart)
     app.router.add_static("/static/", STATIC_DIR)
     return app
@@ -114,7 +218,19 @@ async def _index(request: web.Request) -> web.Response:
 
 
 async def _meta(request: web.Request) -> web.Response:
-    return web.json_response(request.app["meta"])
+    meta = dict(request.app["meta"])
+    service = request.app.get("service")
+    meta["credentials"] = config.credential_status(meta.get("provider"))
+    meta["setup_required"] = config.setup_required()
+    meta["hardware"] = {
+        "usb_online": detect_quectel_usb_online(),
+        "modem_connected": bool(getattr(service, "modem_connected", False)),
+        "port": meta.get("port") or config.get_str("MODEM_PORT"),
+    }
+    setup_sms_token = request.app.get("setup_sms_token") or [None]
+    if not config.get_bool("SETUP_DONE") and setup_sms_token[0]:
+        meta["setup_sms_token"] = setup_sms_token[0]
+    return web.json_response(meta)
 
 
 async def _websocket(request: web.Request) -> web.WebSocketResponse:
@@ -379,6 +495,95 @@ def _amplified_wav_bytes(wav_path: Path, gain: float) -> bytes:
 async def _get_config(request: web.Request) -> web.Response:
     """设置面板数据：全部配置项 + 当前生效值（secret 已掩码）。"""
     return web.json_response(config.read_panel_values())
+
+
+async def _validate_key(request: web.Request) -> web.Response:
+    """Online provider key check for the first-run wizard; never persists secrets."""
+    data = await read_json(request)
+    if not isinstance(data, dict):
+        return web.json_response(
+            {"ok": False, "error": "请求体需为对象"}, status=400
+        )
+    provider = str(data.get("provider") or "").strip().lower()
+    api_key = str(data.get("api_key") or "").strip()
+    if provider not in {"qwen", "openai"}:
+        return web.json_response(
+            {"ok": False, "status": "unsupported", "error": "当前 provider 不支持在线校验"},
+            status=400,
+        )
+    if not api_key:
+        return web.json_response(
+            {"ok": False, "status": "invalid", "error": "API Key 不能为空"},
+            status=400,
+        )
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        partial(config.validate_provider_key_online, provider, api_key, timeout=5.0),
+    )
+    payload = {"ok": result.ok, "status": result.status}
+    if result.message:
+        payload["message"] = result.message
+    return web.json_response(payload)
+
+
+async def _setup_complete(request: web.Request) -> web.Response:
+    """Persist the hidden SETUP_DONE flag after the wizard finishes or is skipped."""
+    await read_json(request)
+    loop = asyncio.get_running_loop()
+    try:
+        updated = await loop.run_in_executor(None, config.mark_setup_done)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    request.app["setup_sms_token"][0] = None
+    return web.json_response({"ok": True, "updated": updated})
+
+
+async def _setup_test_sms(request: web.Request) -> web.Response:
+    """One explicit setup-wizard SMS test, separate from the normal reply-only SMS API."""
+    hub: EventHub = request.app["hub"]
+    modem: Eg25Modem = request.app["modem"]
+    data = await read_json(request)
+    if not isinstance(data, dict):
+        return web.json_response(
+            {"ok": False, "error": "请求体需为对象"}, status=400
+        )
+    number = (data.get("number") or "").strip()
+    text = data.get("text") or ""
+    token = str(data.get("token") or "")
+    token_box = request.app.get("setup_sms_token") or [None]
+    expected_token = token_box[0]
+    if config.get_bool("SETUP_DONE") or not expected_token or token != expected_token:
+        return web.json_response(
+            {"ok": False, "error": "测试短信令牌无效或已使用"}, status=403
+        )
+    if not number or not text.strip():
+        return web.json_response(
+            {"ok": False, "error": "号码和内容都不能为空"}, status=400
+        )
+
+    loop = asyncio.get_running_loop()
+    try:
+        ok = await loop.run_in_executor(None, modem.send_sms, number, text)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("向导测试短信异常")
+        if hub is not None:
+            hub.publish(
+                {"type": "sms_out", "number": number, "text": text, "status": "error"}
+            )
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+    if hub is not None:
+        hub.publish(
+            {
+                "type": "sms_out",
+                "number": number,
+                "text": text,
+                "status": "sent" if ok else "failed",
+            }
+        )
+    token_box[0] = None
+    return web.json_response({"ok": bool(ok)})
 
 
 async def _restart(request: web.Request) -> web.Response:

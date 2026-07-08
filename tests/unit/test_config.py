@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agentcall import platforms
+from agentcall import config, platforms
 from agentcall.config import (
     CONFIG_SPECS,
     app_support_dir,
@@ -336,6 +336,28 @@ def test_provider_keys_are_editable_so_fresh_install_can_be_configured():
     for key in ("DASHSCOPE_API_KEY", "DOUBAO_APP_ID", "DOUBAO_ACCESS_KEY", "OPENAI_API_KEY"):
         assert rows[key]["editable"] is True
         assert rows[key]["secret"] is True
+
+
+def test_setup_done_hidden_and_setup_required_logic(monkeypatch, tmp_path):
+    _unset(
+        monkeypatch,
+        "SETUP_DONE",
+        "DASHSCOPE_API_KEY",
+        "DOUBAO_APP_ID",
+        "DOUBAO_ACCESS_KEY",
+        "OPENAI_API_KEY",
+    )
+    assert config.get_spec("SETUP_DONE").hidden is True
+    assert config.setup_required() is True
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-valid")
+    assert config.setup_required() is False
+
+    monkeypatch.delenv("DASHSCOPE_API_KEY")
+    config.mark_setup_done(env_path=tmp_path / ".env")
+    assert os.environ["SETUP_DONE"] == "true"
+    assert config.setup_required() is False
+    assert "SETUP_DONE=true" in (tmp_path / ".env").read_text(encoding="utf-8")
 
 
 def test_panel_reflects_env_value(monkeypatch):

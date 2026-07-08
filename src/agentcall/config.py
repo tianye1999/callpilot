@@ -16,6 +16,9 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+import urllib.error
+import urllib.request
 
 from . import platforms
 
@@ -100,6 +103,13 @@ class ConfigSpec:
     secret: bool = False
     requires_restart: bool = False
     hidden: bool = False
+
+
+@dataclass(frozen=True)
+class KeyValidationResult:
+    ok: bool
+    status: Literal["valid", "invalid", "network", "unsupported"]
+    message: str = ""
 
 
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
@@ -201,6 +211,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("QWEN_PREWARM", "Qwen 连接预热", "bool", "true"),
     ConfigSpec("QWEN_RECONNECT_MAX", "Qwen 最大重连次数", "int", "2"),
     ConfigSpec("OPENAI_RECONNECT_MAX", "OpenAI 最大重连次数", "int", "2"),
+    ConfigSpec("SETUP_DONE", "首次启动向导完成", "bool", "false",
+               editable=False, hidden=True),
     # 预热调优项：单次握手超时与保活周期（秒），一般无需改动，不进面板。
     ConfigSpec("QWEN_PREWARM_TIMEOUT", "Qwen 预热握手超时（秒）", "float", "5.0",
                editable=False, hidden=True),
@@ -294,6 +306,16 @@ def credential_status(provider: str | None = None) -> dict:
     return {"provider": selected, "ok": not errors, "errors": errors}
 
 
+def any_provider_credentials_ready() -> bool:
+    """Return whether any supported provider has all required credentials."""
+    return any(not validate_provider_credentials(provider) for provider in PROVIDER_REQUIRED_KEYS)
+
+
+def setup_required() -> bool:
+    """First-run wizard is needed when setup was not completed and no provider is usable."""
+    return not get_bool("SETUP_DONE") and not any_provider_credentials_ready()
+
+
 def runtime_meta(provider: str, model: str, port: str) -> dict:
     """Build /api/meta payload with non-fatal configuration readiness."""
     return {
@@ -301,7 +323,66 @@ def runtime_meta(provider: str, model: str, port: str) -> dict:
         "model": model,
         "port": port,
         "credentials": credential_status(provider),
+        "setup_required": setup_required(),
     }
+
+
+def _http_request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: bytes | None = None,
+    timeout: float = 5.0,
+) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        status = getattr(resp, "status", None) or resp.getcode()
+        return int(status), resp.read()
+
+
+def validate_provider_key_online(
+    provider: str,
+    secret: str,
+    *,
+    timeout: float = 5.0,
+) -> KeyValidationResult:
+    """Lightweight online provider credential check without persisting the secret."""
+    provider = provider.strip().lower()
+    secret = secret.strip()
+    if not secret:
+        return KeyValidationResult(False, "invalid", "empty key")
+    try:
+        if provider == "openai":
+            _http_request_json(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {secret}"},
+                timeout=timeout,
+            )
+            return KeyValidationResult(True, "valid")
+        if provider == "qwen":
+            payload = (
+                b'{"model":"qwen-turbo","input":{"messages":['
+                b'{"role":"user","content":"ping"}]},"parameters":{"max_tokens":1}}'
+            )
+            _http_request_json(
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {secret}",
+                    "Content-Type": "application/json",
+                },
+                body=payload,
+                timeout=timeout,
+            )
+            return KeyValidationResult(True, "valid")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return KeyValidationResult(False, "invalid", f"HTTP {exc.code}")
+        return KeyValidationResult(False, "network", f"HTTP {exc.code}")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return KeyValidationResult(False, "network", str(exc))
+    return KeyValidationResult(False, "unsupported", provider)
 
 
 # ---- 面板读取 ----
@@ -372,7 +453,12 @@ def _format_assignment(key: str, value: str) -> str:
     return f'{key}="{escaped}"'
 
 
-def update_env_file(updates: dict[str, str], env_path: str | Path | None = None) -> list[str]:
+def update_env_file(
+    updates: dict[str, str],
+    env_path: str | Path | None = None,
+    *,
+    allow_hidden: bool = False,
+) -> list[str]:
     """把配置写回 .env 并同步 ``os.environ``；返回实际写入的 key 列表。
 
     - 保留原文件注释、空行与行序；已有 key 原地替换（含重复行），新 key 追加尾部；
@@ -385,7 +471,7 @@ def update_env_file(updates: dict[str, str], env_path: str | Path | None = None)
         spec = _SPECS_BY_KEY.get(key)
         if spec is None:
             raise ValueError(f"未注册的配置项: {key}")
-        if not spec.editable:
+        if not spec.editable and not (allow_hidden and spec.hidden):
             raise ValueError(f"配置 {key} 不允许在面板编辑")
         _check_value(spec, value)
 
@@ -416,24 +502,34 @@ def update_env_file(updates: dict[str, str], env_path: str | Path | None = None)
     return list(updates)
 
 
+def mark_setup_done(env_path: str | Path | None = None) -> list[str]:
+    """Persist first-run wizard completion."""
+    return update_env_file({"SETUP_DONE": "true"}, env_path=env_path, allow_hidden=True)
+
+
 __all__ = [
     "APP_NAME",
     "CONFIG_SPECS",
     "ConfigSpec",
+    "KeyValidationResult",
     "PROVIDER_REQUIRED_KEYS",
+    "any_provider_credentials_ready",
     "app_support_dir",
     "call_log_dir",
+    "credential_status",
     "data_dir",
     "env_file_path",
-    "credential_status",
     "get_bool",
     "get_float",
     "get_int",
     "get_spec",
     "get_str",
     "log_dir",
+    "mark_setup_done",
     "read_panel_values",
     "runtime_meta",
+    "setup_required",
     "update_env_file",
     "validate_provider_credentials",
+    "validate_provider_key_online",
 ]
