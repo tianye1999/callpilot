@@ -8,6 +8,7 @@ import os
 from .. import config
 from .base import VoiceAgent
 from .doubao_agent import DoubaoVoiceAgent
+from .openai_agent import OpenAIVoiceAgent
 from .qwen_agent import QwenVoiceAgent
 
 logger = logging.getLogger(__name__)
@@ -41,4 +42,16 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
             model_display_name=config.get_str("AGENT_MODEL_NAME_DOUBAO"),
         )
 
-    raise ValueError(f"不支持的 AGENT_PROVIDER: {selected}，请使用 qwen 或 doubao")
+    if selected == "openai":
+        return OpenAIVoiceAgent(
+            # API Key 属凭证不走注册表默认值：缺失即 KeyError fail-fast。
+            api_key=os.environ["OPENAI_API_KEY"],
+            model=config.get_str("OPENAI_REALTIME_MODEL"),
+            model_display_name=config.get_str("AGENT_MODEL_NAME_OPENAI"),
+            voice=config.get_str("OPENAI_VOICE"),
+            realtime_url=config.get_str("OPENAI_REALTIME_URL") or None,
+        )
+
+    raise ValueError(
+        f"不支持的 AGENT_PROVIDER: {selected}，请使用 qwen、doubao 或 openai"
+    )

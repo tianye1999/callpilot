@@ -110,13 +110,15 @@ def main() -> None:
         hub=hub,
     )
 
+    # provider -> 模型显示名的注册表 key（未知 provider 回落 qwen 显示名）。
+    model_name_keys = {
+        "qwen": "AGENT_MODEL_NAME",
+        "doubao": "AGENT_MODEL_NAME_DOUBAO",
+        "openai": "AGENT_MODEL_NAME_OPENAI",
+    }
     meta = {
         "provider": provider,
-        "model": (
-            config.get_str("AGENT_MODEL_NAME")
-            if provider == "qwen"
-            else config.get_str("AGENT_MODEL_NAME_DOUBAO")
-        ),
+        "model": config.get_str(model_name_keys.get(provider, "AGENT_MODEL_NAME")),
         "port": modem_port,
     }
 

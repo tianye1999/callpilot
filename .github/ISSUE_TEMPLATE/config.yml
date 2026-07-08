@@ -6,3 +6,6 @@ contact_links:
   - name: "README & Roadmap / 说明与路线图"
     url: "https://github.com/tianye1999/callpilot#readme"
     about: "Setup, safety notes, and what's planned. / 搭建步骤、安全须知与规划。"
+  - name: "Security vulnerability / 安全漏洞"
+    url: "https://github.com/tianye1999/callpilot/security/advisories/new"
+    about: "Please report vulnerabilities privately via GitHub Security Advisories — see SECURITY.md. Do not open a public issue. / 安全漏洞请走 GitHub Security Advisories 私密上报（见 SECURITY.md），不要开公开 issue。"

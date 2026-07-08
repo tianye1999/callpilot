@@ -92,7 +92,16 @@ class BridgeHandle:
 
 
 def find_device() -> usb.core.Device:
-    dev = usb.core.find(idVendor=VID, idProduct=PID)
+    try:
+        dev = usb.core.find(idVendor=VID, idProduct=PID)
+    except usb.core.NoBackendError:
+        # pyusb 是纯 Python 包，真正的 USB 访问依赖系统 libusb；
+        # 干净的 Mac 上没有它，裸 traceback 会劝退第一次跑桥的用户。
+        raise SystemExit(
+            "libusb not found — pyusb needs the system libusb library.\n"
+            "  Install it:  brew install libusb   (macOS)\n"
+            "               sudo apt install libusb-1.0-0   (Debian/Ubuntu)"
+        ) from None
     if dev is None:
         raise RuntimeError("未找到 Quectel EC20/EG25 USB 设备 (2c7c:0125)")
     return dev

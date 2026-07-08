@@ -4,6 +4,54 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.2.0] — 2026-07-08
+
+### Added
+
+- **Windows 10/11 support** (code-complete, awaiting hardware reports).
+  Windows uses the official Quectel driver's native COM port — no USB bridge
+  needed. Ships with automatic port detection (`MODEM_PORT=auto` scans for the
+  Quectel vendor ID), a PortAudio/WASAPI audio path, a scheduled-task
+  installer (`scripts/windows/install.ps1`), and `CallPilot.exe` packaging.
+- **OpenAI Realtime provider** — new in this release: use OpenAI's realtime
+  speech-to-speech API as the AI brain, alongside Alibaba Qwen Omni (default)
+  and ByteDance Doubao.
+- **Three-platform CI**: every change now runs the full zero-hardware test
+  suite on Ubuntu, macOS, and Windows.
+- **Language menu**: UI language switching moved to a globe-icon dropdown,
+  making room for more languages beyond English/中文.
+
+### Fixed
+
+- **Five P0 correctness bugs** caught in a three-way code review, including:
+  dashboard occasionally missing live events (broadcast tasks could be
+  garbage-collected mid-flight), a hangup race with call-status polling, a
+  delayed hangup scheduled during one call cutting off the *next* call (calls
+  now carry a generation number), and `RECORDING_ENABLED=on` being interpreted
+  differently in two places.
+- **Zombie sessions**: if the modem's serial link dies mid-call, the session
+  now ends itself within seconds instead of rejecting all new calls until a
+  manual hangup.
+- **launchd PATH**: the launchd units now set `PATH` explicitly, so `ffmpeg`
+  is found and call audio works when CallPilot starts at login.
+- **Dial input validation**: invalid phone numbers are rejected up front
+  instead of tying up the session for a 45-second timeout, and dialing with no
+  modem connected reports a clear error instead of pretending a call was
+  placed.
+
+### Changed
+
+- **Call-session core refactored** for contributors: prompt building and
+  in-call AI tools split into their own modules, outbound call tasks passed
+  explicitly instead of through the environment (batch dialing no longer
+  rewrites `.env` on every call), and web API error handling unified. No
+  intended behavior changes; the automated test suite now stands at 255 tests.
+- **Configuration consolidated into a single registry**: every setting's
+  default value lives in one place, `.env.example` documents all editable
+  settings, and a regression test keeps the two from drifting apart.
+- **Platform differences centralized** in one module — per-OS defaults and
+  paths are no longer scattered through the code.
+
 ## [0.1.0] — 2026-07-08 · Developer Preview
 
 First public release. Verified end-to-end on real hardware: a Quectel EC20
@@ -59,4 +107,5 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.2.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.2.0
 [0.1.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.1.0

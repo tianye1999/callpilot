@@ -143,9 +143,40 @@ def test_validate_doubao_requires_both_keys(monkeypatch):
     assert validate_provider_credentials("doubao") == []
 
 
+def test_validate_openai_missing_and_present(monkeypatch):
+    _unset(monkeypatch, "OPENAI_API_KEY")
+    errors = validate_provider_credentials("openai")
+    assert len(errors) == 1
+    assert "OPENAI_API_KEY" in errors[0]
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert validate_provider_credentials("openai") == []
+
+
 def test_validate_unknown_provider(monkeypatch):
     errors = validate_provider_credentials("gpt")
     assert errors and "gpt" in errors[0]
+
+
+# ---- OpenAI provider 注册项 ----
+
+
+def test_openai_registered_defaults(monkeypatch):
+    """OpenAI provider 注册项的默认值（模型选型已定 gpt-realtime-mini）。"""
+    _unset(monkeypatch, "OPENAI_REALTIME_MODEL", "OPENAI_VOICE",
+           "OPENAI_REALTIME_URL", "AGENT_MODEL_NAME_OPENAI",
+           "OPENAI_RECONNECT_MAX")
+    assert get_str("OPENAI_REALTIME_MODEL") == "gpt-realtime-mini"
+    assert get_str("OPENAI_VOICE") == "alloy"
+    assert get_str("OPENAI_REALTIME_URL") == ""   # 留空走官方端点
+    assert get_str("AGENT_MODEL_NAME_OPENAI") == "OpenAI Realtime Mini"
+    assert get_int("OPENAI_RECONNECT_MAX") == 2   # 与 QWEN_RECONNECT_MAX 默认一致
+    assert get_spec("OPENAI_REALTIME_MODEL").requires_restart
+    assert get_spec("OPENAI_REALTIME_URL").requires_restart
+
+
+def test_agent_provider_choices_include_openai():
+    assert get_spec("AGENT_PROVIDER").choices == ("qwen", "doubao", "openai")
 
 
 # ---- update_env_file ----

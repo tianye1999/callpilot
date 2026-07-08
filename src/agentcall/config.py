@@ -56,7 +56,7 @@ class ConfigSpec:
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- Agent ----
     ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "qwen",
-               choices=("qwen", "doubao"), requires_restart=True),
+               choices=("qwen", "doubao", "openai"), requires_restart=True),
     ConfigSpec("DASHSCOPE_API_KEY", "DashScope API Key", "str", "",
                editable=False, secret=True, requires_restart=True),
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
@@ -77,6 +77,16 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # Realtime 端点覆写（调试用）；留空走 dashscope SDK 内置 wss 地址。
     ConfigSpec("DASHSCOPE_REALTIME_URL", "Qwen Realtime 端点覆写", "str", "",
                editable=False, hidden=True),
+    # OpenAI Realtime（凭证 OPENAI_API_KEY 不进注册表，见 PROVIDER_REQUIRED_KEYS）。
+    ConfigSpec("OPENAI_REALTIME_MODEL", "OpenAI 实时模型", "str",
+               "gpt-realtime-mini", requires_restart=True),
+    ConfigSpec("OPENAI_VOICE", "OpenAI 音色", "str", "alloy"),
+    # 端点覆写：中国大陆直连 api.openai.com 不通，需指向自备可达端点。
+    ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",
+               requires_restart=True),
+    ConfigSpec("AGENT_MODEL_NAME_OPENAI", "OpenAI 模型显示名", "str",
+               "OpenAI Realtime Mini", editable=False, hidden=True,
+               requires_restart=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
     ConfigSpec("AGENT_PERSONA", "AI 人设称谓", "str", "AI 助理"),
     ConfigSpec("AGENT_OUTBOUND_TASK", "外呼任务指令", "str",
@@ -119,6 +129,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 连接管理 ----
     ConfigSpec("QWEN_PREWARM", "Qwen 连接预热", "bool", "true"),
     ConfigSpec("QWEN_RECONNECT_MAX", "Qwen 最大重连次数", "int", "2"),
+    ConfigSpec("OPENAI_RECONNECT_MAX", "OpenAI 最大重连次数", "int", "2"),
     # 预热调优项：单次握手超时与保活周期（秒），一般无需改动，不进面板。
     ConfigSpec("QWEN_PREWARM_TIMEOUT", "Qwen 预热握手超时（秒）", "float", "5.0",
                editable=False, hidden=True),
@@ -137,6 +148,7 @@ _SPECS_BY_KEY: dict[str, ConfigSpec] = {spec.key: spec for spec in CONFIG_SPECS}
 PROVIDER_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "qwen": ("DASHSCOPE_API_KEY",),
     "doubao": ("DOUBAO_APP_ID", "DOUBAO_ACCESS_KEY"),
+    "openai": ("OPENAI_API_KEY",),
 }
 
 

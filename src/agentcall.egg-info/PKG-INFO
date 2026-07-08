@@ -3,6 +3,7 @@ Name: agentcall
 Version: 0.1.0
 Summary: EC20 4G 模组 AI 电话助手：来电自动接听、AI 对话、短信与外呼
 Requires-Python: >=3.12
+License-File: LICENSE
 Requires-Dist: pyserial>=3.5
 Requires-Dist: pyusb>=1.3.1
 Requires-Dist: sounddevice>=0.5.1
@@ -11,5 +12,7 @@ Requires-Dist: python-dotenv>=1.0.0
 Requires-Dist: dashscope>=1.25.6
 Requires-Dist: websockets>=13.0
 Requires-Dist: aiohttp>=3.9.0
+Requires-Dist: pywebview>=5.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
+Dynamic: license-file
