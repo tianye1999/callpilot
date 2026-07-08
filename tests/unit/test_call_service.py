@@ -195,5 +195,6 @@ def test_outbound_call_uses_digital_twin_prompt(monkeypatch):
     assert "李明的数字分身" in agent._session_instructions
     assert "查询本机套餐和剩余流量" in agent._session_instructions
     assert "不要问对方“有什么可以帮您”" in agent._session_instructions
-    assert "李明让我打这个电话" in agent.said[0]
+    assert "我是李明的数字分身" in agent.said[0]
+    assert "让我打" not in agent.said[0]  # 开场白已去掉“让我打来”
     assert "查询本机套餐和剩余流量" in agent.said[0]

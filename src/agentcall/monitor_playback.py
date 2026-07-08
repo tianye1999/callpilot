@@ -96,31 +96,30 @@ class MonitorPlayback:
                 "本机监听播放依赖 macOS 的 ffmpeg audiotoolbox，当前平台暂不支持，监听已禁用"
             )
             return
-        # 与 FfmpegAudioBridge 相同的延迟导入姿势，避免 import 副作用。
-        from .coreaudio import default_output_index, find_output_index
-
-        try:
-            keyword = (self.device_keyword or "").strip()
-            if keyword:
-                # 指定了设备名：按名匹配（用户显式选设备）。
+        keyword = (self.device_keyword or "").strip()
+        # 设备定位（关键设计）：默认（无关键字）**不指定** -audio_device_index，
+        # 让 ffmpeg audiotoolbox 直接播到系统默认输出——彻底摆脱「CoreAudio 序号
+        # ↔ ffmpeg 序号」错位、以及本机多虚拟设备导致的序号漂移。只有用户显式指定
+        # 设备名时才按名解析出序号并传入。
+        dev_args: list[str] = []
+        target = "系统默认输出"
+        if keyword:
+            from .coreaudio import find_output_index  # 延迟导入（macOS 专用绑定）
+            try:
                 output_index = find_output_index(keyword)
-                which = f"含 '{keyword}'"
-            else:
-                # 未指定：跟随系统默认输出（可移植、不依赖机型/语言特定名字）。
-                output_index = default_output_index()
-                which = "系统默认输出"
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("枚举 CoreAudio 输出设备失败: %s，监听已禁用", exc)
-            return
-        if output_index is None:
-            logger.warning("未找到%s的输出设备，监听已禁用", which)
-            return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("枚举 CoreAudio 输出设备失败: %s，监听已禁用", exc)
+                return
+            if output_index is None:
+                logger.warning("未找到含 '%s' 的输出设备，监听已禁用", keyword)
+                return
+            dev_args = ["-audio_device_index", str(output_index)]
+            target = f"'{keyword}'(#{output_index})"
         try:
             self._proc = subprocess.Popen(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
                  "-f", "s16le", "-ar", str(self.sample_rate), "-ac", "1",
-                 "-i", "pipe:0", "-f", "audiotoolbox",
-                 "-audio_device_index", str(output_index), "none"],
+                 "-i", "pipe:0", "-f", "audiotoolbox", *dev_args, "none"],
                 stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
         except Exception as exc:  # noqa: BLE001
@@ -135,8 +134,8 @@ class MonitorPlayback:
         )
         self._thread.start()
         logger.info(
-            "监听播放已启动 (audiotoolbox:%s, %dHz mono, gain=%.2f)",
-            output_index, self.sample_rate, self.gain,
+            "监听播放已启动 (→%s, %dHz mono, gain=%.2f)",
+            target, self.sample_rate, self.gain,
         )
 
     def feed(self, pcm: bytes) -> None:

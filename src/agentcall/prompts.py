@@ -110,8 +110,8 @@ def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
             f"你是{owner}的{persona}，正在代表{owner}主动外呼对方。\n"
             + topic
             + "外呼规则：\n"
-            f"1. 对方接起后自然说明：你是{owner}的{persona}，"
-            f"{owner}让你打来，并带出来意。\n"
+            f"1. 对方接起后简洁说明你是{owner}的{persona}，并直接带出来意"
+            "（不用加“让我打来”这类话）。\n"
             f"2. 你不是客服，不要问对方“有什么可以帮您”；不要冒充{owner}本人。\n"
             "3. 像真人电话沟通一样，围绕本通电话主题推进；如果对方不方便，礼貌收束。\n"
             f"4. 本通目标由你亲自达成（拿到信息/办成事）；只有确实需要{owner}本人"
@@ -158,7 +158,7 @@ def _opening_zh(direction: str, owner: str, persona: str, task: str) -> str:
         purpose = f"这次主要是{task}" if task.strip() else "有件事想跟您沟通一下"
         return (
             "请直接用中文说一句自然电话开场白，不要解释："
-            f"你好，我是{owner}的{persona}，{owner}让我打这个电话。"
+            f"你好，我是{owner}的{persona}。"
             f"{purpose} 你现在方便说两句吗？"
         )
     return (
@@ -198,8 +198,8 @@ def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
             f"You are {owner}'s {persona}, making an outbound call on {owner}'s behalf.\n"
             + topic
             + "Outbound rules:\n"
-            f"1. Once they pick up, naturally explain: you are {owner}'s {persona}, "
-            f"{owner} asked you to call, and state your purpose.\n"
+            f"1. Once they pick up, briefly say you are {owner}'s {persona} and get "
+            "straight to the point (no phrasing like \"asked me to call\").\n"
             f"2. You are not a call-center agent — don't ask \"how can I help you\"; "
             f"never impersonate {owner} in person.\n"
             "3. Talk like a real person on the phone, moving the topic forward; if "
@@ -243,7 +243,7 @@ def _opening_en(direction: str, owner: str, persona: str, task: str) -> str:
         purpose = f"It's mainly about {task}" if task.strip() else "There's something I'd like to go over with you"
         return (
             "Say one natural phone opening line directly in English, no explanation: "
-            f"Hi, this is {owner}'s {persona}, {owner} asked me to make this call. "
+            f"Hi, this is {owner}'s {persona}. "
             f"{purpose} Is now a good time to talk?"
         )
     return (

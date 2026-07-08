@@ -245,6 +245,16 @@
   }
   #chat { min-height: 300px; max-height: calc(100vh - 300px); overflow-y: auto; padding: 18px 20px; }
   #chat:empty::before { content: attr(data-empty); color: var(--dim); font-size: 13px; display: block; text-align: center; padding: 40px 0; }
+  /* 通话之间的分割线：一行居中标签 + 两侧渐隐横线 */
+  .call-divider {
+    display: flex; align-items: center; gap: 12px;
+    margin: 22px 2px 18px; color: var(--dim);
+    font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+  }
+  .call-divider::before, .call-divider::after {
+    content: ""; flex: 1; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--border-strong), transparent);
+  }
   .bubble { margin-bottom: 14px; max-width: 82%; animation: rise .25s ease both; }
   @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
   .bubble .who { font-size: 10.5px; letter-spacing: .1em; color: var(--muted); margin-bottom: 4px; }
@@ -679,7 +689,7 @@ const I18N = {
     q_active: (p, d) => `In progress · ${p} pending · ${d} dialed`, q_current: " dialing",
     recent_label: "RECENT CALLS", empty_calls: "No calls yet", view_all: "View all history",
     live_title: "Live Transcript", live_sub_idle: "Opens automatically when a call starts",
-    live_empty: "Waiting for transcript…", dtmf_send_fail: "Send failed",
+    live_empty: "Waiting for transcript…", dtmf_send_fail: "Send failed", new_call: "NEW CALL",
     leave_title: "Unsaved changes",
     leave_msg: "You've edited settings that aren't saved yet. What would you like to do?",
     leave_save: "Save & leave", leave_discard: "Discard changes", leave_stay: "Keep editing",
@@ -760,7 +770,7 @@ const I18N = {
     q_active: (p, d) => `队列进行中 · 待拨 ${p} · 已拨 ${d}`, q_current: " 拨打中",
     recent_label: "最近通话", empty_calls: "暂无通话", view_all: "查看全部历史",
     live_title: "实时对话", live_sub_idle: "通话开始后自动进入本页",
-    live_empty: "等待通话转写…", dtmf_send_fail: "发送失败",
+    live_empty: "等待通话转写…", dtmf_send_fail: "发送失败", new_call: "新通话",
     leave_title: "有未保存的修改",
     leave_msg: "你修改了设置但还没保存，要怎么处理？",
     leave_save: "保存并离开", leave_discard: "放弃修改", leave_stay: "继续编辑",
@@ -911,11 +921,14 @@ let callStatus = "idle";
 let backTimer = null;
 function setCall(status, caller) {
   const chip = $("stateChip");
+  const wasActive = callActive;  // 上一状态（用于识别「新通话开始」这一跳变）
   callStatus = status;
   chip.className = "state-chip " + status;
   $("stateText").textContent = t("st_" + status) !== "st_" + status ? t("st_" + status) : status;
   $("stateNum").textContent = status === "idle" ? "" : (caller || "");
   callActive = (status === "ringing" || status === "dialing" || status === "answered");
+  // 从空闲跳到活跃 = 一通新通话开始：在实时转写里插入分割线（与上一通隔开）
+  if (callActive && !wasActive) insertCallDivider(caller);
   $("quickActs").classList.toggle("show", callActive);
   $("liveTag").style.display = callActive ? "inline-flex" : "none";
   $("liveSub").textContent = callActive ? (caller || "") : t("live_sub_idle");
@@ -933,6 +946,16 @@ function setCall(status, caller) {
 }
 
 /* ========= 实时对话 ========= */
+function insertCallDivider(caller) {
+  const chat = $("chat");
+  if (!chat.children.length) return;  // 首通之前无历史，不插分割线
+  const d = el("div", "call-divider");
+  const now = new Date().toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
+  d.appendChild(el("span", "", t("new_call") + (caller ? " · " + caller : "") + " · " + now));
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
+}
+
 function addTranscript(role, text, ts) {
   const chat = $("chat");
   const b = el("div", "bubble " + (role === "user" ? "user" : "agent"));

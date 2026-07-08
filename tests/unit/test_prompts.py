@@ -73,7 +73,7 @@ def test_instructions_common_sections_present():
 def test_outbound_opening_injects_owner_and_task():
     text = opening_instructions("outbound", "李明", "数字分身", "查询本月话费")
     assert "我是李明的数字分身" in text
-    assert "李明让我打这个电话" in text
+    assert "让我打" not in text  # 简洁化：去掉“让我打来”
     assert "这次主要是查询本月话费" in text
 
 
