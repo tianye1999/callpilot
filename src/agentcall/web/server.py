@@ -22,13 +22,56 @@ STATIC_DIR = Path(__file__).parent / "static"
 _CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+def require_service(request: web.Request):
+    """取出注入的 service，缺失时抛 503（middleware 会统一转成 500 JSON）。
+
+    历史行为：service 未注入时各端点返回 500。为保持逐端点一致，middleware
+    把这里抛出的 503 统一映射为 500，业务层不再各自写「service is None → 500」。
+    """
+    service = request.app["service"]
+    if service is None:
+        raise web.HTTPServiceUnavailable(reason="服务不可用")
+    return service
+
+
+def require_call_logger(request: web.Request):
+    """历史类端点：service 与 call_logger 都在才可用，否则 503→500。"""
+    service = require_service(request)
+    if getattr(service, "call_logger", None) is None:
+        raise web.HTTPServiceUnavailable(reason="服务不可用")
+    return service
+
+
+async def read_json(request: web.Request):
+    """解析请求体 JSON，非法时抛 400（middleware 统一转成 JSON 错误）。"""
+    try:
+        return await request.json()
+    except Exception:  # noqa: BLE001
+        raise web.HTTPBadRequest(reason="请求体不是合法 JSON")
+
+
+@web.middleware
+async def _error_middleware(request: web.Request, handler):
+    """把 require_service/read_json 抛出的 HTTP 异常统一转成现有 JSON 错误格式。
+
+    503（服务不可用）保持历史状态码 500；400（非法 JSON/参数）保持 400。
+    响应体沿用 {"ok": false, "error": ...}，error 取异常 reason。
+    """
+    try:
+        return await handler(request)
+    except web.HTTPServiceUnavailable as exc:
+        return web.json_response({"ok": False, "error": exc.reason}, status=500)
+    except web.HTTPBadRequest as exc:
+        return web.json_response({"ok": False, "error": exc.reason}, status=400)
+
+
 def build_app(
     hub: EventHub,
     modem: Eg25Modem,
     service=None,
     meta: dict | None = None,
 ) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[_error_middleware])
     app["hub"] = hub
     app["modem"] = modem
     app["service"] = service
@@ -87,10 +130,7 @@ async def _websocket(request: web.Request) -> web.WebSocketResponse:
 async def _send_sms(request: web.Request) -> web.Response:
     hub: EventHub = request.app["hub"]
     modem: Eg25Modem = request.app["modem"]
-    try:
-        data = await request.json()
-    except Exception:  # noqa: BLE001
-        return web.json_response({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
+    data = await read_json(request)
 
     number = (data.get("number") or "").strip()
     text = data.get("text") or ""
@@ -121,13 +161,8 @@ async def _send_sms(request: web.Request) -> web.Response:
 
 
 async def _dial(request: web.Request) -> web.Response:
-    service = request.app["service"]
-    if service is None:
-        return web.json_response({"ok": False, "error": "服务不可用"}, status=500)
-    try:
-        data = await request.json()
-    except Exception:  # noqa: BLE001
-        return web.json_response({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
+    service = require_service(request)
+    data = await read_json(request)
 
     number = (data.get("number") or "").strip()
     if not number:
@@ -144,45 +179,33 @@ async def _dial(request: web.Request) -> web.Response:
 
 async def _hangup(request: web.Request) -> web.Response:
     """挂断进行中的通话（AI 与 IVR 互相不挂断时的人工兜底）。"""
-    service = request.app["service"]
-    if service is None:
-        return web.json_response({"ok": False, "error": "服务不可用"}, status=500)
-    session = service.session
-    if not session.is_active:
-        return web.json_response({"ok": False, "error": "当前没有进行中的通话"}, status=409)
-    session.stop()
+    service = require_service(request)
+    ok, err = service.hangup()
+    if not ok:
+        return web.json_response({"ok": False, "error": err}, status=409)
     return web.json_response({"ok": True})
 
 
 async def _dtmf(request: web.Request) -> web.Response:
     """通话中人工发送 DTMF 按键（IVR 菜单导航）。"""
-    service = request.app["service"]
-    if service is None:
-        return web.json_response({"ok": False, "error": "服务不可用"}, status=500)
-    if not service.session.is_active:
-        return web.json_response({"ok": False, "error": "当前没有进行中的通话"}, status=409)
-    try:
-        data = await request.json()
-    except Exception:  # noqa: BLE001
-        return web.json_response({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
+    service = require_service(request)
+    data = await read_json(request)
     digits = (data.get("digits") or "").strip()
     if not digits or any(ch not in "0123456789*#" for ch in digits):
         return web.json_response({"ok": False, "error": "digits 仅允许 0-9、*、#"}, status=400)
 
     loop = asyncio.get_running_loop()
-    ok = await loop.run_in_executor(None, service.modem.send_dtmf, digits)
+    ok, err = await loop.run_in_executor(None, service.send_dtmf, digits)
+    # 无通话属状态冲突（旧行为 409）；模组发送失败沿用旧行为返回 200 + {"ok": false}。
+    if not ok and err == "当前没有进行中的通话":
+        return web.json_response({"ok": False, "error": err}, status=409)
     return web.json_response({"ok": bool(ok)})
 
 
 async def _batch_dial(request: web.Request) -> web.Response:
     """批量外呼：``{"numbers": [...], "task"?: str}`` → ``service.batch_dial``。"""
-    service = request.app["service"]
-    if service is None:
-        return web.json_response({"ok": False, "error": "服务不可用"}, status=500)
-    try:
-        data = await request.json()
-    except Exception:  # noqa: BLE001
-        return web.json_response({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
+    service = require_service(request)
+    data = await read_json(request)
 
     numbers = data.get("numbers") if isinstance(data, dict) else None
     if not isinstance(numbers, list) or not numbers:
@@ -199,22 +222,19 @@ async def _batch_dial(request: web.Request) -> web.Response:
     task = (task or "").strip() or None
 
     result = service.batch_dial(numbers, task)
-    return web.json_response(result)
+    # 成功响应统一带 ok=true（前端可据此判断，字段只增不改）。
+    return web.json_response({**result, "ok": True})
 
 
 async def _queue_status(request: web.Request) -> web.Response:
     """外呼队列状态快照（pending/current/done/active）。"""
-    service = request.app["service"]
-    if service is None:
-        return web.json_response({"ok": False, "error": "服务不可用"}, status=500)
-    return web.json_response(service.dial_queue_status())
+    service = require_service(request)
+    return web.json_response({**service.dial_queue_status(), "ok": True})
 
 
 async def _history(request: web.Request) -> web.Response:
     """通话历史列表：``?limit=50``（新→旧）。"""
-    service = request.app["service"]
-    if service is None or getattr(service, "call_logger", None) is None:
-        return web.json_response({"ok": False, "error": "服务不可用"}, status=500)
+    service = require_call_logger(request)
     raw_limit = request.query.get("limit", "50")
     try:
         limit = int(raw_limit)
@@ -230,9 +250,7 @@ async def _history(request: web.Request) -> web.Response:
 
 async def _history_events(request: web.Request) -> web.Response:
     """单通通话的事件时间线：读 ``events.jsonl`` 返回 JSON 列表。"""
-    service = request.app["service"]
-    if service is None or getattr(service, "call_logger", None) is None:
-        return web.json_response({"ok": False, "error": "服务不可用"}, status=500)
+    service = require_call_logger(request)
     call_id = request.match_info["call_id"]
     if not _CALL_ID_RE.fullmatch(call_id):
         return web.json_response({"ok": False, "error": "非法的通话 ID"}, status=400)
@@ -266,13 +284,10 @@ async def _get_config(request: web.Request) -> web.Response:
 async def _post_config(request: web.Request) -> web.Response:
     """保存设置：``{key: value, ...}`` → 写回 .env 并同步环境变量。
 
-    响应 ``{"updated": [...], "requires_restart": [...]}``；
+    响应 ``{"ok": true, "updated": [...], "requires_restart": [...]}``；
     任一项非法则整批拒绝（400），文件与环境均不改动。
     """
-    try:
-        data = await request.json()
-    except Exception:  # noqa: BLE001
-        return web.json_response({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
+    data = await read_json(request)
     if not isinstance(data, dict):
         return web.json_response(
             {"ok": False, "error": "请求体需为 {key: value} 对象"}, status=400
@@ -300,4 +315,6 @@ async def _post_config(request: web.Request) -> web.Response:
     requires_restart = [
         key for key in updated if config.get_spec(key).requires_restart
     ]
-    return web.json_response({"updated": updated, "requires_restart": requires_restart})
+    return web.json_response(
+        {"ok": True, "updated": updated, "requires_restart": requires_restart}
+    )

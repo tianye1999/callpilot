@@ -35,7 +35,12 @@ _NEEDS_QUOTING_RE = re.compile(r"[\s#\"']")
 
 @dataclass(frozen=True)
 class ConfigSpec:
-    """单个配置项的注册信息。"""
+    """单个配置项的注册信息。
+
+    ``hidden`` 标记内部/调试项：默认值仍由注册表单一出处管理，但不进设置面板
+    （``read_panel_values`` 跳过）；hidden 项必须同时 ``editable=False``，
+    避免面板渲染不出却能经 API 写入。
+    """
 
     key: str
     label: str
@@ -45,6 +50,7 @@ class ConfigSpec:
     editable: bool = True
     secret: bool = False
     requires_restart: bool = False
+    hidden: bool = False
 
 
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
@@ -56,6 +62,21 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
                "qwen3.5-omni-flash-realtime", requires_restart=True),
     ConfigSpec("QWEN_VOICE", "Qwen 音色", "str", "Raymond"),
+    # 模型显示名只用于 /api/meta 与豆包自我介绍提示词，属内部项不进面板。
+    ConfigSpec("AGENT_MODEL_NAME", "Qwen 模型显示名", "str",
+               "通义千问 Qwen3.5-Omni", editable=False, hidden=True,
+               requires_restart=True),
+    ConfigSpec("AGENT_MODEL_NAME_DOUBAO", "豆包模型显示名", "str",
+               "豆包实时语音大模型", editable=False, hidden=True,
+               requires_restart=True),
+    # 豆包接入的固定资源参数（火山引擎文档给定，一般无需改动）。
+    ConfigSpec("DOUBAO_RESOURCE_ID", "豆包资源 ID", "str", "volc.speech.dialog",
+               editable=False, hidden=True),
+    ConfigSpec("DOUBAO_APP_KEY", "豆包 App Key", "str", "PlgvMymc7f3tQnJ6",
+               editable=False, hidden=True),
+    # Realtime 端点覆写（调试用）；留空走 dashscope SDK 内置 wss 地址。
+    ConfigSpec("DASHSCOPE_REALTIME_URL", "Qwen Realtime 端点覆写", "str", "",
+               editable=False, hidden=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
     ConfigSpec("AGENT_PERSONA", "AI 人设称谓", "str", "AI 助理"),
     ConfigSpec("AGENT_OUTBOUND_TASK", "外呼任务指令", "str",
@@ -69,6 +90,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                choices=("uac_ffmpeg", "uac", "nmea"), requires_restart=True),
     ConfigSpec("MODEM_AUDIO_KEYWORD", "UAC 声卡匹配关键字", "str", "Interface",
                requires_restart=True),
+    # nmea 音频模式专用的 PCM 数据串口；uac/uac_ffmpeg 模式留空即可。
+    ConfigSpec("MODEM_PCM_PORT", "模组 PCM 串口", "str", "",
+               requires_restart=True),
+    ConfigSpec("MODEM_PCM_BAUD", "PCM 串口波特率", "int", "921600",
+               requires_restart=True),
     ConfigSpec("MODEM_TX_GAIN", "上行发送增益", "float", "1.0"),
     # ---- 通话行为 ----
     ConfigSpec("HALF_DUPLEX_HANGOVER_SECONDS", "半双工挂尾时长（秒）", "float", "0.5"),
@@ -77,6 +103,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("RECORDING_RETENTION_DAYS", "录音保留天数", "int", "30"),
     ConfigSpec("SUMMARY_ENABLED", "通话摘要开关", "bool", "true"),
     ConfigSpec("SUMMARY_MODEL", "摘要模型", "str", "qwen-plus"),
+    # 摘要 API 超时秒数（真机实测 15s 对长转写不够用），调试项不进面板。
+    ConfigSpec("SUMMARY_TIMEOUT", "摘要超时（秒）", "float", "30",
+               editable=False, hidden=True),
     # ---- 本地监听 ----
     ConfigSpec("MONITOR_AI_PLAYBACK", "本地监听 AI 语音", "bool", "false"),
     ConfigSpec("MONITOR_OUTPUT_DEVICE", "监听输出设备", "str", "MacBook Air扬声器"),
@@ -90,6 +119,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 连接管理 ----
     ConfigSpec("QWEN_PREWARM", "Qwen 连接预热", "bool", "true"),
     ConfigSpec("QWEN_RECONNECT_MAX", "Qwen 最大重连次数", "int", "2"),
+    # 预热调优项：单次握手超时与保活周期（秒），一般无需改动，不进面板。
+    ConfigSpec("QWEN_PREWARM_TIMEOUT", "Qwen 预热握手超时（秒）", "float", "5.0",
+               editable=False, hidden=True),
+    ConfigSpec("QWEN_PREWARM_INTERVAL", "Qwen 预热保活间隔（秒）", "float", "240.0",
+               editable=False, hidden=True),
     # ---- Web 服务 ----
     ConfigSpec("WEB_HOST", "Web 监听地址", "str", "127.0.0.1",
                editable=False, requires_restart=True),
@@ -174,11 +208,13 @@ def validate_provider_credentials(provider: str) -> list[str]:
 def read_panel_values() -> list[dict]:
     """返回面板渲染所需的配置列表（spec 字段 + 当前生效值）。
 
-    secret 项不回传真实值，掩码为「已设置」/「未设置」。
-    所有字段均可直接 JSON 序列化。
+    hidden 项（内部/调试）不返回；secret 项不回传真实值，
+    掩码为「已设置」/「未设置」。所有字段均可直接 JSON 序列化。
     """
     rows: list[dict] = []
     for spec in CONFIG_SPECS:
+        if spec.hidden:
+            continue
         if spec.secret:
             value = "已设置" if os.environ.get(spec.key, "").strip() else "未设置"
         else:

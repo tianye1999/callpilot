@@ -821,7 +821,7 @@ function connect() {
     $("dot").classList.remove("on"); $("conn").textContent = t("conn_retry");
     setTimeout(connect, 2000);
   };
-  ws.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (err) {} };
+  ws.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (err) { console.warn("[ws] 处理事件失败", err); } };
 }
 async function loadMeta() {
   try {
@@ -829,7 +829,7 @@ async function loadMeta() {
     $("model").textContent = m.model || "-";
     $("provider").textContent = m.provider || "-";
     $("portSub").textContent = t("modem_prefix") + (m.port || "-");
-  } catch (e) {}
+  } catch (e) { console.warn("[meta] 加载运行信息失败", e); }
 }
 
 /* ========= 拨打 / 挂断 / 键盘 ========= */
@@ -861,13 +861,13 @@ async function loadDefaultTask() {
     const specs = await (await fetch("/api/config")).json();
     const spec = specs.find((c) => c.key === "AGENT_OUTBOUND_TASK");
     if (spec) updateTaskPlaceholder(spec.value);
-  } catch (e) {}
+  } catch (e) { console.warn("[config] 加载默认外呼主题失败", e); }
 }
 
 $("hangupBtn").addEventListener("click", async () => {
   const btn = $("hangupBtn");
   btn.disabled = true;
-  try { await postJson("/api/call/hangup", {}); } catch (e) {}
+  try { await postJson("/api/call/hangup", {}); } catch (e) { console.warn("[hangup] 挂断请求失败", e); }
   btn.disabled = false;
 });
 
@@ -935,7 +935,7 @@ async function loadTimeline(tl, id) {
       tl.appendChild(row);
     }
     tl.dataset.loaded = "1";
-  } catch (e) {}
+  } catch (e) { console.warn("[history] 加载通话时间线失败", e); }
 }
 async function toggleHistItem(item, id) {
   if (item.classList.contains("open")) { item.classList.remove("open"); openCalls.delete(id); return; }
@@ -979,7 +979,7 @@ async function loadHistory() {
         item.classList.add("open");
       }
     }
-  } catch (e) {}
+  } catch (e) { console.warn("[history] 加载通话历史失败", e); }
 }
 /* 电话主页右列：最近 6 条 */
 async function loadRecent() {
@@ -1001,7 +1001,7 @@ async function loadRecent() {
       item.addEventListener("click", () => switchPage("history"));
       list.appendChild(item);
     }
-  } catch (e) {}
+  } catch (e) { console.warn("[recent] 加载最近通话失败", e); }
 }
 $("recentMore").addEventListener("click", () => switchPage("history"));
 
@@ -1025,7 +1025,7 @@ async function refreshQueue() {
     for (const d of (q.done || []).slice(-10)) {
       queueChip(box, `${d.number} ${d.ok ? "✓" : "✗" + (d.error ? " " + d.error : "")}`, d.ok ? "ok" : "fail");
     }
-  } catch (e) {}
+  } catch (e) { console.warn("[queue] 刷新外呼队列失败", e); }
 }
 $("batchDialBtn").addEventListener("click", async () => {
   const numbers = $("batchNumbers").value
@@ -1121,7 +1121,7 @@ async function loadConfig() {
       }
       groups.get(g).appendChild(row);
     }
-  } catch (e) {}
+  } catch (e) { console.warn("[config] 加载设置面板失败", e); }
 }
 $("configSave").addEventListener("click", async () => {
   const updates = {};

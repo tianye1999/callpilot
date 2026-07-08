@@ -22,16 +22,16 @@ def wait_until(cond, timeout: float = 2.0) -> bool:
 
 
 class FakeDial:
-    """记录调用顺序与调用时 env 的 dial_fn 替身。"""
+    """记录调用顺序与随传 task 的 dial_fn 替身。"""
 
     def __init__(self, results: dict[str, tuple[bool, str | None]] | None = None):
         self.calls: list[str] = []
-        self.env_at_call: list[str | None] = []
+        self.task_at_call: list[str | None] = []
         self.results = dict(results or {})
 
-    def __call__(self, number: str) -> tuple[bool, str | None]:
+    def __call__(self, number: str, task: str | None = None) -> tuple[bool, str | None]:
         self.calls.append(number)
-        self.env_at_call.append(os.environ.get("AGENT_OUTBOUND_TASK"))
+        self.task_at_call.append(task)
         return self.results.get(number, (True, None))
 
 
@@ -101,9 +101,9 @@ def test_enqueue_does_not_block_caller():
     started = time.monotonic()
     slow_dial = FakeDial()
 
-    def slow(number: str) -> tuple[bool, str | None]:
+    def slow(number: str, task: str | None = None) -> tuple[bool, str | None]:
         time.sleep(0.3)
-        return slow_dial(number)
+        return slow_dial(number, task)
 
     queue = DialQueue(slow, interval_seconds=FAST)
     queue.enqueue(["111"])
@@ -133,10 +133,10 @@ def test_dial_failure_records_and_continues():
 def test_dial_exception_treated_as_failure():
     dial = FakeDial()
 
-    def flaky(number: str) -> tuple[bool, str | None]:
+    def flaky(number: str, task: str | None = None) -> tuple[bool, str | None]:
         if number == "111":
             raise RuntimeError("模组串口断开")
-        return dial(number)
+        return dial(number, task)
 
     queue = DialQueue(flaky, interval_seconds=FAST)
     queue.enqueue(["111", "222"])
@@ -190,9 +190,9 @@ def test_enqueue_dedup_and_empty_numbers():
     assert again["rejected"] == ["111", "222"]
 
 
-# ---- task 环境变量 ----
+# ---- task 显式传参（不再写 os.environ）----
 
-def test_task_sets_env_before_each_dial(monkeypatch):
+def test_task_passed_to_each_dial(monkeypatch):
     monkeypatch.delenv("AGENT_OUTBOUND_TASK", raising=False)
     dial = FakeDial()
     queue = DialQueue(dial, interval_seconds=FAST)
@@ -201,18 +201,19 @@ def test_task_sets_env_before_each_dial(monkeypatch):
     assert wait_until(lambda: dial.calls == ["111"])
     queue.on_session_ended()
     assert wait_until(lambda: dial.calls == ["111", "222"])
-    assert dial.env_at_call == ["提醒客户明天复诊", "提醒客户明天复诊"]
-    # 清理，避免污染其他测试
-    monkeypatch.delenv("AGENT_OUTBOUND_TASK", raising=False)
+    assert dial.task_at_call == ["提醒客户明天复诊", "提醒客户明天复诊"]
+    # DialQueue 不碰 os.environ（持久化归 CallAgentService._remember_outbound_task）
+    assert "AGENT_OUTBOUND_TASK" not in os.environ
 
 
-def test_no_task_leaves_env_untouched(monkeypatch):
+def test_no_task_passes_none(monkeypatch):
     monkeypatch.delenv("AGENT_OUTBOUND_TASK", raising=False)
     dial = FakeDial()
     queue = DialQueue(dial, interval_seconds=FAST)
     queue.enqueue(["111"])
     assert wait_until(lambda: dial.calls == ["111"])
-    assert dial.env_at_call == [None]
+    assert dial.task_at_call == [None]
+    assert "AGENT_OUTBOUND_TASK" not in os.environ
 
 
 # ---- from_env ----
@@ -264,7 +265,7 @@ def test_session_ended_during_dial_does_not_stall_queue():
     queue_ref: list = []
     second_dialed = _threading.Event()
 
-    def dial_fn(number: str):
+    def dial_fn(number: str, task: str | None = None):
         dialed.append(number)
         if number == "111":
             # 模拟会话极速失败：dial 尚未返回，结束回调先到。

@@ -2,7 +2,8 @@
 
 设计要点：
 - ``DialQueue`` 只负责排队与调度，实际拨号委托给 ``dial_fn``
-  （即 ``CallAgentService.dial`` 的签名：``dial_fn(number) -> tuple[bool, str | None]``）。
+  （即 ``CallAgentService.dial`` 的签名：
+  ``dial_fn(number, task) -> tuple[bool, str | None]``）。
 - 回调（``on_session_ended``）来自模组监听线程，enqueue 来自 web 线程，
   所有共享状态用一把锁保护；拨号动作在 ``threading.Timer`` 线程里执行，
   不阻塞任何调用方。
@@ -17,7 +18,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from collections import deque
 from typing import Any, Callable
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 ENV_WHITELIST = "DIAL_WHITELIST"
 ENV_INTERVAL = "DIAL_INTERVAL_SECONDS"
 
-DialFn = Callable[[str], "tuple[bool, str | None]"]
+DialFn = Callable[[str, "str | None"], "tuple[bool, str | None]"]
 
 
 def number_allowed(number: str, whitelist: tuple[str, ...]) -> bool:
@@ -124,8 +124,8 @@ class DialQueue:
         - accepted：本次真正入队的号码（已 strip）；
         - rejected：空号/空白、白名单不放行、与队列中或本批次重复的号码（原样返回）。
 
-        ``task`` 非空时记为本队列的外呼任务，每次拨号前写入
-        ``AGENT_OUTBOUND_TASK`` 环境变量（现有 prompt 层从该 env 读取）。
+        ``task`` 非空时记为本队列的外呼任务，每次拨号时随号码显式
+        传给 ``dial_fn``（不再写环境变量）。
         队列空闲时立即（异步）拨打第一个号码，不阻塞调用方。
         """
         accepted: list[str] = []
@@ -236,10 +236,8 @@ class DialQueue:
                     # on_session_ended，预占让该回调有东西可清、标记可留。
                     self._current = number
                     self._ended_during_dial = False
-                if task:
-                    os.environ["AGENT_OUTBOUND_TASK"] = task
                 try:
-                    ok, error = self._dial_fn(number)
+                    ok, error = self._dial_fn(number, task)
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("拨号 %s 时 dial_fn 抛出异常", number)
                     ok, error = False, f"dial 异常: {exc}"

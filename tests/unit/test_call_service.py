@@ -32,7 +32,7 @@ def test_ring_starts_session_once(monkeypatch):
     service = make_service(modem)
     starts: list[str | None] = []
 
-    def fake_start(outbound_number: str | None = None) -> None:
+    def fake_start(outbound_number: str | None = None, task: str | None = None) -> None:
         starts.append(outbound_number)
         service.session._active = True  # 模拟会话进行中
 
@@ -51,7 +51,7 @@ def test_dial_rejected_when_session_active(monkeypatch):
     service = make_service(modem)
     monkeypatch.setattr(
         service.session, "start",
-        lambda outbound_number=None: setattr(service.session, "_active", True),
+        lambda outbound_number=None, task=None: setattr(service.session, "_active", True),
     )
 
     ok, err = service.dial("13900000000")
@@ -85,44 +85,45 @@ def test_wait_connected_success():
     assert asyncio.run(session._wait_connected(timeout=0.2)) is True
 
 
-# ---- 工具处理 ----
+# ---- 服务层高层方法：hangup / send_dtmf ----
 
-def test_tool_send_sms_uses_current_caller():
+def test_service_hangup_requires_active_call(monkeypatch):
+    service = make_service(FakeModem())
+    ok, err = service.hangup()
+    assert not ok and "没有进行中的通话" in (err or "")
+
+    stopped = []
+    monkeypatch.setattr(service.session, "stop", lambda: stopped.append(True))
+    service.session._active = True
+    ok, err = service.hangup()
+    assert ok and err is None
+    assert stopped == [True]
+
+
+def test_service_send_dtmf_requires_active_call():
     modem = FakeModem()
-    session = make_service(modem).session
-    session.current_caller = "13800000000"
+    sent: list[str] = []
+    modem.send_dtmf = lambda digits: sent.append(digits) or True  # type: ignore[attr-defined]
+    service = make_service(modem)
 
-    result = session._tool_send_sms({"content": "你好"})
+    ok, err = service.send_dtmf("103#")
+    assert not ok and "没有进行中的通话" in (err or "")
+    assert sent == []
 
-    assert result["success"] is True
-    assert ("send_sms", ("13800000000", "你好")) in modem.calls
+    service.session._active = True
+    ok, err = service.send_dtmf("103#")
+    assert ok and err is None
+    assert sent == ["103#"]
 
 
-def test_tool_send_sms_failure_reported():
+def test_service_send_dtmf_reports_modem_failure():
     modem = FakeModem()
-    modem.sms_should_succeed = False
-    session = make_service(modem).session
-    session.current_caller = "13800000000"
+    modem.send_dtmf = lambda digits: False  # type: ignore[attr-defined]
+    service = make_service(modem)
+    service.session._active = True
 
-    result = session._tool_send_sms({"content": "hi"})
-    assert result["success"] is False
-
-
-def test_tool_query_code_finds_keyword_sms():
-    hub = make_hub()
-    hub.publish({"type": "sms_in", "sender": "10086", "text": "余额 1000 元"})
-    hub.publish({"type": "sms_in", "sender": "95588", "text": "您的验证码是 482913，5分钟内有效"})
-    session = make_service(FakeModem(), hub=hub).session
-
-    result = session._tool_query_code({})
-
-    assert result["success"] is True
-    assert result["code"] == "482913"
-
-
-def test_tool_query_code_no_sms():
-    session = make_service(FakeModem(), hub=make_hub()).session
-    assert session._tool_query_code({})["success"] is False
+    ok, err = service.send_dtmf("1")
+    assert not ok and "按键发送失败" in (err or "")
 
 
 # ---- 来电全链路：接听 → 开场白 → 下行音频 → 挂断收尾 ----

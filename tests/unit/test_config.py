@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+from pathlib import Path
 
 import pytest
 
@@ -237,12 +239,23 @@ def test_update_quotes_value_with_spaces(tmp_path, monkeypatch):
 # ---- read_panel_values ----
 
 
-def test_panel_covers_all_specs_and_fields():
+def test_panel_covers_visible_specs_and_fields():
+    """面板返回全部非 hidden spec，且字段齐全；hidden 项绝不出现。"""
     rows = read_panel_values()
-    assert len(rows) == len(CONFIG_SPECS)
+    visible_keys = {spec.key for spec in CONFIG_SPECS if not spec.hidden}
+    assert {row["key"] for row in rows} == visible_keys
+    assert len(rows) == len(visible_keys)
     for row in rows:
         assert {"key", "label", "kind", "default", "choices", "editable",
                 "secret", "requires_restart", "value"} <= set(row)
+
+
+def test_hidden_specs_are_internal_only():
+    """hidden 项必须同时不可编辑（防止面板渲染不出却能经 API 写入）。"""
+    hidden = [spec for spec in CONFIG_SPECS if spec.hidden]
+    assert hidden, "注册表应存在 hidden 内部项"
+    for spec in hidden:
+        assert spec.editable is False, spec.key
 
 
 def test_panel_masks_secret_value(monkeypatch):
@@ -262,3 +275,32 @@ def test_panel_reflects_env_value(monkeypatch):
     rows = {row["key"]: row for row in read_panel_values()}
     assert rows["QWEN_VOICE"]["value"] == "Cherry"
     assert rows["QWEN_VOICE"]["default"] == "Raymond"
+
+
+# ---- 收口回归护栏 ----
+
+
+def test_registered_defaults_match_original_call_sites(monkeypatch):
+    """本轮收口的配置项，注册表默认值必须与原调用点硬编码一致。"""
+    _unset(monkeypatch, "MODEM_PCM_PORT", "MODEM_PCM_BAUD", "SUMMARY_TIMEOUT",
+           "QWEN_PREWARM_TIMEOUT", "QWEN_PREWARM_INTERVAL", "DASHSCOPE_REALTIME_URL")
+    assert get_str("MODEM_PCM_PORT") == ""            # app.py 原 os.getenv 无默认
+    assert get_int("MODEM_PCM_BAUD") == 921600        # app.py 原硬编码 "921600"
+    assert get_float("SUMMARY_TIMEOUT") == pytest.approx(30.0)   # summarizer 原 "30"
+    assert get_float("QWEN_PREWARM_TIMEOUT") == pytest.approx(5.0)    # 原模块常量
+    assert get_float("QWEN_PREWARM_INTERVAL") == pytest.approx(240.0)  # 原函数入参默认
+    assert get_str("DASHSCOPE_REALTIME_URL") == ""    # 留空走 SDK 内置端点
+
+
+def test_editable_specs_covered_by_env_example():
+    """防脱节：每个面板可编辑 spec 的 key 必须出现在 .env.example。"""
+    example = Path(__file__).resolve().parents[2] / ".env.example"
+    assign_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+    keys = set()
+    for line in example.read_text(encoding="utf-8").splitlines():
+        match = assign_re.match(line)
+        if match:
+            keys.add(match.group(1))
+    missing = [spec.key for spec in CONFIG_SPECS
+               if spec.editable and spec.key not in keys]
+    assert not missing, f".env.example 缺少可编辑配置项: {missing}"

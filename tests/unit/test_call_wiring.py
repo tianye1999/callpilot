@@ -15,6 +15,7 @@ import time
 import pytest
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
+from agentcall import config
 from agentcall.call_agent import CallAgentService
 from agentcall.call_log import CallLogger
 from agentcall.events import EventHub
@@ -177,7 +178,7 @@ def test_stale_hangup_timer_does_not_stop_next_call(tmp_path, monkeypatch):
     # 第一通：接起后 Agent 调用挂断工具，排下延迟挂断
     modem.trigger_ring("13800000000")
     assert wait_until(lambda: bridges and bridges[0].downlink), "第一通未跑起来"
-    session._tool_hangup({})
+    session._schedule_deferred_hangup()  # hangup 工具经此回调排定延迟挂断
     timer_fires_at = time.monotonic() + 0.4
 
     # 延迟窗口内对方先挂断，第一通收尾
@@ -210,14 +211,14 @@ def test_deferred_hangup_ignores_stale_generation(monkeypatch):
     assert session.is_active, "过期的延迟挂断回调不得停掉新会话"
 
 
-def test_tool_hangup_stops_current_session(monkeypatch):
+def test_scheduled_hangup_stops_current_session(monkeypatch):
     """延迟挂断对本通会话仍然生效（防止修复过度）。"""
     session = make_service(FakeModem()).session
     monkeypatch.setattr(session, "_run", lambda: None)
     session._hangup_delay_seconds = 0.05
 
     session.start()
-    session._tool_hangup({})
+    session._schedule_deferred_hangup()
     assert wait_until(lambda: not session.is_active), "延迟挂断未停掉本通会话"
 
 
@@ -302,21 +303,26 @@ def test_summary_skipped_without_user_speech(tmp_path, monkeypatch):
 def test_batch_dial_dials_in_order(tmp_path, monkeypatch):
     monkeypatch.setenv("DIAL_INTERVAL_SECONDS", "0.05")
     monkeypatch.delenv("DIAL_WHITELIST", raising=False)
-    # DialQueue 会直接写 os.environ["AGENT_OUTBOUND_TASK"]；
+    # 持久化经 _remember_outbound_task 写 os.environ；
     # 先让 monkeypatch 登记该变量，测试结束自动恢复原状。
     monkeypatch.delenv("AGENT_OUTBOUND_TASK", raising=False)
+    monkeypatch.setattr(config, "update_env_file", lambda updates: list(updates))
     modem = FakeModem()
     bridges: list[FakeAudioBridge] = []
+    agents: list[FakeAgent] = []
 
     def new_bridge(**kw):
         bridge = FakeAudioBridge()
         bridges.append(bridge)
         return bridge
 
+    def new_agent(provider):
+        agent = FakeAgent()
+        agents.append(agent)
+        return agent
+
     monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", new_bridge)
-    monkeypatch.setattr(
-        "agentcall.call_agent.create_agent", lambda provider: FakeAgent()
-    )
+    monkeypatch.setattr("agentcall.call_agent.create_agent", new_agent)
     service = make_service(modem, call_logger=CallLogger(tmp_path / "rec"))
 
     result = service.batch_dial(["10000", " 10001 ", ""], task="催一下快递进度")
@@ -328,9 +334,11 @@ def test_batch_dial_dials_in_order(tmp_path, monkeypatch):
 
     # 第一通：拨号 → 接通 → 对端挂断
     assert wait_until(lambda: "10000" in dials()), "第一通未拨出"
-    assert os.environ["AGENT_OUTBOUND_TASK"] == "催一下快递进度"
+    assert os.environ["AGENT_OUTBOUND_TASK"] == "催一下快递进度"  # 持久化为下次默认
     modem.trigger_call_connected("10000")
     assert wait_until(lambda: bridges and bridges[0].downlink)
+    # 队列的 task 显式传进会话，注入本通提示词
+    assert "本通电话主题：催一下快递进度" in agents[0]._session_instructions
     modem.trigger_hangup()
 
     # 第二通：间隔后自动拨下一个
@@ -357,7 +365,7 @@ def test_batch_dial_respects_whitelist_from_env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service.session,
         "start",
-        lambda outbound_number=None: setattr(service.session, "_active", True),
+        lambda outbound_number=None, task=None: setattr(service.session, "_active", True),
     )
 
     result = service.batch_dial(["10000", "13900001111", "13800000000"])
@@ -366,6 +374,27 @@ def test_batch_dial_respects_whitelist_from_env(tmp_path, monkeypatch):
 
     assert wait_until(lambda: service.dial_queue_status()["current"] == "10000")
     assert service.dial_queue_status()["pending"] == ["13800000000"]
+
+
+def test_dial_queue_does_not_touch_environ(tmp_path, monkeypatch):
+    """队列的 task 显式传参，不再经 os.environ 中转（除持久化写点外）。"""
+    monkeypatch.setenv("DIAL_INTERVAL_SECONDS", "0.05")
+    monkeypatch.delenv("DIAL_WHITELIST", raising=False)
+    monkeypatch.delenv("AGENT_OUTBOUND_TASK", raising=False)
+    service = make_service(FakeModem(), call_logger=CallLogger(tmp_path / "rec"))
+    received: list[tuple[str, str | None]] = []
+
+    def fake_dial(number: str, task: str | None = None) -> tuple[bool, str | None]:
+        received.append((number, task))
+        return False, "测试拒绝"  # 立即失败，驱动队列继续
+
+    monkeypatch.setattr(service.dial_queue, "_dial_fn", fake_dial)
+    service.dial_queue.enqueue(["10000", "10001"], task="催一下快递进度")
+
+    assert wait_until(lambda: len(received) == 2)
+    # task 随每次拨号显式传给 dial_fn，而 DialQueue 全程不碰 os.environ
+    assert received == [("10000", "催一下快递进度"), ("10001", "催一下快递进度")]
+    assert "AGENT_OUTBOUND_TASK" not in os.environ
 
 
 # ---- P2-7 本地监听：feed 接线 + 按配置构造并启动 ----
@@ -449,66 +478,42 @@ def test_session_reloads_tunables_from_env(monkeypatch):
 
 
 def test_dial_with_task_persists_as_default(monkeypatch, tmp_path):
-    from fakes import FakeModem
-
-    from agentcall import config
-    from agentcall.call_agent import CallAgentService
-
+    monkeypatch.delenv("AGENT_OUTBOUND_TASK", raising=False)
     written = {}
     monkeypatch.setattr(config, "update_env_file", lambda updates: written.update(updates) or list(updates))
-    service = CallAgentService(
-        modem_port="unused", audio_keyword="unused", provider="qwen",
-        modem=FakeModem(),  # type: ignore[arg-type]
+    service = make_service(FakeModem())
+    starts: list[tuple[str | None, str | None]] = []
+    monkeypatch.setattr(
+        service.session,
+        "start",
+        lambda outbound_number=None, task=None: starts.append((outbound_number, task)),
     )
-    monkeypatch.setattr(service.session, "start", lambda outbound_number=None: None)
 
     ok, _ = service.dial("10000", task="查询本月话费")
     assert ok
     assert os.environ["AGENT_OUTBOUND_TASK"] == "查询本月话费"
     assert written == {"AGENT_OUTBOUND_TASK": "查询本月话费"}
+    # task 同时显式传给会话（不依赖 env 中转）
+    assert starts == [("10000", "查询本月话费")]
 
 
 def test_dial_without_task_keeps_previous(monkeypatch):
-    from fakes import FakeModem
-
-    from agentcall import config
-    from agentcall.call_agent import CallAgentService
-
     monkeypatch.setenv("AGENT_OUTBOUND_TASK", "上次的主题")
     called = []
     monkeypatch.setattr(config, "update_env_file", lambda updates: called.append(updates))
-    service = CallAgentService(
-        modem_port="unused", audio_keyword="unused", provider="qwen",
-        modem=FakeModem(),  # type: ignore[arg-type]
+    service = make_service(FakeModem())
+    starts: list[tuple[str | None, str | None]] = []
+    monkeypatch.setattr(
+        service.session,
+        "start",
+        lambda outbound_number=None, task=None: starts.append((outbound_number, task)),
     )
-    monkeypatch.setattr(service.session, "start", lambda outbound_number=None: None)
 
     ok, _ = service.dial("10000")
     assert ok
     assert os.environ["AGENT_OUTBOUND_TASK"] == "上次的主题"
     assert called == []  # 未持久化任何变更
-
-
-# ---- DTMF 工具 ----
-
-
-def test_tool_send_dtmf_dispatches_to_modem(monkeypatch):
-    from fakes import FakeModem
-
-    from agentcall.call_agent import CallAgentService
-
-    modem = FakeModem()
-    sent = []
-    modem.send_dtmf = lambda digits: sent.append(digits) or True  # type: ignore[attr-defined]
-    service = CallAgentService(
-        modem_port="unused", audio_keyword="unused", provider="qwen",
-        modem=modem,  # type: ignore[arg-type]
-    )
-    result = service.session._tool_send_dtmf({"digits": "103#"})
-    assert result["success"] is True
-    assert sent == ["103#"]
-
-    assert service.session._tool_send_dtmf({"digits": ""})["success"] is False
+    assert starts == [("10000", None)]  # 未传 task：会话回退 env 默认
 
 
 # ---- 韧性启动：模组不在也起服务，后台 supervisor 反复重连 ----
@@ -637,7 +642,7 @@ def test_dial_rejects_malformed_number():
         ok, err = service.dial(bad)
         assert not ok and "格式不合法" in (err or ""), bad
     # 合法形态不受影响（不真正拨出：session.start 打桩）
-    service.session.start = lambda outbound_number=None: None  # type: ignore[method-assign]
+    service.session.start = lambda outbound_number=None, task=None: None  # type: ignore[method-assign]
     for good in ("10000", "+8613800138000", "*57#"):
         ok, _ = service.dial(good)
         assert ok, good

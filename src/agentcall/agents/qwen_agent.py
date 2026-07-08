@@ -24,15 +24,13 @@ from dashscope.audio.qwen_omni import (
     OmniRealtimeConversation,
 )
 
+from .. import config
 from .base import VoiceAgent
 
 logger = logging.getLogger(__name__)
 
 # 千问 Realtime 连接重试次数（SDK connect 硬超时 5s，冷连接抖动会踩线）。
 QWEN_CONNECT_MAX_ATTEMPTS = 3
-
-# 运行中断线后的最大重连次数默认值（env QWEN_RECONNECT_MAX 可覆盖）。
-QWEN_RECONNECT_MAX_DEFAULT = 2
 
 # 重连成功后让 Agent 主动安抚对方的提示词。
 RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继续。"
@@ -41,25 +39,19 @@ RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继
 DEFAULT_PREWARM_HOST = "dashscope.aliyuncs.com"
 DEFAULT_PREWARM_PORT = 443
 
-# 预热握手超时秒数默认值（env QWEN_PREWARM_TIMEOUT 可覆盖）。
-QWEN_PREWARM_TIMEOUT_DEFAULT = 5.0
-
 
 def _reconnect_max() -> int:
-    """读取运行中断线的最大重连次数（env QWEN_RECONNECT_MAX，默认 2）。"""
-    try:
-        return int(os.getenv("QWEN_RECONNECT_MAX", str(QWEN_RECONNECT_MAX_DEFAULT)))
-    except ValueError:
-        return QWEN_RECONNECT_MAX_DEFAULT
+    """读取运行中断线的最大重连次数（注册表 QWEN_RECONNECT_MAX，默认 2）。"""
+    return config.get_int("QWEN_RECONNECT_MAX")
 
 
 def _resolve_prewarm_target() -> tuple[str, int]:
     """解析预热目标 host/port。
 
-    优先解析 env DASHSCOPE_REALTIME_URL 的 host（兼容缺 scheme 的裸 host 写法），
+    优先解析 DASHSCOPE_REALTIME_URL 的 host（兼容缺 scheme 的裸 host 写法），
     否则回落到 dashscope 官方 Realtime 端点。
     """
-    url = os.getenv("DASHSCOPE_REALTIME_URL", "").strip()
+    url = config.get_str("DASHSCOPE_REALTIME_URL").strip()
     if url:
         if "://" not in url:
             url = "//" + url
@@ -76,12 +68,7 @@ def prewarm_connection(timeout: float | None = None) -> float | None:
     返回握手耗时（秒）；失败时记 warning 并返回 None，不抛异常。
     """
     if timeout is None:
-        try:
-            timeout = float(
-                os.getenv("QWEN_PREWARM_TIMEOUT", str(QWEN_PREWARM_TIMEOUT_DEFAULT))
-            )
-        except ValueError:
-            timeout = QWEN_PREWARM_TIMEOUT_DEFAULT
+        timeout = config.get_float("QWEN_PREWARM_TIMEOUT")
     host, port = _resolve_prewarm_target()
     started = time.monotonic()
     try:
@@ -107,10 +94,12 @@ def start_prewarm_keepalive(
     可随时停止循环（线程也挂在返回对象的 stop_event 属性上）。
     """
     event = stop_event if stop_event is not None else threading.Event()
-    try:
-        interval = float(os.getenv("QWEN_PREWARM_INTERVAL", str(interval_seconds)))
-    except ValueError:
-        interval = interval_seconds
+    # env 覆盖优先于入参（保持原有语义）；未设置时沿用调用方传入的间隔。
+    interval = (
+        config.get_float("QWEN_PREWARM_INTERVAL")
+        if "QWEN_PREWARM_INTERVAL" in os.environ
+        else interval_seconds
+    )
 
     def _worker() -> None:
         while not event.is_set():

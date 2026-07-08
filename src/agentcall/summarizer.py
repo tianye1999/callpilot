@@ -16,10 +16,9 @@ from typing import Any
 
 import dashscope
 
-logger = logging.getLogger(__name__)
+from . import config
 
-# 默认总结模型，可用环境变量 SUMMARY_MODEL 覆盖。
-DEFAULT_SUMMARY_MODEL = "qwen-plus"
+logger = logging.getLogger(__name__)
 
 # urgency 合法取值；模型输出不在此集合内时回落到默认值。
 _VALID_URGENCY = ("高", "中", "低")
@@ -78,7 +77,7 @@ def _build_messages(
         f"对方号码：{number or '未知'}\n"
         f"通话转写：\n" + "\n".join(lines)
     )
-    owner = os.environ.get("OWNER_NAME", "").strip() or "机主"
+    owner = config.get_str("OWNER_NAME").strip() or "机主"
     return [
         {"role": "system", "content": _SYSTEM_PROMPT.format(owner=owner)},
         {"role": "user", "content": user_content},
@@ -200,7 +199,7 @@ def summarize_call(
     :param transcripts: ``[(role, text)]``，role 为 ``"user"`` 或 ``"agent"``。
     :param direction: 通话方向（``"inbound"``/``"outbound"``，其余值原样带入 prompt）。
     :param number: 对方号码，未知可传 None。
-    :param timeout: API 调用超时秒数；缺省读 env ``SUMMARY_TIMEOUT``（默认 30，
+    :param timeout: API 调用超时秒数；缺省读注册表 ``SUMMARY_TIMEOUT``（默认 30，
         真机实测 15s 对长转写不够用）。
     :returns: ``{"ok", "caller_identity", "intent", "urgency",
         "callback_needed", "summary", "error"}``；失败时 ``ok=False`` 且
@@ -214,12 +213,9 @@ def summarize_call(
             return _fail("转写为空或无用户发言，跳过总结")
 
         if timeout is None:
-            try:
-                timeout = float(os.environ.get("SUMMARY_TIMEOUT", "30"))
-            except ValueError:
-                timeout = 30.0
+            timeout = config.get_float("SUMMARY_TIMEOUT")
 
-        model = os.environ.get("SUMMARY_MODEL", DEFAULT_SUMMARY_MODEL)
+        model = config.get_str("SUMMARY_MODEL")
         messages = _build_messages(transcripts, direction, number)
 
         response, error = _call_with_timeout(messages, model, timeout)

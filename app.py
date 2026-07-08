@@ -104,8 +104,8 @@ def main() -> None:
         provider=provider,
         baudrate=config.get_int("MODEM_BAUD"),
         audio_mode=config.get_str("MODEM_AUDIO_MODE"),
-        pcm_port=os.getenv("MODEM_PCM_PORT"),
-        pcm_baudrate=int(os.getenv("MODEM_PCM_BAUD", "921600")),
+        pcm_port=config.get_str("MODEM_PCM_PORT") or None,
+        pcm_baudrate=config.get_int("MODEM_PCM_BAUD"),
         tx_gain=config.get_float("MODEM_TX_GAIN"),
         hub=hub,
     )
@@ -113,9 +113,9 @@ def main() -> None:
     meta = {
         "provider": provider,
         "model": (
-            os.getenv("AGENT_MODEL_NAME", "通义千问 Qwen3-Omni")
+            config.get_str("AGENT_MODEL_NAME")
             if provider == "qwen"
-            else os.getenv("AGENT_MODEL_NAME_DOUBAO", "豆包实时语音大模型")
+            else config.get_str("AGENT_MODEL_NAME_DOUBAO")
         ),
         "port": modem_port,
     }

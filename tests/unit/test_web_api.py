@@ -24,6 +24,12 @@ class FakeService:
         self.batch_calls: list[tuple[list[str], str | None]] = []
         self.batch_result: dict = {"accepted": [], "rejected": []}
         self.queue: dict = {"pending": [], "current": None, "done": [], "active": False}
+        # 通话相关高层方法的可控返回值（默认：无通话）。
+        self.dial_calls: list[tuple[str, str | None]] = []
+        self.dial_result: tuple[bool, str | None] = (True, None)
+        self.hangup_result: tuple[bool, str | None] = (True, None)
+        self.dtmf_calls: list[str] = []
+        self.dtmf_result: tuple[bool, str | None] = (True, None)
 
     def batch_dial(self, numbers: list[str], task: str | None = None) -> dict:
         self.batch_calls.append((list(numbers), task))
@@ -31,6 +37,39 @@ class FakeService:
 
     def dial_queue_status(self) -> dict:
         return dict(self.queue)
+
+    def dial(self, number: str, task: str | None = None) -> tuple[bool, str | None]:
+        self.dial_calls.append((number, task))
+        return self.dial_result
+
+    def hangup(self) -> tuple[bool, str | None]:
+        return self.hangup_result
+
+    def send_dtmf(self, digits: str) -> tuple[bool, str | None]:
+        self.dtmf_calls.append(digits)
+        return self.dtmf_result
+
+
+class FakeHub:
+    """最小事件总线替身：只记录 publish 调用。"""
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def publish(self, event: dict) -> None:
+        self.events.append(event)
+
+
+class FakeModem:
+    """最小模组替身：只提供 _send_sms 用到的接口。"""
+
+    def __init__(self, send_result: bool = True) -> None:
+        self.send_result = send_result
+        self.sms_calls: list[tuple[str, str]] = []
+
+    def send_sms(self, number: str, text: str) -> bool:
+        self.sms_calls.append((number, text))
+        return self.send_result
 
 
 def make_app(service):
@@ -50,7 +89,7 @@ def api(app, fn):
 # ---- /api/config ----
 
 
-def test_config_get_returns_all_specs():
+def test_config_get_returns_all_visible_specs():
     app = make_app(FakeService())
 
     async def fn(client):
@@ -59,7 +98,10 @@ def test_config_get_returns_all_specs():
         return await resp.json()
 
     rows = api(app, fn)
-    assert len(rows) == len(config.CONFIG_SPECS)
+    # hidden 内部项不进面板，其余 spec 全量返回
+    visible = [spec for spec in config.CONFIG_SPECS if not spec.hidden]
+    assert {row["key"] for row in rows} == {spec.key for spec in visible}
+    assert len(rows) == len(visible)
     by_key = {row["key"]: row for row in rows}
     # secret 项不回传真实值
     assert by_key["DASHSCOPE_API_KEY"]["value"] in ("已设置", "未设置")
@@ -97,6 +139,7 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
         return await resp.json()
 
     data = api(app, fn)
+    assert data["ok"] is True
     assert data["updated"] == ["QWEN_VOICE", "AGENT_PROVIDER", "RECORDING_ENABLED"]
     assert data["requires_restart"] == ["AGENT_PROVIDER"]
 
@@ -221,7 +264,11 @@ def test_batch_dial_delegates_to_service():
             json={"numbers": ["10086", "bad"], "task": "催快递"},
         )
         assert resp.status == 200
-        assert await resp.json() == {"accepted": ["10086"], "rejected": ["bad"]}
+        assert await resp.json() == {
+            "ok": True,
+            "accepted": ["10086"],
+            "rejected": ["bad"],
+        }
 
         # task 缺省 / 空串都应透传 None
         resp = await client.post("/api/call/batch_dial", json={"numbers": ["10010"]})
@@ -273,7 +320,8 @@ def test_queue_status_passthrough():
     async def fn(client):
         resp = await client.get("/api/call/queue")
         assert resp.status == 200
-        assert await resp.json() == service.queue
+        # 成功响应统一补 ok=true；其余队列字段原样透传。
+        assert await resp.json() == {**service.queue, "ok": True}
 
     api(app, fn)
 
@@ -287,7 +335,212 @@ def test_endpoints_without_service_return_500():
             assert resp.status == 500, path
         resp = await client.get("/api/history/abc/events")
         assert resp.status == 500
-        resp = await client.post("/api/call/batch_dial", json={"numbers": ["1"]})
-        assert resp.status == 500
+        # service 缺失时，所有依赖 service 的 POST 端点统一 500（middleware 转换）。
+        for path, body in (
+            ("/api/call/batch_dial", {"numbers": ["1"]}),
+            ("/api/call/dial", {"number": "10086"}),
+            ("/api/call/hangup", {}),
+            ("/api/call/dtmf", {"digits": "1"}),
+        ):
+            resp = await client.post(path, json=body)
+            assert resp.status == 500, path
 
     api(app, fn)
+
+
+# ---- /api/meta ----
+
+
+def test_meta_returns_injected_metadata():
+    app = build_app(hub=None, modem=None, service=FakeService(), meta={"model": "qwen-x"})  # type: ignore[arg-type]
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        assert resp.status == 200
+        return await resp.json()
+
+    assert api(app, fn) == {"model": "qwen-x"}
+
+
+# ---- /api/call/dial ----
+
+
+def test_dial_delegates_and_validates():
+    service = FakeService()
+    app = make_app(service)
+
+    async def fn(client):
+        # 正常外呼 → 200 且透传到 service.dial
+        resp = await client.post("/api/call/dial", json={"number": "10086", "task": "催快递"})
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True}
+
+        # 号码空 → 400，且不落到 service
+        resp = await client.post("/api/call/dial", json={"number": "   "})
+        assert resp.status == 400
+
+        # task 非字符串 → 400
+        resp = await client.post("/api/call/dial", json={"number": "10086", "task": 5})
+        assert resp.status == 400
+
+        # 非法 JSON → 400
+        resp = await client.post("/api/call/dial", data=b"not json")
+        assert resp.status == 400
+
+    api(app, fn)
+    assert service.dial_calls == [("10086", "催快递")]
+
+
+def test_dial_conflict_when_service_rejects():
+    """service.dial 返回 (False, err) → 409（如通话中）。"""
+    service = FakeService()
+    service.dial_result = (False, "当前正在通话中，请稍后再拨")
+    app = make_app(service)
+
+    async def fn(client):
+        resp = await client.post("/api/call/dial", json={"number": "10086"})
+        assert resp.status == 409
+        body = await resp.json()
+        assert body["ok"] is False
+        assert body["error"] == "当前正在通话中，请稍后再拨"
+
+    api(app, fn)
+
+
+# ---- /api/call/hangup ----
+
+
+def test_hangup_success_and_no_active_call():
+    # 有通话 → 200
+    service = FakeService()
+    service.hangup_result = (True, None)
+    app = make_app(service)
+
+    async def ok_fn(client):
+        resp = await client.post("/api/call/hangup", json={})
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True}
+
+    api(app, ok_fn)
+
+    # 无通话 → 409
+    service2 = FakeService()
+    service2.hangup_result = (False, "当前没有进行中的通话")
+    app2 = make_app(service2)
+
+    async def conflict_fn(client):
+        resp = await client.post("/api/call/hangup", json={})
+        assert resp.status == 409
+        body = await resp.json()
+        assert body["ok"] is False
+        assert body["error"] == "当前没有进行中的通话"
+
+    api(app2, conflict_fn)
+
+
+# ---- /api/call/dtmf ----
+
+
+def test_dtmf_success_validation_and_no_active_call():
+    service = FakeService()
+    app = make_app(service)
+
+    async def fn(client):
+        # 正常按键 → 200，透传到 service.send_dtmf
+        resp = await client.post("/api/call/dtmf", json={"digits": "12*#"})
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True}
+
+        # digits 空 → 400
+        resp = await client.post("/api/call/dtmf", json={"digits": ""})
+        assert resp.status == 400
+        # digits 含非法字符 → 400
+        resp = await client.post("/api/call/dtmf", json={"digits": "12a"})
+        assert resp.status == 400
+        # 非法 JSON → 400
+        resp = await client.post("/api/call/dtmf", data=b"not json")
+        assert resp.status == 400
+
+    api(app, fn)
+    # 只有合法请求会落到 service
+    assert service.dtmf_calls == ["12*#"]
+
+
+def test_dtmf_no_active_call_returns_409():
+    service = FakeService()
+    service.dtmf_result = (False, "当前没有进行中的通话")
+    app = make_app(service)
+
+    async def fn(client):
+        resp = await client.post("/api/call/dtmf", json={"digits": "1"})
+        assert resp.status == 409
+        body = await resp.json()
+        assert body["ok"] is False
+        assert body["error"] == "当前没有进行中的通话"
+
+    api(app, fn)
+
+
+def test_dtmf_send_failure_keeps_200():
+    """模组发送失败沿用旧行为：200 + {"ok": false}（非无通话场景）。"""
+    service = FakeService()
+    service.dtmf_result = (False, "按键发送失败")
+    app = make_app(service)
+
+    async def fn(client):
+        resp = await client.post("/api/call/dtmf", json={"digits": "1"})
+        assert resp.status == 200
+        assert await resp.json() == {"ok": False}
+
+    api(app, fn)
+
+
+def test_dtmf_validation_precedes_call_state_check():
+    """有意的行为决策（2026-07 重构评审确认）：参数校验优先于通话状态。
+
+    无通话 + 非法参数的双重错误场景返回 400（旧实现返回 409）——
+    「先修好请求再谈状态冲突」是标准 REST 语义；唯一前端消费者只读
+    res.ok 不看状态码。此测试锁定该决策，防止无意回摆。
+    """
+    service = FakeService()
+    service.dtmf_result = (False, "当前没有进行中的通话")
+    app = make_app(service)
+
+    async def fn(client):
+        resp = await client.post("/api/call/dtmf", json={"digits": "abc"})
+        assert resp.status == 400
+        resp = await client.post("/api/call/dtmf", data=b"not json")
+        assert resp.status == 400
+
+    api(app, fn)
+    assert service.dtmf_calls == []  # 非法请求不触达 service
+
+
+# ---- /api/sms/send ----
+
+
+def test_send_sms_success_and_validation():
+    hub = FakeHub()
+    modem = FakeModem(send_result=True)
+    app = build_app(hub=hub, modem=modem, service=FakeService())  # type: ignore[arg-type]
+
+    async def fn(client):
+        # 正常发送 → 200 且透传到 modem.send_sms
+        resp = await client.post(
+            "/api/sms/send", json={"number": "10086", "text": "余额查询"}
+        )
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True}
+
+        # 号码空 → 400
+        resp = await client.post("/api/sms/send", json={"number": "", "text": "x"})
+        assert resp.status == 400
+        # 内容空 → 400
+        resp = await client.post("/api/sms/send", json={"number": "10086", "text": ""})
+        assert resp.status == 400
+        # 非法 JSON → 400
+        resp = await client.post("/api/sms/send", data=b"not json")
+        assert resp.status == 400
+
+    api(app, fn)
+    assert modem.sms_calls == [("10086", "余额查询")]
