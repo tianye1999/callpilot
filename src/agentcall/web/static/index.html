@@ -419,6 +419,54 @@
     min-height: 15px; letter-spacing: .22em; text-align: center;
   }
 
+  /* ========= 模态确认框（自定义，替代原生 confirm）========= */
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: 100; display: none;
+    align-items: center; justify-content: center; padding: 24px;
+    background: radial-gradient(120% 120% at 50% 0%, rgba(10,20,30,.62), rgba(4,6,10,.82));
+    backdrop-filter: blur(10px) saturate(1.15);
+    animation: modal-fade .18s ease-out;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal-card {
+    position: relative; width: min(92vw, 400px); overflow: hidden;
+    background: linear-gradient(165deg, rgba(34,42,58,.96), rgba(15,20,30,.97));
+    border: 1px solid var(--border-strong); border-radius: 22px;
+    padding: 30px 26px 22px; text-align: center;
+    box-shadow: 0 28px 70px rgba(0,0,0,.62), inset 0 1px 0 rgba(255,255,255,.06);
+    animation: modal-pop .24s cubic-bezier(.2,.9,.3,1.1);
+  }
+  /* 顶部一道磷光科技感高光 */
+  .modal-card::before {
+    content: ""; position: absolute; top: 0; left: 20%; right: 20%; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--ok), transparent);
+    opacity: .8;
+  }
+  .modal-icon {
+    width: 54px; height: 54px; margin: 0 auto 16px; border-radius: 16px;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--warn-dim); border: 1px solid rgba(255,214,10,.32);
+    box-shadow: 0 0 24px rgba(255,214,10,.18), inset 0 0 12px rgba(255,214,10,.1);
+  }
+  .modal-icon svg { width: 26px; height: 26px; stroke: var(--warn); }
+  .modal-title { font-size: 17px; font-weight: 700; color: var(--text); letter-spacing: .01em; }
+  .modal-msg {
+    margin: 10px auto 22px; max-width: 300px;
+    font-size: 13.5px; line-height: 1.65; color: var(--muted);
+  }
+  .modal-actions { display: flex; flex-direction: column; gap: 9px; }
+  .modal-actions .btn { width: 100%; padding: 12px 18px; }
+  .btn.save {
+    background: var(--grad-green); color: #fff;
+    box-shadow: 0 2px 16px rgba(48,209,88,.38), inset 0 1px 0 rgba(255,255,255,.25);
+  }
+  .btn.save:hover { filter: brightness(1.1); box-shadow: 0 2px 22px rgba(48,209,88,.55); }
+  @keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes modal-pop {
+    from { opacity: 0; transform: translateY(10px) scale(.96); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
   /* ========= 语言选择菜单 ========= */
   #langBtn { display: inline-flex; align-items: center; gap: 5px; }
   #langBtn svg { display: block; }
@@ -572,6 +620,19 @@
     <div class="sent" id="dtmfSent"></div>
   </div>
 
+  <div class="modal-overlay" id="modal">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/>
+        </svg>
+      </div>
+      <div class="modal-title" id="modalTitle"></div>
+      <div class="modal-msg" id="modalMsg"></div>
+      <div class="modal-actions" id="modalActions"></div>
+    </div>
+  </div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 /* ========= i18n（默认英文，localStorage 记忆） ========= */
@@ -596,7 +657,9 @@ const I18N = {
     recent_label: "RECENT CALLS", empty_calls: "No calls yet", view_all: "View all history",
     live_title: "Live Transcript", live_sub_idle: "Opens automatically when a call starts",
     live_empty: "Waiting for transcript…", dtmf_send_fail: "Send failed",
-    cfg_leave_save: "You have unsaved settings. Save them before leaving?  (OK = save, Cancel = discard)",
+    leave_title: "Unsaved changes",
+    leave_msg: "You've edited settings that aren't saved yet. What would you like to do?",
+    leave_save: "Save & leave", leave_discard: "Discard changes", leave_stay: "Keep editing",
     who_user: "Caller", who_agent: "AI Pilot",
     sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
@@ -661,7 +724,9 @@ const I18N = {
     recent_label: "最近通话", empty_calls: "暂无通话", view_all: "查看全部历史",
     live_title: "实时对话", live_sub_idle: "通话开始后自动进入本页",
     live_empty: "等待通话转写…", dtmf_send_fail: "发送失败",
-    cfg_leave_save: "有未保存的设置修改，离开前保存吗？（确定 = 保存，取消 = 放弃）",
+    leave_title: "有未保存的修改",
+    leave_msg: "你修改了设置但还没保存，要怎么处理？",
+    leave_save: "保存并离开", leave_discard: "放弃修改", leave_stay: "继续编辑",
     who_user: "对方", who_agent: "AI 副驾",
     sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
@@ -738,10 +803,47 @@ function switchPage(name) {
   });
   if (name === "history") loadHistory();
 }
-function navTo(name) {
-  // 离开设置页且有未保存修改：确认=保存后离开，取消=放弃后离开。
+/* 自定义模态确认框：返回 Promise<所选 action.key>；点遮罩/Esc 视为第一个 action */
+let _modalResolve = null;
+function showModal({ title, message, actions }) {
+  $("modalTitle").textContent = title;
+  $("modalMsg").textContent = message;
+  const box = $("modalActions");
+  box.textContent = "";
+  actions.forEach((a) => {
+    const btn = el("button", "btn " + (a.kind || "ghost"), a.label);
+    btn.addEventListener("click", () => closeModal(a.key));
+    box.appendChild(btn);
+  });
+  $("modal").classList.add("show");
+  return new Promise((resolve) => { _modalResolve = resolve; });
+}
+function closeModal(key) {
+  $("modal").classList.remove("show");
+  const r = _modalResolve; _modalResolve = null;
+  if (r) r(key);
+}
+$("modal").addEventListener("click", (e) => {
+  if (e.target === $("modal") && _modalResolve) closeModal("__dismiss");
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && _modalResolve) closeModal("__dismiss");
+});
+
+async function navTo(name) {
+  // 离开设置页且有未保存修改：弹自定义模态（保存/放弃/继续编辑）。
   if (currentPage === "settings" && name !== "settings" && cfgDirty) {
-    if (confirm(t("cfg_leave_save"))) $("configSave").click();
+    const choice = await showModal({
+      title: t("leave_title"),
+      message: t("leave_msg"),
+      actions: [
+        { key: "save", label: t("leave_save"), kind: "save" },
+        { key: "discard", label: t("leave_discard"), kind: "danger" },
+        { key: "stay", label: t("leave_stay"), kind: "ghost" },
+      ],
+    });
+    if (choice === "stay" || choice === "__dismiss") return;  // 留在设置页
+    if (choice === "save") $("configSave").click();
     cfgDirty = false;
   }
   switchPage(name);
