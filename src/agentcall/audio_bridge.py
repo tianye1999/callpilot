@@ -357,6 +357,21 @@ class FfmpegAudioBridge:
                 return int(match.group(1))
         return None
 
+    def _spawn_play(self) -> None:
+        """（重）启动下行播放 ffmpeg 进程。
+
+        EC20 的 UAC 输出设备在 AT+QPCMV=1,2 刚启用时往往还没就绪，过早打开会
+        AudioQueueStart 失败（-66637）而立即退出。故播放进程独立于此，供 write
+        loop 在其退出后带退避重启，直到设备就绪。
+        """
+        self._play = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "s16le", "-ar", str(MODEM_RATE), "-ac", "1",
+             "-i", "pipe:0", "-f", "audiotoolbox",
+             "-audio_device_index", str(self.output_index), "none"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+
     def start(self) -> None:
         common = ["-hide_banner", "-loglevel", "error"]
         self._cap = subprocess.Popen(
@@ -365,12 +380,7 @@ class FfmpegAudioBridge:
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
         os.set_blocking(self._cap.stdout.fileno(), False)
-        self._play = subprocess.Popen(
-            ["ffmpeg", *common, "-f", "s16le", "-ar", str(MODEM_RATE), "-ac", "1",
-             "-i", "pipe:0", "-f", "audiotoolbox",
-             "-audio_device_index", str(self.output_index), "none"],
-            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
+        self._spawn_play()
         self._running = True
         self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
         self._writer_thread.start()
@@ -413,10 +423,18 @@ class FfmpegAudioBridge:
                 if chunk:
                     self._tx_buffer.extend(chunk)
 
+    # 播放进程退出后的最大重启次数（× ~0.5s ≈ 覆盖 EC20 UAC 设备就绪窗口）。
+    _MAX_PLAY_RESTARTS = 20
+
     def _write_loop(self) -> None:
-        """按 100ms 实时节奏喂给播放进程，空闲时也补静音保持 UAC 下行时钟。"""
+        """按 100ms 实时节奏喂给播放进程，空闲时也补静音保持 UAC 下行时钟。
+
+        播放进程若退出（多为 QPCMV 刚启用、UAC 输出设备尚未就绪），带退避
+        重启重试直到就绪，而非整通哑掉。一旦写成功即清零重启计数。
+        """
         next_write_at = time.monotonic()
         silence = b"\x00" * NMEA_WRITE_SIZE
+        restarts = 0
         while self._running:
             now = time.monotonic()
             if now < next_write_at:
@@ -427,10 +445,28 @@ class FfmpegAudioBridge:
                 try:
                     self._play.stdin.write(payload)
                     self._play.stdin.flush()
+                    restarts = 0  # 写通了 = 设备就绪，重置计数
                 except (BrokenPipeError, ValueError):
-                    logger.error("ffmpeg 播放进程管道断开")
-                    self._running = False
-                    return
+                    if restarts >= self._MAX_PLAY_RESTARTS:
+                        logger.error(
+                            "ffmpeg 播放进程反复退出（已重启 %d 次），下行放弃", restarts
+                        )
+                        self._running = False
+                        return
+                    restarts += 1
+                    logger.warning(
+                        "ffmpeg 播放进程退出（UAC 设备可能未就绪），0.5s 后重启（第 %d 次）",
+                        restarts,
+                    )
+                    try:
+                        if self._play:
+                            self._play.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._spawn_play()
+                    time.sleep(0.5)
+                    next_write_at = time.monotonic()
+                    continue
             next_write_at += NMEA_WRITE_INTERVAL_SECONDS
 
     def _next_write_payload(self, silence: bytes) -> bytes:

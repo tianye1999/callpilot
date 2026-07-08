@@ -525,6 +525,12 @@
     </div>
     <span class="spacer"></span>
     <div class="meta">
+      <button class="btn sm ghost" id="restartTop" style="padding:4px 8px" title="Restart service">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/>
+          <path d="M3 3v5h5"/>
+        </svg>
+      </button>
       <button class="btn sm ghost" id="langBtn" style="padding:4px 8px" title="Language" aria-haspopup="menu">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
           <circle cx="12" cy="12" r="9"/>
@@ -1379,7 +1385,7 @@ async function loadConfig() {
   } catch (e) { console.warn("[config] 加载设置面板失败", e); }
 }
 // 手动重启按钮：确认后重启服务（可从界面重连模组/恢复，无需命令行）。
-$("restartBtn").addEventListener("click", async () => {
+async function confirmRestart() {
   const choice = await showModal({
     title: t("restart_confirm_title"), message: t("restart_confirm_msg"),
     actions: [
@@ -1388,7 +1394,9 @@ $("restartBtn").addEventListener("click", async () => {
     ],
   });
   if (choice === "ok") restartService();
-});
+}
+$("restartBtn").addEventListener("click", confirmRestart);   // 设置页按钮
+$("restartTop").addEventListener("click", confirmRestart);   // 顶栏图标
 
 // 保存了「需重启」配置后自动重启服务：过场遮罩 + 轮询 /api/meta 复活后自动刷新。
 async function restartService() {
