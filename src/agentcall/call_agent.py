@@ -33,6 +33,7 @@ from .prompts import (
     default_outbound_task,
     opening_instructions,
     owner_name,
+    winddown_instructions,
 )
 from .summarizer import summarize_call
 
@@ -295,12 +296,32 @@ class CallSession:
     ) -> None:
         """通话主循环：下行音频搬运 + 半双工防回环的上行转发。"""
         last_play_at = 0.0
+        loop_started = time.monotonic()
+        # 外呼硬时限兜底：模型不自觉道别挂断时（真机见过对 IVR 打转 3 分钟），
+        # 到点让 AI 说句告别，再给挂尾窗口播完就结束整通（→ 挂断物理通话）。
+        max_seconds = (
+            float(config.get_int("OUTBOUND_MAX_SECONDS")) if self._outbound_number else 0.0
+        )
+        winddown_deadline: float | None = None
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
         while self._active and not agent.fatal:
             self._drain_agent_audio(bridge)
 
             now = time.monotonic()
+            if (
+                max_seconds > 0
+                and winddown_deadline is None
+                and (now - loop_started) > max_seconds
+            ):
+                logger.warning("外呼超过 %.0fs 仍在进行，自动道别收尾", max_seconds)
+                try:
+                    await agent.say(self._winddown_instructions())
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("收尾道别发送失败: %s", exc)
+                winddown_deadline = now + self._hangup_delay_seconds
+            if winddown_deadline is not None and now >= winddown_deadline:
+                break
             pending = (
                 bridge.pending_output_bytes()
                 if hasattr(bridge, "pending_output_bytes")
@@ -426,6 +447,10 @@ class CallSession:
         return opening_instructions(
             direction, owner_name(lang), agent_persona(lang), self._outbound_task(lang), lang
         )
+
+    def _winddown_instructions(self) -> str:
+        """外呼硬时限到点的收尾道别指令。"""
+        return winddown_instructions(agent_language())
 
     def _outbound_task(self, lang: str = "zh") -> str:
         """本通外呼主题：start() 显式传入优先，否则回退 AGENT_OUTBOUND_TASK 配置。"""

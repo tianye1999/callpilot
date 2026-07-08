@@ -122,6 +122,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 通话行为 ----
     ConfigSpec("HALF_DUPLEX_HANGOVER_SECONDS", "半双工挂尾时长（秒）", "float", "0.5"),
     ConfigSpec("HANGUP_TOOL_DELAY_SECONDS", "挂断工具延迟（秒）", "float", "4.5"),
+    # 外呼硬时限（秒）：到点自动道别并挂断，兜底模型不自觉收尾导致的打转/话费；
+    # 0 = 不限制。
+    ConfigSpec("OUTBOUND_MAX_SECONDS", "外呼最长时长（秒）", "int", "150"),
     ConfigSpec("RECORDING_ENABLED", "通话录音开关", "bool", "true"),
     ConfigSpec("RECORDING_RETENTION_DAYS", "录音保留天数", "int", "30"),
     ConfigSpec("SUMMARY_ENABLED", "通话摘要开关", "bool", "true"),

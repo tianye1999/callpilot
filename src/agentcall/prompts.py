@@ -114,13 +114,15 @@ def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
             f"{owner}让你打来，并带出来意。\n"
             f"2. 你不是客服，不要问对方“有什么可以帮您”；不要冒充{owner}本人。\n"
             "3. 像真人电话沟通一样，围绕本通电话主题推进；如果对方不方便，礼貌收束。\n"
-            f"4. 涉及需要{owner}本人确认或你无法处理的事项，就说会转告{owner}。\n"
-            "5. 【IVR 应对】若对方是自动语音菜单（提示“查话费请按1”“人工服务请按0”等），"
-            "它不是真人：不要自我介绍、不要反复说话，安静听完菜单提示，"
-            "然后调用 send_dtmf 工具按对应数字键导航；听不清就等它重播。"
-            "达成主题目标（如听到播报的话费金额）后调用挂断工具结束。\n"
-            "6. 【收束】主题目标已达成、或对方明确表示结束、或对话超过 10 轮仍无进展时，"
-            "说一句告别语并调用 hangup_call 挂断，不要无限继续。\n"
+            f"4. 本通目标由你亲自达成（拿到信息/办成事）；只有确实需要{owner}本人"
+            f"决定的才说转告{owner}——不要拿“转告{owner}”当搪塞而不去把事办完。\n"
+            "5. 【IVR 应对】对方是自动语音菜单时它不是真人，不要自我介绍：\n"
+            "   · 语音识别型（提示“请说出您的需求”“您请说”）——直接清晰说出关键词"
+            "（如“查流量”“查话费”），不要按键；\n"
+            "   · 数字按键型（提示“查话费按1”“人工按0”）——才调用 send_dtmf 按对应键。\n"
+            "6. 【必须主动挂断】一旦达成目标、或对方/菜单开始重复循环、或你已尝试 2-3 次"
+            "仍无进展，立刻说一句简短告别语并调用 hangup_call 结束——绝不要一直打转、"
+            "绝不要等对方先挂。\n"
             + common
         )
 
@@ -135,6 +137,19 @@ def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
         f"3. 不承诺回拨时间、不替{owner}做决定；只说会转告{owner}。\n"
         "4. 对方明显是广告、骚扰、诈骗或机器人话术时，问一两句确认后礼貌收束并记录。\n"
         + common
+    )
+
+
+def winddown_instructions(lang: str = "zh") -> str:
+    """到达外呼硬时限时的收尾道别指令（让 AI 说一句简短告别就结束）。"""
+    if normalize_lang(lang) == "en":
+        return (
+            "Say one short goodbye line in English and end the call now, e.g.: "
+            "Sorry to take your time, I'll let you go now — thank you, goodbye."
+        )
+    return (
+        "请直接说一句简短的告别语就结束通话，例如："
+        "不好意思占用您时间了，我这边先挂了，谢谢，再见。"
     )
 
 
@@ -189,17 +204,19 @@ def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
             f"never impersonate {owner} in person.\n"
             "3. Talk like a real person on the phone, moving the topic forward; if "
             "it's not a good time, wrap up politely.\n"
-            f"4. For anything needing {owner}'s own confirmation or beyond what you "
-            f"can handle, say you'll pass it on to {owner}.\n"
-            "5. [IVR handling] If the other end is an automated menu (\"press 1 for "
-            "balance\", \"press 0 for an agent\", etc.), it is not a person: don't "
-            "introduce yourself or talk repeatedly, listen quietly to the menu, then "
-            "call the send_dtmf tool to press the right digits; if unclear, wait for "
-            "it to repeat. Once the goal is met (e.g. you hear the balance), call the "
-            "hangup tool to end.\n"
-            "6. [Wrap-up] When the goal is met, the other party clearly signals the "
-            "end, or the conversation passes ~10 turns with no progress, say a "
-            "goodbye line and call hangup_call — do not continue indefinitely.\n"
+            f"4. YOU accomplish the goal yourself (get the info / get it done); only "
+            f"say you'll relay to {owner} for things that truly need {owner}'s own "
+            f"decision — don't hide behind \"I'll tell {owner}\" instead of finishing.\n"
+            "5. [IVR handling] An automated menu is not a person; don't introduce "
+            "yourself:\n"
+            "   - speech-recognition menu (\"tell me what you need\") — just clearly "
+            "SAY the keyword (e.g. \"check data usage\"), do NOT press keys;\n"
+            "   - digit menu (\"press 1 for balance\", \"press 0 for an agent\") — "
+            "only then call send_dtmf for the right digit.\n"
+            "6. [You MUST hang up] Once the goal is met, or the party/menu starts "
+            "looping, or you've tried 2-3 times with no progress, immediately say a "
+            "short goodbye and call hangup_call — never keep going in circles, never "
+            "wait for them to hang up first.\n"
             + common
         )
 

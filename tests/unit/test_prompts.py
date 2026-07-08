@@ -38,7 +38,14 @@ def test_outbound_instructions_inject_owner_persona_task():
     assert "send_dtmf" in text
     assert "hangup_call" in text
     assert "【IVR 应对】" in text
-    assert "【收束】" in text
+    assert "【必须主动挂断】" in text
+
+
+def test_winddown_instructions_bilingual():
+    from agentcall.prompts import winddown_instructions
+    assert "告别" in winddown_instructions("zh") and "再见" in winddown_instructions("zh")
+    en = winddown_instructions("en")
+    assert "goodbye" in en.lower() and "end the call" in en.lower()
 
 
 def test_inbound_instructions_inject_owner_and_rules():

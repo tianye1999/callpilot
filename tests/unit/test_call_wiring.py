@@ -646,3 +646,30 @@ def test_dial_rejects_malformed_number():
     for good in ("10000", "+8613800138000", "*57#"):
         ok, _ = service.dial(good)
         assert ok, good
+
+
+# ---- 外呼硬时限：模型不自觉收尾时，自动道别并挂断 ----
+
+def test_outbound_auto_winddown_hangs_up(monkeypatch):
+    """外呼超过 OUTBOUND_MAX_SECONDS：AI 说收尾告别 + 物理挂断（不依赖模型自觉）。"""
+    from fakes import FakeAgent, FakeAudioBridge, FakeModem
+
+    monkeypatch.setenv("OUTBOUND_MAX_SECONDS", "1")
+    monkeypatch.setenv("HANGUP_TOOL_DELAY_SECONDS", "0.2")
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+    # 外呼一拨号即视为接通（覆盖 FakeModem.dial 清除接通标志的行为）
+    monkeypatch.setattr(modem, "dial", lambda number: modem.connected_flag.set() or "OK")
+
+    service = make_service(modem)
+    ok, _ = service.dial("10000")
+    assert ok
+
+    # 到点自动收尾：agent 说了告别语（含“再见”），且模组被挂断
+    assert wait_until(lambda: any("再见" in s for s in agent.said), timeout=6), agent.said
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=6)
+    assert ("hangup", ()) in modem.calls
