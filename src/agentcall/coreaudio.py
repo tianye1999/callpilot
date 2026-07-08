@@ -1,10 +1,10 @@
 """CoreAudio 设备枚举（macOS 专用，ctypes 直调，无第三方依赖）。
 
-关键：ffmpeg 的 audiotoolbox ``-audio_device_index`` 只对**有输出流的设备**
-重新编号（0,1,2…），而非 kAudioHardwarePropertyDevices 全设备数组序号。
-本机存在大量只读输入设备/虚拟设备时两者会错位（曾导致下行播到 BlackHole
-虚拟设备、对端听不到）。因此本模块的查找一律返回「输出设备中的序位」，
-与 ffmpeg 对齐。
+ffmpeg 的 audiotoolbox ``-audio_device_index`` 用的是 kAudioHardwarePropertyDevices
+**全设备数组序号**（含只输入的设备），实测证实：给只输入设备的序号会
+AudioQueueStart(-66637) 失败，给有输出的序号成功。故本模块返回全数组序号，
+与 ffmpeg 对齐。（注意：这不是「输出设备中的序位」——曾误改成序位导致下行
+落到只输入的 AC Interface、对端听不到。）
 """
 
 from __future__ import annotations
@@ -72,17 +72,10 @@ _KA_DEFAULT_OUTPUT = _fourcc("dOut")  # kAudioHardwarePropertyDefaultOutputDevic
 
 
 def find_output_index(keyword: str) -> int | None:
-    """名字含 keyword 的输出设备，在「输出设备」中的序位（供 ffmpeg audiotoolbox）。
-
-    只对 out_streams>0 的设备计数——与 ffmpeg audiotoolbox 的编号一致。
-    """
-    out_ordinal = 0
-    for _idx, _dev_id, name, out_streams in list_devices():
-        if out_streams <= 0:
-            continue
-        if keyword.lower() in name.lower():
-            return out_ordinal
-        out_ordinal += 1
+    """名字含 keyword 且有输出流的设备的全数组序号（供 ffmpeg audiotoolbox）。"""
+    for idx, _dev_id, name, out_streams in list_devices():
+        if keyword.lower() in name.lower() and out_streams > 0:
+            return idx
     return None
 
 
@@ -105,18 +98,11 @@ def _resolve_default_output_id() -> int | None:
 
 
 def default_output_index() -> int | None:
-    """系统默认输出设备在「输出设备」中的序位（供 ffmpeg audiotoolbox）。
-
-    比按名字匹配更稳健、可移植：跟随用户在系统里选的输出。查不到返回 None。
-    """
+    """系统默认输出设备的全数组序号（供 ffmpeg audiotoolbox）。查不到返回 None。"""
     default_id = _resolve_default_output_id()
     if default_id is None:
         return None
-    out_ordinal = 0
-    for _idx, dev_id, _name, out_streams in list_devices():
-        if out_streams <= 0:
-            continue
-        if dev_id == default_id:
-            return out_ordinal
-        out_ordinal += 1
+    for idx, dev_id, _name, out_streams in list_devices():
+        if dev_id == default_id and out_streams > 0:
+            return idx
     return None

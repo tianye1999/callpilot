@@ -20,23 +20,24 @@ _DEVICES = [
 ]
 
 
-def test_find_output_index_returns_output_ordinal(monkeypatch):
+def test_find_output_index_returns_full_array_index(monkeypatch):
+    """ffmpeg audiotoolbox 用全数组序号（含只输入设备），实测证实。"""
     monkeypatch.setattr(coreaudio, "list_devices", lambda: list(_DEVICES))
-    # 'AS Interface' 全数组序号是 2，但输出序位是 1（ffmpeg 只数有输出的设备）
-    assert coreaudio.find_output_index("Interface") == 1
-    assert coreaudio.find_output_index("扬声器") == 3
-    assert coreaudio.find_output_index("BlackHole") == 2
+    # 'AS Interface' 全数组序号 = 2（跳过 out=0 的 AC Interface），不是「输出序位 1」
+    assert coreaudio.find_output_index("Interface") == 2
+    assert coreaudio.find_output_index("扬声器") == 5
+    assert coreaudio.find_output_index("BlackHole") == 4
     assert coreaudio.find_output_index("不存在") is None
     # 只读输入设备即便名字匹配也不返回（无输出流）
     assert coreaudio.find_output_index("麦克风") is None
 
 
-def test_default_output_index_returns_output_ordinal(monkeypatch):
+def test_default_output_index_returns_full_array_index(monkeypatch):
     monkeypatch.setattr(coreaudio, "list_devices", lambda: list(_DEVICES))
-    # 默认输出设备 id=105（扬声器）→ 输出序位 3，而非全数组序号 5
+    # 默认输出设备 id=105（扬声器）→ 全数组序号 5
     monkeypatch.setattr(coreaudio, "_resolve_default_output_id", lambda: 105)
-    assert coreaudio.default_output_index() == 3
+    assert coreaudio.default_output_index() == 5
     monkeypatch.setattr(coreaudio, "_resolve_default_output_id", lambda: 102)
-    assert coreaudio.default_output_index() == 1  # AS Interface
+    assert coreaudio.default_output_index() == 2  # AS Interface
     monkeypatch.setattr(coreaudio, "_resolve_default_output_id", lambda: 999)
     assert coreaudio.default_output_index() is None  # 未匹配

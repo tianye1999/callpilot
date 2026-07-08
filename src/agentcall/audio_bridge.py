@@ -440,33 +440,30 @@ class FfmpegAudioBridge:
             if now < next_write_at:
                 time.sleep(min(0.01, next_write_at - now))
                 continue
+            # 用 poll() 判定播放进程是否真的退出——不能靠 write 是否抛异常：
+            # 进程刚退出时 write 仍可能把数据塞进管道缓冲而“看似成功”，
+            # 会误清重启计数、导致无限重试刷屏（曾整通每 0.5s 重启上百次）。
+            if self._play is not None and self._play.poll() is not None:
+                if restarts >= self._MAX_PLAY_RESTARTS:
+                    logger.error(
+                        "ffmpeg 播放进程反复退出（已重启 %d 次），下行放弃——"
+                        "检查 EC20 UAC 输出设备是否被其它 App 占用", restarts
+                    )
+                    self._running = False
+                    return
+                restarts += 1
+                logger.warning("ffmpeg 播放进程退出，0.5s 后重启（第 %d 次）", restarts)
+                self._spawn_play()
+                time.sleep(0.5)
+                next_write_at = time.monotonic()
+                continue
             payload = self._next_write_payload(silence)
             if self._play and self._play.stdin:
                 try:
                     self._play.stdin.write(payload)
                     self._play.stdin.flush()
-                    restarts = 0  # 写通了 = 设备就绪，重置计数
                 except (BrokenPipeError, ValueError):
-                    if restarts >= self._MAX_PLAY_RESTARTS:
-                        logger.error(
-                            "ffmpeg 播放进程反复退出（已重启 %d 次），下行放弃", restarts
-                        )
-                        self._running = False
-                        return
-                    restarts += 1
-                    logger.warning(
-                        "ffmpeg 播放进程退出（UAC 设备可能未就绪），0.5s 后重启（第 %d 次）",
-                        restarts,
-                    )
-                    try:
-                        if self._play:
-                            self._play.kill()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self._spawn_play()
-                    time.sleep(0.5)
-                    next_write_at = time.monotonic()
-                    continue
+                    continue  # 进程已退出，下一轮由上面的 poll() 统一处理重启
             next_write_at += NMEA_WRITE_INTERVAL_SECONDS
 
     def _next_write_payload(self, silence: bytes) -> bytes:
