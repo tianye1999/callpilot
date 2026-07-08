@@ -1051,38 +1051,47 @@ async function loadMeta() {
 }
 
 /* ========= 实时旁听：Web Audio 播放下行 PCM（走浏览器→系统音频，绕开 native）========= */
-let audioWs = null, audioCtx = null, audioRate = 24000, nextPlayAt = 0;
+// 下行(AI)与上行(对方)各一条播放时间线，按帧首字节的方向标记分流，两路同时出声。
+let audioWs = null, audioCtx = null;
+const listenRate = {0: 24000, 1: 8000};   // 0=下行 1=上行
+const listenNextAt = {0: 0, 1: 0};
 function toggleListen() {
   if (audioWs) { stopListen(); return; }
   try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
   catch (e) { console.warn("[listen] AudioContext 不可用", e); return; }
-  nextPlayAt = 0;
+  listenNextAt[0] = 0; listenNextAt[1] = 0;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   audioWs = new WebSocket(`${proto}://${location.host}/ws/audio`);
   audioWs.binaryType = "arraybuffer";
   audioWs.onmessage = (e) => {
     if (typeof e.data === "string") {
-      try { const m = JSON.parse(e.data); if (m.rate) audioRate = m.rate; } catch (_) {}
+      try {
+        const m = JSON.parse(e.data);
+        if (m.rate) listenRate[0] = m.rate;
+        if (m.uplink_rate) listenRate[1] = m.uplink_rate;
+      } catch (_) {}
       return;
     }
-    playPcm(new Int16Array(e.data));
+    const kind = new Uint8Array(e.data, 0, 1)[0];        // 首字节：方向
+    playPcm(new Int16Array(e.data.slice(1)), kind);      // 其余：s16le PCM
   };
   audioWs.onclose = () => { if (audioWs) stopListen(); };
   const btn = $("listenBtn");
   btn.classList.add("on"); btn.textContent = t("listen_on");
 }
-function playPcm(int16) {
+function playPcm(int16, kind) {
   if (!audioCtx || !int16.length) return;
+  const rate = listenRate[kind] || 24000;
   const f32 = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
-  const buf = audioCtx.createBuffer(1, f32.length, audioRate);
+  const buf = audioCtx.createBuffer(1, f32.length, rate);
   buf.copyToChannel(f32, 0);
   const src = audioCtx.createBufferSource();
   src.buffer = buf; src.connect(audioCtx.destination);
   const now = audioCtx.currentTime;
-  if (nextPlayAt < now) nextPlayAt = now + 0.08;  // 抖动缓冲，防爆音
-  src.start(nextPlayAt);
-  nextPlayAt += buf.duration;
+  if (listenNextAt[kind] < now) listenNextAt[kind] = now + 0.08;  // 抖动缓冲，防爆音
+  src.start(listenNextAt[kind]);
+  listenNextAt[kind] += buf.duration;
 }
 function stopListen() {
   if (audioWs) { try { audioWs.onclose = null; audioWs.close(); } catch (_) {} audioWs = null; }

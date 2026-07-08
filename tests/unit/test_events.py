@@ -87,10 +87,12 @@ def test_broadcast_audio_fans_out_only_to_audio_clients():
             hub.set_audio_rate(16000)
             assert hub.audio_rate == 16000
             hub.register_audio(AudioWS())
-            hub.broadcast_audio(b"\x01\x00\x02\x00")
+            hub.broadcast_audio(b"\x01\x00\x02\x00")      # 默认 kind=0（下行）
+            hub.broadcast_audio(b"\x05\x00", kind=1)      # kind=1（上行）
             await asyncio.sleep(0)               # 让 _broadcast_audio 执行
             await asyncio.gather(*list(hub._audio_tasks))
-            assert received == [b"\x01\x00\x02\x00"]
+            # 每帧前置 1 字节方向标记：0x00=下行、0x01=上行
+            assert received == [b"\x00\x01\x00\x02\x00", b"\x01\x05\x00"]
 
         loop.run_until_complete(scenario())
     finally:

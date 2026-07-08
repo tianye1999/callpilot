@@ -146,7 +146,8 @@ async def _audio_websocket(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
     hub: EventHub = request.app["hub"]
 
-    await ws.send_json({"type": "meta", "rate": hub.audio_rate})
+    # rate=下行(AI)采样率；uplink_rate=上行(对方)固定 8kHz（模组 PCM 速率）。
+    await ws.send_json({"type": "meta", "rate": hub.audio_rate, "uplink_rate": 8000})
     hub.register_audio(ws)
     logger.info("音频旁听端已连接")
     try:

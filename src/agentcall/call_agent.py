@@ -18,6 +18,7 @@ from .audio_bridge import (
     FfmpegAudioBridge,
     ModemAudioBridge,
     SerialPcmAudioBridge,
+    apply_pcm_gain,
     create_audio_bridge,
 )
 from .call_log import CallLogger, CallRecord
@@ -291,9 +292,9 @@ class CallSession:
             self.hub.set_audio_rate(agent.output_rate)
 
         def on_agent_audio(pcm_agent: bytes) -> None:
-            # 浏览器实时旁听（Web Audio）：无监听端时 broadcast_audio 零成本返回。
+            # 浏览器实时旁听下行 AI（Web Audio）：无监听端时零成本返回。kind=0=下行。
             if self.hub is not None:
-                self.hub.broadcast_audio(pcm_agent)
+                self.hub.broadcast_audio(pcm_agent, kind=0)
             monitor = self.monitor
             if monitor is not None:
                 monitor.feed(pcm_agent)
@@ -327,6 +328,8 @@ class CallSession:
         judge_grace, judge_interval = 20.0, 15.0
         last_judge_at = loop_started
         goal = self._outbound_task(agent_language()) if judge_enabled else ""
+        # 浏览器实时旁听：对方上行电平低，推给浏览器前按此增益放大到可闻。
+        uplink_listen_gain = config.get_float("MONITOR_UPLINK_GAIN")
         winddown_deadline: float | None = None
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
@@ -388,6 +391,12 @@ class CallSession:
                 # 录音不受半双工屏蔽影响（内存追加，非磁盘 IO）。
                 if record is not None:
                     record.write_uplink(pcm_8k)
+                # 浏览器实时旁听对方声音（kind=1=上行）：放大到可闻后推；不受半双工屏蔽
+                # 影响（旁听是单向到浏览器，无回环），让运维能实时听到对方在说什么。
+                if self.hub is not None:
+                    self.hub.broadcast_audio(
+                        apply_pcm_gain(pcm_8k, uplink_listen_gain), kind=1
+                    )
                 # 本机监听对方声音（8k 旁路，入队即返回）。
                 if self.uplink_monitor is not None:
                     self.uplink_monitor.feed(pcm_8k)

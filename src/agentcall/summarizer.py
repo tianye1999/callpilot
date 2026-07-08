@@ -84,24 +84,26 @@ _JUDGE_TIMEOUT = 8.0
 _JUDGE_SYSTEM = {
     "zh": (
         "你在监督机主{owner}的电话助理正在进行的一通外呼。本通目标：{goal}。\n"
-        "根据下面到目前为止的对话，判断这通电话现在该「继续」还是「收尾挂断」：\n"
-        "- wrap_up（收尾）：目标已达成（已拿到所需信息/办成事）；或明显打转卡住"
-        "（反复说同样的话、菜单绕圈、多次尝试仍无进展）；或对方已明确要结束。\n"
-        "- continue（继续）：正在推进；对方让你稍候/正在查询、结果还没出来。\n"
-        "宁可多给一次继续的机会：只有确信达成或确信卡死才判 wrap_up。\n"
+        "判断依据是「有没有真正拿到实质结果」，而不是「对话听起来是否结束了」。\n"
+        "- wrap_up（收尾）：所要的信息/结果已被对方真正给出、或事情确实办成；或已明显"
+        "在原地打转、多次尝试仍无实质进展；或对方明确要结束。\n"
+        "- continue（继续）：要的实质结果还没真正到手（哪怕场面上已经在客套收尾）。\n"
+        "拿不准时倾向继续：只有确信已拿到结果、或确信卡死，才判 wrap_up。\n"
         "只输出严格合法的 JSON，无任何多余文字："
         '{{"decision": "continue" 或 "wrap_up", "reason": "一句话理由"}}'
     ),
     "en": (
         "You are supervising an ongoing OUTBOUND call by {owner}'s phone assistant. "
         "Goal of this call: {goal}.\n"
-        "From the conversation so far, decide whether to CONTINUE or WRAP UP now:\n"
-        "- wrap_up: goal achieved (info obtained / task done); or clearly stuck/"
-        "looping (repeating the same thing, menu circles, no progress after several "
-        "tries); or the other party wants to end.\n"
-        "- continue: making progress; the other party asked you to hold / is looking "
-        "it up and the result hasn't arrived.\n"
-        "When in doubt, lean continue: only pick wrap_up if clearly done or stuck.\n"
+        "Judge on whether the substance was actually obtained, not on whether the "
+        "conversation sounds finished.\n"
+        "- wrap_up: the requested info/result has actually been provided, or the task "
+        "is genuinely done; or it's clearly going in circles with no real progress; "
+        "or the other party wants to end.\n"
+        "- continue: the requested result isn't actually in hand yet (even if the "
+        "conversation sounds like it's wrapping up).\n"
+        "When in doubt, lean continue: only wrap_up once you truly have the result or "
+        "it's clearly stuck.\n"
         'Output only strict JSON, no extra text: {{"decision": "continue" or '
         '"wrap_up", "reason": "one short sentence"}}'
     ),

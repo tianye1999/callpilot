@@ -70,15 +70,18 @@ class EventHub:
     def unregister_audio(self, ws: web.WebSocketResponse) -> None:
         self._audio_clients.discard(ws)
 
-    def broadcast_audio(self, pcm: bytes) -> None:
-        """把下行 PCM 帧广播给旁听端（任意线程调用，非阻塞、满即丢）。
+    def broadcast_audio(self, pcm: bytes, kind: int = 0) -> None:
+        """把通话 PCM 帧广播给旁听端（任意线程调用，非阻塞、满即丢）。
 
+        kind：0=下行（AI，采样率 audio_rate）、1=上行（对方，8kHz）。每帧前置 1 字节
+        方向标记，浏览器据此分两条时间线各按其采样率播放（双向可同时出声）。
         无旁听端时立即返回（零成本）；在途发送积压时丢帧不堆积（旁听可丢）。
         """
         if not self._audio_clients or not pcm:
             return
+        frame = bytes((kind & 0xFF,)) + pcm
         try:
-            self._loop.call_soon_threadsafe(self._broadcast_audio, pcm)
+            self._loop.call_soon_threadsafe(self._broadcast_audio, frame)
         except RuntimeError:
             pass
 
