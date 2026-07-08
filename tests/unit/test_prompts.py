@@ -42,10 +42,52 @@ def test_outbound_instructions_inject_owner_persona_task():
     assert "查您的" in text  # 明确「不要说成查您的X」
 
 
+def test_outbound_instructions_insert_dynamic_scenario_after_task():
+    text = build_instructions(
+        "outbound",
+        "李明",
+        "数字分身",
+        "查询本月流量",
+        scenario="对语音菜单直接说查流量，少做自我介绍。",
+    )
+    assert (
+        "你要办的事：查询本月流量\n"
+        "本通场景与开场策略：对语音菜单直接说查流量，少做自我介绍。\n"
+        "这件事是李明的"
+    ) in text
+    assert "安全边界" in text
+    assert "开头简单说一次你是谁、要办什么" not in text
+    assert "按上面的《本通场景与开场策略》" in text
+    assert "不要默认先自报身份" in text
+
+
+def test_outbound_instructions_without_scenario_remain_template():
+    old = build_instructions("outbound", "李明", "数字分身", "查询本月流量")
+    new = build_instructions(
+        "outbound", "李明", "数字分身", "查询本月流量", scenario=""
+    )
+    assert new == old
+    assert "开头简单说一次你是谁、要办什么" in new
+
+
 def test_outbound_standpoint_framing_english():
     text = build_instructions("outbound", "Alex", "AI assistant", "check data usage", "en")
     assert "on Alex's account" in text  # 立场：机主名下的事
     assert "your X" in text  # 明确禁止「your X」措辞
+
+
+def test_outbound_scenario_defers_english_opening_strategy():
+    text = build_instructions(
+        "outbound",
+        "Alex",
+        "AI assistant",
+        "check data usage",
+        "en",
+        scenario="Use a short IVR phrase.",
+    )
+    assert "at the start say once who you are and what you need" not in text
+    assert "defer the opening entirely to the scenario strategy" in text
+    assert "do not self-introduce by default" in text
 
 
 def test_outbound_requires_substantive_result_before_wrapping_up():
@@ -93,6 +135,7 @@ def test_instructions_common_sections_present():
     for direction in ("outbound", "inbound"):
         text = build_instructions(direction, "李明", "AI 助理", "随便")
         assert "当前真实日期时间是" in text
+        assert "不要主动报时间" in text
         assert "安全边界" in text
         assert "send_sms" in text
         assert "query_verification_code" in text
@@ -106,6 +149,18 @@ def test_outbound_opening_injects_owner_and_task():
     assert "让我打" not in text  # 简洁化：去掉“让我打来”
     assert "方便说两句" not in text  # 简洁化：去掉“现在方便说两句吗”
     assert "查询本月话费" in text
+
+
+def test_outbound_opening_uses_generated_opening_directly():
+    text = opening_instructions(
+        "outbound",
+        "李明",
+        "数字分身",
+        "查询本月话费",
+        opening="查一下本月话费",
+    )
+    assert text == "请直接说：查一下本月话费"
+    assert "我是李明的数字分身" not in text
 
 
 def test_inbound_opening_injects_owner():

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -380,6 +381,142 @@ def test_batch_dial_dials_in_order(tmp_path, monkeypatch):
     assert status["current"] is None
     assert [d["number"] for d in status["done"]] == ["10000", "10001"]
     assert all(d["ok"] for d in status["done"])
+
+
+def test_outbound_prompt_generation_injects_scenario_and_logs_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "true")
+    monkeypatch.setenv("PROMPT_GEN_WAIT_SECONDS", "1")
+    monkeypatch.setenv("AGENT_OUTBOUND_TASK", "查询流量")
+    monkeypatch.setattr(config, "validate_provider_credentials", lambda provider: [])
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+    monkeypatch.setattr(
+        "agentcall.call_agent.generate_prompt_scenario",
+        lambda number, task, lang, **kwargs: {
+            "ok": True,
+            "scenario": "开场直接说查询流量，遇到菜单用短词。",
+            "opening": "查一下本机流量",
+            "error": None,
+            "provider": "qwen",
+            "model": "qwen-plus",
+            "cached": False,
+        },
+    )
+
+    service = make_service(modem, call_logger=CallLogger(tmp_path / "rec"))
+    ok, err = service.dial("10000")
+    assert ok, err
+    assert wait_until(lambda: ("dial", ("10000",)) in modem.calls)
+    modem.trigger_call_connected("10000")
+    assert wait_until(lambda: bridge.downlink)
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    assert "本通场景与开场策略：开场直接说查询流量" in agent._session_instructions
+    call_dir = sole_call_dir(tmp_path / "rec")
+    events = [
+        json.loads(line)
+        for line in (call_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    prompt_events = [event for event in events if event["type"] == "prompt_gen"]
+    assert prompt_events
+    assert prompt_events[0]["ok"] is True
+    assert prompt_events[0]["scenario"] == "开场直接说查询流量，遇到菜单用短词。"
+    assert prompt_events[0]["opening"] == "查一下本机流量"
+    assert agent.said[0] == "请直接说：查一下本机流量"
+
+
+def test_outbound_prompt_generation_timeout_falls_back_to_template(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "true")
+    monkeypatch.setenv("PROMPT_GEN_WAIT_SECONDS", "0.01")
+    monkeypatch.setenv("AGENT_OUTBOUND_TASK", "查询流量")
+    monkeypatch.setattr(config, "validate_provider_credentials", lambda provider: [])
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    release = threading.Event()
+
+    def slow_generate(number, task, lang, **kwargs):
+        release.wait(timeout=2)
+        return {
+            "ok": True,
+            "scenario": "这段太晚了，本通不应使用。",
+            "opening": "这句也太晚了",
+            "error": None,
+            "provider": "qwen",
+            "model": "qwen-plus",
+            "cached": False,
+        }
+
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+    monkeypatch.setattr("agentcall.call_agent.generate_prompt_scenario", slow_generate)
+
+    service = make_service(modem, call_logger=CallLogger(tmp_path / "rec"))
+    ok, err = service.dial("10000")
+    assert ok, err
+    assert wait_until(lambda: ("dial", ("10000",)) in modem.calls)
+    modem.trigger_call_connected("10000")
+    assert wait_until(lambda: bridge.downlink)
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    assert "本通场景与开场策略" not in agent._session_instructions
+    call_dir = sole_call_dir(tmp_path / "rec")
+    events = [
+        json.loads(line)
+        for line in (call_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    timeout_events = [event for event in events if event["type"] == "prompt_gen"]
+    assert timeout_events
+    assert timeout_events[0]["ok"] is False
+    assert "超时" in timeout_events[0]["error"]
+    release.set()
+    if service.session._prompt_gen_thread is not None:
+        service.session._prompt_gen_thread.join(timeout=1)
+
+
+def test_outbound_prompt_generation_skips_when_credentials_missing(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "true")
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        config,
+        "validate_provider_credentials",
+        lambda provider: [f"缺少环境变量 DASHSCOPE_API_KEY（{provider} 必需）"],
+    )
+    monkeypatch.setattr(
+        "agentcall.call_agent.generate_prompt_scenario",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {
+            "ok": True,
+            "scenario": "不应生成",
+            "opening": "不应开场",
+            "error": None,
+            "provider": "qwen",
+            "model": "qwen-plus",
+            "cached": False,
+        },
+    )
+
+    service = make_service(FakeModem(), call_logger=CallLogger(tmp_path / "rec"))
+    service.session._outbound_number = "10000"
+    service.session._outbound_task_value = "查询流量"
+
+    with caplog.at_level("DEBUG", logger="agentcall.call_agent"):
+        service.session._start_prompt_generation()
+
+    assert service.session._prompt_gen_thread is None
+    assert calls == []
+    assert service.session._take_prompt_scenario() is None
+    assert service.session._prompt_gen_opening == ""
+    assert "跳过动态场景提示词生成" in caplog.text
 
 
 def test_batch_dial_respects_whitelist_from_env(tmp_path, monkeypatch):

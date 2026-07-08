@@ -30,6 +30,7 @@ from .dtmf import dtmf_tone
 from .events import EventHub
 from .modem import Eg25Modem
 from .monitor_playback import MonitorPlayback
+from .prompt_gen import generate_prompt_scenario
 from .prompts import (
     agent_language,
     agent_persona,
@@ -107,6 +108,13 @@ class CallSession:
         # 会话级可调参数：每通会话开始时从 config 重新读取，支持不重启改参。
         self._hangover_seconds = HALF_DUPLEX_HANGOVER_SECONDS
         self._hangup_delay_seconds = HANGUP_TOOL_DELAY_SECONDS
+        # 外呼动态场景提示词：拨号等待接通时后台生成，接通后限时取用。
+        self._prompt_gen_thread: threading.Thread | None = None
+        self._prompt_gen_done = threading.Event()
+        self._prompt_gen_result: dict | None = None
+        self._prompt_gen_timed_out = False
+        self._prompt_gen_generation = 0
+        self._prompt_gen_opening = ""
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -125,6 +133,12 @@ class CallSession:
         self._wrap_up_requested = False  # 每通重置收尾裁判状态
         self._wrap_up_reason = ""
         self._judge_task = None
+        self._prompt_gen_thread = None
+        self._prompt_gen_done = threading.Event()
+        self._prompt_gen_result = None
+        self._prompt_gen_timed_out = False
+        self._prompt_gen_generation += 1
+        self._prompt_gen_opening = ""
         # 世代号推进与置活必须同锁原子完成：与 _deferred_hangup 的
         # 「校验世代号 → stop()」互斥，保证旧回调要么在新会话置活前跑完
         # （只影响已结束的旧会话），要么校验失败直接放弃。
@@ -239,6 +253,7 @@ class CallSession:
         """外呼：拨号并等待接通；未接通时发结束事件、挂断并返回 False。"""
         logger.info("开始外呼: %s", self._outbound_number)
         self.current_caller = self._outbound_number
+        self._start_prompt_generation()
         self.modem.dial(self._outbound_number)
         mark("dialing", number=self._outbound_number)
         self._publish(
@@ -505,15 +520,26 @@ class CallSession:
     def _build_agent_instructions(self, direction: str) -> str:
         """会话系统提示词：文本构造在 prompts 模块（纯函数，可独测）。"""
         lang = agent_language()
+        scenario = self._take_prompt_scenario() if direction == "outbound" else None
         return build_instructions(
-            direction, owner_name(lang), agent_persona(lang), self._outbound_task(lang), lang
+            direction,
+            owner_name(lang),
+            agent_persona(lang),
+            self._outbound_task(lang),
+            lang,
+            scenario=scenario,
         )
 
     def _opening_instructions(self, direction: str) -> str:
         """开场白指令：文本构造在 prompts 模块（纯函数，可独测）。"""
         lang = agent_language()
         return opening_instructions(
-            direction, owner_name(lang), agent_persona(lang), self._outbound_task(lang), lang
+            direction,
+            owner_name(lang),
+            agent_persona(lang),
+            self._outbound_task(lang),
+            lang,
+            opening=self._prompt_gen_opening if direction == "outbound" else None,
         )
 
     async def _run_wrap_up_judge(
@@ -536,6 +562,87 @@ class CallSession:
         logger.warning("复读抑制判定会话卡死，准备收尾: %s", reason)
         self._wrap_up_requested = True
         self._wrap_up_reason = reason
+
+    def _start_prompt_generation(self) -> None:
+        if not self._outbound_number or not config.get_bool("PROMPT_GEN_ENABLED"):
+            return
+        provider = (self.provider or config.get_str("AGENT_PROVIDER")).strip()
+        credential_errors = config.validate_provider_credentials(provider)
+        if credential_errors:
+            logger.debug(
+                "跳过动态场景提示词生成: %s",
+                "；".join(credential_errors),
+            )
+            return
+        number = self._outbound_number
+        lang = agent_language()
+        task = self._outbound_task(lang)
+        generation = self._prompt_gen_generation
+
+        def worker() -> None:
+            result = generate_prompt_scenario(number, task, lang, provider=provider)
+            if generation != self._prompt_gen_generation:
+                return
+            self._prompt_gen_result = result
+            self._prompt_gen_done.set()
+            if self._prompt_gen_timed_out:
+                return
+            self._log_prompt_gen_result(result)
+
+        self._prompt_gen_thread = threading.Thread(
+            target=worker, name="prompt-gen", daemon=True
+        )
+        self._prompt_gen_thread.start()
+
+    def _take_prompt_scenario(self) -> str | None:
+        thread = self._prompt_gen_thread
+        if thread is None:
+            return None
+        wait_seconds = max(0.0, config.get_float("PROMPT_GEN_WAIT_SECONDS"))
+        if not self._prompt_gen_done.wait(wait_seconds):
+            self._prompt_gen_timed_out = True
+            self._log_prompt_gen_result(
+                {
+                    "ok": False,
+                    "scenario": "",
+                    "opening": "",
+                    "error": f"等待动态场景提示词超时（>{wait_seconds:g}s）",
+                    "provider": self.provider or config.get_str("AGENT_PROVIDER"),
+                    "model": config.get_str("PROMPT_GEN_MODEL"),
+                    "cached": False,
+                }
+            )
+            return None
+        result = self._prompt_gen_result or {}
+        self._prompt_gen_opening = str(result.get("opening") or "")
+        if result.get("ok") and str(result.get("scenario", "")).strip():
+            return str(result["scenario"])
+        return None
+
+    def _log_prompt_gen_result(self, result: dict) -> None:
+        ok = bool(result.get("ok"))
+        scenario = str(result.get("scenario") or "")
+        opening = str(result.get("opening") or "")
+        error = str(result.get("error") or "")
+        model = str(result.get("model") or "")
+        provider = str(result.get("provider") or self.provider or "")
+        cached = bool(result.get("cached"))
+        if ok:
+            logger.info("动态场景提示词生成成功: %.120s", scenario)
+        else:
+            logger.info("动态场景提示词未使用: %s", error)
+        record = self._record
+        if record is not None:
+            record.log_event(
+                "prompt_gen",
+                ok=ok,
+                scenario=scenario,
+                opening=opening,
+                error=error,
+                provider=provider,
+                model=model,
+                cached=cached,
+            )
 
     def _winddown_instructions(self) -> str:
         """收尾道别指令（硬时限或收尾裁判触发时让 AI 说一句简短告别）。"""

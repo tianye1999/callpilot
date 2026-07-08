@@ -68,20 +68,34 @@ def _now_str(lang: str) -> str:
 
 
 def build_instructions(
-    direction: str, owner: str, persona: str, task: str, lang: str = "zh"
+    direction: str,
+    owner: str,
+    persona: str,
+    task: str,
+    lang: str = "zh",
+    scenario: str | None = None,
 ) -> str:
     """构造会话系统提示词；``task`` 仅在外呼（direction="outbound"）时使用。"""
     lang = normalize_lang(lang)
     if lang == "en":
-        return _build_en(direction, owner, persona, task)
-    return _build_zh(direction, owner, persona, task)
+        return _build_en(direction, owner, persona, task, scenario)
+    return _build_zh(direction, owner, persona, task, scenario)
 
 
 def opening_instructions(
-    direction: str, owner: str, persona: str, task: str, lang: str = "zh"
+    direction: str,
+    owner: str,
+    persona: str,
+    task: str,
+    lang: str = "zh",
+    opening: str | None = None,
 ) -> str:
     """构造开场白指令；``task`` 仅在外呼时使用。"""
     lang = normalize_lang(lang)
+    if direction == "outbound" and opening and opening.strip():
+        if lang == "en":
+            return f"Say directly: {opening.strip()}"
+        return f"请直接说：{opening.strip()}"
     if lang == "en":
         return _opening_en(direction, owner, persona, task)
     return _opening_zh(direction, owner, persona, task)
@@ -89,10 +103,13 @@ def opening_instructions(
 
 # ---- 中文 ----
 
-def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
+def _build_zh(
+    direction: str, owner: str, persona: str, task: str, scenario: str | None = None
+) -> str:
     common = (
         f"当前真实日期时间是 {_now_str('zh')}，这是准确信息；对方询问日期、时间、"
-        "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份。\n"
+        "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份；"
+        "不要主动报时间，只在对方明确问起日期或时间时才引用。\n"
         "语音风格：普通话，自然电话口吻，语速比正常稍慢，节奏从容，"
         "声音低沉、稳重、沉稳亲和，清晰但不要喊，不要播音腔、客服腔或机器人腔。\n"
         "像真人打电话那样：先回应对方刚说的，再往下推进；一次只说一句、简短自然、口语化，"
@@ -106,13 +123,23 @@ def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
 
     if direction == "outbound":
         topic = f"你要办的事：{task}\n" if task.strip() else _NO_TASK["zh"] + "\n"
+        scenario_value = (scenario or "").strip()
+        has_scenario = bool(scenario_value)
+        scenario_text = f"本通场景与开场策略：{scenario_value}\n" if has_scenario else ""
+        opening_strategy = (
+            "开场完全按上面的《本通场景与开场策略》来决定要不要自我介绍、"
+            "第一句说什么，不要默认先自报身份"
+            if has_scenario
+            else "开头简单说一次你是谁、要办什么"
+        )
         return (
             f"你是{owner}的{persona}，正在替{owner}给对方打这通电话。\n"
             + topic
+            + scenario_text
             + f"这件事是{owner}的（围绕{owner}名下的账户/情况）：你是主叫，对方是帮你办事"
             f"的人——可能是人工客服，也可能是自动语音菜单。所以说的是“帮{owner}查/办"
             f"{owner}这边的X”，不是“查您的X”，别把对方当成被服务的人。\n"
-            f"像真人打电话那样自然处理：开头简单说一次你是谁、要办什么，然后自己把事办成"
+            f"像真人打电话那样自然处理：{opening_strategy}，然后自己把事办成"
             f"（要查就查、要办就办，别只顾着说要转告{owner}）；只有确实得{owner}本人拿主意"
             f"的才回头转告。本通要的是实质结果；结果没真正到手前，就算对方自然收束话题，"
             f"也要礼貌把话题拉回要办的事，继续推进到有结果。对方若是语音菜单，就顺着它走——"
@@ -179,11 +206,14 @@ def _opening_zh(direction: str, owner: str, persona: str, task: str) -> str:
 
 # ---- English ----
 
-def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
+def _build_en(
+    direction: str, owner: str, persona: str, task: str, scenario: str | None = None
+) -> str:
     common = (
         f"The current real date and time is {_now_str('en')}; this is accurate. "
         "When asked about the date, time, or day of week, answer from this, do not "
-        "guess the year from memory.\n"
+        "guess the year from memory; do not proactively state the time, and only "
+        "refer to it when the other party explicitly asks about the date or time.\n"
         "Voice style: natural phone tone, a little slower than usual, unhurried, "
         "low and steady, warm and composed, clear but not shouting; no broadcaster, "
         "call-center, or robotic tone.\n"
@@ -202,16 +232,31 @@ def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
 
     if direction == "outbound":
         topic = f"What you need to get done: {task}\n" if task.strip() else _NO_TASK["en"] + "\n"
+        scenario_value = (scenario or "").strip()
+        has_scenario = bool(scenario_value)
+        scenario_text = (
+            f"Scenario and opening strategy for this call: {scenario_value}\n"
+            if has_scenario
+            else ""
+        )
+        opening_strategy = (
+            "defer the opening entirely to the scenario strategy above, including "
+            "whether to introduce yourself and what first sentence to say; do not "
+            "self-introduce by default"
+            if has_scenario
+            else "at the start say once who you are and what you need"
+        )
         return (
             f"You are {owner}'s {persona}, making this call on {owner}'s behalf.\n"
             + topic
+            + scenario_text
             + f"This is {owner}'s business (about {owner}'s own account/situation): YOU "
             f"are the caller, and the other party is whoever helps you get it done — "
             f"maybe a human agent, maybe an automated voice menu. So you say \"please "
             f"look up/handle X on {owner}'s account\", not \"your X\"; don't treat the "
             "other party as the one being served.\n"
-            f"Handle the call naturally, like a real person: at the start say once who "
-            f"you are and what you need, then get it done yourself (look it up / handle "
+            f"Handle the call naturally, like a real person: {opening_strategy}, "
+            f"then get it done yourself (look it up / handle "
             f"it — don't just keep saying you'll relay to {owner}); only defer to "
             f"{owner} for things that truly need {owner}'s own decision. This call needs "
             "a substantive result; before wrapping up, if the result is not actually in "

@@ -169,6 +169,12 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 默认留空 = 无预设事项（提示词走「无预设」优雅分支，不会硬塞元指令当主题）；
     # 外呼时通常在页面临时填具体主题。
     ConfigSpec("AGENT_OUTBOUND_TASK", "外呼任务指令", "str", ""),
+    ConfigSpec("PROMPT_GEN_ENABLED", "动态场景提示词", "bool", "true"),
+    ConfigSpec("PROMPT_GEN_MODEL", "动态场景提示词模型", "str", ""),
+    ConfigSpec("PROMPT_GEN_TIMEOUT", "动态场景提示词超时（秒）", "float", "5.0",
+               editable=False, hidden=True),
+    ConfigSpec("PROMPT_GEN_WAIT_SECONDS", "动态场景提示词等待（秒）", "float", "3.0",
+               editable=False, hidden=True),
     # ---- 模组 ----
     # 默认值按当前平台在模块加载时定死（Windows 为 auto 哨兵，连接时扫描）。
     ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", platforms.default_modem_port(),
