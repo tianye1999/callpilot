@@ -27,9 +27,10 @@ from .events import EventHub
 from .modem import Eg25Modem
 from .monitor_playback import MonitorPlayback
 from .prompts import (
-    DEFAULT_OUTBOUND_TASK,
+    agent_language,
     agent_persona,
     build_instructions,
+    default_outbound_task,
     opening_instructions,
     owner_name,
 )
@@ -414,20 +415,22 @@ class CallSession:
 
     def _build_agent_instructions(self, direction: str) -> str:
         """会话系统提示词：文本构造在 prompts 模块（纯函数，可独测）。"""
+        lang = agent_language()
         return build_instructions(
-            direction, owner_name(), agent_persona(), self._outbound_task()
+            direction, owner_name(lang), agent_persona(lang), self._outbound_task(lang), lang
         )
 
     def _opening_instructions(self, direction: str) -> str:
         """开场白指令：文本构造在 prompts 模块（纯函数，可独测）。"""
+        lang = agent_language()
         return opening_instructions(
-            direction, owner_name(), agent_persona(), self._outbound_task()
+            direction, owner_name(lang), agent_persona(lang), self._outbound_task(lang), lang
         )
 
-    def _outbound_task(self) -> str:
+    def _outbound_task(self, lang: str = "zh") -> str:
         """本通外呼主题：start() 显式传入优先，否则回退 AGENT_OUTBOUND_TASK 配置。"""
         task = self._outbound_task_value or config.get_str("AGENT_OUTBOUND_TASK")
-        return (task or DEFAULT_OUTBOUND_TASK).strip()
+        return (task or default_outbound_task(lang)).strip()
 
     def _schedule_deferred_hangup(self) -> None:
         """排定延迟挂断（hangup 工具触发，HANGUP_TOOL_DELAY_SECONDS 后生效），

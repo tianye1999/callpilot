@@ -114,6 +114,7 @@ MODEM_PORT=/tmp/ec20-at
 MODEM_AUDIO_MODE=uac_ffmpeg
 MODEM_AUDIO_KEYWORD=Interface
 OWNER_NAME=Your Name        # shown to callers; blank = neutral "the owner"
+AGENT_LANGUAGE=en           # language the AI speaks on calls & summaries (zh|en); default zh
 ```
 
 Then call the modem's SIM number — the AI should auto-answer. All settings are

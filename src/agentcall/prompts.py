@@ -2,6 +2,10 @@
 
 从 call_agent.CallSession 拆出（code-review 2026-07 P1 #6）：
 提示词文本改动不再牵动会话线程/循环逻辑。
+
+多语言（2026-07）：AI 通话语言由 config ``AGENT_LANGUAGE`` 决定（zh/en，默认 zh），
+所有面向对方/开场白/系统提示均按该语言生成，面向国际用户。UI 语言（前端 localStorage）
+与之独立——一个决定 AI 说什么语言，一个决定界面显示什么语言。
 """
 
 from __future__ import annotations
@@ -10,28 +14,81 @@ from datetime import datetime
 
 from . import config
 
-DEFAULT_OUTBOUND_TASK = (
-    "代表机主主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。"
-)
+_OWNER_FALLBACK = {"zh": "机主", "en": "the owner"}
+_PERSONA_FALLBACK = {"zh": "AI 助理", "en": "AI assistant"}
 
-_WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+_DEFAULT_OUTBOUND_TASK = {
+    "zh": "代表机主主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。",
+    "en": (
+        "Make an outbound call on the owner's behalf; once the other party picks "
+        "up, naturally explain why you're calling and keep the conversation brief "
+        "and on-topic."
+    ),
+}
+
+_WEEKDAYS_ZH = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+
+# 向后兼容：旧代码 `from .prompts import DEFAULT_OUTBOUND_TASK` 仍可用（中文默认）。
+DEFAULT_OUTBOUND_TASK = _DEFAULT_OUTBOUND_TASK["zh"]
 
 
-# 机主与人设：从 config 读（OWNER_NAME 未设置时用中性称谓，公开产品去个人化）。
-def owner_name() -> str:
-    return config.get_str("OWNER_NAME").strip() or "机主"
+def normalize_lang(lang: str | None) -> str:
+    """把任意输入规整为受支持的语言码；非 en 一律回退 zh。"""
+    return "en" if (lang or "").strip().lower() == "en" else "zh"
 
 
-def agent_persona() -> str:
-    return config.get_str("AGENT_PERSONA").strip() or "AI 助理"
+def agent_language() -> str:
+    """AI 通话语言：config ``AGENT_LANGUAGE``，默认 zh。"""
+    return normalize_lang(config.get_str("AGENT_LANGUAGE"))
 
 
-def build_instructions(direction: str, owner: str, persona: str, task: str) -> str:
-    """构造会话系统提示词；``task`` 仅在外呼（direction="outbound"）时使用。"""
+def owner_name(lang: str = "zh") -> str:
+    """机主称谓；OWNER_NAME 未设置时用当前语言的中性称谓。"""
+    return config.get_str("OWNER_NAME").strip() or _OWNER_FALLBACK[normalize_lang(lang)]
+
+
+def agent_persona(lang: str = "zh") -> str:
+    """AI 人设称谓；AGENT_PERSONA 未设置时用当前语言的中性称谓。"""
+    return config.get_str("AGENT_PERSONA").strip() or _PERSONA_FALLBACK[normalize_lang(lang)]
+
+
+def default_outbound_task(lang: str = "zh") -> str:
+    """外呼默认主题（用户未指定时的兜底），按语言。"""
+    return _DEFAULT_OUTBOUND_TASK[normalize_lang(lang)]
+
+
+def _now_str(lang: str) -> str:
     now = datetime.now()
-    now_str = f"{now:%Y年%m月%d日 %H:%M}（{_WEEKDAYS[now.weekday()]}）"
+    if lang == "en":
+        return f"{now:%A, %B %d %Y, %H:%M}"
+    return f"{now:%Y年%m月%d日 %H:%M}（{_WEEKDAYS_ZH[now.weekday()]}）"
+
+
+def build_instructions(
+    direction: str, owner: str, persona: str, task: str, lang: str = "zh"
+) -> str:
+    """构造会话系统提示词；``task`` 仅在外呼（direction="outbound"）时使用。"""
+    lang = normalize_lang(lang)
+    if lang == "en":
+        return _build_en(direction, owner, persona, task)
+    return _build_zh(direction, owner, persona, task)
+
+
+def opening_instructions(
+    direction: str, owner: str, persona: str, task: str, lang: str = "zh"
+) -> str:
+    """构造开场白指令；``task`` 仅在外呼时使用。"""
+    lang = normalize_lang(lang)
+    if lang == "en":
+        return _opening_en(direction, owner, persona, task)
+    return _opening_zh(direction, owner, persona, task)
+
+
+# ---- 中文 ----
+
+def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
     common = (
-        f"当前真实日期时间是 {now_str}，这是准确信息；对方询问日期、时间、"
+        f"当前真实日期时间是 {_now_str('zh')}，这是准确信息；对方询问日期、时间、"
         "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份。\n"
         "语音风格：普通话，自然电话口吻，语速比正常稍慢，节奏从容，"
         "声音低沉、稳重、沉稳亲和，清晰但不要喊，不要播音腔、客服腔或机器人腔。\n"
@@ -77,8 +134,7 @@ def build_instructions(direction: str, owner: str, persona: str, task: str) -> s
     )
 
 
-def opening_instructions(direction: str, owner: str, persona: str, task: str) -> str:
-    """构造开场白指令；``task`` 仅在外呼时使用。"""
+def _opening_zh(direction: str, owner: str, persona: str, task: str) -> str:
     if direction == "outbound":
         return (
             "请直接用中文说一句自然电话开场白，不要解释："
@@ -89,4 +145,85 @@ def opening_instructions(direction: str, owner: str, persona: str, task: str) ->
         "请直接用中文说一句自然电话开场白，不要解释："
         f"喂，你好，我是{owner}的{persona}，"
         f"{owner}现在不方便接，你说。"
+    )
+
+
+# ---- English ----
+
+def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
+    common = (
+        f"The current real date and time is {_now_str('en')}; this is accurate. "
+        "When asked about the date, time, or day of week, answer from this, do not "
+        "guess the year from memory.\n"
+        "Voice style: natural phone tone, a little slower than usual, unhurried, "
+        "low and steady, warm and composed, clear but not shouting; no broadcaster, "
+        "call-center, or robotic tone.\n"
+        "Keep replies suitable for a phone call: first acknowledge what the other "
+        "party just said, then move the task forward; usually one sentence, at most "
+        "two; no long speeches, no quotation marks, no paragraphs, no explaining "
+        "your reasoning.\n"
+        "Safety boundaries: never ask for verification codes, passwords, bank cards, "
+        "transfers, full ID numbers, or other sensitive information; do not make up "
+        f"anything you don't know or can't verify — naturally say you're not sure and "
+        f"will pass it on to {owner}.\n"
+        "Available tools: send an SMS (send_sms; leave the number empty to text the "
+        "owner), hang up (hangup_call; say a goodbye line before hanging up), look up "
+        "the latest SMS verification code (query_verification_code). Call the right "
+        "tool when needed, and confirm the result in one spoken sentence afterward."
+    )
+
+    if direction == "outbound":
+        return (
+            f"You are {owner}'s {persona}, making an outbound call on {owner}'s behalf.\n"
+            f"Topic of this call: {task}\n"
+            "Outbound rules:\n"
+            f"1. Once they pick up, naturally explain: you are {owner}'s {persona}, "
+            f"{owner} asked you to call, and state your purpose.\n"
+            f"2. You are not a call-center agent — don't ask \"how can I help you\"; "
+            f"never impersonate {owner} in person.\n"
+            "3. Talk like a real person on the phone, moving the topic forward; if "
+            "it's not a good time, wrap up politely.\n"
+            f"4. For anything needing {owner}'s own confirmation or beyond what you "
+            f"can handle, say you'll pass it on to {owner}.\n"
+            "5. [IVR handling] If the other end is an automated menu (\"press 1 for "
+            "balance\", \"press 0 for an agent\", etc.), it is not a person: don't "
+            "introduce yourself or talk repeatedly, listen quietly to the menu, then "
+            "call the send_dtmf tool to press the right digits; if unclear, wait for "
+            "it to repeat. Once the goal is met (e.g. you hear the balance), call the "
+            "hangup tool to end.\n"
+            "6. [Wrap-up] When the goal is met, the other party clearly signals the "
+            "end, or the conversation passes ~10 turns with no progress, say a "
+            "goodbye line and call hangup_call — do not continue indefinitely.\n"
+            + common
+        )
+
+    return (
+        f"You are {owner}'s {persona}, answering an incoming call for {owner}, "
+        f"who can't take it right now.\n"
+        f"Task for this call: greet naturally, find out who's calling, what they "
+        f"need {owner} for, how urgent it is, and whether {owner} should call back; "
+        f"note the key points to pass on to {owner}.\n"
+        "Incoming-call rules:\n"
+        f"1. Never impersonate {owner} in person; when asked, say you are {owner}'s "
+        f"{persona}.\n"
+        f"2. Don't imply that {owner} initiated contact.\n"
+        f"3. Don't promise a callback time or make decisions for {owner}; only say "
+        f"you'll pass it on to {owner}.\n"
+        "4. If the caller is clearly an ad, spam, scam, or robocall script, confirm "
+        "with a question or two, then wrap up politely and note it.\n"
+        + common
+    )
+
+
+def _opening_en(direction: str, owner: str, persona: str, task: str) -> str:
+    if direction == "outbound":
+        return (
+            "Say one natural phone opening line directly in English, no explanation: "
+            f"Hi, this is {owner}'s {persona}, {owner} asked me to make this call. "
+            f"It's mainly about {task} Is now a good time to talk?"
+        )
+    return (
+        "Say one natural phone opening line directly in English, no explanation: "
+        f"Hello, this is {owner}'s {persona}; {owner} can't take the call right now, "
+        "how can I help?"
     )

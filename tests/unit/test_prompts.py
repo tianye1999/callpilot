@@ -76,3 +76,54 @@ def test_inbound_opening_injects_owner():
     assert "李明现在不方便接" in text
     # 来电开场白不应带外呼主题
     assert DEFAULT_OUTBOUND_TASK not in text
+
+
+# ---- 多语言（AGENT_LANGUAGE=en）----
+
+def test_normalize_lang_falls_back_to_zh():
+    from agentcall.prompts import normalize_lang
+    assert normalize_lang("en") == "en"
+    assert normalize_lang("EN") == "en"
+    assert normalize_lang("zh") == "zh"
+    assert normalize_lang("fr") == "zh"   # 未支持语言回退
+    assert normalize_lang(None) == "zh"
+    assert normalize_lang("") == "zh"
+
+
+def test_english_build_instructions_are_english():
+    from agentcall.prompts import build_instructions
+    out = build_instructions("outbound", "Alex", "AI assistant", "confirm a time", "en")
+    assert "You are Alex's AI assistant" in out
+    assert "confirm a time" in out
+    assert "send_dtmf" in out          # IVR 指引仍在
+    assert "hangup_call" in out
+    assert "机主" not in out and "你是" not in out   # 无中文残留
+    inb = build_instructions("inbound", "Alex", "AI assistant", "", "en")
+    assert "answering an incoming call for Alex" in inb
+    assert "机主" not in inb
+
+
+def test_english_opening_instructions_are_english():
+    from agentcall.prompts import opening_instructions
+    out = opening_instructions("outbound", "Alex", "AI assistant", "a delivery", "en")
+    assert "this is Alex's AI assistant" in out
+    assert "开场白" not in out
+
+
+def test_owner_persona_fallback_per_language(monkeypatch):
+    from agentcall import prompts
+    monkeypatch.delenv("OWNER_NAME", raising=False)
+    monkeypatch.delenv("AGENT_PERSONA", raising=False)
+    monkeypatch.setattr(prompts.config, "get_str", lambda k, *a, **kw: "")
+    assert prompts.owner_name("en") == "the owner"
+    assert prompts.owner_name("zh") == "机主"
+    assert prompts.agent_persona("en") == "AI assistant"
+    assert prompts.agent_persona("zh") == "AI 助理"
+
+
+def test_agent_language_reads_config(monkeypatch):
+    from agentcall import prompts, config
+    monkeypatch.setenv("AGENT_LANGUAGE", "en")
+    assert prompts.agent_language() == "en"
+    monkeypatch.setenv("AGENT_LANGUAGE", "zh")
+    assert prompts.agent_language() == "zh"

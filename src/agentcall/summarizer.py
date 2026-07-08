@@ -17,69 +17,104 @@ from typing import Any
 import dashscope
 
 from . import config
+from .prompts import agent_language, owner_name
 
 logger = logging.getLogger(__name__)
 
-# urgency 合法取值；模型输出不在此集合内时回落到默认值。
-_VALID_URGENCY = ("高", "中", "低")
-_DEFAULT_URGENCY = "中"
+# urgency 合法取值（按语言）；模型输出不在集合内时回落到默认值。
+_VALID_URGENCY = {"zh": ("高", "中", "低"), "en": ("high", "medium", "low")}
+_DEFAULT_URGENCY = {"zh": "中", "en": "medium"}
+_UNKNOWN = {"zh": "未知", "en": "unknown"}
 
-_ROLE_LABELS = {"user": "对方", "agent": "分身"}
+_ROLE_LABELS = {
+    "zh": {"user": "对方", "agent": "分身"},
+    "en": {"user": "Caller", "agent": "AI"},
+}
 _DIRECTION_LABELS = {
-    "inbound": "来电（对方打给机主）",
-    "outbound": "去电（机主的分身打给对方）",
+    "zh": {
+        "inbound": "来电（对方打给机主）",
+        "outbound": "去电（机主的分身打给对方）",
+    },
+    "en": {
+        "inbound": "inbound (the other party called the owner)",
+        "outbound": "outbound (the owner's AI called the other party)",
+    },
+}
+_META_LABELS = {
+    "zh": {"direction": "通话方向", "number": "对方号码", "transcript": "通话转写"},
+    "en": {"direction": "Call direction", "number": "Other party's number",
+           "transcript": "Transcript"},
 }
 
-_SYSTEM_PROMPT = (
-    "你是通话记录分析助手。通话中的 AI 是机主{owner}的电话助理，"
-    "代替{owner}接打电话。下面给你一通电话的完整转写，请从{owner}的视角分析并总结。\n"
-    "必须只输出一个严格合法的 JSON 对象（不要输出任何解释、markdown 围栏或多余文字），"
-    "字段如下：\n"
-    '- "caller_identity": 字符串，对方是谁（如"快递员""银行客服""朋友张三"），'
-    '判断不出写"未知"\n'
-    '- "intent": 字符串，对方来意/通话目的，一句话\n'
-    '- "urgency": 字符串，紧急程度，只能是"高"、"中"、"低"之一\n'
-    '- "callback_needed": 布尔值，机主本人是否需要回电或跟进\n'
-    '- "summary": 字符串，2~3 句话的通话摘要，写清结论和待办\n'
-)
+_SYSTEM_PROMPT = {
+    "zh": (
+        "你是通话记录分析助手。通话中的 AI 是机主{owner}的电话助理，"
+        "代替{owner}接打电话。下面给你一通电话的完整转写，请从{owner}的视角分析并总结。\n"
+        "必须只输出一个严格合法的 JSON 对象（不要输出任何解释、markdown 围栏或多余文字），"
+        "字段如下：\n"
+        '- "caller_identity": 字符串，对方是谁（如"快递员""银行客服""朋友张三"），'
+        '判断不出写"未知"\n'
+        '- "intent": 字符串，对方来意/通话目的，一句话\n'
+        '- "urgency": 字符串，紧急程度，只能是"高"、"中"、"低"之一\n'
+        '- "callback_needed": 布尔值，机主本人是否需要回电或跟进\n'
+        '- "summary": 字符串，2~3 句话的通话摘要，写清结论和待办\n'
+    ),
+    "en": (
+        "You are a call-log analysis assistant. The AI on the call is {owner}'s "
+        "phone assistant, taking and making calls on {owner}'s behalf. Below is the "
+        "full transcript of one call; analyze and summarize it from {owner}'s "
+        "perspective.\n"
+        "Output ONLY a single strictly-valid JSON object (no explanation, no "
+        "markdown fences, no extra text), with these fields:\n"
+        '- "caller_identity": string, who the other party is (e.g. "courier", '
+        '"bank agent", "friend Alex"); write "unknown" if unclear\n'
+        '- "intent": string, the other party\'s purpose, one sentence\n'
+        '- "urgency": string, one of "high", "medium", "low"\n'
+        '- "callback_needed": boolean, whether the owner personally needs to call '
+        "back or follow up\n"
+        '- "summary": string, a 2-3 sentence summary with the conclusion and any '
+        "to-dos\n"
+    ),
+}
 
 
-def _default_result() -> dict[str, Any]:
+def _default_result(lang: str = "zh") -> dict[str, Any]:
     """返回一份全默认字段的结果骨架。"""
     return {
         "ok": False,
-        "caller_identity": "未知",
-        "intent": "未知",
-        "urgency": _DEFAULT_URGENCY,
+        "caller_identity": _UNKNOWN[lang],
+        "intent": _UNKNOWN[lang],
+        "urgency": _DEFAULT_URGENCY[lang],
         "callback_needed": False,
         "summary": "",
         "error": None,
     }
 
 
-def _fail(error: str) -> dict[str, Any]:
-    result = _default_result()
+def _fail(error: str, lang: str = "zh") -> dict[str, Any]:
+    result = _default_result(lang)
     result["error"] = error
     return result
 
 
 def _build_messages(
-    transcripts: list[tuple[str, str]], direction: str, number: str | None
+    transcripts: list[tuple[str, str]], direction: str, number: str | None, lang: str = "zh"
 ) -> list[dict[str, str]]:
+    roles = _ROLE_LABELS[lang]
+    meta = _META_LABELS[lang]
     lines = []
     for role, text in transcripts:
         text = (text or "").strip()
         if not text:
             continue
-        lines.append(f"{_ROLE_LABELS.get(role, role)}: {text}")
+        lines.append(f"{roles.get(role, role)}: {text}")
     user_content = (
-        f"通话方向：{_DIRECTION_LABELS.get(direction, direction)}\n"
-        f"对方号码：{number or '未知'}\n"
-        f"通话转写：\n" + "\n".join(lines)
+        f"{meta['direction']}：{_DIRECTION_LABELS[lang].get(direction, direction)}\n"
+        f"{meta['number']}：{number or _UNKNOWN[lang]}\n"
+        f"{meta['transcript']}：\n" + "\n".join(lines)
     )
-    owner = config.get_str("OWNER_NAME").strip() or "机主"
     return [
-        {"role": "system", "content": _SYSTEM_PROMPT.format(owner=owner)},
+        {"role": "system", "content": _SYSTEM_PROMPT[lang].format(owner=owner_name(lang))},
         {"role": "user", "content": user_content},
     ]
 
@@ -131,9 +166,9 @@ def _coerce_bool(value: Any) -> bool:
     return False
 
 
-def _normalize(data: dict[str, Any]) -> dict[str, Any]:
+def _normalize(data: dict[str, Any], lang: str = "zh") -> dict[str, Any]:
     """把模型输出的 JSON 规整为契约字段，缺省/非法值补默认。"""
-    result = _default_result()
+    result = _default_result(lang)
     result["ok"] = True
 
     identity = data.get("caller_identity")
@@ -145,8 +180,8 @@ def _normalize(data: dict[str, Any]) -> dict[str, Any]:
         result["intent"] = intent.strip()
 
     urgency = data.get("urgency")
-    if isinstance(urgency, str) and urgency.strip() in _VALID_URGENCY:
-        result["urgency"] = urgency.strip()
+    if isinstance(urgency, str) and urgency.strip().lower() in _VALID_URGENCY[lang]:
+        result["urgency"] = urgency.strip().lower() if lang == "en" else urgency.strip()
 
     result["callback_needed"] = _coerce_bool(data.get("callback_needed"))
 
@@ -205,23 +240,24 @@ def summarize_call(
         "callback_needed", "summary", "error"}``；失败时 ``ok=False`` 且
         ``error`` 描述原因。本函数保证不抛出异常。
     """
+    lang = agent_language()
     try:
         has_user_speech = any(
             role == "user" and (text or "").strip() for role, text in transcripts or []
         )
         if not has_user_speech:
-            return _fail("转写为空或无用户发言，跳过总结")
+            return _fail("转写为空或无用户发言，跳过总结", lang)
 
         if timeout is None:
             timeout = config.get_float("SUMMARY_TIMEOUT")
 
         model = config.get_str("SUMMARY_MODEL")
-        messages = _build_messages(transcripts, direction, number)
+        messages = _build_messages(transcripts, direction, number, lang)
 
         response, error = _call_with_timeout(messages, model, timeout)
         if error is not None:
             logger.warning("通话总结失败: %s", error)
-            return _fail(error)
+            return _fail(error, lang)
 
         status = getattr(response, "status_code", None)
         if status is not None and status != 200:
@@ -230,18 +266,18 @@ def summarize_call(
                 f"{getattr(response, 'message', '') or getattr(response, 'code', '')}"
             )
             logger.warning("通话总结失败: %s", error)
-            return _fail(error)
+            return _fail(error, lang)
 
         text = _extract_text(response)
         if not text:
-            return _fail("dashscope 响应中没有文本内容")
+            return _fail("dashscope 响应中没有文本内容", lang)
 
         data = _parse_json_payload(text)
         if data is None:
             logger.warning("通话总结 JSON 解析失败，原文: %.200s", text)
-            return _fail("模型输出不是合法 JSON")
+            return _fail("模型输出不是合法 JSON", lang)
 
-        return _normalize(data)
+        return _normalize(data, lang)
     except Exception as exc:  # noqa: BLE001 —— 契约：绝不抛出
         logger.exception("通话总结出现未预期异常")
-        return _fail(f"{type(exc).__name__}: {exc}")
+        return _fail(f"{type(exc).__name__}: {exc}", lang)

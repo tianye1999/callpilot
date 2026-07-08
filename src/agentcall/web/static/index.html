@@ -622,6 +622,7 @@ const I18N = {
       OPENAI_REALTIME_URL: "OpenAI endpoint override", OPENAI_RECONNECT_MAX: "OpenAI max reconnects",
       AGENT_OUTBOUND_TASK: "Default outbound topic",
       OWNER_NAME: "Owner name", AGENT_PERSONA: "AI persona title",
+      AGENT_LANGUAGE: "AI call language",
       MODEM_PORT: "Modem AT port", MODEM_BAUD: "Baud rate",
       MODEM_PCM_PORT: "Modem PCM port", MODEM_PCM_BAUD: "PCM baud rate",
       MODEM_AUDIO_MODE: "Audio mode", MODEM_AUDIO_KEYWORD: "UAC device keyword",
@@ -1065,7 +1066,7 @@ const CFG_SUGGEST = {
 const truthy = ["true", "1", "yes"];
 const boolChecked = (v) => truthy.includes(String(v).trim().toLowerCase());
 function cfgGroup(key) {
-  if (/^(OWNER_NAME|AGENT_PERSONA)$/.test(key)) return t("grp_identity");
+  if (/^(OWNER_NAME|AGENT_PERSONA|AGENT_LANGUAGE)$/.test(key)) return t("grp_identity");
   if (/^(AGENT_PROVIDER|QWEN_|OPENAI_|AGENT_MODEL|AGENT_OUTBOUND|DASHSCOPE)/.test(key)) return t("grp_ai");
   if (/^MODEM_/.test(key)) return t("grp_modem");
   if (/^(RECORDING_|SUMMARY_|CALL_LOG|HALF_DUPLEX|HANGUP_)/.test(key)) return t("grp_call");

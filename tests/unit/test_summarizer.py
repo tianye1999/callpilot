@@ -150,3 +150,26 @@ def test_empty_or_agent_only_short_circuits(monkeypatch, transcripts):
 
     assert result["ok"] is False
     assert result["error"] is not None
+
+
+# ---- 多语言摘要（AGENT_LANGUAGE=en）----
+
+def test_english_summary_prompt_and_normalize(monkeypatch):
+    from agentcall import summarizer
+    msgs = summarizer._build_messages(
+        [("user", "Hi, is this a good time?"), ("agent", "Yes, go ahead.")],
+        "inbound", "13800000000", "en",
+    )
+    sys_prompt = msgs[0]["content"]
+    assert "call-log analysis assistant" in sys_prompt
+    assert "通话记录" not in sys_prompt
+    assert "Call direction" in msgs[1]["content"]
+
+    # en urgency 值 high/medium/low 合法，中文「高」不合法回落 medium
+    norm = summarizer._normalize({"urgency": "high", "summary": "ok"}, "en")
+    assert norm["urgency"] == "high"
+    norm2 = summarizer._normalize({"urgency": "高", "summary": "ok"}, "en")
+    assert norm2["urgency"] == "medium"
+    # 默认结果英文
+    assert summarizer._default_result("en")["caller_identity"] == "unknown"
+    assert summarizer._default_result("zh")["caller_identity"] == "未知"

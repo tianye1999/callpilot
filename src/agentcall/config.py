@@ -90,7 +90,13 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                "OpenAI Realtime Mini", editable=False, hidden=True,
                requires_restart=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
-    ConfigSpec("AGENT_PERSONA", "AI 人设称谓", "str", "AI 助理"),
+    # 默认留空：让 prompts.agent_persona() 按 AGENT_LANGUAGE 回退到
+    # 「AI 助理」/「AI assistant」，英文模式下不会硬塞中文人设。
+    ConfigSpec("AGENT_PERSONA", "AI 人设称谓", "str", ""),
+    # AI 通话语言：决定 AI 打/接电话说什么语言、通话摘要用什么语言写；
+    # 与前端 UI 语言（localStorage）相互独立。改动需重启会话。
+    ConfigSpec("AGENT_LANGUAGE", "AI 通话语言", "select", "zh",
+               choices=("zh", "en"), requires_restart=True),
     ConfigSpec("AGENT_OUTBOUND_TASK", "外呼任务指令", "str",
                "代表机主主动外呼，对方接起后自然说明来意，并围绕本次目的简短沟通。"),
     # ---- 模组 ----
