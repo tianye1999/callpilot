@@ -24,14 +24,21 @@ from agentcall.platforms import IS_MACOS, IS_WINDOWS
 
 datas = [(str(project_root_file), ".")]
 binaries = []
-# desktop_app 运行时经 sys.path 动态加载 agentcall.platforms，显式声明保底
-hiddenimports = ["webview", "agentcall.platforms"]
+# desktop_app 运行时经 sys.path 动态加载 agentcall.platforms，显式声明保底；
+# 入口 tray_app 会惰性 import desktop_app（--window 分支开面板窗口）。
+hiddenimports = ["webview", "agentcall.platforms", "desktop_app"]
+
+# 菜单栏图标资源随包内嵌（tray_app.icon_path 经 _MEIPASS/menubar 解析）
+_menubar_dir = project_root / "packaging" / "menubar"
+if _menubar_dir.is_dir():
+    for _png in _menubar_dir.glob("*.png"):
+        datas.append((str(_png), "menubar"))
 
 # pywebview 的平台后端不同，按平台收集对应运行时
 if IS_MACOS:
-    # mac 后端 = cocoa（pyobjc 系列）
-    hiddenimports += ["webview.platforms.cocoa", "objc", "Foundation", "AppKit", "WebKit"]
-    gui_packages = ("webview", "objc", "Foundation", "AppKit", "WebKit")
+    # mac 后端 = cocoa（pyobjc 系列）+ rumps 菜单栏
+    hiddenimports += ["webview.platforms.cocoa", "objc", "Foundation", "AppKit", "WebKit", "rumps"]
+    gui_packages = ("webview", "objc", "Foundation", "AppKit", "WebKit", "rumps")
 elif IS_WINDOWS:
     # Windows 后端 = WinForms + EdgeChromium(WebView2)，经 pythonnet 的 clr 加载；
     # pythonnet/clr 的打包细节由 pyinstaller-hooks-contrib 兜底。【待硬件验证】
@@ -48,7 +55,9 @@ for package_name in gui_packages:
     hiddenimports += collect_submodules(package_name)
 
 a = Analysis(
-    [str(project_root / "desktop_app.py")],
+    # macOS 入口 = 菜单栏托盘 App（tray_app 惰性拉起 desktop_app 的面板窗口）；
+    # 其余平台仍以窗口 desktop_app 为入口（无菜单栏概念）。
+    [str(project_root / ("tray_app.py" if IS_MACOS else "desktop_app.py"))],
     pathex=[str(project_root), str(project_root / "src")],
     binaries=binaries,
     datas=datas,
@@ -85,7 +94,9 @@ if IS_MACOS:
         bundle_identifier="ai.bondings.callpilot",
         info_plist={
             "CFBundleDisplayName": "CallPilot",
-            "CFBundleShortVersionString": "0.1.0",
+            "CFBundleShortVersionString": "0.2.0",
             "NSHighResolutionCapable": True,
+            # 菜单栏 App：不在 Dock 显示图标、无主窗口（LSUIElement）
+            "LSUIElement": True,
         },
     )

@@ -160,8 +160,11 @@ bash scripts/build_app.sh          # → dist/CallPilot.app
 powershell -ExecutionPolicy Bypass -File scripts\windows\build_app.ps1   # → dist\CallPilot\CallPilot.exe
 ```
 
-The current `.app` is a **thin window over your local checkout** (it launches the
-service from this repo). A self-contained installer is v0.3 on the roadmap.
+On macOS `CallPilot.app` is a **menu-bar app**: a phone icon sits in the menu bar
+(green = service running, gray = stopped) with *Open dashboard / Restart service /
+Quit*. It's a thin control panel over your local checkout — the call-answering
+service runs in the background (launchd), so closing the dashboard window never
+drops a call. A self-contained installer is v0.3 on the roadmap.
 
 ### Verify it works, without a human on the line
 
@@ -313,14 +316,16 @@ copy .env.example .env             # 编辑 .env
 
 ```bash
 # macOS
-.venv/bin/pip install pyinstaller pywebview
+.venv/bin/pip install pyinstaller   # pywebview 已是核心依赖
 bash scripts/build_app.sh          # → dist/CallPilot.app
 # Windows
 powershell -ExecutionPolicy Bypass -File scripts\windows\build_app.ps1   # → dist\CallPilot\CallPilot.exe
 ```
 
-当前 `.app` 是**你本地代码仓库的薄壳窗口**（从本仓库拉起服务）。真正独立的安装包
-是路线图 v0.3。
+macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=服务运行中，
+灰=已停止），菜单含「打开控制台 / 重启服务 / 退出」。它只是本地代码仓库的薄壳
+控制面板——接电话的服务在后台常驻（launchd），关掉面板窗口不影响接打电话。
+真正独立的安装包是路线图 v0.3。
 
 ### 无需真人也能自测
 
