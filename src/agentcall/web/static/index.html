@@ -449,6 +449,12 @@
     box-shadow: 0 0 24px rgba(255,214,10,.18), inset 0 0 12px rgba(255,214,10,.1);
   }
   .modal-icon svg { width: 26px; height: 26px; stroke: var(--warn); }
+  .modal-icon.danger {
+    background: var(--err-dim); border-color: rgba(255,69,58,.34);
+    box-shadow: 0 0 24px rgba(255,69,58,.2), inset 0 0 12px rgba(255,69,58,.1);
+  }
+  .modal-icon.danger svg { stroke: var(--err); }
+  .modal-card.danger::before { background: linear-gradient(90deg, transparent, var(--err), transparent); }
   .modal-title { font-size: 17px; font-weight: 700; color: var(--text); letter-spacing: .01em; }
   .modal-msg {
     margin: 10px auto 22px; max-width: 300px;
@@ -621,8 +627,8 @@
   </div>
 
   <div class="modal-overlay" id="modal">
-    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-      <div class="modal-icon">
+    <div class="modal-card" id="modalCard" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-icon" id="modalIcon">
         <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/>
         </svg>
@@ -660,6 +666,13 @@ const I18N = {
     leave_title: "Unsaved changes",
     leave_msg: "You've edited settings that aren't saved yet. What would you like to do?",
     leave_save: "Save & leave", leave_discard: "Discard changes", leave_stay: "Keep editing",
+    modal_cancel: "Cancel",
+    hangup_title: "End this call?",
+    hangup_msg: "A call is in progress. Hang up now?",
+    hangup_ok: "Hang up",
+    batch_title: "Start batch calling?",
+    batch_msg: (n) => `CallPilot will place ${n} call${n > 1 ? "s" : ""}, one at a time.`,
+    batch_ok: "Start dialing",
     who_user: "Caller", who_agent: "AI Pilot",
     sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
@@ -727,6 +740,13 @@ const I18N = {
     leave_title: "有未保存的修改",
     leave_msg: "你修改了设置但还没保存，要怎么处理？",
     leave_save: "保存并离开", leave_discard: "放弃修改", leave_stay: "继续编辑",
+    modal_cancel: "取消",
+    hangup_title: "挂断这通电话？",
+    hangup_msg: "当前正在通话中，确定现在挂断吗？",
+    hangup_ok: "挂断",
+    batch_title: "开始批量外呼？",
+    batch_msg: (n) => `将逐个拨打 ${n} 个号码。`,
+    batch_ok: "开始拨打",
     who_user: "对方", who_agent: "AI 副驾",
     sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
@@ -805,7 +825,10 @@ function switchPage(name) {
 }
 /* 自定义模态确认框：返回 Promise<所选 action.key>；点遮罩/Esc 视为第一个 action */
 let _modalResolve = null;
-function showModal({ title, message, actions }) {
+function showModal({ title, message, actions, tone }) {
+  const t2 = tone || "warn";
+  $("modalIcon").className = "modal-icon" + (t2 === "danger" ? " danger" : "");
+  $("modalCard").className = "modal-card" + (t2 === "danger" ? " danger" : "");
   $("modalTitle").textContent = title;
   $("modalMsg").textContent = message;
   const box = $("modalActions");
@@ -986,6 +1009,15 @@ async function loadDefaultTask() {
 }
 
 $("hangupBtn").addEventListener("click", async () => {
+  const choice = await showModal({
+    tone: "danger",
+    title: t("hangup_title"), message: t("hangup_msg"),
+    actions: [
+      { key: "ok", label: t("hangup_ok"), kind: "danger" },
+      { key: "cancel", label: t("modal_cancel"), kind: "ghost" },
+    ],
+  });
+  if (choice !== "ok") return;
   const btn = $("hangupBtn");
   btn.disabled = true;
   try { await postJson("/api/call/hangup", {}); } catch (e) { console.warn("[hangup] 挂断请求失败", e); }
@@ -1153,6 +1185,14 @@ $("batchDialBtn").addEventListener("click", async () => {
     .split(/[\r\n,，;；]+/).map((s) => s.trim()).filter(Boolean);
   const task = $("batchTask").value.trim();
   if (!numbers.length) { setToast("batchToast", "err", t("need_number")); return; }
+  const choice = await showModal({
+    title: t("batch_title"), message: t("batch_msg")(numbers.length),
+    actions: [
+      { key: "ok", label: t("batch_ok"), kind: "primary" },
+      { key: "cancel", label: t("modal_cancel"), kind: "ghost" },
+    ],
+  });
+  if (choice !== "ok") return;
   const btn = $("batchDialBtn");
   btn.disabled = true; setToast("batchToast", "", t("enqueuing"));
   try {

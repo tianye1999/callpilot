@@ -86,7 +86,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("OPENAI_REALTIME_MODEL", "OpenAI 实时模型", "str",
                "gpt-realtime-mini", requires_restart=True),
     ConfigSpec("OPENAI_VOICE", "OpenAI 音色", "str", "alloy"),
-    # 端点覆写：中国大陆直连 api.openai.com 不通，需指向自备可达端点。
+    # 端点覆写（可选）：留空即直连 api.openai.com；仅在用反代/Azure OpenAI，
+    # 或所在网络无法直连 OpenAI 时才需要填。
     ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",
                requires_restart=True),
     ConfigSpec("AGENT_MODEL_NAME_OPENAI", "OpenAI 模型显示名", "str",
