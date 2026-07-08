@@ -51,8 +51,18 @@ _STATUS_LABELS = {
     "zh": {"online": "服务：运行中", "offline": "服务：已停止"},
 }
 _MENU_LABELS = {
-    "en": {"open": "Open dashboard", "restart": "Restart service", "quit": "Quit"},
-    "zh": {"open": "打开控制台", "restart": "重启服务", "quit": "退出"},
+    "en": {
+        "open": "Open dashboard",
+        "restart": "Restart service",
+        "uninstall": "Uninstall background services",
+        "quit": "Quit",
+    },
+    "zh": {
+        "open": "打开控制台",
+        "restart": "重启服务",
+        "uninstall": "卸载常驻",
+        "quit": "退出",
+    },
 }
 
 
@@ -103,6 +113,63 @@ def _is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False) or getattr(sys, "_MEIPASS", None))
 
 
+def _resources_dir() -> Path:
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return Path(base)
+    exe = Path(sys.executable).resolve()
+    parts = exe.parts
+    for index, part in enumerate(parts):
+        if part.endswith(".app"):
+            return Path(*parts[: index + 1]) / "Contents" / "Resources"
+    return PROJECT_ROOT
+
+
+def _prepend_runtime_paths() -> None:
+    resources = _resources_dir()
+    bin_dir = resources / "bin"
+    lib_dir = resources / "lib"
+    os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
+    os.environ.setdefault("DYLD_LIBRARY_PATH", str(lib_dir))
+
+
+def _ensure_launchd_installed():
+    if not _is_frozen() or sys.platform != "darwin":
+        from agentcall.macos_launchd import LaunchdInstallResult
+
+        return LaunchdInstallResult(changed=[], failures=[], warnings=[])
+    from agentcall import macos_launchd
+
+    layout = macos_launchd.make_layout(sys.executable, resources_dir=_resources_dir())
+    return macos_launchd.install_launch_agents(layout)
+
+
+def _uninstall_launchd() -> list[str]:
+    from agentcall import macos_launchd
+
+    layout = macos_launchd.make_layout(sys.executable, resources_dir=_resources_dir())
+    return macos_launchd.uninstall_launch_agents(layout)
+
+
+def _run_service() -> None:
+    _prepend_runtime_paths()
+    import app
+
+    app.main()
+
+
+def _run_bridge(argv: list[str]) -> int:
+    _prepend_runtime_paths()
+    from scripts import ec20_usb_pty
+
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = [original_argv[0], *argv]
+        return ec20_usb_pty.main()
+    finally:
+        sys.argv = original_argv
+
+
 def dashboard_command(python_exe: str | None = None, frozen: bool | None = None) -> list[str]:
     """构造打开面板窗口的子进程命令（pywebview 窗口，单独进程避免与 rumps
     抢占 Cocoa 主线程 runloop）。
@@ -136,6 +203,13 @@ def _import_rumps():
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    _prepend_runtime_paths()
+    if "--service" in sys.argv[1:]:
+        _run_service()
+        return
+    if "--bridge" in sys.argv[1:]:
+        args = [arg for arg in sys.argv[1:] if arg != "--bridge"]
+        raise SystemExit(_run_bridge(args))
     # 打包后「打开控制台」复用本可执行文件 + --window 分支拉起 pywebview 面板窗口
     # （避免 pywebview 与 rumps 抢占 Cocoa 主线程 runloop）。
     if "--window" in sys.argv[1:]:
@@ -144,6 +218,17 @@ def main() -> None:
         return
     rumps = _import_rumps()
     lang = "en" if os.getenv("AGENT_LANGUAGE", "zh").strip().lower() == "en" else "zh"
+    try:
+        install_result = _ensure_launchd_installed()
+        if install_result.changed:
+            logger.info("launchd agents installed/updated: %s", ", ".join(install_result.changed))
+        if install_result.failures:
+            summary = install_result.failure_summary()
+            logger.error("launchd 自装失败: %s", summary)
+            rumps.notification("CallPilot", "Background services failed", summary)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("launchd 自装失败: %s", exc)
+        rumps.notification("CallPilot", "Background services failed", str(exc))
 
     class CallPilotTray(rumps.App):
         def __init__(self) -> None:
@@ -158,6 +243,7 @@ def main() -> None:
                 None,
                 rumps.MenuItem(menu_label("open", lang), callback=self._open),
                 rumps.MenuItem(menu_label("restart", lang), callback=self._restart),
+                rumps.MenuItem(menu_label("uninstall", lang), callback=self._uninstall),
                 None,
                 rumps.MenuItem(menu_label("quit", lang), callback=self._quit),
             ]
@@ -177,6 +263,13 @@ def main() -> None:
 
         def _restart(self, _sender) -> None:
             request_restart(web_url())
+
+        def _uninstall(self, _sender) -> None:
+            try:
+                removed = _uninstall_launchd()
+                logger.info("launchd agents removed: %s", ", ".join(removed) or "none")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("卸载常驻失败: %s", exc)
 
         def _quit(self, _sender) -> None:
             rumps.quit_application()

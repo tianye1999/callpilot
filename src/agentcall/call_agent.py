@@ -52,9 +52,6 @@ HALF_DUPLEX_HANGOVER_SECONDS = 0.5
 # （仅作缺省值；每通会话开始时从 config.HANGUP_TOOL_DELAY_SECONDS 重新读取。）
 HANGUP_TOOL_DELAY_SECONDS = 4.5
 
-# 通话记录根目录（可用 CALL_LOG_DIR 环境变量覆盖）。
-DEFAULT_CALL_LOG_DIR = "data/recordings"
-
 
 class CallSession:
     def __init__(
@@ -650,7 +647,7 @@ class CallAgentService:
         self._service_running = False
         self._supervisor_thread: threading.Thread | None = None
         self.call_logger = call_logger or CallLogger(
-            base_dir=os.getenv("CALL_LOG_DIR", DEFAULT_CALL_LOG_DIR),
+            base_dir=os.getenv("CALL_LOG_DIR", str(config.call_log_dir())),
             recording_enabled=config.get_bool("RECORDING_ENABLED"),
             retention_days=config.get_int("RECORDING_RETENTION_DAYS"),
         )
@@ -720,6 +717,18 @@ class CallAgentService:
         if self.hub:
             self.hub.publish(event)
 
+    def _credential_errors(self) -> list[str]:
+        provider = self.provider or config.get_str("AGENT_PROVIDER")
+        return config.validate_provider_credentials(provider)
+
+    def _reject_if_credentials_missing(self) -> tuple[bool, str | None]:
+        errors = self._credential_errors()
+        if not errors:
+            return False, None
+        provider = self.provider or config.get_str("AGENT_PROVIDER")
+        self._publish({"type": "config_error", "provider": provider, "errors": errors})
+        return True, "；".join(errors)
+
     def _setup_callbacks(self) -> None:
         def on_ring(caller: str | None) -> None:
             # 同一通来电会被 RING 主动上报和 CLCC 轮询重复触发，需去重：
@@ -729,6 +738,18 @@ class CallAgentService:
                     logger.debug("已有通话进行中，忽略重复的 RING/CLCC: %s", caller)
                     return
                 logger.info("来电号码: %s", caller or "未知")
+                missing_credentials, message = self._reject_if_credentials_missing()
+                if missing_credentials:
+                    logger.warning("来电未接入 Agent，配置未完成: %s", message)
+                    self._publish(
+                        {
+                            "type": "call",
+                            "status": "error",
+                            "caller": caller,
+                            "error": message,
+                        }
+                    )
+                    return
                 self.session.current_caller = caller
                 self._publish({"type": "call", "status": "ringing", "caller": caller})
                 self.session.start()
@@ -758,6 +779,9 @@ class CallAgentService:
         # 乱输入，否则占用会话直到 45s 接通超时才释放。
         if not re.fullmatch(r"\+?[0-9*#]{1,32}", number):
             return False, f"号码格式不合法: {number}"
+        missing_credentials, message = self._reject_if_credentials_missing()
+        if missing_credentials:
+            return False, message
         if not self.modem_connected:
             return False, "模组未连接（检查 USB 桥与 EC20）"
         self._remember_outbound_task(task)

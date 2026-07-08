@@ -1,11 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""CallPilot 桌面壳打包配置（薄前端窗口，参考 poc packaging/agent_for_call.spec）。
-
-只打包 desktop_app.py + pywebview 运行时；服务本体仍在仓库 venv 里跑，
-项目根位置经内嵌 project_root.txt 传递（见 desktop_app._resolve_project_root）。
+"""CallPilot standalone macOS app packaging configuration.
 
 产物按构建机平台而异（PyInstaller 不做交叉编译，构建机平台 = 目标平台）：
-    macOS   → dist/CallPilot.app（scripts/build_app.sh）
+    macOS   → dist/CallPilot.app（packaging/build_installer.sh）
     Windows → dist/CallPilot/CallPilot.exe（scripts/windows/build_app.ps1，待硬件验证）
 """
 
@@ -13,26 +10,39 @@ import os
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 project_root = Path(os.environ["AGENTCALL_BUILD_ROOT"]).resolve()
-project_root_file = Path(os.environ["AGENTCALL_BUILD_ROOT_FILE"]).resolve()
 
 # 平台判断统一走 platforms 模块；agentcall 在 src/ 下，构建时不要求已 pip 安装
 sys.path.insert(0, str(project_root / "src"))
 from agentcall.platforms import IS_MACOS, IS_WINDOWS
 
-datas = [(str(project_root_file), ".")]
+datas = []
 binaries = []
-# desktop_app 运行时经 sys.path 动态加载 agentcall.platforms，显式声明保底；
-# 入口 tray_app 会惰性 import desktop_app（--window 分支开面板窗口）。
-hiddenimports = ["webview", "agentcall.platforms", "desktop_app"]
+hiddenimports = [
+    "webview",
+    "app",
+    "desktop_app",
+    "scripts.ec20_usb_pty",
+    "usb.backend.libusb1",
+]
+hiddenimports += collect_submodules("agentcall")
+datas += collect_data_files("agentcall")
 
 # 菜单栏图标资源随包内嵌（tray_app.icon_path 经 _MEIPASS/menubar 解析）
 _menubar_dir = project_root / "packaging" / "menubar"
 if _menubar_dir.is_dir():
     for _png in _menubar_dir.glob("*.png"):
         datas.append((str(_png), "menubar"))
+
+ffmpeg_path = os.environ.get("AGENTCALL_FFMPEG_PATH", "").strip()
+if ffmpeg_path:
+    datas.append((ffmpeg_path, "bin"))
+
+libusb_path = os.environ.get("AGENTCALL_LIBUSB_PATH", "").strip()
+if libusb_path:
+    datas.append((libusb_path, "lib"))
 
 # pywebview 的平台后端不同，按平台收集对应运行时
 if IS_MACOS:
@@ -62,11 +72,7 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    excludes=[
-        # 服务端依赖不进 App（App 只是窗口，服务在仓库 venv 里跑）
-        "aiohttp", "dashscope", "numpy", "serial", "sounddevice",
-        "usb", "websockets", "pytest",
-    ],
+    excludes=["pytest"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

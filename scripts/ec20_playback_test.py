@@ -51,7 +51,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="EC20 下行 PCM 播放诊断")
     parser.add_argument("--at-port", default="/tmp/ec20-at")
     parser.add_argument("--pcm-port", default="/tmp/ec20-nmea")
-    parser.add_argument("--wav", default="/Users/tianye/temp/AA/qwen_greeting_8k.wav")
+    parser.add_argument("--wav", default=str(ROOT / "data" / "voice_samples" / "Raymond_phone_8k.wav"))
     parser.add_argument("--seconds", type=float, default=12)
     parser.add_argument("--timeout", type=float, default=90)
     args = parser.parse_args()

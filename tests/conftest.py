@@ -16,3 +16,4 @@ def _isolate_side_effects(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("CALL_LOG_DIR", str(tmp_path / "recordings"))
     monkeypatch.setenv("SUMMARY_ENABLED", "false")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-dashscope-key")

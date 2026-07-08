@@ -13,12 +13,15 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import platforms
 
 logger = logging.getLogger(__name__)
+
+APP_NAME = "CallPilot"
 
 # get_bool 认定为真的取值（大小写不敏感）。
 _TRUTHY = {"true", "1", "yes"}
@@ -31,6 +34,52 @@ _ENV_LINE_RE = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)\s*=")
 
 # 值里含这些字符时写回 .env 需要加双引号。
 _NEEDS_QUOTING_RE = re.compile(r"[\s#\"']")
+
+
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False) or getattr(sys, "_MEIPASS", None))
+
+
+def app_support_dir() -> Path:
+    """Per-user writable runtime directory for the bundled app."""
+    override = os.environ.get("AGENTCALL_APP_SUPPORT_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    if _is_frozen():
+        return Path.home() / "Library" / "Application Support" / APP_NAME
+    return Path.cwd()
+
+
+def env_file_path() -> Path:
+    override = os.environ.get("AGENTCALL_ENV_FILE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return app_support_dir() / ".env"
+
+
+def data_dir() -> Path:
+    override = os.environ.get("AGENTCALL_DATA_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    if _is_frozen():
+        return app_support_dir() / "data"
+    return Path.cwd() / "data"
+
+
+def log_dir() -> Path:
+    override = os.environ.get("AGENTCALL_LOG_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    if _is_frozen():
+        return app_support_dir() / "logs"
+    return data_dir()
+
+
+def call_log_dir() -> Path:
+    override = os.environ.get("CALL_LOG_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return data_dir() / "recordings"
 
 
 @dataclass(frozen=True)
@@ -58,7 +107,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "qwen",
                choices=("qwen", "doubao", "openai"), requires_restart=True),
     ConfigSpec("DASHSCOPE_API_KEY", "DashScope API Key", "str", "",
-               editable=False, secret=True, requires_restart=True),
+               secret=True, requires_restart=True),
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
                "qwen3.5-omni-flash-realtime", requires_restart=True),
     ConfigSpec("QWEN_VOICE", "Qwen 音色", "str", "Raymond"),
@@ -76,13 +125,17 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                editable=False, hidden=True),
     ConfigSpec("DOUBAO_APP_KEY", "豆包 App Key", "str", "PlgvMymc7f3tQnJ6",
                editable=False, hidden=True),
+    ConfigSpec("DOUBAO_APP_ID", "豆包 App ID", "str", "",
+               secret=True, requires_restart=True),
+    ConfigSpec("DOUBAO_ACCESS_KEY", "豆包 Access Key", "str", "",
+               secret=True, requires_restart=True),
     # Realtime 端点覆写（调试用）；留空走 dashscope SDK 内置 wss 地址。
     ConfigSpec("DASHSCOPE_REALTIME_URL", "Qwen Realtime 端点覆写", "str", "",
                editable=False, hidden=True),
     # OpenAI Realtime。API Key 仍从环境变量读（凭证校验见 PROVIDER_REQUIRED_KEYS），
     # 此处登记只为在设置面板显示「已设置/未设置」状态（editable=False，不回传真值）。
     ConfigSpec("OPENAI_API_KEY", "OpenAI API Key", "str", "",
-               editable=False, secret=True, requires_restart=True),
+               secret=True, requires_restart=True),
     ConfigSpec("OPENAI_REALTIME_MODEL", "OpenAI 实时模型", "str",
                "gpt-realtime-mini", requires_restart=True),
     ConfigSpec("OPENAI_VOICE", "OpenAI 音色", "str", "alloy"),
@@ -234,6 +287,23 @@ def validate_provider_credentials(provider: str) -> list[str]:
     return errors
 
 
+def credential_status(provider: str | None = None) -> dict:
+    """Return current provider credential readiness for UI/API status."""
+    selected = provider or get_str("AGENT_PROVIDER")
+    errors = validate_provider_credentials(selected)
+    return {"provider": selected, "ok": not errors, "errors": errors}
+
+
+def runtime_meta(provider: str, model: str, port: str) -> dict:
+    """Build /api/meta payload with non-fatal configuration readiness."""
+    return {
+        "provider": provider,
+        "model": model,
+        "port": port,
+        "credentials": credential_status(provider),
+    }
+
+
 # ---- 面板读取 ----
 
 
@@ -302,7 +372,7 @@ def _format_assignment(key: str, value: str) -> str:
     return f'{key}="{escaped}"'
 
 
-def update_env_file(updates: dict[str, str], env_path: str | Path = ".env") -> list[str]:
+def update_env_file(updates: dict[str, str], env_path: str | Path | None = None) -> list[str]:
     """把配置写回 .env 并同步 ``os.environ``；返回实际写入的 key 列表。
 
     - 保留原文件注释、空行与行序；已有 key 原地替换（含重复行），新 key 追加尾部；
@@ -322,7 +392,8 @@ def update_env_file(updates: dict[str, str], env_path: str | Path = ".env") -> l
     if not updates:
         return []
 
-    path = Path(env_path)
+    path = Path(env_path) if env_path is not None else env_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
     replaced: set[str] = set()
@@ -346,15 +417,23 @@ def update_env_file(updates: dict[str, str], env_path: str | Path = ".env") -> l
 
 
 __all__ = [
+    "APP_NAME",
     "CONFIG_SPECS",
     "ConfigSpec",
     "PROVIDER_REQUIRED_KEYS",
+    "app_support_dir",
+    "call_log_dir",
+    "data_dir",
+    "env_file_path",
+    "credential_status",
     "get_bool",
     "get_float",
     "get_int",
     "get_spec",
     "get_str",
+    "log_dir",
     "read_panel_values",
+    "runtime_meta",
     "update_env_file",
     "validate_provider_credentials",
 ]

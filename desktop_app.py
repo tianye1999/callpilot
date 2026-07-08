@@ -59,7 +59,7 @@ PROJECT_ROOT = _resolve_project_root()
 # （spec 的 pathex 含 src），跳过插入以免误引仓库源码。
 if not getattr(sys, "_MEIPASS", None):
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
-from agentcall import platforms  # noqa: E402
+from agentcall import config, platforms  # noqa: E402
 
 WINDOW_TITLE = "CallPilot"
 ERROR_WINDOW_TITLE = "CallPilot — 服务未启动"
@@ -94,6 +94,12 @@ def _env_int(name: str, default: int) -> int:
 
 def _launch_config() -> tuple[str, str, str]:
     """返回拉起服务所需的 (python 解释器, 入口脚本, 控制台日志路径)。"""
+    if getattr(sys, "_MEIPASS", None) or getattr(sys, "frozen", False):
+        return (
+            os.getenv("AGENTCALL_PYTHON", sys.executable),
+            os.getenv("AGENTCALL_APP_SCRIPT", "--service"),
+            os.getenv("AGENTCALL_CONSOLE_LOG", str(config.log_dir() / "app_console.log")),
+        )
     python_exe = os.getenv(
         "AGENTCALL_PYTHON", str(platforms.venv_python(PROJECT_ROOT))
     )
@@ -189,7 +195,7 @@ def ensure_service_running(
         with log_file.open("ab") as out:
             proc = subprocess.Popen(
                 [str(python_exe), str(app_script)],
-                cwd=str(PROJECT_ROOT),
+                cwd=str(config.app_support_dir() if getattr(sys, "frozen", False) else PROJECT_ROOT),
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,

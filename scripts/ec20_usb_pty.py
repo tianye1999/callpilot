@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import usb.core
+import usb.backend.libusb1
 import usb.util
 
 logger = logging.getLogger("ec20_usb_pty")
@@ -31,6 +32,27 @@ VID = 0x2C7C
 PID = 0x0125
 
 LOCK_PATH = Path("/tmp/ec20-usb-pty.lock")
+
+
+def bundled_libusb_path() -> Path | None:
+    """Return bundled libusb dylib path when running from the macOS app."""
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return None
+    candidate = Path(base) / "lib" / "libusb-1.0.0.dylib"
+    return candidate if candidate.is_file() else None
+
+
+def libusb_backend():
+    """PyUSB backend, preferring the dylib bundled in CallPilot.app."""
+    bundled = bundled_libusb_path()
+    if bundled is None:
+        return None
+
+    def find_library(_name: str) -> str:
+        return str(bundled)
+
+    return usb.backend.libusb1.get_backend(find_library=find_library)
 
 
 def acquire_instance_lock() -> object:
@@ -93,7 +115,7 @@ class BridgeHandle:
 
 def find_device() -> usb.core.Device:
     try:
-        dev = usb.core.find(idVendor=VID, idProduct=PID)
+        dev = usb.core.find(idVendor=VID, idProduct=PID, backend=libusb_backend())
     except usb.core.NoBackendError:
         # pyusb 是纯 Python 包，真正的 USB 访问依赖系统 libusb；
         # 干净的 Mac 上没有它，裸 traceback 会劝退第一次跑桥的用户。

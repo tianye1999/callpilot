@@ -8,8 +8,8 @@
     <array>
       <string>/usr/bin/caffeinate</string>
       <string>-s</string>
-        <string>/Users/tianye/AgentCall/.venv/bin/python</string>
-        <string>/Users/tianye/AgentCall/scripts/ec20_usb_pty.py</string>
+        <string>/Applications/CallPilot.app/Contents/MacOS/CallPilot</string>
+        <string>--bridge</string>
         <string>--map</string>
         <string>2:/tmp/ec20-at</string>
         <string>--map</string>
@@ -17,16 +17,24 @@
         <string>--map</string>
         <string>3:/tmp/ec20-modem</string>
         <string>--log-file</string>
-        <string>/Users/tianye/AgentCall/data/ec20_usb_pty.log</string>
+        <string>~/Library/Application Support/CallPilot/logs/ec20_usb_pty.log</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-      <!-- launchd 不继承用户 shell 的 PATH；ffmpeg（Homebrew）必须可寻址 -->
+      <!-- Reference template only. The app rewrites this from its actual bundle path on first launch. -->
       <key>PATH</key>
-      <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+      <string>/Applications/CallPilot.app/Contents/Resources/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+      <key>AGENTCALL_APP_SUPPORT_DIR</key>
+      <string>~/Library/Application Support/CallPilot</string>
+      <key>AGENTCALL_ENV_FILE</key>
+      <string>~/Library/Application Support/CallPilot/.env</string>
+      <key>AGENTCALL_DATA_DIR</key>
+      <string>~/Library/Application Support/CallPilot/data</string>
+      <key>CALL_LOG_DIR</key>
+      <string>~/Library/Application Support/CallPilot/data/recordings</string>
     </dict>
     <key>WorkingDirectory</key>
-    <string>/Users/tianye/AgentCall</string>
+    <string>~/Library/Application Support/CallPilot</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -34,9 +42,9 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>
-    <string>/Users/tianye/AgentCall/data/launchd-bridge.out.log</string>
+    <string>~/Library/Application Support/CallPilot/logs/launchd-bridge.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/tianye/AgentCall/data/launchd-bridge.err.log</string>
+    <string>~/Library/Application Support/CallPilot/logs/launchd-bridge.err.log</string>
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
 </dict>

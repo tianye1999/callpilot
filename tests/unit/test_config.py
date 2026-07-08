@@ -11,6 +11,10 @@ import pytest
 from agentcall import platforms
 from agentcall.config import (
     CONFIG_SPECS,
+    app_support_dir,
+    call_log_dir,
+    data_dir,
+    env_file_path,
     get_bool,
     get_float,
     get_int,
@@ -89,6 +93,32 @@ def test_modem_defaults_follow_platforms(monkeypatch):
     assert get_str("MODEM_AUDIO_MODE") == platforms.default_audio_mode()
     # 音频模式的三个可选值不因平台默认变化而缩水
     assert get_spec("MODEM_AUDIO_MODE").choices == ("uac_ffmpeg", "uac", "nmea")
+
+
+def test_runtime_paths_default_to_project_cwd_or_env_override(tmp_path, monkeypatch):
+    _unset(
+        monkeypatch,
+        "AGENTCALL_APP_SUPPORT_DIR",
+        "AGENTCALL_ENV_FILE",
+        "AGENTCALL_DATA_DIR",
+        "AGENTCALL_LOG_DIR",
+        "CALL_LOG_DIR",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert app_support_dir() == tmp_path
+    assert env_file_path() == tmp_path / ".env"
+    assert data_dir() == tmp_path / "data"
+    assert call_log_dir() == tmp_path / "data" / "recordings"
+
+    monkeypatch.setenv("AGENTCALL_APP_SUPPORT_DIR", str(tmp_path / "Support"))
+    monkeypatch.setenv("AGENTCALL_ENV_FILE", str(tmp_path / "Support" / ".env"))
+    monkeypatch.setenv("AGENTCALL_DATA_DIR", str(tmp_path / "Support" / "Data"))
+    monkeypatch.setenv("CALL_LOG_DIR", str(tmp_path / "Support" / "Calls"))
+    assert app_support_dir() == tmp_path / "Support"
+    assert env_file_path() == tmp_path / "Support" / ".env"
+    assert data_dir() == tmp_path / "Support" / "Data"
+    assert call_log_dir() == tmp_path / "Support" / "Calls"
 
 
 def test_call_log_and_dial_queue_follow_config_semantics(tmp_path, monkeypatch):
@@ -293,12 +323,19 @@ def test_panel_masks_secret_value(monkeypatch):
     _unset(monkeypatch, "DASHSCOPE_API_KEY")
     rows = {row["key"]: row for row in read_panel_values()}
     assert rows["DASHSCOPE_API_KEY"]["value"] == "未设置"
-    assert rows["DASHSCOPE_API_KEY"]["editable"] is False
+    assert rows["DASHSCOPE_API_KEY"]["editable"] is True
 
     monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-secret")
     rows = {row["key"]: row for row in read_panel_values()}
     assert rows["DASHSCOPE_API_KEY"]["value"] == "已设置"
     assert "sk-secret" not in str(rows["DASHSCOPE_API_KEY"])
+
+
+def test_provider_keys_are_editable_so_fresh_install_can_be_configured():
+    rows = {row["key"]: row for row in read_panel_values()}
+    for key in ("DASHSCOPE_API_KEY", "DOUBAO_APP_ID", "DOUBAO_ACCESS_KEY", "OPENAI_API_KEY"):
+        assert rows[key]["editable"] is True
+        assert rows[key]["secret"] is True
 
 
 def test_panel_reflects_env_value(monkeypatch):

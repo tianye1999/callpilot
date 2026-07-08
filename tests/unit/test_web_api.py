@@ -106,6 +106,26 @@ def api(app, fn):
 # ---- /api/config ----
 
 
+def test_meta_reports_missing_credentials_without_blocking(monkeypatch):
+    monkeypatch.setenv("AGENT_PROVIDER", "qwen")
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    app = build_app(
+        hub=None,  # type: ignore[arg-type]
+        modem=None,  # type: ignore[arg-type]
+        service=FakeService(),
+        meta=config.runtime_meta(provider="qwen", model="Qwen3.5-Omni", port="/tmp/ec20-at"),
+    )
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        assert resp.status == 200
+        return await resp.json()
+
+    meta = api(app, fn)
+    assert meta["credentials"]["ok"] is False
+    assert any("DASHSCOPE_API_KEY" in err for err in meta["credentials"]["errors"])
+
+
 def test_config_get_returns_all_visible_specs():
     app = make_app(FakeService())
 

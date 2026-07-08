@@ -628,6 +628,26 @@ def test_dial_rejected_when_modem_not_connected(monkeypatch):
     assert "模组未连接" in (err or "")
 
 
+def test_dial_rejected_with_clear_error_when_provider_key_missing(monkeypatch):
+    from fakes import FakeModem
+
+    monkeypatch.setenv("AGENT_PROVIDER", "qwen")
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    hub = make_hub()
+    service = make_service(FakeModem(), hub=hub)
+
+    ok, err = service.dial("10000")
+
+    assert not ok
+    assert "DASHSCOPE_API_KEY" in (err or "")
+    events = hub.history()
+    assert any(
+        event.get("type") == "config_error"
+        and any("DASHSCOPE_API_KEY" in msg for msg in event.get("errors", []))
+        for event in events
+    )
+
+
 def test_dial_rejects_malformed_number():
     """非号码输入直接拒绝，不占用会话等 45s 超时。"""
     from fakes import FakeModem

@@ -32,6 +32,7 @@ def test_status_and_menu_labels_bilingual():
     assert tray_app.status_label(True, "en") == "Service: running"
     assert tray_app.menu_label("open", "en") == "Open dashboard"
     assert tray_app.menu_label("restart", "zh") == "重启服务"
+    assert tray_app.menu_label("uninstall", "zh") == "卸载常驻"
     assert tray_app.menu_label("quit", "en") == "Quit"
     # 未知语言回退中文
     assert tray_app.status_label(True, "fr") == "服务：运行中"
@@ -41,6 +42,14 @@ def test_dashboard_command_points_to_desktop_app():
     cmd = tray_app.dashboard_command("/fake/python")
     assert cmd[0] == "/fake/python"
     assert cmd[1].endswith("desktop_app.py")
+
+
+def test_dashboard_command_uses_frozen_executable(monkeypatch):
+    monkeypatch.setattr(tray_app.sys, "executable", "/Applications/CallPilot.app/Contents/MacOS/CallPilot")
+    assert tray_app.dashboard_command(frozen=True) == [
+        "/Applications/CallPilot.app/Contents/MacOS/CallPilot",
+        "--window",
+    ]
 
 
 def test_probe_online_true_false(monkeypatch):

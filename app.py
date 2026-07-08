@@ -36,12 +36,12 @@ def _force_utf8() -> None:
 
 
 def main() -> None:
-    load_dotenv()
+    load_dotenv(config.env_file_path())
     _force_utf8()
 
-    log_dir = os.path.join(os.path.dirname(__file__), "data")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "app.log")
+    log_dir = config.log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "app.log"
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -58,8 +58,7 @@ def main() -> None:
     credential_errors = config.validate_provider_credentials(provider)
     if credential_errors:
         for message in credential_errors:
-            print(f"错误: {message}", file=sys.stderr)
-        sys.exit(1)
+            logger.warning("配置未完成: %s", message)
 
     # 启动期 fail-fast：uac_ffmpeg 仅 macOS 可用。不在这里拦，守卫要到
     # 通话建桥时才抛，对端每通都是「接通即挂」，远比启动报错难排查。
@@ -75,7 +74,7 @@ def main() -> None:
 
     # Qwen 连接预热：提前建好 TLS 连接，降低首通接听延迟。
     # start_prewarm_keepalive 由 W2 实现，未就绪时跳过即可，不阻塞启动。
-    if provider == "qwen" and config.get_bool("QWEN_PREWARM"):
+    if provider == "qwen" and config.get_bool("QWEN_PREWARM") and not credential_errors:
         try:
             from agentcall.agents.qwen_agent import start_prewarm_keepalive
 
@@ -95,7 +94,9 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    store_path = os.path.join(os.path.dirname(__file__), "data", "messages.json")
+    data_dir = config.data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    store_path = data_dir / "messages.json"
     hub = EventHub(loop, store_path=store_path)
 
     service = CallAgentService(
@@ -116,11 +117,11 @@ def main() -> None:
         "doubao": "AGENT_MODEL_NAME_DOUBAO",
         "openai": "AGENT_MODEL_NAME_OPENAI",
     }
-    meta = {
-        "provider": provider,
-        "model": config.get_str(model_name_keys.get(provider, "AGENT_MODEL_NAME")),
-        "port": modem_port,
-    }
+    meta = config.runtime_meta(
+        provider=provider,
+        model=config.get_str(model_name_keys.get(provider, "AGENT_MODEL_NAME")),
+        port=modem_port,
+    )
 
     # 韧性启动：模组连接交给后台 supervisor 反复重试，Web 服务不因模组缺席而退出。
     service.start()
