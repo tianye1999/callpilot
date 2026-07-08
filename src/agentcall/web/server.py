@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import re
+import wave
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
 from .. import config
+from ..audio_bridge import apply_pcm_gain
 from ..events import EventHub
 from ..modem import Eg25Modem
 
@@ -91,6 +94,7 @@ def build_app(
     app.router.add_get("/api/call/queue", _queue_status)
     app.router.add_get("/api/history", _history)
     app.router.add_get("/api/history/{call_id}/events", _history_events)
+    app.router.add_get("/api/history/{call_id}/audio/{track}", _history_audio)
     app.router.add_get("/api/config", _get_config)
     app.router.add_post("/api/config", _post_config)
     app.router.add_post("/api/restart", _restart)
@@ -278,6 +282,52 @@ async def _history_events(request: web.Request) -> web.Response:
     loop = asyncio.get_running_loop()
     events = await loop.run_in_executor(None, read_events)
     return web.json_response(events)
+
+
+_AUDIO_TRACKS = {"uplink", "downlink"}
+
+
+async def _history_audio(request: web.Request) -> web.Response:
+    """播放某通录音：downlink=AI 下行，uplink=对方上行（WAV，供浏览器 <audio> 播放）。
+
+    浏览器播放走 Chrome→系统音频，绕开本机 PortAudio/ffmpeg 播放通道的已知问题，
+    是听 AI 到底说了什么最稳的途径（配合实时转写）。
+    """
+    service = require_call_logger(request)
+    call_id = request.match_info["call_id"]
+    track = request.match_info["track"]
+    if not _CALL_ID_RE.fullmatch(call_id):
+        return web.json_response({"ok": False, "error": "非法的通话 ID"}, status=400)
+    if track not in _AUDIO_TRACKS:
+        return web.json_response(
+            {"ok": False, "error": "track 只能是 downlink/uplink"}, status=400
+        )
+    wav_path = Path(service.call_logger.base_dir) / call_id / f"{track}.wav"
+    if not wav_path.is_file():
+        return web.json_response({"ok": False, "error": "录音不存在"}, status=404)
+    # 上行（对方）模组采集电平极低（原始 RMS 仅几十），回放前放大到可闻；
+    # 下行本身够响，原样发。放大量沿用监听增益 MONITOR_UPLINK_GAIN。
+    if track == "uplink":
+        gain = config.get_float("MONITOR_UPLINK_GAIN")
+        loop = asyncio.get_running_loop()
+        body = await loop.run_in_executor(None, _amplified_wav_bytes, wav_path, gain)
+        return web.Response(body=body, content_type="audio/wav")
+    return web.FileResponse(wav_path, headers={"Content-Type": "audio/wav"})
+
+
+def _amplified_wav_bytes(wav_path: Path, gain: float) -> bytes:
+    """读 WAV、对 PCM 加增益、重新封成 WAV 字节（供上行回放放大到可闻）。"""
+    with wave.open(str(wav_path), "rb") as r:
+        params = r.getparams()
+        frames = r.readframes(r.getnframes())
+    amplified = apply_pcm_gain(frames, gain)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(params.nchannels)
+        w.setsampwidth(params.sampwidth)
+        w.setframerate(params.framerate)
+        w.writeframes(amplified)
+    return buf.getvalue()
 
 
 async def _get_config(request: web.Request) -> web.Response:

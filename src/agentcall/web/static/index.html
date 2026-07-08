@@ -303,6 +303,10 @@
   /* ========= 历史面板 ========= */
   #page-history .wrap { max-width: 900px; margin: 0 auto; }
   #historyList { padding: 14px 20px; }
+  .rec-audio { margin: 4px 0 10px; }
+  .rec-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+  .rec-label { font-size: 12px; color: var(--muted); min-width: 68px; font-family: var(--mono); }
+  .rec-row audio { height: 32px; flex: 1; max-width: 320px; }
   .hist-item {
     padding: 12px 14px; border-radius: 13px; margin-bottom: 10px;
     background: var(--well); border: 1px solid var(--border); cursor: pointer;
@@ -714,6 +718,7 @@ const I18N = {
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
     need_sms: "Enter number and text", sms_in: "IN ← ", sms_out: "OUT → ",
     hist_title: "Call History", hist_sub: "Click to expand timeline", empty_history: "No call records",
+    rec_ai: "AI voice", rec_peer: "Caller",
     dir_in: "Inbound", dir_out: "Outbound",
     stc_completed: "Completed", stc_failed: "Failed", stc_not_connected: "No answer",
     unknown_number: "Unknown",
@@ -795,6 +800,7 @@ const I18N = {
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
     need_sms: "请填写号码和内容", sms_in: "收 ← ", sms_out: "发 → ",
     hist_title: "通话历史", hist_sub: "点击展开事件时间线", empty_history: "暂无通话记录",
+    rec_ai: "AI 下行", rec_peer: "对方上行",
     dir_in: "呼入", dir_out: "呼出",
     stc_completed: "已完成", stc_failed: "异常", stc_not_connected: "未接通",
     unknown_number: "未知号码",
@@ -1134,12 +1140,28 @@ function evDetail(ev) {
   if (ev.type === "dtmf") return ev.digits || "";
   return "";
 }
+function buildRecPlayers(id) {
+  // 录音播放器：走浏览器 <audio>（Chrome→系统音频），绕开本机 PortAudio/ffmpeg 播放问题。
+  const box = el("div", "rec-audio");
+  for (const [track, label] of [["downlink", t("rec_ai")], ["uplink", t("rec_peer")]]) {
+    const row = el("div", "rec-row");
+    row.appendChild(el("span", "rec-label", label));
+    const a = document.createElement("audio");
+    a.controls = true;
+    a.preload = "none";
+    a.src = `/api/history/${encodeURIComponent(id)}/audio/${track}`;
+    row.appendChild(a);
+    box.appendChild(row);
+  }
+  return box;
+}
 async function loadTimeline(tl, id) {
   try {
     const r = await fetch(`/api/history/${encodeURIComponent(id)}/events`);
     if (!r.ok) return;
     const events = await r.json();
     tl.textContent = "";
+    tl.appendChild(buildRecPlayers(id));
     for (const ev of events) {
       const row = el("div", "tl-row");
       row.appendChild(el("span", "t", ev.ts ? fmtTime(ev.ts) : ""));

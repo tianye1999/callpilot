@@ -13,7 +13,7 @@ from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from agentcall import config
 from agentcall.call_log import CallLogger
-from agentcall.web.server import _history_events, build_app
+from agentcall.web.server import _history_audio, _history_events, build_app
 
 
 class FakeService:
@@ -248,6 +248,72 @@ def test_history_events_call_id_validation(tmp_path):
 
     resp = asyncio.run(run("20260707-183000-inbound-100"))
     assert resp.status == 404
+
+
+# ---- /api/history/{id}/audio/{track}：录音回放（浏览器播放）----
+
+
+def test_history_audio_serves_recorded_wav(tmp_path):
+    call_logger = CallLogger(base_dir=tmp_path / "calls")
+    rec = call_logger.begin_call("outbound", "10086")
+    rec.write_downlink(b"\x01\x00" * 200)
+    rec.finish("completed")
+    app = make_app(FakeService(call_logger=call_logger))
+
+    async def fn(client):
+        resp = await client.get(f"/api/history/{rec.id}/audio/downlink")
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "audio/wav"
+        body = await resp.read()
+        assert body[:4] == b"RIFF"  # WAV 头
+        return body
+
+    assert len(api(app, fn)) > 44  # WAV 头 + 采样数据
+
+
+def test_history_audio_uplink_amplified(tmp_path, monkeypatch):
+    """上行回放前放大到可闻：原始极轻的样本经路由后峰值明显变大。"""
+    monkeypatch.setenv("MONITOR_UPLINK_GAIN", "10")
+    call_logger = CallLogger(base_dir=tmp_path / "calls")
+    rec = call_logger.begin_call("outbound", "10086")
+    rec.write_uplink((100).to_bytes(2, "little", signed=True) * 400)  # 很轻的上行
+    rec.finish("completed")
+    app = make_app(FakeService(call_logger=call_logger))
+
+    async def fn(client):
+        resp = await client.get(f"/api/history/{rec.id}/audio/uplink")
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "audio/wav"
+        return await resp.read()
+
+    body = api(app, fn)
+    import io as _io
+    import wave as _wave
+
+    import numpy as np
+
+    with _wave.open(_io.BytesIO(body), "rb") as w:
+        samples = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    assert int(np.abs(samples).max()) >= 900  # 原始 100 → 约 1000（放大 10x）
+
+
+def test_history_audio_validation(tmp_path):
+    """track 仅 downlink/uplink；call_id 防路径穿越；合法但不存在 404。"""
+    call_logger = CallLogger(base_dir=tmp_path / "calls")
+    app = make_app(FakeService(call_logger=call_logger))
+
+    async def run(call_id: str, track: str):
+        request = make_mocked_request(
+            "GET",
+            f"/api/history/{call_id}/audio/{track}",
+            match_info={"call_id": call_id, "track": track},
+            app=app,
+        )
+        return await _history_audio(request)
+
+    assert asyncio.run(run("../secret", "downlink")).status == 400  # 路径穿越
+    assert asyncio.run(run("20260707-183000-inbound-100", "evil")).status == 400  # 非法 track
+    assert asyncio.run(run("20260707-183000-inbound-100", "downlink")).status == 404  # 不存在
 
 
 # ---- /api/call/batch_dial 与 /api/call/queue ----
