@@ -2,7 +2,7 @@
 
 用法：
     python app.py
-浏览器会自动打开 http://127.0.0.1:8000
+浏览器会自动打开 http://127.0.0.1:47100
 """
 
 from __future__ import annotations

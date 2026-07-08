@@ -236,7 +236,7 @@ def test_main_service_already_running(monkeypatch):
     assert len(fake.windows) == 1
     win = fake.windows[0]
     assert win["title"] == "CallPilot"
-    assert win["url"] == "http://127.0.0.1:8000"
+    assert win["url"] == "http://127.0.0.1:47100"
     assert win["html"] is None
     assert win["kwargs"] == {"width": 1100, "height": 780}
     assert fake.start_count == 1
@@ -273,7 +273,7 @@ def test_main_starts_service_then_opens(monkeypatch, tmp_path):
     assert popen_calls[0][1].endswith("app.py")
     assert len(fake.windows) == 1
     win = fake.windows[0]
-    assert win["url"] == "http://127.0.0.1:8000"
+    assert win["url"] == "http://127.0.0.1:47100"
     assert win["html"] is None
     assert fake.start_count == 1
 

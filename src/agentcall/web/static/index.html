@@ -613,6 +613,7 @@
           <div id="configForm"><div class="empty" data-i18n="cfg_loading"></div></div>
           <div class="cfg-save">
             <button class="btn primary sm" id="configSave" data-i18n="cfg_save"></button>
+            <button class="btn ghost sm" id="restartBtn" data-i18n="restart_btn"></button>
             <span class="toast" id="configToast" style="margin:0"></span>
           </div>
         </section>
@@ -705,6 +706,10 @@ const I18N = {
       latency: "Latency", summary: "Summary", ended: "Wrap-up", call_finished: "Call finished",
       not_connected: "No answer", dtmf: "DTMF keys", transcript_user: "Caller said", transcript_agent: "AI said" },
     settings_title: "Settings", cfg_loading: "Loading…", cfg_save: "Save",
+    restart_btn: "Restart service",
+    restart_confirm_title: "Restart the service?",
+    restart_confirm_msg: "The service will restart to reconnect the modem and apply settings. Any call in progress will end.",
+    restart_confirm_ok: "Restart now",
     cfg_nochange: "Nothing to save", cfg_saving: "Saving…",
     cfg_saved: (n) => `Saved ${n} item(s)`, cfg_restart: (n) => `, ${n} need restart`,
     cfg_savefail: "Save failed: ", tag_restart: "restart required",
@@ -782,6 +787,10 @@ const I18N = {
       latency: "延迟打点", summary: "生成摘要", ended: "会话收尾", call_finished: "通话结束",
       not_connected: "未接通", dtmf: "发送按键", transcript_user: "对方说", transcript_agent: "分身说" },
     settings_title: "系统设置", cfg_loading: "正在加载配置…", cfg_save: "保存设置",
+    restart_btn: "重启服务",
+    restart_confirm_title: "重启服务？",
+    restart_confirm_msg: "服务将重启以重连模组并应用设置，进行中的通话会中断。",
+    restart_confirm_ok: "立即重启",
     cfg_nochange: "没有需要保存的修改", cfg_saving: "保存中…",
     cfg_saved: (n) => `已保存 ${n} 项`, cfg_restart: (n) => `，其中 ${n} 项需重启生效`,
     cfg_savefail: "保存失败：", tag_restart: "改后需重启",
@@ -1346,6 +1355,18 @@ async function loadConfig() {
     cfgDirty = false;  // 刚从服务端同步，视为无未保存修改
   } catch (e) { console.warn("[config] 加载设置面板失败", e); }
 }
+// 手动重启按钮：确认后重启服务（可从界面重连模组/恢复，无需命令行）。
+$("restartBtn").addEventListener("click", async () => {
+  const choice = await showModal({
+    title: t("restart_confirm_title"), message: t("restart_confirm_msg"),
+    actions: [
+      { key: "ok", label: t("restart_confirm_ok"), kind: "primary" },
+      { key: "cancel", label: t("modal_cancel"), kind: "ghost" },
+    ],
+  });
+  if (choice === "ok") restartService();
+});
+
 // 保存了「需重启」配置后自动重启服务：过场遮罩 + 轮询 /api/meta 复活后自动刷新。
 async function restartService() {
   $("restartTitle").textContent = t("restart_title");

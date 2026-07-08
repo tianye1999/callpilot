@@ -91,7 +91,7 @@ bash scripts/setup.sh         # one command: checks Python 3.12+/ffmpeg, creates
 # terminal 1 — USB→PTY bridge (exposes /tmp/ec20-at)
 .venv/bin/python scripts/ec20_usb_pty.py --map 2:/tmp/ec20-at
 
-# terminal 2 — the service (opens http://127.0.0.1:8000)
+# terminal 2 — the service (opens http://127.0.0.1:47100)
 .venv/bin/python app.py
 ```
 
@@ -263,7 +263,7 @@ bash scripts/setup.sh         # 一条命令：检查 Python 3.12+/ffmpeg，创�
 # 终端 1 — USB→PTY 桥
 .venv/bin/python scripts/ec20_usb_pty.py --map 2:/tmp/ec20-at
 
-# 终端 2 — 服务（打开 http://127.0.0.1:8000）
+# 终端 2 — 服务（打开 http://127.0.0.1:47100）
 .venv/bin/python app.py
 ```
 

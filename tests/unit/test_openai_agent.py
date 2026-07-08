@@ -120,21 +120,24 @@ def test_start_sends_session_update_with_expected_fields(monkeypatch):
     async def scenario():
         await agent.start(lambda pcm: None)
         try:
-            # URL 与鉴权 header（beta 兼容 header 必须在）
+            # URL 与鉴权 header（GA 形态不发 OpenAI-Beta 头）
             url, headers = calls[0]
             assert url == "wss://api.openai.com/v1/realtime?model=gpt-realtime-mini"
             assert headers["Authorization"] == "Bearer sk-test"
-            assert headers["OpenAI-Beta"] == "realtime=v1"
+            assert "OpenAI-Beta" not in headers
 
-            # 首条消息即 session.update
+            # 首条消息即 session.update（GA 嵌套 audio 结构）
             ws = instances[0]
             assert ws.sent_types()[0] == "session.update"
             session = ws.sent[0]["session"]
-            assert session["voice"] == "alloy"
-            assert session["turn_detection"] == {"type": "server_vad"}
-            assert session["input_audio_format"] == "pcm16"
-            assert session["output_audio_format"] == "pcm16"
-            assert session["input_audio_transcription"] == {
+            assert session["type"] == "realtime"
+            assert session["output_modalities"] == ["audio"]
+            audio = session["audio"]
+            assert audio["output"]["voice"] == "alloy"
+            assert audio["input"]["turn_detection"] == {"type": "server_vad"}
+            assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+            assert audio["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
+            assert audio["input"]["transcription"] == {
                 "model": openai_agent.TRANSCRIPTION_MODEL
             }
             assert session["instructions"]  # 默认系统提示词非空

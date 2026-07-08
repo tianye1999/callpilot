@@ -150,7 +150,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- Web 服务 ----
     ConfigSpec("WEB_HOST", "Web 监听地址", "str", "127.0.0.1",
                editable=False, requires_restart=True),
-    ConfigSpec("WEB_PORT", "Web 监听端口", "int", "8000",
+    # 默认用不常见的高位端口，规避 8000/8080 这类常见端口的占用冲突；
+    # 桌面 App 会自动打开该地址，CLI 用户从启动日志获取，无需记忆。
+    ConfigSpec("WEB_PORT", "Web 监听端口", "int", "47100",
                editable=False, requires_restart=True),
 )
 

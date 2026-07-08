@@ -1,11 +1,12 @@
 """OpenAI Realtime 实时语音 Agent（raw websockets，不依赖 openai SDK）。
 
-协议实现基于 OpenAI Realtime API 官方文档，兼容 beta 与 GA 两代事件命名：
-- 下行音频：``response.audio.delta``（beta）与 ``response.output_audio.delta``（GA）；
-- Agent 转写：``response.audio_transcript.done`` 与 ``response.output_audio_transcript.done``。
+采用 GA（正式版）会话结构（session.type="realtime" + 嵌套 audio.input/output），
+真机验证连通（2026-07）。事件命名同时容忍新旧两代以增强兼容：
+- 下行音频：``response.output_audio.delta``（GA）与 ``response.audio.delta``；
+- Agent 转写：``response.output_audio_transcript.done`` 与 ``response.audio_transcript.done``。
 
-中国大陆直连 api.openai.com 不通，需经 OPENAI_REALTIME_URL 指向自备的
-可达端点（反代 / Azure OpenAI 兼容端点）。
+OPENAI_REALTIME_URL 可选：留空即直连 api.openai.com；仅在用反代 / Azure OpenAI，
+或所在网络无法直连 OpenAI 时才需填。
 """
 
 from __future__ import annotations
@@ -109,24 +110,32 @@ class OpenAIVoiceAgent(VoiceAgent):
         return specs
 
     async def _connect(self) -> None:
-        """建立 websocket 连接并发送 session.update；成功后挂到 self._ws。"""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            # beta header；GA 端点会忽略未知 header，两代均兼容。
-            "OpenAI-Beta": "realtime=v1",
-        }
+        """建立 websocket 连接并发送 session.update；成功后挂到 self._ws。
+
+        采用 GA（正式版）会话结构：``session.type="realtime"`` + 嵌套的
+        ``audio.input/output``（含 pcm 采样率、server_vad、转写、音色）。
+        不发 ``OpenAI-Beta`` 头——beta 形态已在多数账号停用
+        （否则报 beta_api_shape_disabled）。
+        """
+        headers = {"Authorization": f"Bearer {self.api_key}"}
         ws = await websockets.connect(self._build_url(), additional_headers=headers)
 
         session: dict = {
+            "type": "realtime",
             "instructions": self._instructions,
-            "voice": self.voice,
-            "modalities": ["audio", "text"],
-            # 打断事件（input_audio_buffer.speech_started）本轮忽略，
-            # 半双工由 call_agent 统一管理。
-            "turn_detection": {"type": "server_vad"},
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
-            "input_audio_transcription": {"model": TRANSCRIPTION_MODEL},
+            "output_modalities": ["audio"],
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": self.input_rate},
+                    # 打断事件本轮忽略，半双工由 call_agent 统一管理。
+                    "turn_detection": {"type": "server_vad"},
+                    "transcription": {"model": TRANSCRIPTION_MODEL},
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": self.output_rate},
+                    "voice": self.voice,
+                },
+            },
         }
         tool_specs = self._tool_specs()
         if tool_specs:

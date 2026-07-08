@@ -14,7 +14,7 @@
     Windows:        .venv\\Scripts\\python desktop_app.py
 
 可配置环境变量（均有默认值）：
-    AGENTCALL_WEB_URL        服务地址，默认 http://127.0.0.1:8000
+    AGENTCALL_WEB_URL        服务地址，默认 http://127.0.0.1:47100
     AGENTCALL_PROBE_TIMEOUT  单次探测超时秒数，默认 2
     AGENTCALL_STARTUP_WAIT   拉起后等待就绪的最长秒数，默认 15
     AGENTCALL_POLL_INTERVAL  就绪轮询间隔秒数，默认 0.5
@@ -63,7 +63,7 @@ from agentcall import platforms  # noqa: E402
 
 WINDOW_TITLE = "CallPilot"
 ERROR_WINDOW_TITLE = "CallPilot — 服务未启动"
-DEFAULT_WEB_URL = "http://127.0.0.1:8000"
+DEFAULT_WEB_URL = "http://127.0.0.1:47100"
 
 ServiceStatus = Literal["already", "started", "failed"]
 
