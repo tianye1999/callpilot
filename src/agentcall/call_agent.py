@@ -210,6 +210,7 @@ class CallSession:
             agent.set_transcript_handler(
                 self._make_transcript_handler(record, transcripts)
             )
+            agent.set_repeat_stuck_handler(self._request_repeat_stuck_wrap_up)
             agent.set_tools(self._build_tools())
             if isinstance(bridge, SerialPcmAudioBridge):
                 bridge.set_ready_check(self.modem.pcm_ready)
@@ -527,6 +528,11 @@ class CallSession:
         if result.get("decision") == "wrap_up":
             self._wrap_up_requested = True
             self._wrap_up_reason = result.get("reason", "")
+
+    def _request_repeat_stuck_wrap_up(self, reason: str) -> None:
+        logger.warning("复读抑制判定会话卡死，准备收尾: %s", reason)
+        self._wrap_up_requested = True
+        self._wrap_up_reason = reason
 
     def _winddown_instructions(self) -> str:
         """收尾道别指令（硬时限或收尾裁判触发时让 AI 说一句简短告别）。"""

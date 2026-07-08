@@ -149,6 +149,20 @@ def winddown_instructions(lang: str = "zh") -> str:
     )
 
 
+def repeat_nudge_instructions(lang: str = "zh") -> str:
+    """复读抑制触发后，要求模型换说法继续推进。"""
+    if normalize_lang(lang) == "en":
+        return (
+            "Your last reply repeated something you had already said, and the other "
+            "side did not hear any new information. Say it a different way now, move "
+            "the call forward directly, and do not repeat the same sentence."
+        )
+    return (
+        "你刚才的话和之前重复了，对方没有听到新内容。请立刻换一种说法，"
+        "直接推进你要办的事，不要重复原句。"
+    )
+
+
 def _opening_zh(direction: str, owner: str, persona: str, task: str) -> str:
     if direction == "outbound":
         purpose = f"想咨询一下{task}" if task.strip() else "有件事想跟您确认"

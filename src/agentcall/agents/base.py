@@ -18,6 +18,7 @@ class VoiceAgent(ABC):
     fatal: bool = False
 
     _on_transcript: "Callable[[str, str], None] | None" = None
+    _on_repeat_stuck: "Callable[[str], None] | None" = None
     _tools: "ToolRegistry | None" = None
     _session_instructions: str | None = None
 
@@ -35,10 +36,23 @@ class VoiceAgent(ABC):
         """设置本通电话的系统提示词。"""
         self._session_instructions = instructions
 
+    def set_repeat_stuck_handler(
+        self, handler: "Callable[[str], None] | None"
+    ) -> None:
+        """注册复读抑制连续触发后的卡死回调。"""
+        self._on_repeat_stuck = handler
+
     def _emit_transcript(self, role: str, text: str) -> None:
         if self._on_transcript and text:
             try:
                 self._on_transcript(role, text)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _emit_repeat_stuck(self, reason: str) -> None:
+        if self._on_repeat_stuck:
+            try:
+                self._on_repeat_stuck(reason)
             except Exception:  # noqa: BLE001
                 pass
 

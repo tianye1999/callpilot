@@ -345,7 +345,18 @@ def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
             "response_id": "r2",
             "transcript": repeated,
         })
+        callback.on_event({
+            "type": "response.audio.delta",
+            "response_id": "r3",
+            "delta": base64.b64encode(b"repeat-again").decode("ascii"),
+        })
+        callback.on_event({
+            "type": "response.audio_transcript.done",
+            "response_id": "r3",
+            "transcript": repeated,
+        })
 
+    assert agent._audio_queue.get_nowait() == b"repeat"
     try:
         agent._audio_queue.get_nowait()
     except Empty:
@@ -353,3 +364,21 @@ def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
     else:
         raise AssertionError("复读响应音频不应进入下行队列")
     assert "抑制复读" in caplog.text
+
+
+def test_qwen_repeat_suppression_nudge_uses_say_channel():
+    fake_cls = _make_fake_conversation_cls()
+    conversation = fake_cls()
+    agent = qwen_agent.QwenVoiceAgent(
+        api_key="test-key",
+        model="qwen-omni-turbo-realtime",
+        model_display_name="千问测试",
+    )
+    agent._conversation = conversation
+
+    agent._nudge_after_repeat_suppressed("重复内容")
+
+    assert any(
+        "换一种说法" in response.get("instructions", "")
+        for response in conversation.responses
+    )

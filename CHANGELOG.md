@@ -4,6 +4,19 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.3.1] — 2026-07-09
+
+### Fixed
+
+- **Repeat suppression could silence the call** (regression in 0.3.0, caught on
+  real hardware): dropped audio wasn't communicated to the model, so when the
+  other side asked it to repeat, the repeat was dropped again — the callee
+  heard dead air until they hung up. Now the second occurrence plays (repeating
+  once when asked is legitimate), from the third on the audio is dropped *and*
+  the model is nudged to rephrase (8s cooldown); three consecutive suppressed
+  repeats mark the call as stuck and end it politely instead of leaving
+  silence.
+
 ## [0.3.0] — 2026-07-09
 
 ### Added
@@ -179,6 +192,7 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.3.1]: https://github.com/tianye1999/callpilot/releases/tag/v0.3.1
 [0.3.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.3.0
 [0.2.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.2.0
 [0.1.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.1.0

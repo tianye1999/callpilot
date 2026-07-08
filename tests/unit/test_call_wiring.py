@@ -222,6 +222,31 @@ def test_scheduled_hangup_stops_current_session(monkeypatch):
     assert wait_until(lambda: not session.is_active), "延迟挂断未停掉本通会话"
 
 
+def test_repeat_suppression_stuck_requests_winddown(monkeypatch, tmp_path):
+    """连续复读抑制判卡死后，CallSession 走既有收尾路径说告别并挂断。"""
+
+    class StuckAfterStartAgent(FakeAgent):
+        async def start(self, on_audio_out):
+            await super().start(on_audio_out)
+            self._emit_repeat_stuck("复读抑制连续触发，判定模型卡死")
+
+    monkeypatch.setenv("HANGUP_TOOL_DELAY_SECONDS", "0.05")
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = StuckAfterStartAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    service = make_service(modem, call_logger=CallLogger(tmp_path / "rec"))
+    bridge.feed_uplink(b"\x02\x00" * 160)
+    modem.trigger_ring("13800000000")
+
+    assert wait_until(lambda: any("再见" in s for s in agent.said), timeout=5), agent.said
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+    assert ("hangup", ()) in modem.calls
+
+
 # ---- P1-4 通话摘要：后台线程 + summary.json + hub 推送 ----
 
 class TalkativeCallerAgent(FakeAgent):

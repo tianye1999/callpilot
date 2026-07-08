@@ -326,13 +326,28 @@ def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
                     "response_id": "r2",
                     "transcript": repeated,
                 })
+                instances[0].feed({
+                    "type": "response.output_audio.delta",
+                    "response_id": "r3",
+                    "delta": base64.b64encode(b"repeat-again").decode("ascii"),
+                })
+                instances[0].feed({
+                    "type": "response.output_audio_transcript.done",
+                    "response_id": "r3",
+                    "transcript": repeated,
+                })
                 await _drain()
         finally:
             await agent.stop()
 
     asyncio.run(scenario())
-    assert received == [b"first"]
+    assert received == [b"first", b"repeat"]
     assert "抑制复读" in caplog.text
+    assert any(
+        msg.get("type") == "response.create"
+        and "换一种说法" in msg.get("response", {}).get("instructions", "")
+        for msg in instances[0].sent
+    )
 
 
 # ---------------------------------------------------------------------------

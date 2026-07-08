@@ -25,6 +25,7 @@ from dashscope.audio.qwen_omni import (
 )
 
 from .. import config
+from ..prompts import agent_language, repeat_nudge_instructions
 from ..repeat_suppression import ResponseAudioGate
 from .base import VoiceAgent
 from .tools import TERMINAL_TOOLS
@@ -217,6 +218,8 @@ class QwenVoiceAgent(VoiceAgent):
         self._audio_gate = ResponseAudioGate(
             "qwen",
             lambda chunk: self._audio_queue.put(chunk),
+            on_suppressed=self._nudge_after_repeat_suppressed,
+            on_stuck=self._repeat_suppression_stuck,
         )
         self._callback = _QwenCallback(self._audio_queue, agent=self)
         self._on_audio_out: Callable[[bytes], None] | None = None
@@ -410,6 +413,21 @@ class QwenVoiceAgent(VoiceAgent):
             instructions=instructions,
             output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
         )
+
+    def _nudge_after_repeat_suppressed(self, _transcript: str) -> None:
+        instructions = repeat_nudge_instructions(agent_language())
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(self.say(instructions))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("发送复读换说法提示失败: %s", exc)
+            return
+        loop.create_task(self.say(instructions))
+
+    def _repeat_suppression_stuck(self, count: int, _transcript: str) -> None:
+        self._emit_repeat_stuck(f"复读抑制连续触发 {count} 次，判定模型卡死")
 
     def _dispatch_tool_call(self, name: str, call_id: str, arguments: str) -> None:
         if call_id in self._handled_tool_calls:

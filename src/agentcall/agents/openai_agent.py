@@ -21,6 +21,7 @@ from typing import Any, Callable
 import websockets
 
 from .. import config
+from ..prompts import agent_language, repeat_nudge_instructions
 from ..repeat_suppression import ResponseAudioGate
 from .base import VoiceAgent
 from .tools import TERMINAL_TOOLS
@@ -90,7 +91,12 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._ws: Any = None
         self._recv_task: asyncio.Task | None = None
         self._on_audio_out: Callable[[bytes], None] | None = None
-        self._audio_gate = ResponseAudioGate("openai", self._emit_audio_out)
+        self._audio_gate = ResponseAudioGate(
+            "openai",
+            self._emit_audio_out,
+            on_suppressed=self._nudge_after_repeat_suppressed,
+            on_stuck=self._repeat_suppression_stuck,
+        )
         self._running = False
         self._handled_tool_calls: set[str] = set()
         self._instructions: str | None = None
@@ -234,6 +240,17 @@ class OpenAIVoiceAgent(VoiceAgent):
             # 断线窗口内 say 失败不应炸掉整通电话（开场白路径直接 await）；
             # 重连由接收循环统一负责。
             logger.warning("发送说话指令失败: %s", exc)
+
+    def _nudge_after_repeat_suppressed(self, _transcript: str) -> None:
+        try:
+            asyncio.get_running_loop().create_task(
+                self.say(repeat_nudge_instructions(agent_language()))
+            )
+        except RuntimeError:
+            logger.warning("发送复读换说法提示失败: event loop 不可用")
+
+    def _repeat_suppression_stuck(self, count: int, _transcript: str) -> None:
+        self._emit_repeat_stuck(f"复读抑制连续触发 {count} 次，判定模型卡死")
 
     async def stop(self) -> None:
         self._running = False
