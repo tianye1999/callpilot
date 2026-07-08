@@ -38,7 +38,7 @@ def test_outbound_instructions_inject_owner_persona_task():
     assert "send_dtmf" in text
     assert "hangup_call" in text
     assert "【IVR 应对】" in text
-    assert "【必须主动挂断】" in text
+    assert "【达成即礼貌收尾】" in text
     # 「立场」框定：事项围绕机主、对方是协助方（防 OpenAI 把对端当被查询对象）
     assert "【立场】" in text
     assert "帮我查/办" in text and "查您的" in text  # 明确「不要说成查您的X」

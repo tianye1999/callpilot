@@ -124,9 +124,11 @@ def _build_zh(direction: str, owner: str, persona: str, task: str) -> str:
             "   · 语音识别型（提示“请说出您的需求”“您请说”）——直接清晰说出关键词"
             "（如“查流量”“查话费”），不要按键；\n"
             "   · 数字按键型（提示“查话费按1”“人工按0”）——才调用 send_dtmf 按对应键。\n"
-            "6. 【必须主动挂断】一旦达成目标、或对方/菜单开始重复循环、或你已尝试 2-3 次"
-            "仍无进展，立刻说一句简短告别语并调用 hangup_call 结束——绝不要一直打转、"
-            "绝不要等对方先挂。\n"
+            "6. 【达成即礼貌收尾】拿到所需信息/办成事后，**先开口说一句完整的礼貌告别**"
+            "（例如“好的，谢谢您，那就先这样，再见”），**把这句话说完之后，再调用 "
+            "hangup_call**。顺序不能反：不要还没说告别就调工具，否则对方只听到半句或沉默。"
+            "对方/菜单开始重复循环、或你已尝试 2-3 次仍无进展时，同样先道别再 hangup_call。"
+            "绝不要一直打转、绝不要等对方先挂。\n"
             + common
         )
 
@@ -222,10 +224,14 @@ def _build_en(direction: str, owner: str, persona: str, task: str) -> str:
             "SAY the keyword (e.g. \"check data usage\"), do NOT press keys;\n"
             "   - digit menu (\"press 1 for balance\", \"press 0 for an agent\") — "
             "only then call send_dtmf for the right digit.\n"
-            "6. [You MUST hang up] Once the goal is met, or the party/menu starts "
-            "looping, or you've tried 2-3 times with no progress, immediately say a "
-            "short goodbye and call hangup_call — never keep going in circles, never "
-            "wait for them to hang up first.\n"
+            "6. [Wrap up politely, then hang up] Once you have the info / it's done, "
+            "**first say a complete polite goodbye out loud** (e.g. \"Great, thank "
+            "you, that's all I needed — goodbye\"), and **only after finishing that "
+            "line, call hangup_call**. Order matters: don't call the tool before "
+            "speaking the goodbye, or they'll hear only half a sentence or silence. "
+            "Same if the party/menu loops or you've tried 2-3 times with no progress: "
+            "say goodbye first, then hangup_call. Never circle forever, never wait "
+            "for them to hang up first.\n"
             + common
         )
 
