@@ -7,8 +7,8 @@ Web 接口被 CSRF 利用发信。允许的目标 = 收到过短信的号码 ∪
 数据源都取自「落盘、重启存活」的记录:
 - 收到过短信的号码:``EventHub.history()`` 里 ``type == "sms_in"`` 的 ``sender``。
   EventHub 启动时会从 ``messages.json`` 把历史短信载回 history,故跨重启存活。
-- 所有来电方:``CallLogger.list_calls()`` 里 ``direction == "inbound"`` 的 ``number``,
-  按通话目录落盘,跨重启存活。
+- 所有来电方:``CallLogger.inbound_numbers()``——扫描全部通话目录取 inbound 的
+  ``number``(不设窗口上限,避免大量外呼把老来电方挤出导致合法回复被误拒)。
 
 号码只做 strip 比对,不改写国家码——宁可漏放行(可退回不发)也不误放行。
 """
@@ -23,9 +23,6 @@ if TYPE_CHECKING:
     from .events import EventHub
 
 logger = logging.getLogger(__name__)
-
-# 查询来电历史的上限:够覆盖实际联系人,又不至于每次发信都扫太多通话目录。
-CALL_HISTORY_LIMIT = 1000
 
 
 def _norm(number: str | None) -> str:
@@ -53,14 +50,15 @@ def known_contact_numbers(
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取短信历史用于联系人判定失败: %s", exc)
 
-    list_calls: Callable[..., list] | None = getattr(call_logger, "list_calls", None)
-    if callable(list_calls):
+    inbound_numbers: Callable[[], set] | None = getattr(
+        call_logger, "inbound_numbers", None
+    )
+    if callable(inbound_numbers):
         try:
-            for entry in list_calls(limit=CALL_HISTORY_LIMIT):
-                if isinstance(entry, dict) and entry.get("direction") == "inbound":
-                    number = _norm(entry.get("number"))
-                    if number:
-                        numbers.add(number)
+            for number in inbound_numbers():
+                num = _norm(number)
+                if num:
+                    numbers.add(num)
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取来电历史用于联系人判定失败: %s", exc)
 

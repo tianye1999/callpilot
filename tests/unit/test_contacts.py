@@ -14,11 +14,13 @@ class FakeHub:
 
 
 class FakeCallLogger:
-    def __init__(self, calls: list | None = None) -> None:
-        self._calls = calls or []
+    """来电方由 inbound_numbers() 提供(direction 过滤在真实 CallLogger 里做)。"""
 
-    def list_calls(self, limit: int = 50) -> list:
-        return list(self._calls)
+    def __init__(self, inbound: list | None = None) -> None:
+        self._inbound = set(inbound or [])
+
+    def inbound_numbers(self) -> set:
+        return set(self._inbound)
 
 
 def test_known_numbers_union_of_sms_senders_and_inbound_callers():
@@ -27,17 +29,13 @@ def test_known_numbers_union_of_sms_senders_and_inbound_callers():
         {"type": "sms_out", "number": "999", "text": "x"},   # 发出的不算
         {"type": "sms_in", "sender": "", "text": "空发件方"},   # 空 sender 跳过
     ])
-    call_logger = FakeCallLogger([
-        {"direction": "inbound", "number": "10086"},
-        {"direction": "outbound", "number": "13900000000"},   # 外呼不算
-        {"direction": "inbound", "number": None},              # 空号码跳过
-    ])
+    call_logger = FakeCallLogger(["10086"])
     assert known_contact_numbers(hub, call_logger) == {"13800000000", "10086"}
 
 
 def test_allowed_for_sms_sender_and_inbound_caller_with_strip():
     hub = FakeHub([{"type": "sms_in", "sender": "13800000000", "text": "hi"}])
-    call_logger = FakeCallLogger([{"direction": "inbound", "number": "10086"}])
+    call_logger = FakeCallLogger(["10086"])
     assert is_reply_target_allowed("13800000000", hub, call_logger)
     assert is_reply_target_allowed("10086", hub, call_logger)
     assert is_reply_target_allowed("  10086  ", hub, call_logger)  # strip 后匹配
@@ -51,10 +49,10 @@ def test_rejected_for_unknown_and_empty():
     assert not is_reply_target_allowed("   ", hub, call_logger)
 
 
-def test_outbound_only_number_not_allowed():
-    """只外呼过、从未来电/来信的号码,不自动放行。"""
-    call_logger = FakeCallLogger([{"direction": "outbound", "number": "10086"}])
-    assert not is_reply_target_allowed("10086", FakeHub([]), call_logger)
+def test_number_not_in_either_source_rejected():
+    """既没发过短信、也不在来电方集合里的号码,不放行。"""
+    call_logger = FakeCallLogger(["10086"])
+    assert not is_reply_target_allowed("13900000000", FakeHub([]), call_logger)
 
 
 def test_extra_allowed_current_caller_bypasses_history():

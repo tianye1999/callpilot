@@ -282,6 +282,29 @@ class CallLogger:
             results.append(entry)
         return results
 
+    def inbound_numbers(self) -> set[str]:
+        """所有来电方号码集合（direction==inbound），供发短信目标校验用。
+
+        扫描全部通话目录(不设窗口上限、不读 summary),比 ``list_calls`` 更省;
+        只取来电——避免大量外呼把老来电方挤出窗口,导致给该号码的合法回复被误拒。
+        """
+        numbers: set[str] = set()
+        if not self.base_dir.is_dir():
+            return numbers
+        for path in self.base_dir.iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(meta, dict) or meta.get("direction") != "inbound":
+                continue
+            number = meta.get("number")
+            if isinstance(number, str) and number.strip():
+                numbers.add(number.strip())
+        return numbers
+
     def purge_expired(self) -> int:
         """删除超过保留期的通话目录，返回删除数量；retention_days<=0 不清理。"""
         if self.retention_days <= 0 or not self.base_dir.is_dir():

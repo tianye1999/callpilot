@@ -257,3 +257,18 @@ def test_log_event_concurrent_smoke(tmp_path):
     assert len(events) == threads_n * per_thread + 2
     with wave.open(str(record.path / "uplink.wav"), "rb") as wf:
         assert wf.getnframes() == threads_n * per_thread
+
+
+def test_inbound_numbers_collects_only_inbound(tmp_path):
+    """inbound_numbers 只收来电方号码:外呼不算、空号码跳过、去重。"""
+    clog = CallLogger(base_dir=tmp_path / "calls")
+    clog.begin_call("inbound", "13800000000").finish("completed")
+    clog.begin_call("inbound", "10086").finish("completed")
+    clog.begin_call("inbound", "10086").finish("failed")      # 重复来电 → 去重
+    clog.begin_call("outbound", "13900000000").finish("completed")  # 外呼不算
+    clog.begin_call("inbound", None).finish("completed")      # 空号码跳过
+    assert clog.inbound_numbers() == {"13800000000", "10086"}
+
+
+def test_inbound_numbers_empty_when_no_calls(tmp_path):
+    assert CallLogger(base_dir=tmp_path / "calls").inbound_numbers() == set()
