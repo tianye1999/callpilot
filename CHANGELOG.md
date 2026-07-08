@@ -4,6 +4,72 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.3.0] — 2026-07-09
+
+### Added
+
+- **One-click macOS installer**: `packaging/build_installer.sh` produces a
+  self-contained `CallPilot.dmg` — bundled Python runtime, ffmpeg and libusb,
+  no Python/venv/Homebrew needed. First launch installs the launchd background
+  services automatically (and re-points them if the app is moved); the tray
+  menu gains an "Uninstall background services" item. Runtime data moves to
+  `~/Library/Application Support/CallPilot/`. Unsigned for now (right-click →
+  Open on first launch); codesign/notarization hooks are in place.
+- **First-run setup wizard**: detects the modem (PyUSB/system_profiler on
+  macOS, serial VID scan elsewhere), validates your API key online
+  (distinguishes "invalid key" from "network unreachable"), sets owner name /
+  persona / language / voice, and can send a test SMS — no manual `.env`
+  editing. Missing credentials no longer crash the service: the web UI comes
+  up and guides you instead.
+- **Live listen in the browser**: hear both call directions (AI + caller) in
+  real time via WebSocket + Web Audio — works even where native audio is
+  broken. Call recordings are also playable per-call from History (caller
+  track auto-amplified).
+- **LLM wrap-up judge**: a cheap text model watches the transcript and decides
+  "keep going vs wrap up" — ends calls that are stuck in circles, keeps
+  waiting when the other side is still looking something up, and only counts
+  the goal as reached when the substantive result was actually given. Replaces
+  keyword heuristics entirely.
+- **Repeat suppression**: when an IVR broadcast forces the model to respond
+  over and over, near-identical replies are detected by text similarity and
+  dropped before they reach the line (`REPEAT_SUPPRESS_SIMILARITY`, 0 to
+  disable).
+- **Tool safety**: shared SMS rate limit across the AI tool and the web API
+  (`SMS_RATE_LIMIT_PER_HOUR`), an off switch for the OTP-reading tool
+  (`TOOL_QUERY_CODE_ENABLED`), and desensitized audit logging for every tool
+  call (message lengths, not contents; hit/miss, not the code).
+- **Clear recordings**: delete a single call or all call records from History
+  (in-progress calls are protected); SMS sending restricted to numbers you've
+  actually interacted with.
+- **Modem primitives examples**: `examples/modem/` — minimal standalone demos
+  for raw AT, device probe, dial, answer, SMS send/receive and DTMF.
+
+### Changed
+
+- **Prompts rewritten scenario-style** (describe the situation, don't
+  enumerate rules): shorter opening line, introduce yourself once, speak
+  short menu keywords to voice menus, say a complete goodbye *before* calling
+  the hang-up tool, and politely steer back to the task until the substantive
+  result is in hand.
+- Doubao provider is now labeled **experimental** in Settings and docs
+  (outbound calls may be silent).
+- Frontend hardened against XSS: no HTML-injection APIs; all user-controlled
+  content rendered via `textContent` (guarded by a static test).
+
+### Fixed
+
+- **Incoming-SMS race**: a `+CMTI` notification arriving while any AT command
+  response was being read was silently discarded; all command responses now
+  scan for URCs.
+- Installer first-run race: bootstrapping launchd agents right after removing
+  old ones could silently fail; now waits for unload and retries with backoff,
+  reporting failures via tray notification.
+
+### Engineering
+
+- `ruff` (E/F/W/I) and `mypy` gates wired into CI, warning-clean at
+  introduction; zero behavior change.
+
 ## [0.2.0] — 2026-07-08
 
 ### Added
@@ -113,5 +179,6 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.3.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.3.0
 [0.2.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.2.0
 [0.1.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.1.0
