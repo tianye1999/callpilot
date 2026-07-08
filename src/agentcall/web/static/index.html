@@ -611,7 +611,7 @@ const I18N = {
     cfg_saved: (n) => `Saved ${n} item(s)`, cfg_restart: (n) => `, ${n} need restart`,
     cfg_savefail: "Save failed: ", tag_restart: "restart required",
     secret_set: "Set", secret_unset: "Not set", modem_prefix: "Modem ",
-    grp_ai: "AI & PERSONA", grp_modem: "MODEM & AUDIO", grp_call: "CALL & RECORDS",
+    grp_identity: "IDENTITY", grp_ai: "AI MODEL", grp_modem: "MODEM & AUDIO", grp_call: "CALL & RECORDS",
     grp_monitor: "LOCAL MONITOR", grp_dial: "DIALING & SMS", grp_sys: "SYSTEM",
     cfg: {
       AGENT_PROVIDER: "Agent provider", DASHSCOPE_API_KEY: "DashScope API key",
@@ -669,7 +669,7 @@ const I18N = {
     cfg_saved: (n) => `已保存 ${n} 项`, cfg_restart: (n) => `，其中 ${n} 项需重启生效`,
     cfg_savefail: "保存失败：", tag_restart: "改后需重启",
     secret_set: "已设置", secret_unset: "未设置", modem_prefix: "模组 ",
-    grp_ai: "AI 与人设", grp_modem: "模组与音频", grp_call: "通话与记录",
+    grp_identity: "身份", grp_ai: "AI 模型", grp_modem: "模组与音频", grp_call: "通话与记录",
     grp_monitor: "本机监听", grp_dial: "外呼与短信", grp_sys: "系统",
     cfg: {},  // 中文用后端 label
   },
@@ -1053,7 +1053,8 @@ let cfgSpecs = [];
 const truthy = ["true", "1", "yes"];
 const boolChecked = (v) => truthy.includes(String(v).trim().toLowerCase());
 function cfgGroup(key) {
-  if (/^(AGENT_PROVIDER|QWEN_|AGENT_MODEL|AGENT_OUTBOUND|DASHSCOPE)/.test(key)) return t("grp_ai");
+  if (/^(OWNER_NAME|AGENT_PERSONA)$/.test(key)) return t("grp_identity");
+  if (/^(AGENT_PROVIDER|QWEN_|OPENAI_|AGENT_MODEL|AGENT_OUTBOUND|DASHSCOPE)/.test(key)) return t("grp_ai");
   if (/^MODEM_/.test(key)) return t("grp_modem");
   if (/^(RECORDING_|SUMMARY_|CALL_LOG|HALF_DUPLEX|HANGUP_)/.test(key)) return t("grp_call");
   if (/^MONITOR_/.test(key)) return t("grp_monitor");
@@ -1071,15 +1072,19 @@ async function loadConfig() {
     cfgSpecs = await r.json();
     const form = $("configForm");
     form.textContent = "";
+    // 固定分组顺序：身份（机主姓名/人设）最靠前——是最关键的个性化项，
+    // 不能像以前那样落到兜底的「系统」组、埋在 WEB_PORT 之间。
+    const order = [t("grp_identity"), t("grp_ai"), t("grp_modem"),
+                   t("grp_call"), t("grp_monitor"), t("grp_dial"), t("grp_sys")];
     const groups = new Map();
+    for (const g of order) {
+      const wrap = el("div", "cfg-group");
+      wrap.appendChild(el("div", "gname", g));
+      groups.set(g, wrap);
+      form.appendChild(wrap);
+    }
     for (const c of cfgSpecs) {
       const g = cfgGroup(c.key);
-      if (!groups.has(g)) {
-        const wrap = el("div", "cfg-group");
-        wrap.appendChild(el("div", "gname", g));
-        groups.set(g, wrap);
-        form.appendChild(wrap);
-      }
       const row = el("div", "cfg-row");
       const label = el("label", "", cfgLabel(c));
       if (c.requires_restart) label.appendChild(el("span", "tag-restart", t("tag_restart")));
@@ -1120,6 +1125,10 @@ async function loadConfig() {
         row.appendChild(ctrl);
       }
       groups.get(g).appendChild(row);
+    }
+    // 移除没有任何字段的空分组（只剩标题那一个子节点）。
+    for (const wrap of groups.values()) {
+      if (wrap.childElementCount <= 1) wrap.remove();
     }
   } catch (e) { console.warn("[config] 加载设置面板失败", e); }
 }

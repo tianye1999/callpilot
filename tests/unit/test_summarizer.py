@@ -11,9 +11,9 @@ import pytest
 from agentcall.summarizer import summarize_call
 
 TRANSCRIPTS = [
-    ("agent", "您好，我是田野的数字分身。"),
+    ("agent", "您好，我是李明的数字分身。"),
     ("user", "你好，我是顺丰快递员，有个包裹放驿站了，请让他尽快取。"),
-    ("agent", "好的，我会转告田野。"),
+    ("agent", "好的，我会转告李明。"),
 ]
 
 
@@ -34,7 +34,7 @@ GOOD_PAYLOAD = {
     "intent": "通知包裹已放驿站，提醒尽快领取",
     "urgency": "中",
     "callback_needed": False,
-    "summary": "快递员来电告知包裹已放驿站，田野需尽快去取，无需回电。",
+    "summary": "快递员来电告知包裹已放驿站，李明需尽快去取，无需回电。",
 }
 
 
@@ -136,7 +136,7 @@ def test_invalid_json_returns_error(monkeypatch):
     "transcripts",
     [
         [],
-        [("agent", "您好，我是田野的数字分身。")],
+        [("agent", "您好，我是李明的数字分身。")],
         [("agent", "您好。"), ("user", "   ")],
     ],
 )

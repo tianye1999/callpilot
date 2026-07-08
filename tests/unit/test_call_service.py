@@ -129,7 +129,7 @@ def test_service_send_dtmf_reports_modem_failure():
 # ---- 来电全链路：接听 → 开场白 → 下行音频 → 挂断收尾 ----
 
 def test_inbound_call_full_lifecycle(monkeypatch):
-    monkeypatch.setenv("OWNER_NAME", "田野")
+    monkeypatch.setenv("OWNER_NAME", "李明")
     monkeypatch.setenv("AGENT_PERSONA", "数字分身")
     modem = FakeModem()
     hub = make_hub()
@@ -152,7 +152,7 @@ def test_inbound_call_full_lifecycle(monkeypatch):
 
     assert "answer" in modem.call_names()  # ATA 接听
     assert agent.started and agent.said  # 开场白已发
-    assert "田野的数字分身" in agent._session_instructions
+    assert "李明的数字分身" in agent._session_instructions
     assert "不方便接" in agent.said[0]
     assert bridge.downlink  # 开场白 PCM 写回模组
     assert agent.stopped and bridge.stopped  # 会话收尾
@@ -165,7 +165,7 @@ def test_inbound_call_full_lifecycle(monkeypatch):
 
 
 def test_outbound_call_uses_digital_twin_prompt(monkeypatch):
-    monkeypatch.setenv("OWNER_NAME", "田野")
+    monkeypatch.setenv("OWNER_NAME", "李明")
     monkeypatch.setenv("AGENT_PERSONA", "数字分身")
     modem = FakeModem()
     bridge = FakeAudioBridge()
@@ -192,8 +192,8 @@ def test_outbound_call_uses_digital_twin_prompt(monkeypatch):
     service.session._thread.join(timeout=5)
 
     assert ("dial", ("10000",)) in modem.calls
-    assert "田野的数字分身" in agent._session_instructions
+    assert "李明的数字分身" in agent._session_instructions
     assert "查询本机套餐和剩余流量" in agent._session_instructions
     assert "不要问对方“有什么可以帮您”" in agent._session_instructions
-    assert "田野让我打这个电话" in agent.said[0]
+    assert "李明让我打这个电话" in agent.said[0]
     assert "查询本机套餐和剩余流量" in agent.said[0]
