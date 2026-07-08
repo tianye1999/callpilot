@@ -22,6 +22,7 @@ from .audio_bridge import (
 )
 from .call_log import CallLogger, CallRecord
 from .call_tools import CallTools
+from .contacts import is_reply_target_allowed
 from .dial_queue import DialQueue, whitelist_from_env
 from .events import EventHub
 from .modem import Eg25Modem
@@ -35,7 +36,7 @@ from .prompts import (
     owner_name,
     winddown_instructions,
 )
-from .summarizer import summarize_call
+from .summarizer import judge_wrap_up, summarize_call
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,11 @@ class CallSession:
         self._hangup_timer: threading.Timer | None = None
         self._session_generation = 0
         self._hangup_lock = threading.Lock()
+        # 外呼收尾裁判（LLM 判断对话该继续还是收尾，替代关键词枚举）：
+        # 请求收尾标志 + 理由 + 在途裁判 task（每通重置）。
+        self._wrap_up_requested = False
+        self._wrap_up_reason = ""
+        self._judge_task: asyncio.Task | None = None
         # 会话级可调参数：每通会话开始时从 config 重新读取，支持不重启改参。
         self._hangover_seconds = HALF_DUPLEX_HANGOVER_SECONDS
         self._hangup_delay_seconds = HANGUP_TOOL_DELAY_SECONDS
@@ -116,6 +122,9 @@ class CallSession:
             return
         self._outbound_number = outbound_number
         self._outbound_task_value = task
+        self._wrap_up_requested = False  # 每通重置收尾裁判状态
+        self._wrap_up_reason = ""
+        self._judge_task = None
         # 世代号推进与置活必须同锁原子完成：与 _deferred_hangup 的
         # 「校验世代号 → stop()」互斥，保证旧回调要么在新会话置活前跑完
         # （只影响已结束的旧会话），要么校验失败直接放弃。
@@ -215,7 +224,7 @@ class CallSession:
             mark("greeting_sent")
 
             try:
-                await self._run_agent_loop(agent, bridge, record)
+                await self._run_agent_loop(agent, bridge, record, transcripts)
             finally:
                 await self._shutdown_agent(agent, bridge)
         except BaseException:
@@ -275,9 +284,16 @@ class CallSession:
     def _make_agent_audio_handler(
         self, agent, bridge: AudioBridge, record: CallRecord | None
     ) -> Callable[[bytes], None]:
-        """Agent 下行音频回调：本机监听旁路、重采样到 8k、录音、入发送队列。"""
+        """Agent 下行音频回调：浏览器实时旁听、本机监听旁路、重采样到 8k、录音、入发送队列。"""
+
+        # 实时旁听按 Agent 输出采样率播放（qwen/openai 均 24k）。
+        if self.hub is not None:
+            self.hub.set_audio_rate(agent.output_rate)
 
         def on_agent_audio(pcm_agent: bytes) -> None:
+            # 浏览器实时旁听（Web Audio）：无监听端时 broadcast_audio 零成本返回。
+            if self.hub is not None:
+                self.hub.broadcast_audio(pcm_agent)
             monitor = self.monitor
             if monitor is not None:
                 monitor.feed(pcm_agent)
@@ -292,16 +308,25 @@ class CallSession:
         return on_agent_audio
 
     async def _run_agent_loop(
-        self, agent, bridge: AudioBridge, record: CallRecord | None
+        self,
+        agent,
+        bridge: AudioBridge,
+        record: CallRecord | None,
+        transcripts: list[tuple[str, str]],
     ) -> None:
         """通话主循环：下行音频搬运 + 半双工防回环的上行转发。"""
         last_play_at = 0.0
         loop_started = time.monotonic()
-        # 外呼硬时限兜底：模型不自觉道别挂断时（真机见过对 IVR 打转 3 分钟），
-        # 到点让 AI 说句告别，再给挂尾窗口播完就结束整通（→ 挂断物理通话）。
+        # 外呼硬时限：LLM 收尾裁判失灵/漏判时的最后防线（到点道别挂断）。
         max_seconds = (
             float(config.get_int("OUTBOUND_MAX_SECONDS")) if self._outbound_number else 0.0
         )
+        # 收尾裁判（仅外呼）：接通后先给 grace 让通话进正题，之后每 interval 让文本模型
+        # 看对话判「继续/收尾」——理解任意措辞（治打转/太早撤），不靠关键词枚举。
+        judge_enabled = self._outbound_number is not None
+        judge_grace, judge_interval = 20.0, 15.0
+        last_judge_at = loop_started
+        goal = self._outbound_task(agent_language()) if judge_enabled else ""
         winddown_deadline: float | None = None
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
@@ -309,12 +334,34 @@ class CallSession:
             self._drain_agent_audio(bridge)
 
             now = time.monotonic()
+            # ① 硬时限兜底
             if (
                 max_seconds > 0
                 and winddown_deadline is None
                 and (now - loop_started) > max_seconds
             ):
                 logger.warning("外呼超过 %.0fs 仍在进行，自动道别收尾", max_seconds)
+                try:
+                    await agent.say(self._winddown_instructions())
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("收尾道别发送失败: %s", exc)
+                winddown_deadline = now + self._hangup_delay_seconds
+            # ② 收尾裁判：到间隔就后台跑一次（asyncio task，不阻塞主循环）
+            if (
+                judge_enabled
+                and winddown_deadline is None
+                and not self._wrap_up_requested
+                and (now - loop_started) > judge_grace
+                and (now - last_judge_at) >= judge_interval
+                and (self._judge_task is None or self._judge_task.done())
+            ):
+                last_judge_at = now
+                self._judge_task = asyncio.create_task(
+                    self._run_wrap_up_judge(list(transcripts), goal)
+                )
+            # ③ 裁判判定该收尾 → 说句告别再挂（同硬时限收尾路径）
+            if self._wrap_up_requested and winddown_deadline is None:
+                logger.info("收尾裁判判定结束（%s），自动收尾", self._wrap_up_reason)
                 try:
                     await agent.say(self._winddown_instructions())
                 except Exception as exc:  # noqa: BLE001
@@ -431,8 +478,19 @@ class CallSession:
             get_caller=lambda: self.current_caller,
             get_record=lambda: self._record,
             schedule_hangup=self._schedule_deferred_hangup,
+            is_sms_target_allowed=self._sms_target_allowed,
         )
         return tools.register()
+
+    def _sms_target_allowed(self, number: str) -> bool:
+        """发短信目标限制:只允许回复已联系过的号码或当前通话对端。
+
+        取当下的 current_caller(通话中对端可能还没进落盘记录),
+        与落盘的短信/来电记录一起判定。
+        """
+        return is_reply_target_allowed(
+            number, self.hub, self.call_logger, extra_allowed=self.current_caller
+        )
 
     def _build_agent_instructions(self, direction: str) -> str:
         """会话系统提示词：文本构造在 prompts 模块（纯函数，可独测）。"""
@@ -448,8 +506,24 @@ class CallSession:
             direction, owner_name(lang), agent_persona(lang), self._outbound_task(lang), lang
         )
 
+    async def _run_wrap_up_judge(
+        self, transcripts: list[tuple[str, str]], goal: str
+    ) -> None:
+        """后台跑一次收尾裁判；判 wrap_up 就置标志，主循环据此说告别并挂断。
+
+        judge_wrap_up 是同步的（内部带超时），放线程池跑，绝不阻塞音频主循环。
+        """
+        try:
+            result = await asyncio.to_thread(judge_wrap_up, transcripts, goal)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("收尾裁判调度异常: %s", exc)
+            return
+        if result.get("decision") == "wrap_up":
+            self._wrap_up_requested = True
+            self._wrap_up_reason = result.get("reason", "")
+
     def _winddown_instructions(self) -> str:
-        """外呼硬时限到点的收尾道别指令。"""
+        """收尾道别指令（硬时限或收尾裁判触发时让 AI 说一句简短告别）。"""
         return winddown_instructions(agent_language())
 
     def _outbound_task(self, lang: str = "zh") -> str:

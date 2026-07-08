@@ -122,8 +122,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 通话行为 ----
     ConfigSpec("HALF_DUPLEX_HANGOVER_SECONDS", "半双工挂尾时长（秒）", "float", "0.5"),
     ConfigSpec("HANGUP_TOOL_DELAY_SECONDS", "挂断工具延迟（秒）", "float", "4.5"),
-    # 外呼硬时限（秒）：到点自动道别并挂断，兜底模型不自觉收尾导致的打转/话费；
-    # 0 = 不限制。
+    # 外呼硬时限（秒）：LLM 收尾裁判失灵/漏判时的最后防线，到点自动道别挂断；
+    # 0 = 不限制。（正常收尾由 summarizer.judge_wrap_up 提前判定。）
     ConfigSpec("OUTBOUND_MAX_SECONDS", "外呼最长时长（秒）", "int", "150"),
     ConfigSpec("RECORDING_ENABLED", "通话录音开关", "bool", "true"),
     ConfigSpec("RECORDING_RETENTION_DAYS", "录音保留天数", "int", "30"),
@@ -142,7 +142,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 白名单与节流 ----
     ConfigSpec("DIAL_WHITELIST", "外呼白名单", "str", ""),
     ConfigSpec("DIAL_INTERVAL_SECONDS", "连续拨号间隔（秒）", "float", "5.0"),
-    ConfigSpec("SMS_WHITELIST", "短信白名单", "str", ""),
+    # 发短信目标限制改为「只能回复已联系过的号码」(见 contacts.py),
+    # 不再用静态白名单,故移除原 SMS_WHITELIST 配置项。
     # ---- 连接管理 ----
     ConfigSpec("QWEN_PREWARM", "Qwen 连接预热", "bool", "true"),
     ConfigSpec("QWEN_RECONNECT_MAX", "Qwen 最大重连次数", "int", "2"),

@@ -43,12 +43,16 @@ class CallTools:
         get_caller: Callable[[], str | None],
         get_record: Callable[[], "CallRecord | None"],
         schedule_hangup: Callable[[], None],
+        is_sms_target_allowed: Callable[[str], bool] | None = None,
     ) -> None:
         self._modem = modem
         self._hub = hub
         self._get_caller = get_caller
         self._get_record = get_record
         self._schedule_hangup = schedule_hangup
+        # 发短信目标限制:只允许回复已联系过的号码(由 CallSession 注入)。
+        # None = 不限制(直接构造 CallTools 的单测保持旧行为)。
+        self._is_sms_target_allowed = is_sms_target_allowed
 
     def register(self) -> ToolRegistry:
         registry = ToolRegistry()
@@ -70,6 +74,14 @@ class CallTools:
             return {"success": False, "message": "没有可用的收件号码"}
         if not content:
             return {"success": False, "message": "短信内容为空"}
+        if self._is_sms_target_allowed is not None and not self._is_sms_target_allowed(
+            number
+        ):
+            logger.warning("发短信被拦截(非已联系号码): %s", number)
+            return {
+                "success": False,
+                "message": "只能给来过电或发过短信的号码回复短信",
+            }
         try:
             ok = self._modem.send_sms(number, content)
         except Exception as exc:  # noqa: BLE001

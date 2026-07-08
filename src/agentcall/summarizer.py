@@ -78,6 +78,86 @@ _SYSTEM_PROMPT = {
 }
 
 
+# 收尾裁判：让文本模型「理解对话」判断该继续还是收尾，替代关键词枚举。
+_JUDGE_TIMEOUT = 8.0
+
+_JUDGE_SYSTEM = {
+    "zh": (
+        "你在监督机主{owner}的电话助理正在进行的一通外呼。本通目标：{goal}。\n"
+        "根据下面到目前为止的对话，判断这通电话现在该「继续」还是「收尾挂断」：\n"
+        "- wrap_up（收尾）：目标已达成（已拿到所需信息/办成事）；或明显打转卡住"
+        "（反复说同样的话、菜单绕圈、多次尝试仍无进展）；或对方已明确要结束。\n"
+        "- continue（继续）：正在推进；对方让你稍候/正在查询、结果还没出来。\n"
+        "宁可多给一次继续的机会：只有确信达成或确信卡死才判 wrap_up。\n"
+        "只输出严格合法的 JSON，无任何多余文字："
+        '{{"decision": "continue" 或 "wrap_up", "reason": "一句话理由"}}'
+    ),
+    "en": (
+        "You are supervising an ongoing OUTBOUND call by {owner}'s phone assistant. "
+        "Goal of this call: {goal}.\n"
+        "From the conversation so far, decide whether to CONTINUE or WRAP UP now:\n"
+        "- wrap_up: goal achieved (info obtained / task done); or clearly stuck/"
+        "looping (repeating the same thing, menu circles, no progress after several "
+        "tries); or the other party wants to end.\n"
+        "- continue: making progress; the other party asked you to hold / is looking "
+        "it up and the result hasn't arrived.\n"
+        "When in doubt, lean continue: only pick wrap_up if clearly done or stuck.\n"
+        'Output only strict JSON, no extra text: {{"decision": "continue" or '
+        '"wrap_up", "reason": "one short sentence"}}'
+    ),
+}
+
+
+def judge_wrap_up(
+    transcripts: list[tuple[str, str]],
+    goal: str,
+    *,
+    timeout: float | None = None,
+) -> dict:
+    """判断进行中的外呼该继续还是收尾（用文本模型理解对话，非关键词枚举）。
+
+    契约同 summarize_call：**绝不抛异常**；任何失败一律返回 continue（保守，
+    交给外呼硬时限 OUTBOUND_MAX_SECONDS 兜底，避免误判导致过早挂断）。
+    """
+    lang = agent_language()
+    try:
+        lines = [
+            (r, (t or "").strip())
+            for r, t in (transcripts or [])
+            if (t or "").strip()
+        ]
+        if len(lines) < 3:
+            return {"ok": True, "decision": "continue", "reason": "对话刚开始"}
+        roles = _ROLE_LABELS[lang]
+        convo = "\n".join(f"{roles.get(r, r)}: {t}" for r, t in lines[-16:])
+        goal_text = (goal or "").strip() or _UNKNOWN[lang]
+        messages = [
+            {
+                "role": "system",
+                "content": _JUDGE_SYSTEM[lang].format(
+                    owner=owner_name(lang), goal=goal_text
+                ),
+            },
+            {"role": "user", "content": convo},
+        ]
+        model = config.get_str("SUMMARY_MODEL")
+        response, error = _call_with_timeout(
+            messages, model, timeout or _JUDGE_TIMEOUT
+        )
+        if error is not None:
+            logger.debug("收尾裁判失败（默认继续）: %s", error)
+            return {"ok": False, "decision": "continue", "reason": error}
+        text = _extract_text(response)
+        data = _parse_json_payload(text) if text else None
+        reason = str((data or {}).get("reason", ""))[:120]
+        if (data or {}).get("decision") == "wrap_up":
+            return {"ok": True, "decision": "wrap_up", "reason": reason}
+        return {"ok": True, "decision": "continue", "reason": reason}
+    except Exception as exc:  # noqa: BLE001 —— 契约：绝不抛出
+        logger.debug("收尾裁判异常（默认继续）: %s", exc)
+        return {"ok": False, "decision": "continue", "reason": f"{type(exc).__name__}: {exc}"}
+
+
 def _default_result(lang: str = "zh") -> dict[str, Any]:
     """返回一份全默认字段的结果骨架。"""
     return {

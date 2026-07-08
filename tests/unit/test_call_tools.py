@@ -34,6 +34,7 @@ def make_tools(
     caller: str | None = None,
     record: SpyRecord | None = None,
     on_hangup=None,
+    sms_gate=None,
 ) -> tuple[CallTools, FakeModem, list]:
     modem = modem or FakeModem()
     hangups: list[bool] = []
@@ -43,6 +44,7 @@ def make_tools(
         get_caller=lambda: caller,
         get_record=lambda: record,
         schedule_hangup=on_hangup or (lambda: hangups.append(True)),
+        is_sms_target_allowed=sms_gate,
     )
     return tools, modem, hangups
 
@@ -86,6 +88,34 @@ def test_send_sms_rejects_missing_number_and_empty_content():
     assert tools._send_sms({"content": "你好"})["success"] is False
     assert tools._send_sms({"to": "13800000000", "content": " "})["success"] is False
     assert modem.calls == []  # 拒绝路径不得触发 AT 指令
+
+
+def test_send_sms_rejected_when_target_not_allowed():
+    """网关拒绝(非已联系号码)时:不发送、不触达 AT。"""
+    tools, modem, _ = make_tools(caller="13800000000", sms_gate=lambda n: False)
+
+    result = tools._send_sms({"to": "18800000000", "content": "hi"})
+
+    assert result["success"] is False
+    assert "只能" in result["message"]
+    assert modem.calls == []  # 拦截路径不得触发 AT 指令
+
+
+def test_send_sms_allowed_when_target_permitted():
+    """网关放行时正常发送。"""
+    tools, modem, _ = make_tools(sms_gate=lambda n: n == "10086")
+
+    result = tools._send_sms({"to": "10086", "content": "hi"})
+
+    assert result["success"] is True
+    assert ("send_sms", ("10086", "hi")) in modem.calls
+
+
+def test_send_sms_no_gate_allows_all():
+    """未注入网关(默认 None)保持旧行为:不限制。"""
+    tools, modem, _ = make_tools(caller="18800000000")
+    assert tools._send_sms({"content": "hi"})["success"] is True
+    assert ("send_sms", ("18800000000", "hi")) in modem.calls
 
 
 def test_send_sms_failure_reported():

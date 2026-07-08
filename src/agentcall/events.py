@@ -38,6 +38,10 @@ class EventHub:
         self._lock = threading.Lock()
         # 推送 task 需持强引用直至完成，否则可能被 GC 提前回收导致 WS 丢事件。
         self._tasks: set[asyncio.Task[None]] = set()
+        # 实时旁听：下行 PCM 二进制帧的订阅端（与 JSON 事件端分开，无监听者时零成本）。
+        self._audio_clients: set[web.WebSocketResponse] = set()
+        self._audio_tasks: set[asyncio.Task[None]] = set()
+        self._audio_rate = 24000
         self._store_path = Path(store_path) if store_path else None
         if self._store_path:
             self._load_persisted()
@@ -49,6 +53,52 @@ class EventHub:
 
     def unregister(self, ws: web.WebSocketResponse) -> None:
         self._clients.discard(ws)
+
+    # ---- 实时旁听（二进制音频）----
+
+    @property
+    def audio_rate(self) -> int:
+        return self._audio_rate
+
+    def set_audio_rate(self, rate: int) -> None:
+        if rate and rate > 0:
+            self._audio_rate = int(rate)
+
+    def register_audio(self, ws: web.WebSocketResponse) -> None:
+        self._audio_clients.add(ws)
+
+    def unregister_audio(self, ws: web.WebSocketResponse) -> None:
+        self._audio_clients.discard(ws)
+
+    def broadcast_audio(self, pcm: bytes) -> None:
+        """把下行 PCM 帧广播给旁听端（任意线程调用，非阻塞、满即丢）。
+
+        无旁听端时立即返回（零成本）；在途发送积压时丢帧不堆积（旁听可丢）。
+        """
+        if not self._audio_clients or not pcm:
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._broadcast_audio, pcm)
+        except RuntimeError:
+            pass
+
+    def _broadcast_audio(self, pcm: bytes) -> None:
+        # 丢帧保护：在途发送远超监听端数说明浏览器跟不上，丢这帧而非堆积。
+        if len(self._audio_tasks) > len(self._audio_clients) * 4:
+            return
+        for ws in list(self._audio_clients):
+            task = asyncio.create_task(self._safe_send_audio(ws, pcm))
+            self._audio_tasks.add(task)
+            task.add_done_callback(self._audio_tasks.discard)
+
+    async def _safe_send_audio(self, ws: web.WebSocketResponse, pcm: bytes) -> None:
+        try:
+            await ws.send_bytes(pcm)
+        except (ConnectionResetError, RuntimeError):
+            self.unregister_audio(ws)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("推送音频失败: %s", exc)
+            self.unregister_audio(ws)
 
     def history(self) -> list[dict[str, Any]]:
         with self._lock:

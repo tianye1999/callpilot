@@ -16,11 +16,24 @@ from agentcall.call_log import CallLogger
 from agentcall.web.server import _history_audio, _history_events, build_app
 
 
+class _SessionStub:
+    """CallSession 替身：只提供发短信目标校验用到的两个属性。"""
+
+    def __init__(self, current_caller: str | None = None, is_active: bool = False) -> None:
+        self.current_caller = current_caller
+        self.is_active = is_active
+
+
 class FakeService:
     """最小 service 替身：只提供 web 层用到的接口。"""
 
-    def __init__(self, call_logger: CallLogger | None = None) -> None:
+    def __init__(
+        self,
+        call_logger: CallLogger | None = None,
+        session: "_SessionStub | None" = None,
+    ) -> None:
         self.call_logger = call_logger
+        self.session = session
         self.batch_calls: list[tuple[list[str], str | None]] = []
         self.batch_result: dict = {"accepted": [], "rejected": []}
         self.queue: dict = {"pending": [], "current": None, "done": [], "active": False}
@@ -51,13 +64,17 @@ class FakeService:
 
 
 class FakeHub:
-    """最小事件总线替身：只记录 publish 调用。"""
+    """最小事件总线替身：记录 publish；history 供发短信目标校验读已联系号码。"""
 
-    def __init__(self) -> None:
+    def __init__(self, history: list[dict] | None = None) -> None:
         self.events: list[dict] = []
+        self._history = history or []
 
     def publish(self, event: dict) -> None:
         self.events.append(event)
+
+    def history(self) -> list[dict]:
+        return list(self._history)
 
 
 class FakeModem:
@@ -586,12 +603,13 @@ def test_dtmf_validation_precedes_call_state_check():
 
 
 def test_send_sms_success_and_validation():
-    hub = FakeHub()
+    # 10086 曾发来短信 → 属已联系号码,可回复。
+    hub = FakeHub(history=[{"type": "sms_in", "sender": "10086", "text": "余额"}])
     modem = FakeModem(send_result=True)
     app = build_app(hub=hub, modem=modem, service=FakeService())  # type: ignore[arg-type]
 
     async def fn(client):
-        # 正常发送 → 200 且透传到 modem.send_sms
+        # 正常发送（已联系号码）→ 200 且透传到 modem.send_sms
         resp = await client.post(
             "/api/sms/send", json={"number": "10086", "text": "余额查询"}
         )
@@ -610,6 +628,65 @@ def test_send_sms_success_and_validation():
 
     api(app, fn)
     assert modem.sms_calls == [("10086", "余额查询")]
+
+
+def test_send_sms_rejects_uncontacted_number():
+    """未联系过的号码（无来电/来信）→ 403,且不触发发送。"""
+    hub = FakeHub()  # 无历史联系人
+    modem = FakeModem(send_result=True)
+    app = build_app(hub=hub, modem=modem, service=FakeService())  # type: ignore[arg-type]
+
+    async def fn(client):
+        resp = await client.post(
+            "/api/sms/send", json={"number": "18800000000", "text": "陌生号码"}
+        )
+        assert resp.status == 403
+        body = await resp.json()
+        assert body["ok"] is False
+
+    api(app, fn)
+    assert modem.sms_calls == []  # 拦截不触发发送
+
+
+def test_send_sms_current_caller_bypass_requires_active_session():
+    """当前对端放行必须绑定 is_active:会话结束后 current_caller 残留不得绕过网关。
+
+    回归 codex review 发现的 P1:current_caller 通话结束不清空,且 /api/call/dial
+    会把任意外呼目标写进它,不 gate on is_active 会被 CSRF 利用(先拨号再发短信)。
+    """
+    hub = FakeHub()  # 无历史联系人
+
+    # 会话已结束(is_active=False)但 current_caller 残留 → 陌生号码仍被拒。
+    stale_modem = FakeModem(send_result=True)
+    stale = FakeService(
+        session=_SessionStub(current_caller="18800000000", is_active=False)
+    )
+    app = build_app(hub=hub, modem=stale_modem, service=stale)  # type: ignore[arg-type]
+
+    async def rejected(client):
+        resp = await client.post(
+            "/api/sms/send", json={"number": "18800000000", "text": "x"}
+        )
+        assert resp.status == 403
+
+    api(app, rejected)
+    assert stale_modem.sms_calls == []
+
+    # 通话进行中(is_active=True)可给当前对端回短信。
+    active_modem = FakeModem(send_result=True)
+    active = FakeService(
+        session=_SessionStub(current_caller="18800000000", is_active=True)
+    )
+    app2 = build_app(hub=hub, modem=active_modem, service=active)  # type: ignore[arg-type]
+
+    async def allowed(client):
+        resp = await client.post(
+            "/api/sms/send", json={"number": "18800000000", "text": "x"}
+        )
+        assert resp.status == 200
+
+    api(app2, allowed)
+    assert active_modem.sms_calls == [("18800000000", "x")]
 
 
 # ---- /api/restart ----

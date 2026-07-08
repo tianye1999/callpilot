@@ -173,3 +173,56 @@ def test_english_summary_prompt_and_normalize(monkeypatch):
     # 默认结果英文
     assert summarizer._default_result("en")["caller_identity"] == "unknown"
     assert summarizer._default_result("zh")["caller_identity"] == "未知"
+
+
+# ---- judge_wrap_up：收尾裁判（继续/收尾），失败默认继续 ----
+
+_JUDGE_TR = [
+    ("agent", "查流量。"),
+    ("user", "正在查询，请稍后。"),
+    ("agent", "好的，麻烦您了。"),
+    ("user", "请问还有其他需要吗？"),
+]
+
+
+def test_judge_wrap_up_and_continue_decisions(monkeypatch):
+    from agentcall.summarizer import judge_wrap_up
+
+    monkeypatch.setenv("SUMMARY_MODEL", "qwen-test")
+
+    monkeypatch.setattr(
+        dashscope.Generation, "call",
+        staticmethod(lambda **kw: make_response('{"decision":"wrap_up","reason":"目标已达成"}')),
+    )
+    r = judge_wrap_up(_JUDGE_TR, "查流量")
+    assert r["decision"] == "wrap_up" and r["ok"] is True
+
+    monkeypatch.setattr(
+        dashscope.Generation, "call",
+        staticmethod(lambda **kw: make_response('{"decision":"continue","reason":"仍在查询"}')),
+    )
+    assert judge_wrap_up(_JUDGE_TR, "查流量")["decision"] == "continue"
+
+
+def test_judge_short_transcript_continues_without_model(monkeypatch):
+    """转写太短直接返回 continue，不调模型。"""
+    from agentcall.summarizer import judge_wrap_up
+
+    def boom(**kw):
+        raise AssertionError("不应调用模型")
+
+    monkeypatch.setattr(dashscope.Generation, "call", staticmethod(boom))
+    r = judge_wrap_up([("agent", "你好")], "查流量")
+    assert r["decision"] == "continue"
+
+
+def test_judge_api_failure_defaults_continue(monkeypatch):
+    """模型报错时保守返回 continue（交给外呼硬时限兜底，绝不误挂）。"""
+    from agentcall.summarizer import judge_wrap_up
+
+    def boom(**kw):
+        raise RuntimeError("api down")
+
+    monkeypatch.setattr(dashscope.Generation, "call", staticmethod(boom))
+    r = judge_wrap_up(_JUDGE_TR, "查流量")
+    assert r["decision"] == "continue" and r["ok"] is False

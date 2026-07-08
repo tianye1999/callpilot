@@ -32,22 +32,20 @@ def test_owner_and_persona_defaults(monkeypatch):
 def test_outbound_instructions_inject_owner_persona_task():
     text = build_instructions("outbound", "李明", "数字分身", "查询本月话费")
     assert "李明的数字分身" in text
-    assert "本通电话主题：查询本月话费" in text
-    assert "不要问对方“有什么可以帮您”" in text
-    # IVR 按键指引与收束规则（仅外呼有）
+    assert "查询本月话费" in text  # 本通要办的事注入
+    assert "有什么可以帮您" in text  # 提醒不是客服口吻
+    # 可用工具（语音菜单按键 + 挂断）与场景描述（仅外呼有）
     assert "send_dtmf" in text
     assert "hangup_call" in text
-    assert "【IVR 应对】" in text
-    assert "【达成即礼貌收尾】" in text
-    # 「立场」框定：事项围绕机主、对方是协助方（防 OpenAI 把对端当被查询对象）
-    assert "【立场】" in text
-    assert "帮我查/办" in text and "查您的" in text  # 明确「不要说成查您的X」
+    assert "语音菜单" in text
+    # 立场框定：事项围绕机主、对方是协助方（防把对端当被查询对象）
+    assert "李明这边" in text or "李明名下" in text
+    assert "查您的" in text  # 明确「不要说成查您的X」
 
 
 def test_outbound_standpoint_framing_english():
     text = build_instructions("outbound", "Alex", "AI assistant", "check data usage", "en")
-    assert "[Standpoint]" in text
-    assert "on Alex's account" in text
+    assert "on Alex's account" in text  # 立场：机主名下的事
     assert "your X" in text  # 明确禁止「your X」措辞
 
 
@@ -64,8 +62,8 @@ def test_inbound_instructions_inject_owner_and_rules():
     assert "现在不方便接" in text
     assert "会转告李明" in text
     # 外呼专属片段不得出现在来电提示词里
-    assert "本通电话主题" not in text
-    assert "【IVR 应对】" not in text
+    assert "你要办的事" not in text
+    assert "send_dtmf" not in text
 
 
 def test_instructions_common_sections_present():
@@ -84,7 +82,8 @@ def test_outbound_opening_injects_owner_and_task():
     text = opening_instructions("outbound", "李明", "数字分身", "查询本月话费")
     assert "我是李明的数字分身" in text
     assert "让我打" not in text  # 简洁化：去掉“让我打来”
-    assert "这次主要是查询本月话费" in text
+    assert "方便说两句" not in text  # 简洁化：去掉“现在方便说两句吗”
+    assert "查询本月话费" in text
 
 
 def test_inbound_opening_injects_owner():
@@ -102,7 +101,7 @@ def test_outbound_empty_task_uses_no_agenda_frame():
     assert "本通电话主题：" not in text          # 不硬塞主题行
     assert "没有预设具体事项" in text            # 走优雅兜底
     assert "绝不要充当客服" in text              # 强化主叫身份
-    assert "不要问对方“有什么可以帮您”" in text
+    assert "有什么可以帮您" in text              # 提醒不是客服口吻
     en = build_instructions("outbound", "Alex", "AI assistant", "", "en")
     assert "Topic of this call:" not in en
     assert "no preset agenda" in en
@@ -111,10 +110,10 @@ def test_outbound_empty_task_uses_no_agenda_frame():
 
 def test_outbound_empty_task_opening_no_meta():
     text = opening_instructions("outbound", "李明", "数字分身", "", "zh")
-    assert "有件事想跟您沟通一下" in text        # 空任务用自然措辞
+    assert "有件事想跟您确认" in text            # 空任务用自然措辞
     assert "这次主要是" not in text              # 不注入空/元任务
     en = opening_instructions("outbound", "Alex", "AI assistant", "", "en")
-    assert "There's something I'd like to go over" in en
+    assert "something to go over" in en
     assert "It's mainly about" not in en
 
 

@@ -14,6 +14,7 @@ from aiohttp import WSMsgType, web
 
 from .. import config
 from ..audio_bridge import apply_pcm_gain
+from ..contacts import is_reply_target_allowed
 from ..events import EventHub
 from ..modem import Eg25Modem
 
@@ -86,6 +87,7 @@ def build_app(
     app.router.add_get("/", _index)
     app.router.add_get("/api/meta", _meta)
     app.router.add_get("/ws", _websocket)
+    app.router.add_get("/ws/audio", _audio_websocket)
     app.router.add_post("/api/sms/send", _send_sms)
     app.router.add_post("/api/call/dial", _dial)
     app.router.add_post("/api/call/hangup", _hangup)
@@ -135,6 +137,28 @@ async def _websocket(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+async def _audio_websocket(request: web.Request) -> web.WebSocketResponse:
+    """实时旁听：把通话下行 PCM 二进制帧推给浏览器（Web Audio 播放，绕开 native 音频）。
+
+    先发一条 JSON meta 告知采样率，之后全是 s16le 单声道二进制帧。
+    """
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+    hub: EventHub = request.app["hub"]
+
+    await ws.send_json({"type": "meta", "rate": hub.audio_rate})
+    hub.register_audio(ws)
+    logger.info("音频旁听端已连接")
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.ERROR:
+                break
+    finally:
+        hub.unregister_audio(ws)
+        logger.info("音频旁听端已断开")
+    return ws
+
+
 async def _send_sms(request: web.Request) -> web.Response:
     hub: EventHub = request.app["hub"]
     modem: Eg25Modem = request.app["modem"]
@@ -145,6 +169,27 @@ async def _send_sms(request: web.Request) -> web.Response:
     if not number or not text:
         return web.json_response(
             {"ok": False, "error": "号码和内容都不能为空"}, status=400
+        )
+
+    # 发短信目标限制:只能回复已联系过的号码(来过电/发过短信)或当前通话对端。
+    # 无鉴权的 Web 接口也过这道闸,防 CSRF 被利用群发陌生号码。
+    service = request.app.get("service")
+    call_logger = getattr(service, "call_logger", None)
+    # 当前对端仅在「确有通话进行中」时才作放行例外:current_caller 通话结束不清空,
+    # 且 /api/call/dial 会把任意外呼目标写进它——不 gate on is_active 会被 CSRF 利用
+    # (先拨号写入 current_caller,再发短信绕过联系人校验)。
+    session = getattr(service, "session", None)
+    current_caller = (
+        session.current_caller
+        if session is not None and getattr(session, "is_active", False)
+        else None
+    )
+    if not is_reply_target_allowed(
+        number, hub, call_logger, extra_allowed=current_caller
+    ):
+        return web.json_response(
+            {"ok": False, "error": "只能给来过电或发过短信的号码发送短信"},
+            status=403,
         )
 
     loop = asyncio.get_running_loop()

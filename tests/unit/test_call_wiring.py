@@ -338,7 +338,7 @@ def test_batch_dial_dials_in_order(tmp_path, monkeypatch):
     modem.trigger_call_connected("10000")
     assert wait_until(lambda: bridges and bridges[0].downlink)
     # 队列的 task 显式传进会话，注入本通提示词
-    assert "本通电话主题：催一下快递进度" in agents[0]._session_instructions
+    assert "你要办的事：催一下快递进度" in agents[0]._session_instructions
     modem.trigger_hangup()
 
     # 第二通：间隔后自动拨下一个

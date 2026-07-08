@@ -66,6 +66,37 @@ def test_broadcast_tasks_referenced_until_done():
         loop.close()
 
 
+def test_broadcast_audio_fans_out_only_to_audio_clients():
+    """音频通道：无监听端零成本；有监听端时二进制帧原样送达，采样率可设。"""
+    loop = make_loop()
+    try:
+        hub = EventHub(loop)
+
+        async def scenario():
+            received: list[bytes] = []
+
+            class AudioWS:
+                async def send_bytes(self, data):
+                    received.append(bytes(data))
+
+            # 无监听端：broadcast_audio 不调度、零成本
+            hub.broadcast_audio(b"\x01\x02")
+            await asyncio.sleep(0)
+            assert received == []
+
+            hub.set_audio_rate(16000)
+            assert hub.audio_rate == 16000
+            hub.register_audio(AudioWS())
+            hub.broadcast_audio(b"\x01\x00\x02\x00")
+            await asyncio.sleep(0)               # 让 _broadcast_audio 执行
+            await asyncio.gather(*list(hub._audio_tasks))
+            assert received == [b"\x01\x00\x02\x00"]
+
+        loop.run_until_complete(scenario())
+    finally:
+        loop.close()
+
+
 def test_reload_repairs_legacy_pdu_sms(tmp_path):
     # 迁移前遗留的未解码 PDU 短信（sender 为空、正文是 PDU hex）
     pdu = "00040D91683108000000F0000862707021030023044F60597D"

@@ -243,6 +243,12 @@
     width: 8px; height: 8px; border-radius: 50%; background: var(--ok);
     box-shadow: 0 0 9px var(--ok); animation: breathe 1.2s infinite;
   }
+  .listen-btn {
+    margin-left: auto; font-size: 12px; padding: 5px 11px; border-radius: 999px;
+    border: 1px solid var(--line); background: transparent; color: var(--muted);
+    cursor: pointer; font-family: var(--mono);
+  }
+  .listen-btn.on { color: var(--ok); border-color: var(--ok); box-shadow: 0 0 9px rgba(67,230,154,.4); }
   #chat { min-height: 300px; max-height: calc(100vh - 300px); overflow-y: auto; padding: 18px 20px; }
   #chat:empty::before { content: attr(data-empty); color: var(--dim); font-size: 13px; display: block; text-align: center; padding: 40px 0; }
   /* 通话之间的分割线：一行居中标签 + 两侧渐隐横线 */
@@ -591,6 +597,7 @@
           <h2><span data-i18n="live_title"></span>
             <span class="live-tag" id="liveTag" style="display:none"><span class="ldot"></span>LIVE</span>
             <span class="sub" id="liveSub"></span>
+            <button id="listenBtn" class="listen-btn" type="button" data-i18n="listen_off"></button>
           </h2>
           <div id="chat"></div>
         </section>
@@ -699,6 +706,7 @@ const I18N = {
     q_active: (p, d) => `In progress · ${p} pending · ${d} dialed`, q_current: " dialing",
     recent_label: "RECENT CALLS", empty_calls: "No calls yet", view_all: "View all history",
     live_title: "Live Transcript", live_sub_idle: "Opens automatically when a call starts",
+    listen_off: "🔊 Listen live", listen_on: "🔊 Listening…",
     live_empty: "Waiting for transcript…", dtmf_send_fail: "Send failed", new_call: "NEW CALL",
     leave_title: "Unsaved changes",
     leave_msg: "You've edited settings that aren't saved yet. What would you like to do?",
@@ -757,7 +765,6 @@ const I18N = {
       MONITOR_AI_PLAYBACK: "Monitor on this Mac", MONITOR_OUTPUT_DEVICE: "Monitor output device",
       MONITOR_AI_GAIN: "Monitor gain (AI)", MONITOR_UPLINK_GAIN: "Monitor gain (caller)",
       DIAL_WHITELIST: "Dial whitelist", DIAL_INTERVAL_SECONDS: "Dial interval (s)",
-      SMS_WHITELIST: "SMS whitelist",
       QWEN_PREWARM: "Qwen connection prewarm", QWEN_RECONNECT_MAX: "Max reconnects",
       WEB_HOST: "Web host", WEB_PORT: "Web port",
     },
@@ -781,6 +788,7 @@ const I18N = {
     q_active: (p, d) => `队列进行中 · 待拨 ${p} · 已拨 ${d}`, q_current: " 拨打中",
     recent_label: "最近通话", empty_calls: "暂无通话", view_all: "查看全部历史",
     live_title: "实时对话", live_sub_idle: "通话开始后自动进入本页",
+    listen_off: "🔊 实时旁听", listen_on: "🔊 旁听中…",
     live_empty: "等待通话转写…", dtmf_send_fail: "发送失败", new_call: "新通话",
     leave_title: "有未保存的修改",
     leave_msg: "你修改了设置但还没保存，要怎么处理？",
@@ -1041,6 +1049,48 @@ async function loadMeta() {
     $("portSub").textContent = t("modem_prefix") + (m.port || "-");
   } catch (e) { console.warn("[meta] 加载运行信息失败", e); }
 }
+
+/* ========= 实时旁听：Web Audio 播放下行 PCM（走浏览器→系统音频，绕开 native）========= */
+let audioWs = null, audioCtx = null, audioRate = 24000, nextPlayAt = 0;
+function toggleListen() {
+  if (audioWs) { stopListen(); return; }
+  try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+  catch (e) { console.warn("[listen] AudioContext 不可用", e); return; }
+  nextPlayAt = 0;
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  audioWs = new WebSocket(`${proto}://${location.host}/ws/audio`);
+  audioWs.binaryType = "arraybuffer";
+  audioWs.onmessage = (e) => {
+    if (typeof e.data === "string") {
+      try { const m = JSON.parse(e.data); if (m.rate) audioRate = m.rate; } catch (_) {}
+      return;
+    }
+    playPcm(new Int16Array(e.data));
+  };
+  audioWs.onclose = () => { if (audioWs) stopListen(); };
+  const btn = $("listenBtn");
+  btn.classList.add("on"); btn.textContent = t("listen_on");
+}
+function playPcm(int16) {
+  if (!audioCtx || !int16.length) return;
+  const f32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+  const buf = audioCtx.createBuffer(1, f32.length, audioRate);
+  buf.copyToChannel(f32, 0);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf; src.connect(audioCtx.destination);
+  const now = audioCtx.currentTime;
+  if (nextPlayAt < now) nextPlayAt = now + 0.08;  // 抖动缓冲，防爆音
+  src.start(nextPlayAt);
+  nextPlayAt += buf.duration;
+}
+function stopListen() {
+  if (audioWs) { try { audioWs.onclose = null; audioWs.close(); } catch (_) {} audioWs = null; }
+  if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; }
+  const btn = $("listenBtn");
+  btn.classList.remove("on"); btn.textContent = t("listen_off");
+}
+$("listenBtn").addEventListener("click", toggleListen);
 
 /* ========= 拨打 / 挂断 / 键盘 ========= */
 async function doDial() {
