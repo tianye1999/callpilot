@@ -204,6 +204,14 @@ class Eg25Modem:
         self._open_serial()
         logger.info("模组已连接: %s", self._active_port)
 
+    def send_command(self, command: str) -> str:
+        """发送一条原始 AT 指令，返回模组原始响应文本（最底层原子能力）。
+
+        供诊断/示例脚本做任意 AT 交互（如 ``AT+CSQ`` 查信号、``AT+COPS?`` 查
+        网络、``AT+CPIN?`` 查 SIM）。与拨号/短信等共用串口锁，可与监听并发安全调用。
+        """
+        return self._send(command)
+
     def _resolve_port(self) -> str:
         """把 auto 哨兵解析为实际串口；每次打开都重扫（Windows 重插后 COM 号会变）。
 

@@ -269,6 +269,18 @@ def test_hangup_commands_not_interleaved_by_concurrent_send():
     assert not modem.is_call_connected()
 
 
+# ---- send_command：原始 AT 原子能力 ----
+
+
+def test_send_command_returns_raw_response():
+    """send_command 透传 _send：发出原始指令并返回模组原始响应。"""
+    modem = make_modem()
+    modem._ser = FakeSerial()
+    resp = modem.send_command("AT+CSQ")
+    assert "OK" in resp
+    assert modem._ser.writes == ["AT+CSQ"]
+
+
 # ---- P0 会话僵尸：串口断连期通话消失，CLCC 恢复后必须触发 on_hangup ----
 # 真机事故（2026-07-08）：通话中 USB 断死→NO CARRIER 收不到→重连后 CLCC
 # 每 2s 返回空却无人处理，会话僵尸直到手动挂断。

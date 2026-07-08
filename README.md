@@ -210,6 +210,10 @@ Developer Preview wants hardware reproduction reports. If you have an EC20, plea
 open an issue with your modem firmware, macOS version, and what worked / didn't.
 Tests: `.venv/bin/pytest` (no hardware needed — uses fake modem/bridge/agent).
 
+For architecture and where-to-change-what, see [`docs/architecture.md`](docs/architecture.md).
+To learn or test a single modem primitive (raw AT, dial, SMS, DTMF) in isolation, see
+[`examples/modem/`](examples/modem/).
+
 License: [Apache-2.0](LICENSE).
 
 ---
@@ -356,5 +360,8 @@ macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=
 
 Developer Preview 阶段最需要同型号硬件的复现反馈。有 EC20 的话，欢迎带上模组固件、
 macOS 版本、以及哪里成功/失败开 issue。测试：`.venv/bin/pytest`（无需硬件）。
+
+架构与「想改 X 去哪」见 [`docs/architecture.md`](docs/architecture.md)；想单独学习/验证某个
+模组原子能力（原始 AT、拨号、短信、DTMF），见 [`examples/modem/`](examples/modem/)。
 
 许可证：[Apache-2.0](LICENSE)。
