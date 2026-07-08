@@ -127,7 +127,7 @@ def test_inbound_instructions_inject_owner_and_rules():
     assert "会转告李明" in text
     # 外呼专属片段不得出现在来电提示词里
     assert "你要办的事" not in text
-    assert "send_dtmf" not in text
+    assert "这件事是李明的" not in text
 
 
 def test_instructions_common_sections_present():
@@ -138,7 +138,64 @@ def test_instructions_common_sections_present():
         assert "不要主动报时间" in text
         assert "安全边界" in text
         assert "send_sms" in text
+        assert "send_dtmf" in text
         assert "query_verification_code" in text
+
+
+def test_common_prompt_requires_real_dtmf_tool_call():
+    text = build_instructions("inbound", "李明", "AI 助理", "随便")
+
+    assert "发送按键音/DTMF(send_dtmf" in text
+    assert "必须调用 send_dtmf 工具真正发送按键" in text
+    assert "不是只在话里说" in text
+
+
+def test_common_prompt_requires_real_dtmf_tool_call_english():
+    text = build_instructions("outbound", "Alex", "AI assistant", "navigate a menu", "en")
+
+    assert "send DTMF keypad tones (send_dtmf" in text
+    assert "must call send_dtmf to actually send the keypress" in text
+    assert "not merely say" in text
+
+
+def test_outbound_prompt_rejects_customer_service_impersonation():
+    text = build_instructions("outbound", "李明", "数字分身", "查询套餐")
+
+    assert "你是主叫" in text
+    assert "代李明向对方求助或办事" in text
+    assert "绝不是客服" in text
+    assert "不代表对方机构" in text
+    assert "不得冒充对方身份" in text
+
+
+def test_outbound_prompt_rejects_customer_service_impersonation_english():
+    text = build_instructions("outbound", "Alex", "AI assistant", "check a plan", "en")
+
+    assert "you are the caller" in text
+    assert "asking for help or getting something done for Alex" in text
+    assert "not customer service" in text
+    assert "do not represent the other party's organization" in text
+    assert "never impersonate the other party's identity" in text
+
+
+def test_common_prompt_forbids_fabricating_unprovided_results():
+    text = build_instructions("outbound", "李明", "数字分身", "查询套餐")
+
+    assert "你要向对方获取的信息或结果" in text
+    assert "在对方明确、具体地给出之前" in text
+    assert "绝不能声称已经查到或办好" in text
+    assert "绝不能说出任何具体数值或结论" in text
+    assert "还在等对方" in text
+
+
+def test_common_prompt_forbids_fabricating_unprovided_results_english():
+    text = build_instructions("inbound", "Alex", "AI assistant", "", "en")
+
+    assert "information or result you are trying to get from the other party" in text
+    assert "before the other party clearly and specifically gives it" in text
+    assert "must never claim it has already been found or handled" in text
+    assert "must never state any specific number or conclusion" in text
+    assert "still waiting for the other party" in text
 
 
 # ---- 开场白 ----
