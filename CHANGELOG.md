@@ -4,6 +4,58 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.4.0] — 2026-07-09
+
+### Added
+
+- **Task preset library** (预调教任务库): pre-tuned per-(number + task) prompt
+  profiles in a local JSON file. A matched preset pins the call's scenario
+  strategy and opening line — stable stance, no self-introduction loops, no
+  model roundtrip. Hierarchical matching: exact number+task, then number-only
+  wildcard, then dynamic generation as fallback. Fully bilingual: every field
+  accepts a plain string or `{"zh": …, "en": …}`; scenario/opening follow the
+  call language, labels follow the UI language.
+- **Preset dropdown on the dial panel**: pick a preset to auto-fill number +
+  topic (guaranteed profile hit — no more near-miss typing). The topic field
+  stays editable as a per-call sub-topic ("check *last month's* data usage")
+  without losing the preset's strategy.
+- **Dynamic scenario prompts**: for numbers not in the preset library, a cheap
+  text model drafts a per-call scenario + opening while the phone is still
+  ringing (falls back to the template on timeout/failure; cached per
+  number+task).
+- **In-band DTMF** (default): keypad tones are synthesized into the uplink PCM
+  itself. `AT+QVTS` tones never reached the far end in UAC audio mode — IVRs
+  kept saying "no input detected"; in-band fixes the path and the tones are
+  audible in call recordings for auditing.
+- **Manual response control** (experimental, default off): when a rambling IVR
+  triggers a reply per menu line, `MANUAL_RESPONSE_CONTROL=true` merges
+  consecutive speech into one turn via a silence-debounce and answers once.
+- **Voice settings**: voice pickers for Qwen/OpenAI with official preview
+  links, plus `VOICE_STYLE` — a free-text speaking-style hint merged into the
+  session instructions for both providers.
+- **Real-hardware regression script** (`scripts/regression_call.py`): dials the
+  carrier hotline, waits for the call to finish, and asserts transcript
+  quality (no self-intro loop, no fabricated figures, no impersonating the
+  callee's organization, profile hit, clean wrap-up) — PASS/FAIL exit codes
+  for use in loops/CI.
+- **Signed & notarized DMG**: `packaging/build_installer.sh` now signs
+  (Developer ID), notarizes, staples, and self-verifies the artifacts when
+  `CODESIGN_IDENTITY`/`NOTARY_PROFILE` are set — no more right-click-to-open
+  on first launch.
+
+### Fixed
+
+- **AI fabricating results**: the model could claim "your remaining data is
+  5 GB" before the callee said anything. Hardened the core prompt: never state
+  figures or claim completion before the other side actually provides them.
+  Verified gone on real calls.
+- **AI impersonating the callee's organization** ("this is China Telecom
+  customer service…"): stance rules hardened — the agent is always the caller
+  acting for the owner, never the institution.
+- **AI saying "I'll press 2" without pressing**: `send_dtmf` was missing from
+  the always-available tool list, so the model narrated key presses instead of
+  calling the tool. Now listed and mandated.
+
 ## [0.3.1] — 2026-07-09
 
 ### Fixed
@@ -192,6 +244,7 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.4.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.0
 [0.3.1]: https://github.com/tianye1999/callpilot/releases/tag/v0.3.1
 [0.3.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.3.0
 [0.2.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.2.0

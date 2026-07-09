@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # Build standalone CallPilot.app and CallPilot.dmg for macOS.
+# Usage:
+#   Unsigned local package:
+#     ./packaging/build_installer.sh
+#   Signed and notarized release package:
+#     CODESIGN_IDENTITY="Developer ID Application: <Name> (<TEAMID>)" \
+#       NOTARY_PROFILE=<keychain-profile> ./packaging/build_installer.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -91,6 +97,54 @@ check_arm64() {
     [[ "$archs" == *arm64* ]] || die "$name must contain arm64 slice: $path (${archs:-unknown arch})"
 }
 
+verify_artifacts() {
+    local dmg_size spctl_output
+
+    [[ -d "$APP_PATH" ]] || die "app missing before verification: $APP_PATH"
+    [[ -f "$DMG_PATH" ]] || die "DMG missing before verification: $DMG_PATH"
+
+    info "DMG SHA256:"
+    if ! shasum -a 256 "$DMG_PATH"; then
+        die "failed to compute DMG SHA256: $DMG_PATH"
+    fi
+
+    if ! dmg_size="$(stat -f '%z' "$DMG_PATH")"; then
+        die "failed to read DMG size: $DMG_PATH"
+    fi
+    info "DMG_SIZE_BYTES=$dmg_size"
+
+    if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+        if ! codesign --verify --deep --strict --verbose=2 "$APP_PATH"; then
+            die "app codesign verification failed: $APP_PATH"
+        fi
+        if ! codesign --verify "$DMG_PATH"; then
+            die "DMG codesign verification failed: $DMG_PATH"
+        fi
+    fi
+
+    if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+        if ! xcrun stapler validate "$DMG_PATH"; then
+            die "DMG staple validation failed: $DMG_PATH"
+        fi
+        if ! spctl_output="$(spctl -a -vvv -t open --context context:primary-signature "$DMG_PATH" 2>&1)"; then
+            [[ -n "$spctl_output" ]] && printf '%s\n' "$spctl_output" >&2
+            die "Gatekeeper notarization validation failed: $DMG_PATH"
+        fi
+        [[ -n "$spctl_output" ]] && printf '%s\n' "$spctl_output" >&2
+        if [[ "$spctl_output" != *accepted* || "$spctl_output" != *"Notarized Developer ID"* ]]; then
+            die "Gatekeeper validation did not report accepted Notarized Developer ID: $DMG_PATH"
+        fi
+    fi
+
+    if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+        info "verification passed: notarized package (app and DMG signatures verified; staple and Gatekeeper notarization accepted)"
+    elif [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+        info "verification passed: signed package (app and DMG signatures verified; notarization skipped)"
+    else
+        info "verification passed: unsigned package (SHA256 and file size recorded; signing and notarization skipped)"
+    fi
+}
+
 [[ "$(uname -s)" == "Darwin" ]] || die "macOS is required"
 PYTHON="$(ensure_build_python)"
 [[ -x "$PYTHON" ]] || die "Python not found: $PYTHON"
@@ -143,6 +197,8 @@ if [[ -n "${NOTARY_PROFILE:-}" ]]; then
 else
     info "NOTARY_PROFILE not set; skipping notarization"
 fi
+
+verify_artifacts
 
 info "APP_PATH=$APP_PATH"
 info "DMG_PATH=$DMG_PATH"
