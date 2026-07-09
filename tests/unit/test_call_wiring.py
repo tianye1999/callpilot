@@ -743,7 +743,7 @@ def test_batch_dial_respects_whitelist_from_env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service.session,
         "start",
-        lambda outbound_number=None, task=None: setattr(service.session, "_active", True),
+        lambda outbound_number=None, task=None, preset_hint=None: setattr(service.session, "_active", True),
     )
 
     result = service.batch_dial(["10000", "13900001111", "13800000000"])
@@ -864,7 +864,7 @@ def test_dial_with_task_persists_as_default(monkeypatch, tmp_path):
     monkeypatch.setattr(
         service.session,
         "start",
-        lambda outbound_number=None, task=None: starts.append((outbound_number, task)),
+        lambda outbound_number=None, task=None, preset_hint=None: starts.append((outbound_number, task)),
     )
 
     ok, _ = service.dial("10000", task="查询本月话费")
@@ -884,7 +884,7 @@ def test_dial_without_task_keeps_previous(monkeypatch):
     monkeypatch.setattr(
         service.session,
         "start",
-        lambda outbound_number=None, task=None: starts.append((outbound_number, task)),
+        lambda outbound_number=None, task=None, preset_hint=None: starts.append((outbound_number, task)),
     )
 
     ok, _ = service.dial("10000")
@@ -1040,7 +1040,7 @@ def test_dial_rejects_malformed_number():
         ok, err = service.dial(bad)
         assert not ok and "格式不合法" in (err or ""), bad
     # 合法形态不受影响（不真正拨出：session.start 打桩）
-    service.session.start = lambda outbound_number=None, task=None: None  # type: ignore[method-assign]
+    service.session.start = lambda *a, **kw: None  # type: ignore[method-assign]
     for good in ("10000", "+8613800138000", "*57#"):
         ok, _ = service.dial(good)
         assert ok, good

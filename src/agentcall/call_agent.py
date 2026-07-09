@@ -89,6 +89,8 @@ class CallSession:
         self._outbound_number: str | None = None
         # 本通外呼主题：start() 显式传入；未传时回退 AGENT_OUTBOUND_TASK 配置。
         self._outbound_task_value: str | None = None
+        # 命中键：选中预设时锁定"用哪条预设"（预设原任务），与事项框的具体子主题解耦。
+        self._preset_hint: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._active = False
@@ -125,12 +127,18 @@ class CallSession:
     def is_active(self) -> bool:
         return self._active
 
-    def start(self, outbound_number: str | None = None, task: str | None = None) -> None:
+    def start(
+        self,
+        outbound_number: str | None = None,
+        task: str | None = None,
+        preset_hint: str | None = None,
+    ) -> None:
         if self._active:
             logger.warning("已有通话进行中，忽略新的呼叫请求")
             return
         self._outbound_number = outbound_number
         self._outbound_task_value = task
+        self._preset_hint = preset_hint
         self._wrap_up_requested = False  # 每通重置收尾裁判状态
         self._wrap_up_reason = ""
         self._judge_task = None
@@ -570,8 +578,11 @@ class CallSession:
         number = self._outbound_number
         lang = agent_language()
         task = self._outbound_task(lang)
+        # 命中键：选了预设时用预设原任务定位（事项框可被改成具体子主题、不影响命中）；
+        # 未选预设（手输）时用事项框内容。子主题始终经 _outbound_task 进 instructions 的 topic。
+        match_key = self._preset_hint if self._preset_hint is not None else task
         if config.get_bool("NUMBER_PROFILES_ENABLED"):
-            profile = lookup_profile(number, task, lang=lang)
+            profile = lookup_profile(number, match_key, lang=lang)
             if profile is not None:
                 self._prompt_gen_result = profile
                 self._prompt_gen_done.set()
@@ -953,7 +964,9 @@ class CallAgentService:
         self.modem.on_hangup(on_hangup)
         self.modem.on_sms(on_sms)
 
-    def dial(self, number: str, task: str | None = None) -> tuple[bool, str | None]:
+    def dial(
+        self, number: str, task: str | None = None, preset_hint: str | None = None
+    ) -> tuple[bool, str | None]:
         """发起外呼：让 Agent 主动拨打指定号码。
 
         task 非空时作为本通外呼主题并持久化为默认（下次不填主题即沿用）；
@@ -976,7 +989,7 @@ class CallAgentService:
             if self.session.is_active:
                 return False, "当前正在通话中，请稍后再拨"
             self.session.current_caller = number
-            self.session.start(outbound_number=number, task=task)
+            self.session.start(outbound_number=number, task=task, preset_hint=preset_hint)
         return True, None
 
     def hangup(self) -> tuple[bool, str | None]:

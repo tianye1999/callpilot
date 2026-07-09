@@ -1373,6 +1373,7 @@ $("listenBtn").addEventListener("click", toggleListen);
 
 /* ========= 拨打 / 挂断 / 键盘 ========= */
 let dialProfiles = [];
+let dialPresetHint = null;  // 选中预设的命中键（预设原任务）；改号码或选自定义时清空，改事项不清
 function renderDialPresets() {
   const select = $("dialPreset");
   const current = select.value;
@@ -1398,13 +1399,16 @@ async function loadDialPresets() {
 }
 function applyDialPreset() {
   const value = $("dialPreset").value;
-  if (value === "") return;
+  if (value === "") { dialPresetHint = null; return; }
   const profile = dialProfiles[Number(value)];
-  if (!profile) return;
+  if (!profile) { dialPresetHint = null; return; }
+  dialPresetHint = String(profile.task || "");  // 命中键：预设原任务（通配预设为空串）
   $("dialNumber").value = String(profile.number || "");
   $("dialTask").value = String(profile.task || "");
 }
 $("dialPreset").addEventListener("change", applyDialPreset);
+// 手动改号码=脱离预设；改事项框（子主题）不清命中键，仍走选中预设的策略框架
+$("dialNumber").addEventListener("input", () => { dialPresetHint = null; $("dialPreset").value = ""; });
 
 async function doDial() {
   const number = $("dialNumber").value.trim();
@@ -1413,7 +1417,7 @@ async function doDial() {
   const btn = $("dialBtn");
   btn.disabled = true; setToast("dialToast", "", t("calling"));
   try {
-    const { res } = await postJson("/api/call/dial", { number, task: task || null });
+    const { res } = await postJson("/api/call/dial", { number, task: task || null, preset_task: dialPresetHint });
     if (res.ok) {
       setToast("dialToast", "ok", t("call_sent"));
       if (task) { updateTaskPlaceholder(task); $("dialTask").value = ""; }

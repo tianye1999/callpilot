@@ -40,7 +40,7 @@ class FakeService:
         self.batch_result: dict = {"accepted": [], "rejected": []}
         self.queue: dict = {"pending": [], "current": None, "done": [], "active": False}
         # 通话相关高层方法的可控返回值（默认：无通话）。
-        self.dial_calls: list[tuple[str, str | None]] = []
+        self.dial_calls: list[tuple[str, str | None, str | None]] = []
         self.dial_result: tuple[bool, str | None] = (True, None)
         self.hangup_result: tuple[bool, str | None] = (True, None)
         self.dtmf_calls: list[str] = []
@@ -53,8 +53,10 @@ class FakeService:
     def dial_queue_status(self) -> dict:
         return dict(self.queue)
 
-    def dial(self, number: str, task: str | None = None) -> tuple[bool, str | None]:
-        self.dial_calls.append((number, task))
+    def dial(
+        self, number: str, task: str | None = None, preset_hint: str | None = None
+    ) -> tuple[bool, str | None]:
+        self.dial_calls.append((number, task, preset_hint))
         return self.dial_result
 
     def hangup(self) -> tuple[bool, str | None]:
@@ -725,7 +727,25 @@ def test_dial_delegates_and_validates():
         assert resp.status == 400
 
     api(app, fn)
-    assert service.dial_calls == [("10086", "催快递")]
+    assert service.dial_calls == [("10086", "催快递", None)]
+
+
+def test_dial_forwards_preset_hint():
+    """选中预设时 preset_task 作为命中键透传 service.dial；子主题走 task；非字符串→400。"""
+    service = FakeService()
+    app = make_app(service)
+
+    async def fn(client):
+        resp = await client.post(
+            "/api/call/dial",
+            json={"number": "12345", "task": "退休金怎么领取", "preset_task": "政务咨询"},
+        )
+        assert resp.status == 200
+        resp = await client.post("/api/call/dial", json={"number": "12345", "preset_task": 5})
+        assert resp.status == 400
+
+    api(app, fn)
+    assert service.dial_calls == [("12345", "退休金怎么领取", "政务咨询")]
 
 
 def test_dial_conflict_when_service_rejects():

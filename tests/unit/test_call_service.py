@@ -56,7 +56,7 @@ def test_dial_rejected_when_session_active(monkeypatch):
     service = make_service(modem)
     monkeypatch.setattr(
         service.session, "start",
-        lambda outbound_number=None, task=None: setattr(service.session, "_active", True),
+        lambda outbound_number=None, task=None, preset_hint=None: setattr(service.session, "_active", True),
     )
 
     ok, err = service.dial("13900000000")

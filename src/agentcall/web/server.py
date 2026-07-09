@@ -361,8 +361,12 @@ async def _dial(request: web.Request) -> web.Response:
     task = data.get("task")
     if task is not None and not isinstance(task, str):
         return web.json_response({"ok": False, "error": "task 必须是字符串"}, status=400)
+    # preset_task：选中预设时的命中键（事项框改成子主题也不影响命中）；手输时为 None。
+    preset_hint = data.get("preset_task")
+    if preset_hint is not None and not isinstance(preset_hint, str):
+        return web.json_response({"ok": False, "error": "preset_task 必须是字符串"}, status=400)
 
-    ok, err = service.dial(number, task=task)
+    ok, err = service.dial(number, task=task, preset_hint=preset_hint)
     if not ok:
         return web.json_response({"ok": False, "error": err}, status=409)
     return web.json_response({"ok": True})
