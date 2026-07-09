@@ -122,7 +122,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                secret=True, requires_restart=True),
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
                "qwen3.5-omni-flash-realtime", requires_restart=True),
-    ConfigSpec("QWEN_VOICE", "Qwen 音色", "str", "Raymond"),
+    # 精选常用音色做下拉;完整 55 种(含方言/多语言)见官网试听页,列表外音色
+    # 可直接在 .env 填 QWEN_VOICE(get_str 读环境变量,不受 choices 限制)。
+    ConfigSpec("QWEN_VOICE", "Qwen 音色", "select", "Raymond",
+               choices=("Raymond", "Ethan", "Tina", "Cindy", "Serena",
+                        "Harvey", "Maia", "Sunnybobi")),
     # 模型显示名只用于 /api/meta 与豆包自我介绍提示词，属内部项不进面板。
     # 显示名用语言中性的品牌名（Qwen/Doubao 是同款产品的国际名），
     # 避免英文界面右上角出现「通义千问」这类中文品牌串。
@@ -150,7 +154,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                secret=True, requires_restart=True),
     ConfigSpec("OPENAI_REALTIME_MODEL", "OpenAI 实时模型", "str",
                "gpt-realtime-mini", requires_restart=True),
-    ConfigSpec("OPENAI_VOICE", "OpenAI 音色", "str", "alloy"),
+    # OpenAI Realtime 全部 10 个音色(官方推荐 marin/cedar)。
+    ConfigSpec("OPENAI_VOICE", "OpenAI 音色", "select", "alloy",
+               choices=("alloy", "ash", "ballad", "coral", "echo",
+                        "sage", "shimmer", "verse", "marin", "cedar")),
     # 端点覆写（可选）：留空即直连 api.openai.com；仅在用反代/Azure OpenAI，
     # 或所在网络无法直连 OpenAI 时才需要填。
     ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",

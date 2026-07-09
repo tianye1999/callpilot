@@ -421,3 +421,17 @@ def test_editable_specs_covered_by_env_example():
     missing = [spec.key for spec in CONFIG_SPECS
                if spec.editable and spec.key not in keys]
     assert not missing, f".env.example 缺少可编辑配置项: {missing}"
+
+
+def test_voice_specs_are_selects_with_default_in_choices():
+    """音色改为下拉(select)：默认值必须在 choices 内，否则面板/写回校验不一致。"""
+    for key, expected_default in (("QWEN_VOICE", "Raymond"), ("OPENAI_VOICE", "alloy")):
+        spec = get_spec(key)
+        assert spec.kind == "select", key
+        assert spec.default == expected_default, key
+        assert expected_default in spec.choices, key
+    # OpenAI Realtime 全部 10 个音色齐全
+    assert set(get_spec("OPENAI_VOICE").choices) == {
+        "alloy", "ash", "ballad", "coral", "echo",
+        "sage", "shimmer", "verse", "marin", "cedar",
+    }
