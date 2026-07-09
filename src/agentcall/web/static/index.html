@@ -562,6 +562,14 @@
   .setup-field input:focus, .setup-field select:focus, .setup-field textarea:focus {
     outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-dim);
   }
+  .setup-key-help {
+    margin-top: 12px; padding: 10px 12px; border-radius: 10px;
+    background: var(--well); border: 1px solid var(--border);
+    color: var(--muted); font-size: 13px; line-height: 1.55;
+  }
+  .setup-key-help[hidden] { display: none; }
+  .setup-key-help a { color: var(--blue); text-decoration: none; font-weight: 700; }
+  .setup-key-help a:hover { text-decoration: underline; }
   .setup-status {
     margin-top: 12px; padding: 11px 12px; border-radius: 12px;
     background: var(--well); border: 1px solid var(--border); color: var(--muted); font-size: 13px;
@@ -822,6 +830,7 @@
               <input id="setupDoubaoAccessKey" type="password" autocomplete="off" spellcheck="false" />
             </div>
           </div>
+          <p class="setup-key-help" id="setupQwenKeyHelp"></p>
           <div style="margin-top:12px">
             <button class="btn ghost sm" id="setupValidateKey" data-i18n="setup_validate"></button>
           </div>
@@ -963,6 +972,11 @@ const I18N = {
     setup_usb: "USB module", setup_at: "AT port", setup_port: "Port",
     setup_hw_ok: "Hardware looks ready.", setup_hw_wait: "Hardware is not fully ready yet. You can continue and retry after plugging it in.",
     setup_key_title: "Provider API key", setup_key_hint: "Qwen and OpenAI keys are validated online before saving. The key is never echoed back.",
+    setup_qwen_key_help: {
+      before: "Qwen / DashScope API Key can be created for free in ",
+      link: "Alibaba Cloud Model Studio",
+      after: ". New users usually receive a free usage quota; after it expires or is exhausted, calls are billed at Alibaba Cloud pricing.",
+    },
     setup_provider: "Provider", setup_validate: "Validate key", setup_need_key: "Enter a key first.",
     setup_validating: "Validating…", setup_key_valid: "Key is valid.", setup_key_invalid: "Key is invalid.",
     setup_key_network: "Network unavailable or provider timed out.", setup_key_unsupported: "Online validation is not available for this provider.",
@@ -1075,6 +1089,11 @@ const I18N = {
     setup_usb: "USB 模组", setup_at: "AT 口", setup_port: "端口",
     setup_hw_ok: "硬件状态看起来已就绪。", setup_hw_wait: "硬件暂未完全就绪。你可以继续配置，插好后再重试。",
     setup_key_title: "Provider API Key", setup_key_hint: "Qwen 与 OpenAI 会先在线校验再保存；Key 不会被回显。",
+    setup_qwen_key_help: {
+      before: "Qwen / DashScope API Key：前往",
+      link: "阿里云百炼",
+      after: "免费创建；新用户通常有免费调用额度，额度用完或过期后将按阿里云价格计费。",
+    },
     setup_provider: "Provider", setup_validate: "校验 Key", setup_need_key: "请先填写 Key。",
     setup_validating: "正在校验…", setup_key_valid: "Key 有效。", setup_key_invalid: "Key 无效。",
     setup_key_network: "网络不通或 provider 超时。", setup_key_unsupported: "该 provider 暂不支持在线校验。",
@@ -1719,6 +1738,7 @@ const CFG_SUGGEST = {
 };
 let setupStep = 0;
 let setupValidated = false;
+const QWEN_API_KEY_URL = "https://bailian.console.aliyun.com/?tab=api#/api-key";
 const setupProviderKey = (provider) => provider === "openai" ? "OPENAI_API_KEY" : "DASHSCOPE_API_KEY";
 const setupVoiceKey = (provider) => provider === "openai" ? "OPENAI_VOICE" : "QWEN_VOICE";
 const cfgVal = (key) => (cfgSpecs.find((c) => c.key === key) || {}).value || "";
@@ -1837,6 +1857,7 @@ function renderSetupProviderFields() {
   document.querySelectorAll(".setup-doubao-field").forEach((node) => { node.style.display = doubao ? "" : "none"; });
   document.querySelectorAll(".setup-key-field").forEach((node) => { node.style.display = doubao ? "none" : ""; });
   $("setupValidateKey").style.display = doubao ? "none" : "";
+  renderSetupQwenKeyHelp(provider);
   $("setupApiKeyLabel").textContent = provider === "openai" ? "OpenAI API Key" : "DashScope API Key";
   const key = setupVoiceKey(provider);
   const choices = CFG_SUGGEST[key] || [];
@@ -1848,6 +1869,23 @@ function renderSetupProviderFields() {
     list.appendChild(opt);
   });
   if (doubao) setupStatus("setupKeyStatus", "", t("setup_doubao_note"));
+}
+
+function renderSetupQwenKeyHelp(provider) {
+  const box = $("setupQwenKeyHelp");
+  if (!box) return;
+  box.textContent = "";
+  box.hidden = provider !== "qwen";
+  if (provider !== "qwen") return;
+  const copy = t("setup_qwen_key_help");
+  box.appendChild(document.createTextNode(copy.before || ""));
+  const link = document.createElement("a");
+  link.href = QWEN_API_KEY_URL;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = copy.link || "Alibaba Cloud Model Studio";
+  box.appendChild(link);
+  box.appendChild(document.createTextNode(copy.after || ""));
 }
 
 async function validateSetupKey() {

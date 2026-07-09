@@ -20,10 +20,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -73,6 +75,17 @@ def web_url() -> str:
     return os.getenv("AGENTCALL_WEB_URL", DEFAULT_WEB_URL).rstrip("/")
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("环境变量 %s=%r 不是合法数字，使用默认值 %s", name, raw, default)
+        return default
+
+
 def probe_online(url: str, timeout: float = 2.0) -> bool:
     """探测 ``<url>/api/meta`` 是否 2xx（服务是否在线）。任何错误视为离线。"""
     try:
@@ -81,6 +94,18 @@ def probe_online(url: str, timeout: float = 2.0) -> bool:
             return 200 <= int(status) < 300
     except (urllib.error.URLError, OSError, ValueError):
         return False
+
+
+def fetch_setup_required(url: str, timeout: float = 2.0) -> bool | None:
+    """读取 ``<url>/api/meta`` 的 setup_required；探测不到时返回 None。"""
+    try:
+        with urllib.request.urlopen(f"{url.rstrip('/')}/api/meta", timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "setup_required" not in data:
+        return None
+    return bool(data["setup_required"])
 
 
 def status_label(online: bool, lang: str = "zh") -> str:
@@ -185,6 +210,41 @@ def dashboard_command(python_exe: str | None = None, frozen: bool | None = None)
     return [py, str(PROJECT_ROOT / "desktop_app.py")]
 
 
+def maybe_autoopen_dashboard(
+    url: str,
+    *,
+    wait: float,
+    poll_interval: float,
+    probe=probe_online,
+    fetch_setup_required_func=fetch_setup_required,
+    popen=subprocess.Popen,
+    dashboard_cmd_factory=dashboard_command,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> bool:
+    """首次未配置时自动打开一次控制台窗口；返回是否真的触发开窗。"""
+    deadline = monotonic() + max(wait, 0.0)
+    while True:
+        if probe(url):
+            setup_required = fetch_setup_required_func(url)
+            if setup_required is not True:
+                return False
+            try:
+                popen(dashboard_cmd_factory(), cwd=str(PROJECT_ROOT))
+            except OSError as exc:
+                logger.error("自动打开控制台失败: %s", exc)
+                return False
+            return True
+
+        now = monotonic()
+        if now >= deadline:
+            return False
+        sleep_for = min(max(poll_interval, 0.0), deadline - now)
+        if sleep_for <= 0:
+            return False
+        sleep(sleep_for)
+
+
 # ---- rumps 菜单栏胶水（薄层，惰性导入，仅 macOS）----
 
 def _import_rumps():
@@ -229,6 +289,12 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("launchd 自装失败: %s", exc)
         rumps.notification("CallPilot", "Background services failed", str(exc))
+
+    maybe_autoopen_dashboard(
+        web_url(),
+        wait=_env_float("AGENTCALL_TRAY_STARTUP_WAIT", 15.0),
+        poll_interval=_env_float("AGENTCALL_TRAY_POLL_INTERVAL", 0.5),
+    )
 
     class CallPilotTray(rumps.App):
         def __init__(self) -> None:

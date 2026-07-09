@@ -19,3 +19,13 @@ def test_settings_render_uses_choice_labels_for_provider_badges():
     text = INDEX.read_text(encoding="utf-8")
     assert "(c.choice_labels && c.choice_labels[ch]) || ch" in text
     assert '<option value="doubao">Doubao (experimental)</option>' in text
+
+
+def test_setup_qwen_key_help_has_safe_console_link():
+    text = INDEX.read_text(encoding="utf-8")
+    assert 'id="setupQwenKeyHelp"' in text
+    assert "QWEN_API_KEY_URL" in text
+    assert "https://bailian.console.aliyun.com/?tab=api#/api-key" in text
+    assert 'link.rel = "noopener noreferrer"' in text
+    assert "Qwen / DashScope API Key" in text
+    assert "免费调用额度" in text
