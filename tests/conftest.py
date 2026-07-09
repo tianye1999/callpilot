@@ -15,6 +15,7 @@ def _isolate_side_effects(tmp_path, monkeypatch):
     需要覆盖的测试可自行 monkeypatch.setenv/delenv（测试级优先于本 fixture）。
     """
     monkeypatch.setenv("CALL_LOG_DIR", str(tmp_path / "recordings"))
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(tmp_path / "number_profiles.json"))
     monkeypatch.setenv("SUMMARY_ENABLED", "false")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-dashscope-key")
     from agentcall.rate_limit import reset_sms_rate_limit_state

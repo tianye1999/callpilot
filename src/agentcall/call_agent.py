@@ -30,6 +30,7 @@ from .dtmf import dtmf_tone
 from .events import EventHub
 from .modem import Eg25Modem
 from .monitor_playback import MonitorPlayback
+from .number_profiles import lookup_profile
 from .prompt_gen import generate_prompt_scenario
 from .prompts import (
     agent_language,
@@ -564,7 +565,25 @@ class CallSession:
         self._wrap_up_reason = reason
 
     def _start_prompt_generation(self) -> None:
-        if not self._outbound_number or not config.get_bool("PROMPT_GEN_ENABLED"):
+        if not self._outbound_number:
+            return
+        number = self._outbound_number
+        lang = agent_language()
+        task = self._outbound_task(lang)
+        if config.get_bool("NUMBER_PROFILES_ENABLED"):
+            profile = lookup_profile(number, task)
+            if profile is not None:
+                self._prompt_gen_result = profile
+                self._prompt_gen_done.set()
+                logger.info(
+                    "命中预调教任务库: number=%s task=%s scenario=%.120s",
+                    number,
+                    task,
+                    profile.get("scenario") or "",
+                )
+                self._log_prompt_gen_result(profile)
+                return
+        if not config.get_bool("PROMPT_GEN_ENABLED"):
             return
         provider = (self.provider or config.get_str("AGENT_PROVIDER")).strip()
         credential_errors = config.validate_provider_credentials(provider)
@@ -574,13 +593,13 @@ class CallSession:
                 "；".join(credential_errors),
             )
             return
-        number = self._outbound_number
-        lang = agent_language()
-        task = self._outbound_task(lang)
         generation = self._prompt_gen_generation
 
         def worker() -> None:
             result = generate_prompt_scenario(number, task, lang, provider=provider)
+            result["source"] = "generated"
+            result["number"] = number
+            result["task"] = task
             if generation != self._prompt_gen_generation:
                 return
             self._prompt_gen_result = result
@@ -597,6 +616,8 @@ class CallSession:
     def _take_prompt_scenario(self) -> str | None:
         thread = self._prompt_gen_thread
         if thread is None:
+            if self._prompt_gen_done.is_set():
+                return self._apply_prompt_gen_result()
             return None
         wait_seconds = max(0.0, config.get_float("PROMPT_GEN_WAIT_SECONDS"))
         if not self._prompt_gen_done.wait(wait_seconds):
@@ -610,9 +631,15 @@ class CallSession:
                     "provider": self.provider or config.get_str("AGENT_PROVIDER"),
                     "model": config.get_str("PROMPT_GEN_MODEL"),
                     "cached": False,
+                    "source": "generated",
+                    "number": self._outbound_number or "",
+                    "task": self._outbound_task(agent_language()),
                 }
             )
             return None
+        return self._apply_prompt_gen_result()
+
+    def _apply_prompt_gen_result(self) -> str | None:
         result = self._prompt_gen_result or {}
         self._prompt_gen_opening = str(result.get("opening") or "")
         if result.get("ok") and str(result.get("scenario", "")).strip():
@@ -627,8 +654,14 @@ class CallSession:
         model = str(result.get("model") or "")
         provider = str(result.get("provider") or self.provider or "")
         cached = bool(result.get("cached"))
+        source = str(result.get("source") or "generated")
+        number = str(result.get("number") or self._outbound_number or "")
+        task = str(result.get("task") or self._outbound_task(agent_language()))
         if ok:
-            logger.info("动态场景提示词生成成功: %.120s", scenario)
+            if source == "profile":
+                logger.info("使用预调教场景提示词: %.120s", scenario)
+            else:
+                logger.info("动态场景提示词生成成功: %.120s", scenario)
         else:
             logger.info("动态场景提示词未使用: %s", error)
         record = self._record
@@ -642,6 +675,9 @@ class CallSession:
                 provider=provider,
                 model=model,
                 cached=cached,
+                source=source,
+                number=number,
+                task=task,
             )
 
     def _winddown_instructions(self) -> str:

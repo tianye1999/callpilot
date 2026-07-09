@@ -385,6 +385,7 @@ def test_batch_dial_dials_in_order(tmp_path, monkeypatch):
 
 def test_outbound_prompt_generation_injects_scenario_and_logs_event(tmp_path, monkeypatch):
     monkeypatch.setenv("PROMPT_GEN_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "false")
     monkeypatch.setenv("PROMPT_GEN_WAIT_SECONDS", "1")
     monkeypatch.setenv("AGENT_OUTBOUND_TASK", "查询流量")
     monkeypatch.setattr(config, "validate_provider_credentials", lambda provider: [])
@@ -428,11 +429,225 @@ def test_outbound_prompt_generation_injects_scenario_and_logs_event(tmp_path, mo
     assert prompt_events[0]["ok"] is True
     assert prompt_events[0]["scenario"] == "开场直接说查询流量，遇到菜单用短词。"
     assert prompt_events[0]["opening"] == "查一下本机流量"
+    assert prompt_events[0]["source"] == "generated"
     assert agent.said[0] == "请直接说：查一下本机流量"
+
+
+def test_outbound_prompt_generation_uses_number_profile_without_thread_or_model(
+    tmp_path, monkeypatch
+):
+    profile_file = tmp_path / "number_profiles.json"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "number": "10000",
+                        "task": "查询流量",
+                        "scenario": "预设策略：只说需求，菜单用短词。",
+                        "opening": "查流量",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profile_file))
+    monkeypatch.setenv("AGENT_OUTBOUND_TASK", "查询流量")
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "agentcall.call_agent.generate_prompt_scenario",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {
+            "ok": True,
+            "scenario": "不应生成",
+            "opening": "不应开场",
+            "error": None,
+            "provider": "qwen",
+            "model": "qwen-plus",
+            "cached": False,
+        },
+    )
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    service = make_service(modem, call_logger=CallLogger(tmp_path / "rec"))
+    ok, err = service.dial("10000")
+    assert ok, err
+    assert wait_until(lambda: ("dial", ("10000",)) in modem.calls)
+    assert service.session._prompt_gen_thread is None
+    modem.trigger_call_connected("10000")
+    assert wait_until(lambda: bridge.downlink)
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    assert calls == []
+    assert "本通场景与开场策略：预设策略：只说需求" in agent._session_instructions
+    assert agent.said[0] == "请直接说：查流量"
+    call_dir = sole_call_dir(tmp_path / "rec")
+    events = [
+        json.loads(line)
+        for line in (call_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    prompt_event = next(event for event in events if event["type"] == "prompt_gen")
+    assert prompt_event["source"] == "profile"
+    assert prompt_event["number"] == "10000"
+    assert prompt_event["task"] == "查询流量"
+    assert prompt_event["scenario"] == "预设策略：只说需求，菜单用短词。"
+
+
+def test_number_profiles_disabled_falls_back_to_dynamic_generation(tmp_path, monkeypatch):
+    profile_file = tmp_path / "number_profiles.json"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "number": "10000",
+                        "task": "查询流量",
+                        "scenario": "禁用时不应使用",
+                        "opening": "不应开场",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "false")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profile_file))
+    monkeypatch.setenv("AGENT_OUTBOUND_TASK", "查询流量")
+    monkeypatch.setattr(config, "validate_provider_credentials", lambda provider: [])
+    monkeypatch.setattr(
+        "agentcall.call_agent.generate_prompt_scenario",
+        lambda number, task, lang, **kwargs: {
+            "ok": True,
+            "scenario": "动态生成策略",
+            "opening": "动态开场",
+            "error": None,
+            "provider": "qwen",
+            "model": "qwen-plus",
+            "cached": False,
+        },
+    )
+
+    service = make_service(FakeModem(), call_logger=CallLogger(tmp_path / "rec"))
+    service.session._outbound_number = "10000"
+    service.session._outbound_task_value = "查询流量"
+    service.session._start_prompt_generation()
+    assert service.session._prompt_gen_thread is not None
+    service.session._prompt_gen_thread.join(timeout=1)
+
+    assert service.session._take_prompt_scenario() == "动态生成策略"
+    assert service.session._prompt_gen_opening == "动态开场"
+
+
+def test_number_profile_still_used_when_dynamic_generation_disabled(
+    tmp_path, monkeypatch
+):
+    profile_file = tmp_path / "number_profiles.json"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "number": "10000",
+                        "task": "查询流量",
+                        "scenario": "关动态生成也应使用预设",
+                        "opening": "查流量",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profile_file))
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "agentcall.call_agent.generate_prompt_scenario",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {
+            "ok": True,
+            "scenario": "不应生成",
+            "opening": "不应开场",
+            "error": None,
+            "provider": "qwen",
+            "model": "qwen-plus",
+            "cached": False,
+        },
+    )
+
+    service = make_service(FakeModem(), call_logger=CallLogger(tmp_path / "rec"))
+    service.session._outbound_number = "10000"
+    service.session._outbound_task_value = "查询流量"
+    service.session._start_prompt_generation()
+
+    assert service.session._prompt_gen_thread is None
+    assert calls == []
+    assert service.session._take_prompt_scenario() == "关动态生成也应使用预设"
+    assert service.session._prompt_gen_opening == "查流量"
+
+
+def test_dynamic_generation_disabled_and_profile_miss_falls_back_to_template(
+    tmp_path, monkeypatch
+):
+    profile_file = tmp_path / "number_profiles.json"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "number": "10000",
+                        "task": "查询流量",
+                        "scenario": "不匹配时不应使用",
+                        "opening": "不应开场",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profile_file))
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "agentcall.call_agent.generate_prompt_scenario",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {
+            "ok": True,
+            "scenario": "不应生成",
+            "opening": "不应开场",
+            "error": None,
+            "provider": "qwen",
+            "model": "qwen-plus",
+            "cached": False,
+        },
+    )
+
+    service = make_service(FakeModem(), call_logger=CallLogger(tmp_path / "rec"))
+    service.session._outbound_number = "10001"
+    service.session._outbound_task_value = "查询流量"
+    service.session._start_prompt_generation()
+
+    assert service.session._prompt_gen_thread is None
+    assert calls == []
+    assert service.session._take_prompt_scenario() is None
+    assert service.session._prompt_gen_opening == ""
 
 
 def test_outbound_prompt_generation_timeout_falls_back_to_template(tmp_path, monkeypatch):
     monkeypatch.setenv("PROMPT_GEN_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "false")
     monkeypatch.setenv("PROMPT_GEN_WAIT_SECONDS", "0.01")
     monkeypatch.setenv("AGENT_OUTBOUND_TASK", "查询流量")
     monkeypatch.setattr(config, "validate_provider_credentials", lambda provider: [])
@@ -486,6 +701,7 @@ def test_outbound_prompt_generation_skips_when_credentials_missing(
     tmp_path, monkeypatch, caplog
 ):
     monkeypatch.setenv("PROMPT_GEN_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "false")
     calls: list[tuple] = []
     monkeypatch.setattr(
         config,

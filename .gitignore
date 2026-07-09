@@ -5,6 +5,9 @@ __pycache__/
 
 # 运行时数据（含短信记录/日志，可能包含隐私）
 data/
+!data/
+data/*
+!data/number_profiles.example.json
 
 # 生成的音频文件
 *.wav
