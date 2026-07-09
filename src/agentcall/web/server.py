@@ -426,7 +426,9 @@ async def _queue_status(request: web.Request) -> web.Response:
 async def _number_profiles(request: web.Request) -> web.Response:
     if not config.get_bool("NUMBER_PROFILES_ENABLED"):
         return web.json_response({"profiles": []})
-    return web.json_response({"profiles": list_profiles()})
+    # UI 语言决定下拉里 label/task 的展示语言；缺省回退通话语言。
+    lang = request.query.get("lang", "").strip() or config.get_str("AGENT_LANGUAGE")
+    return web.json_response({"profiles": list_profiles(lang=lang)})
 
 
 async def _history(request: web.Request) -> web.Response:

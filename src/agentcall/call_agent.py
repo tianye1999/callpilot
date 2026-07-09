@@ -571,7 +571,7 @@ class CallSession:
         lang = agent_language()
         task = self._outbound_task(lang)
         if config.get_bool("NUMBER_PROFILES_ENABLED"):
-            profile = lookup_profile(number, task)
+            profile = lookup_profile(number, task, lang=lang)
             if profile is not None:
                 self._prompt_gen_result = profile
                 self._prompt_gen_done.set()

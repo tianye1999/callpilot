@@ -1,18 +1,21 @@
 {
-  "_comment": "Copy this file to data/number_profiles.json and edit locally. Lookup order: exact number+task first, then number-only fallback. If nothing matches, CallPilot falls back to dynamic prompt generation.",
+  "_comment": "Copy to data/number_profiles.json and edit locally. Each of label/task/scenario/opening may be a plain string OR a {zh,en} object. scenario/opening follow the call language (AGENT_LANGUAGE); label/task follow the UI language. Missing language falls back. Lookup: exact number+task first, then number-only, else dynamic generation.",
   "profiles": [
     {
-      "label": "公开客服 · 查询套餐",
       "number": "10000",
-      "task": "查询套餐使用情况",
-      "scenario": "你正替机主拨打公开客服热线办理查询事项。开场只说需求，不默认自我介绍；遇到菜单时用短词，并需要按键时调用 send_dtmf 工具真实发送。",
-      "opening": "查询套餐使用情况"
+      "task": {"zh": "查询套餐使用情况", "en": "check plan usage"},
+      "label": {"zh": "公开客服 · 查套餐", "en": "Hotline · Plan usage"},
+      "scenario": {
+        "zh": "你正替机主拨打公开客服热线办理查询事项。你是主叫、替机主求助的一方，不是客服、不冒充机主本人。开场只说需求、不自我介绍；遇语音菜单用短词，遇按键菜单调用 send_dtmf 工具真正按键；对方未明确给出结果前不编造、不声称已查到。",
+        "en": "You are calling a public service hotline on the owner's behalf. You are the caller asking for help — not an agent, never impersonate the owner. State the need directly, no self-introduction; short keywords to voice menus, call the send_dtmf tool for keypad menus; never fabricate or claim you have the result before it is given."
+      },
+      "opening": {"zh": "你好，我想查一下套餐使用情况。", "en": "Hi, I'd like to check the plan usage."}
     },
     {
-      "label": "公开客服 · 通用",
       "number": "10000",
+      "label": {"zh": "公开客服 · 通用", "en": "Hotline · General"},
       "scenario": "你正替机主联系公开客服热线办理通用事项。保持主叫求助立场，不冒充客服或机主本人；对方未明确给出结果前，不声称已经查到或办好。",
-      "opening": "办理业务"
+      "opening": "你好，我想咨询一件事。"
     }
   ]
 }

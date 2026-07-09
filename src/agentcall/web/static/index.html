@@ -1386,7 +1386,7 @@ function renderDialPresets() {
 }
 async function loadDialPresets() {
   try {
-    const r = await fetch("/api/number_profiles");
+    const r = await fetch(`/api/number_profiles?lang=${encodeURIComponent(LANG)}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     dialProfiles = Array.isArray(data.profiles) ? data.profiles.filter((profile) => profile && profile.number) : [];
@@ -2196,6 +2196,7 @@ function setLang(code) {
   loadHistory().then(loadRecent);  // 重渲染带翻译的动态列表
   loadConfig();
   refreshQueue();
+  loadDialPresets();  // 语言切换后重取预设，label/task 跟随界面语言
   if (window._lastTask) updateTaskPlaceholder(window._lastTask);
 }
 $("langBtn").addEventListener("click", (e) => {

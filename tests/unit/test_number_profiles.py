@@ -118,11 +118,73 @@ def test_list_profiles_handles_missing_and_bad_files(tmp_path):
     assert number_profiles.list_profiles(path=bad_json) == []
 
 
-def test_list_profiles_uses_english_general_fallback(tmp_path, monkeypatch):
+def test_list_profiles_uses_english_general_fallback(tmp_path):
     path = tmp_path / "number_profiles.json"
     write_profiles(path, [{"number": "10086", "scenario": "通用策略"}])
-    monkeypatch.setenv("AGENT_LANGUAGE", "en")
 
-    assert number_profiles.list_profiles(path=path) == [
+    assert number_profiles.list_profiles(path=path, lang="en") == [
         {"number": "10086", "task": "", "label": "10086 · general"}
     ]
+
+
+def test_bilingual_scenario_and_opening_by_call_lang(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [
+            {
+                "number": "10000",
+                "task": {"zh": "查流量", "en": "check data"},
+                "scenario": {"zh": "中文场景", "en": "English scenario"},
+                "opening": {"zh": "你好查流量", "en": "hi check data"},
+            }
+        ],
+    )
+
+    zh = number_profiles.lookup_profile("10000", "查流量", lang="zh", path=path)
+    en = number_profiles.lookup_profile("10000", "check data", lang="en", path=path)
+
+    assert zh is not None and zh["scenario"] == "中文场景" and zh["opening"] == "你好查流量"
+    assert en is not None and en["scenario"] == "English scenario" and en["opening"] == "hi check data"
+
+
+def test_bilingual_task_matches_either_language(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [{"number": "10000", "task": {"zh": "查流量", "en": "check data"}, "scenario": "策略"}],
+    )
+
+    assert number_profiles.lookup_profile("10000", "查流量", path=path) is not None
+    assert number_profiles.lookup_profile("10000", "check data", path=path) is not None
+
+
+def test_scenario_falls_back_to_other_language(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(path, [{"number": "10000", "task": "查流量", "scenario": {"zh": "只有中文"}}])
+
+    result = number_profiles.lookup_profile("10000", "查流量", lang="en", path=path)
+
+    assert result is not None
+    assert result["scenario"] == "只有中文"
+
+
+def test_list_profiles_label_and_task_by_ui_lang(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [
+            {
+                "number": "10000",
+                "task": {"zh": "查流量", "en": "check data"},
+                "label": {"zh": "电信·查流量", "en": "Telecom · Data"},
+                "scenario": "策略",
+            }
+        ],
+    )
+
+    zh = number_profiles.list_profiles(path=path, lang="zh")
+    en = number_profiles.list_profiles(path=path, lang="en")
+
+    assert zh == [{"number": "10000", "task": "查流量", "label": "电信·查流量"}]
+    assert en == [{"number": "10000", "task": "check data", "label": "Telecom · Data"}]
