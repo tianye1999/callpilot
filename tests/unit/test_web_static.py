@@ -47,3 +47,23 @@ def test_history_recording_players_stop_click_propagation():
     assert 'const box = el("div", "rec-audio");' in text
     assert 'box.addEventListener("click", (event) => event.stopPropagation());' in text
     assert 'a.addEventListener("click", (event) => event.stopPropagation());' in text
+
+
+def test_profile_manager_has_crud_controls_and_safe_rendering():
+    text = INDEX.read_text(encoding="utf-8")
+
+    for element_id in (
+        "page-profiles",
+        "profileList",
+        "profileSearch",
+        "profileNew",
+        "profileForm",
+        "profileSave",
+        "profileDelete",
+    ):
+        assert f'id="{element_id}"' in text
+    assert 'fetch("/api/number_profiles/manage")' in text
+    assert 'method: id ? "PATCH" : "POST"' in text
+    assert 'method: "DELETE"' in text
+    assert 'preset_id: dialPresetId' in text
+    assert 'title.appendChild(el("b", "", profileLangValue(profile, "label")' in text
