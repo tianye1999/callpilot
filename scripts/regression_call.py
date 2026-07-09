@@ -163,6 +163,10 @@ def check_no_repeat_stuck(transcripts: Sequence[Transcript]) -> CheckResult:
     for item in transcripts:
         if item.role != "agent":
             continue
+        # ≤4 字的礼貌短语（"您好""好的"）多次出现属正常电话应答，不算复读卡死；
+        # 8 轮稳定性采集中 2 次假阳性均为"您好"×3，完整语句复读才是要抓的信号。
+        if len(item.text.strip()) <= 4:
+            continue
         counts[item.text] = counts.get(item.text, 0) + 1
         if counts[item.text] >= 3:
             return CheckResult(

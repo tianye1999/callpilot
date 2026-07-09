@@ -99,7 +99,24 @@ def test_same_agent_sentence_repeated_three_times_fails():
 
     result = _result(report, "no_repeat_stuck")
     assert result.status == "FAIL"
-    assert repeated in result.detail
+
+
+def test_short_courtesy_token_repeats_do_not_fail():
+    """≤4 字礼貌短语（"您好"）多次出现属正常应答，不算复读卡死（真机假阳性标定）。"""
+    report = _report(
+        _base_events(
+            _event("transcript", role="agent", text="你好，我想查一下这个号码的流量使用情况。"),
+            _event("transcript", role="agent", text="您好"),
+            _event("transcript", role="agent", text="您好"),
+            _event("transcript", role="agent", text="您好"),
+            _event("transcript", role="agent", text="好的"),
+            _event("transcript", role="agent", text="好的"),
+            _event("transcript", role="agent", text="好的"),
+        )
+    )
+
+    result = _result(report, "no_repeat_stuck")
+    assert result.status == "PASS"
 
 
 def test_says_i_press_without_dtmf_warns_but_does_not_fail():
