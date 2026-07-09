@@ -34,6 +34,15 @@ STATIC_DIR = Path(__file__).parent / "static"
 _CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+def _ensure_setup_sms_token(app: web.Application) -> str | None:
+    token_box = app.get("setup_sms_token")
+    if not token_box:
+        return None
+    if not token_box[0]:
+        token_box[0] = secrets.token_urlsafe(24)
+    return str(token_box[0])
+
+
 def _bundled_libusb_path() -> Path | None:
     base = getattr(sys, "_MEIPASS", None)
     if not base:
@@ -233,9 +242,9 @@ async def _meta(request: web.Request) -> web.Response:
         "modem_connected": bool(getattr(service, "modem_connected", False)),
         "port": meta.get("port") or config.get_str("MODEM_PORT"),
     }
-    setup_sms_token = request.app.get("setup_sms_token") or [None]
-    if not config.get_bool("SETUP_DONE") and setup_sms_token[0]:
-        meta["setup_sms_token"] = setup_sms_token[0]
+    setup_sms_token = _ensure_setup_sms_token(request.app)
+    if setup_sms_token:
+        meta["setup_sms_token"] = setup_sms_token
     return web.json_response(meta)
 
 
@@ -633,7 +642,7 @@ async def _setup_test_sms(request: web.Request) -> web.Response:
     token = str(data.get("token") or "")
     token_box = request.app.get("setup_sms_token") or [None]
     expected_token = token_box[0]
-    if config.get_bool("SETUP_DONE") or not expected_token or token != expected_token:
+    if not expected_token or token != expected_token:
         return web.json_response(
             {"ok": False, "error": "测试短信令牌无效或已使用"}, status=403
         )
