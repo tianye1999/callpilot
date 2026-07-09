@@ -11,9 +11,9 @@ caller with a realtime voice AI, places outbound calls, sends/receives SMS,
 navigates IVR menus (DTMF), and records + summarizes every call — all on your
 own hardware and API keys.
 
-> **Status: Mac Beta (v0.2).** Runs on macOS with a Quectel EC20 today. Developers
-> can run from source; regular users can install the unsigned macOS DMG from a
-> GitHub Release once attached. See [Roadmap](docs/roadmap.md).
+> **Status: Mac Beta (v0.4.0).** Runs on macOS with a Quectel EC20 today.
+> Developers can run from source; regular users can install the signed,
+> notarized macOS DMG from the latest GitHub Release. See [Roadmap](docs/roadmap.md).
 
 [English](#english) · [中文](#中文)
 
@@ -42,6 +42,24 @@ Phone call → EC20 modem ──(AT: RING/ATA/CLCC)── CallPilot
   SMS send/receive (Chinese UCS2), AI tool-calling (send SMS / hang up / read OTP /
   **DTMF keypad**), per-call recording + latency metrics + LLM summary, live
   transcript, local speaker monitoring, bilingual (English/Chinese) desktop UI.
+
+v0.4.0 adds several call-quality controls for outbound work:
+
+- **Task preset library:** copy [`data/number_profiles.example.json`](data/number_profiles.example.json)
+  to local `data/number_profiles.json` and tune prompts per number + task. The
+  dial panel shows these presets; every `label` / `task` / `scenario` /
+  `opening` field can be either a string or a `{zh,en}` object.
+- **Preset dialing with sub-topics:** choosing a preset fills the number and
+  topic, while the topic box stays editable for the exact sub-topic of this call
+  without losing the preset match.
+- **Dynamic scenario prompts:** when no preset matches, a lightweight text model
+  can draft the call scenario and opening before connection (`PROMPT_GEN_*`).
+- **More IVR control:** DTMF is in-band by default (`DTMF_MODE=inband`), so keypad
+  tones are synthesized into the call audio path. Experimental manual response
+  control (`MANUAL_RESPONSE_CONTROL=false` by default) can merge long IVR menu
+  speech before the AI replies once.
+- **Voice settings:** Settings includes Qwen/OpenAI voice pickers with official
+  preview links, plus `VOICE_STYLE` for a free-text speaking-style hint.
 
 ### Hardware & platform support
 
@@ -86,14 +104,13 @@ or Taobao for "EC20 USB adapter".
 
 ### Install for regular users (macOS DMG)
 
-Download `CallPilot.dmg` from GitHub Releases, open it, and drag
-`CallPilot.app` to `/Applications`. The DMG is built by
-[`packaging/build_installer.sh`](packaging/build_installer.sh); release builds
-will attach the generated `dist/CallPilot.dmg`.
-
-Unsigned builds are blocked by Gatekeeper the first time. Right-click
-`CallPilot.app` in `/Applications`, choose **Open**, and confirm once; later
-launches can use the normal double-click/open flow.
+Download `CallPilot.dmg` from the
+[latest GitHub Release](https://github.com/tianye1999/callpilot/releases/latest),
+open it, and drag `CallPilot.app` to `/Applications`. Official release DMGs are
+signed with Developer ID, notarized, and stapled, so Gatekeeper should allow the
+normal open flow without right-clicking. The DMG is built by
+[`packaging/build_installer.sh`](packaging/build_installer.sh), which also
+verifies the signed/notarized artifact when release signing variables are set.
 
 On first launch, open <http://127.0.0.1:47100> from the menu bar app. The setup
 wizard guides you through hardware status, provider credentials, owner/persona
@@ -138,6 +155,12 @@ AGENT_LANGUAGE=en           # language the AI speaks on calls & summaries (zh|en
 Then open <http://127.0.0.1:47100> and follow the first-run wizard, or edit
 `.env` manually if you prefer. Call the modem's SIM number — the AI should
 auto-answer. All settings are editable live in the **Settings** panel of the UI.
+For the full configuration list, keep [`.env.example`](.env.example) as the
+source of truth; v0.4.0 options there include `NUMBER_PROFILES_ENABLED`,
+`NUMBER_PROFILES_FILE`, `PROMPT_GEN_ENABLED`, `PROMPT_GEN_MODEL`,
+`PROMPT_GEN_TIMEOUT`, `PROMPT_GEN_WAIT_SECONDS`, `DTMF_MODE`,
+`MANUAL_RESPONSE_CONTROL`, `MANUAL_RESPONSE_SILENCE_MS`,
+`MANUAL_RESPONSE_MAX_WAIT_MS`, `QWEN_VOICE`, `OPENAI_VOICE`, and `VOICE_STYLE`.
 
 ### Quick start (Windows) — awaiting hardware reports
 
@@ -185,17 +208,20 @@ On macOS `CallPilot.app` is a **menu-bar app**: a phone icon sits in the menu ba
 (green = service running, gray = stopped) with *Open dashboard / Restart service /
 Quit*. `scripts/build_app.sh` builds a thin app over your local checkout for
 development. `packaging/build_installer.sh` builds the standalone DMG with the
-runtime and native dependencies bundled; signing and notarization are optional
-and still pending for official distribution.
+runtime and native dependencies bundled; official release builds set signing and
+notarization variables so the app + DMG are Developer ID signed, notarized,
+stapled, and self-verified.
 
 ### Verify it works, without a human on the line
 
 - **Dial your own mobile**: the simplest check — pick up and you hear the AI talk.
 - **Dial your carrier's customer-service hotline** (an IVR that speaks back): if the AI
   holds a coherent multi-turn exchange with the voice menu, both audio directions work.
-  `10000` is one carrier's service hotline; use whatever hotline your carrier provides.
 - **SMS a balance query to your carrier's service number**: you should receive a reply
   SMS — proves send + receive, including non-ASCII (UCS2) decoding.
+- **Run the hardware regression script**: `.venv/bin/python scripts/regression_call.py --task "check plan usage"`
+  places one test call through the local web API, waits for the recording, and
+  exits PASS/FAIL; add `--no-dial` to replay the latest recording instead.
 
 ### Troubleshooting
 
@@ -213,8 +239,8 @@ and still pending for official distribution.
 
 **Read before using on a real line.**
 
-- **Not for emergency calls.** Do not rely on CallPilot for 110/119/911 or any
-  life-safety communication.
+- **Not for emergency calls.** Do not rely on CallPilot for any life-safety
+  communication.
 - **Recording laws vary by jurisdiction** — call recording is **on by default**
   and stored locally only; disable it in Settings or with
   `RECORDING_ENABLED=false`. You are responsible for obtaining any consent the
@@ -254,6 +280,19 @@ Quectel EC20/EG25，来电自动接听并与对方对话，可外呼、收发短
   （发短信/挂断/查验证码/**DTMF 按键**）、通话录音+摘要、实时转写、本机监听、
   中英双语桌面界面。
 
+v0.4.0 增加了几项面向外呼质量的控制：
+
+- **预调教任务库**：把 [`data/number_profiles.example.json`](data/number_profiles.example.json)
+  复制为本地 `data/number_profiles.json`，按「号码+任务」精调提示词；拨号面板会显示下拉预设，
+  `label` / `task` / `scenario` / `opening` 字段均可写普通字符串或 `{zh,en}` 双语对象。
+- **拨号下拉 + 子主题**：选择预设会自动填号码和事项，事项框仍可改成本通的具体子主题，
+  同时保留预设命中。
+- **动态场景提示词**：预设未命中时，可在接通前用轻量文本模型生成本通场景与开场白
+  （`PROMPT_GEN_*` 配置）。
+- **更稳的 IVR 控制**：DTMF 默认走带内音频（`DTMF_MODE=inband`），按键音直接合成进通话音频流；
+  实验性的手动应答控制默认关闭（`MANUAL_RESPONSE_CONTROL=false`），可把连续 IVR 菜单合并后再让 AI 回复一次。
+- **音色设置**：设置面板提供 Qwen/OpenAI 音色下拉和官网试听链接，`VOICE_STYLE` 可补充自由文本说话风格。
+
 ### 硬件与平台支持
 
 | 项 | 状态 |
@@ -288,12 +327,11 @@ macOS 没有 Quectel 厂商串口的原生设备，需先跑 USB→PTY 桥（`sc
 
 ### 普通用户安装（macOS DMG）
 
-从 GitHub Releases 下载 `CallPilot.dmg`，打开后把 `CallPilot.app` 拖到
-`/Applications`。这个 DMG 由 [`packaging/build_installer.sh`](packaging/build_installer.sh)
-构建，发布时会附带生成的 `dist/CallPilot.dmg`。
-
-未签名构建首次启动会被 Gatekeeper 拦截：在 `/Applications` 里右键
-`CallPilot.app` → **打开**，确认一次；之后即可正常双击/打开。
+从 [最新 GitHub Release](https://github.com/tianye1999/callpilot/releases/latest)
+下载 `CallPilot.dmg`，打开后把 `CallPilot.app` 拖到 `/Applications`。官方发布 DMG
+已用 Developer ID 签名、完成公证并 staple，Gatekeeper 应可直接按正常方式打开，无需右键。
+这个 DMG 由 [`packaging/build_installer.sh`](packaging/build_installer.sh) 构建；发布签名变量
+存在时脚本也会自检签名、公证与 staple 状态。
 
 首次启动后，从菜单栏 App 打开 <http://127.0.0.1:47100>。首启向导会引导检查硬件、
 填写 provider 凭证、设置机主/人设，并可发送一条测试短信；普通安装无需手改 `.env`。
@@ -324,6 +362,11 @@ cp .env.example .env          # 编辑 .env
 
 打开 <http://127.0.0.1:47100> 跟随首启向导，或按上方英文段手动写最小 `.env`。
 之后拨打模组 SIM 卡号码即可，AI 应自动接听；所有配置都能在界面「设置」面板里实时修改。
+完整配置以 [`.env.example`](.env.example) 为准；v0.4.0 新增/相关项包括
+`NUMBER_PROFILES_ENABLED`、`NUMBER_PROFILES_FILE`、`PROMPT_GEN_ENABLED`、
+`PROMPT_GEN_MODEL`、`PROMPT_GEN_TIMEOUT`、`PROMPT_GEN_WAIT_SECONDS`、`DTMF_MODE`、
+`MANUAL_RESPONSE_CONTROL`、`MANUAL_RESPONSE_SILENCE_MS`、`MANUAL_RESPONSE_MAX_WAIT_MS`、
+`QWEN_VOICE`、`OPENAI_VOICE`、`VOICE_STYLE`。
 
 ### 快速开始（Windows）—— 待硬件复现反馈
 
@@ -369,12 +412,16 @@ macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=
 灰=已停止），菜单含「打开控制台 / 重启服务 / 退出」。它只是本地代码仓库的薄壳
 控制面板——接电话的服务在后台常驻（launchd），关掉面板窗口不影响接打电话。
 `scripts/build_app.sh` 适合开发调试；`packaging/build_installer.sh` 会把 runtime 和原生依赖
-打进独立 DMG。官方分发仍缺签名与公证。
+打进独立 DMG；官方发布构建会设置签名与公证变量，使 App + DMG 完成 Developer ID
+签名、公证、staple 和自检。
 
 ### 无需真人也能自测
 
-- **拨 `10000`**（电信 IVR）：若 AI 能与语音菜单连贯多轮对话，说明双向语音都通。
-- **发「查余额」短信到 `10000`**：会收到回复短信，验证发+收+中文编解码全链路。
+- **拨你的运营商客服/IVR 热线**：若 AI 能与语音菜单连贯多轮对话，说明双向语音都通。
+- **向运营商服务号发送余额查询短信**：会收到回复短信，验证发+收+中文编解码全链路。
+- **跑真机回归脚本**：`.venv/bin/python scripts/regression_call.py --task "查询套餐使用情况"`
+  会通过本地 Web API 发起一通测试外呼、等待录音并以 PASS/FAIL 退出；加 `--no-dial`
+  可直接回放最近一通录音。
 
 ### 排障
 
