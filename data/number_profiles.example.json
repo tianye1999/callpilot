@@ -2,6 +2,7 @@
   "_comment": "Public hotline seed presets for first run. Copy to data/number_profiles.json and edit locally. Each of label/task/scenario/opening may be a plain string OR a {zh,en} object. scenario/opening follow the call language (AGENT_LANGUAGE); label/task follow the UI language. Missing language falls back. Lookup: exact number+task first, then number-only, else dynamic generation. Keep committed seeds limited to public service numbers; do not add private phone numbers or real names.",
   "profiles": [
     {
+      "id": "china_telecom_data",
       "number": "10000",
       "task": {"zh": "咨询流量使用情况", "en": "check data usage"},
       "label": {"zh": "中国电信·查流量", "en": "China Telecom · Data usage"},
@@ -12,6 +13,7 @@
       "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."}
     },
     {
+      "id": "china_telecom_balance",
       "number": "10000",
       "task": {"zh": "查询话费余额", "en": "check account balance"},
       "label": {"zh": "中国电信·查话费", "en": "China Telecom · Balance"},
@@ -22,6 +24,7 @@
       "opening": {"zh": "你好，我想查一下这个号码的话费余额。", "en": "Hi, I'd like to check the balance."}
     },
     {
+      "id": "china_mobile_data",
       "number": "10086",
       "task": {"zh": "咨询流量使用情况", "en": "check data usage"},
       "label": {"zh": "中国移动·查流量", "en": "China Mobile · Data usage"},
@@ -32,6 +35,7 @@
       "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."}
     },
     {
+      "id": "china_unicom_data",
       "number": "10010",
       "task": {"zh": "咨询流量使用情况", "en": "check data usage"},
       "label": {"zh": "中国联通·查流量", "en": "China Unicom · Data usage"},
@@ -42,6 +46,7 @@
       "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."}
     },
     {
+      "id": "icbc_card_statement",
       "number": "95588",
       "task": {"zh": "查询信用卡账单", "en": "check credit card statement"},
       "label": {"zh": "工商银行·查信用卡账单", "en": "ICBC · Card statement"},
@@ -52,6 +57,7 @@
       "opening": {"zh": "你好，我想查一下信用卡账单。", "en": "Hi, I'd like to check card statement."}
     },
     {
+      "id": "ccb_card_statement",
       "number": "95533",
       "task": {"zh": "查询信用卡账单", "en": "check credit card statement"},
       "label": {"zh": "建设银行·查信用卡账单", "en": "CCB · Card statement"},
@@ -62,6 +68,7 @@
       "opening": {"zh": "你好，我想查一下信用卡账单。", "en": "Hi, I'd like to check card statement."}
     },
     {
+      "id": "cmb_card_statement",
       "number": "95555",
       "task": {"zh": "查询信用卡账单", "en": "check credit card statement"},
       "label": {"zh": "招商银行·查信用卡账单", "en": "CMB · Card statement"},
@@ -72,6 +79,7 @@
       "opening": {"zh": "你好，我想查一下信用卡账单。", "en": "Hi, I'd like to check card statement."}
     },
     {
+      "id": "boc_card_statement",
       "number": "95566",
       "task": {"zh": "查询信用卡账单", "en": "check credit card statement"},
       "label": {"zh": "中国银行·查信用卡账单", "en": "Bank of China · Card statement"},
@@ -82,6 +90,7 @@
       "opening": {"zh": "你好，我想查一下信用卡账单。", "en": "Hi, I'd like to check card statement."}
     },
     {
+      "id": "consumer_complaint_12315",
       "number": "12315",
       "task": {"zh": "消费投诉举报", "en": "file a consumer complaint"},
       "label": {"zh": "12315·消费投诉", "en": "12315 · Consumer complaint"},
@@ -92,6 +101,7 @@
       "opening": {"zh": "你好，我想反映一个消费投诉问题。", "en": "Hi, I'd like to file a complaint."}
     },
     {
+      "id": "government_service_12345",
       "number": "12345",
       "task": {"zh": "政务咨询", "en": "government service enquiry"},
       "label": {"zh": "12345·政务咨询", "en": "12345 · Gov service"},

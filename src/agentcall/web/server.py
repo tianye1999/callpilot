@@ -22,7 +22,16 @@ from ..audio_bridge import apply_pcm_gain
 from ..contacts import is_reply_target_allowed
 from ..events import EventHub
 from ..modem import Eg25Modem
-from ..number_profiles import list_profiles
+from ..number_profiles import (
+    ProfileConflictError,
+    ProfileNotFoundError,
+    ProfileValidationError,
+    create_profile,
+    delete_profile,
+    list_managed_profiles,
+    list_profiles,
+    update_profile,
+)
 from ..port_detect import QUECTEL_VID
 from ..rate_limit import acquire_sms_send_slot
 
@@ -207,6 +216,10 @@ def build_app(
     app.router.add_post("/api/call/batch_dial", _batch_dial)
     app.router.add_get("/api/call/queue", _queue_status)
     app.router.add_get("/api/number_profiles", _number_profiles)
+    app.router.add_get("/api/number_profiles/manage", _number_profiles_manage)
+    app.router.add_post("/api/number_profiles", _number_profiles_create)
+    app.router.add_patch("/api/number_profiles/{profile_id}", _number_profiles_update)
+    app.router.add_delete("/api/number_profiles/{profile_id}", _number_profiles_delete)
     app.router.add_get("/api/history", _history)
     app.router.add_delete("/api/history", _history_clear)
     app.router.add_post("/api/history/{call_id}", _history_delete)
@@ -374,8 +387,20 @@ async def _dial(request: web.Request) -> web.Response:
     preset_hint = data.get("preset_task")
     if preset_hint is not None and not isinstance(preset_hint, str):
         return web.json_response({"ok": False, "error": "preset_task 必须是字符串"}, status=400)
+    preset_id = data.get("preset_id")
+    if preset_id is not None and (
+        not isinstance(preset_id, str)
+        or len(preset_id) > 64
+        or not _CALL_ID_RE.fullmatch(preset_id)
+    ):
+        return web.json_response({"ok": False, "error": "preset_id 格式不合法"}, status=400)
 
-    ok, err = service.dial(number, task=task, preset_hint=preset_hint)
+    ok, err = service.dial(
+        number,
+        task=task,
+        preset_hint=preset_hint,
+        preset_id=preset_id,
+    )
     if not ok:
         return web.json_response({"ok": False, "error": err}, status=409)
     return web.json_response({"ok": True})
@@ -441,7 +466,64 @@ async def _number_profiles(request: web.Request) -> web.Response:
         return web.json_response({"profiles": []})
     # UI 语言决定下拉里 label/task 的展示语言；缺省回退通话语言。
     lang = request.query.get("lang", "").strip() or config.get_str("AGENT_LANGUAGE")
-    return web.json_response({"profiles": list_profiles(lang=lang)})
+    return web.json_response({"profiles": list_profiles(lang=lang, include_id=True)})
+
+
+async def _number_profiles_manage(request: web.Request) -> web.Response:
+    loop = asyncio.get_running_loop()
+    profiles = await loop.run_in_executor(None, list_managed_profiles)
+    return web.json_response(
+        {
+            "ok": True,
+            "enabled": config.get_bool("NUMBER_PROFILES_ENABLED"),
+            "profiles": profiles,
+        }
+    )
+
+
+def _profile_error(exc: Exception) -> web.Response:
+    if isinstance(exc, ProfileConflictError):
+        status = 409
+    elif isinstance(exc, ProfileNotFoundError):
+        status = 404
+    else:
+        status = 400
+    return web.json_response({"ok": False, "error": str(exc)}, status=status)
+
+
+async def _number_profiles_create(request: web.Request) -> web.Response:
+    data = await read_json(request)
+    loop = asyncio.get_running_loop()
+    try:
+        profile = await loop.run_in_executor(None, partial(create_profile, data))
+    except (ProfileValidationError, ProfileConflictError) as exc:
+        return _profile_error(exc)
+    return web.json_response({"ok": True, "profile": profile}, status=201)
+
+
+async def _number_profiles_update(request: web.Request) -> web.Response:
+    data = await read_json(request)
+    profile_id = request.match_info["profile_id"]
+    loop = asyncio.get_running_loop()
+    try:
+        profile = await loop.run_in_executor(
+            None, partial(update_profile, profile_id, data)
+        )
+    except (ProfileValidationError, ProfileConflictError, ProfileNotFoundError) as exc:
+        return _profile_error(exc)
+    return web.json_response({"ok": True, "profile": profile})
+
+
+async def _number_profiles_delete(request: web.Request) -> web.Response:
+    profile_id = request.match_info["profile_id"]
+    loop = asyncio.get_running_loop()
+    try:
+        deleted = await loop.run_in_executor(None, partial(delete_profile, profile_id))
+    except ProfileValidationError as exc:
+        return _profile_error(exc)
+    if not deleted:
+        return _profile_error(ProfileNotFoundError("预设任务不存在或已被删除"))
+    return web.json_response({"ok": True})
 
 
 async def _history(request: web.Request) -> web.Response:
