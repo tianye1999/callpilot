@@ -317,3 +317,52 @@ def test_import_webview_missing(monkeypatch, capsys):
         desktop_app._import_webview()
     assert exc_info.value.code == 1
     assert "pywebview" in capsys.readouterr().err
+
+
+def test_activate_macos_app_calls_appkit_on_macos(monkeypatch):
+    calls = []
+
+    class FakeApp:
+        def activateIgnoringOtherApps_(self, value):
+            calls.append(value)
+
+    class FakeNSApplication:
+        @staticmethod
+        def sharedApplication():
+            return FakeApp()
+
+    monkeypatch.setattr(desktop_app.platforms, "IS_MACOS", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "AppKit",
+        types.SimpleNamespace(NSApplication=FakeNSApplication),
+    )
+
+    assert desktop_app.activate_macos_app()
+    assert calls == [True]
+
+
+def test_activate_macos_app_skips_non_macos(monkeypatch):
+    monkeypatch.setattr(desktop_app.platforms, "IS_MACOS", False)
+
+    assert not desktop_app.activate_macos_app()
+
+
+def test_activate_hook_registers_injected_action_on_window_shown():
+    callbacks = []
+
+    class FakeEvent:
+        def __iadd__(self, callback):
+            callbacks.append(callback)
+            return self
+
+    window = types.SimpleNamespace(
+        events=types.SimpleNamespace(shown=FakeEvent())
+    )
+    activated = []
+
+    desktop_app._activate_on_window_shown(window, activate=lambda: activated.append(True))
+
+    assert len(callbacks) == 1
+    callbacks[0]()
+    assert activated == [True]

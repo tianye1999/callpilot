@@ -1,14 +1,15 @@
 """发短信目标限制:只允许回复「已联系过的号码」。
 
 安全护栏:防止 AI 被话术注入诱导给任意陌生号码群发短信,也防止无鉴权的
-Web 接口被 CSRF 利用发信。允许的目标 = 收到过短信的号码 ∪ 所有来电方,
-外加当前通话对端(通话中可回短信,此时对方可能还没进落盘记录)。
+Web 接口被 CSRF 利用发信。允许的目标 = 收到过短信的号码 ∪ 所有来电方
+∪ 已接通的外呼号码,外加当前通话对端(通话中可回短信,此时对方可能还没进落盘记录)。
 
 数据源都取自「落盘、重启存活」的记录:
 - 收到过短信的号码:``EventHub.history()`` 里 ``type == "sms_in"`` 的 ``sender``。
   EventHub 启动时会从 ``messages.json`` 把历史短信载回 history,故跨重启存活。
 - 所有来电方:``CallLogger.inbound_numbers()``——扫描全部通话目录取 inbound 的
   ``number``(不设窗口上限,避免大量外呼把老来电方挤出导致合法回复被误拒)。
+- 已接通外呼:``CallLogger.answered_outbound_numbers()``——只认有 answered 事件的外呼。
 
 号码只做 strip 比对,不改写国家码——宁可漏放行(可退回不发)也不误放行。
 """
@@ -33,7 +34,7 @@ def known_contact_numbers(
     hub: "EventHub | None",
     call_logger: "CallLogger | None",
 ) -> set[str]:
-    """返回已联系过的号码集合:收到过短信的发件方 ∪ 所有来电方(inbound)。
+    """返回已联系过的号码集合:短信发件方 ∪ 来电方 ∪ 已接通外呼。
 
     任一数据源读取失败只告警并跳过(宁可少放行),不影响另一源与整体判定。
     """
@@ -62,6 +63,18 @@ def known_contact_numbers(
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取来电历史用于联系人判定失败: %s", exc)
 
+    answered_outbound_numbers: Callable[[], set] | None = getattr(
+        call_logger, "answered_outbound_numbers", None
+    )
+    if callable(answered_outbound_numbers):
+        try:
+            for number in answered_outbound_numbers():
+                num = _norm(number)
+                if num:
+                    numbers.add(num)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取已接通外呼历史用于联系人判定失败: %s", exc)
+
     return numbers
 
 
@@ -76,7 +89,7 @@ def is_reply_target_allowed(
 
     放行条件(满足其一):
     - 等于 ``extra_allowed``(当前通话对端,通话中可直接回短信);
-    - 是收到过短信的号码,或任一来电方。
+    - 是收到过短信的号码、任一来电方,或已接通的外呼号码。
 
     空号码一律拒绝。
     """

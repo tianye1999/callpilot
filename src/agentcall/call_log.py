@@ -91,6 +91,7 @@ class CallRecord:
         # 长通话时 extend 会在锁内触发大 buffer 扩容拷贝，造成音频抖动。
         self._uplink: list[bytes] = []
         self._downlink: list[bytes] = []
+        self._answered = False
         self._finished = False
 
     # ---- 热路径：只做内存追加 ----
@@ -105,6 +106,8 @@ class CallRecord:
         line = json.dumps(event, ensure_ascii=False, default=str)
         with self._lock:
             if not self._finished:
+                if type == "answered":
+                    self._answered = True
                 self._event_lines.append(line)
                 return
         # 已经 finish：直接落盘（低频路径）。
@@ -164,6 +167,7 @@ class CallRecord:
             self._event_lines = []
             uplink = b"".join(self._uplink)
             downlink = b"".join(self._downlink)
+            answered = self._answered
             self._uplink = []
             self._downlink = []
 
@@ -184,6 +188,7 @@ class CallRecord:
                 "ended_at": ended_at,
                 "duration": round(ended_at - self.started_at, 3),
                 "status": status,
+                "answered": answered,
                 "events": len(event_lines),
                 "recording_enabled": self.recording_enabled,
                 "uplink_bytes": len(uplink),
@@ -336,6 +341,45 @@ class CallLogger:
             if isinstance(number, str) and number.strip():
                 numbers.add(number.strip())
         return numbers
+
+    def answered_outbound_numbers(self) -> set[str]:
+        """已真正接通过的外呼号码集合，供发短信目标校验用。"""
+        numbers: set[str] = set()
+        if not self.base_dir.is_dir():
+            return numbers
+        for path in self.base_dir.iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(meta, dict) or meta.get("direction") != "outbound":
+                continue
+            number = meta.get("number")
+            if not isinstance(number, str) or not number.strip():
+                continue
+            answered = meta.get("answered")
+            if answered is True or (
+                "answered" not in meta and self._legacy_events_include_answered(path)
+            ):
+                numbers.add(number.strip())
+        return numbers
+
+    @staticmethod
+    def _legacy_events_include_answered(path: Path) -> bool:
+        try:
+            with (path / "events.jsonl").open(encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict) and event.get("type") == "answered":
+                        return True
+        except (OSError, UnicodeDecodeError):
+            return False
+        return False
 
     def purge_expired(self) -> int:
         """删除超过保留期的通话目录，返回删除数量；retention_days<=0 不清理。"""

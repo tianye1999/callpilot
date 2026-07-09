@@ -175,7 +175,9 @@ chmod +x "$APP_PATH/Contents/Resources/bin/$(basename "$FFMPEG_BIN")" 2>/dev/nul
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
     info "codesigning with identity: $CODESIGN_IDENTITY"
-    codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP_PATH"
+    codesign --force --deep --options runtime --timestamp \
+      --entitlements "$ROOT/packaging/entitlements.plist" \
+      --sign "$CODESIGN_IDENTITY" "$APP_PATH"
 else
     info "CODESIGN_IDENTITY not set; leaving app unsigned"
 fi

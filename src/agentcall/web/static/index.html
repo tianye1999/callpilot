@@ -986,7 +986,7 @@ const I18N = {
     setup_person_saved: "Personalization saved.",
     setup_test_title: "Self-test", setup_test_hint: "Review readiness and optionally send one test SMS to a phone number you can receive on.",
     setup_sms_number: "Phone number to receive the test SMS", setup_sms_text: "Message", setup_send_sms: "Send test SMS",
-    setup_sms_default: "CallPilot setup test.", setup_sms_sent: "Test SMS sent.", setup_sms_fail: "Test SMS failed: ",
+    setup_sms_default: "CallPilot setup test.", setup_sms_sent: "Test SMS sent. It is listed in the SMS tab.", setup_sms_fail: "Test SMS failed: ",
     setup_ready_creds: "Provider credentials", setup_ready_modem: "Modem", setup_ready_yes: "Ready", setup_ready_no: "Not ready",
     setup_done_title: "Ready to start", setup_done_hint: "Finish setup to enter the main interface.",
     setup_done_status: "Setup will be marked complete on this Mac.",
@@ -1103,7 +1103,7 @@ const I18N = {
     setup_person_saved: "个性化设置已保存。",
     setup_test_title: "自测", setup_test_hint: "检查模组与凭证状态，也可以向你能接收短信的手机号发送一条测试短信。",
     setup_sms_number: "接收测试短信的手机号", setup_sms_text: "短信内容", setup_send_sms: "发送测试短信",
-    setup_sms_default: "CallPilot 配置测试。", setup_sms_sent: "测试短信已发送。", setup_sms_fail: "测试短信失败：",
+    setup_sms_default: "CallPilot 配置测试。", setup_sms_sent: "测试短信已发送，可在短信页查看。", setup_sms_fail: "测试短信失败：",
     setup_ready_creds: "Provider 凭证", setup_ready_modem: "模组", setup_ready_yes: "就绪", setup_ready_no: "未就绪",
     setup_done_title: "可以开始了", setup_done_hint: "完成向导后会进入主界面。",
     setup_done_status: "本机将记录首次启动向导已完成。",
@@ -1289,7 +1289,7 @@ function addSms(event) {
   item.appendChild(head);
   item.appendChild(el("div", "content", event.text || ""));
   $("smsList").insertBefore(item, $("smsList").firstChild);
-  if (isIn && currentPage !== "sms") {
+  if (currentPage !== "sms") {
     document.querySelector('.dock button[data-page="sms"]').classList.add("notify");
   }
 }
@@ -1531,13 +1531,16 @@ function evDetail(ev) {
 function buildRecPlayers(id) {
   // 录音播放器：走浏览器 <audio>（Chrome→系统音频），绕开本机 PortAudio/ffmpeg 播放问题。
   const box = el("div", "rec-audio");
+  box.addEventListener("click", (event) => event.stopPropagation());
   for (const [track, label] of [["downlink", t("rec_ai")], ["uplink", t("rec_peer")]]) {
     const row = el("div", "rec-row");
+    row.addEventListener("click", (event) => event.stopPropagation());
     row.appendChild(el("span", "rec-label", label));
     const a = document.createElement("audio");
     a.controls = true;
     a.preload = "none";
     a.src = `/api/history/${encodeURIComponent(id)}/audio/${track}`;
+    a.addEventListener("click", (event) => event.stopPropagation());
     row.appendChild(a);
     box.appendChild(row);
   }
@@ -2020,8 +2023,10 @@ $("setupSendSms").addEventListener("click", async () => {
   setupStatus("setupTestStatus", "", t("sending"));
   try {
     const { httpOk, res } = await postJson("/api/setup/test_sms", { number, text, token: (lastMeta || {}).setup_sms_token || "" });
-    if (httpOk && res.ok) setupStatus("setupTestStatus", "ok", t("setup_sms_sent"));
-    else setupStatus("setupTestStatus", "err", t("setup_sms_fail") + (res.error || ""));
+    if (httpOk && res.ok) {
+      setupStatus("setupTestStatus", "ok", t("setup_sms_sent"));
+      await loadMeta();
+    } else setupStatus("setupTestStatus", "err", t("setup_sms_fail") + (res.error || ""));
   } catch (e) {
     setupStatus("setupTestStatus", "err", t("setup_sms_fail") + t("req_error"));
   } finally {

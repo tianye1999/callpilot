@@ -158,6 +158,51 @@ def test_meta_includes_setup_and_hardware_status(monkeypatch):
         "modem_connected": False,
         "port": "/tmp/ec20-at",
     }
+    assert meta["setup_sms_token"]
+
+
+def test_meta_exposes_fresh_setup_sms_token_after_setup_done(monkeypatch):
+    monkeypatch.setenv("SETUP_DONE", "true")
+    app = make_app(FakeService())
+    app["setup_sms_token"][0] = None
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        assert resp.status == 200
+        return await resp.json()
+
+    meta = api(app, fn)
+    assert meta["setup_required"] is False
+    assert meta["setup_sms_token"]
+    assert app["setup_sms_token"][0] == meta["setup_sms_token"]
+
+
+def test_setup_test_sms_allows_manual_rerun_after_setup_done(monkeypatch):
+    monkeypatch.setenv("SETUP_DONE", "true")
+    hub = FakeHub()
+    modem = FakeModem()
+    app = build_app(hub=hub, modem=modem, service=FakeService())
+    token = app["setup_sms_token"][0]
+
+    async def fn(client):
+        resp = await client.post(
+            "/api/setup/test_sms",
+            json={"number": "18800000000", "text": "hello", "token": token},
+        )
+        assert resp.status == 200
+        return await resp.json()
+
+    assert api(app, fn) == {"ok": True}
+    assert modem.sms_calls == [("18800000000", "hello")]
+    assert hub.events == [
+        {
+            "type": "sms_out",
+            "number": "18800000000",
+            "text": "hello",
+            "status": "sent",
+        }
+    ]
+    assert app["setup_sms_token"][0] is None
 
 
 def test_quectel_usb_detection_on_macos_uses_usb_scan(monkeypatch):
@@ -917,6 +962,7 @@ def test_send_sms_rejects_uncontacted_number():
         assert resp.status == 403
         body = await resp.json()
         assert body["ok"] is False
+        assert "已接通的外呼" in body["error"]
 
     api(app, fn)
     assert modem.sms_calls == []  # 拦截不触发发送

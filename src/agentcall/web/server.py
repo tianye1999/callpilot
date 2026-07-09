@@ -311,7 +311,7 @@ async def _send_sms(request: web.Request) -> web.Response:
         number, hub, call_logger, extra_allowed=current_caller
     ):
         return web.json_response(
-            {"ok": False, "error": "只能给来过电或发过短信的号码发送短信"},
+            {"ok": False, "error": "只能给曾通话（来电/已接通的外呼）或发过短信的号码发送短信"},
             status=403,
         )
     slot = acquire_sms_send_slot(config.get_int("SMS_RATE_LIMIT_PER_HOUR"))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -217,3 +218,33 @@ def test_empty_target_task_does_not_match_task_bearing_entry(tmp_path):
 
     assert number_profiles.lookup_profile("10000", "", path=path) is None
     assert number_profiles.lookup_profile("10000", None, path=path) is None
+
+
+def test_ensure_seeded_copies_seed_when_target_missing(tmp_path):
+    seed = tmp_path / "seed" / "number_profiles.example.json"
+    seed.parent.mkdir()
+    seed.write_text('{"profiles":[{"number":"10000","scenario":"seed"}]}', encoding="utf-8")
+    target = tmp_path / "data" / "number_profiles.json"
+
+    assert number_profiles.ensure_seeded(target=target, seed=seed)
+    assert target.read_text(encoding="utf-8") == seed.read_text(encoding="utf-8")
+
+
+def test_ensure_seeded_keeps_existing_target(tmp_path):
+    seed = tmp_path / "number_profiles.example.json"
+    seed.write_text('{"profiles":[{"number":"10000","scenario":"seed"}]}', encoding="utf-8")
+    target = tmp_path / "number_profiles.json"
+    target.write_text('{"profiles":[{"number":"10086","scenario":"existing"}]}', encoding="utf-8")
+
+    assert not number_profiles.ensure_seeded(target=target, seed=seed)
+    assert "10086" in target.read_text(encoding="utf-8")
+
+
+def test_ensure_seeded_warns_and_does_not_raise_when_seed_missing(tmp_path, caplog):
+    target = tmp_path / "number_profiles.json"
+
+    with caplog.at_level(logging.WARNING):
+        assert not number_profiles.ensure_seeded(target=target, seed=tmp_path / "missing.json")
+
+    assert not target.exists()
+    assert "号码任务库种子文件不存在" in caplog.text

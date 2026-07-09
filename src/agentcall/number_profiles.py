@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,39 @@ def default_profiles_file() -> Path:
     if configured:
         return Path(configured).expanduser()
     return config.data_dir() / "number_profiles.json"
+
+
+def bundled_seed_file() -> Path:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass) / "seed" / "number_profiles.example.json"
+    return Path(__file__).resolve().parents[2] / "data" / "number_profiles.example.json"
+
+
+def ensure_seeded(
+    *,
+    target: str | Path | None = None,
+    seed: str | Path | None = None,
+) -> bool:
+    """Copy the bundled preset library on first run; never overwrite or raise."""
+    target_path = (
+        Path(target).expanduser()
+        if target is not None
+        else config.data_dir() / "number_profiles.json"
+    )
+    seed_path = Path(seed).expanduser() if seed is not None else bundled_seed_file()
+    if target_path.exists():
+        return False
+    try:
+        if not seed_path.exists():
+            logger.warning("号码任务库种子文件不存在: %s", seed_path)
+            return False
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(seed_path, target_path)
+        return True
+    except OSError as exc:
+        logger.warning("初始化号码任务库失败: %s", exc)
+        return False
 
 
 def _lang_key(lang: str | None) -> str:

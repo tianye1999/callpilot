@@ -70,6 +70,7 @@ def test_full_lifecycle_produces_all_artifacts(tmp_path):
     assert meta["direction"] == "outbound"
     assert meta["number"] == "10000"
     assert meta["status"] == "completed"
+    assert meta["answered"] is False
     assert meta["ended_at"] >= meta["started_at"]
     assert meta["duration"] == pytest.approx(meta["ended_at"] - meta["started_at"], abs=0.01)
 
@@ -272,3 +273,48 @@ def test_inbound_numbers_collects_only_inbound(tmp_path):
 
 def test_inbound_numbers_empty_when_no_calls(tmp_path):
     assert CallLogger(base_dir=tmp_path / "calls").inbound_numbers() == set()
+
+
+def test_finish_writes_answered_true_after_answered_event(tmp_path):
+    clog = CallLogger(tmp_path)
+    record = clog.begin_call("outbound", "10000")
+    record.log_event("answered")
+    record.finish("completed")
+
+    meta = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["answered"] is True
+
+
+def test_answered_outbound_numbers_collects_only_answered_outbound(tmp_path):
+    clog = CallLogger(base_dir=tmp_path / "calls")
+    answered = clog.begin_call("outbound", "10000")
+    answered.log_event("answered")
+    answered.finish("completed")
+    not_connected = clog.begin_call("outbound", "10086")
+    not_connected.finish("not_connected")
+    inbound = clog.begin_call("inbound", "13800000000")
+    inbound.log_event("answered")
+    inbound.finish("completed")
+
+    assert clog.answered_outbound_numbers() == {"10000"}
+
+
+def test_answered_outbound_numbers_falls_back_to_legacy_events(tmp_path):
+    clog = CallLogger(base_dir=tmp_path / "calls")
+    legacy = make_call_dir(
+        clog.base_dir,
+        "20260101-100000-outbound-10000",
+        meta={"id": "legacy", "direction": "outbound", "number": "10000"},
+    )
+    (legacy / "events.jsonl").write_text(
+        json.dumps({"type": "call_started"}) + "\n" + json.dumps({"type": "answered"}) + "\n",
+        encoding="utf-8",
+    )
+    missed = make_call_dir(
+        clog.base_dir,
+        "20260101-100001-outbound-10086",
+        meta={"id": "missed", "direction": "outbound", "number": "10086"},
+    )
+    (missed / "events.jsonl").write_text(json.dumps({"type": "call_started"}) + "\n", encoding="utf-8")
+
+    assert clog.answered_outbound_numbers() == {"10000"}

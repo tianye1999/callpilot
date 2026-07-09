@@ -37,3 +37,13 @@ def test_setup_sms_copy_spells_out_receiver_number():
     assert "接收测试短信的手机号" in text
     assert "you can receive on" in text
     assert "你能接收短信的手机号" in text
+    assert "It is listed in the SMS tab" in text
+    assert "可在短信页查看" in text
+
+
+def test_history_recording_players_stop_click_propagation():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'const box = el("div", "rec-audio");' in text
+    assert 'box.addEventListener("click", (event) => event.stopPropagation());' in text
+    assert 'a.addEventListener("click", (event) => event.stopPropagation());' in text

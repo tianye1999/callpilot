@@ -17,10 +17,18 @@ import webbrowser
 from aiohttp import web
 from dotenv import load_dotenv
 
-from agentcall import config
+from agentcall import config, number_profiles
 from agentcall.call_agent import CallAgentService
 from agentcall.events import EventHub
 from agentcall.web.server import build_app
+
+
+def _open_browser_later(url: str, delay: float = 1.0) -> threading.Timer | None:
+    if config._is_frozen():
+        return None
+    timer = threading.Timer(delay, lambda: webbrowser.open(url))
+    timer.start()
+    return timer
 
 
 def _force_utf8() -> None:
@@ -95,6 +103,7 @@ def main() -> None:
 
     data_dir = config.data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
+    number_profiles.ensure_seeded()
     store_path = data_dir / "messages.json"
     hub = EventHub(loop, store_path=store_path)
 
@@ -147,7 +156,7 @@ def main() -> None:
 
     url = f"http://{host}:{port}"
     logger.info("网页仪表盘已启动: %s", url)
-    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    _open_browser_later(url)
 
     try:
         loop.run_forever()

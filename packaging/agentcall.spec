@@ -36,6 +36,10 @@ if _menubar_dir.is_dir():
     for _png in _menubar_dir.glob("*.png"):
         datas.append((str(_png), "menubar"))
 
+_seed_profiles = project_root / "data" / "number_profiles.example.json"
+if _seed_profiles.is_file():
+    datas.append((str(_seed_profiles), "seed"))
+
 ffmpeg_path = os.environ.get("AGENTCALL_FFMPEG_PATH", "").strip()
 if ffmpeg_path:
     datas.append((ffmpeg_path, "bin"))
@@ -100,7 +104,8 @@ if IS_MACOS:
         bundle_identifier="ai.bondings.callpilot",
         info_plist={
             "CFBundleDisplayName": "CallPilot",
-            "CFBundleShortVersionString": "0.2.0",
+            "CFBundleShortVersionString": "0.4.1",
+            "NSMicrophoneUsageDescription": "CallPilot 需要采集通话对方的语音，供 AI 实时应答。",
             "NSHighResolutionCapable": True,
             # 菜单栏 App：不在 Dock 显示图标、无主窗口（LSUIElement）
             "LSUIElement": True,

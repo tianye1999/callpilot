@@ -241,6 +241,27 @@ def build_error_html(web_url: str, log_path: str, start_cmd: str) -> str:
 
 # ---- 窗口入口 ----
 
+def activate_macos_app() -> bool:
+    if not platforms.IS_MACOS:
+        return False
+    try:
+        from AppKit import NSApplication
+
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        return True
+    except Exception as exc:  # noqa: BLE001 - AppKit may be absent in tests/Linux builds
+        logger.warning("激活桌面窗口失败: %s", exc)
+        return False
+
+
+def _activate_on_window_shown(window, activate=activate_macos_app) -> None:
+    events = getattr(window, "events", None)
+    shown = getattr(events, "shown", None)
+    if shown is None:
+        return
+    shown += activate
+
+
 def _import_webview():
     """导入 pywebview；未安装时打印中文提示并退出。"""
     try:
@@ -276,14 +297,16 @@ def main() -> None:
         python_exe, app_script, log_path = _launch_config()
         # Windows PowerShell 5.1 不认 &&，且路径可能含空格；分号 + 引号两平台通吃
         start_cmd = f'cd "{PROJECT_ROOT}"; "{python_exe}" "{app_script}"'
-        webview.create_window(
+        window = webview.create_window(
             ERROR_WINDOW_TITLE,
             html=build_error_html(web_url, log_path, start_cmd),
             width=width,
             height=height,
         )
     else:
-        webview.create_window(WINDOW_TITLE, web_url, width=width, height=height)
+        window = webview.create_window(WINDOW_TITLE, web_url, width=width, height=height)
+    if window is not None:
+        _activate_on_window_shown(window)
     webview.start()
 
 
