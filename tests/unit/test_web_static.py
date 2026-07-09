@@ -29,3 +29,11 @@ def test_setup_qwen_key_help_has_safe_console_link():
     assert 'link.rel = "noopener noreferrer"' in text
     assert "Qwen / DashScope API Key" in text
     assert "免费调用额度" in text
+
+
+def test_setup_sms_copy_spells_out_receiver_number():
+    text = INDEX.read_text(encoding="utf-8")
+    assert "Phone number to receive the test SMS" in text
+    assert "接收测试短信的手机号" in text
+    assert "you can receive on" in text
+    assert "你能接收短信的手机号" in text
