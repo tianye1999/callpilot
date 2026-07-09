@@ -45,7 +45,7 @@ def test_packaged_app_declares_microphone_permission_and_seed_data():
 
     assert '"NSMicrophoneUsageDescription"' in text
     assert "CallPilot 需要采集通话对方的语音" in text
-    assert '"CFBundleShortVersionString": "0.4.1"' in text
+    assert '"CFBundleShortVersionString": "0.4.2"' in text
     assert '"number_profiles.example.json"' in text
     assert '"seed"' in text
 

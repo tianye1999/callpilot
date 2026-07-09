@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +14,47 @@ from agentcall import number_profiles
 
 def write_profiles(path, profiles) -> None:
     path.write_text(json.dumps({"profiles": profiles}, ensure_ascii=False), encoding="utf-8")
+
+
+def test_bundled_seed_has_public_hotline_profiles_without_private_data():
+    seed = Path(__file__).resolve().parents[2] / "data" / "number_profiles.example.json"
+    raw = seed.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    profiles = data["profiles"]
+
+    assert data.get("_comment")
+    assert [item["number"] for item in profiles] == [
+        "10000",
+        "10000",
+        "10086",
+        "10010",
+        "95588",
+        "95533",
+        "95555",
+        "95566",
+        "12315",
+        "12345",
+    ]
+    assert not re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", raw)
+    allowed_numbers = {
+        "10000",
+        "10086",
+        "10010",
+        "95588",
+        "95533",
+        "95555",
+        "95566",
+        "12315",
+        "12345",
+    }
+    assert all(item["number"] in allowed_numbers for item in profiles)
+
+    for item in profiles:
+        for field in ("label", "task", "scenario", "opening"):
+            value = item[field]
+            assert set(value) == {"zh", "en"}
+            assert value["zh"].strip()
+            assert value["en"].strip()
 
 
 def test_lookup_exact_number_and_task_first(tmp_path):

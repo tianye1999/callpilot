@@ -104,7 +104,7 @@ if IS_MACOS:
         bundle_identifier="ai.bondings.callpilot",
         info_plist={
             "CFBundleDisplayName": "CallPilot",
-            "CFBundleShortVersionString": "0.4.1",
+            "CFBundleShortVersionString": "0.4.2",
             "NSMicrophoneUsageDescription": "CallPilot 需要采集通话对方的语音，供 AI 实时应答。",
             "NSHighResolutionCapable": True,
             # 菜单栏 App：不在 Dock 显示图标、无主窗口（LSUIElement）
