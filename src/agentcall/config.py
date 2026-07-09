@@ -155,8 +155,12 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 此处登记只为在设置面板显示「已设置/未设置」状态（editable=False，不回传真值）。
     ConfigSpec("OPENAI_API_KEY", "OpenAI API Key", "str", "",
                secret=True, requires_restart=True),
-    ConfigSpec("OPENAI_REALTIME_MODEL", "OpenAI 实时模型", "str",
-               "gpt-realtime-mini", requires_restart=True),
+    ConfigSpec("OPENAI_REALTIME_MODEL", "OpenAI 实时模型", "select",
+               "gpt-realtime-2.1-mini",
+               choices=("gpt-realtime-2.1-mini", "gpt-realtime-2.1",
+                        "gpt-realtime-2", "gpt-realtime",
+                        "gpt-realtime-mini"),
+               requires_restart=True),
     # OpenAI Realtime 全部 10 个音色(官方推荐 marin/cedar)。
     ConfigSpec("OPENAI_VOICE", "OpenAI 音色", "select", "alloy",
                choices=("alloy", "ash", "ballad", "coral", "echo",
@@ -167,7 +171,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",
                requires_restart=True),
     ConfigSpec("AGENT_MODEL_NAME_OPENAI", "OpenAI 模型显示名", "str",
-               "OpenAI Realtime Mini", editable=False, hidden=True,
+               "OpenAI Realtime", editable=False, hidden=True,
                requires_restart=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
     # 默认留空：让 prompts.agent_persona() 按 AGENT_LANGUAGE 回退到

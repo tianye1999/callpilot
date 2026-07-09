@@ -60,6 +60,10 @@ v0.4.0 adds several call-quality controls for outbound work:
   speech before the AI replies once.
 - **Voice settings:** Settings includes Qwen/OpenAI voice pickers with official
   preview links, plus `VOICE_STYLE` for a free-text speaking-style hint.
+- **OpenAI model choice:** the OpenAI Realtime provider defaults to
+  `gpt-realtime-2.1-mini` for lower call latency, with `gpt-realtime-2.1`,
+  `gpt-realtime-2`, `gpt-realtime`, and `gpt-realtime-mini` still selectable in
+  `.env` / Settings.
 
 ### Hardware & platform support
 
@@ -292,6 +296,9 @@ v0.4.0 增加了几项面向外呼质量的控制：
 - **更稳的 IVR 控制**：DTMF 默认走带内音频（`DTMF_MODE=inband`），按键音直接合成进通话音频流；
   实验性的手动应答控制默认关闭（`MANUAL_RESPONSE_CONTROL=false`），可把连续 IVR 菜单合并后再让 AI 回复一次。
 - **音色设置**：设置面板提供 Qwen/OpenAI 音色下拉和官网试听链接，`VOICE_STYLE` 可补充自由文本说话风格。
+- **OpenAI 模型选择**：OpenAI Realtime provider 默认使用 `gpt-realtime-2.1-mini`
+  以优先降低电话链路延迟；仍可在 `.env` / 设置面板切换到 `gpt-realtime-2.1`、
+  `gpt-realtime-2`、`gpt-realtime` 或 `gpt-realtime-mini`。
 
 ### 硬件与平台支持
 

@@ -87,6 +87,25 @@ def sole_call_dir(base: Path) -> Path:
     return dirs[0]
 
 
+def call_events(base: Path) -> list[dict]:
+    call_dir = sole_call_dir(base)
+    return [
+        json.loads(line)
+        for line in (call_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+
+class MultiChunkGreetingAgent(FakeAgent):
+    """开场白一次吐两块音频，用来验证首音频只打点一次。"""
+
+    async def say(self, instructions: str) -> None:
+        self.said.append(instructions)
+        self._emit_transcript("agent", instructions)
+        if self._on_audio_out:
+            self._on_audio_out(self.reply_pcm)
+            self._on_audio_out(self.reply_pcm)
+
+
 # ---- P0-2 通话记录：events.jsonl 全生命周期 + 录音落盘 ----
 
 def test_inbound_call_writes_events_and_recordings(tmp_path, monkeypatch):
@@ -129,6 +148,54 @@ def test_inbound_call_writes_events_and_recordings(tmp_path, monkeypatch):
     assert meta["uplink_bytes"] > 0 and meta["downlink_bytes"] > 0
     assert (call_dir / "uplink.wav").exists()
     assert (call_dir / "downlink.wav").exists()
+
+
+def test_first_audio_latency_logged_once_after_greeting(tmp_path, monkeypatch, caplog):
+    base = tmp_path / "rec"
+    with caplog.at_level("INFO", logger="agentcall.call_agent"):
+        run_inbound_call(
+            monkeypatch,
+            CallLogger(base),
+            agent=MultiChunkGreetingAgent(),
+        )
+
+    events = call_events(base)
+    types = [event["type"] for event in events]
+    first_audio = [event for event in events if event["type"] == "first_audio"]
+
+    assert len(first_audio) == 1
+    assert first_audio[0]["ms"] >= 0
+    assert types.index("greeting_sent") < types.index("first_audio")
+    assert "首音频延迟:" in caplog.text
+
+
+def test_first_audio_latency_logged_for_outbound_call(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    base = tmp_path / "rec"
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    service = make_service(modem, call_logger=CallLogger(base))
+    ok, err = service.dial("10000")
+    assert ok, err
+    assert wait_until(lambda: ("dial", ("10000",)) in modem.calls)
+    modem.trigger_call_connected("10000")
+    assert wait_until(lambda: bridge.downlink)
+
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    events = call_events(base)
+    first_audio = [event for event in events if event["type"] == "first_audio"]
+    call_started = next(event for event in events if event["type"] == "call_started")
+
+    assert call_started["direction"] == "outbound"
+    assert len(first_audio) == 1
+    assert first_audio[0]["ms"] >= 0
 
 
 def test_recording_disabled_skips_wav_but_keeps_events(tmp_path, monkeypatch):

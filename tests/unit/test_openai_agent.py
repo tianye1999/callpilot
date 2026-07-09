@@ -680,8 +680,8 @@ def test_factory_creates_openai_agent(monkeypatch):
     agent = factory.create_agent("openai")
     assert isinstance(agent, OpenAIVoiceAgent)
     assert agent.api_key == "sk-test"
-    assert agent.model == "gpt-realtime-mini"  # 注册表默认
-    assert agent.model_display_name == "OpenAI Realtime Mini"
+    assert agent.model == "gpt-realtime-2.1-mini"  # 注册表默认
+    assert agent.model_display_name == "OpenAI Realtime"
     assert agent.voice == "coral"
     assert agent.realtime_url == "wss://proxy.example.com/v1/realtime"
     assert agent.input_rate == 24000

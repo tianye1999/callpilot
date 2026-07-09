@@ -192,16 +192,26 @@ def test_validate_unknown_provider(monkeypatch):
 
 
 def test_openai_registered_defaults(monkeypatch):
-    """OpenAI provider 注册项的默认值（模型选型已定 gpt-realtime-mini）。"""
+    """OpenAI provider 注册项的默认值与下拉 choices。"""
     _unset(monkeypatch, "OPENAI_REALTIME_MODEL", "OPENAI_VOICE",
            "OPENAI_REALTIME_URL", "AGENT_MODEL_NAME_OPENAI",
            "OPENAI_RECONNECT_MAX")
-    assert get_str("OPENAI_REALTIME_MODEL") == "gpt-realtime-mini"
+    model_spec = get_spec("OPENAI_REALTIME_MODEL")
+    assert model_spec.kind == "select"
+    assert model_spec.default == "gpt-realtime-2.1-mini"
+    assert model_spec.choices == (
+        "gpt-realtime-2.1-mini",
+        "gpt-realtime-2.1",
+        "gpt-realtime-2",
+        "gpt-realtime",
+        "gpt-realtime-mini",
+    )
+    assert get_str("OPENAI_REALTIME_MODEL") == "gpt-realtime-2.1-mini"
     assert get_str("OPENAI_VOICE") == "alloy"
     assert get_str("OPENAI_REALTIME_URL") == ""   # 留空走官方端点
-    assert get_str("AGENT_MODEL_NAME_OPENAI") == "OpenAI Realtime Mini"
+    assert get_str("AGENT_MODEL_NAME_OPENAI") == "OpenAI Realtime"
     assert get_int("OPENAI_RECONNECT_MAX") == 2   # 与 QWEN_RECONNECT_MAX 默认一致
-    assert get_spec("OPENAI_REALTIME_MODEL").requires_restart
+    assert model_spec.requires_restart
     assert get_spec("OPENAI_REALTIME_URL").requires_restart
 
 

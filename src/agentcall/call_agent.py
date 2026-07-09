@@ -193,14 +193,56 @@ class CallSession:
         self._record = record
         transcripts: list[tuple[str, str]] = []
 
-        def mark(event_type: str, **fields) -> None:
+        def mark(event_type: str, **fields) -> float:
             """记录一个会话节点事件，附带相对会话开始的耗时（毫秒）。"""
+            now = time.monotonic()
             if record is not None:
                 record.log_event(
                     event_type,
-                    t_ms=round((time.monotonic() - session_t0) * 1000, 1),
+                    t_ms=round((now - session_t0) * 1000, 1),
                     **fields,
                 )
+            return now
+
+        first_audio_lock = threading.Lock()
+        first_audio_state = {
+            "greeting_sent_at": 0.0,
+            "greeting_ready": False,
+            "logged": False,
+            "pending_before_greeting": False,
+        }
+
+        def log_first_audio(ms: int) -> None:
+            if record is not None:
+                record.log_event("first_audio", ms=ms)
+            logger.info("首音频延迟: %dms", ms)
+
+        def note_first_agent_audio() -> None:
+            with first_audio_lock:
+                if first_audio_state["logged"]:
+                    return
+                if not first_audio_state["greeting_ready"]:
+                    first_audio_state["pending_before_greeting"] = True
+                    return
+                first_audio_state["logged"] = True
+                started_at = float(first_audio_state["greeting_sent_at"])
+                ms = max(0, round((time.monotonic() - started_at) * 1000))
+            log_first_audio(ms)
+
+        def mark_greeting_sent() -> None:
+            marked_at = mark("greeting_sent")
+            should_log_pending = False
+            with first_audio_lock:
+                first_audio_state["greeting_sent_at"] = marked_at
+                first_audio_state["greeting_ready"] = True
+                if (
+                    first_audio_state["pending_before_greeting"]
+                    and not first_audio_state["logged"]
+                ):
+                    first_audio_state["logged"] = True
+                    should_log_pending = True
+            if should_log_pending:
+                log_first_audio(0)
 
         status = "completed"
         try:
@@ -242,10 +284,14 @@ class CallSession:
             bridge.start()
             mark("bridge_started")
 
-            await agent.start(self._make_agent_audio_handler(agent, bridge, record))
+            await agent.start(
+                self._make_agent_audio_handler(
+                    agent, bridge, record, note_first_agent_audio
+                )
+            )
             mark("agent_started")
             await agent.say(self._opening_instructions(direction))
-            mark("greeting_sent")
+            mark_greeting_sent()
 
             try:
                 await self._run_agent_loop(agent, bridge, record, transcripts)
@@ -258,7 +304,7 @@ class CallSession:
             mark("ended", status=status)
             self._finalize_record(record, status, transcripts, direction, number)
 
-    async def _connect_outbound(self, mark: Callable[..., None]) -> bool:
+    async def _connect_outbound(self, mark: Callable[..., float]) -> bool:
         """外呼：拨号并等待接通；未接通时发结束事件、挂断并返回 False。"""
         number = self._outbound_number
         if number is None:
@@ -310,7 +356,11 @@ class CallSession:
         return on_transcript
 
     def _make_agent_audio_handler(
-        self, agent, bridge: AudioBridge, record: CallRecord | None
+        self,
+        agent,
+        bridge: AudioBridge,
+        record: CallRecord | None,
+        on_first_audio: Callable[[], None] | None = None,
     ) -> Callable[[bytes], None]:
         """Agent 下行音频回调：浏览器实时旁听、本机监听旁路、重采样到 8k、录音、入发送队列。"""
 
@@ -319,6 +369,8 @@ class CallSession:
             self.hub.set_audio_rate(agent.output_rate)
 
         def on_agent_audio(pcm_agent: bytes) -> None:
+            if pcm_agent and on_first_audio is not None:
+                on_first_audio()
             # 浏览器实时旁听下行 AI（Web Audio）：无监听端时零成本返回。kind=0=下行。
             if self.hub is not None:
                 self.hub.broadcast_audio(pcm_agent, kind=0)
