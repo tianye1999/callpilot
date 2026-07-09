@@ -106,12 +106,15 @@ def opening_instructions(
 def _build_zh(
     direction: str, owner: str, persona: str, task: str, scenario: str | None = None
 ) -> str:
+    style = config.get_str("VOICE_STYLE").strip()
+    style_line = f"机主希望的说话风格：{style}。\n" if style else ""
     common = (
         f"当前真实日期时间是 {_now_str('zh')}，这是准确信息；对方询问日期、时间、"
         "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份；"
         "不要主动报时间，只在对方明确问起日期或时间时才引用。\n"
         "语音风格：普通话，自然电话口吻，语速比正常稍慢，节奏从容，"
         "声音低沉、稳重、沉稳亲和，清晰但不要喊，不要播音腔、客服腔或机器人腔。\n"
+        f"{style_line}"
         "像真人打电话那样：先回应对方刚说的，再往下推进；一次只说一句、简短自然、口语化，"
         "别长篇大论、别念稿子，也别一遍遍重复自己刚说过的话。\n"
         "安全边界：不索要验证码、密码、银行卡、转账、身份证完整号码等敏感信息；"
@@ -216,6 +219,8 @@ def _opening_zh(direction: str, owner: str, persona: str, task: str) -> str:
 def _build_en(
     direction: str, owner: str, persona: str, task: str, scenario: str | None = None
 ) -> str:
+    style = config.get_str("VOICE_STYLE").strip()
+    style_line = f"Preferred speaking style: {style}.\n" if style else ""
     common = (
         f"The current real date and time is {_now_str('en')}; this is accurate. "
         "When asked about the date, time, or day of week, answer from this, do not "
@@ -224,6 +229,7 @@ def _build_en(
         "Voice style: natural phone tone, a little slower than usual, unhurried, "
         "low and steady, warm and composed, clear but not shouting; no broadcaster, "
         "call-center, or robotic tone.\n"
+        f"{style_line}"
         "Talk like a real person on the phone: first acknowledge what they just "
         "said, then move forward; one short, natural sentence at a time — no long "
         "speeches, no reading a script, and don't repeat what you already said.\n"

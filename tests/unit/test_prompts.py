@@ -42,6 +42,21 @@ def test_outbound_instructions_inject_owner_persona_task():
     assert "查您的" in text  # 明确「不要说成查您的X」
 
 
+def test_voice_style_injected_into_instructions(monkeypatch):
+    monkeypatch.setenv("VOICE_STYLE", "语速稍慢、亲切自然")
+    zh = build_instructions("outbound", "李明", "数字分身", "查话费")
+    assert "语速稍慢、亲切自然" in zh
+    en = build_instructions("outbound", "李明", "assistant", "check balance", "en")
+    assert "语速稍慢、亲切自然" in en
+    assert "Preferred speaking style" in en
+
+
+def test_voice_style_absent_when_unset(monkeypatch):
+    monkeypatch.delenv("VOICE_STYLE", raising=False)
+    zh = build_instructions("outbound", "李明", "数字分身", "查话费")
+    assert "机主希望的说话风格" not in zh
+
+
 def test_outbound_instructions_insert_dynamic_scenario_after_task():
     text = build_instructions(
         "outbound",

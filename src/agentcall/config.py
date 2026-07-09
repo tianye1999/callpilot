@@ -104,6 +104,8 @@ class ConfigSpec:
     requires_restart: bool = False
     hidden: bool = False
     choice_labels: dict[str, str] | None = None
+    # 面板可选帮助文本/链接（如音色官网试听页 URL）；空则不渲染。
+    help: str = ""
 
 
 @dataclass(frozen=True)
@@ -126,7 +128,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 可直接在 .env 填 QWEN_VOICE(get_str 读环境变量,不受 choices 限制)。
     ConfigSpec("QWEN_VOICE", "Qwen 音色", "select", "Raymond",
                choices=("Raymond", "Ethan", "Tina", "Cindy", "Serena",
-                        "Harvey", "Maia", "Sunnybobi")),
+                        "Harvey", "Maia", "Sunnybobi"),
+               help="https://help.aliyun.com/zh/model-studio/omni-voice-list"),
     # 模型显示名只用于 /api/meta 与豆包自我介绍提示词，属内部项不进面板。
     # 显示名用语言中性的品牌名（Qwen/Doubao 是同款产品的国际名），
     # 避免英文界面右上角出现「通义千问」这类中文品牌串。
@@ -157,7 +160,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # OpenAI Realtime 全部 10 个音色(官方推荐 marin/cedar)。
     ConfigSpec("OPENAI_VOICE", "OpenAI 音色", "select", "alloy",
                choices=("alloy", "ash", "ballad", "coral", "echo",
-                        "sage", "shimmer", "verse", "marin", "cedar")),
+                        "sage", "shimmer", "verse", "marin", "cedar"),
+               help="https://openai.fm"),
     # 端点覆写（可选）：留空即直连 api.openai.com；仅在用反代/Azure OpenAI，
     # 或所在网络无法直连 OpenAI 时才需要填。
     ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",
@@ -169,6 +173,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 默认留空：让 prompts.agent_persona() 按 AGENT_LANGUAGE 回退到
     # 「AI 助理」/「AI assistant」，英文模式下不会硬塞中文人设。
     ConfigSpec("AGENT_PERSONA", "AI 人设称谓", "str", ""),
+    # 语音风格描述（如"语速稍慢、亲切自然"）；并进 instructions，qwen/openai 两链路都生效。
+    # 注：OpenAI 的 cedar/marin 可能不太吃风格指令（社区反馈，非官方结论）。
+    ConfigSpec("VOICE_STYLE", "语音风格描述", "str", ""),
     # AI 通话语言：决定 AI 打/接电话说什么语言、通话摘要用什么语言写；
     # 与前端 UI 语言（localStorage）相互独立。改动需重启会话。
     ConfigSpec("AGENT_LANGUAGE", "AI 通话语言", "select", "zh",
@@ -435,6 +442,7 @@ def read_panel_values() -> list[dict]:
             "default": spec.default,
             "choices": list(spec.choices),
             "choice_labels": dict(spec.choice_labels or {}),
+            "help": spec.help,
             "editable": spec.editable,
             "secret": spec.secret,
             "requires_restart": spec.requires_restart,

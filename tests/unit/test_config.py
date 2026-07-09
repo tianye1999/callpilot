@@ -326,7 +326,15 @@ def test_panel_covers_visible_specs_and_fields():
     assert len(rows) == len(visible_keys)
     for row in rows:
         assert {"key", "label", "kind", "default", "choices", "editable",
-                "secret", "requires_restart", "value"} <= set(row)
+                "secret", "requires_restart", "value", "help"} <= set(row)
+
+
+def test_panel_includes_voice_preview_help_links():
+    """help 字段带出面板；音色项含官网试听链接，无 help 的项为空串。"""
+    rows = {row["key"]: row for row in read_panel_values()}
+    assert rows["QWEN_VOICE"]["help"].startswith("https://")
+    assert rows["OPENAI_VOICE"]["help"].startswith("https://")
+    assert rows["OWNER_NAME"]["help"] == ""
 
 
 def test_hidden_specs_are_internal_only():

@@ -887,6 +887,7 @@ const I18N = {
     modem_on: "Modem ready", modem_off: "Modem offline",
     keypad: "Keys", hangup: "Hang up",
     dial_label: "MAKE A CALL", dial: "Call", ph_number: "Phone number",
+    voice_preview: "Preview voices ↗",
     ph_task: "Call topic (blank = reuse last)", task_prefix: "Topic (blank = reuse): ",
     calling: "Calling…", call_sent: "Call started", call_fail: "Call failed",
     need_number: "Enter a number", req_error: "Request error",
@@ -997,6 +998,7 @@ const I18N = {
     modem_on: "模组就绪", modem_off: "模组未连接",
     keypad: "按键", hangup: "挂断",
     dial_label: "拨打电话", dial: "拨打", ph_number: "输入号码",
+    voice_preview: "官网试听 ↗",
     ph_task: "外呼主题（空=沿用上次）", task_prefix: "主题（空=沿用）：",
     calling: "呼叫中…", call_sent: "已发起呼叫", call_fail: "呼叫失败",
     need_number: "请填写号码", req_error: "请求出错",
@@ -1976,6 +1978,13 @@ async function loadConfig() {
       const label = el("label", "", cfgLabel(c));
       if (c.requires_restart) label.appendChild(el("span", "tag-restart", t("tag_restart")));
       label.appendChild(el("span", "key", c.key));
+      if (c.help && /^https?:\/\//.test(c.help)) {
+        const hint = document.createElement("a");
+        hint.href = c.help; hint.target = "_blank"; hint.rel = "noopener";
+        hint.textContent = t("voice_preview");
+        hint.style.cssText = "margin-left:8px;font-size:11px;color:var(--blue);text-decoration:none;";
+        label.appendChild(hint);
+      }
       row.appendChild(label);
 
       let ctrl;
