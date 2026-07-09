@@ -22,6 +22,7 @@ from ..audio_bridge import apply_pcm_gain
 from ..contacts import is_reply_target_allowed
 from ..events import EventHub
 from ..modem import Eg25Modem
+from ..number_profiles import list_profiles
 from ..port_detect import QUECTEL_VID
 from ..rate_limit import acquire_sms_send_slot
 
@@ -196,6 +197,7 @@ def build_app(
     app.router.add_post("/api/call/dtmf", _dtmf)
     app.router.add_post("/api/call/batch_dial", _batch_dial)
     app.router.add_get("/api/call/queue", _queue_status)
+    app.router.add_get("/api/number_profiles", _number_profiles)
     app.router.add_get("/api/history", _history)
     app.router.add_delete("/api/history", _history_clear)
     app.router.add_post("/api/history/{call_id}", _history_delete)
@@ -419,6 +421,12 @@ async def _queue_status(request: web.Request) -> web.Response:
     """外呼队列状态快照（pending/current/done/active）。"""
     service = require_service(request)
     return web.json_response({**service.dial_queue_status(), "ok": True})
+
+
+async def _number_profiles(request: web.Request) -> web.Response:
+    if not config.get_bool("NUMBER_PROFILES_ENABLED"):
+        return web.json_response({"profiles": []})
+    return web.json_response({"profiles": list_profiles()})
 
 
 async def _history(request: web.Request) -> web.Response:

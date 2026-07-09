@@ -2,12 +2,14 @@
   "_comment": "Copy this file to data/number_profiles.json and edit locally. Lookup order: exact number+task first, then number-only fallback. If nothing matches, CallPilot falls back to dynamic prompt generation.",
   "profiles": [
     {
+      "label": "公开客服 · 查询套餐",
       "number": "10000",
       "task": "查询套餐使用情况",
       "scenario": "你正替机主拨打公开客服热线办理查询事项。开场只说需求，不默认自我介绍；遇到菜单时用短词，并需要按键时调用 send_dtmf 工具真实发送。",
       "opening": "查询套餐使用情况"
     },
     {
+      "label": "公开客服 · 通用",
       "number": "10000",
       "scenario": "你正替机主联系公开客服热线办理通用事项。保持主叫求助立场，不冒充客服或机主本人；对方未明确给出结果前，不声称已经查到或办好。",
       "opening": "办理业务"

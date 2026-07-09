@@ -158,6 +158,16 @@
   .home-grid .dial-col { padding: 22px 26px; border-right: 1px solid var(--border); }
   .home-grid .recent-col { padding: 22px 24px; }
   .col-label { font-size: 11px; letter-spacing: .18em; color: var(--muted); margin-bottom: 12px; font-weight: 700; }
+  .preset-label { margin: 0 0 8px; letter-spacing: .14em; }
+  .preset-select {
+    width: 100%; margin-bottom: 10px;
+    background: var(--well); border: 1px solid var(--border); color: var(--text);
+    border-radius: 11px; padding: 10px 12px; font-size: 13.5px;
+    color-scheme: dark;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .preset-select:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-dim); }
+  .preset-select option { background: #111823; color: var(--text); }
 
   .dial-input {
     width: 100%; text-align: center;
@@ -643,6 +653,8 @@
           <div class="home-grid">
             <div class="dial-col">
               <div class="col-label" data-i18n="dial_label"></div>
+              <div class="col-label preset-label" data-i18n="preset_label"></div>
+              <select id="dialPreset" class="preset-select"></select>
               <input id="dialNumber" class="dial-input" type="text" data-i18n-ph="ph_number" />
               <input id="dialTask" class="task-input" type="text" data-i18n-ph="ph_task" />
               <div class="dial-actions">
@@ -886,7 +898,8 @@ const I18N = {
     conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
     modem_on: "Modem ready", modem_off: "Modem offline",
     keypad: "Keys", hangup: "Hang up",
-    dial_label: "MAKE A CALL", dial: "Call", ph_number: "Phone number",
+    dial_label: "MAKE A CALL", preset_label: "PRESET TASK", preset_custom: "Custom (manual input)",
+    dial: "Call", ph_number: "Phone number",
     ph_task: "Call topic (blank = reuse last)", task_prefix: "Topic (blank = reuse): ",
     calling: "Calling…", call_sent: "Call started", call_fail: "Call failed",
     need_number: "Enter a number", req_error: "Request error",
@@ -996,7 +1009,8 @@ const I18N = {
     conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
     modem_on: "模组就绪", modem_off: "模组未连接",
     keypad: "按键", hangup: "挂断",
-    dial_label: "拨打电话", dial: "拨打", ph_number: "输入号码",
+    dial_label: "拨打电话", preset_label: "预设任务", preset_custom: "自定义（手动输入）",
+    dial: "拨打", ph_number: "输入号码",
     ph_task: "外呼主题（空=沿用上次）", task_prefix: "主题（空=沿用）：",
     calling: "呼叫中…", call_sent: "已发起呼叫", call_fail: "呼叫失败",
     need_number: "请填写号码", req_error: "请求出错",
@@ -1093,6 +1107,7 @@ function applyI18n() {
   $("modemState").textContent = t(modemConnected ? "modem_on" : "modem_off");
   $("liveSub").textContent = callActive ? ($("stateNum").textContent || "") : t("live_sub_idle");
   $("chat").dataset.empty = t("live_empty");  // 空转写占位（CSS ::before 读取）
+  if (typeof renderDialPresets === "function") renderDialPresets();
   if (typeof renderSetupWizard === "function") renderSetupWizard();
 }
 
@@ -1357,6 +1372,40 @@ function stopListen() {
 $("listenBtn").addEventListener("click", toggleListen);
 
 /* ========= 拨打 / 挂断 / 键盘 ========= */
+let dialProfiles = [];
+function renderDialPresets() {
+  const select = $("dialPreset");
+  const current = select.value;
+  select.textContent = "";
+  select.appendChild(new Option(t("preset_custom"), ""));
+  dialProfiles.forEach((profile, index) => {
+    const label = String(profile.label || profile.task || profile.number || "");
+    select.appendChild(new Option(label, String(index)));
+  });
+  select.value = [...select.options].some((option) => option.value === current) ? current : "";
+}
+async function loadDialPresets() {
+  try {
+    const r = await fetch("/api/number_profiles");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    dialProfiles = Array.isArray(data.profiles) ? data.profiles.filter((profile) => profile && profile.number) : [];
+  } catch (e) {
+    console.warn("[profiles] 加载预设任务失败", e);
+    dialProfiles = [];
+  }
+  renderDialPresets();
+}
+function applyDialPreset() {
+  const value = $("dialPreset").value;
+  if (value === "") return;
+  const profile = dialProfiles[Number(value)];
+  if (!profile) return;
+  $("dialNumber").value = String(profile.number || "");
+  $("dialTask").value = String(profile.task || "");
+}
+$("dialPreset").addEventListener("change", applyDialPreset);
+
 async function doDial() {
   const number = $("dialNumber").value.trim();
   if (!number) { setToast("dialToast", "err", t("need_number")); return; }
@@ -2168,6 +2217,7 @@ loadHistory().then(loadRecent);
 refreshQueue();
 loadConfig();
 loadDefaultTask();
+loadDialPresets();
 setInterval(refreshQueue, 2000);
 </script>
 </body>

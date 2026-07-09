@@ -61,6 +61,32 @@ def lookup_profile(
         return None
 
 
+def list_profiles(*, path: str | Path | None = None) -> list[dict[str, str]]:
+    """Return all user-visible profile choices in file order; never raises."""
+    try:
+        data = _load_profiles_file(Path(path).expanduser() if path is not None else default_profiles_file())
+        if data is None:
+            return []
+        profiles = data.get("profiles")
+        if not isinstance(profiles, list):
+            logger.warning("号码任务库格式无效: profiles 不是列表")
+            return []
+        choices: list[dict[str, str]] = []
+        for item in profiles:
+            if not isinstance(item, dict):
+                continue
+            number = _norm(item.get("number"))
+            if not number:
+                continue
+            task = _norm(item.get("task"))
+            label = _norm(item.get("label")) or _fallback_label(number, task)
+            choices.append({"number": number, "task": task, "label": label})
+        return choices
+    except Exception as exc:  # noqa: BLE001 - contract: never raise
+        logger.warning("列出号码任务库失败: %s", exc)
+        return []
+
+
 def _load_profiles_file(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -105,3 +131,10 @@ def _normalize_profile(
 
 def _norm(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _fallback_label(number: str, task: str) -> str:
+    if task:
+        return f"{number} · {task}"
+    general = "general" if config.get_str("AGENT_LANGUAGE").strip().lower().startswith("en") else "通用"
+    return f"{number} · {general}"

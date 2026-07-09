@@ -616,6 +616,44 @@ def test_queue_status_passthrough():
     api(app, fn)
 
 
+def test_number_profiles_api_lists_profiles(tmp_path, monkeypatch):
+    profile_file = tmp_path / "number_profiles.json"
+    profile_file.write_text(
+        '{"profiles":[{"label":"Preset <safe>","number":"10000","task":"查流量","scenario":"策略"}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profile_file))
+    app = make_app(FakeService())
+
+    async def fn(client):
+        resp = await client.get("/api/number_profiles")
+        assert resp.status == 200
+        return await resp.json()
+
+    assert api(app, fn) == {
+        "profiles": [{"number": "10000", "task": "查流量", "label": "Preset <safe>"}]
+    }
+
+
+def test_number_profiles_api_returns_empty_when_disabled(tmp_path, monkeypatch):
+    profile_file = tmp_path / "number_profiles.json"
+    profile_file.write_text(
+        '{"profiles":[{"label":"Preset","number":"10000","task":"查流量","scenario":"策略"}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "false")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profile_file))
+    app = make_app(FakeService())
+
+    async def fn(client):
+        resp = await client.get("/api/number_profiles")
+        assert resp.status == 200
+        return await resp.json()
+
+    assert api(app, fn) == {"profiles": []}
+
+
 def test_endpoints_without_service_return_500():
     app = make_app(None)
 

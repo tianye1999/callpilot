@@ -89,3 +89,40 @@ def test_lookup_uses_configured_default_file(tmp_path, monkeypatch):
 
     assert result is not None
     assert result["scenario"] == "配置路径策略"
+
+
+def test_list_profiles_returns_labels_with_fallbacks_in_file_order(tmp_path, monkeypatch):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [
+            {"label": "公开客服 · 查流量", "number": "10000", "task": "查流量", "scenario": "流量策略"},
+            {"number": "10010", "task": "查话费", "scenario": "话费策略"},
+            {"number": "10086", "scenario": "通用策略"},
+        ],
+    )
+    monkeypatch.setenv("AGENT_LANGUAGE", "zh")
+
+    assert number_profiles.list_profiles(path=path) == [
+        {"number": "10000", "task": "查流量", "label": "公开客服 · 查流量"},
+        {"number": "10010", "task": "查话费", "label": "10010 · 查话费"},
+        {"number": "10086", "task": "", "label": "10086 · 通用"},
+    ]
+
+
+def test_list_profiles_handles_missing_and_bad_files(tmp_path):
+    assert number_profiles.list_profiles(path=tmp_path / "missing.json") == []
+
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{not-json", encoding="utf-8")
+    assert number_profiles.list_profiles(path=bad_json) == []
+
+
+def test_list_profiles_uses_english_general_fallback(tmp_path, monkeypatch):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(path, [{"number": "10086", "scenario": "通用策略"}])
+    monkeypatch.setenv("AGENT_LANGUAGE", "en")
+
+    assert number_profiles.list_profiles(path=path) == [
+        {"number": "10086", "task": "", "label": "10086 · general"}
+    ]
