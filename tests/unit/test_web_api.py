@@ -288,7 +288,7 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
         resp = await client.post(
             "/api/config",
             json={
-                "QWEN_VOICE": "Cherry",
+                "QWEN_VOICE": "Ethan",
                 "AGENT_PROVIDER": "doubao",
                 "RECORDING_ENABLED": False,  # JSON bool 应被宽容转成 "false"
             },
@@ -302,10 +302,10 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
     assert data["requires_restart"] == ["AGENT_PROVIDER"]
 
     text = env_file.read_text(encoding="utf-8")
-    assert "QWEN_VOICE=Cherry" in text
+    assert "QWEN_VOICE=Ethan" in text
     assert "AGENT_PROVIDER=doubao" in text
     assert "RECORDING_ENABLED=false" in text
-    assert os.environ["QWEN_VOICE"] == "Cherry"
+    assert os.environ["QWEN_VOICE"] == "Ethan"
 
 
 def test_config_post_invalid_rejected(monkeypatch, tmp_path):

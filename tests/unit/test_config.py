@@ -326,7 +326,15 @@ def test_panel_covers_visible_specs_and_fields():
     assert len(rows) == len(visible_keys)
     for row in rows:
         assert {"key", "label", "kind", "default", "choices", "editable",
-                "secret", "requires_restart", "value"} <= set(row)
+                "secret", "requires_restart", "value", "help"} <= set(row)
+
+
+def test_panel_includes_voice_preview_help_links():
+    """help 字段带出面板；音色项含官网试听链接，无 help 的项为空串。"""
+    rows = {row["key"]: row for row in read_panel_values()}
+    assert rows["QWEN_VOICE"]["help"].startswith("https://")
+    assert rows["OPENAI_VOICE"]["help"].startswith("https://")
+    assert rows["OWNER_NAME"]["help"] == ""
 
 
 def test_hidden_specs_are_internal_only():
@@ -421,3 +429,17 @@ def test_editable_specs_covered_by_env_example():
     missing = [spec.key for spec in CONFIG_SPECS
                if spec.editable and spec.key not in keys]
     assert not missing, f".env.example 缺少可编辑配置项: {missing}"
+
+
+def test_voice_specs_are_selects_with_default_in_choices():
+    """音色改为下拉(select)：默认值必须在 choices 内，否则面板/写回校验不一致。"""
+    for key, expected_default in (("QWEN_VOICE", "Raymond"), ("OPENAI_VOICE", "alloy")):
+        spec = get_spec(key)
+        assert spec.kind == "select", key
+        assert spec.default == expected_default, key
+        assert expected_default in spec.choices, key
+    # OpenAI Realtime 全部 10 个音色齐全
+    assert set(get_spec("OPENAI_VOICE").choices) == {
+        "alloy", "ash", "ballad", "coral", "echo",
+        "sage", "shimmer", "verse", "marin", "cedar",
+    }
