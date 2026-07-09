@@ -38,8 +38,9 @@ TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继续。"
 
 
-def _response_id(event: dict) -> str | None:
-    response = event.get("response") if isinstance(event.get("response"), dict) else {}
+def _response_id(event: dict[str, Any]) -> str | None:
+    raw_response = event.get("response")
+    response: dict[str, Any] = raw_response if isinstance(raw_response, dict) else {}
     raw = (
         event.get("response_id")
         or event.get("item_id")

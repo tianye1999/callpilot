@@ -214,7 +214,7 @@ def build_app(
     return app
 
 
-async def _index(request: web.Request) -> web.Response:
+async def _index(request: web.Request) -> web.StreamResponse:
     index_file = STATIC_DIR / "index.html"
     # 禁缓存：界面迭代频繁，避免浏览器用旧页面（曾致用户看不到新 UI）。
     return web.FileResponse(
@@ -528,7 +528,7 @@ async def _history_events(request: web.Request) -> web.Response:
 _AUDIO_TRACKS = {"uplink", "downlink"}
 
 
-async def _history_audio(request: web.Request) -> web.Response:
+async def _history_audio(request: web.Request) -> web.StreamResponse:
     """播放某通录音：downlink=AI 下行，uplink=对方上行（WAV，供浏览器 <audio> 播放）。
 
     浏览器播放走 Chrome→系统音频，绕开本机 PortAudio/ffmpeg 播放通道的已知问题，
@@ -601,7 +601,7 @@ async def _validate_key(request: web.Request) -> web.Response:
         None,
         partial(config.validate_provider_key_online, provider, api_key, timeout=5.0),
     )
-    payload = {"ok": result.ok, "status": result.status}
+    payload: dict[str, bool | str] = {"ok": result.ok, "status": result.status}
     if result.message:
         payload["message"] = result.message
     return web.json_response(payload)

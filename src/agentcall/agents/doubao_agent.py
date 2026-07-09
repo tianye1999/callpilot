@@ -8,7 +8,7 @@ import json
 import logging
 import struct
 import uuid
-from typing import Callable
+from typing import Any, Callable
 
 import websockets
 
@@ -94,7 +94,7 @@ class DoubaoVoiceAgent(VoiceAgent):
         self.resource_id = resource_id
         self.app_key = app_key
         self.model_display_name = model_display_name
-        self._ws = None
+        self._ws: Any = None
         self._recv_task: asyncio.Task | None = None
         self._on_audio_out: Callable[[bytes], None] | None = None
         self._running = False

@@ -23,6 +23,7 @@ import os
 import subprocess
 import threading
 from collections import deque
+from typing import BinaryIO, cast
 
 # 导入模块而非 from-import 常量：让测试能 monkeypatch platforms.IS_MACOS。
 from . import platforms
@@ -197,8 +198,10 @@ class MonitorPlayback:
                 self._disable_from_thread()
                 return
             try:
-                proc.stdin.write(apply_pcm_gain(pcm, self.gain))
-                proc.stdin.flush()
+                # Safe: stdin is non-None because the process is created with stdin=PIPE.
+                stdin = cast(BinaryIO, proc.stdin)
+                stdin.write(apply_pcm_gain(pcm, self.gain))
+                stdin.flush()
             except (BrokenPipeError, ValueError, OSError) as exc:
                 logger.error("写入监听 ffmpeg 管道失败: %s，自动禁用监听", exc)
                 self._disable_from_thread()

@@ -260,11 +260,14 @@ class CallSession:
 
     async def _connect_outbound(self, mark: Callable[..., None]) -> bool:
         """外呼：拨号并等待接通；未接通时发结束事件、挂断并返回 False。"""
-        logger.info("开始外呼: %s", self._outbound_number)
-        self.current_caller = self._outbound_number
+        number = self._outbound_number
+        if number is None:
+            raise RuntimeError("外呼号码未设置")
+        logger.info("开始外呼: %s", number)
+        self.current_caller = number
         self._start_prompt_generation()
-        self.modem.dial(self._outbound_number)
-        mark("dialing", number=self._outbound_number)
+        self.modem.dial(number)
+        mark("dialing", number=number)
         self._publish(
             {"type": "call", "status": "dialing", "caller": self.current_caller}
         )

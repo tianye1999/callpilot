@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime
 from queue import Empty, Queue
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import dashscope
@@ -43,8 +43,9 @@ DEFAULT_PREWARM_HOST = "dashscope.aliyuncs.com"
 DEFAULT_PREWARM_PORT = 443
 
 
-def _response_id(event: dict) -> str | None:
-    response = event.get("response") if isinstance(event.get("response"), dict) else {}
+def _response_id(event: dict[str, Any]) -> str | None:
+    raw_response = event.get("response")
+    response: dict[str, Any] = raw_response if isinstance(raw_response, dict) else {}
     raw = (
         event.get("response_id")
         or event.get("item_id")

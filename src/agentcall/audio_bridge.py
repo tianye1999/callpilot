@@ -8,7 +8,7 @@ import re
 import subprocess
 import threading
 import time
-from typing import Callable, Iterable
+from typing import Any, BinaryIO, Callable, Iterable, cast
 
 import numpy as np
 import serial
@@ -83,8 +83,8 @@ class ModemAudioBridge:
             raise RuntimeError(
                 f"未找到包含 '{device_keyword}' 的 UAC 输入/输出设备，请检查 EG25 UAC 是否启用"
             )
-        self._input_stream = None
-        self._output_stream = None
+        self._input_stream: Any = None
+        self._output_stream: Any = None
         self._block_size = int(MODEM_RATE * MODEM_BLOCK_MS / 1000)
 
     def start(self) -> None:
@@ -379,7 +379,9 @@ class FfmpegAudioBridge:
              "-f", "s16le", "-ar", str(MODEM_RATE), "-ac", "1", "pipe:1"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
-        os.set_blocking(self._cap.stdout.fileno(), False)
+        # Safe: stdout is non-None because the process is created with stdout=PIPE.
+        stdout = cast(BinaryIO, self._cap.stdout)
+        os.set_blocking(stdout.fileno(), False)
         self._spawn_play()
         self._running = True
         self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)

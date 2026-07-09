@@ -58,16 +58,3 @@ select = ["E", "F", "W", "I"]
 python_version = "3.12"
 ignore_missing_imports = true
 files = ["src/agentcall"]
-
-[[tool.mypy.overrides]]
-# Initial mypy adoption: these modules need runtime-preserving type narrowing later.
-module = [
-    "agentcall.agents.doubao_agent",
-    "agentcall.agents.openai_agent",
-    "agentcall.agents.qwen_agent",
-    "agentcall.audio_bridge",
-    "agentcall.call_agent",
-    "agentcall.monitor_playback",
-    "agentcall.web.server",
-]
-ignore_errors = true
