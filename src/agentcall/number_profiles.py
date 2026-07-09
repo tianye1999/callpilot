@@ -9,7 +9,8 @@ string (language-neutral) or an object like ``{"zh": "...", "en": "..."}``.
 ``scenario``/``opening`` are picked by the call language (AGENT_LANGUAGE);
 ``label``/``task`` are picked by the UI language passed to ``list_profiles``.
 Missing language falls back to the other language, then any non-empty value,
-so single-language profiles keep working unchanged.
+so single-language profiles keep working unchanged. Fallback is per-field, so
+prefer supplying both languages for every field to avoid mixed-language output.
 """
 
 from __future__ import annotations

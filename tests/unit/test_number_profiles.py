@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from agentcall import number_profiles
 
 
@@ -188,3 +190,30 @@ def test_list_profiles_label_and_task_by_ui_lang(tmp_path):
 
     assert zh == [{"number": "10000", "task": "查流量", "label": "电信·查流量"}]
     assert en == [{"number": "10000", "task": "check data", "label": "Telecom · Data"}]
+
+
+@pytest.mark.parametrize(
+    "bad_entry",
+    [
+        {"number": "10000", "task": {"zh": 123}, "scenario": "策略"},
+        {"number": "10000", "task": ["查流量"], "scenario": "策略"},
+        {"number": "10000", "task": "查流量", "scenario": {"zh": {"nested": "x"}}},
+        {"number": "10000", "scenario": 42},
+        {"number": "10000", "task": "查流量", "scenario": "策略", "opening": 99},
+    ],
+)
+def test_malformed_fields_never_raise(tmp_path, bad_entry):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(path, [bad_entry])
+
+    result = number_profiles.lookup_profile("10000", "查流量", path=path)
+    assert result is None or isinstance(result, dict)
+    assert isinstance(number_profiles.list_profiles(path=path), list)
+
+
+def test_empty_target_task_does_not_match_task_bearing_entry(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(path, [{"number": "10000", "task": "查流量", "scenario": "策略"}])
+
+    assert number_profiles.lookup_profile("10000", "", path=path) is None
+    assert number_profiles.lookup_profile("10000", None, path=path) is None
