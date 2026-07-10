@@ -13,7 +13,9 @@ from typing import Callable, Sequence
 
 BRIDGE_LABEL = "com.agentcall.bridge"
 APP_LABEL = "com.agentcall.app"
-LAUNCH_LABELS = (BRIDGE_LABEL, APP_LABEL)
+TRAY_LABEL = "com.agentcall.tray"
+# 安装顺序 bridge→app→tray（图标出现时服务已就绪）；卸载按 reversed 先撤 UI。
+LAUNCH_LABELS = (BRIDGE_LABEL, APP_LABEL, TRAY_LABEL)
 
 _DEFAULT_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 
@@ -191,7 +193,20 @@ def build_plists(layout: LaunchdLayout) -> dict[str, dict]:
         "StandardOutPath": str(layout.log_dir / "launchd-app.out.log"),
         "StandardErrorPath": str(layout.log_dir / "launchd-app.err.log"),
     }
-    return {BRIDGE_LABEL: bridge, APP_LABEL: app}
+    tray = {
+        **common,
+        "Label": TRAY_LABEL,
+        # 菜单栏 UI 进程（无参数入口）。不裹 caffeinate——防睡眠由 --service
+        # 单元承担，UI 进程不该额外持系统断言。
+        "ProgramArguments": [str(layout.executable)],
+        # KeepAlive 用 SuccessfulExit=False：崩溃（非零退出）自动拉起；
+        # 单例让位/用户主动退出（退出码 0）不再拉起——否则双击实例与
+        # launchd 实例互踢会形成 ThrottleInterval 周期的重启风暴。
+        "KeepAlive": {"SuccessfulExit": False},
+        "StandardOutPath": str(layout.log_dir / "launchd-tray.out.log"),
+        "StandardErrorPath": str(layout.log_dir / "launchd-tray.err.log"),
+    }
+    return {BRIDGE_LABEL: bridge, APP_LABEL: app, TRAY_LABEL: tray}
 
 
 def plist_bytes(data: dict) -> bytes:
@@ -293,10 +308,16 @@ def install_launch_agents(
     unload_interval: float = 0.2,
     bootstrap_attempts: int = 3,
     bootstrap_retry_seconds: float = 2.0,
+    no_restart_labels: frozenset[str] | set[str] = frozenset(),
 ) -> LaunchdInstallResult:
     """Write missing/stale plists and bootstrap changed agents.
 
     Returns labels that were written and bootstrapped.
+
+    ``no_restart_labels``：plist 变更时原地写盘、不 bootout 在跑实例（改动下次
+    respawn/登录生效），未加载时照常 bootstrap。给「安装方即被装单元本身」的
+    场景用——tray 进程安装 tray 单元时若 bootout 自己，会被 launchd 杀死在
+    写盘之前，导致新 plist 永远落不了地。
     """
     layout.support_dir.mkdir(parents=True, exist_ok=True)
     layout.data_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +346,24 @@ def install_launch_agents(
                     changed.append(label)
                 else:
                     failures.append(failure)
+            continue
+        if label in no_restart_labels:
+            # 原地更新：只写盘不踢在跑实例；未加载（如首次安装）才 bootstrap。
+            path.write_bytes(plist_bytes(data))
+            if not agent_loaded(label, layout, runner):
+                failure = _bootstrap_with_retry(
+                    label,
+                    path,
+                    layout,
+                    runner,
+                    attempts=bootstrap_attempts,
+                    retry_seconds=bootstrap_retry_seconds,
+                    sleep=sleep,
+                )
+                if failure is not None:
+                    failures.append(failure)
+                    continue
+            changed.append(label)
             continue
         bootout = _run_launchctl(["bootout", f"{layout.gui_domain}/{label}"], runner)
         if bootout.returncode != 0:
@@ -383,6 +422,7 @@ def uninstall_launch_agents(
 __all__ = [
     "APP_LABEL",
     "BRIDGE_LABEL",
+    "TRAY_LABEL",
     "LAUNCH_LABELS",
     "LaunchdLayout",
     "LaunchctlFailure",

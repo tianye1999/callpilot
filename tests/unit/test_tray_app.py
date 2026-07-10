@@ -6,6 +6,8 @@ import sys
 import urllib.error
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import tray_app
@@ -241,3 +243,32 @@ def test_request_restart_posts(monkeypatch):
     assert tray_app.request_restart("http://127.0.0.1:47100") is True
     assert seen["url"] == "http://127.0.0.1:47100/api/restart"
     assert seen["method"] == "POST"
+
+
+def test_tray_singleton_lock_is_exclusive_and_releasable(tmp_path):
+    pytest.importorskip("fcntl", reason="单例锁依赖 POSIX flock（tray 形态仅 macOS）")
+    lock_path = tmp_path / "tray.lock"
+
+    first = tray_app._acquire_tray_singleton_lock(lock_path)
+    assert first is not None
+    # 同一路径的第二个实例拿不到锁（让位信号）。
+    assert tray_app._acquire_tray_singleton_lock(lock_path) is None
+
+    first.close()  # 释放后可再获取（模拟旧实例退出）
+    second = tray_app._acquire_tray_singleton_lock(lock_path)
+    assert second is not None
+    second.close()
+
+
+def test_main_yields_quietly_when_singleton_lock_held(monkeypatch):
+    monkeypatch.setattr(tray_app.sys, "argv", ["tray_app.py"])
+    monkeypatch.setattr(
+        tray_app, "_acquire_tray_singleton_lock", lambda lock_path=None: None
+    )
+
+    def _fail_import():
+        raise AssertionError("让位路径不应再走到 rumps 初始化")
+
+    monkeypatch.setattr(tray_app, "_import_rumps", _fail_import)
+
+    tray_app.main()  # 已有实例在跑：应静默返回（进程退出码 0 语义）

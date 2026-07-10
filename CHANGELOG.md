@@ -4,6 +4,39 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.4.3] — 2026-07-10
+
+### Added
+
+- **Preset library manager**: a bilingual Presets page with create / edit /
+  duplicate / enable-disable / delete / search and a global switch, backed by
+  an atomic local-JSON CRUD API with stable profile IDs, field validation,
+  conflict detection and legacy-file compatibility. Dialing now selects
+  presets by stable ID, so renaming a task no longer breaks the match (#8).
+- **Menu-bar icon is kept alive by launchd** (`com.agentcall.tray`): the icon
+  appears at login and is restarted on crash. A second instance started by
+  double-clicking yields quietly via a singleton lock instead of fighting the
+  resident one, and the tray no longer risks killing itself while refreshing
+  its own launchd unit (#11).
+
+### Fixed
+
+- **Cross-platform CI baseline** (#10): Windows mypy (`os.getuid`), POSIX-only
+  bridge tests now skipped on Windows, launchd test assertions made
+  host-neutral.
+- **Manual response control race** (#10): a reply can no longer double-fire in
+  the request→`response.created` wire gap; a watchdog recovers from a lost
+  `created`/`done` event.
+
+### Engineering
+
+- The packaged app version now has a single source of truth
+  (`pyproject.toml`); the PyInstaller spec reads it at build time, and a test
+  keeps them from drifting.
+- Quality gate hardened: releases / batch closes now require the GitHub
+  Actions three-platform matrix to be green (local triad alone proved
+  insufficient).
+
 ## [0.4.2] — 2026-07-09
 
 > Version 0.4.1 was an internal packaged-app version bump only and was never
@@ -290,6 +323,7 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.4.3]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.3
 [0.4.2]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.2
 [0.4.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.0
 [0.3.1]: https://github.com/tianye1999/callpilot/releases/tag/v0.3.1

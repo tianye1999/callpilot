@@ -107,7 +107,7 @@ def test_install_launch_agents_writes_and_bootstraps_only_changed_plists(tmp_pat
 
     changed = macos_launchd.install_launch_agents(layout, runner=fake_run)
 
-    assert changed == ["com.agentcall.bridge", "com.agentcall.app"]
+    assert changed == ["com.agentcall.bridge", "com.agentcall.app", "com.agentcall.tray"]
     assert (layout.support_dir / ".env").is_file()
     assert (layout.data_dir).is_dir()
     assert (layout.log_dir).is_dir()
@@ -119,6 +119,7 @@ def test_install_launch_agents_writes_and_bootstraps_only_changed_plists(tmp_pat
     assert calls == [
         ["launchctl", "print", "gui/123/com.agentcall.bridge"],
         ["launchctl", "print", "gui/123/com.agentcall.app"],
+        ["launchctl", "print", "gui/123/com.agentcall.tray"],
     ]
 
 
@@ -145,9 +146,11 @@ def test_install_launch_agents_bootstraps_existing_plist_when_unit_not_loaded(tm
     assert macos_launchd.install_launch_agents(layout, runner=fake_run) == [
         "com.agentcall.bridge",
         "com.agentcall.app",
+        "com.agentcall.tray",
     ]
     assert ["launchctl", "bootstrap", "gui/123", str(layout.launch_agents_dir / "com.agentcall.bridge.plist")] in calls
     assert ["launchctl", "bootstrap", "gui/123", str(layout.launch_agents_dir / "com.agentcall.app.plist")] in calls
+    assert ["launchctl", "bootstrap", "gui/123", str(layout.launch_agents_dir / "com.agentcall.tray.plist")] in calls
 
 
 def test_install_launch_agents_waits_for_bootout_before_bootstrap(tmp_path):
@@ -225,7 +228,11 @@ def test_install_launch_agents_retries_bootstrap_failures(tmp_path):
     )
 
     assert result.failures == []
-    assert bootstrap_attempts == {"com.agentcall.bridge": 3, "com.agentcall.app": 3}
+    assert bootstrap_attempts == {
+        "com.agentcall.bridge": 3,
+        "com.agentcall.app": 3,
+        "com.agentcall.tray": 3,
+    }
 
 
 def test_install_launch_agents_reports_bootstrap_failure_details(tmp_path):
@@ -254,6 +261,7 @@ def test_install_launch_agents_reports_bootstrap_failure_details(tmp_path):
     assert [failure.label for failure in result.failures] == [
         "com.agentcall.bridge",
         "com.agentcall.app",
+        "com.agentcall.tray",
     ]
     assert all(failure.action == "bootstrap" for failure in result.failures)
     assert all(failure.returncode == 37 for failure in result.failures)
@@ -279,9 +287,94 @@ def test_uninstall_launch_agents_boots_out_and_removes_plists(tmp_path):
 
     removed = macos_launchd.uninstall_launch_agents(layout, runner=fake_run)
 
-    assert removed == ["com.agentcall.app", "com.agentcall.bridge"]
+    assert removed == ["com.agentcall.tray", "com.agentcall.app", "com.agentcall.bridge"]
     assert calls == [
+        ["launchctl", "bootout", "gui/123/com.agentcall.tray"],
         ["launchctl", "bootout", "gui/123/com.agentcall.app"],
         ["launchctl", "bootout", "gui/123/com.agentcall.bridge"],
     ]
     assert not any(layout.launch_agents_dir.glob("com.agentcall.*.plist"))
+
+
+def test_build_plists_tray_unit_keepalive_and_no_caffeinate(tmp_path):
+    exe = tmp_path / "CallPilot.app" / "Contents" / "MacOS" / "CallPilot"
+    support = tmp_path / "Support"
+    layout = macos_launchd.make_layout(
+        exe, uid=501, support_dir=support, launch_dir=tmp_path / "LaunchAgents"
+    )
+
+    tray = macos_launchd.build_plists(layout)["com.agentcall.tray"]
+
+    # 无参数入口=菜单栏；UI 进程不裹 caffeinate（防睡眠由 --service 承担）。
+    assert tray["ProgramArguments"] == [str(exe.resolve())]
+    # 崩溃（非零退出）自动拉起；单例让位/主动退出（码 0）不拉起——防重启风暴。
+    assert tray["KeepAlive"] == {"SuccessfulExit": False}
+    assert tray["RunAtLoad"] is True
+    assert tray["StandardOutPath"] == str(support / "logs" / "launchd-tray.out.log")
+    assert tray["StandardErrorPath"] == str(support / "logs" / "launchd-tray.err.log")
+
+
+def test_install_no_restart_labels_updates_plist_without_bootout(tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        # print 一律 0 = 全部单元都已加载（在跑）。
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    layout = macos_launchd.make_layout(
+        tmp_path / "CallPilot.app" / "Contents" / "MacOS" / "CallPilot",
+        uid=123,
+        support_dir=tmp_path / "Support",
+        launch_dir=tmp_path / "LaunchAgents",
+    )
+    layout.launch_agents_dir.mkdir()
+    plists = macos_launchd.build_plists(layout)
+    for label, data in plists.items():
+        (layout.launch_agents_dir / f"{label}.plist").write_bytes(plistlib.dumps(data))
+    # tray plist 过期（模拟升级期：安装方就是在跑的 tray 自己）。
+    stale = dict(plists["com.agentcall.tray"])
+    stale["ProgramArguments"] = ["/old/CallPilot"]
+    tray_path = layout.launch_agents_dir / "com.agentcall.tray.plist"
+    tray_path.write_bytes(plistlib.dumps(stale))
+
+    result = macos_launchd.install_launch_agents(
+        layout, runner=fake_run, no_restart_labels={"com.agentcall.tray"}
+    )
+
+    assert result.changed == ["com.agentcall.tray"]
+    assert result.failures == []
+    with tray_path.open("rb") as f:
+        assert plistlib.load(f) == plists["com.agentcall.tray"]  # 原地写盘生效
+    # 不 bootout 在跑实例（否则杀掉安装方自己）、已加载也不重复 bootstrap。
+    assert ["launchctl", "bootout", "gui/123/com.agentcall.tray"] not in calls
+    assert not any(cmd[1] == "bootstrap" and "tray" in cmd[-1] for cmd in calls)
+
+
+def test_install_no_restart_labels_still_bootstraps_when_not_loaded(tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        returncode = 1 if cmd[1] == "print" else 0  # 均未加载
+        return subprocess.CompletedProcess(cmd, returncode, "", "")
+
+    layout = macos_launchd.make_layout(
+        tmp_path / "CallPilot.app" / "Contents" / "MacOS" / "CallPilot",
+        uid=123,
+        support_dir=tmp_path / "Support",
+        launch_dir=tmp_path / "LaunchAgents",
+    )
+
+    result = macos_launchd.install_launch_agents(
+        layout, runner=fake_run, no_restart_labels={"com.agentcall.tray"}
+    )
+
+    assert "com.agentcall.tray" in result.changed
+    assert ["launchctl", "bootout", "gui/123/com.agentcall.tray"] not in calls
+    assert [
+        "launchctl",
+        "bootstrap",
+        "gui/123",
+        str(layout.launch_agents_dir / "com.agentcall.tray.plist"),
+    ] in calls

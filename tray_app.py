@@ -25,10 +25,12 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import IO
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +168,10 @@ def _ensure_launchd_installed():
     from agentcall import macos_launchd
 
     layout = macos_launchd.make_layout(sys.executable, resources_dir=_resources_dir())
-    return macos_launchd.install_launch_agents(layout)
+    # tray 单元由本进程自装：声明 no_restart 防止 bootout 杀掉自己（见函数 docstring）。
+    return macos_launchd.install_launch_agents(
+        layout, no_restart_labels={macos_launchd.TRAY_LABEL}
+    )
 
 
 def _uninstall_launchd() -> list[str]:
@@ -247,6 +252,30 @@ def maybe_autoopen_dashboard(
 
 # ---- rumps 菜单栏胶水（薄层，惰性导入，仅 macOS）----
 
+def _acquire_tray_singleton_lock(lock_path: Path | None = None) -> "IO[str] | object | None":
+    """菜单栏单例文件锁：返回持锁句柄；已有实例在跑时返回 None（调用方让位退出 0）。
+
+    launchd 常驻实例（com.agentcall.tray）与用户双击/LaunchServices 拉起的实例
+    可能并存——靠 flock 让后来者主动让位；配合 tray launchd 单元的
+    ``KeepAlive={"SuccessfulExit": False}``，让位退出（码 0）不会被反复拉起。
+    句柄须由调用方持有到进程结束，锁随进程退出自动释放（含崩溃）。
+    非 POSIX 平台无 fcntl：跳过单例（tray 形态本就 macOS-only），返回占位对象。
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return object()
+    if lock_path is None:
+        lock_path = Path(tempfile.gettempdir()) / f"callpilot-tray-{os.getuid()}.lock"
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
 def _import_rumps():
     try:
         import rumps
@@ -275,6 +304,12 @@ def main() -> None:
     if "--window" in sys.argv[1:]:
         import desktop_app
         desktop_app.main()
+        return
+    # 单例：launchd 常驻实例已在跑时，双击再启的实例让位退出（码 0，见函数注释）。
+    # 句柄须持有到进程结束，锁才不失效。
+    singleton_lock = _acquire_tray_singleton_lock()
+    if singleton_lock is None:
+        logger.info("已有 CallPilot 菜单栏实例在运行，本实例让位退出")
         return
     rumps = _import_rumps()
     lang = "en" if os.getenv("AGENT_LANGUAGE", "zh").strip().lower() == "en" else "zh"
