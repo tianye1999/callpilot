@@ -58,6 +58,7 @@ v0.4.0 adds several call-quality controls for outbound work:
   Use the **Presets** page to create, edit, duplicate, disable, or delete entries;
   advanced users can still edit `data/number_profiles.json`. Every `label` /
   `task` / `scenario` / `opening` field supports a string or `{zh,en}` object.
+  Full schema and writing guide: [`docs/number-profiles.md`](docs/number-profiles.md) (Chinese).
 - **Preset dialing with sub-topics:** choosing a preset fills the number and
   topic, while the topic box stays editable for the exact sub-topic of this call
   without losing the preset match.
@@ -107,6 +108,9 @@ or Taobao for "EC20 USB adapter".
 
 - For the DMG path: an EC20/EG25 modem with an active SIM. The app bundles its
   Python runtime, CallPilot code, `ffmpeg`, and `libusb`.
+- No manual AT setup for audio: the service enables UAC voice automatically at
+  startup (`AT+QCFG="USBCFG"` + `AT+QPCMV=1,2`). If the module has never had UAC
+  enabled before, replug USB once so the new USB config takes effect.
 - For the developer path: Python 3.12+, a working `ffmpeg` on PATH, and on
   macOS `brew install libusb` for the USB→PTY bridge.
 - A **DashScope API key** (for Qwen). Get one at
@@ -254,6 +258,8 @@ stapled, and self-verified.
 
 ### Troubleshooting
 
+New-user install & first-run Q&A: [`docs/faq.md`](docs/faq.md) (Chinese).
+
 | Symptom | Likely cause / fix |
 |---------|-------------------|
 | App can't open `/tmp/ec20-at` | USB bridge not running, or modem replugged (bridge auto-reconnects; the service also re-opens the serial port) |
@@ -323,7 +329,7 @@ v0.4.0 增加了几项面向外呼质量的控制：
 - **预调教任务库**：首次启动会从 [`data/number_profiles.example.json`](data/number_profiles.example.json)
   初始化本地任务库；可在「任务库」页面新建、编辑、复制、停用或删除预设，高级用户仍可直接编辑
   `data/number_profiles.json`。`label` / `task` / `scenario` / `opening` 字段均支持普通字符串或
-  `{zh,en}` 双语对象。
+  `{zh,en}` 双语对象。完整结构与编写指南见 [`docs/number-profiles.md`](docs/number-profiles.md)。
 - **拨号下拉 + 子主题**：选择预设会自动填号码和事项，事项框仍可改成本通的具体子主题，
   同时保留预设命中。
 - **动态场景提示词**：预设未命中时，可在接通前用轻量文本模型生成本通场景与开场白
@@ -362,6 +368,8 @@ macOS 没有 Quectel 厂商串口的原生设备，需先跑 USB→PTY 桥（`sc
 
 - 普通用户 DMG 路径：一张有效 SIM 的 EC20/EG25 模组；App 已内置 Python runtime、
   CallPilot 代码、`ffmpeg` 与 `libusb`。
+- 音频无需手动发 AT：服务启动时自动启用 UAC 语音（`AT+QCFG="USBCFG"` + `AT+QPCMV=1,2`）；
+  模组此前从未启用过 UAC 的话，重插一次 USB 让新配置生效。
 - 开发者源码路径：Python 3.12+、PATH 里有 `ffmpeg`；macOS 还需
   `brew install libusb`（USB→PTY 桥的 pyusb 依赖系统库）。
 - **DashScope API Key**（Qwen 用），申请：<https://dashscope.console.aliyun.com/>。
@@ -478,6 +486,8 @@ macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=
   可直接回放最近一通录音。
 
 ### 排障
+
+新手安装与首启常见问题见 [`docs/faq.md`](docs/faq.md)。
 
 | 现象 | 可能原因 / 解决 |
 |------|----------------|
