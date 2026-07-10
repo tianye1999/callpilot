@@ -8,11 +8,16 @@
 
 import os
 import sys
+import tomllib
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 project_root = Path(os.environ["AGENTCALL_BUILD_ROOT"]).resolve()
+
+# 版本号单一出处：pyproject.toml 的 [project].version（防三头脱节，有测试锁定）。
+with open(project_root / "pyproject.toml", "rb") as _pyproject:
+    APP_VERSION = tomllib.load(_pyproject)["project"]["version"]
 
 # 平台判断统一走 platforms 模块；agentcall 在 src/ 下，构建时不要求已 pip 安装
 sys.path.insert(0, str(project_root / "src"))
@@ -104,7 +109,7 @@ if IS_MACOS:
         bundle_identifier="ai.bondings.callpilot",
         info_plist={
             "CFBundleDisplayName": "CallPilot",
-            "CFBundleShortVersionString": "0.4.2",
+            "CFBundleShortVersionString": APP_VERSION,
             "NSMicrophoneUsageDescription": "CallPilot 需要采集通话对方的语音，供 AI 实时应答。",
             "NSHighResolutionCapable": True,
             # 菜单栏 App：不在 Dock 显示图标、无主窗口（LSUIElement）

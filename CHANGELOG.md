@@ -4,6 +4,52 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.4.2] — 2026-07-09
+
+> Version 0.4.1 was an internal packaged-app version bump only and was never
+> published as a release; its fixes ship here.
+
+### Added
+
+- **10 public-hotline presets out of the box**: a fresh install now seeds the
+  task preset library with carriers (10000 data/balance, 10086, 10010), four
+  banks' card-statement lines (95588 / 95533 / 95555 / 95566), 12315 consumer
+  complaints and 12345 government services — bilingual, zero private data —
+  instead of 2 placeholder entries.
+- **OpenAI provider upgraded to the gpt-realtime-2.1 family** (default
+  `gpt-realtime-2.1-mini` for lower call latency) plus a first-audio latency
+  metric per call (#3).
+- launchd installer (`scripts/launchd/install.sh`) supports both the dev
+  checkout and the packaged app.
+
+### Fixed
+
+First real-device batch on the packaged (signed DMG) app (#6):
+
+- **Microphone permission**: `NSMicrophoneUsageDescription` +
+  `com.apple.security.device.audio-input` entitlement now ship with the
+  bundle — under hardened runtime macOS silently muted capture, so the uplink
+  sat at −91 dB and the AI could not hear the other side. Calls work again.
+- Packaged background service no longer pops a browser tab on start (the dev
+  checkout keeps the auto-open).
+- The native window opened from the tray now comes to the foreground.
+- First launch seeds the preset library into the user data directory.
+- History page: clicking a recording's play control no longer collapses the
+  entry (and no longer mutes playback).
+- SMS reply whitelist now includes outbound numbers that actually answered
+  (CSRF guard preserved for everything else).
+- Setup wizard: the test SMS can be re-run after setup completes (a fresh
+  token is issued via `/api/meta`).
+
+### Engineering
+
+- mypy debt cleared: `ignore_errors` removed for the 7 remaining core modules;
+  the whole repo is now genuinely type-checked (E1).
+- Real-hardware regression calibrated over an 8-round dial run; transcript
+  assertions tuned (short politeness phrases exempted) (D1).
+- Community files moved into `.github/`; stray build artifacts removed from
+  the repo and ignored.
+
 ## [0.4.0] — 2026-07-09
 
 ### Added
@@ -244,6 +290,7 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.4.2]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.2
 [0.4.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.0
 [0.3.1]: https://github.com/tianye1999/callpilot/releases/tag/v0.3.1
 [0.3.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.3.0

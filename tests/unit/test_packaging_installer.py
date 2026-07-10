@@ -45,7 +45,9 @@ def test_packaged_app_declares_microphone_permission_and_seed_data():
 
     assert '"NSMicrophoneUsageDescription"' in text
     assert "CallPilot 需要采集通话对方的语音" in text
-    assert '"CFBundleShortVersionString": "0.4.2"' in text
+    # 版本号单一出处：spec 必须从 pyproject.toml 读版本，不得再写死字面量。
+    assert '"CFBundleShortVersionString": APP_VERSION' in text
+    assert 'tomllib.load(_pyproject)["project"]["version"]' in text
     assert '"number_profiles.example.json"' in text
     assert '"seed"' in text
 

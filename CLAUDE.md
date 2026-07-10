@@ -26,6 +26,10 @@ push 授权等)放在 gitignored 的 `CLAUDE.local.md`,不入库。
 ```
 三件套全绿是 commit 前置条件。`.env.example` 与 `config.py` 注册表有防脱节测试，改配置两边同步。
 
+三件套只覆盖本机环境；push 后要回看 GitHub Actions 三平台矩阵，**发布 Release /
+关闭批次 issue 的前置条件是 main 最新 CI 全绿**（教训：曾本地全绿而 CI 连红 6 轮
+无人察觉，红着发布了 v0.4.2）。Windows 腿可本地预检：`.venv/bin/mypy --platform win32`。
+
 ## 流程
 
 - **批次 issue**：每个开发批次开一个 GitHub issue（任务清单 + 验收标准），不是每个小需求
