@@ -180,7 +180,7 @@ class Eg25Modem:
         self._running = False
         self._on_ring: Callable[[str | None], None] | None = None
         self._on_hangup: Callable[[], None] | None = None
-        self._on_sms: Callable[[str | None, str], None] | None = None
+        self._on_sms: Callable[[str | None, str, str], None] | None = None
         self._on_call_connected: Callable[[str | None], None] | None = None
         self._buffer = ""
         self._processing_response_cmti = False
@@ -290,7 +290,13 @@ class Eg25Modem:
         self._dump_stored_sms()
 
     def _dump_stored_sms(self) -> None:
-        """启动时读取模组里已存的短信并打印，便于确认历史短信是否收到。"""
+        """启动时读取模组/SIM 已存短信并补收（走 on_sms）。
+
+        +CMTI 实时上报只覆盖服务运行期间新到达的短信；服务重启间隙、或
+        CNMI 上报被打断而遗漏的短信，会一直躺在 SIM 里进不了 app。启动时
+        全量读一遍补收，重复的靠 EventHub 短信指纹去重（sender+时间戳+正文），
+        不会重复入库或重复转发邮件。
+        """
         try:
             response = self._send('AT+CMGL="ALL"')
         except Exception as exc:  # noqa: BLE001
@@ -301,11 +307,16 @@ class Eg25Modem:
         if not entries:
             logger.info("模组内暂无已存短信")
             return
-        logger.info("模组内已存短信 %d 条:", len(entries))
+        logger.info("模组内已存短信 %d 条，补收（重复自动去重）", len(entries))
         for sender, timestamp, body in entries:
             logger.info(
-                "[历史短信] 来自 %s (%s): %s", sender or "未知", timestamp, body or "(空)"
+                "[补收短信] 来自 %s (%s): %s", sender or "未知", timestamp, body or "(空)"
             )
+            if self._on_sms:
+                try:
+                    self._on_sms(sender, body, timestamp)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("补收短信回调异常: %s", exc)
 
     def _parse_cmgl(self, response: str) -> list[tuple[str | None, str, str]]:
         lines = response.splitlines()
@@ -351,7 +362,8 @@ class Eg25Modem:
     def on_hangup(self, callback: Callable[[], None]) -> None:
         self._on_hangup = callback
 
-    def on_sms(self, callback: Callable[[str | None, str], None]) -> None:
+    def on_sms(self, callback: Callable[[str | None, str, str], None]) -> None:
+        """注册收件短信回调，参数 (发件方, 正文, 短信时间戳)。时间戳供去重。"""
         self._on_sms = callback
 
     def on_call_connected(self, callback: Callable[[str | None], None]) -> None:
@@ -746,7 +758,7 @@ class Eg25Modem:
         )
         if self._on_sms:
             try:
-                self._on_sms(sender, body)
+                self._on_sms(sender, body, timestamp)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("短信回调异常: %s", exc)
 

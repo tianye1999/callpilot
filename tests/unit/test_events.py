@@ -154,3 +154,33 @@ def test_reload_repairs_legacy_pdu_sms(tmp_path):
     event = hub.history()[0]
     assert event["sender"] == "+8613800000000"
     assert event["text"] == "你好"
+
+
+def test_sms_dedup_within_session():
+    """同一短信（sender+sms_ts+text）重复 publish：只入库一次，publish 返回 False。"""
+    hub = EventHub(make_loop())
+    sms = {"type": "sms_in", "sender": "10086", "text": "余额100", "sms_ts": "26/07/10,14:00:00"}
+    assert hub.publish(dict(sms)) is True          # 首次入库
+    assert hub.publish(dict(sms)) is False         # 重复 → 跳过
+    assert len([e for e in hub.history() if e.get("type") == "sms_in"]) == 1
+
+
+def test_sms_dedup_distinguishes_by_timestamp():
+    """同发件方同正文但时间戳不同 = 两条不同短信，都入库（不误去重）。"""
+    hub = EventHub(make_loop())
+    base = {"type": "sms_in", "sender": "10001", "text": "剩余1.00GB"}
+    assert hub.publish({**base, "sms_ts": "26/07/09,14:00:00"}) is True
+    assert hub.publish({**base, "sms_ts": "26/07/10,14:00:00"}) is True
+    assert len([e for e in hub.history() if e.get("type") == "sms_in"]) == 2
+
+
+def test_sms_dedup_survives_restart(tmp_path):
+    """重启补收：已持久化的短信再 publish（模拟启动补收 SIM 已存）不重复入库。"""
+    store = tmp_path / "messages.json"
+    hub = EventHub(make_loop(), store_path=store)
+    sms = {"type": "sms_in", "sender": "10086", "text": "hi", "sms_ts": "26/07/10,09:00:00"}
+    assert hub.publish(dict(sms)) is True
+
+    reloaded = EventHub(make_loop(), store_path=store)  # 重启：从 messages.json 预填指纹
+    assert reloaded.publish(dict(sms)) is False         # 补收同一条 → 去重
+    assert len([e for e in reloaded.history() if e.get("type") == "sms_in"]) == 1

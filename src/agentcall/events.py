@@ -43,6 +43,9 @@ class EventHub:
         self._audio_clients: set[web.WebSocketResponse] = set()
         self._audio_tasks: set[asyncio.Task[None]] = set()
         self._audio_rate = 24000
+        # 收到过的短信指纹（发件方+时间戳+正文），跨重启去重：启动补收 SIM 已存
+        # 短信、或 +CMTI 重复上报时，同一条不会重复入库/重复转发邮件。
+        self._seen_sms: set[tuple[str, str, str]] = set()
         self._store_path = Path(store_path) if store_path else None
         if self._store_path:
             self._load_persisted()
@@ -110,8 +113,32 @@ class EventHub:
 
     # ---- 发布端（任意线程）----
 
-    def publish(self, event: dict[str, Any]) -> None:
+    @staticmethod
+    def _sms_fingerprint(event: dict[str, Any]) -> tuple[str, str, str]:
+        """收件短信去重指纹：发件方 + 短信自带时间戳(sms_ts，无则空) + 正文。
+
+        不用 ts（入库时间，补收与实时收会不同），用短信本身的 sms_ts，
+        同一条短信无论何时被读到指纹都一致。"""
+        return (
+            str(event.get("sender") or ""),
+            str(event.get("sms_ts") or ""),
+            str(event.get("text") or ""),
+        )
+
+    def publish(self, event: dict[str, Any]) -> bool:
+        """发布事件；返回是否真正入库（收件短信去重时重复的一条返回 False）。
+
+        调用方（如 on_sms）可据返回值决定要不要触发后续动作（如转发邮件），
+        避免补收 SIM 已存短信 / +CMTI 重复上报时重复转发。
+        """
         event.setdefault("ts", time.time())
+        # 收件短信去重：指纹已见过则直接丢弃（不入库、不广播、返回 False）。
+        if event.get("type") == "sms_in":
+            fp = self._sms_fingerprint(event)
+            with self._lock:
+                if fp in self._seen_sms:
+                    return False
+                self._seen_sms.add(fp)
         should_persist = False
         with self._lock:
             self._history.append(event)
@@ -125,6 +152,7 @@ class EventHub:
         except RuntimeError:
             # loop 已关闭（服务正在退出），忽略。
             pass
+        return True
 
     def _broadcast(self, event: dict[str, Any]) -> None:
         # 经 call_soon_threadsafe 调度，始终在 loop 线程内执行，故操作 _tasks 无需加锁。
@@ -158,6 +186,9 @@ class EventHub:
                 if isinstance(event, dict):
                     self._repair_sms_event(event)
                     self._history.append(event)
+                    # 预填去重指纹：重启后补收 SIM 已存短信时，已持久化过的不再重复入库。
+                    if event.get("type") == "sms_in":
+                        self._seen_sms.add(self._sms_fingerprint(event))
 
     @staticmethod
     def _repair_sms_event(event: dict[str, Any]) -> None:

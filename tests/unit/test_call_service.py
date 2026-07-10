@@ -308,3 +308,33 @@ def test_outbound_call_uses_digital_twin_prompt(monkeypatch):
     assert "我是李明的数字分身" in agent.said[0]
     assert "让我打" not in agent.said[0]  # 开场白已去掉“让我打来”
     assert "查询本机套餐和剩余流量" in agent.said[0]
+
+
+def test_duplicate_sms_not_republished_or_reforwarded():
+    """补收/重复上报同一短信：去重后不重复入库、不重复转发邮件（#SMS 补收）。"""
+    modem = FakeModem()
+    hub = make_hub()
+    forwarder = FakeSmsEmailForwarder(hub)
+    make_service(modem, hub=hub, sms_email_forwarder=forwarder)
+
+    modem.trigger_sms("10086", "余额100元", "26/07/10,14:00:00")
+    modem.trigger_sms("10086", "余额100元", "26/07/10,14:00:00")  # 重复（如补收）
+
+    sms_in = [e for e in hub.history() if e.get("type") == "sms_in"]
+    assert len(sms_in) == 1                     # 只入库一次
+    assert forwarder.enqueued == [("10086", "余额100元")]  # 只转发一次
+
+
+def test_same_text_different_timestamp_both_delivered():
+    """同发件方同正文、时间戳不同 = 两条真实短信，都入库都转发（不误去重）。"""
+    modem = FakeModem()
+    hub = make_hub()
+    forwarder = FakeSmsEmailForwarder(hub)
+    make_service(modem, hub=hub, sms_email_forwarder=forwarder)
+
+    modem.trigger_sms("10001", "剩余1.00GB", "26/07/09,14:00:00")
+    modem.trigger_sms("10001", "剩余1.00GB", "26/07/10,14:00:00")
+
+    sms_in = [e for e in hub.history() if e.get("type") == "sms_in"]
+    assert len(sms_in) == 2
+    assert len(forwarder.enqueued) == 2

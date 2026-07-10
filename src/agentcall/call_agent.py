@@ -1045,9 +1045,17 @@ class CallAgentService:
             self.session.stop()
             self.modem.hangup()
 
-        def on_sms(sender: str | None, text: str) -> None:
+        def on_sms(sender: str | None, text: str, sms_ts: str = "") -> None:
             logger.info("收到短信 来自=%s 字符数=%d", sender or "未知", len(text))
-            self._publish({"type": "sms_in", "sender": sender, "text": text})
+            # publish 返回是否为新短信：补收 SIM 已存短信 / +CMTI 重复上报时，
+            # 去重后重复的一条既不入库也不重复转发邮件（is_new=False 直接跳过）。
+            is_new = True
+            if self.hub is not None:
+                is_new = self.hub.publish(
+                    {"type": "sms_in", "sender": sender, "text": text, "sms_ts": sms_ts}
+                )
+            if not is_new:
+                return
             try:
                 self.sms_email_forwarder.enqueue(sender, text)
             except Exception as exc:  # noqa: BLE001 - 转发失败不能中断模组监听。

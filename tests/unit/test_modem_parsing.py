@@ -96,7 +96,7 @@ def test_clcc_outbound_connected_sets_event():
 def test_clcc_response_with_cmti_reads_sms():
     modem = make_modem()
     messages: list[tuple[str | None, str]] = []
-    modem.on_sms(lambda sender, body: messages.append((sender, body)))
+    modem.on_sms(lambda sender, body, ts="": messages.append((sender, body)))
     sent: list[str] = []
 
     def fake_send(cmd: str) -> str:
@@ -450,7 +450,7 @@ def test_send_response_with_cmti_reads_sms():
     modem = make_modem()
     modem._ser = CMTIFakeSerial()
     messages: list[tuple[str | None, str]] = []
-    modem.on_sms(lambda sender, body: messages.append((sender, body)))
+    modem.on_sms(lambda sender, body, ts="": messages.append((sender, body)))
 
     response = modem.send_command("AT+CSQ")
 
@@ -463,7 +463,7 @@ def test_response_without_cmti_has_no_sms_side_effect():
     modem = make_modem()
     modem._ser = FakeSerial()
     messages: list[tuple[str | None, str]] = []
-    modem.on_sms(lambda sender, body: messages.append((sender, body)))
+    modem.on_sms(lambda sender, body, ts="": messages.append((sender, body)))
 
     response = modem.send_command("AT")
 

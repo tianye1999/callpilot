@@ -88,9 +88,9 @@ class FakeModem:
         assert self._on_hangup is not None, "on_hangup 回调未注册"
         self._on_hangup()
 
-    def trigger_sms(self, sender: str | None, text: str) -> None:
+    def trigger_sms(self, sender: str | None, text: str, sms_ts: str = "") -> None:
         assert self._on_sms is not None, "on_sms 回调未注册"
-        self._on_sms(sender, text)
+        self._on_sms(sender, text, sms_ts)
 
     def trigger_call_connected(self, number: str | None = None) -> None:
         self.connected_flag.set()
