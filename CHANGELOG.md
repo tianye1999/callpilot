@@ -4,6 +4,17 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.5.3] — 2026-07-10
+
+### Fixed
+
+- **Incoming SMS not appearing in the app**: stored SIM messages were only
+  logged at startup (never ingested), and live `+CMTI` push only covers
+  messages that arrive while the service is running — anything received during
+  a restart gap was lost. Now the app back-fills stored SIM messages on
+  startup, with SMS de-duplication (sender + timestamp + body fingerprint,
+  persisted across restarts) so nothing is ingested or email-forwarded twice.
+
 ## [0.5.2] — 2026-07-10
 
 ### Added
@@ -390,6 +401,7 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.5.3]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.3
 [0.5.2]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.2
 [0.5.1]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.1
 [0.5.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.0
