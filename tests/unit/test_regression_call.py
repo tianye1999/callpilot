@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts import regression_call
 
@@ -167,3 +171,59 @@ def test_recording_arg_resolves_relative_path_and_reports_missing_dir(tmp_path, 
     missing_out = capsys.readouterr().out
     assert "录音目录不存在" in missing_out
     assert str((tmp_path / "recordings" / "missing").resolve()) in missing_out
+
+
+def test_resolve_recordings_dir_priority(tmp_path, monkeypatch):
+    """优先级：CLI > 服务 /api/meta > CALL_LOG_DIR > 打包目录 > 仓库目录（#15）。"""
+    cli_dir = tmp_path / "cli"
+    service_dir = tmp_path / "service"
+    env_dir = tmp_path / "env"
+    bundled = tmp_path / "bundled"
+
+    monkeypatch.setattr(
+        regression_call, "_service_recordings_dir", lambda api_base=None: service_dir
+    )
+    monkeypatch.setenv("CALL_LOG_DIR", str(env_dir))
+    monkeypatch.setattr(regression_call, "BUNDLED_RECORDINGS_DIR", bundled)
+
+    # CLI 显式最优先
+    assert regression_call.resolve_recordings_dir(str(cli_dir)) == cli_dir
+    # 服务 SSOT 次之
+    assert regression_call.resolve_recordings_dir(None) == service_dir
+    # 服务不可达 → env
+    monkeypatch.setattr(
+        regression_call, "_service_recordings_dir", lambda api_base=None: None
+    )
+    assert regression_call.resolve_recordings_dir(None) == env_dir
+    # env 缺失 → 打包目录（存在时）
+    monkeypatch.delenv("CALL_LOG_DIR")
+    bundled.mkdir()
+    assert regression_call.resolve_recordings_dir(None) == bundled
+    # 打包目录不存在 → 仓库目录
+    monkeypatch.setattr(regression_call, "BUNDLED_RECORDINGS_DIR", tmp_path / "absent")
+    assert (
+        regression_call.resolve_recordings_dir(None)
+        == regression_call.REPO_RECORDINGS_DIR
+    )
+
+
+def test_wait_for_finished_recording_catches_call_finished_in_last_poll_gap(tmp_path, monkeypatch):
+    """极短通话在最后一个 poll 间隙内结束时，超时兜底扫描仍应命中（#15）。"""
+    recordings = tmp_path / "recordings"
+    recordings.mkdir()
+    call_dir = recordings / "20260710-000000-outbound-10000"
+
+    ticks = iter([0.0, 100.0, 200.0])  # 首查即越过 deadline，直接走兜底扫描
+    monkeypatch.setattr(regression_call.time, "monotonic", lambda: next(ticks, 300.0))
+    monkeypatch.setattr(regression_call.time, "sleep", lambda _s: None)
+
+    _write_events(
+        call_dir,
+        _base_events(
+            _event("transcript", role="agent", text="你好。"),
+        ),
+    )
+
+    result = regression_call.wait_for_finished_recording(recordings, set(), timeout_seconds=1)
+    assert result.timed_out is False
+    assert result.path == call_dir

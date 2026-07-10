@@ -255,6 +255,11 @@ async def _meta(request: web.Request) -> web.Response:
         "modem_connected": bool(getattr(service, "modem_connected", False)),
         "port": meta.get("port") or config.get_str("MODEM_PORT"),
     }
+    # 录音根目录的单一事实出处：外部工具（回归脚本等）从这里拿，
+    # 避免开发版/打包版数据目录不一致导致对着空目录空等（issue #15）。
+    call_logger = getattr(service, "call_logger", None)
+    if call_logger is not None:
+        meta["recordings_dir"] = str(call_logger.base_dir)
     setup_sms_token = _ensure_setup_sms_token(request.app)
     if setup_sms_token:
         meta["setup_sms_token"] = setup_sms_token

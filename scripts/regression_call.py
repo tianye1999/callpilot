@@ -22,7 +22,14 @@ API_BASE = "http://127.0.0.1:47100"
 CALL_NUMBER = "10000"
 DEFAULT_TASK = "咨询流量使用情况"
 DEFAULT_WAIT_SECONDS = 180
-RECORDINGS_DIR = Path(__file__).resolve().parents[1] / "data" / "recordings"
+# 开发版（仓库 cwd/data）与打包版（Application Support）的录音目录不同；
+# 这两个只是回退候选，真正以运行中服务的 /api/meta.recordings_dir 为准（issue #15）。
+REPO_RECORDINGS_DIR = Path(__file__).resolve().parents[1] / "data" / "recordings"
+BUNDLED_RECORDINGS_DIR = (
+    Path.home() / "Library" / "Application Support" / "CallPilot" / "data" / "recordings"
+)
+# 兼容旧名（测试/离线回放默认仍指仓库目录，运行时经 resolve_recordings_dir 纠正）。
+RECORDINGS_DIR = REPO_RECORDINGS_DIR
 
 Event = Mapping[str, object]
 Status = Literal["PASS", "FAIL", "WARN"]
@@ -288,6 +295,44 @@ def list_recording_dirs(recordings_dir: Path = RECORDINGS_DIR) -> set[Path]:
     return {path for path in recordings_dir.iterdir() if path.is_dir()}
 
 
+def _service_recordings_dir(api_base: str = API_BASE) -> Path | None:
+    """向运行中的服务询问录音根目录（/api/meta.recordings_dir）；拿不到返回 None。"""
+    try:
+        with urllib.request.urlopen(f"{api_base}/api/meta", timeout=5) as response:
+            meta = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return None
+    raw = meta.get("recordings_dir") if isinstance(meta, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        return Path(raw).expanduser()
+    return None
+
+
+def resolve_recordings_dir(
+    cli_value: str | None = None,
+    *,
+    api_base: str = API_BASE,
+    ask_service: bool = True,
+) -> Path:
+    """确定录音根目录（issue #15：开发版与打包版目录不同，猜错就会空等超时）。
+
+    优先级：``--recordings-dir`` 显式 > 运行中服务的 /api/meta（SSOT）>
+    ``CALL_LOG_DIR`` 环境变量 > 打包版数据目录（存在时）> 仓库 data/recordings。
+    """
+    if cli_value:
+        return Path(cli_value).expanduser()
+    if ask_service:
+        from_service = _service_recordings_dir(api_base)
+        if from_service is not None:
+            return from_service
+    env_value = os.environ.get("CALL_LOG_DIR", "").strip()
+    if env_value:
+        return Path(env_value).expanduser()
+    if BUNDLED_RECORDINGS_DIR.is_dir():
+        return BUNDLED_RECORDINGS_DIR
+    return REPO_RECORDINGS_DIR
+
+
 def dial_call(task: str) -> None:
     body = {"number": CALL_NUMBER, "task": task, "preset_task": task}
     _post_json("/api/call/dial", body)
@@ -308,14 +353,34 @@ def wait_for_finished_recording(
     poll_interval: float = 1.0,
 ) -> WaitResult:
     deadline = time.monotonic() + timeout_seconds
+
+    def _scan() -> tuple[Path | None, Path | None]:
+        """返回 (已结束的目录, 最新出现的目录)。"""
+        newest: Path | None = None
+        new_dirs = sorted(
+            list_recording_dirs(recordings_dir) - before_dirs,
+            key=lambda path: path.name,
+            reverse=True,
+        )
+        for call_dir in new_dirs:
+            if newest is None:
+                newest = call_dir
+            if _recording_finished(call_dir):
+                return call_dir, newest
+        return None, newest
+
     latest_new: Path | None = None
     while time.monotonic() < deadline:
-        new_dirs = sorted(list_recording_dirs(recordings_dir) - before_dirs, key=lambda path: path.name, reverse=True)
-        for call_dir in new_dirs:
-            latest_new = call_dir
-            if _recording_finished(call_dir):
-                return WaitResult(path=call_dir, timed_out=False, detail="通话已结束")
+        finished, newest = _scan()
+        latest_new = newest or latest_new
+        if finished is not None:
+            return WaitResult(path=finished, timed_out=False, detail="通话已结束")
         time.sleep(poll_interval)
+    # 超时兜底再扫一次：极短通话可能恰在最后一个 poll 间隙内结束。
+    finished, newest = _scan()
+    latest_new = newest or latest_new
+    if finished is not None:
+        return WaitResult(path=finished, timed_out=False, detail="通话已结束")
     return WaitResult(path=latest_new, timed_out=True, detail=f"等待 {timeout_seconds}s 后仍未结束")
 
 
@@ -341,11 +406,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.recording is not None:
             call_dir = resolve_recording_path(args.recording)
         elif args.no_dial:
-            call_dir = find_latest_recording()
+            call_dir = find_latest_recording(resolve_recordings_dir(args.recordings_dir))
         else:
-            before_dirs = list_recording_dirs()
+            recordings_dir = resolve_recordings_dir(args.recordings_dir)
+            before_dirs = list_recording_dirs(recordings_dir)
             dial_call(args.task)
-            wait_result = wait_for_finished_recording(RECORDINGS_DIR, before_dirs, args.wait)
+            wait_result = wait_for_finished_recording(recordings_dir, before_dirs, args.wait)
             call_dir = wait_result.path
             if wait_result.timed_out:
                 hangup_error = hangup_call()
@@ -383,8 +449,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dial 10000 and assert call events/transcripts.")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--no-dial", action="store_true", help="不拨打，分析 data/recordings 下最近一通录音")
+    mode.add_argument("--no-dial", action="store_true", help="不拨打，分析录音根目录下最近一通录音")
     mode.add_argument("--recording", help="不拨打，分析指定录音目录（绝对或相对路径）")
+    parser.add_argument(
+        "--recordings-dir",
+        help="录音根目录；缺省依次取运行中服务的 /api/meta、CALL_LOG_DIR、打包版数据目录、仓库 data/recordings",
+    )
     parser.add_argument("--task", default=DEFAULT_TASK, help=f"外呼任务，默认：{DEFAULT_TASK}")
     parser.add_argument("--wait", type=int, default=DEFAULT_WAIT_SECONDS, help="等待通话结束的秒数，默认 180")
     args = parser.parse_args(argv)

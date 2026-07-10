@@ -166,6 +166,40 @@ def test_meta_includes_setup_and_hardware_status(monkeypatch):
     assert meta["setup_sms_token"]
 
 
+def test_meta_exposes_recordings_dir_from_call_logger(tmp_path):
+    """录音根目录经 /api/meta 暴露（SSOT），供回归脚本对准数据目录（#15）。"""
+    service = FakeService(call_logger=CallLogger(base_dir=tmp_path / "rec"))
+    app = build_app(
+        hub=None,  # type: ignore[arg-type]
+        modem=None,  # type: ignore[arg-type]
+        service=service,
+        meta={"provider": "qwen"},
+    )
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        assert resp.status == 200
+        return await resp.json()
+
+    meta = api(app, fn)
+    assert meta["recordings_dir"] == str(tmp_path / "rec")
+
+
+def test_meta_omits_recordings_dir_without_call_logger():
+    app = build_app(
+        hub=None,  # type: ignore[arg-type]
+        modem=None,  # type: ignore[arg-type]
+        service=FakeService(),
+        meta={"provider": "qwen"},
+    )
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        return await resp.json()
+
+    assert "recordings_dir" not in api(app, fn)
+
+
 def test_meta_exposes_fresh_setup_sms_token_after_setup_done(monkeypatch):
     monkeypatch.setenv("SETUP_DONE", "true")
     app = make_app(FakeService())
