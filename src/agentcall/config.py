@@ -256,6 +256,26 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("DIAL_WHITELIST", "外呼白名单", "str", ""),
     ConfigSpec("DIAL_INTERVAL_SECONDS", "连续拨号间隔（秒）", "float", "5.0"),
     ConfigSpec("SMS_RATE_LIMIT_PER_HOUR", "短信发送频控（每小时）", "int", "10"),
+    ConfigSpec("SMS_EMAIL_FORWARD_ENABLED", "收到短信后转发到邮箱", "bool", "false"),
+    ConfigSpec("SMS_EMAIL_RECIPIENT", "短信转发收件邮箱", "str", ""),
+    ConfigSpec("SMS_EMAIL_SMTP_HOST", "发件 SMTP 主机", "str", ""),
+    ConfigSpec("SMS_EMAIL_SMTP_PORT", "发件 SMTP 端口", "int", "587"),
+    ConfigSpec(
+        "SMS_EMAIL_SMTP_SECURITY",
+        "发件 SMTP 加密方式",
+        "select",
+        "starttls",
+        choices=("starttls", "ssl"),
+    ),
+    ConfigSpec("SMS_EMAIL_SMTP_USERNAME", "发件 SMTP 用户名", "str", ""),
+    ConfigSpec(
+        "SMS_EMAIL_SMTP_PASSWORD",
+        "发件 SMTP 应用密码",
+        "str",
+        "",
+        secret=True,
+    ),
+    ConfigSpec("SMS_EMAIL_FROM", "发件邮箱地址", "str", ""),
     ConfigSpec("TOOL_QUERY_CODE_ENABLED", "启用验证码查询工具", "bool", "true",
                requires_restart=True),
     # 发短信目标限制改为「只能回复已联系过的号码」(见 contacts.py),
@@ -511,6 +531,69 @@ def _check_value(spec: ConfigSpec, value: str) -> None:
         )
 
 
+_SMS_EMAIL_CONFIG_KEYS = {
+    "SMS_EMAIL_FORWARD_ENABLED",
+    "SMS_EMAIL_RECIPIENT",
+    "SMS_EMAIL_SMTP_HOST",
+    "SMS_EMAIL_SMTP_PORT",
+    "SMS_EMAIL_SMTP_SECURITY",
+    "SMS_EMAIL_SMTP_USERNAME",
+    "SMS_EMAIL_SMTP_PASSWORD",
+    "SMS_EMAIL_FROM",
+}
+
+
+def _validate_sms_email_updates(updates: dict[str, str]) -> None:
+    """写入前校验短信转发配置合并后的完整状态。"""
+    if not _SMS_EMAIL_CONFIG_KEYS.intersection(updates):
+        return
+
+    def merged(key: str) -> str:
+        return updates.get(key, os.environ.get(key, get_spec(key).default)).strip()
+
+    enabled = merged("SMS_EMAIL_FORWARD_ENABLED").lower() in _TRUTHY
+    recipient = merged("SMS_EMAIL_RECIPIENT")
+    from_address = merged("SMS_EMAIL_FROM")
+    smtp_host = merged("SMS_EMAIL_SMTP_HOST")
+    smtp_security = merged("SMS_EMAIL_SMTP_SECURITY")
+
+    # 延迟导入，避免配置注册表反向依赖转发模块的初始化过程。
+    from .sms_email_forwarder import is_valid_email_address
+
+    if (enabled or "SMS_EMAIL_RECIPIENT" in updates) and recipient:
+        if not is_valid_email_address(recipient):
+            raise ValueError("配置 SMS_EMAIL_RECIPIENT 需要单个合法邮箱地址")
+    if (enabled or "SMS_EMAIL_FROM" in updates) and from_address:
+        if not is_valid_email_address(from_address):
+            raise ValueError("配置 SMS_EMAIL_FROM 需要单个合法邮箱地址")
+    if enabled or "SMS_EMAIL_SMTP_HOST" in updates:
+        if smtp_host and any(char.isspace() or ord(char) < 33 for char in smtp_host):
+            raise ValueError("配置 SMS_EMAIL_SMTP_HOST 不允许包含空白或控制字符")
+    if enabled or "SMS_EMAIL_SMTP_SECURITY" in updates:
+        if smtp_security not in get_spec("SMS_EMAIL_SMTP_SECURITY").choices:
+            raise ValueError("配置 SMS_EMAIL_SMTP_SECURITY 只允许 starttls 或 ssl")
+    if enabled or "SMS_EMAIL_SMTP_PORT" in updates:
+        try:
+            smtp_port = int(merged("SMS_EMAIL_SMTP_PORT"))
+        except ValueError:
+            raise ValueError("配置 SMS_EMAIL_SMTP_PORT 需要整数") from None
+        if not 1 <= smtp_port <= 65535:
+            raise ValueError("配置 SMS_EMAIL_SMTP_PORT 必须在 1..65535")
+
+    if not enabled:
+        return
+    required = {
+        "SMS_EMAIL_RECIPIENT": recipient,
+        "SMS_EMAIL_SMTP_HOST": smtp_host,
+        "SMS_EMAIL_SMTP_USERNAME": merged("SMS_EMAIL_SMTP_USERNAME"),
+        "SMS_EMAIL_SMTP_PASSWORD": merged("SMS_EMAIL_SMTP_PASSWORD"),
+        "SMS_EMAIL_FROM": from_address,
+    }
+    missing = [key for key, value in required.items() if not value]
+    if missing:
+        raise ValueError("启用短信邮件转发前请完整配置: " + ", ".join(missing))
+
+
 def _format_assignment(key: str, value: str) -> str:
     """生成 ``KEY=value`` 赋值文本；值含空白/#/引号时加双引号并转义。"""
     if value == "" or not _NEEDS_QUOTING_RE.search(value):
@@ -540,6 +623,7 @@ def update_env_file(
         if not spec.editable and not (allow_hidden and spec.hidden):
             raise ValueError(f"配置 {key} 不允许在面板编辑")
         _check_value(spec, value)
+    _validate_sms_email_updates(updates)
 
     if not updates:
         return []

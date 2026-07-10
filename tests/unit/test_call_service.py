@@ -15,7 +15,11 @@ def make_service(
     modem: FakeModem,
     hub: EventHub | None = None,
     audio_mode: str = "uac",
+    sms_email_forwarder=None,
 ) -> CallAgentService:
+    kwargs = {}
+    if sms_email_forwarder is not None:
+        kwargs["sms_email_forwarder"] = sms_email_forwarder
     return CallAgentService(
         modem_port="unused",
         audio_keyword="unused",
@@ -23,11 +27,29 @@ def make_service(
         audio_mode=audio_mode,
         hub=hub,
         modem=modem,  # type: ignore[arg-type]  # FakeModem 与 Eg25Modem 同形
+        **kwargs,
     )
 
 
 def make_hub() -> EventHub:
     return EventHub(asyncio.new_event_loop())
+
+
+class FakeSmsEmailForwarder:
+    def __init__(self, hub: EventHub | None = None) -> None:
+        self.hub = hub
+        self.enqueued: list[tuple[str | None, str]] = []
+        self.history_at_enqueue: list[dict] = []
+        self.stopped = False
+
+    def enqueue(self, sender: str | None, body: str, **_kwargs) -> bool:
+        self.enqueued.append((sender, body))
+        if self.hub is not None:
+            self.history_at_enqueue = self.hub.history()
+        return True
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self.stopped = True
 
 
 # ---- RING 去重 ----
@@ -47,6 +69,44 @@ def test_ring_starts_session_once(monkeypatch):
     modem.trigger_ring("13800000000")  # RING 与 CLCC 轮询重复触发
 
     assert starts == [None]
+
+
+# ---- 收到短信后邮件转发 ----
+
+
+def test_new_sms_is_published_before_nonblocking_email_enqueue():
+    modem = FakeModem()
+    hub = make_hub()
+    forwarder = FakeSmsEmailForwarder(hub)
+    make_service(modem, hub=hub, sms_email_forwarder=forwarder)
+
+    modem.trigger_sms("10086", "您的验证码是 482913")
+
+    assert forwarder.enqueued == [("10086", "您的验证码是 482913")]
+    assert forwarder.history_at_enqueue[-1]["type"] == "sms_in"
+    assert forwarder.history_at_enqueue[-1]["text"] == "您的验证码是 482913"
+
+
+def test_service_does_not_replay_sms_history_to_email_forwarder():
+    modem = FakeModem()
+    hub = make_hub()
+    hub.publish({"type": "sms_in", "sender": "10086", "text": "历史短信"})
+    forwarder = FakeSmsEmailForwarder(hub)
+
+    make_service(modem, hub=hub, sms_email_forwarder=forwarder)
+
+    assert forwarder.enqueued == []
+
+
+def test_stop_service_stops_sms_email_worker():
+    modem = FakeModem()
+    forwarder = FakeSmsEmailForwarder()
+    service = make_service(modem, sms_email_forwarder=forwarder)
+
+    service.stop_service()
+
+    assert forwarder.stopped is True
+    assert ("close", ()) in modem.calls
 
 
 # ---- 外呼互斥与等待接通 ----

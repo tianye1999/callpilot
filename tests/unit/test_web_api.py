@@ -350,6 +350,9 @@ def test_config_get_returns_all_visible_specs():
     assert by_key["AGENT_PROVIDER"]["kind"] == "select"
     assert by_key["AGENT_PROVIDER"]["choices"] == ["qwen", "doubao", "openai", "local"]
     assert by_key["MODEM_PORT"]["requires_restart"] is True
+    assert by_key["SMS_EMAIL_FORWARD_ENABLED"]["value"] in ("true", "false")
+    assert by_key["SMS_EMAIL_SMTP_PASSWORD"]["secret"] is True
+    assert by_key["SMS_EMAIL_SMTP_PASSWORD"]["value"] in ("已设置", "未设置")
 
 
 def test_config_post_roundtrip(monkeypatch, tmp_path):
@@ -418,6 +421,63 @@ def test_config_post_invalid_rejected(monkeypatch, tmp_path):
 
     api(app, fn)
     assert not env_file.exists()
+
+
+def test_config_post_enables_sms_email_only_with_complete_atomic_config(
+    monkeypatch, tmp_path
+):
+    env_file = tmp_path / ".env"
+    real_update = config.update_env_file
+    monkeypatch.setattr(
+        config,
+        "update_env_file",
+        lambda updates, env_path=".env": real_update(updates, env_path=env_file),
+    )
+    for key in (
+        "SMS_EMAIL_FORWARD_ENABLED",
+        "SMS_EMAIL_RECIPIENT",
+        "SMS_EMAIL_SMTP_HOST",
+        "SMS_EMAIL_SMTP_PORT",
+        "SMS_EMAIL_SMTP_SECURITY",
+        "SMS_EMAIL_SMTP_USERNAME",
+        "SMS_EMAIL_SMTP_PASSWORD",
+        "SMS_EMAIL_FROM",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    app = make_app(FakeService())
+
+    async def fn(client):
+        incomplete = await client.post(
+            "/api/config",
+            json={
+                "SMS_EMAIL_FORWARD_ENABLED": True,
+                "SMS_EMAIL_RECIPIENT": "owner@example.com",
+            },
+        )
+        assert incomplete.status == 400
+        assert not env_file.exists()
+        assert "SMS_EMAIL_FORWARD_ENABLED" not in os.environ
+
+        complete = await client.post(
+            "/api/config",
+            json={
+                "SMS_EMAIL_FORWARD_ENABLED": True,
+                "SMS_EMAIL_RECIPIENT": "owner@example.com",
+                "SMS_EMAIL_SMTP_HOST": "smtp.example.com",
+                "SMS_EMAIL_SMTP_PORT": 587,
+                "SMS_EMAIL_SMTP_SECURITY": "starttls",
+                "SMS_EMAIL_SMTP_USERNAME": "sender@example.com",
+                "SMS_EMAIL_SMTP_PASSWORD": "test-app-password",
+                "SMS_EMAIL_FROM": "sender@example.com",
+            },
+        )
+        assert complete.status == 200
+        return await complete.json()
+
+    data = api(app, fn)
+    assert data["ok"] is True
+    assert data["requires_restart"] == []
+    assert "SMS_EMAIL_FORWARD_ENABLED=true" in env_file.read_text(encoding="utf-8")
 
 
 # ---- /api/history ----

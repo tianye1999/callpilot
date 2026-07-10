@@ -4,6 +4,16 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [Unreleased]
+
+### Added
+
+- Optional SMS-to-email forwarding (#17): live modem SMS messages enter a
+  bounded background queue and are sent through per-deployment TLS SMTP
+  credentials. Reliable OTPs lead the subject for notification previews;
+  settings are atomically validated, secrets are masked, and forwarding is off
+  by default with no history replay.
+
 ## [0.5.0] — 2026-07-10
 
 ### Added

@@ -41,6 +41,7 @@ from .prompts import (
     owner_name,
     winddown_instructions,
 )
+from .sms_email_forwarder import SmsEmailForwarder
 from .summarizer import judge_wrap_up, summarize_call
 
 logger = logging.getLogger(__name__)
@@ -914,6 +915,7 @@ class CallAgentService:
         hub: EventHub | None = None,
         modem: Eg25Modem | None = None,
         call_logger: CallLogger | None = None,
+        sms_email_forwarder: SmsEmailForwarder | None = None,
     ) -> None:
         # modem/call_logger 参数供测试注入；默认按串口/环境配置自建。
         self.modem = modem or Eg25Modem(modem_port, baudrate)
@@ -928,6 +930,9 @@ class CallAgentService:
         self.modem_connected = modem is not None
         self._service_running = False
         self._supervisor_thread: threading.Thread | None = None
+        self.sms_email_forwarder = (
+            sms_email_forwarder if sms_email_forwarder is not None else SmsEmailForwarder()
+        )
         self.call_logger = call_logger or CallLogger(
             base_dir=os.getenv("CALL_LOG_DIR", str(config.call_log_dir())),
             recording_enabled=config.get_bool("RECORDING_ENABLED"),
@@ -1041,8 +1046,12 @@ class CallAgentService:
             self.modem.hangup()
 
         def on_sms(sender: str | None, text: str) -> None:
-            logger.info("收到短信 来自=%s 内容=%s", sender or "未知", text)
+            logger.info("收到短信 来自=%s 字符数=%d", sender or "未知", len(text))
             self._publish({"type": "sms_in", "sender": sender, "text": text})
+            try:
+                self.sms_email_forwarder.enqueue(sender, text)
+            except Exception as exc:  # noqa: BLE001 - 转发失败不能中断模组监听。
+                logger.warning("短信邮件转发入队失败: error_type=%s", type(exc).__name__)
 
         self.modem.on_ring(on_ring)
         self.modem.on_hangup(on_hangup)
@@ -1202,6 +1211,10 @@ class CallAgentService:
         self._service_running = False
         self.session.stop()
         self.modem.close()
+        try:
+            self.sms_email_forwarder.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("停止短信邮件转发 worker 失败: error_type=%s", type(exc).__name__)
 
     def run(self) -> None:
         self.start()
