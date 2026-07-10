@@ -188,3 +188,33 @@ def test_pipeline_init_failure_sets_fatal():
     except RuntimeError:
         pass
     assert agent.fatal
+
+
+def test_first_run_downloads_missing_models_and_reports_progress():
+    """首启缺模型：工厂收到 on_progress 回调、状态经 set_status_handler 播出。"""
+    progress: list[str] = []
+
+    def factory(on_progress=None):
+        if on_progress:
+            on_progress("下载中…")
+        return FakePipeline()
+
+    agent = LocalPipelineAgent(pipeline_factory=factory, llm_chat=lambda *a: {})
+    agent.set_status_handler(progress.append)
+    asyncio.run(agent.start(lambda pcm: None))
+    try:
+        assert "下载中…" in progress
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_factory_without_on_progress_still_works():
+    """fake/旧工厂不接受 on_progress 时，start() 退回无参调用不报错。"""
+    agent = LocalPipelineAgent(
+        pipeline_factory=lambda: FakePipeline(), llm_chat=lambda *a: {}
+    )
+    asyncio.run(agent.start(lambda pcm: None))
+    try:
+        assert agent.output_rate == 22050
+    finally:
+        asyncio.run(agent.stop())

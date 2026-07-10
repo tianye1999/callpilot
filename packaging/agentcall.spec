@@ -35,6 +35,17 @@ hiddenimports = [
 hiddenimports += collect_submodules("agentcall")
 datas += collect_data_files("agentcall")
 
+# 三段式 local provider 的 sherpa-onnx（可选依赖）：装了才收进包。
+# 打包 venv 由 build_installer.sh 的 [local] extra 装入；缺失时静默跳过，
+# 产出仍是可用的 realtime-only 包（不硬依赖三段式）。
+try:
+    _sherpa_datas, _sherpa_binaries, _sherpa_hidden = collect_all("sherpa_onnx")
+    datas += _sherpa_datas
+    binaries += _sherpa_binaries
+    hiddenimports += _sherpa_hidden
+except Exception:
+    pass
+
 # 菜单栏图标资源随包内嵌（tray_app.icon_path 经 _MEIPASS/menubar 解析）
 _menubar_dir = project_root / "packaging" / "menubar"
 if _menubar_dir.is_dir():

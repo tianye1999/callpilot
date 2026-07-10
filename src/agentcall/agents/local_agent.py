@@ -70,9 +70,9 @@ class _SayRequest:
 
 
 class _SherpaPipeline:
-    """sherpa-onnx 实现（惰性 import；模型缺失/库未装抛 RuntimeError）。"""
+    """sherpa-onnx 实现（惰性 import；缺库抛错，缺模型则首启自动下载）。"""
 
-    def __init__(self) -> None:
+    def __init__(self, on_progress: "Callable[[str], None] | None" = None) -> None:
         try:
             import sherpa_onnx  # noqa: PLC0415 - 可选依赖，惰性导入
         except ImportError as exc:
@@ -81,13 +81,20 @@ class _SherpaPipeline:
             ) from exc
         from .. import local_models
 
+        # 首启自动下载缺失模型（~300MB，不进 DMG）；进度经 on_progress 播给 UI。
         missing = local_models.missing_assets()
         if missing:
             ids = ", ".join(asset.id for asset in missing)
-            raise RuntimeError(
-                f"local provider 模型资产缺失（{ids}）："
-                "先运行 .venv/bin/python -m agentcall.local_models 下载"
-            )
+            logger.info("local 模型资产缺失（%s），开始首次下载…", ids)
+            if on_progress is not None:
+                on_progress(f"首次使用本地模式：正在下载语音模型（{ids}，约 300MB）…")
+            for asset in missing:
+                if on_progress is not None:
+                    on_progress(f"下载 {asset.id} 模型中…")
+                local_models.ensure_asset(asset)
+            if on_progress is not None:
+                on_progress("语音模型下载完成，正在加载…")
+            logger.info("local 模型下载完成")
         root = local_models.models_dir()
         vad_config = sherpa_onnx.VadModelConfig()
         vad_config.silero_vad.model = str(root / "silero_vad.onnx")
@@ -263,11 +270,18 @@ class LocalPipelineAgent(VoiceAgent):
 
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
         self._on_audio_out = on_audio_out
-        # 模型加载重（首次 2-10s），放线程池，不卡 CallSession 事件循环。
+        # 模型加载重（首次含 ~300MB 下载），放线程池，不卡 CallSession 事件循环。
+        # 工厂支持 on_progress 时把下载进度播给 UI（首启体验）；fake 工厂不支持则退回无参。
+        def _build() -> SpeechPipeline:
+            try:
+                return self._pipeline_factory(on_progress=self._emit_status)  # type: ignore[call-arg]
+            except TypeError:
+                return self._pipeline_factory()
         try:
-            self._pipeline = await asyncio.to_thread(self._pipeline_factory)
+            self._pipeline = await asyncio.to_thread(_build)
         except Exception as exc:
             logger.error("local 管线初始化失败: %s", exc)
+            self._emit_status(f"本地语音模型初始化失败：{exc}")
             self.fatal = True
             raise
         # 采样率以真实管线为准（fake/未来模型可能不同）。

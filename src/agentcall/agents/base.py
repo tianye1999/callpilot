@@ -19,6 +19,7 @@ class VoiceAgent(ABC):
 
     _on_transcript: "Callable[[str, str], None] | None" = None
     _on_repeat_stuck: "Callable[[str], None] | None" = None
+    _on_status: "Callable[[str], None] | None" = None
     _tools: "ToolRegistry | None" = None
     _session_instructions: str | None = None
 
@@ -41,6 +42,17 @@ class VoiceAgent(ABC):
     ) -> None:
         """注册复读抑制连续触发后的卡死回调。"""
         self._on_repeat_stuck = handler
+
+    def set_status_handler(self, handler: "Callable[[str], None] | None") -> None:
+        """注册面向用户的状态提示回调（如首启下载模型的进度）；多数实现无需用。"""
+        self._on_status = handler
+
+    def _emit_status(self, text: str) -> None:
+        if self._on_status and text:
+            try:
+                self._on_status(text)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _emit_transcript(self, role: str, text: str) -> None:
         if self._on_transcript and text:

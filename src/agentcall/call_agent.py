@@ -282,6 +282,10 @@ class CallSession:
                 self._make_transcript_handler(record, transcripts)
             )
             agent.set_repeat_stuck_handler(self._request_repeat_stuck_wrap_up)
+            # 面向用户的状态提示（如 local provider 首启下载模型进度）经 EventHub 播给 UI。
+            agent.set_status_handler(
+                lambda text: self._publish({"type": "system", "text": text})
+            )
             agent.set_tools(self._build_tools())
             if isinstance(bridge, SerialPcmAudioBridge):
                 bridge.set_ready_check(self.modem.pcm_ready)
