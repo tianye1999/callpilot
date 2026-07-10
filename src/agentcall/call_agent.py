@@ -408,7 +408,8 @@ class CallSession:
         # 收尾裁判（仅外呼）：接通后先给 grace 让通话进正题，之后每 interval 让文本模型
         # 看对话判「继续/收尾」——理解任意措辞（治打转/太早撤），不靠关键词枚举。
         judge_enabled = self._outbound_number is not None
-        judge_grace, judge_interval = 20.0, 15.0
+        judge_grace = config.get_float("WRAP_UP_JUDGE_GRACE_SECONDS")
+        judge_interval = config.get_float("WRAP_UP_JUDGE_INTERVAL_SECONDS")
         last_judge_at = loop_started
         goal = self._outbound_task(agent_language()) if judge_enabled else ""
         # 浏览器实时旁听：对方上行电平低，推给浏览器前按此增益放大到可闻。
