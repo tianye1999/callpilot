@@ -228,6 +228,168 @@ def test_tool_security_config_defaults(monkeypatch):
     assert get_bool("TOOL_QUERY_CODE_ENABLED") is True
 
 
+def test_sms_email_forwarding_defaults_and_secret_mask(monkeypatch):
+    keys = (
+        "SMS_EMAIL_FORWARD_ENABLED",
+        "SMS_EMAIL_RECIPIENT",
+        "SMS_EMAIL_SMTP_HOST",
+        "SMS_EMAIL_SMTP_PORT",
+        "SMS_EMAIL_SMTP_SECURITY",
+        "SMS_EMAIL_SMTP_USERNAME",
+        "SMS_EMAIL_SMTP_PASSWORD",
+        "SMS_EMAIL_FROM",
+    )
+    _unset(monkeypatch, *keys)
+
+    assert get_bool("SMS_EMAIL_FORWARD_ENABLED") is False
+    assert get_str("SMS_EMAIL_RECIPIENT") == ""
+    assert get_int("SMS_EMAIL_SMTP_PORT") == 587
+    assert get_str("SMS_EMAIL_SMTP_SECURITY") == "starttls"
+    password = get_spec("SMS_EMAIL_SMTP_PASSWORD")
+    assert password.secret is True and password.editable is True
+    rows = {row["key"]: row for row in read_panel_values()}
+    assert rows["SMS_EMAIL_SMTP_PASSWORD"]["value"] == "未设置"
+
+    monkeypatch.setenv("SMS_EMAIL_SMTP_PASSWORD", "must-not-be-returned")
+    rows = {row["key"]: row for row in read_panel_values()}
+    assert rows["SMS_EMAIL_SMTP_PASSWORD"]["value"] == "已设置"
+    assert "must-not-be-returned" not in str(rows["SMS_EMAIL_SMTP_PASSWORD"])
+
+
+def test_enabling_sms_email_forwarding_requires_complete_valid_config(tmp_path, monkeypatch):
+    keys = (
+        "SMS_EMAIL_FORWARD_ENABLED",
+        "SMS_EMAIL_RECIPIENT",
+        "SMS_EMAIL_SMTP_HOST",
+        "SMS_EMAIL_SMTP_PORT",
+        "SMS_EMAIL_SMTP_SECURITY",
+        "SMS_EMAIL_SMTP_USERNAME",
+        "SMS_EMAIL_SMTP_PASSWORD",
+        "SMS_EMAIL_FROM",
+    )
+    _unset(monkeypatch, *keys)
+    env_file = tmp_path / ".env"
+
+    with pytest.raises(ValueError, match="SMS_EMAIL_RECIPIENT"):
+        update_env_file(
+            {"SMS_EMAIL_FORWARD_ENABLED": "true"},
+            env_path=env_file,
+        )
+
+    assert not env_file.exists()
+    assert "SMS_EMAIL_FORWARD_ENABLED" not in os.environ
+
+
+def test_sms_email_forward_config_is_written_atomically_when_valid(tmp_path, monkeypatch):
+    keys = (
+        "SMS_EMAIL_FORWARD_ENABLED",
+        "SMS_EMAIL_RECIPIENT",
+        "SMS_EMAIL_SMTP_HOST",
+        "SMS_EMAIL_SMTP_PORT",
+        "SMS_EMAIL_SMTP_SECURITY",
+        "SMS_EMAIL_SMTP_USERNAME",
+        "SMS_EMAIL_SMTP_PASSWORD",
+        "SMS_EMAIL_FROM",
+    )
+    _unset(monkeypatch, *keys)
+    env_file = tmp_path / ".env"
+    updates = {
+        "SMS_EMAIL_FORWARD_ENABLED": "true",
+        "SMS_EMAIL_RECIPIENT": "owner@example.com",
+        "SMS_EMAIL_SMTP_HOST": "smtp.example.com",
+        "SMS_EMAIL_SMTP_PORT": "587",
+        "SMS_EMAIL_SMTP_SECURITY": "starttls",
+        "SMS_EMAIL_SMTP_USERNAME": "sender@example.com",
+        "SMS_EMAIL_SMTP_PASSWORD": "test-app-password",
+        "SMS_EMAIL_FROM": "sender@example.com",
+    }
+
+    assert update_env_file(updates, env_path=env_file) == list(updates)
+
+    rendered = env_file.read_text(encoding="utf-8")
+    for key, value in updates.items():
+        assert f"{key}={value}" in rendered
+
+
+@pytest.mark.parametrize(
+    ("updates", "error_key"),
+    [
+        ({"SMS_EMAIL_RECIPIENT": "a@example.com,b@example.com"}, "SMS_EMAIL_RECIPIENT"),
+        ({"SMS_EMAIL_FROM": "Name <sender@example.com>"}, "SMS_EMAIL_FROM"),
+        ({"SMS_EMAIL_SMTP_PORT": "0"}, "SMS_EMAIL_SMTP_PORT"),
+        ({"SMS_EMAIL_SMTP_HOST": "smtp example.com"}, "SMS_EMAIL_SMTP_HOST"),
+    ],
+)
+def test_sms_email_config_rejects_unsafe_values_even_while_disabled(
+    tmp_path, monkeypatch, updates, error_key
+):
+    _unset(monkeypatch, "SMS_EMAIL_FORWARD_ENABLED")
+
+    with pytest.raises(ValueError, match=error_key):
+        update_env_file(updates, env_path=tmp_path / ".env")
+
+
+def test_disabling_sms_email_forwarding_does_not_require_smtp_config(tmp_path, monkeypatch):
+    _unset(monkeypatch, "SMS_EMAIL_FORWARD_ENABLED")
+
+    updated = update_env_file(
+        {"SMS_EMAIL_FORWARD_ENABLED": "false"},
+        env_path=tmp_path / ".env",
+    )
+
+    assert updated == ["SMS_EMAIL_FORWARD_ENABLED"]
+
+
+def test_disabling_sms_email_forwarding_ignores_broken_existing_port(tmp_path, monkeypatch):
+    monkeypatch.setenv("SMS_EMAIL_FORWARD_ENABLED", "true")
+    monkeypatch.setenv("SMS_EMAIL_SMTP_PORT", "not-a-port")
+
+    updated = update_env_file(
+        {"SMS_EMAIL_FORWARD_ENABLED": "false"},
+        env_path=tmp_path / ".env",
+    )
+
+    assert updated == ["SMS_EMAIL_FORWARD_ENABLED"]
+    assert os.environ["SMS_EMAIL_FORWARD_ENABLED"] == "false"
+
+
+def test_enabling_sms_email_forwarding_rejects_invalid_existing_security(
+    tmp_path, monkeypatch
+):
+    values = {
+        "SMS_EMAIL_RECIPIENT": "owner@example.com",
+        "SMS_EMAIL_SMTP_HOST": "smtp.example.com",
+        "SMS_EMAIL_SMTP_PORT": "587",
+        "SMS_EMAIL_SMTP_SECURITY": "plaintext",
+        "SMS_EMAIL_SMTP_USERNAME": "sender@example.com",
+        "SMS_EMAIL_SMTP_PASSWORD": "test-app-password",
+        "SMS_EMAIL_FROM": "sender@example.com",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    with pytest.raises(ValueError, match="SMS_EMAIL_SMTP_SECURITY"):
+        update_env_file(
+            {"SMS_EMAIL_FORWARD_ENABLED": "true"},
+            env_path=tmp_path / ".env",
+        )
+
+
+def test_enabled_sms_email_config_reports_invalid_existing_port_cleanly(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SMS_EMAIL_FORWARD_ENABLED", "true")
+    monkeypatch.setenv("SMS_EMAIL_SMTP_PORT", "not-a-port")
+
+    with pytest.raises(ValueError, match="SMS_EMAIL_SMTP_PORT 需要整数") as exc_info:
+        update_env_file(
+            {"SMS_EMAIL_RECIPIENT": "owner@example.com"},
+            env_path=tmp_path / ".env",
+        )
+
+    assert "not-a-port" not in str(exc_info.value)
+
+
 def test_manual_response_control_defaults(monkeypatch):
     _unset(
         monkeypatch,

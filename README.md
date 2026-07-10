@@ -175,6 +175,22 @@ source of truth; v0.4.0 options there include `NUMBER_PROFILES_ENABLED`,
 `MANUAL_RESPONSE_CONTROL`, `MANUAL_RESPONSE_SILENCE_MS`,
 `MANUAL_RESPONSE_MAX_WAIT_MS`, `QWEN_VOICE`, `OPENAI_VOICE`, and `VOICE_STYLE`.
 
+### Forward received SMS to email
+
+This opt-in feature is **off by default**. In **Settings → Dialing & SMS**, enter
+one recipient address and the sender account's SMTP host, port, TLS mode,
+username, app password, and From address, then enable **Forward received SMS to
+email**. New modem SMS messages are queued without blocking the modem listener.
+When a verification code is reliably detected, the email subject begins with
+`【验证码 <code>】`; unrelated numbers are not promoted as codes.
+
+For Google Workspace/Gmail, the usual values are `smtp.gmail.com`, port `587`,
+`starttls`, the complete mailbox address as username/From, and a Google **App
+Password** rather than the normal account password. CallPilot stores that
+secret only in the local, git-ignored `.env` and never returns it from the
+settings API. Public DMG/EXE builds intentionally contain no shared sender
+credential. Enabling forwarding sends SMS content to the configured mailbox.
+
 ### Quick start (Windows) — awaiting hardware reports
 
 Windows needs **no USB bridge**: install the official Quectel EC20 Windows
@@ -262,6 +278,9 @@ stapled, and self-verified.
   Use the dial whitelist and dial your own numbers for testing.
 - **You bear all carrier charges and API costs.**
 - **Your API keys stay in your local `.env`** (git-ignored). Never commit them.
+- **SMS-to-email forwarding is a data export.** It is disabled by default; when
+  enabled, SMS sender, timestamp, and body leave the app through your configured
+  TLS-protected SMTP account. Use an app password and never commit it.
 - Provided **as-is, no warranty** (Apache-2.0).
 
 ### Contributing
@@ -391,6 +410,18 @@ cp .env.example .env          # 编辑 .env
 `MANUAL_RESPONSE_CONTROL`、`MANUAL_RESPONSE_SILENCE_MS`、`MANUAL_RESPONSE_MAX_WAIT_MS`、
 `QWEN_VOICE`、`OPENAI_VOICE`、`VOICE_STYLE`。
 
+### 收到短信后转发到邮箱
+
+该功能**默认关闭**。在「设置 → 外呼与短信」中填写一个收件邮箱，以及发件账号的
+SMTP 主机、端口、加密方式、用户名、应用密码和发件地址，再打开「收到短信后转发到
+邮箱」。新短信只做非阻塞入队，不会卡住模组监听；可靠识别到验证码时，邮件标题以
+`【验证码 <code>】` 开头，普通数字不会被误当验证码。
+
+Google Workspace/Gmail 通常填写 `smtp.gmail.com`、端口 `587`、`starttls`，用户名和
+发件地址填写完整邮箱，密码填写 Google **应用专用密码**而不是账号登录密码。密钥只存
+在本机且被 git 忽略的 `.env`，设置 API 不会回显。公开 DMG/EXE 不内置任何共享发件
+凭证。开启此功能即表示短信发件号码、时间和正文会通过 TLS SMTP 发往所填收件邮箱。
+
 ### 快速开始（Windows）—— 待硬件复现反馈
 
 Windows **不需要 USB 桥**：装 Quectel 官方 EC20 Windows 驱动后模组直接暴露原生
@@ -462,7 +493,8 @@ macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=
 **上真机前务必阅读。** 不用于紧急电话；通话录音**默认开启**、仅存储在本地，可在
 设置面板或 `RECORDING_ENABLED=false` 关闭——是否录音、是否需征得对方同意由你按
 当地法律负责；外呼/批量呼叫须遵守反骚扰与营销合规；运营商资费与 API 费用由你自行
-承担；API Key 只存于本地 `.env`（已 git 忽略），切勿提交。本软件按「原样」提供，
+承担；API Key 和 SMTP 应用密码只存于本地 `.env`（已 git 忽略），切勿提交。短信邮件
+转发默认关闭；开启后，短信发件号码、接收时间和正文会离开 App 并发往配置邮箱。本软件按「原样」提供，
 不作任何担保（Apache-2.0）。
 
 ### 贡献

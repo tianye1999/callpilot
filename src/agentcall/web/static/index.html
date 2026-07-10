@@ -375,6 +375,10 @@
   .cfg-row > label:not(.switch) { font-size: 13.5px; flex: 1; }
   .cfg-row label.switch { flex: 0 0 48px; }
   .cfg-row .key { display: block; font-size: 10px; color: var(--dim); font-family: var(--mono); }
+  .cfg-row .cfg-note {
+    display: block; max-width: 430px; margin-top: 4px; color: var(--muted);
+    font-size: 11px; line-height: 1.45;
+  }
   .tag-restart { font-size: 10px; color: var(--warn); margin-left: 6px; }
   .cfg-row input[type=text], .cfg-row input[type=password], .cfg-row input[type=number], .cfg-row select {
     width: 200px; background: var(--well); border: 1px solid var(--border);
@@ -475,6 +479,10 @@
   @media (max-width: 720px) {
     .dock { max-width: calc(100vw - 16px); overflow-x: auto; }
     .dock button { width: 68px; flex: 0 0 68px; }
+    .cfg-row { align-items: stretch; flex-direction: column; gap: 8px; }
+    .cfg-row label.switch { align-self: flex-start; }
+    .cfg-row input[type=text], .cfg-row input[type=password],
+    .cfg-row input[type=number], .cfg-row select { width: 100%; }
     .profile-head { flex-wrap: wrap; }
     .profile-head .profile-head-spacer { display: none; }
     .profile-editor { padding: 16px; }
@@ -1171,6 +1179,7 @@ const I18N = {
     cfg_saved: (n) => `Saved ${n} item(s)`, cfg_restart: (n) => `, ${n} need restart`,
     cfg_savefail: "Save failed: ", tag_restart: "restart required",
     secret_set: "Set", secret_unset: "Not set", secret_keep: "Leave blank to keep current",
+    sms_email_privacy: "When enabled, SMS content will be sent to the configured email address.",
     modem_prefix: "Modem ", setup_rerun: "Run setup",
     setup_kicker: "FIRST RUN", setup_title: "Set up CallPilot",
     setup_subtitle: "Connect the modem, add a provider key, and personalize the assistant.",
@@ -1221,6 +1230,13 @@ const I18N = {
       MONITOR_AI_PLAYBACK: "Monitor on this Mac", MONITOR_OUTPUT_DEVICE: "Monitor output device",
       MONITOR_AI_GAIN: "Monitor gain (AI)", MONITOR_UPLINK_GAIN: "Monitor gain (caller)",
       DIAL_WHITELIST: "Dial whitelist", DIAL_INTERVAL_SECONDS: "Dial interval (s)",
+      SMS_EMAIL_FORWARD_ENABLED: "Forward received SMS to email",
+      SMS_EMAIL_RECIPIENT: "Forwarding recipient email",
+      SMS_EMAIL_SMTP_HOST: "Sender SMTP host", SMS_EMAIL_SMTP_PORT: "Sender SMTP port",
+      SMS_EMAIL_SMTP_SECURITY: "Sender SMTP security",
+      SMS_EMAIL_SMTP_USERNAME: "Sender SMTP username",
+      SMS_EMAIL_SMTP_PASSWORD: "Sender SMTP app password",
+      SMS_EMAIL_FROM: "Sender email address",
       QWEN_PREWARM: "Qwen connection prewarm", QWEN_RECONNECT_MAX: "Max reconnects",
       WEB_HOST: "Web host", WEB_PORT: "Web port",
     },
@@ -1304,6 +1320,7 @@ const I18N = {
     cfg_saved: (n) => `已保存 ${n} 项`, cfg_restart: (n) => `，其中 ${n} 项需重启生效`,
     cfg_savefail: "保存失败：", tag_restart: "改后需重启",
     secret_set: "已设置", secret_unset: "未设置", secret_keep: "留空则保持现有密钥",
+    sms_email_privacy: "开启后，短信内容将发送到你配置的收件邮箱。",
     modem_prefix: "模组 ", setup_rerun: "重新运行向导",
     setup_kicker: "首次启动", setup_title: "配置 CallPilot",
     setup_subtitle: "连接模组、填写 provider Key，并设定你的 AI 助理。",
@@ -2627,6 +2644,9 @@ async function loadConfig() {
       const label = el("label", "", cfgLabel(c));
       if (c.requires_restart) label.appendChild(el("span", "tag-restart", t("tag_restart")));
       label.appendChild(el("span", "key", c.key));
+      if (c.key === "SMS_EMAIL_FORWARD_ENABLED") {
+        label.appendChild(el("span", "cfg-note", t("sms_email_privacy")));
+      }
       if (c.help && /^https?:\/\//.test(c.help)) {
         const hint = document.createElement("a");
         hint.href = c.help; hint.target = "_blank"; hint.rel = "noopener";

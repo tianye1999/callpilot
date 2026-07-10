@@ -41,6 +41,25 @@ def test_setup_sms_copy_spells_out_receiver_number():
     assert "可在短信页查看" in text
 
 
+def test_settings_expose_sms_email_forwarding_with_bilingual_privacy_notice():
+    text = INDEX.read_text(encoding="utf-8")
+
+    for key in (
+        "SMS_EMAIL_FORWARD_ENABLED",
+        "SMS_EMAIL_RECIPIENT",
+        "SMS_EMAIL_SMTP_HOST",
+        "SMS_EMAIL_SMTP_PORT",
+        "SMS_EMAIL_SMTP_SECURITY",
+        "SMS_EMAIL_SMTP_USERNAME",
+        "SMS_EMAIL_SMTP_PASSWORD",
+        "SMS_EMAIL_FROM",
+    ):
+        assert key in text
+    assert "SMS content will be sent to the configured email address" in text
+    assert "短信内容将发送到你配置的收件邮箱" in text
+    assert 'el("span", "cfg-note", t("sms_email_privacy"))' in text
+
+
 def test_history_recording_players_stop_click_propagation():
     text = INDEX.read_text(encoding="utf-8")
 
