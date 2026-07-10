@@ -197,6 +197,18 @@ fi
 
 if [[ -n "${NOTARY_PROFILE:-}" ]]; then
     [[ -n "${CODESIGN_IDENTITY:-}" ]] || die "NOTARY_PROFILE requires CODESIGN_IDENTITY"
+    # 公证凭证在 macOS login keychain 里偶发丢失（2026-07-10 踩过，Apple 论坛
+    # 亦有同类报告）。提交前先自愈：profile 不可用且有备份恢复脚本就自动重建，
+    # 避免打到最后一步才因凭证丢失前功尽弃。
+    if ! xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+        _restore="$HOME/.callpilot-notary-backup/restore-notary-credential.sh"
+        if [[ -x "$_restore" ]]; then
+            info "公证凭证 $NOTARY_PROFILE 缺失，尝试从备份自动恢复…"
+            "$_restore" || die "公证凭证恢复失败：手动跑 $_restore（或去 appleid.apple.com 重生成 App 专用密码）"
+        else
+            die "公证凭证 $NOTARY_PROFILE 不可用，且无备份恢复脚本；请先配置：xcrun notarytool store-credentials $NOTARY_PROFILE --apple-id support@bondings.ai --team-id 34KBLZ6RX3"
+        fi
+    fi
     info "submitting DMG for notarization with keychain profile: $NOTARY_PROFILE"
     xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
     xcrun stapler staple "$DMG_PATH"
