@@ -214,6 +214,12 @@
   .q-num.cur { border-color: var(--blue); color: var(--blue); animation: breathe 1.4s infinite; }
   .q-num.ok { color: var(--ok); }
   .q-num.fail { color: var(--err); }
+  .q-table { width: 100%; margin-top: 8px; border-collapse: collapse; font-size: 12px; }
+  .q-table th { text-align: left; color: var(--dim); font-weight: 500; padding: 4px 8px;
+    border-bottom: 1px solid rgba(255,255,255,.08); }
+  .q-table td { padding: 4px 8px; color: var(--muted); border-bottom: 1px solid rgba(255,255,255,.04); }
+  .q-table td.ok { color: var(--ok); }
+  .q-table td.fail { color: var(--err); }
 
   /* 最近通话（poc recent-col） */
   .recent-item {
@@ -1105,6 +1111,8 @@ const I18N = {
     enq_fail: "Enqueue failed: ",
     q_idle: "Queue idle", q_done: (n) => `Queue idle · ${n} dialed`,
     q_active: (p, d) => `In progress · ${p} pending · ${d} dialed`, q_current: " dialing",
+    q_th_number: "Number", q_th_result: "Result", q_th_detail: "Detail",
+    q_ok: "dialed", q_fail: "failed",
     profiles_title: "Preset library", profiles_sub: "Reusable call strategies", profiles_global: "Use presets",
     profile_new: "+ New", profile_search: "Search label, number, or task", profile_empty: "Select a preset to edit, or create a new one.",
     profile_no_match: "No matching presets", profile_new_title: "New preset", profile_edit_title: "Edit preset",
@@ -1236,6 +1244,8 @@ const I18N = {
     enq_fail: "入队失败：",
     q_idle: "队列空闲", q_done: (n) => `队列空闲 · 本轮已拨 ${n}`,
     q_active: (p, d) => `队列进行中 · 待拨 ${p} · 已拨 ${d}`, q_current: " 拨打中",
+    q_th_number: "号码", q_th_result: "结果", q_th_detail: "详情",
+    q_ok: "已拨", q_fail: "失败",
     profiles_title: "预设任务库", profiles_sub: "维护常用号码的通话策略", profiles_global: "启用预设",
     profile_new: "+ 新建", profile_search: "搜索名称、号码或任务", profile_empty: "选择一条预设进行编辑，或新建预设。",
     profile_no_match: "没有匹配的预设", profile_new_title: "新建预设", profile_edit_title: "编辑预设",
@@ -1444,12 +1454,38 @@ document.querySelectorAll(".dock button").forEach((b) =>
 let callActive = false;
 let callStatus = "idle";
 let backTimer = null;
+// 通话计时：answered 起走表，直观感知通话进行中与时长（每秒刷新状态文本）。
+let callTimerId = null;
+let callAnsweredAt = 0;
+function _fmtCallDur(ms) {
+  const total = Math.floor(ms / 1000);
+  const m = String(Math.floor(total / 60)).padStart(2, "0");
+  const s = String(total % 60).padStart(2, "0");
+  return `${m}:${s}`;
+}
+function _renderStateText(status) {
+  let label = t("st_" + status) !== "st_" + status ? t("st_" + status) : status;
+  if (status === "answered" && callAnsweredAt) {
+    label += ` ${_fmtCallDur(Date.now() - callAnsweredAt)}`;
+  }
+  $("stateText").textContent = label;
+}
 function setCall(status, caller) {
   const chip = $("stateChip");
   const wasActive = callActive;  // 上一状态（用于识别「新通话开始」这一跳变）
   callStatus = status;
   chip.className = "state-chip " + status;
-  $("stateText").textContent = t("st_" + status) !== "st_" + status ? t("st_" + status) : status;
+  if (status === "answered") {
+    if (!callTimerId) {
+      callAnsweredAt = Date.now();
+      callTimerId = setInterval(() => _renderStateText(callStatus), 1000);
+    }
+  } else if (callTimerId) {
+    clearInterval(callTimerId);
+    callTimerId = null;
+    callAnsweredAt = 0;
+  }
+  _renderStateText(status);
   $("stateNum").textContent = status === "idle" ? "" : (caller || "");
   callActive = (status === "ringing" || status === "dialing" || status === "answered");
   // 从空闲跳到活跃 = 一通新通话开始：在实时转写里插入分割线（与上一通隔开）
@@ -2199,8 +2235,23 @@ async function refreshQueue() {
     box.appendChild(el("div", "q-stat", statText));
     if (q.current) queueChip(box, `${q.current}${t("q_current")}`, "cur");
     for (const n of q.pending) queueChip(box, n);
-    for (const d of (q.done || []).slice(-10)) {
-      queueChip(box, `${d.number} ${d.ok ? "✓" : "✗" + (d.error ? " " + d.error : "")}`, d.ok ? "ok" : "fail");
+    // 已拨结果汇总表（全量，谁成谁败一目了然；替代原先只显示尾部 10 个的 chips）
+    const done = q.done || [];
+    if (done.length) {
+      const table = el("table", "q-table");
+      const head = el("tr");
+      for (const key of ["q_th_number", "q_th_result", "q_th_detail"]) {
+        head.appendChild(el("th", "", t(key)));
+      }
+      table.appendChild(head);
+      for (const d of done) {
+        const row = el("tr");
+        row.appendChild(el("td", "", d.number));
+        row.appendChild(el("td", d.ok ? "ok" : "fail", d.ok ? "✓ " + t("q_ok") : "✗ " + t("q_fail")));
+        row.appendChild(el("td", "", d.error || ""));
+        table.appendChild(row);
+      }
+      box.appendChild(table);
     }
   } catch (e) { console.warn("[queue] 刷新外呼队列失败", e); }
 }
