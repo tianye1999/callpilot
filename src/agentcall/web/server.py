@@ -38,6 +38,11 @@ from ..rate_limit import acquire_sms_send_slot
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+_REMOTE_DIALER_CSP = (
+    "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline'; connect-src wss:; media-src blob:; worker-src blob:; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
 
 # 通话 ID 白名单字符（call_log 生成的目录名），防路径穿越。
 _CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -232,6 +237,10 @@ def build_app(
     app["setup_sms_token"] = [secrets.token_urlsafe(24)]
 
     app.router.add_get("/", _index)
+    app.router.add_get("/remote-dialer", _remote_dialer_redirect)
+    app.router.add_get("/remote-dialer/", _remote_dialer_page)
+    app.router.add_get("/remote-dialer/remote_dialer.css", _remote_dialer_asset)
+    app.router.add_get("/remote-dialer/remote_dialer.js", _remote_dialer_asset)
     app.router.add_get("/api/meta", _meta)
     app.router.add_get("/ws", _websocket)
     app.router.add_get("/ws/audio", _audio_websocket)
@@ -239,6 +248,9 @@ def build_app(
     app.router.add_post("/api/call/dial", _dial)
     app.router.add_post("/api/call/hangup", _hangup)
     app.router.add_post("/api/call/dtmf", _dtmf)
+    app.router.add_get("/api/remote_dialer/status", _remote_dialer_status)
+    app.router.add_post("/api/remote_dialer/invite", _remote_dialer_invite)
+    app.router.add_post("/api/remote_dialer/cancel", _remote_dialer_cancel)
     app.router.add_post("/api/call/batch_dial", _batch_dial)
     app.router.add_get("/api/call/queue", _queue_status)
     app.router.add_get("/api/number_profiles", _number_profiles)
@@ -268,6 +280,33 @@ async def _index(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(
         index_file,
         headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
+
+
+async def _remote_dialer_redirect(request: web.Request) -> web.StreamResponse:
+    raise web.HTTPFound("/remote-dialer/")
+
+
+async def _remote_dialer_page(request: web.Request) -> web.StreamResponse:
+    return web.FileResponse(
+        STATIC_DIR / "remote_dialer.html",
+        headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "Permissions-Policy": "microphone=(self), camera=()",
+            "Content-Security-Policy": _REMOTE_DIALER_CSP,
+        },
+    )
+
+
+async def _remote_dialer_asset(request: web.Request) -> web.StreamResponse:
+    filename = request.path.rsplit("/", 1)[-1]
+    if filename not in {"remote_dialer.css", "remote_dialer.js"}:
+        raise web.HTTPNotFound()
+    return web.FileResponse(
+        STATIC_DIR / filename,
+        headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -460,6 +499,41 @@ async def _dtmf(request: web.Request) -> web.Response:
     if not ok and err == "当前没有进行中的通话":
         return web.json_response({"ok": False, "error": err}, status=409)
     return web.json_response({"ok": bool(ok)})
+
+
+async def _remote_dialer_status(request: web.Request) -> web.Response:
+    service = require_service(request)
+    return web.json_response({"ok": True, **service.remote_dialer_status()})
+
+
+async def _remote_dialer_invite(request: web.Request) -> web.Response:
+    service = require_service(request)
+    loop = asyncio.get_running_loop()
+    invite, error = await loop.run_in_executor(
+        None, service.create_remote_dialer_invite
+    )
+    if invite is None:
+        return web.json_response(
+            {"ok": False, "error": error or "无法创建远程拨号邀请"},
+            status=409,
+            headers={"Cache-Control": "no-store"},
+        )
+    return web.json_response(
+        {"ok": True, "invite": invite},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _remote_dialer_cancel(request: web.Request) -> web.Response:
+    service = require_service(request)
+    loop = asyncio.get_running_loop()
+    ok, error = await loop.run_in_executor(None, service.cancel_remote_dialer)
+    if not ok:
+        return web.json_response(
+            {"ok": False, "error": error or "当前没有远程拨号会话"},
+            status=409,
+        )
+    return web.json_response({"ok": True})
 
 
 async def _batch_dial(request: web.Request) -> web.Response:

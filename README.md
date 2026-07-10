@@ -195,6 +195,22 @@ secret only in the local, git-ignored `.env` and never returns it from the
 settings API. Public DMG/EXE builds intentionally contain no shared sender
 credential. Enabling forwarding sends SMS content to the configured mailbox.
 
+### Remote Web Dialer POC
+
+Issue #31 adds an **off-by-default** outbound proof: create a short-lived mobile
+link in the local dial panel, open it in a phone browser, grant microphone access,
+and let the Edge use the Dongle SIM to call the entered number. Browser audio and
+scoped dial/DTMF/hangup commands travel through one LiveKit room; the local admin
+port is not exposed.
+
+A real off-LAN test needs a LiveKit project and an HTTPS static host for
+`remote_dialer.html`, `remote_dialer.css`, and `remote_dialer.js`. Fill the
+`REMOTE_*` / `LIVEKIT_*` settings shown in [`.env.example`](.env.example), then
+enable **Remote Web Dialer**. Never publish or tunnel `WEB_PORT` (47100). See
+[ADR-001](docs/decisions/001-remote-web-dialer-livekit.md) for the security and
+deployment boundary. Mobile background/lock-screen calling and inbound takeover
+remain outside this browser POC.
+
 ### Quick start (Windows) — awaiting hardware reports
 
 Windows needs **no USB bridge**: install the official Quectel EC20 Windows
@@ -429,6 +445,19 @@ Google Workspace/Gmail 通常填写 `smtp.gmail.com`、端口 `587`、`starttls`
 发件地址填写完整邮箱，密码填写 Google **应用专用密码**而不是账号登录密码。密钥只存
 在本机且被 git 忽略的 `.env`，设置 API 不会回显。公开 DMG/EXE 不内置任何共享发件
 凭证。开启此功能即表示短信发件号码、时间和正文会通过 TLS SMTP 发往所填收件邮箱。
+
+### 远程网页拨号 POC
+
+issue #31 新增一个**默认关闭**的外呼验证链路：在本机拨号面板生成短期手机链接，
+用手机浏览器打开并授权麦克风，Edge 再使用 Dongle SIM 拨打网页中输入的号码。
+浏览器音频以及拨号、DTMF、挂断命令都走同一个 LiveKit 房间，不需要开放本地管理端口。
+
+真机异地测试需要一个 LiveKit 项目，并把 `remote_dialer.html`、
+`remote_dialer.css`、`remote_dialer.js` 部署到同一个 HTTPS 静态目录。按
+[`.env.example`](.env.example) 填写 `REMOTE_*` / `LIVEKIT_*` 后打开「远程网页拨号」。
+绝不能把 `WEB_PORT`（47100）发布或映射到公网。安全边界和部署步骤见
+[ADR-001](docs/decisions/001-remote-web-dialer-livekit.md)。浏览器锁屏后台与入站接管
+不在本 POC 内，仍由 #30 后续原生 App 承担。
 
 ### 快速开始（Windows）—— 待硬件复现反馈
 

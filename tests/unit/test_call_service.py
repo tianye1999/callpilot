@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
 from agentcall.call_agent import CallAgentService
 from agentcall.events import EventHub
+from agentcall.remote_dialer import RemoteDialerInvite
 
 
 def make_service(
@@ -50,6 +52,39 @@ class FakeSmsEmailForwarder:
 
     def stop(self, timeout: float = 2.0) -> None:
         self.stopped = True
+
+
+class FakeRemoteCoordinator:
+    def __init__(self) -> None:
+        self.call_active = threading.Event()
+        self.stop_reasons: list[str] = []
+        self.commands: list[dict] = []
+
+    def request_call_stop(self, reason: str) -> None:
+        self.stop_reasons.append(reason)
+
+    def submit_local_command(self, command: dict) -> bool:
+        self.commands.append(command)
+        return True
+
+    def status(self) -> dict:
+        return {"status": "media_ready", "call_active": self.call_active.is_set()}
+
+
+class FakeRemoteWorker:
+    def __init__(self, coordinator: FakeRemoteCoordinator) -> None:
+        self.coordinator = coordinator
+        self.is_running = False
+        self.started = False
+        self.stop_reasons: list[str] = []
+
+    def start(self, timeout: float = 10.0) -> None:
+        self.started = True
+        self.is_running = True
+
+    def stop(self, reason: str, **_kwargs) -> None:
+        self.stop_reasons.append(reason)
+        self.is_running = False
 
 
 # ---- RING 去重 ----
@@ -234,6 +269,150 @@ def test_service_send_dtmf_reports_modem_failure():
 
     ok, err = service.send_dtmf("1")
     assert not ok and "按键发送失败" in (err or "")
+
+
+# ---- 远程网页拨号会话 ----
+
+
+def test_remote_invite_default_off_does_not_start_worker(monkeypatch):
+    monkeypatch.delenv("REMOTE_WEB_DIALER_ENABLED", raising=False)
+    service = make_service(FakeModem())
+    built: list[bool] = []
+    monkeypatch.setattr(
+        service,
+        "_build_remote_worker",
+        lambda: built.append(True),
+    )
+
+    invite, error = service.create_remote_dialer_invite()
+
+    assert invite is None
+    assert "未启用" in (error or "")
+    assert built == []
+
+
+def test_remote_invite_starts_once_and_reuses_active_invite(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    service = make_service(FakeModem())
+    coordinator = FakeRemoteCoordinator()
+    worker = FakeRemoteWorker(coordinator)
+    invite = RemoteDialerInvite(
+        session_id="session-1",
+        url="https://dial.example/#short-lived-token",
+        expires_at=time.time() + 300,
+    )
+    builds: list[bool] = []
+
+    def build():
+        builds.append(True)
+        return invite, worker
+
+    monkeypatch.setattr(service, "_build_remote_worker", build)
+
+    first, first_error = service.create_remote_dialer_invite()
+    second, second_error = service.create_remote_dialer_invite()
+
+    assert first_error is None and second_error is None
+    assert first == second == {
+        "session_id": "session-1",
+        "url": invite.url,
+        "expires_at": invite.expires_at,
+    }
+    assert worker.started is True
+    assert builds == [True]
+
+
+def test_expired_remote_invite_stops_old_worker_before_replacement(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    service = make_service(FakeModem())
+    old_worker = FakeRemoteWorker(FakeRemoteCoordinator())
+    old_worker.is_running = True
+    service._remote_worker = old_worker  # type: ignore[assignment]
+    service._remote_invite = RemoteDialerInvite(
+        session_id="expired",
+        url="https://dial.example/#expired",
+        expires_at=time.time() - 1,
+    )
+    new_invite = RemoteDialerInvite(
+        session_id="new-session",
+        url="https://dial.example/#new",
+        expires_at=time.time() + 300,
+    )
+    new_worker = FakeRemoteWorker(FakeRemoteCoordinator())
+    monkeypatch.setattr(
+        service, "_build_remote_worker", lambda: (new_invite, new_worker)
+    )
+
+    payload, error = service.create_remote_dialer_invite()
+
+    assert error is None
+    assert payload and payload["session_id"] == "new-session"
+    assert old_worker.stop_reasons == ["invite_expired"]
+    assert new_worker.started is True
+
+
+def test_remote_reserved_line_blocks_local_ai_dial_and_routes_hangup(monkeypatch):
+    from agentcall import rate_limit
+
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_DIAL_LIMIT_PER_HOUR", "0")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    rate_limit.reset_remote_dial_rate_limit_state()
+    modem = FakeModem()
+    service = make_service(modem)
+    coordinator = FakeRemoteCoordinator()
+    worker = FakeRemoteWorker(coordinator)
+    worker.is_running = True
+    service._remote_worker = worker  # type: ignore[assignment]
+
+    assert service._reserve_remote_line(coordinator) is None  # type: ignore[arg-type]
+    ok, error = service.dial("10000")
+    assert ok is False
+    assert "正在通话" in (error or "")
+
+    modem.trigger_hangup()
+    assert coordinator.stop_reasons == ["remote_party_hangup"]
+    assert ("hangup", ()) not in modem.calls
+
+    service._release_remote_line(coordinator)  # type: ignore[arg-type]
+    rate_limit.reset_remote_dial_rate_limit_state()
+
+
+def test_local_dashboard_dtmf_and_shutdown_route_to_remote_worker(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    service = make_service(FakeModem())
+    coordinator = FakeRemoteCoordinator()
+    worker = FakeRemoteWorker(coordinator)
+    worker.is_running = True
+    service._remote_worker = worker  # type: ignore[assignment]
+    service._remote_call_owner = coordinator  # type: ignore[assignment]
+
+    ok, error = service.send_dtmf("2")
+    assert ok is True and error is None
+    assert coordinator.commands == [{"type": "dtmf", "digits": "2"}]
+
+    service.stop_service()
+    assert worker.stop_reasons == ["service_shutdown"]
+
+
+def test_remote_dial_reservation_uses_hourly_rate_limit(monkeypatch):
+    from agentcall import rate_limit
+
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_DIAL_LIMIT_PER_HOUR", "1")
+    rate_limit.reset_remote_dial_rate_limit_state()
+    service = make_service(FakeModem())
+    coordinator = FakeRemoteCoordinator()
+    worker = FakeRemoteWorker(coordinator)
+    worker.is_running = True
+    service._remote_worker = worker  # type: ignore[assignment]
+
+    assert service._reserve_remote_line(coordinator) is None  # type: ignore[arg-type]
+    service._release_remote_line(coordinator)  # type: ignore[arg-type]
+    error = service._reserve_remote_line(coordinator)  # type: ignore[arg-type]
+
+    assert "过于频繁" in (error or "")
+    rate_limit.reset_remote_dial_rate_limit_state()
 
 
 # ---- 来电全链路：接听 → 开场白 → 下行音频 → 挂断收尾 ----

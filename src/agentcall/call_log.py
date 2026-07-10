@@ -78,11 +78,13 @@ class CallRecord:
         direction: str,
         number: str | None,
         recording_enabled: bool = True,
+        source: str | None = None,
     ) -> None:
         self.id = id
         self.path = path
         self.direction = direction
         self.number = number
+        self.source = source
         self.recording_enabled = recording_enabled
         self.started_at = time.time()
         self._lock = threading.Lock()
@@ -194,6 +196,8 @@ class CallRecord:
                 "uplink_bytes": len(uplink),
                 "downlink_bytes": len(downlink),
             }
+            if self.source:
+                meta["source"] = self.source
             (self.path / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -224,7 +228,13 @@ class CallLogger:
             retention_days=config.get_int("RECORDING_RETENTION_DAYS"),
         )
 
-    def begin_call(self, direction: str, number: str | None) -> CallRecord:
+    def begin_call(
+        self,
+        direction: str,
+        number: str | None,
+        *,
+        source: str | None = None,
+    ) -> CallRecord:
         """开始记录一次通话；direction 必须是 inbound 或 outbound。"""
         if direction not in ("inbound", "outbound"):
             raise ValueError(f"direction 必须是 inbound/outbound，收到: {direction!r}")
@@ -243,8 +253,12 @@ class CallLogger:
             direction=direction,
             number=number,
             recording_enabled=self.recording_enabled,
+            source=source,
         )
-        record.log_event("call_started", direction=direction, number=number)
+        started_fields: dict[str, Any] = {"direction": direction, "number": number}
+        if source:
+            started_fields["source"] = source
+        record.log_event("call_started", **started_fields)
         logger.info("开始记录通话 %s", call_id)
         return record
 

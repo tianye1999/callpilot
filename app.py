@@ -229,6 +229,10 @@ def _selftest() -> int:
         "agentcall.agents.local_agent",
         "agentcall.local_models",
         "agentcall.sms_email_forwarder",
+        "agentcall.remote_dialer",
+        "agentcall.livekit_media",
+        "livekit.rtc",
+        "livekit.api",
     ]
     optional = {"sherpa_onnx"}
     ok = True

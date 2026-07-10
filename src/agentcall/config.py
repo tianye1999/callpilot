@@ -17,6 +17,7 @@ import re
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -287,6 +288,21 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("QWEN_PREWARM", "Qwen 连接预热", "bool", "true"),
     ConfigSpec("QWEN_RECONNECT_MAX", "Qwen 最大重连次数", "int", "2"),
     ConfigSpec("OPENAI_RECONNECT_MAX", "OpenAI 最大重连次数", "int", "2"),
+    # ---- 远程网页拨号 POC ----
+    ConfigSpec("REMOTE_WEB_DIALER_ENABLED", "启用远程网页拨号", "bool", "false"),
+    ConfigSpec("REMOTE_MEDIA_PROVIDER", "远程媒体服务", "select", "livekit",
+               choices=("livekit",)),
+    ConfigSpec("REMOTE_CONTROL_URL", "远程拨号页 HTTPS 地址", "str", ""),
+    ConfigSpec("LIVEKIT_URL", "LiveKit WebSocket 地址", "str", ""),
+    ConfigSpec("LIVEKIT_API_KEY", "LiveKit API Key", "str", "", secret=True),
+    ConfigSpec("LIVEKIT_API_SECRET", "LiveKit API Secret", "str", "", secret=True),
+    ConfigSpec("REMOTE_DISCONNECT_GRACE_SECONDS", "远程断线宽限（秒）", "float", "5"),
+    ConfigSpec("REMOTE_OUTBOUND_MAX_SECONDS", "远程外呼最长时长（秒）", "int", "1800"),
+    ConfigSpec("REMOTE_DIAL_LIMIT_PER_HOUR", "远程外呼频控（每小时）", "int", "10"),
+    ConfigSpec("REMOTE_INVITE_TTL_SECONDS", "远程拨号邀请有效期（秒）", "int", "300",
+               editable=False, hidden=True),
+    ConfigSpec("REMOTE_CONNECT_TIMEOUT_SECONDS", "远程外呼接通超时（秒）", "float", "45",
+               editable=False, hidden=True),
     ConfigSpec("SETUP_DONE", "首次启动向导完成", "bool", "false",
                editable=False, hidden=True),
     # 预热调优项：单次握手超时与保活周期（秒），一般无需改动，不进面板。
@@ -597,6 +613,66 @@ def _validate_sms_email_updates(updates: dict[str, str]) -> None:
         raise ValueError("启用短信邮件转发前请完整配置: " + ", ".join(missing))
 
 
+_REMOTE_DIALER_CONFIG_KEYS = {
+    "REMOTE_WEB_DIALER_ENABLED",
+    "REMOTE_MEDIA_PROVIDER",
+    "REMOTE_CONTROL_URL",
+    "LIVEKIT_URL",
+    "LIVEKIT_API_KEY",
+    "LIVEKIT_API_SECRET",
+    "REMOTE_DISCONNECT_GRACE_SECONDS",
+    "REMOTE_OUTBOUND_MAX_SECONDS",
+    "REMOTE_DIAL_LIMIT_PER_HOUR",
+}
+
+
+def _validate_remote_dialer_updates(updates: dict[str, str]) -> None:
+    if not _REMOTE_DIALER_CONFIG_KEYS.intersection(updates):
+        return
+
+    def merged(key: str) -> str:
+        return updates.get(key, os.environ.get(key, get_spec(key).default)).strip()
+
+    enabled = merged("REMOTE_WEB_DIALER_ENABLED").lower() in _TRUTHY
+    if not enabled:
+        return
+    required = (
+        "REMOTE_CONTROL_URL",
+        "LIVEKIT_URL",
+        "LIVEKIT_API_KEY",
+        "LIVEKIT_API_SECRET",
+    )
+    missing = [key for key in required if not merged(key)]
+    if missing:
+        raise ValueError("启用远程网页拨号前请完整配置: " + ", ".join(missing))
+
+    public_url = urllib.parse.urlparse(merged("REMOTE_CONTROL_URL"))
+    if (
+        public_url.scheme != "https"
+        or not public_url.netloc
+        or public_url.username
+        or public_url.password
+        or public_url.fragment
+    ):
+        raise ValueError("配置 REMOTE_CONTROL_URL 必须是无内嵌凭证的 HTTPS URL")
+    livekit_url = urllib.parse.urlparse(merged("LIVEKIT_URL"))
+    if (
+        livekit_url.scheme != "wss"
+        or not livekit_url.netloc
+        or livekit_url.username
+        or livekit_url.password
+        or livekit_url.fragment
+    ):
+        raise ValueError("配置 LIVEKIT_URL 必须是无内嵌凭证的 WSS URL")
+
+    if float(merged("REMOTE_DISCONNECT_GRACE_SECONDS")) < 0:
+        raise ValueError("配置 REMOTE_DISCONNECT_GRACE_SECONDS 不能小于 0")
+    if int(merged("REMOTE_OUTBOUND_MAX_SECONDS")) <= 0:
+        raise ValueError("配置 REMOTE_OUTBOUND_MAX_SECONDS 必须大于 0")
+    if int(merged("REMOTE_DIAL_LIMIT_PER_HOUR")) < 0:
+        raise ValueError("配置 REMOTE_DIAL_LIMIT_PER_HOUR 不能小于 0")
+
+
 def _format_assignment(key: str, value: str) -> str:
     """生成 ``KEY=value`` 赋值文本；值含空白/#/引号时加双引号并转义。"""
     if value == "" or not _NEEDS_QUOTING_RE.search(value):
@@ -627,6 +703,7 @@ def update_env_file(
             raise ValueError(f"配置 {key} 不允许在面板编辑")
         _check_value(spec, value)
     _validate_sms_email_updates(updates)
+    _validate_remote_dialer_updates(updates)
 
     if not updates:
         return []

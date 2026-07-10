@@ -551,6 +551,73 @@ def test_update_env_file_handles_utf8_bom_and_preserves_crlf(tmp_path, monkeypat
     assert raw.count(b"QWEN_VOICE=") == 1
 
 
+def test_remote_web_dialer_defaults_off_and_masks_livekit_secrets(monkeypatch):
+    _unset(
+        monkeypatch,
+        "REMOTE_WEB_DIALER_ENABLED",
+        "LIVEKIT_API_KEY",
+        "LIVEKIT_API_SECRET",
+    )
+    assert get_bool("REMOTE_WEB_DIALER_ENABLED") is False
+    rows = {row["key"]: row for row in read_panel_values()}
+    assert rows["LIVEKIT_API_KEY"]["secret"] is True
+    assert rows["LIVEKIT_API_SECRET"]["secret"] is True
+    assert rows["LIVEKIT_API_SECRET"]["value"] == "未设置"
+
+
+def test_enabling_remote_web_dialer_requires_complete_secure_config(
+    tmp_path, monkeypatch
+):
+    for key in (
+        "REMOTE_WEB_DIALER_ENABLED",
+        "REMOTE_CONTROL_URL",
+        "LIVEKIT_URL",
+        "LIVEKIT_API_KEY",
+        "LIVEKIT_API_SECRET",
+    ):
+        _unset(monkeypatch, key)
+    env = tmp_path / ".env"
+
+    with pytest.raises(ValueError, match="完整配置"):
+        update_env_file({"REMOTE_WEB_DIALER_ENABLED": "true"}, env_path=env)
+    assert not env.exists()
+
+    updates = {
+        "REMOTE_WEB_DIALER_ENABLED": "true",
+        "REMOTE_CONTROL_URL": "https://dial.example/remote_dialer.html",
+        "LIVEKIT_URL": "wss://project.livekit.cloud",
+        "LIVEKIT_API_KEY": "api-key",
+        "LIVEKIT_API_SECRET": "api-secret",
+    }
+    assert update_env_file(updates, env_path=env) == list(updates)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("REMOTE_CONTROL_URL", "http://dial.example", "HTTPS"),
+        ("REMOTE_CONTROL_URL", "https://dial.example/#token", "HTTPS"),
+        ("LIVEKIT_URL", "ws://project.livekit.cloud", "WSS"),
+        ("REMOTE_DISCONNECT_GRACE_SECONDS", "-1", "不能小于"),
+        ("REMOTE_OUTBOUND_MAX_SECONDS", "0", "必须大于"),
+        ("REMOTE_DIAL_LIMIT_PER_HOUR", "-1", "不能小于"),
+    ],
+)
+def test_remote_web_dialer_rejects_insecure_or_invalid_values(
+    key, value, message, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv(
+        "REMOTE_CONTROL_URL", "https://dial.example/remote_dialer.html"
+    )
+    monkeypatch.setenv("LIVEKIT_URL", "wss://project.livekit.cloud")
+    monkeypatch.setenv("LIVEKIT_API_KEY", "api-key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "api-secret")
+
+    with pytest.raises(ValueError, match=message):
+        update_env_file({key: value}, env_path=tmp_path / ".env")
+
+
 # ---- read_panel_values ----
 
 

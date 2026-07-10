@@ -1,0 +1,205 @@
+:root {
+  color-scheme: dark;
+  --bg: #090b0d;
+  --surface: #111519;
+  --surface-raised: #171c21;
+  --line: #2a3138;
+  --text: #f4f7f8;
+  --muted: #8e9aa5;
+  --green: #38d996;
+  --green-strong: #1fb477;
+  --amber: #f2bd57;
+  --red: #ef5f62;
+  --red-strong: #ce454b;
+}
+
+* { box-sizing: border-box; }
+
+html, body { min-height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input { font: inherit; letter-spacing: 0; }
+
+.dialer-shell {
+  width: min(100%, 520px);
+  min-height: 100dvh;
+  margin: 0 auto;
+  padding: max(20px, env(safe-area-inset-top)) 20px max(24px, env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.brand { font-size: 20px; font-weight: 720; }
+
+.line-label {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.status-pill {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: right;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.status-pill[data-state="ready"] .status-dot,
+.status-pill[data-state="connected"] .status-dot { background: var(--green); }
+.status-pill[data-state="working"] .status-dot { background: var(--amber); }
+.status-pill[data-state="error"] .status-dot { background: var(--red); }
+
+.call-surface {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 0;
+}
+
+h1 {
+  margin: 0 0 32px;
+  font-size: 28px;
+  line-height: 1.15;
+  font-weight: 680;
+}
+
+label {
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.number-input {
+  width: 100%;
+  height: 64px;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  outline: none;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 26px;
+}
+
+.number-input:focus {
+  border-color: var(--green-strong);
+  box-shadow: 0 0 0 3px rgb(56 217 150 / 16%);
+}
+
+.number-input:disabled { color: var(--muted); opacity: .75; }
+
+.primary-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.command {
+  height: 52px;
+  border: 0;
+  border-radius: 6px;
+  color: #06110c;
+  font-weight: 720;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.command.call { background: var(--green); }
+.command.call:active { background: var(--green-strong); }
+.command.hangup { background: var(--red); color: #fff; }
+.command.hangup:active { background: var(--red-strong); }
+.command:disabled { cursor: default; opacity: .36; }
+
+.keypad {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 28px;
+}
+
+.keypad button {
+  aspect-ratio: 1.55;
+  min-height: 48px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 650;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.keypad button:active:not(:disabled) { background: #222a31; }
+.keypad button:disabled { cursor: default; opacity: .34; }
+
+.connection-row {
+  height: 18px;
+  margin-top: 24px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 5px;
+}
+
+.connection-row span {
+  width: 3px;
+  height: 5px;
+  background: var(--line);
+}
+
+body[data-call-state="connected"] .connection-row span { background: var(--green-strong); }
+body[data-call-state="connected"] .connection-row span:nth-child(2) { height: 9px; }
+body[data-call-state="connected"] .connection-row span:nth-child(3) { height: 13px; }
+body[data-call-state="connected"] .connection-row span:nth-child(4) { height: 17px; }
+
+@media (max-height: 620px) {
+  .dialer-shell { gap: 16px; }
+  .call-surface { justify-content: flex-start; }
+  h1 { margin-bottom: 18px; font-size: 24px; }
+  .keypad { margin-top: 18px; gap: 8px; }
+  .keypad button { min-height: 42px; }
+  .connection-row { margin-top: 12px; }
+}
+
+@media (min-width: 700px) {
+  .dialer-shell { padding-left: 32px; padding-right: 32px; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .status-pill[data-state="working"] .status-dot { animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .38; } }
+}

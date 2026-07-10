@@ -46,6 +46,20 @@ class FakeService:
         self.hangup_result: tuple[bool, str | None] = (True, None)
         self.dtmf_calls: list[str] = []
         self.dtmf_result: tuple[bool, str | None] = (True, None)
+        self.remote_invite_result: tuple[dict | None, str | None] = (
+            {
+                "session_id": "session-1",
+                "url": "https://dial.example/#token",
+                "expires_at": 12345.0,
+            },
+            None,
+        )
+        self.remote_cancel_result: tuple[bool, str | None] = (True, None)
+        self.remote_status: dict = {
+            "enabled": True,
+            "configured": True,
+            "active": False,
+        }
 
     def batch_dial(self, numbers: list[str], task: str | None = None) -> dict:
         self.batch_calls.append((list(numbers), task))
@@ -70,6 +84,15 @@ class FakeService:
     def send_dtmf(self, digits: str) -> tuple[bool, str | None]:
         self.dtmf_calls.append(digits)
         return self.dtmf_result
+
+    def create_remote_dialer_invite(self) -> tuple[dict | None, str | None]:
+        return self.remote_invite_result
+
+    def remote_dialer_status(self) -> dict:
+        return dict(self.remote_status)
+
+    def cancel_remote_dialer(self) -> tuple[bool, str | None]:
+        return self.remote_cancel_result
 
 
 class FakeHub:
@@ -1058,6 +1081,75 @@ def test_dtmf_send_failure_keeps_200():
         resp = await client.post("/api/call/dtmf", json={"digits": "1"})
         assert resp.status == 200
         assert await resp.json() == {"ok": False}
+
+    api(app, fn)
+
+
+# ---- /api/remote_dialer ----
+
+
+def test_remote_dialer_invite_status_and_cancel_endpoints():
+    service = FakeService()
+    app = make_app(service)
+
+    async def fn(client):
+        status = await client.get("/api/remote_dialer/status")
+        assert status.status == 200
+        assert await status.json() == {"ok": True, **service.remote_status}
+
+        invite = await client.post("/api/remote_dialer/invite", json={})
+        assert invite.status == 200
+        assert invite.headers["Cache-Control"] == "no-store"
+        assert await invite.json() == {
+            "ok": True,
+            "invite": service.remote_invite_result[0],
+        }
+
+        cancel = await client.post("/api/remote_dialer/cancel", json={})
+        assert cancel.status == 200
+        assert await cancel.json() == {"ok": True}
+
+    api(app, fn)
+
+
+def test_remote_dialer_invite_and_cancel_conflicts():
+    service = FakeService()
+    service.remote_invite_result = (None, "远程网页拨号未启用")
+    service.remote_cancel_result = (False, "当前没有远程拨号会话")
+    app = make_app(service)
+
+    async def fn(client):
+        invite = await client.post("/api/remote_dialer/invite", json={})
+        assert invite.status == 409
+        assert (await invite.json())["error"] == "远程网页拨号未启用"
+
+        cancel = await client.post("/api/remote_dialer/cancel", json={})
+        assert cancel.status == 409
+        assert (await cancel.json())["error"] == "当前没有远程拨号会话"
+
+    api(app, fn)
+
+
+def test_remote_dialer_page_is_no_store_and_does_not_expose_admin_data():
+    app = make_app(FakeService())
+
+    async def fn(client):
+        redirect = await client.get("/remote-dialer", allow_redirects=False)
+        assert redirect.status == 302
+        assert redirect.headers["Location"] == "/remote-dialer/"
+
+        page = await client.get("/remote-dialer/")
+        assert page.status == 200
+        assert page.headers["Cache-Control"] == "no-store"
+        assert page.headers["Referrer-Policy"] == "no-referrer"
+        assert "frame-ancestors 'none'" in page.headers["Content-Security-Policy"]
+        body = await page.text()
+        assert "CallPilot Remote" in body
+        assert "LIVEKIT_API_SECRET" not in body
+
+        script = await client.get("/remote-dialer/remote_dialer.js")
+        assert script.status == 200
+        assert "callpilot.control" in await script.text()
 
     api(app, fn)
 

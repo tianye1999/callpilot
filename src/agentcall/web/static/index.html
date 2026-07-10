@@ -186,6 +186,13 @@
   .task-input:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-dim); }
   .dial-actions { display: flex; gap: 10px; margin-top: 14px; }
   .dial-actions .btn { flex: 1; padding: 14px; font-size: 16px; }
+  .remote-invite { display: none; margin-top: 10px; gap: 8px; align-items: center; }
+  .remote-invite.show { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; }
+  .remote-invite input { min-width: 0; font-size: 12px; }
+  @media(max-width:520px) {
+    .remote-invite.show { grid-template-columns: 1fr 1fr; }
+    .remote-invite input { grid-column: 1 / -1; }
+  }
   .toast { font-size: 12px; min-height: 16px; color: var(--muted); margin-top: 8px; }
   .toast.ok { color: var(--ok); }
   .toast.err { color: var(--err); }
@@ -756,8 +763,14 @@
               <input id="dialTask" class="task-input" type="text" data-i18n-ph="ph_task" />
               <div class="dial-actions">
                 <button class="btn primary" id="dialBtn" data-i18n="dial"></button>
+                <button class="btn ghost" id="remoteInviteBtn" data-i18n="remote_invite" hidden></button>
               </div>
               <div class="toast" id="dialToast"></div>
+              <div class="remote-invite" id="remoteInvitePanel">
+                <input id="remoteInviteUrl" type="text" readonly aria-label="Remote dialer link" />
+                <button class="btn sm ghost" id="remoteInviteCopy" data-i18n="remote_copy"></button>
+                <button class="btn sm ghost" id="remoteInviteCancel" data-i18n="remote_cancel"></button>
+              </div>
               <div class="batch-zone">
                 <div class="col-label" data-i18n="batch_label"></div>
                 <textarea id="batchNumbers" data-i18n-ph="ph_batch_numbers"></textarea>
@@ -1108,7 +1121,9 @@ const I18N = {
     modem_on: "Modem ready", modem_off: "Modem offline",
     keypad: "Keys", hangup: "Hang up",
     dial_label: "MAKE A CALL", preset_label: "PRESET TASK", preset_custom: "Custom (manual input)",
-    dial: "Call", ph_number: "Phone number",
+    dial: "Call", ph_number: "Phone number", remote_invite: "Mobile link",
+    remote_copy: "Copy", remote_cancel: "Cancel", remote_creating: "Preparing mobile link…",
+    remote_ready: "Mobile link ready", remote_copied: "Link copied", remote_fail: "Could not create link: ",
     voice_preview: "Preview voices ↗",
     ph_task: "Call topic (blank = reuse last)", task_prefix: "Topic (blank = reuse): ",
     calling: "Calling…", call_sent: "Call started", call_fail: "Call failed",
@@ -1237,6 +1252,15 @@ const I18N = {
       SMS_EMAIL_SMTP_USERNAME: "Sender SMTP username",
       SMS_EMAIL_SMTP_PASSWORD: "Sender SMTP app password",
       SMS_EMAIL_FROM: "Sender email address",
+      REMOTE_WEB_DIALER_ENABLED: "Remote Web Dialer",
+      REMOTE_MEDIA_PROVIDER: "Remote media provider",
+      REMOTE_CONTROL_URL: "Remote dialer HTTPS URL",
+      LIVEKIT_URL: "LiveKit WebSocket URL",
+      LIVEKIT_API_KEY: "LiveKit API key",
+      LIVEKIT_API_SECRET: "LiveKit API secret",
+      REMOTE_DISCONNECT_GRACE_SECONDS: "Remote disconnect grace (s)",
+      REMOTE_OUTBOUND_MAX_SECONDS: "Remote call max duration (s)",
+      REMOTE_DIAL_LIMIT_PER_HOUR: "Remote calls per hour",
       QWEN_PREWARM: "Qwen connection prewarm", QWEN_RECONNECT_MAX: "Max reconnects",
       WEB_HOST: "Web host", WEB_PORT: "Web port",
     },
@@ -1249,7 +1273,9 @@ const I18N = {
     modem_on: "模组就绪", modem_off: "模组未连接",
     keypad: "按键", hangup: "挂断",
     dial_label: "拨打电话", preset_label: "预设任务", preset_custom: "自定义（手动输入）",
-    dial: "拨打", ph_number: "输入号码",
+    dial: "拨打", ph_number: "输入号码", remote_invite: "生成手机链接",
+    remote_copy: "复制", remote_cancel: "取消", remote_creating: "正在准备手机链接…",
+    remote_ready: "手机链接已生成", remote_copied: "链接已复制", remote_fail: "生成链接失败：",
     voice_preview: "官网试听 ↗",
     ph_task: "外呼主题（空=沿用上次）", task_prefix: "主题（空=沿用）：",
     calling: "呼叫中…", call_sent: "已发起呼叫", call_fail: "呼叫失败",
@@ -2004,6 +2030,61 @@ async function doDial() {
 $("dialBtn").addEventListener("click", doDial);
 $("dialNumber").addEventListener("keydown", (e) => { if (e.key === "Enter") doDial(); });
 
+let remoteInviteTimer = null;
+function clearRemoteInvite() {
+  if (remoteInviteTimer) clearTimeout(remoteInviteTimer);
+  remoteInviteTimer = null;
+  $("remoteInviteUrl").value = "";
+  $("remoteInvitePanel").classList.remove("show");
+}
+async function loadRemoteDialerStatus() {
+  try {
+    const response = await fetch("/api/remote_dialer/status", { cache: "no-store" });
+    if (!response.ok) return;
+    const status = await response.json();
+    $("remoteInviteBtn").hidden = !status.enabled;
+  } catch (e) {
+    $("remoteInviteBtn").hidden = true;
+  }
+}
+$("remoteInviteBtn").addEventListener("click", async () => {
+  const button = $("remoteInviteBtn");
+  button.disabled = true;
+  setToast("dialToast", "", t("remote_creating"));
+  try {
+    const { httpOk, res } = await postJson("/api/remote_dialer/invite", {});
+    if (!httpOk || !res.invite || !res.invite.url) {
+      setToast("dialToast", "err", t("remote_fail") + (res.error || ""));
+      return;
+    }
+    clearRemoteInvite();
+    $("remoteInviteUrl").value = String(res.invite.url);
+    $("remoteInvitePanel").classList.add("show");
+    setToast("dialToast", "ok", t("remote_ready"));
+    const expiresIn = Math.max(0, Number(res.invite.expires_at || 0) * 1000 - Date.now());
+    remoteInviteTimer = setTimeout(clearRemoteInvite, expiresIn);
+  } catch (e) {
+    setToast("dialToast", "err", t("req_error"));
+  } finally {
+    button.disabled = false;
+  }
+});
+$("remoteInviteCopy").addEventListener("click", async () => {
+  const value = $("remoteInviteUrl").value;
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    setToast("dialToast", "ok", t("remote_copied"));
+  } catch (e) {
+    $("remoteInviteUrl").focus();
+    $("remoteInviteUrl").select();
+  }
+});
+$("remoteInviteCancel").addEventListener("click", async () => {
+  try { await postJson("/api/remote_dialer/cancel", {}); } catch (e) { /* local cleanup still applies */ }
+  clearRemoteInvite();
+});
+
 function updateTaskPlaceholder(task) {
   const t2 = (task || "").trim();
   window._lastTask = t2 || window._lastTask;
@@ -2613,7 +2694,7 @@ function cfgGroup(key) {
   if (/^MODEM_/.test(key)) return t("grp_modem");
   if (/^(RECORDING_|SUMMARY_|CALL_LOG|HALF_DUPLEX|HANGUP_)/.test(key)) return t("grp_call");
   if (/^MONITOR_/.test(key)) return t("grp_monitor");
-  if (/^(DIAL_|SMS_)/.test(key)) return t("grp_dial");
+  if (/^(DIAL_|SMS_|REMOTE_|LIVEKIT_)/.test(key)) return t("grp_dial");
   return t("grp_sys");
 }
 function cfgLabel(c) {
@@ -2795,6 +2876,7 @@ $("configSave").addEventListener("click", async () => {
       // 含「需重启」项且当前无通话：自动重启服务应用（通话中则留待用户手动，不打断）。
       if (res.requires_restart.length && !callActive) restartService();
       else loadConfig();
+      loadRemoteDialerStatus();
     } else setToast("configToast", "err", t("cfg_savefail") + (res.error || ""));
   } catch (err) { setToast("configToast", "err", t("req_error")); }
   finally { btn.disabled = false; }
@@ -2848,6 +2930,7 @@ refreshQueue();
 loadConfig();
 loadDefaultTask();
 loadDialPresets();
+loadRemoteDialerStatus();
 setInterval(refreshQueue, 2000);
 </script>
 </body>
