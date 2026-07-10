@@ -7,6 +7,7 @@ service 用最小替身（只实现 web 层用到的接口），CallLogger 落�
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 
@@ -40,7 +41,7 @@ class FakeService:
         self.batch_result: dict = {"accepted": [], "rejected": []}
         self.queue: dict = {"pending": [], "current": None, "done": [], "active": False}
         # 通话相关高层方法的可控返回值（默认：无通话）。
-        self.dial_calls: list[tuple[str, str | None, str | None]] = []
+        self.dial_calls: list[tuple[str, str | None, str | None, str | None]] = []
         self.dial_result: tuple[bool, str | None] = (True, None)
         self.hangup_result: tuple[bool, str | None] = (True, None)
         self.dtmf_calls: list[str] = []
@@ -54,9 +55,13 @@ class FakeService:
         return dict(self.queue)
 
     def dial(
-        self, number: str, task: str | None = None, preset_hint: str | None = None
+        self,
+        number: str,
+        task: str | None = None,
+        preset_hint: str | None = None,
+        preset_id: str | None = None,
     ) -> tuple[bool, str | None]:
-        self.dial_calls.append((number, task, preset_hint))
+        self.dial_calls.append((number, task, preset_hint, preset_id))
         return self.dial_result
 
     def hangup(self) -> tuple[bool, str | None]:
@@ -678,9 +683,16 @@ def test_number_profiles_api_lists_profiles(tmp_path, monkeypatch):
         assert resp.status == 200
         return await resp.json()
 
-    assert api(app, fn) == {
-        "profiles": [{"number": "10000", "task": "查流量", "label": "Preset <safe>"}]
-    }
+    result = api(app, fn)
+    assert result["profiles"] == [
+        {
+            "id": result["profiles"][0]["id"],
+            "number": "10000",
+            "task": "查流量",
+            "label": "Preset <safe>",
+        }
+    ]
+    assert result["profiles"][0]["id"].startswith("legacy_")
 
 
 def test_number_profiles_api_returns_empty_when_disabled(tmp_path, monkeypatch):
@@ -699,6 +711,56 @@ def test_number_profiles_api_returns_empty_when_disabled(tmp_path, monkeypatch):
         return await resp.json()
 
     assert api(app, fn) == {"profiles": []}
+
+
+def test_number_profile_management_api_crud_and_validation(tmp_path, monkeypatch):
+    profile_file = tmp_path / "number_profiles.json"
+    profile_file.write_text('{"_comment":"keep","profiles":[]}', encoding="utf-8")
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "false")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profile_file))
+    app = make_app(FakeService())
+
+    async def fn(client):
+        response = await client.get("/api/number_profiles/manage")
+        assert response.status == 200
+        assert await response.json() == {"ok": True, "enabled": False, "profiles": []}
+
+        payload = {
+            "enabled": True,
+            "number": "10000",
+            "match_mode": "exact",
+            "label": {"zh": "电信·查流量", "en": "Telecom · Data"},
+            "task": {"zh": "查流量", "en": "check data"},
+            "scenario": {"zh": "中文策略", "en": "English strategy"},
+            "opening": {"zh": "查流量", "en": "Check data"},
+        }
+        response = await client.post("/api/number_profiles", json=payload)
+        assert response.status == 201
+        created = (await response.json())["profile"]
+
+        response = await client.patch(
+            f"/api/number_profiles/{created['id']}", json={**created, "enabled": False}
+        )
+        assert response.status == 200
+        assert (await response.json())["profile"]["enabled"] is False
+
+        response = await client.post(
+            "/api/number_profiles", json={**payload, "opening": {"zh": "开" * 41, "en": ""}}
+        )
+        assert response.status == 400
+
+        response = await client.delete(f"/api/number_profiles/{created['id']}")
+        assert response.status == 200
+        assert await response.json() == {"ok": True}
+
+        response = await client.delete(f"/api/number_profiles/{created['id']}")
+        assert response.status == 404
+
+    api(app, fn)
+    assert json.loads(profile_file.read_text(encoding="utf-8")) == {
+        "_comment": "keep",
+        "profiles": [],
+    }
 
 
 def test_endpoints_without_service_return_500():
@@ -772,25 +834,34 @@ def test_dial_delegates_and_validates():
         assert resp.status == 400
 
     api(app, fn)
-    assert service.dial_calls == [("10086", "催快递", None)]
+    assert service.dial_calls == [("10086", "催快递", None, None)]
 
 
-def test_dial_forwards_preset_hint():
-    """选中预设时 preset_task 作为命中键透传 service.dial；子主题走 task；非字符串→400。"""
+def test_dial_forwards_preset_identity_and_legacy_hint():
+    """新 preset_id 与旧 preset_task 都透传；子主题仍独立走 task。"""
     service = FakeService()
     app = make_app(service)
 
     async def fn(client):
         resp = await client.post(
             "/api/call/dial",
-            json={"number": "12345", "task": "退休金怎么领取", "preset_task": "政务咨询"},
+            json={
+                "number": "12345",
+                "task": "退休金怎么领取",
+                "preset_task": "政务咨询",
+                "preset_id": "profile_123",
+            },
         )
         assert resp.status == 200
         resp = await client.post("/api/call/dial", json={"number": "12345", "preset_task": 5})
         assert resp.status == 400
+        resp = await client.post("/api/call/dial", json={"number": "12345", "preset_id": 5})
+        assert resp.status == 400
 
     api(app, fn)
-    assert service.dial_calls == [("12345", "退休金怎么领取", "政务咨询")]
+    assert service.dial_calls == [
+        ("12345", "退休金怎么领取", "政务咨询", "profile_123")
+    ]
 
 
 def test_dial_conflict_when_service_rejects():

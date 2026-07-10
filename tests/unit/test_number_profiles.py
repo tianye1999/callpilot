@@ -48,6 +48,8 @@ def test_bundled_seed_has_public_hotline_profiles_without_private_data():
         "12345",
     }
     assert all(item["number"] in allowed_numbers for item in profiles)
+    assert len({item["id"] for item in profiles}) == len(profiles)
+    assert all(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", item["id"]) for item in profiles)
 
     for item in profiles:
         for field in ("label", "task", "scenario", "opening"):
@@ -291,3 +293,136 @@ def test_ensure_seeded_warns_and_does_not_raise_when_seed_missing(tmp_path, capl
 
     assert not target.exists()
     assert "号码任务库种子文件不存在" in caplog.text
+
+
+def test_management_crud_persists_ids_and_disabled_profiles_do_not_match(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [
+            {
+                "number": "10000",
+                "task": {"zh": "查流量", "en": "check data"},
+                "label": {"zh": "电信·查流量", "en": "Telecom · Data"},
+                "scenario": {"zh": "中文策略", "en": "English strategy"},
+                "opening": {"zh": "查流量", "en": "Check data"},
+            }
+        ],
+    )
+
+    legacy = number_profiles.list_managed_profiles(path=path)
+    assert len(legacy) == 1
+    legacy_id = legacy[0]["id"]
+    assert legacy_id.startswith("legacy_")
+
+    updated = number_profiles.update_profile(
+        legacy_id,
+        {
+            **legacy[0],
+            "enabled": False,
+            "label": {"zh": "电信·流量", "en": "Telecom · Data usage"},
+        },
+        path=path,
+    )
+
+    stored = json.loads(path.read_text(encoding="utf-8"))["profiles"]
+    assert stored[0]["id"] == legacy_id
+    assert updated["enabled"] is False
+    assert number_profiles.lookup_profile("10000", "查流量", path=path) is None
+    assert number_profiles.lookup_profile_by_id(legacy_id, "10000", "本月用量", path=path) is None
+    assert number_profiles.list_profiles(path=path) == []
+
+    created = number_profiles.create_profile(
+        {
+            "enabled": True,
+            "number": "10086",
+            "match_mode": "number",
+            "label": {"zh": "移动·通用", "en": "China Mobile · General"},
+            "task": {"zh": "", "en": ""},
+            "scenario": {"zh": "号码通用策略", "en": "Number fallback strategy"},
+            "opening": {"zh": "办理业务", "en": "I'd like some help"},
+        },
+        path=path,
+    )
+    assert created["id"]
+    assert created["match_mode"] == "number"
+
+    by_id = number_profiles.lookup_profile_by_id(
+        created["id"], "10086", "任意本通子事项", path=path
+    )
+    assert by_id is not None
+    assert by_id["scenario"] == "号码通用策略"
+    assert by_id["profile_id"] == created["id"]
+    assert number_profiles.lookup_profile_by_id(created["id"], "10010", "", path=path) is None
+
+    assert number_profiles.delete_profile(created["id"], path=path)
+    assert not number_profiles.delete_profile(created["id"], path=path)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"number": "not a number", "scenario": "策略"}, "号码格式"),
+        ({"number": "10000", "scenario": ""}, "scenario"),
+        ({"number": "10000", "scenario": "策" * 1201}, "1200"),
+        ({"number": "10000", "scenario": "策略", "opening": "开" * 41}, "40"),
+        (
+            {"number": "10000", "match_mode": "exact", "task": "", "scenario": "策略"},
+            "task",
+        ),
+    ],
+)
+def test_create_profile_rejects_invalid_input_without_changing_file(
+    tmp_path, payload, message
+):
+    path = tmp_path / "number_profiles.json"
+    original = '{"_comment":"keep","profiles":[]}\n'
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(number_profiles.ProfileValidationError, match=message):
+        number_profiles.create_profile(payload, path=path)
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_create_profile_rejects_ambiguous_exact_and_number_fallbacks(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [
+            {"number": "10000", "task": {"zh": "查流量", "en": "check data"}, "scenario": "精确"},
+            {"number": "10000", "scenario": "通配"},
+        ],
+    )
+
+    with pytest.raises(number_profiles.ProfileConflictError):
+        number_profiles.create_profile(
+            {"number": "10000", "task": "check data", "scenario": "重复精确"}, path=path
+        )
+    with pytest.raises(number_profiles.ProfileConflictError):
+        number_profiles.create_profile(
+            {"number": "10000", "match_mode": "number", "scenario": "重复通配"},
+            path=path,
+        )
+
+
+def test_list_profiles_exposes_stable_id_without_rewriting_legacy_file(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(path, [{"number": "10000", "task": "查流量", "scenario": "策略"}])
+    before = path.read_text(encoding="utf-8")
+
+    choices = number_profiles.list_profiles(path=path, include_id=True)
+
+    assert choices[0]["id"].startswith("legacy_")
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_profile_scenario_limit_preserves_full_bundled_english_strategy():
+    seed = Path(__file__).resolve().parents[2] / "data" / "number_profiles.example.json"
+    result = number_profiles.lookup_profile(
+        "10000", "check data usage", lang="en", path=seed
+    )
+
+    assert result is not None
+    assert len(result["scenario"]) > 200
+    assert "never claim you have the figures" in result["scenario"]

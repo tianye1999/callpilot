@@ -45,10 +45,11 @@ Phone call → EC20 modem ──(AT: RING/ATA/CLCC)── CallPilot
 
 v0.4.0 adds several call-quality controls for outbound work:
 
-- **Task preset library:** copy [`data/number_profiles.example.json`](data/number_profiles.example.json)
-  to local `data/number_profiles.json` and tune prompts per number + task. The
-  dial panel shows these presets; every `label` / `task` / `scenario` /
-  `opening` field can be either a string or a `{zh,en}` object.
+- **Task preset library:** first launch seeds the local library from
+  [`data/number_profiles.example.json`](data/number_profiles.example.json).
+  Use the **Presets** page to create, edit, duplicate, disable, or delete entries;
+  advanced users can still edit `data/number_profiles.json`. Every `label` /
+  `task` / `scenario` / `opening` field supports a string or `{zh,en}` object.
 - **Preset dialing with sub-topics:** choosing a preset fills the number and
   topic, while the topic box stays editable for the exact sub-topic of this call
   without losing the preset match.
@@ -286,9 +287,10 @@ Quectel EC20/EG25，来电自动接听并与对方对话，可外呼、收发短
 
 v0.4.0 增加了几项面向外呼质量的控制：
 
-- **预调教任务库**：把 [`data/number_profiles.example.json`](data/number_profiles.example.json)
-  复制为本地 `data/number_profiles.json`，按「号码+任务」精调提示词；拨号面板会显示下拉预设，
-  `label` / `task` / `scenario` / `opening` 字段均可写普通字符串或 `{zh,en}` 双语对象。
+- **预调教任务库**：首次启动会从 [`data/number_profiles.example.json`](data/number_profiles.example.json)
+  初始化本地任务库；可在「任务库」页面新建、编辑、复制、停用或删除预设，高级用户仍可直接编辑
+  `data/number_profiles.json`。`label` / `task` / `scenario` / `opening` 字段均支持普通字符串或
+  `{zh,en}` 双语对象。
 - **拨号下拉 + 子主题**：选择预设会自动填号码和事项，事项框仍可改成本通的具体子主题，
   同时保留预设命中。
 - **动态场景提示词**：预设未命中时，可在接通前用轻量文本模型生成本通场景与开场白

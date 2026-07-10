@@ -30,7 +30,7 @@ from .dtmf import dtmf_tone
 from .events import EventHub
 from .modem import Eg25Modem
 from .monitor_playback import MonitorPlayback
-from .number_profiles import lookup_profile
+from .number_profiles import lookup_profile, lookup_profile_by_id
 from .prompt_gen import generate_prompt_scenario
 from .prompts import (
     agent_language,
@@ -91,6 +91,8 @@ class CallSession:
         self._outbound_task_value: str | None = None
         # 命中键：选中预设时锁定"用哪条预设"（预设原任务），与事项框的具体子主题解耦。
         self._preset_hint: str | None = None
+        # 稳定预设 ID：新界面优先按 ID 命中；preset_hint 只保留给旧客户端兼容回退。
+        self._preset_id: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._active = False
@@ -132,6 +134,7 @@ class CallSession:
         outbound_number: str | None = None,
         task: str | None = None,
         preset_hint: str | None = None,
+        preset_id: str | None = None,
     ) -> None:
         if self._active:
             logger.warning("已有通话进行中，忽略新的呼叫请求")
@@ -139,6 +142,7 @@ class CallSession:
         self._outbound_number = outbound_number
         self._outbound_task_value = task
         self._preset_hint = preset_hint
+        self._preset_id = preset_id
         self._wrap_up_requested = False  # 每通重置收尾裁判状态
         self._wrap_up_reason = ""
         self._judge_task = None
@@ -637,7 +641,16 @@ class CallSession:
         # 未选预设（手输）时用事项框内容。子主题始终经 _outbound_task 进 instructions 的 topic。
         match_key = self._preset_hint if self._preset_hint is not None else task
         if config.get_bool("NUMBER_PROFILES_ENABLED"):
-            profile = lookup_profile(number, match_key, lang=lang)
+            profile = None
+            if self._preset_id:
+                profile = lookup_profile_by_id(
+                    self._preset_id,
+                    number,
+                    task,
+                    lang=lang,
+                )
+            if profile is None:
+                profile = lookup_profile(number, match_key, lang=lang)
             if profile is not None:
                 self._prompt_gen_result = profile
                 self._prompt_gen_done.set()
@@ -721,6 +734,7 @@ class CallSession:
         provider = str(result.get("provider") or self.provider or "")
         cached = bool(result.get("cached"))
         source = str(result.get("source") or "generated")
+        profile_id = str(result.get("profile_id") or "")
         number = str(result.get("number") or self._outbound_number or "")
         task = str(result.get("task") or self._outbound_task(agent_language()))
         if ok:
@@ -742,6 +756,7 @@ class CallSession:
                 model=model,
                 cached=cached,
                 source=source,
+                profile_id=profile_id,
                 number=number,
                 task=task,
             )
@@ -1020,7 +1035,11 @@ class CallAgentService:
         self.modem.on_sms(on_sms)
 
     def dial(
-        self, number: str, task: str | None = None, preset_hint: str | None = None
+        self,
+        number: str,
+        task: str | None = None,
+        preset_hint: str | None = None,
+        preset_id: str | None = None,
     ) -> tuple[bool, str | None]:
         """发起外呼：让 Agent 主动拨打指定号码。
 
@@ -1044,7 +1063,20 @@ class CallAgentService:
             if self.session.is_active:
                 return False, "当前正在通话中，请稍后再拨"
             self.session.current_caller = number
-            self.session.start(outbound_number=number, task=task, preset_hint=preset_hint)
+            if preset_id is None:
+                # 保持旧客户端/测试替身的调用形状；未选预设时不新增关键字参数。
+                self.session.start(
+                    outbound_number=number,
+                    task=task,
+                    preset_hint=preset_hint,
+                )
+            else:
+                self.session.start(
+                    outbound_number=number,
+                    task=task,
+                    preset_hint=preset_hint,
+                    preset_id=preset_id,
+                )
         return True, None
 
     def hangup(self) -> tuple[bool, str | None]:

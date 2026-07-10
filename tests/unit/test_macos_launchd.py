@@ -6,16 +6,28 @@ import plistlib
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from agentcall import macos_launchd
 
 
 def test_bundle_root_and_resources_resolve_from_app_executable():
     exe = Path("/Applications/CallPilot.app/Contents/MacOS/CallPilot")
+    expected_root = exe.resolve().parents[2]
 
-    assert macos_launchd.bundle_root_for_executable(exe) == Path("/Applications/CallPilot.app")
+    assert macos_launchd.bundle_root_for_executable(exe) == expected_root
     assert macos_launchd.resources_dir_for_executable(exe) == Path(
-        "/Applications/CallPilot.app/Contents/Resources"
+        expected_root / "Contents" / "Resources"
     )
+
+
+def test_make_layout_without_uid_fails_clearly_when_getuid_is_unavailable(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(macos_launchd.os, "getuid", None, raising=False)
+
+    with pytest.raises(RuntimeError, match="macOS"):
+        macos_launchd.make_layout(tmp_path / "CallPilot")
 
 
 def test_build_plists_use_current_bundle_and_application_support_paths(tmp_path):
@@ -41,7 +53,7 @@ def test_build_plists_use_current_bundle_and_application_support_paths(tmp_path)
     assert app["WorkingDirectory"] == str(support)
     assert app["StandardOutPath"] == str(support / "logs" / "launchd-app.out.log")
     env = app["EnvironmentVariables"]
-    assert env["PATH"].split(":")[0] == str(resources / "bin")
+    assert env["PATH"].startswith(f"{resources / 'bin'}:")
     assert env["AGENTCALL_ENV_FILE"] == str(support / ".env")
     assert env["AGENTCALL_DATA_DIR"] == str(support / "data")
     assert env["CALL_LOG_DIR"] == str(support / "data" / "recordings")

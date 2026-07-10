@@ -399,6 +399,81 @@
   .switch input:disabled + .knob { opacity: .4; cursor: default; }
   .cfg-save { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
 
+  /* ========= 预设任务库管理 ========= */
+  #page-profiles .wrap { max-width: 1180px; margin: 0 auto; }
+  .profile-head { display: flex; align-items: center; gap: 12px; }
+  .profile-head .sub { margin-left: 0; }
+  .profile-head .profile-head-spacer { flex: 1; }
+  .profile-global { display: inline-flex; align-items: center; gap: 9px; color: var(--muted); font-size: 12px; }
+  .profile-grid { display: grid; grid-template-columns: minmax(260px, .8fr) minmax(0, 1.5fr); min-height: 560px; }
+  .profile-sidebar { border-right: 1px solid var(--border); min-width: 0; }
+  .profile-toolbar { padding: 14px; border-bottom: 1px solid var(--border); }
+  .profile-toolbar input {
+    width: 100%; background: var(--well); border: 1px solid var(--border); color: var(--text);
+    border-radius: 9px; padding: 9px 11px; font-size: 13px;
+  }
+  .profile-toolbar input:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-dim); }
+  .profile-list { max-height: calc(100vh - 270px); overflow-y: auto; padding: 8px; }
+  .profile-row { display: flex; align-items: stretch; gap: 4px; margin-bottom: 4px; }
+  .profile-row-main {
+    min-width: 0; flex: 1; border: 1px solid transparent; border-radius: 8px; padding: 9px 10px;
+    background: transparent; color: var(--text); text-align: left; cursor: pointer;
+  }
+  .profile-row-main:hover { background: var(--well); }
+  .profile-row.active .profile-row-main { background: var(--blue-dim); border-color: rgba(10,132,255,.38); }
+  .profile-row-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .profile-row-title b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
+  .profile-status-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--ok); }
+  .profile-status-dot.off { background: var(--dim); }
+  .profile-row-sub { margin: 3px 0 0 15px; color: var(--muted); font-family: var(--mono); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .profile-copy {
+    width: 34px; flex: 0 0 34px; border: 0; border-radius: 8px; background: transparent;
+    color: var(--muted); cursor: pointer; font-size: 17px;
+  }
+  .profile-copy:hover { color: var(--text); background: var(--well); }
+  .profile-editor { min-width: 0; padding: 18px 20px; }
+  .profile-editor-empty { color: var(--dim); text-align: center; padding: 90px 20px; }
+  .profile-form[hidden], .profile-editor-empty[hidden] { display: none; }
+  .profile-form-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+  .profile-form-title h3 { margin: 0; font-size: 15px; }
+  .profile-topline { display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; gap: 14px; align-items: end; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .profile-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .profile-field > label, .profile-switch-label { color: var(--muted); font-size: 11.5px; font-weight: 700; }
+  .profile-field input, .profile-field textarea {
+    width: 100%; background: var(--well); border: 1px solid var(--border); color: var(--text);
+    border-radius: 9px; padding: 9px 11px; font-size: 13px;
+  }
+  .profile-field textarea { min-height: 92px; resize: vertical; line-height: 1.5; }
+  .profile-field input:focus, .profile-field textarea:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-dim); }
+  .profile-field input:disabled { opacity: .42; }
+  .profile-segments { display: flex; width: 210px; padding: 3px; border-radius: 9px; background: var(--well); border: 1px solid var(--border); }
+  .profile-segments button { flex: 1; border: 0; border-radius: 6px; padding: 7px 9px; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 700; }
+  .profile-segments button[aria-pressed="true"] { background: var(--blue-dim); color: var(--blue); }
+  .profile-enabled-field { display: flex; flex-direction: column; align-items: flex-end; gap: 7px; }
+  .profile-languages { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; margin-top: 16px; }
+  .profile-language { min-width: 0; border: 0; padding: 0; margin: 0; }
+  .profile-language legend { color: var(--blue); font-size: 11px; font-weight: 800; letter-spacing: .12em; margin-bottom: 10px; }
+  .profile-language .profile-field { margin-bottom: 12px; }
+  .profile-count { align-self: flex-end; color: var(--dim); font-family: var(--mono); font-size: 10px; }
+  .profile-actions { display: flex; align-items: center; gap: 9px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .profile-actions .spacer { flex: 1; }
+  .profile-toast { min-height: 18px; margin: 10px 0 0; }
+  @media (max-width: 900px) {
+    .profile-grid { grid-template-columns: 1fr; }
+    .profile-sidebar { border-right: 0; border-bottom: 1px solid var(--border); }
+    .profile-list { max-height: 220px; }
+    .profile-topline { grid-template-columns: 1fr; align-items: stretch; }
+    .profile-enabled-field { align-items: flex-start; }
+    .profile-languages { grid-template-columns: 1fr; gap: 8px; }
+  }
+  @media (max-width: 720px) {
+    .dock { max-width: calc(100vw - 16px); overflow-x: auto; }
+    .dock button { width: 68px; flex: 0 0 68px; }
+    .profile-head { flex-wrap: wrap; }
+    .profile-head .profile-head-spacer { display: none; }
+    .profile-editor { padding: 16px; }
+  }
+
   /* ========= 底部胶囊 dock（poc 招牌）========= */
   .dock {
     position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 30;
@@ -735,6 +810,116 @@
       </div>
     </div>
 
+    <!-- 预设任务库 -->
+    <div class="panel-page" id="page-profiles">
+      <div class="wrap">
+        <section class="card">
+          <h2 class="profile-head">
+            <span data-i18n="profiles_title"></span>
+            <span class="sub" data-i18n="profiles_sub"></span>
+            <span class="profile-head-spacer"></span>
+            <label class="profile-global" for="profilesEnabled">
+              <span data-i18n="profiles_global"></span>
+              <span class="switch">
+                <input id="profilesEnabled" type="checkbox" />
+                <span class="knob"></span>
+              </span>
+            </label>
+            <button class="btn primary sm" id="profileNew" type="button" data-i18n="profile_new"></button>
+          </h2>
+          <div class="profile-grid">
+            <aside class="profile-sidebar">
+              <div class="profile-toolbar">
+                <input id="profileSearch" type="search" data-i18n-ph="profile_search" />
+              </div>
+              <div class="profile-list" id="profileList"></div>
+            </aside>
+            <div class="profile-editor">
+              <div class="profile-editor-empty" id="profileEditorEmpty" data-i18n="profile_empty"></div>
+              <form class="profile-form" id="profileForm" hidden>
+                <input id="profileId" type="hidden" />
+                <div class="profile-form-title">
+                  <h3 id="profileEditorTitle"></h3>
+                </div>
+                <div class="profile-topline">
+                  <div class="profile-field">
+                    <label for="profileNumber" data-i18n="profile_number"></label>
+                    <input id="profileNumber" type="text" maxlength="32" autocomplete="off" />
+                  </div>
+                  <div class="profile-field">
+                    <label data-i18n="profile_match"></label>
+                    <div class="profile-segments" role="group" aria-label="Match mode">
+                      <button id="profileModeExact" type="button" aria-pressed="true" data-i18n="profile_exact"></button>
+                      <button id="profileModeNumber" type="button" aria-pressed="false" data-i18n="profile_number_default"></button>
+                    </div>
+                  </div>
+                  <div class="profile-enabled-field">
+                    <span class="profile-switch-label" id="profileEnabledLabel" data-i18n="profile_enabled"></span>
+                    <label class="switch" for="profileEnabled">
+                      <input id="profileEnabled" type="checkbox" aria-labelledby="profileEnabledLabel" checked />
+                      <span class="knob"></span>
+                    </label>
+                  </div>
+                </div>
+                <div class="profile-languages">
+                  <fieldset class="profile-language">
+                    <legend data-i18n="profile_lang_zh"></legend>
+                    <div class="profile-field">
+                      <label for="profileLabelZh" data-i18n="profile_label"></label>
+                      <input id="profileLabelZh" type="text" maxlength="120" />
+                    </div>
+                    <div class="profile-field">
+                      <label for="profileTaskZh" data-i18n="profile_task"></label>
+                      <input id="profileTaskZh" type="text" maxlength="120" />
+                    </div>
+                    <div class="profile-field">
+                      <label for="profileScenarioZh" data-i18n="profile_scenario"></label>
+                      <textarea id="profileScenarioZh" maxlength="1200"></textarea>
+                      <span class="profile-count" id="profileScenarioZhCount"></span>
+                    </div>
+                    <div class="profile-field">
+                      <label for="profileOpeningZh" data-i18n="profile_opening"></label>
+                      <input id="profileOpeningZh" type="text" maxlength="40" />
+                      <span class="profile-count" id="profileOpeningZhCount"></span>
+                    </div>
+                  </fieldset>
+                  <fieldset class="profile-language">
+                    <legend data-i18n="profile_lang_en"></legend>
+                    <div class="profile-field">
+                      <label for="profileLabelEn" data-i18n="profile_label"></label>
+                      <input id="profileLabelEn" type="text" maxlength="120" />
+                    </div>
+                    <div class="profile-field">
+                      <label for="profileTaskEn" data-i18n="profile_task"></label>
+                      <input id="profileTaskEn" type="text" maxlength="120" />
+                    </div>
+                    <div class="profile-field">
+                      <label for="profileScenarioEn" data-i18n="profile_scenario"></label>
+                      <textarea id="profileScenarioEn" maxlength="1200"></textarea>
+                      <span class="profile-count" id="profileScenarioEnCount"></span>
+                    </div>
+                    <div class="profile-field">
+                      <label for="profileOpeningEn" data-i18n="profile_opening"></label>
+                      <input id="profileOpeningEn" type="text" maxlength="40" />
+                      <span class="profile-count" id="profileOpeningEnCount"></span>
+                    </div>
+                  </fieldset>
+                </div>
+                <div class="profile-actions">
+                  <button class="btn primary sm" id="profileSave" type="submit" data-i18n="profile_save"></button>
+                  <button class="btn ghost sm" id="profileCancel" type="button" data-i18n="profile_cancel"></button>
+                  <button class="btn ghost sm" id="profileDuplicate" type="button" data-i18n="profile_duplicate"></button>
+                  <span class="spacer"></span>
+                  <button class="btn danger sm" id="profileDelete" type="button" data-i18n="profile_delete"></button>
+                </div>
+                <div class="toast profile-toast" id="profileToast" role="status"></div>
+              </form>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+
     <!-- 设置 -->
     <div class="panel-page" id="page-settings">
       <div class="wrap">
@@ -758,6 +943,7 @@
     <button data-page="live"><span class="ico">💬</span><span data-i18n="nav_live"></span><span class="dot"></span></button>
     <button data-page="sms"><span class="ico">✉️</span><span data-i18n="nav_sms"></span><span class="dot"></span></button>
     <button data-page="history"><span class="ico">🕘</span><span data-i18n="nav_history"></span><span class="dot"></span></button>
+    <button data-page="profiles"><span class="ico">☷</span><span data-i18n="nav_profiles"></span><span class="dot"></span></button>
     <button data-page="settings"><span class="ico">⚙️</span><span data-i18n="nav_settings"></span><span class="dot"></span></button>
   </nav>
 
@@ -902,7 +1088,7 @@ const $ = (id) => document.getElementById(id);
 const I18N = {
   en: {
     slogan: "Your calls, handled by AI",
-    nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_settings: "Settings",
+    nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_profiles: "Presets", nav_settings: "Settings",
     st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
     conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
     modem_on: "Modem ready", modem_off: "Modem offline",
@@ -919,6 +1105,20 @@ const I18N = {
     enq_fail: "Enqueue failed: ",
     q_idle: "Queue idle", q_done: (n) => `Queue idle · ${n} dialed`,
     q_active: (p, d) => `In progress · ${p} pending · ${d} dialed`, q_current: " dialing",
+    profiles_title: "Preset library", profiles_sub: "Reusable call strategies", profiles_global: "Use presets",
+    profile_new: "+ New", profile_search: "Search label, number, or task", profile_empty: "Select a preset to edit, or create a new one.",
+    profile_no_match: "No matching presets", profile_new_title: "New preset", profile_edit_title: "Edit preset",
+    profile_number: "Phone number", profile_match: "Match rule", profile_exact: "Exact task", profile_number_default: "Number fallback",
+    profile_enabled: "Enabled", profile_lang_zh: "CHINESE", profile_lang_en: "ENGLISH",
+    profile_label: "Dropdown label", profile_task: "Matching task", profile_scenario: "Scenario strategy", profile_opening: "First sentence",
+    profile_save: "Save", profile_cancel: "Cancel", profile_duplicate: "Duplicate", profile_delete: "Delete",
+    profile_saving: "Saving…", profile_saved: "Preset saved", profile_deleted: "Preset deleted",
+    profile_need_number: "Enter a dialable phone number.", profile_need_scenario: "Add a scenario strategy in at least one language.",
+    profile_need_task: "Exact matching needs a task in at least one language.", profile_save_fail: "Could not save: ",
+    profile_delete_title: "Delete this preset?", profile_delete_msg: "It will disappear from the dialer immediately.",
+    profile_delete_ok: "Delete", profile_delete_fail: "Could not delete: ", profile_copy_suffix: " (copy)",
+    profile_global_fail: "Could not update the preset switch: ", profile_leave_title: "Unsaved preset changes",
+    profile_leave_msg: "Discard the changes to this preset?", profile_leave_discard: "Discard changes", profile_leave_stay: "Keep editing",
     recent_label: "RECENT CALLS", empty_calls: "No calls yet", view_all: "View all history",
     live_title: "Live Transcript", live_sub_idle: "Opens automatically when a call starts",
     listen_off: "🔊 Listen live", listen_on: "🔊 Listening…",
@@ -1019,7 +1219,7 @@ const I18N = {
   },
   zh: {
     slogan: "电话，交给 AI",
-    nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_settings: "设置",
+    nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_profiles: "任务库", nav_settings: "设置",
     st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
     conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
     modem_on: "模组就绪", modem_off: "模组未连接",
@@ -1036,6 +1236,20 @@ const I18N = {
     enq_fail: "入队失败：",
     q_idle: "队列空闲", q_done: (n) => `队列空闲 · 本轮已拨 ${n}`,
     q_active: (p, d) => `队列进行中 · 待拨 ${p} · 已拨 ${d}`, q_current: " 拨打中",
+    profiles_title: "预设任务库", profiles_sub: "维护常用号码的通话策略", profiles_global: "启用预设",
+    profile_new: "+ 新建", profile_search: "搜索名称、号码或任务", profile_empty: "选择一条预设进行编辑，或新建预设。",
+    profile_no_match: "没有匹配的预设", profile_new_title: "新建预设", profile_edit_title: "编辑预设",
+    profile_number: "电话号码", profile_match: "匹配规则", profile_exact: "号码+任务", profile_number_default: "号码通配",
+    profile_enabled: "启用本条", profile_lang_zh: "中文", profile_lang_en: "英文",
+    profile_label: "下拉显示名称", profile_task: "匹配任务", profile_scenario: "场景策略", profile_opening: "第一句话",
+    profile_save: "保存", profile_cancel: "取消", profile_duplicate: "复制", profile_delete: "删除",
+    profile_saving: "保存中…", profile_saved: "预设已保存", profile_deleted: "预设已删除",
+    profile_need_number: "请输入可以拨打的电话号码。", profile_need_scenario: "请至少填写一种语言的场景策略。",
+    profile_need_task: "号码+任务匹配至少需要填写一种语言的任务。", profile_save_fail: "保存失败：",
+    profile_delete_title: "删除这条预设？", profile_delete_msg: "删除后会立即从拨号下拉中消失。",
+    profile_delete_ok: "删除", profile_delete_fail: "删除失败：", profile_copy_suffix: "（副本）",
+    profile_global_fail: "更新预设开关失败：", profile_leave_title: "预设有未保存修改",
+    profile_leave_msg: "要放弃当前预设的修改吗？", profile_leave_discard: "放弃修改", profile_leave_stay: "继续编辑",
     recent_label: "最近通话", empty_calls: "暂无通话", view_all: "查看全部历史",
     live_title: "实时对话", live_sub_idle: "通话开始后自动进入本页",
     listen_off: "🔊 实时旁听", listen_on: "🔊 旁听中…",
@@ -1129,6 +1343,8 @@ function applyI18n() {
   $("liveSub").textContent = callActive ? ($("stateNum").textContent || "") : t("live_sub_idle");
   $("chat").dataset.empty = t("live_empty");  // 空转写占位（CSS ::before 读取）
   if (typeof renderDialPresets === "function") renderDialPresets();
+  if (typeof renderProfileList === "function") renderProfileList();
+  if (typeof refreshProfileEditorText === "function") refreshProfileEditorText();
   if (typeof renderSetupWizard === "function") renderSetupWizard();
 }
 
@@ -1168,6 +1384,7 @@ function switchPage(name) {
     if (b.dataset.page === name) b.classList.remove("notify");
   });
   if (name === "history") loadHistory();
+  if (name === "profiles" && !profileDirty) loadManagedProfiles();
 }
 /* 自定义模态确认框：返回 Promise<所选 action.key>；点遮罩/Esc 视为第一个 action */
 let _modalResolve = null;
@@ -1200,6 +1417,9 @@ document.addEventListener("keydown", (e) => {
 });
 
 async function navTo(name) {
+  if (currentPage === "profiles" && name !== "profiles" && profileDirty) {
+    if (!(await confirmProfileDiscardChanges())) return;
+  }
   // 离开设置页且有未保存修改：弹自定义模态（保存/放弃/继续编辑）。
   if (currentPage === "settings" && name !== "settings" && cfgDirty) {
     const choice = await showModal({
@@ -1392,9 +1612,289 @@ function stopListen() {
 }
 $("listenBtn").addEventListener("click", toggleListen);
 
+/* ========= 预设任务库管理 ========= */
+let managedProfiles = [];
+let profileDirty = false;
+let profileMatchMode = "exact";
+
+function profileLangValue(profile, field, lang = LANG) {
+  const value = profile && profile[field];
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return "";
+  return String(value[lang] || value[lang === "zh" ? "en" : "zh"] || "");
+}
+
+function profileExactLangValue(profile, field, lang) {
+  const value = profile && profile[field];
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return "";
+  return String(value[lang] || "");
+}
+
+function blankManagedProfile() {
+  const blank = { zh: "", en: "" };
+  return {
+    id: "", enabled: true, number: "", match_mode: "exact",
+    label: { ...blank }, task: { ...blank }, scenario: { ...blank }, opening: { ...blank },
+  };
+}
+
+function renderProfileList() {
+  const list = $("profileList");
+  if (!list) return;
+  const query = $("profileSearch").value.trim().toLowerCase();
+  const selectedId = $("profileId").value;
+  list.textContent = "";
+  const matches = managedProfiles.filter((profile) => {
+    const haystack = [
+      profile.number,
+      profileLangValue(profile, "label", "zh"), profileLangValue(profile, "label", "en"),
+      profileLangValue(profile, "task", "zh"), profileLangValue(profile, "task", "en"),
+    ].join(" ").toLowerCase();
+    return !query || haystack.includes(query);
+  });
+  if (!matches.length) {
+    list.appendChild(el("div", "empty", t("profile_no_match")));
+    return;
+  }
+  for (const profile of matches) {
+    const row = el("div", "profile-row" + (profile.id === selectedId ? " active" : ""));
+    const main = el("button", "profile-row-main");
+    main.type = "button";
+    const title = el("div", "profile-row-title");
+    title.appendChild(el("span", "profile-status-dot" + (profile.enabled ? "" : " off")));
+    title.appendChild(el("b", "", profileLangValue(profile, "label") || profile.number));
+    main.appendChild(title);
+    const task = profile.match_mode === "number" ? t("profile_number_default") : profileLangValue(profile, "task");
+    main.appendChild(el("div", "profile-row-sub", `${profile.number}${task ? " · " + task : ""}`));
+    main.addEventListener("click", async () => {
+      if (profile.id === $("profileId").value) return;
+      if (await confirmProfileDiscardChanges()) openProfileEditor(profile);
+    });
+    row.appendChild(main);
+    const copy = el("button", "profile-copy", "⧉");
+    copy.type = "button";
+    copy.title = t("profile_duplicate");
+    copy.setAttribute("aria-label", t("profile_duplicate"));
+    copy.addEventListener("click", async () => {
+      if (await confirmProfileDiscardChanges()) duplicateProfile(profile);
+    });
+    row.appendChild(copy);
+    list.appendChild(row);
+  }
+}
+
+function refreshProfileCounts() {
+  for (const [id, max] of [
+    ["profileScenarioZh", 1200], ["profileScenarioEn", 1200],
+    ["profileOpeningZh", 40], ["profileOpeningEn", 40],
+  ]) {
+    $(id + "Count").textContent = `${$(id).value.length}/${max}`;
+  }
+}
+
+function refreshProfileEditorText() {
+  if (!$("profileForm") || $("profileForm").hidden) return;
+  $("profileEditorTitle").textContent = $("profileId").value ? t("profile_edit_title") : t("profile_new_title");
+  refreshProfileCounts();
+}
+
+function setProfileMatchMode(mode, markDirty = false) {
+  profileMatchMode = mode === "number" ? "number" : "exact";
+  $("profileModeExact").setAttribute("aria-pressed", String(profileMatchMode === "exact"));
+  $("profileModeNumber").setAttribute("aria-pressed", String(profileMatchMode === "number"));
+  $("profileTaskZh").disabled = profileMatchMode === "number";
+  $("profileTaskEn").disabled = profileMatchMode === "number";
+  if (markDirty) profileDirty = true;
+}
+
+function setProfileField(id, value) {
+  $(id).value = String(value || "");
+}
+
+function openProfileEditor(profile) {
+  const item = profile || blankManagedProfile();
+  $("profileEditorEmpty").hidden = true;
+  $("profileForm").hidden = false;
+  setProfileField("profileId", item.id);
+  setProfileField("profileNumber", item.number);
+  $("profileEnabled").checked = item.enabled !== false;
+  for (const [field, suffix] of [["label", "Label"], ["task", "Task"], ["scenario", "Scenario"], ["opening", "Opening"]]) {
+    setProfileField(`profile${suffix}Zh`, profileExactLangValue(item, field, "zh"));
+    setProfileField(`profile${suffix}En`, profileExactLangValue(item, field, "en"));
+  }
+  setProfileMatchMode(item.match_mode || "exact");
+  $("profileDelete").hidden = !item.id;
+  $("profileToast").className = "toast profile-toast";
+  $("profileToast").textContent = "";
+  profileDirty = false;
+  refreshProfileEditorText();
+  renderProfileList();
+}
+
+function closeProfileEditor() {
+  profileDirty = false;
+  $("profileForm").hidden = true;
+  $("profileEditorEmpty").hidden = false;
+  $("profileId").value = "";
+  renderProfileList();
+}
+
+function readProfileForm() {
+  return {
+    enabled: $("profileEnabled").checked,
+    number: $("profileNumber").value.trim(),
+    match_mode: profileMatchMode,
+    label: { zh: $("profileLabelZh").value.trim(), en: $("profileLabelEn").value.trim() },
+    task: { zh: $("profileTaskZh").value.trim(), en: $("profileTaskEn").value.trim() },
+    scenario: { zh: $("profileScenarioZh").value.trim(), en: $("profileScenarioEn").value.trim() },
+    opening: { zh: $("profileOpeningZh").value.trim(), en: $("profileOpeningEn").value.trim() },
+  };
+}
+
+function duplicateProfile(profile) {
+  const copy = JSON.parse(JSON.stringify(profile));
+  copy.id = "";
+  for (const lang of ["zh", "en"]) {
+    const label = String((copy.label || {})[lang] || "");
+    const suffix = I18N[lang].profile_copy_suffix || t("profile_copy_suffix");
+    if (label) copy.label[lang] = label + suffix;
+  }
+  openProfileEditor(copy);
+  profileDirty = true;
+  renderProfileList();
+}
+
+async function loadManagedProfiles(selectId = null) {
+  try {
+    const response = await fetch("/api/number_profiles/manage");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    managedProfiles = Array.isArray(data.profiles) ? data.profiles : [];
+    $("profilesEnabled").checked = !!data.enabled;
+    const targetId = selectId || (!profileDirty ? $("profileId").value : "");
+    const selected = managedProfiles.find((profile) => profile.id === targetId);
+    if (selected && !profileDirty) openProfileEditor(selected);
+    else renderProfileList();
+  } catch (error) {
+    console.warn("[profiles] 加载管理数据失败", error);
+    managedProfiles = [];
+    renderProfileList();
+  }
+}
+
+function validateProfileForm(profile) {
+  if (!/^\+?[0-9*#]{1,32}$/.test(profile.number)) return t("profile_need_number");
+  if (!profile.scenario.zh && !profile.scenario.en) return t("profile_need_scenario");
+  if (profile.match_mode === "exact" && !profile.task.zh && !profile.task.en) return t("profile_need_task");
+  return "";
+}
+
+async function confirmProfileDiscardChanges() {
+  if (!profileDirty) return true;
+  const choice = await showModal({
+    title: t("profile_leave_title"), message: t("profile_leave_msg"),
+    actions: [
+      { key: "discard", label: t("profile_leave_discard"), kind: "danger" },
+      { key: "stay", label: t("profile_leave_stay"), kind: "ghost" },
+    ],
+  });
+  if (choice !== "discard") return false;
+  profileDirty = false;
+  return true;
+}
+
+$("profileNew").addEventListener("click", async () => {
+  if (await confirmProfileDiscardChanges()) openProfileEditor(blankManagedProfile());
+});
+$("profileSearch").addEventListener("input", renderProfileList);
+$("profileModeExact").addEventListener("click", () => setProfileMatchMode("exact", true));
+$("profileModeNumber").addEventListener("click", () => setProfileMatchMode("number", true));
+$("profileForm").addEventListener("input", () => { profileDirty = true; refreshProfileCounts(); });
+$("profileDuplicate").addEventListener("click", () => duplicateProfile({ id: $("profileId").value, ...readProfileForm() }));
+
+$("profileCancel").addEventListener("click", async () => {
+  if (await confirmProfileDiscardChanges()) closeProfileEditor();
+});
+
+$("profileForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const profile = readProfileForm();
+  const validationError = validateProfileForm(profile);
+  if (validationError) { setToast("profileToast", "err", validationError); return; }
+  const id = $("profileId").value;
+  const button = $("profileSave");
+  button.disabled = true;
+  setToast("profileToast", "", t("profile_saving"));
+  try {
+    const response = await fetch(id ? `/api/number_profiles/${encodeURIComponent(id)}` : "/api/number_profiles", {
+      method: id ? "PATCH" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(profile),
+    });
+    const result = await response.json();
+    if (!response.ok) { setToast("profileToast", "err", t("profile_save_fail") + (result.error || "")); return; }
+    profileDirty = false;
+    await loadManagedProfiles(result.profile.id);
+    await loadDialPresets();
+    setToast("profileToast", "ok", t("profile_saved"));
+  } catch (error) {
+    setToast("profileToast", "err", t("profile_save_fail") + t("req_error"));
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("profileDelete").addEventListener("click", async () => {
+  const id = $("profileId").value;
+  if (!id) return;
+  const choice = await showModal({
+    title: t("profile_delete_title"), message: t("profile_delete_msg"), tone: "danger",
+    actions: [
+      { key: "delete", label: t("profile_delete_ok"), kind: "danger" },
+      { key: "cancel", label: t("modal_cancel"), kind: "ghost" },
+    ],
+  });
+  if (choice !== "delete") return;
+  try {
+    const response = await fetch(`/api/number_profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const result = await response.json();
+    if (!response.ok) { setToast("profileToast", "err", t("profile_delete_fail") + (result.error || "")); return; }
+    closeProfileEditor();
+    await loadManagedProfiles();
+    await loadDialPresets();
+  } catch (error) {
+    setToast("profileToast", "err", t("profile_delete_fail") + t("req_error"));
+  }
+});
+
+$("profilesEnabled").addEventListener("change", async () => {
+  const checkbox = $("profilesEnabled");
+  const desired = checkbox.checked;
+  checkbox.disabled = true;
+  try {
+    const { httpOk, res } = await postJson("/api/config", { NUMBER_PROFILES_ENABLED: desired });
+    if (!httpOk) {
+      checkbox.checked = !desired;
+      throw new Error(res.error || t("req_error"));
+    }
+    await loadDialPresets();
+    loadConfig();
+  } catch (error) {
+    checkbox.checked = !desired;
+    await showModal({
+      title: t("profile_global_fail"), message: String(error.message || error),
+      actions: [{ key: "ok", label: "OK", kind: "ghost" }],
+    });
+  } finally {
+    checkbox.disabled = false;
+  }
+});
+
 /* ========= 拨打 / 挂断 / 键盘 ========= */
 let dialProfiles = [];
 let dialPresetHint = null;  // 选中预设的命中键（预设原任务）；改号码或选自定义时清空，改事项不清
+let dialPresetId = null;    // 稳定身份：任务库改名或本通事项细化后仍命中原预设
 function renderDialPresets() {
   const select = $("dialPreset");
   const current = select.value;
@@ -1402,9 +1902,10 @@ function renderDialPresets() {
   select.appendChild(new Option(t("preset_custom"), ""));
   dialProfiles.forEach((profile, index) => {
     const label = String(profile.label || profile.task || profile.number || "");
-    select.appendChild(new Option(label, String(index)));
+    select.appendChild(new Option(label, String(profile.id || index)));
   });
   select.value = [...select.options].some((option) => option.value === current) ? current : "";
+  if (!select.value) { dialPresetHint = null; dialPresetId = null; }
 }
 async function loadDialPresets() {
   try {
@@ -1420,16 +1921,17 @@ async function loadDialPresets() {
 }
 function applyDialPreset() {
   const value = $("dialPreset").value;
-  if (value === "") { dialPresetHint = null; return; }
-  const profile = dialProfiles[Number(value)];
-  if (!profile) { dialPresetHint = null; return; }
+  if (value === "") { dialPresetHint = null; dialPresetId = null; return; }
+  const profile = dialProfiles.find((item) => String(item.id || "") === value) || dialProfiles[Number(value)];
+  if (!profile) { dialPresetHint = null; dialPresetId = null; return; }
   dialPresetHint = String(profile.task || "");  // 命中键：预设原任务（通配预设为空串）
+  dialPresetId = profile.id ? String(profile.id) : null;
   $("dialNumber").value = String(profile.number || "");
   $("dialTask").value = String(profile.task || "");
 }
 $("dialPreset").addEventListener("change", applyDialPreset);
 // 手动改号码=脱离预设；改事项框（子主题）不清命中键，仍走选中预设的策略框架
-$("dialNumber").addEventListener("input", () => { dialPresetHint = null; $("dialPreset").value = ""; });
+$("dialNumber").addEventListener("input", () => { dialPresetHint = null; dialPresetId = null; $("dialPreset").value = ""; });
 
 async function doDial() {
   const number = $("dialNumber").value.trim();
@@ -1438,7 +1940,7 @@ async function doDial() {
   const btn = $("dialBtn");
   btn.disabled = true; setToast("dialToast", "", t("calling"));
   try {
-    const { res } = await postJson("/api/call/dial", { number, task: task || null, preset_task: dialPresetHint });
+    const { res } = await postJson("/api/call/dial", { number, task: task || null, preset_task: dialPresetHint, preset_id: dialPresetId });
     if (res.ok) {
       setToast("dialToast", "ok", t("call_sent"));
       if (task) { updateTaskPlaceholder(task); $("dialTask").value = ""; }

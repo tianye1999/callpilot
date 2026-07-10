@@ -664,6 +664,43 @@ def test_number_profile_still_used_when_dynamic_generation_disabled(
     assert service.session._prompt_gen_opening == "查流量"
 
 
+def test_selected_profile_id_survives_custom_subtopic(tmp_path, monkeypatch):
+    profile_file = tmp_path / "number_profiles.json"
+    profile_file.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "id": "telecom_data",
+                        "number": "10000",
+                        "task": "查询流量",
+                        "scenario": "稳定预设策略",
+                        "opening": "查流量",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profile_file))
+
+    service = make_service(FakeModem(), call_logger=CallLogger(tmp_path / "rec"))
+    service.session._outbound_number = "10000"
+    service.session._outbound_task_value = "只查本月剩余量"
+    service.session._preset_hint = "不匹配的旧任务文案"
+    service.session._preset_id = "telecom_data"
+    service.session._start_prompt_generation()
+
+    result = service.session._prompt_gen_result
+    assert result is not None
+    assert result["profile_id"] == "telecom_data"
+    assert result["task"] == "只查本月剩余量"
+    assert service.session._take_prompt_scenario() == "稳定预设策略"
+
+
 def test_dynamic_generation_disabled_and_profile_miss_falls_back_to_template(
     tmp_path, monkeypatch
 ):
