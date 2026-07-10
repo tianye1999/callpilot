@@ -43,6 +43,14 @@ Phone call → EC20 modem ──(AT: RING/ATA/CLCC)── CallPilot
   **DTMF keypad**), per-call recording + latency metrics + LLM summary, live
   transcript, local speaker monitoring, bilingual (English/Chinese) desktop UI.
 
+**New in v0.5.0 — local three-stage provider** (`AGENT_PROVIDER=local`):
+on-device VAD → STT → text LLM → on-device TTS. Audio never leaves your
+machine; only the transcript goes to the text brain (default `qwen-plus`,
+same DashScope key, an order of magnitude cheaper than realtime audio).
+Setup: `pip install 'callpilot[local]'` then
+`python -m agentcall.local_models` (one-time ~300 MB model download).
+Tools, transcripts, summaries and presets all work the same.
+
 v0.4.0 adds several call-quality controls for outbound work:
 
 - **Task preset library:** first launch seeds the local library from
@@ -284,6 +292,12 @@ Quectel EC20/EG25，来电自动接听并与对方对话，可外呼、收发短
 - **能力**：自动接听、外呼（单个+批量带白名单）、中文短信收发、AI 工具调用
   （发短信/挂断/查验证码/**DTMF 按键**）、通话录音+摘要、实时转写、本机监听、
   中英双语桌面界面。
+
+**v0.5.0 新增——本地三段式 provider**（`AGENT_PROVIDER=local`）：本地 VAD →
+本地转写 → 云端文本模型 → 本地合成。音频不出本机，只有转写文本上云（默认
+`qwen-plus`，同一个 DashScope key，比 realtime 音频便宜一个量级）。启用：
+`pip install 'callpilot[local]'` 后运行 `python -m agentcall.local_models`
+一次性下载 ~300MB 模型。工具调用/转写/摘要/预设库全部照常。
 
 v0.4.0 增加了几项面向外呼质量的控制：
 

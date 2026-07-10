@@ -313,7 +313,12 @@ provider 外呼静默失效、WS 推送偶发丢事件、hangup 无锁等）→ 
 
 ---
 
-## 附录 A：暂缓的三段式本地大脑（未来）
+## 附录 A：三段式本地大脑（✅ 已落地，2026-07-10）
+
+> **状态更新**：已作为第四 provider `local` 落地（`agents/local_agent.py`），选型改为
+> sherpa-onnx 全家桶（VAD/STT/TTS，无 torch）+ dashscope 文本脑（默认 qwen-plus），
+> 模型资产 `python -m agentcall.local_models` 下载。真机拨 10000 验收 8/8。
+> 原设想的 FunASR torch 栈弃用（依赖数 GB 无法进 DMG）。以下为历史设计记录。
 
 未来若要"本地可控、隐私优先、可离线"的 AI 大脑，再启用本地三段式方案：把
 iphone-call-ai-poc 的 Silero VAD → FunASR → DeepSeek → sherpa-onnx 包装成 `LocalPipelineAgent`，

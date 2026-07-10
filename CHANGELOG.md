@@ -4,6 +4,57 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.5.0] — 2026-07-10
+
+### Added
+
+- **Local three-stage provider** (`AGENT_PROVIDER=local`): on-device
+  VAD → STT → text LLM → on-device TTS. Audio never leaves your machine —
+  only the transcript goes to the cloud brain (default `qwen-plus`, reusing
+  your DashScope key; text tokens cost an order of magnitude less than
+  realtime audio). Powered by the sherpa-onnx family (silero-vad v5,
+  paraformer-zh int8, piper zh_CN — no torch). Install with
+  `pip install 'callpilot[local]'`, then fetch models (~300 MB, one-time)
+  with `python -m agentcall.local_models`. Tools, live transcript, call
+  summary and the preset library all work as with realtime providers.
+  Real-hardware acceptance: 8/8 regression assertions, first audio in ~1.9 s,
+  both directions understood by the carrier IVR.
+- **Batch dialing results table**: the queue panel now shows a full
+  per-number results table (dialed/failed + error detail) instead of the last
+  10 chips.
+- **On-call timer**: the state chip shows mm:ss while a call is active.
+- **Web auth token for non-loopback deployments**: exposing `WEB_HOST` beyond
+  127.0.0.1 now requires `WEB_AUTH_TOKEN` (Bearer header or `?token=`);
+  the app refuses to start bare. Loopback behavior is unchanged.
+
+### Fixed
+
+- **Wrap-up judge now treats a definite negative answer as the result**
+  ("no such plan on this account" IS the final answer): the AI says goodbye
+  within a couple turns instead of re-asking the same question in different
+  words. Verified end-to-end on a real call (4 s from negative answer to
+  goodbye; previously 4-5 re-asks). Judge decisions are now logged to the
+  call's events for observability, and a new regression assertion (WARN on
+  ≥3 near-identical re-asks) guards the behavior long-term.
+- **Audio main loop can no longer be stalled by a degraded realtime link**:
+  dashscope's synchronous websocket send could hang for tens of seconds on a
+  bad network, freezing the loop that enforces the 150 s hard call limit
+  (two real calls ran 180 s+). Sends now run in a thread with a timeout
+  circuit breaker (2 s audio / 5 s say) and fall back to the existing
+  reconnect path.
+- **Regression tool follows the running service's recordings directory**
+  (`/api/meta.recordings_dir`): the packaged app and the dev checkout use
+  different data directories, and the dial-and-assert tool was scanning the
+  wrong one — every packaged-app run "timed out" while the call actually
+  succeeded. Also waits for the recording to flush after a forced hangup.
+
+### Engineering
+
+- Manual-response silence window calibrated on real calls (IVR burst gap
+  p90 ≈ 2.4 s → use `MANUAL_RESPONSE_SILENCE_MS=2500` when enabling; stays
+  off by default).
+- `.playwright-cli/` session artifacts are now git-ignored.
+
 ## [0.4.3] — 2026-07-10
 
 ### Added
@@ -323,6 +374,7 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.5.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.0
 [0.4.3]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.3
 [0.4.2]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.2
 [0.4.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.0
