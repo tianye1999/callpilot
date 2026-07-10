@@ -241,6 +241,60 @@ def test_manual_response_control_fires_after_silence_window(monkeypatch):
         asyncio.run(agent.stop())
 
 
+def test_manual_response_control_does_not_repeat_before_created(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "20")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        conv = fake_cls.instances[-1]
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "第一段播报",
+        })
+        assert _wait_until(lambda: len(conv.responses) == 1)
+
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "服务端尚未确认回复时的第二段播报",
+        })
+        time.sleep(0.05)
+        assert len(conv.responses) == 1
+
+        agent._callback.on_event({"type": "response.created", "response": {"id": "r1"}})
+        agent._callback.on_event({"type": "response.done", "response": {"id": "r1"}})
+        assert _wait_until(lambda: len(conv.responses) == 2)
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_manual_response_control_request_watchdog_recovers_missing_created(
+    monkeypatch,
+):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "20")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "0")
+    monkeypatch.setattr(qwen_agent, "_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS", 0.04)
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        conv = fake_cls.instances[-1]
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "第一段播报",
+        })
+        assert _wait_until(lambda: len(conv.responses) == 1)
+
+        agent._callback.on_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "created 丢失后的新播报",
+        })
+        assert _wait_until(lambda: len(conv.responses) == 2)
+    finally:
+        asyncio.run(agent.stop())
+
+
 def test_manual_response_control_max_wait_forces_response(monkeypatch):
     monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
     monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "1000")

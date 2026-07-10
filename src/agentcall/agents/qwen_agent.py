@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 # 千问 Realtime 连接重试次数（SDK connect 硬超时 5s，冷连接抖动会踩线）。
 QWEN_CONNECT_MAX_ATTEMPTS = 3
 
+# create_response 发出后等待 wire response.created 的独立超时。
+_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS = 5.0
+
 # 重连成功后让 Agent 主动安抚对方的提示词。
 RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继续。"
 
@@ -249,6 +252,7 @@ class QwenVoiceAgent(VoiceAgent):
         self._manual_response_watchdog_timer: threading.Timer | None = None
         self._manual_response_watchdog_generation = 0
         self._manual_response_first_at: float | None = None
+        self._manual_response_request_pending = False
         self._manual_response_outstanding = 0
         self._manual_response_pending_after_flight = False
 
@@ -442,6 +446,7 @@ class QwenVoiceAgent(VoiceAgent):
             self._cancel_manual_response_timer_locked()
             self._cancel_manual_response_watchdog_locked()
             self._manual_response_first_at = None
+            self._manual_response_request_pending = False
             self._manual_response_outstanding = 0
             self._manual_response_pending_after_flight = False
 
@@ -450,6 +455,7 @@ class QwenVoiceAgent(VoiceAgent):
             self._cancel_manual_response_timer_locked()
             self._cancel_manual_response_watchdog_locked()
             self._manual_response_first_at = None
+            self._manual_response_request_pending = False
             self._manual_response_outstanding = 0
             self._manual_response_pending_after_flight = False
 
@@ -476,6 +482,10 @@ class QwenVoiceAgent(VoiceAgent):
         now = time.monotonic()
         with self._manual_response_lock:
             if not self._running or self._disconnected.is_set():
+                return
+            if self._manual_response_request_pending:
+                self._manual_response_pending_after_flight = True
+                self._manual_response_first_at = None
                 return
             if self._manual_response_first_at is None:
                 self._manual_response_first_at = now
@@ -519,6 +529,12 @@ class QwenVoiceAgent(VoiceAgent):
                 self._manual_response_first_at = None
                 return
             self._manual_response_first_at = None
+            # This only gates the request-to-created wire gap. In-flight state
+            # remains driven exclusively by response.created/response.done.
+            self._manual_response_request_pending = True
+            self._start_manual_response_watchdog_locked(
+                _MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS
+            )
 
         try:
             conversation.create_response(
@@ -526,6 +542,16 @@ class QwenVoiceAgent(VoiceAgent):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("手动触发千问回复失败: %s", exc)
+            should_schedule = False
+            with self._manual_response_lock:
+                self._manual_response_request_pending = False
+                if self._manual_response_outstanding == 0:
+                    self._cancel_manual_response_watchdog_locked()
+                if self._manual_response_pending_after_flight and self._running:
+                    self._manual_response_pending_after_flight = False
+                    should_schedule = True
+            if should_schedule:
+                self._schedule_manual_response_timer()
 
     def _on_response_created(self) -> None:
         if not self._manual_response_enabled:
@@ -533,21 +559,27 @@ class QwenVoiceAgent(VoiceAgent):
         with self._manual_response_lock:
             if not self._running:
                 return
+            self._manual_response_request_pending = False
             self._manual_response_outstanding += 1
             if self._manual_response_outstanding == 1:
                 self._start_manual_response_watchdog_locked()
 
-    def _start_manual_response_watchdog_locked(self) -> None:
+    def _start_manual_response_watchdog_locked(
+        self, timeout_seconds: float | None = None
+    ) -> None:
         timer = self._manual_response_watchdog_timer
         if timer is not None:
             timer.cancel()
         self._manual_response_watchdog_generation += 1
         generation = self._manual_response_watchdog_generation
-        max_wait_seconds = max(0, config.get_int("MANUAL_RESPONSE_MAX_WAIT_MS")) / 1000
-        if max_wait_seconds <= 0:
+        if timeout_seconds is None:
+            timeout_seconds = (
+                max(0, config.get_int("MANUAL_RESPONSE_MAX_WAIT_MS")) / 1000
+            )
+        if timeout_seconds <= 0:
             return
         next_timer = threading.Timer(
-            max_wait_seconds, self._fire_manual_response_watchdog, args=(generation,)
+            timeout_seconds, self._fire_manual_response_watchdog, args=(generation,)
         )
         next_timer.daemon = True
         self._manual_response_watchdog_timer = next_timer
@@ -560,11 +592,15 @@ class QwenVoiceAgent(VoiceAgent):
                 generation != self._manual_response_watchdog_generation
                 or not self._running
                 or self._disconnected.is_set()
-                or self._manual_response_outstanding <= 0
+                or (
+                    not self._manual_response_request_pending
+                    and self._manual_response_outstanding <= 0
+                )
             ):
                 return
-            logger.warning("手动应答控制等待 response.done 超时，清理 in-flight 状态")
+            logger.warning("手动应答控制等待 response.created/done 超时，清理状态")
             self._manual_response_watchdog_timer = None
+            self._manual_response_request_pending = False
             self._manual_response_outstanding = 0
             if self._manual_response_pending_after_flight:
                 self._manual_response_pending_after_flight = False
@@ -579,7 +615,10 @@ class QwenVoiceAgent(VoiceAgent):
         with self._manual_response_lock:
             if self._manual_response_outstanding > 0:
                 self._manual_response_outstanding -= 1
-            if self._manual_response_outstanding == 0:
+            if (
+                self._manual_response_outstanding == 0
+                and not self._manual_response_request_pending
+            ):
                 self._cancel_manual_response_watchdog_locked()
             if (
                 self._manual_response_outstanding == 0
@@ -653,6 +692,7 @@ class QwenVoiceAgent(VoiceAgent):
             self._cancel_manual_response_timer_locked()
             self._cancel_manual_response_watchdog_locked()
             self._manual_response_first_at = None
+            self._manual_response_request_pending = False
             self._manual_response_pending_after_flight = False
             self._manual_response_outstanding = 0
         with self._reconnect_lock:

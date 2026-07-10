@@ -6,6 +6,8 @@ import plistlib
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from agentcall import macos_launchd
 
 
@@ -16,6 +18,15 @@ def test_bundle_root_and_resources_resolve_from_app_executable():
     assert macos_launchd.resources_dir_for_executable(exe) == Path(
         "/Applications/CallPilot.app/Contents/Resources"
     )
+
+
+def test_make_layout_without_uid_fails_clearly_when_getuid_is_unavailable(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(macos_launchd.os, "getuid", None, raising=False)
+
+    with pytest.raises(RuntimeError, match="macOS"):
+        macos_launchd.make_layout(tmp_path / "CallPilot")
 
 
 def test_build_plists_use_current_bundle_and_application_support_paths(tmp_path):

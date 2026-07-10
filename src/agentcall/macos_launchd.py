@@ -109,6 +109,13 @@ def resources_dir_for_executable(executable: str | Path) -> Path:
     return Path(executable).resolve().parent
 
 
+def _current_uid() -> int:
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise RuntimeError("launchd layout is only available on macOS")
+    return int(getuid())
+
+
 def make_layout(
     executable: str | Path,
     *,
@@ -124,7 +131,7 @@ def make_layout(
         resources_dir=Path(resources_dir).resolve() if resources_dir else resources_dir_for_executable(exe),
         support_dir=Path(support_dir).expanduser() if support_dir else app_support_dir(home),
         launch_agents_dir=Path(launch_dir).expanduser() if launch_dir else launch_agents_dir(home),
-        uid=uid if uid is not None else os.getuid(),
+        uid=uid if uid is not None else _current_uid(),
     )
 
 
