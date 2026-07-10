@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 import re
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -325,6 +328,67 @@ def test_update_quotes_value_with_spaces(tmp_path, monkeypatch):
     assert os.environ["MONITOR_OUTPUT_DEVICE"] == "MacBook Air 扬声器"
 
 
+def test_update_env_file_concurrent_writers_do_not_lose_keys(
+    tmp_path, monkeypatch
+):
+    keys = {
+        "QWEN_VOICE": "Raymond",
+        "MODEM_TX_GAIN": "0.75",
+        "SUMMARY_MODEL": "qwen-plus",
+        "MONITOR_OUTPUT_DEVICE": "Built-in Output",
+    }
+    _unset(monkeypatch, *keys)
+    env = tmp_path / ".env"
+    env.write_text("# concurrent updates\n", encoding="utf-8")
+    original_write_text = Path.write_text
+
+    def slow_write_text(path, data, *args, **kwargs):
+        if path == env:
+            time.sleep(0.03)
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", slow_write_text)
+    start = threading.Barrier(len(keys) + 1)
+    errors: list[Exception] = []
+
+    def writer(key: str, value: str) -> None:
+        try:
+            start.wait(timeout=2)
+            update_env_file({key: value}, env_path=env)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=writer, args=item, daemon=True)
+        for item in keys.items()
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=2)
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    text = env.read_text(encoding="utf-8")
+    for key, value in keys.items():
+        assert f"{key}={config._format_assignment(key, value).split('=', 1)[1]}" in text
+
+
+def test_update_env_file_handles_utf8_bom_and_preserves_crlf(tmp_path, monkeypatch):
+    _unset(monkeypatch, "QWEN_VOICE")
+    env = tmp_path / ".env"
+    env.write_bytes(codecs.BOM_UTF8 + b"QWEN_VOICE=Cherry\r\n# keep\r\n")
+
+    update_env_file({"QWEN_VOICE": "Raymond"}, env_path=env)
+
+    raw = env.read_bytes()
+    assert raw.startswith(codecs.BOM_UTF8)
+    assert b"QWEN_VOICE=Raymond\r\n" in raw
+    assert b"QWEN_VOICE=Cherry" not in raw
+    assert raw.count(b"QWEN_VOICE=") == 1
+
+
 # ---- read_panel_values ----
 
 
@@ -417,7 +481,8 @@ def test_registered_defaults_match_original_call_sites(monkeypatch):
     """本轮收口的配置项，注册表默认值必须与原调用点硬编码一致。"""
     _unset(monkeypatch, "MODEM_PCM_PORT", "MODEM_PCM_BAUD", "SUMMARY_TIMEOUT",
            "QWEN_PREWARM_TIMEOUT", "QWEN_PREWARM_INTERVAL", "DASHSCOPE_REALTIME_URL",
-           "REPEAT_SUPPRESS_SIMILARITY")
+           "REPEAT_SUPPRESS_SIMILARITY", "WRAP_UP_JUDGE_GRACE_SECONDS",
+           "WRAP_UP_JUDGE_INTERVAL_SECONDS")
     assert get_str("MODEM_PCM_PORT") == ""            # app.py 原 os.getenv 无默认
     assert get_int("MODEM_PCM_BAUD") == 921600        # app.py 原硬编码 "921600"
     assert get_float("SUMMARY_TIMEOUT") == pytest.approx(30.0)   # summarizer 原 "30"
@@ -425,6 +490,15 @@ def test_registered_defaults_match_original_call_sites(monkeypatch):
     assert get_float("QWEN_PREWARM_INTERVAL") == pytest.approx(240.0)  # 原函数入参默认
     assert get_str("DASHSCOPE_REALTIME_URL") == ""    # 留空走 SDK 内置端点
     assert get_float("REPEAT_SUPPRESS_SIMILARITY") == pytest.approx(0.9)
+    assert get_float("WRAP_UP_JUDGE_GRACE_SECONDS") == pytest.approx(20.0)
+    assert get_float("WRAP_UP_JUDGE_INTERVAL_SECONDS") == pytest.approx(15.0)
+    assert get_spec("WRAP_UP_JUDGE_GRACE_SECONDS").hidden
+    assert get_spec("WRAP_UP_JUDGE_INTERVAL_SECONDS").hidden
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+    assert "WRAP_UP_JUDGE_GRACE_SECONDS=20.0" in example
+    assert "WRAP_UP_JUDGE_INTERVAL_SECONDS=15.0" in example
 
 
 def test_editable_specs_covered_by_env_example():

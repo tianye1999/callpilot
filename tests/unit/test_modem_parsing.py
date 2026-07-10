@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 import time
 
+import serial
+
 from agentcall.modem import Eg25Modem, parse_sms_pdu
 
 
@@ -259,6 +261,116 @@ class FakeSerial:
     def reset_input_buffer(self) -> None:
         with self._lock:
             self._pending = b""
+
+    def close(self) -> None:
+        self.is_open = False
+
+
+class TrackingRLock:
+    """RLock wrapper that exposes when a named thread starts waiting for it."""
+
+    def __init__(self, watched_thread: str) -> None:
+        self._lock = threading.RLock()
+        self._watched_thread = watched_thread
+        self.waiting = threading.Event()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if threading.current_thread().name == self._watched_thread:
+            self.waiting.set()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+def test_send_and_reader_reconnect_do_not_deadlock_on_opposite_lock_order(monkeypatch):
+    """发送线程持串口锁失败时，与读线程并发重连不得形成 ABBA 死锁。"""
+    modem = make_modem()
+    serial_lock = TrackingRLock("reader-reconnect")
+    modem._serial_lock = serial_lock  # type: ignore[assignment]
+    modem._ser = FakeSerial()
+    modem._running = True
+    write_calls = 0
+    open_calls = 0
+    results: list[str] = []
+
+    def flaky_write(_cmd: str) -> str:
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 1:
+            raise serial.SerialException("forced write failure")
+        return "OK"
+
+    def reopen() -> None:
+        nonlocal open_calls
+        open_calls += 1
+        modem._ser = FakeSerial()
+
+    monkeypatch.setattr(modem, "_write_command", flaky_write)
+    monkeypatch.setattr(modem, "_open_serial", reopen)
+
+    sender_holds_serial = threading.Event()
+
+    def sender() -> None:
+        with modem._serial_lock:
+            sender_holds_serial.set()
+            assert serial_lock.waiting.wait(timeout=1)
+            results.append(modem._send("AT"))
+
+    sender_thread = threading.Thread(target=sender, name="sender", daemon=True)
+    sender_thread.start()
+    assert sender_holds_serial.wait(timeout=1)
+
+    reader_thread = threading.Thread(
+        target=modem._reconnect, name="reader-reconnect", daemon=True
+    )
+    reader_thread.start()
+
+    sender_thread.join(timeout=1)
+    reader_thread.join(timeout=1)
+    modem._running = False
+
+    assert not sender_thread.is_alive(), "发送线程与读线程发生 ABBA 死锁"
+    assert not reader_thread.is_alive(), "重连线程未能退出"
+    assert results == ["OK"]
+    assert open_calls == 1
+
+
+def test_reconnect_state_machine_retries_and_replaces_serial(monkeypatch):
+    modem = make_modem()
+    old_serial = FakeSerial()
+    modem._ser = old_serial
+    modem._buffer = "stale URC"
+    modem._running = True
+    attempts = 0
+    delays: list[float] = []
+
+    def flaky_open() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise serial.SerialException("bridge not ready")
+        modem._ser = FakeSerial()
+
+    monkeypatch.setattr(modem, "_open_serial", flaky_open)
+    monkeypatch.setattr("agentcall.modem.time.sleep", delays.append)
+
+    modem._reconnect()
+    modem._running = False
+
+    assert old_serial.is_open is False
+    assert modem._ser is not old_serial
+    assert modem._ser is not None and modem._ser.is_open
+    assert modem._buffer == ""
+    assert attempts == 3
+    assert delays == [1.0, 2.0]
 
 
 def test_hangup_commands_not_interleaved_by_concurrent_send():

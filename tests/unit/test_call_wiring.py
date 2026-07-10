@@ -1063,6 +1063,67 @@ def test_supervisor_retries_until_modem_available(monkeypatch):
     assert calls["n"] >= 3
 
 
+def test_supervisor_ready_transition_serializes_ring_and_manual_dial(monkeypatch):
+    """重连刚完成时 RING 与用户外呼并发，只允许一个会话抢占成功。"""
+    modem = FakeModem()
+    service = make_service(modem)
+    service.modem_connected = False
+    monkeypatch.setattr(service, "_credential_errors", lambda: [])
+    starts: list[str | None] = []
+
+    def fake_start(outbound_number=None, **kwargs) -> None:
+        starts.append(outbound_number)
+        service.session._active = True
+
+    monkeypatch.setattr(service.session, "start", fake_start)
+    connected = threading.Event()
+    release_supervisor = threading.Event()
+    original_set_connected = service._set_modem_connected
+
+    def pause_when_connected(value: bool, error: str | None = None) -> None:
+        original_set_connected(value, error)
+        if value:
+            connected.set()
+            release_supervisor.wait(timeout=2)
+
+    monkeypatch.setattr(service, "_set_modem_connected", pause_when_connected)
+    service.start()
+    assert connected.wait(timeout=2)
+
+    race = threading.Barrier(3)
+    dial_result: list[tuple[bool, str | None]] = []
+
+    def ring() -> None:
+        race.wait(timeout=2)
+        modem.trigger_ring("10086")
+
+    def dial() -> None:
+        race.wait(timeout=2)
+        dial_result.append(service.dial("10000"))
+
+    ring_thread = threading.Thread(target=ring, daemon=True)
+    dial_thread = threading.Thread(target=dial, daemon=True)
+    ring_thread.start()
+    dial_thread.start()
+    race.wait(timeout=2)
+    ring_thread.join(timeout=2)
+    dial_thread.join(timeout=2)
+    release_supervisor.set()
+    if service._supervisor_thread:
+        service._supervisor_thread.join(timeout=2)
+    service._service_running = False
+    service.session._active = False
+
+    assert not ring_thread.is_alive() and not dial_thread.is_alive()
+    assert len(starts) == 1
+    assert len(dial_result) == 1
+    if starts[0] is None:
+        assert dial_result[0][0] is False
+    else:
+        assert starts[0] == "10000"
+        assert dial_result[0][0] is True
+
+
 def test_stop_service_halts_supervisor():
     modem = FakeModem()
 

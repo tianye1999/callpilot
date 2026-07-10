@@ -10,10 +10,12 @@ roadmap P2-2/P2-5/P2-6 的地基：
 
 from __future__ import annotations
 
+import codecs
 import logging
 import os
 import re
 import sys
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -23,6 +25,8 @@ from typing import Literal
 from . import platforms
 
 logger = logging.getLogger(__name__)
+
+_ENV_WRITE_LOCK = threading.RLock()
 
 APP_NAME = "CallPilot"
 
@@ -222,6 +226,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 外呼硬时限（秒）：LLM 收尾裁判失灵/漏判时的最后防线，到点自动道别挂断；
     # 0 = 不限制。（正常收尾由 summarizer.judge_wrap_up 提前判定。）
     ConfigSpec("OUTBOUND_MAX_SECONDS", "外呼最长时长（秒）", "int", "150"),
+    ConfigSpec("WRAP_UP_JUDGE_GRACE_SECONDS", "收尾裁判首次等待（秒）", "float", "20.0",
+               editable=False, hidden=True),
+    ConfigSpec("WRAP_UP_JUDGE_INTERVAL_SECONDS", "收尾裁判间隔（秒）", "float", "15.0",
+               editable=False, hidden=True),
     ConfigSpec("RECORDING_ENABLED", "通话录音开关", "bool", "true"),
     ConfigSpec("RECORDING_RETENTION_DAYS", "录音保留天数", "int", "30"),
     ConfigSpec("SUMMARY_ENABLED", "通话摘要开关", "bool", "true"),
@@ -518,25 +526,38 @@ def update_env_file(
         return []
 
     path = Path(env_path) if env_path is not None else env_file_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    with _ENV_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            raw = path.read_bytes()
+            has_bom = raw.startswith(codecs.BOM_UTF8)
+            text = raw.decode("utf-8-sig")
+            newline = "\r\n" if "\r\n" in text else "\n"
+            lines = text.splitlines()
+        else:
+            has_bom = False
+            newline = "\n"
+            lines = []
 
-    replaced: set[str] = set()
-    for i, line in enumerate(lines):
-        match = _ENV_LINE_RE.match(line)
-        if match is None:
-            continue
-        key = match.group(2)
-        if key in updates:
-            lines[i] = f"{match.group(1)}{_format_assignment(key, updates[key])}"
-            replaced.add(key)
-    for key, value in updates.items():
-        if key not in replaced:
-            lines.append(_format_assignment(key, value))
+        replaced: set[str] = set()
+        for i, line in enumerate(lines):
+            match = _ENV_LINE_RE.match(line)
+            if match is None:
+                continue
+            key = match.group(2)
+            if key in updates:
+                lines[i] = f"{match.group(1)}{_format_assignment(key, updates[key])}"
+                replaced.add(key)
+        for key, value in updates.items():
+            if key not in replaced:
+                lines.append(_format_assignment(key, value))
 
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    for key, value in updates.items():
-        os.environ[key] = value
+        rendered = newline.join(lines) + newline
+        if has_bom:
+            rendered = "\ufeff" + rendered
+        path.write_text(rendered, encoding="utf-8", newline="")
+        for key, value in updates.items():
+            os.environ[key] = value
     logger.info("已更新 %s: %s", path, ", ".join(updates))
     return list(updates)
 

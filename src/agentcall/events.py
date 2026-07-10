@@ -36,6 +36,7 @@ class EventHub:
         self._clients: set[web.WebSocketResponse] = set()
         self._history: deque[dict[str, Any]] = deque(maxlen=history_limit)
         self._lock = threading.Lock()
+        self._persist_lock = threading.Lock()
         # 推送 task 需持强引用直至完成，否则可能被 GC 提前回收导致 WS 丢事件。
         self._tasks: set[asyncio.Task[None]] = set()
         # 实时旁听：下行 PCM 二进制帧的订阅端（与 JSON 事件端分开，无监听者时零成本）。
@@ -111,10 +112,14 @@ class EventHub:
 
     def publish(self, event: dict[str, Any]) -> None:
         event.setdefault("ts", time.time())
+        should_persist = False
         with self._lock:
             self._history.append(event)
-            if self._store_path and event.get("type") in _PERSISTED_TYPES:
-                self._persist_locked()
+            should_persist = bool(
+                self._store_path and event.get("type") in _PERSISTED_TYPES
+            )
+        if should_persist:
+            self._persist()
         try:
             self._loop.call_soon_threadsafe(self._broadcast, event)
         except RuntimeError:
@@ -174,16 +179,18 @@ class EventHub:
             event["sender"] = sender
             event["text"] = body
 
-    def _persist_locked(self) -> None:
+    def _persist(self) -> None:
         assert self._store_path is not None
-        persisted = [
-            e for e in self._history if e.get("type") in _PERSISTED_TYPES
-        ]
-        try:
-            self._store_path.parent.mkdir(parents=True, exist_ok=True)
-            self._store_path.write_text(
-                json.dumps(persisted, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            logger.warning("写入短信历史失败: %s", exc)
+        with self._persist_lock:
+            with self._lock:
+                persisted = [
+                    e for e in self._history if e.get("type") in _PERSISTED_TYPES
+                ]
+            try:
+                self._store_path.parent.mkdir(parents=True, exist_ok=True)
+                self._store_path.write_text(
+                    json.dumps(persisted, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.warning("写入短信历史失败: %s", exc)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from pathlib import Path
 
 from agentcall.events import EventHub
 
@@ -33,6 +35,46 @@ def test_sms_events_persisted_and_reloaded(tmp_path):
 
     reloaded = EventHub(make_loop(), store_path=store)
     assert [e["type"] for e in reloaded.history()] == ["sms_in"]
+
+
+def test_persist_write_does_not_hold_history_lock(tmp_path, monkeypatch):
+    store = tmp_path / "messages.json"
+    hub = EventHub(make_loop(), store_path=store)
+    write_started = threading.Event()
+    release_write = threading.Event()
+    second_publish_done = threading.Event()
+    original_write_text = Path.write_text
+
+    def blocked_write(path, data, *args, **kwargs):
+        if path == store:
+            write_started.set()
+            release_write.wait(timeout=2)
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", blocked_write)
+    persist_thread = threading.Thread(
+        target=hub.publish,
+        args=({"type": "sms_in", "sender": "10086", "text": "hello"},),
+        daemon=True,
+    )
+    persist_thread.start()
+    assert write_started.wait(timeout=1)
+
+    publish_thread = threading.Thread(
+        target=lambda: (
+            hub.publish({"type": "system", "text": "still responsive"}),
+            second_publish_done.set(),
+        ),
+        daemon=True,
+    )
+    publish_thread.start()
+    completed_without_disk = second_publish_done.wait(timeout=0.2)
+    release_write.set()
+    persist_thread.join(timeout=1)
+    publish_thread.join(timeout=1)
+
+    assert completed_without_disk, "磁盘写入期间 publish 热路径被 history lock 阻塞"
+    assert [event["type"] for event in hub.history()] == ["sms_in", "system"]
 
 
 def test_broadcast_tasks_referenced_until_done():
