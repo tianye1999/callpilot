@@ -42,6 +42,13 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
             model_display_name=config.get_str("AGENT_MODEL_NAME_DOUBAO"),
         )
 
+    if selected == "local":
+        # 三段式：本地 VAD/STT/TTS + 文本 LLM。sherpa-onnx/模型缺失时在
+        # agent.start() 阶段报清晰错误并置 fatal（不在这里提前 import）。
+        from .local_agent import LocalPipelineAgent
+
+        return LocalPipelineAgent()
+
     if selected == "openai":
         return OpenAIVoiceAgent(
             # API Key 属凭证不走注册表默认值：缺失即 KeyError fail-fast。
@@ -53,5 +60,5 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
         )
 
     raise ValueError(
-        f"不支持的 AGENT_PROVIDER: {selected}，请使用 qwen、doubao 或 openai"
+        f"不支持的 AGENT_PROVIDER: {selected}，请使用 qwen、doubao、openai 或 local"
     )

@@ -122,8 +122,9 @@ class KeyValidationResult:
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- Agent ----
     ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "qwen",
-               choices=("qwen", "doubao", "openai"), requires_restart=True,
-               choice_labels={"doubao": "doubao (experimental)"}),
+               choices=("qwen", "doubao", "openai", "local"), requires_restart=True,
+               choice_labels={"doubao": "doubao (experimental)",
+                              "local": "local (三段式，音频不出本机)"}),
     ConfigSpec("DASHSCOPE_API_KEY", "DashScope API Key", "str", "",
                secret=True, requires_restart=True),
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
@@ -199,6 +200,13 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                editable=False, hidden=True),
     ConfigSpec("NUMBER_PROFILES_ENABLED", "预调教任务库", "bool", "true"),
     ConfigSpec("NUMBER_PROFILES_FILE", "预调教任务库文件", "str", ""),
+    # ---- 本地三段式（AGENT_PROVIDER=local）----
+    ConfigSpec("LOCAL_LLM_MODEL", "三段式 LLM 模型", "str", "qwen-plus",
+               requires_restart=True),
+    ConfigSpec("LOCAL_LLM_TIMEOUT", "三段式 LLM 超时（秒）", "float", "20.0",
+               editable=False, hidden=True),
+    ConfigSpec("LOCAL_MODELS_DIR", "三段式模型目录", "str", "",
+               editable=False, hidden=True, requires_restart=True),
     ConfigSpec("MANUAL_RESPONSE_CONTROL", "手动应答控制", "bool", "false"),
     ConfigSpec("MANUAL_RESPONSE_SILENCE_MS", "手动应答静默窗口（毫秒）", "int", "1000"),
     ConfigSpec("MANUAL_RESPONSE_MAX_WAIT_MS", "手动应答最长等待（毫秒）", "int", "8000"),
@@ -288,6 +296,8 @@ PROVIDER_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "qwen": ("DASHSCOPE_API_KEY",),
     "doubao": ("DOUBAO_APP_ID", "DOUBAO_ACCESS_KEY"),
     "openai": ("OPENAI_API_KEY",),
+    # 三段式的默认 LLM 脑是 dashscope 文本模型（qwen-plus），复用同一凭证。
+    "local": ("DASHSCOPE_API_KEY",),
 }
 
 

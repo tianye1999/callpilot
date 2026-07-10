@@ -348,7 +348,7 @@ def test_config_get_returns_all_visible_specs():
     # secret 项不回传真实值
     assert by_key["DASHSCOPE_API_KEY"]["value"] in ("已设置", "未设置")
     assert by_key["AGENT_PROVIDER"]["kind"] == "select"
-    assert by_key["AGENT_PROVIDER"]["choices"] == ["qwen", "doubao", "openai"]
+    assert by_key["AGENT_PROVIDER"]["choices"] == ["qwen", "doubao", "openai", "local"]
     assert by_key["MODEM_PORT"]["requires_restart"] is True
 
 

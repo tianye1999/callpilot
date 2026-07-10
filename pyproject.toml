@@ -28,6 +28,11 @@ dev = [
     "ruff>=0.15",
     "mypy>=1.10",
 ]
+# 本地三段式 provider（AGENT_PROVIDER=local）：VAD/STT/TTS 全走 sherpa-onnx，
+# 无 torch；模型资产另行 python -m agentcall.local_models 下载。
+local = [
+    "sherpa-onnx>=1.10",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
