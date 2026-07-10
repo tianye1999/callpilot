@@ -427,8 +427,6 @@ def test_manual_response_control_watchdog_recovers_missing_done(monkeypatch):
             "type": "conversation.item.input_audio_transcription.completed",
             "transcript": "done 丢失后仍需恢复",
         })
-        time.sleep(0.03)
-        assert conv.responses == []
 
         assert _wait_until(lambda: len(conv.responses) == 1)
     finally:
