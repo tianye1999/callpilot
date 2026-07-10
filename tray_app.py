@@ -250,6 +250,44 @@ def maybe_autoopen_dashboard(
         sleep(sleep_for)
 
 
+def _bring_window_to_front(pid: int) -> None:
+    """把指定 pid 的控制台窗口进程拉到前台（仅 macOS）；失败只记日志不抛。
+
+    需要「辅助功能 / 自动化」权限控制 System Events；未授权时激活失败，
+    退化为「窗口仍在后台」——仍好于每次点击都新开一个窗口。
+    """
+    if sys.platform != "darwin":
+        return
+    script = (
+        "tell application \"System Events\" to set frontmost of "
+        f"(first process whose unix id is {pid}) to true"
+    )
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            check=False, capture_output=True, timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("激活控制台窗口失败: %s", exc)
+
+
+def open_or_focus_dashboard(
+    current_proc: "subprocess.Popen | None",
+    *,
+    popen=subprocess.Popen,
+    bring_to_front=_bring_window_to_front,
+    cmd_factory=dashboard_command,
+) -> "subprocess.Popen":
+    """打开控制台窗口；已有窗口进程存活则拉到前台并复用，避免每次点击都新开一个。
+
+    返回当前应持有的窗口进程句柄（复用旧的或新开的），调用方负责保存以便下次判活。
+    """
+    if current_proc is not None and current_proc.poll() is None:
+        bring_to_front(current_proc.pid)
+        return current_proc
+    return popen(cmd_factory(), cwd=str(PROJECT_ROOT))
+
+
 # ---- rumps 菜单栏胶水（薄层，惰性导入，仅 macOS）----
 
 def _acquire_tray_singleton_lock(lock_path: Path | None = None) -> "IO[str] | object | None":
@@ -342,6 +380,7 @@ def main() -> None:
                 "CallPilot", title=None, icon=icon_path(False),
                 template=False, quit_button=None,
             )
+            self._window_proc: subprocess.Popen | None = None
             self._status_item = rumps.MenuItem(status_label(False, lang))
             self.menu = [
                 self._status_item,
@@ -362,7 +401,7 @@ def main() -> None:
 
         def _open(self, _sender) -> None:
             try:
-                subprocess.Popen(dashboard_command(), cwd=str(PROJECT_ROOT))
+                self._window_proc = open_or_focus_dashboard(self._window_proc)
             except OSError as exc:
                 logger.error("打开控制台失败: %s", exc)
 

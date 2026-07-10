@@ -73,6 +73,60 @@ def test_dashboard_command_uses_frozen_executable(monkeypatch):
     ]
 
 
+class _FakeProc:
+    """模拟 subprocess.Popen：poll() 按 alive 返回 None(存活)/0(已退出)。"""
+
+    def __init__(self, pid: int, alive: bool):
+        self.pid = pid
+        self._alive = alive
+
+    def poll(self):
+        return None if self._alive else 0
+
+
+def test_open_or_focus_opens_when_no_window():
+    """无窗口进程时新开一个。"""
+    calls: list = []
+    new_proc = _FakeProc(111, alive=True)
+    result = tray_app.open_or_focus_dashboard(
+        None,
+        popen=lambda cmd, cwd: calls.append(("popen", cmd)) or new_proc,
+        bring_to_front=lambda pid: calls.append(("front", pid)),
+        cmd_factory=lambda: ["cmd"],
+    )
+    assert result is new_proc
+    assert calls == [("popen", ["cmd"])]  # 只 Popen，未激活
+
+
+def test_open_or_focus_reuses_live_window():
+    """已有存活窗口时拉到前台并复用，绝不再开新窗口。"""
+    calls: list = []
+    live = _FakeProc(222, alive=True)
+    result = tray_app.open_or_focus_dashboard(
+        live,
+        popen=lambda cmd, cwd: calls.append(("popen", cmd)) or _FakeProc(999, True),
+        bring_to_front=lambda pid: calls.append(("front", pid)),
+        cmd_factory=lambda: ["cmd"],
+    )
+    assert result is live  # 复用旧句柄
+    assert calls == [("front", 222)]  # 只激活，未 Popen
+
+
+def test_open_or_focus_reopens_after_window_closed():
+    """上一个窗口已关闭（poll 非 None）时重新开一个。"""
+    calls: list = []
+    dead = _FakeProc(333, alive=False)
+    fresh = _FakeProc(444, alive=True)
+    result = tray_app.open_or_focus_dashboard(
+        dead,
+        popen=lambda cmd, cwd: calls.append(("popen", cmd)) or fresh,
+        bring_to_front=lambda pid: calls.append(("front", pid)),
+        cmd_factory=lambda: ["cmd"],
+    )
+    assert result is fresh
+    assert calls == [("popen", ["cmd"])]
+
+
 def test_probe_online_true_false(monkeypatch):
     class Resp:
         status = 200
