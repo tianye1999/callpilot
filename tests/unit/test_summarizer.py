@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import dashscope
@@ -104,6 +106,27 @@ def test_api_exception_returns_error(monkeypatch):
     assert result["ok"] is False
     assert "network down" in result["error"]
     assert result["urgency"] == "中"  # 兜底结果仍是完整契约结构
+
+
+def test_summary_timeout_returns_before_slow_api_finishes(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_call(**kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return make_response(json.dumps(GOOD_PAYLOAD, ensure_ascii=False))
+
+    monkeypatch.setattr(dashscope.Generation, "call", staticmethod(slow_call))
+    began = time.monotonic()
+    result = summarize_call(TRANSCRIPTS, "inbound", None, timeout=0.03)
+    elapsed = time.monotonic() - began
+    release.set()
+
+    assert started.is_set()
+    assert elapsed < 0.5
+    assert result["ok"] is False
+    assert "超时" in result["error"]
 
 
 def test_non_200_status_returns_error(monkeypatch):

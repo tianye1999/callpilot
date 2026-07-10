@@ -4,11 +4,36 @@ from __future__ import annotations
 
 import threading
 
+import numpy as np
 import pytest
 
 import agentcall.audio_bridge as audio_bridge
 import agentcall.coreaudio as coreaudio
-from agentcall.audio_bridge import NMEA_WRITE_SIZE, FfmpegAudioBridge, create_audio_bridge
+from agentcall.audio_bridge import (
+    NMEA_WRITE_SIZE,
+    FfmpegAudioBridge,
+    create_audio_bridge,
+    resample_pcm,
+)
+
+
+@pytest.mark.parametrize("src_rate,dst_rate", [(8000, 24000), (24000, 8000)])
+def test_resample_pcm_round_trip_preserves_length_and_waveform(src_rate, dst_rate):
+    duration = 0.1
+    sample_count = int(src_rate * duration)
+    phase = np.arange(sample_count, dtype=np.float64) / src_rate
+    original = (np.sin(2 * np.pi * 440 * phase) * 12000).astype(np.int16)
+
+    converted = resample_pcm(original.tobytes(), src_rate, dst_rate)
+    restored_bytes = resample_pcm(converted, dst_rate, src_rate)
+    restored = np.frombuffer(restored_bytes, dtype=np.int16)
+
+    assert len(converted) == int(sample_count * dst_rate / src_rate) * 2
+    assert restored.size == original.size
+    assert np.corrcoef(original.astype(np.float64), restored.astype(np.float64))[0, 1] > 0.98
+    assert np.sqrt(np.mean(restored.astype(np.float64) ** 2)) == pytest.approx(
+        np.sqrt(np.mean(original.astype(np.float64) ** 2)), rel=0.05
+    )
 
 
 def make_ffmpeg_bridge() -> FfmpegAudioBridge:
