@@ -4,15 +4,21 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
-## [Unreleased]
+## [0.5.2] — 2026-07-10
 
 ### Added
 
-- Optional SMS-to-email forwarding (#17): live modem SMS messages enter a
-  bounded background queue and are sent through per-deployment TLS SMTP
-  credentials. Reliable OTPs lead the subject for notification previews;
-  settings are atomically validated, secrets are masked, and forwarding is off
-  by default with no history replay.
+- **SMS-to-email forwarding** (#17, opt-in, off by default): live modem SMS
+  messages enter a bounded background queue and are sent through per-deployment
+  TLS-only SMTP credentials. Reliable OTPs lead the subject for notification
+  previews; settings are atomically validated, secrets masked, and forwarding
+  never blocks the modem callback or crashes the service.
+
+### Fixed
+
+- The v0.5.1 DMG was built before this feature merged, so its Settings page had
+  no email fields. This build includes them; `--selftest` now also covers the
+  forwarder module.
 
 ## [0.5.0] — 2026-07-10
 
@@ -384,6 +390,8 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.5.2]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.2
+[0.5.1]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.1
 [0.5.0]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.0
 [0.4.3]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.3
 [0.4.2]: https://github.com/tianye1999/callpilot/releases/tag/v0.4.2

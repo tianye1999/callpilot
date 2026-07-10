@@ -228,6 +228,7 @@ def _selftest() -> int:
         "agentcall.agents.openai_agent",
         "agentcall.agents.local_agent",
         "agentcall.local_models",
+        "agentcall.sms_email_forwarder",
     ]
     optional = {"sherpa_onnx"}
     ok = True
