@@ -559,6 +559,7 @@ def test_remote_web_dialer_defaults_off_and_masks_livekit_secrets(monkeypatch):
         "LIVEKIT_API_SECRET",
     )
     assert get_bool("REMOTE_WEB_DIALER_ENABLED") is False
+    assert get_str("REMOTE_DTMF_MODE") == "qvts"
     rows = {row["key"]: row for row in read_panel_values()}
     assert rows["LIVEKIT_API_KEY"]["secret"] is True
     assert rows["LIVEKIT_API_SECRET"]["secret"] is True

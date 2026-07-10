@@ -10,7 +10,7 @@ from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
 from agentcall.call_agent import CallAgentService
 from agentcall.events import EventHub
-from agentcall.remote_dialer import RemoteDialerInvite
+from agentcall.remote_dialer import IssuedLiveKitSession, RemoteDialerInvite
 
 
 def make_service(
@@ -320,6 +320,43 @@ def test_remote_invite_starts_once_and_reuses_active_invite(monkeypatch):
     }
     assert worker.started is True
     assert builds == [True]
+
+
+def test_remote_worker_uses_remote_dtmf_mode_not_ai_call_mode(monkeypatch):
+    monkeypatch.setenv("REMOTE_DTMF_MODE", "qvts")
+    monkeypatch.setenv("DTMF_MODE", "inband")
+    monkeypatch.setenv("REMOTE_MEDIA_PROVIDER", "livekit")
+    monkeypatch.setenv("LIVEKIT_URL", "wss://project.livekit.cloud")
+    monkeypatch.setenv("LIVEKIT_API_KEY", "api-key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "api-secret")
+    monkeypatch.setenv(
+        "REMOTE_CONTROL_URL", "https://dial.example/remote_dialer.html"
+    )
+    invite = RemoteDialerInvite(
+        session_id="session-1",
+        url="https://dial.example/#token",
+        expires_at=time.time() + 300,
+    )
+    issued = IssuedLiveKitSession(
+        invite=invite,
+        room_name="room",
+        browser_identity="browser",
+        edge_identity="edge",
+        browser_token="browser-token",
+        edge_token="edge-token",
+        livekit_url="wss://project.livekit.cloud",
+    )
+    monkeypatch.setattr(
+        "agentcall.call_agent.issue_livekit_session", lambda **_kwargs: issued
+    )
+    monkeypatch.setattr(
+        "agentcall.livekit_media.LiveKitRemoteMediaEndpoint",
+        lambda _issued: object(),
+    )
+
+    _invite, worker = make_service(FakeModem())._build_remote_worker()
+
+    assert worker.coordinator.runtime.dtmf_mode == "qvts"
 
 
 def test_expired_remote_invite_stops_old_worker_before_replacement(monkeypatch):

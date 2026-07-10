@@ -1252,7 +1252,7 @@ class CallAgentService:
             connect_timeout_seconds=max(
                 1.0, config.get_float("REMOTE_CONNECT_TIMEOUT_SECONDS")
             ),
-            dtmf_mode=config.get_str("DTMF_MODE"),
+            dtmf_mode=config.get_str("REMOTE_DTMF_MODE"),
         )
         coordinator = RemoteWebDialerCoordinator(
             session_id=issued.invite.session_id,

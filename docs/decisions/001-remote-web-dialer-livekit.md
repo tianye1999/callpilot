@@ -65,6 +65,7 @@ transport and must not be described as end-to-end encrypted.
 ```dotenv
 REMOTE_WEB_DIALER_ENABLED=true
 REMOTE_MEDIA_PROVIDER=livekit
+REMOTE_DTMF_MODE=qvts
 REMOTE_CONTROL_URL=https://dial.example.com/remote_dialer.html
 LIVEKIT_URL=wss://your-project.livekit.cloud
 LIVEKIT_API_KEY=...
@@ -73,6 +74,11 @@ REMOTE_DISCONNECT_GRACE_SECONDS=5
 REMOTE_OUTBOUND_MAX_SECONDS=1800
 REMOTE_DIAL_LIMIT_PER_HOUR=10
 ```
+
+`REMOTE_DTMF_MODE` intentionally defaults to `qvts`. A real EC20/EG25 UAC call
+showed that the carrier IVR ignored in-band-only tones, while QVTS triggered the
+menu and its resulting service SMS. `both` remains available for hardware that
+needs both paths.
 
 Deploy these files in the same HTTPS directory:
 

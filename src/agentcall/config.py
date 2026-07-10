@@ -292,6 +292,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("REMOTE_WEB_DIALER_ENABLED", "启用远程网页拨号", "bool", "false"),
     ConfigSpec("REMOTE_MEDIA_PROVIDER", "远程媒体服务", "select", "livekit",
                choices=("livekit",)),
+    # EC20/EG25 真机验证：UAC 路径只注入带内双音时，运营商 IVR 可能不识别；
+    # 远程真人拨号默认走模组 QVTS，避免继承 AI 通话的带内默认值。
+    ConfigSpec("REMOTE_DTMF_MODE", "远程拨号 DTMF 模式", "select", "qvts",
+               choices=("qvts", "both", "inband")),
     ConfigSpec("REMOTE_CONTROL_URL", "远程拨号页 HTTPS 地址", "str", ""),
     ConfigSpec("LIVEKIT_URL", "LiveKit WebSocket 地址", "str", ""),
     ConfigSpec("LIVEKIT_API_KEY", "LiveKit API Key", "str", "", secret=True),
