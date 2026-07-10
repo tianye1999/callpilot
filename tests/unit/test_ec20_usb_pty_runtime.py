@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("fcntl", reason="EC20 PTY bridge is POSIX-only")
+
 from scripts import ec20_usb_pty
 
 
