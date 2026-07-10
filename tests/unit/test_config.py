@@ -527,3 +527,13 @@ def test_voice_specs_are_selects_with_default_in_choices():
         "alloy", "ash", "ballad", "coral", "echo",
         "sage", "shimmer", "verse", "marin", "cedar",
     }
+
+
+def test_is_loopback_host():
+    from agentcall.config import is_loopback_host
+
+    assert is_loopback_host("127.0.0.1")
+    assert is_loopback_host("localhost")
+    assert is_loopback_host(" ::1 ")
+    assert not is_loopback_host("0.0.0.0")
+    assert not is_loopback_host("192.168.1.10")

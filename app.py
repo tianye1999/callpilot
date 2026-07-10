@@ -98,6 +98,17 @@ def main() -> None:
     port = config.get_int("WEB_PORT")
     modem_port = config.get_str("MODEM_PORT")
 
+    # 非 loopback 监听必须带访问令牌：Web API 能拨号/发短信，裸监听等于把
+    # 电话交给整个网段。fail-fast 拒绝启动，比静默裸奔清晰。
+    web_auth_token = config.get_str("WEB_AUTH_TOKEN").strip()
+    if not config.is_loopback_host(host) and not web_auth_token:
+        logger.error(
+            "WEB_HOST=%s 暴露到非本机网络，但未设置 WEB_AUTH_TOKEN；"
+            "请在 .env 里设置访问令牌（客户端用 Authorization: Bearer <token> "
+            "或 ?token=<token>），或将 WEB_HOST 改回 127.0.0.1", host,
+        )
+        sys.exit(2)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -147,7 +158,13 @@ def main() -> None:
     # 需重启配置的自愈重启：/api/restart 置位该事件 → 停 loop → 清理后 os.execv。
     restart_event = threading.Event()
     app = build_app(
-        hub, service.modem, service=service, meta=meta, restart_event=restart_event
+        hub,
+        service.modem,
+        service=service,
+        meta=meta,
+        restart_event=restart_event,
+        # loopback 下不启用令牌校验（行为不变）；非 loopback 上面已保证 token 非空。
+        auth_token=web_auth_token if not config.is_loopback_host(host) else None,
     )
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())

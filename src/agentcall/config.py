@@ -270,7 +270,16 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 桌面 App 会自动打开该地址，CLI 用户从启动日志获取，无需记忆。
     ConfigSpec("WEB_PORT", "Web 监听端口", "int", "47100",
                editable=False, requires_restart=True),
+    # 非 loopback 监听（局域网/公网暴露）时必填：Web API 能拨号/发短信，
+    # 裸监听等于把电话交给整个网段。loopback（默认）下忽略本项、行为不变。
+    ConfigSpec("WEB_AUTH_TOKEN", "Web 访问令牌（非本机监听必填）", "str", "",
+               secret=True, editable=False, hidden=True, requires_restart=True),
 )
+
+
+def is_loopback_host(host: str) -> bool:
+    """WEB_HOST 是否只在本机回环上监听（此时无需 Web 访问令牌）。"""
+    return host.strip().lower() in {"127.0.0.1", "::1", "localhost"}
 
 _SPECS_BY_KEY: dict[str, ConfigSpec] = {spec.key: spec for spec in CONFIG_SPECS}
 

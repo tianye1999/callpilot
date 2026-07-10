@@ -1163,3 +1163,42 @@ def test_restart_sets_event_and_returns_ok():
         assert (await resp.json())["ok"] is True
     api(app, fn)
     assert ev.is_set()
+
+
+def test_auth_middleware_rejects_without_token_and_accepts_bearer_or_query():
+    """非 loopback 部署时的访问令牌闸（T9）：无/错 token 401，Bearer 头或 ?token= 放行。"""
+    app = build_app(
+        hub=None,  # type: ignore[arg-type]
+        modem=None,  # type: ignore[arg-type]
+        service=FakeService(),
+        meta={"provider": "qwen"},
+        auth_token="secret-token",
+    )
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        assert resp.status == 401
+        resp = await client.get("/api/meta", headers={"Authorization": "Bearer wrong"})
+        assert resp.status == 401
+        resp = await client.get("/api/meta", headers={"Authorization": "Bearer secret-token"})
+        assert resp.status == 200
+        resp = await client.get("/api/meta?token=secret-token")
+        assert resp.status == 200
+        return True
+
+    assert api(app, fn)
+
+
+def test_auth_disabled_when_token_none_keeps_loopback_behavior():
+    app = build_app(
+        hub=None,  # type: ignore[arg-type]
+        modem=None,  # type: ignore[arg-type]
+        service=FakeService(),
+        meta={"provider": "qwen"},
+    )
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        return resp.status
+
+    assert api(app, fn) == 200

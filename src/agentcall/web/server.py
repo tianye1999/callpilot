@@ -189,14 +189,40 @@ async def _error_middleware(request: web.Request, handler):
         return web.json_response({"ok": False, "error": exc.reason}, status=400)
 
 
+def _auth_middleware_factory(token: str):
+    """非 loopback 监听时的访问令牌校验（Bearer 头或 ?token= 查询参数）。
+
+    Web API 能拨号/发短信，暴露到网段必须带闸；loopback 部署不启用本中间件，
+    行为与历史完全一致。WS 客户端无法自定义头，故同时接受查询参数。
+    """
+
+    @web.middleware
+    async def _auth_middleware(request: web.Request, handler):
+        supplied = ""
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            supplied = authorization[len("Bearer "):].strip()
+        if not supplied:
+            supplied = request.query.get("token", "")
+        if not supplied or not secrets.compare_digest(supplied, token):
+            return web.json_response({"ok": False, "error": "未授权：缺少或错误的访问令牌"}, status=401)
+        return await handler(request)
+
+    return _auth_middleware
+
+
 def build_app(
     hub: EventHub,
     modem: Eg25Modem,
     service=None,
     meta: dict | None = None,
     restart_event=None,
+    auth_token: str | None = None,
 ) -> web.Application:
-    app = web.Application(middlewares=[_error_middleware])
+    middlewares = [_error_middleware]
+    if auth_token:
+        middlewares.insert(0, _auth_middleware_factory(auth_token))
+    app = web.Application(middlewares=middlewares)
     app["hub"] = hub
     app["modem"] = modem
     app["service"] = service
