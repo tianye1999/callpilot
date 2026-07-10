@@ -4,6 +4,17 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.5.4] — 2026-07-10
+
+### Fixed
+
+- **New SMS not received once SIM storage fills up**: the SIM's SMS store holds
+  only ~20-50 messages; once full, new messages never reach the modem at all.
+  CallPilot now deletes each SMS from the SIM right after ingesting it into the
+  app (both back-fill and live receive), so storage never fills and `+CMTI`
+  live delivery keeps working. New `SMS_DELETE_AFTER_INGEST` setting (default
+  on) can disable it.
+
 ## [0.5.3] — 2026-07-10
 
 ### Fixed
@@ -401,6 +412,7 @@ directions and exchanging SMS.
 - No barge-in (half-duplex); no self-contained installer yet.
 - Requires your own DashScope API key and carrier SIM with voice + SMS.
 
+[0.5.4]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.4
 [0.5.3]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.3
 [0.5.2]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.2
 [0.5.1]: https://github.com/tianye1999/callpilot/releases/tag/v0.5.1
