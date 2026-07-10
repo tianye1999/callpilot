@@ -87,8 +87,14 @@ _JUDGE_SYSTEM = {
         "判断依据是「有没有真正拿到实质结果」，而不是「对话听起来是否结束了」。\n"
         "- wrap_up（收尾）：所要的信息/结果已被对方真正给出、或事情确实办成；或已明显"
         "在原地打转、多次尝试仍无实质进展；或对方明确要结束。\n"
-        "- continue（继续）：要的实质结果还没真正到手（哪怕场面上已经在客套收尾）。\n"
-        "拿不准时倾向继续：只有确信已拿到结果、或确信卡死，才判 wrap_up。\n"
+        "  特别注意：对方给出的**明确否定式/空结果答复也算拿到了实质结果**——比如"
+        "「未办理该业务」「名下没有这项套餐」「查不到相关记录」「不支持办理」。"
+        "这类答复本身就是最终答案，不是「还没查到」；此时应 wrap_up，"
+        "而不是换个说法再问一遍同一件事。\n"
+        "- continue（继续）：对方还没针对所问的事给出明确答复（在查询中、答非所问、"
+        "被打断、只是客套），实质结果还没真正到手。\n"
+        "拿不准时倾向继续：只有确信已拿到结果（含明确的否定答复）、或确信卡死，"
+        "才判 wrap_up。\n"
         "只输出严格合法的 JSON，无任何多余文字："
         '{{"decision": "continue" 或 "wrap_up", "reason": "一句话理由"}}'
     ),
@@ -100,10 +106,16 @@ _JUDGE_SYSTEM = {
         "- wrap_up: the requested info/result has actually been provided, or the task "
         "is genuinely done; or it's clearly going in circles with no real progress; "
         "or the other party wants to end.\n"
-        "- continue: the requested result isn't actually in hand yet (even if the "
-        "conversation sounds like it's wrapping up).\n"
-        "When in doubt, lean continue: only wrap_up once you truly have the result or "
-        "it's clearly stuck.\n"
+        "  Important: a clear NEGATIVE or empty-result answer from the other side "
+        "ALSO counts as the substantive result — e.g. \"no such plan on this "
+        "account\", \"this service is not activated\", \"no matching record\". "
+        "Such an answer IS the final answer, not \"not found yet\"; wrap_up instead "
+        "of re-asking the same question in different words.\n"
+        "- continue: the other side has not yet given a definite answer to the "
+        "question (still looking it up, answered something else, got cut off, or "
+        "was merely being polite) — the substance isn't in hand yet.\n"
+        "When in doubt, lean continue: only wrap_up once you truly have the result "
+        "(including a definite negative answer) or it's clearly stuck.\n"
         'Output only strict JSON, no extra text: {{"decision": "continue" or '
         '"wrap_up", "reason": "one short sentence"}}'
     ),

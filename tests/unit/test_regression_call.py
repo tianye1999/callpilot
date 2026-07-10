@@ -227,3 +227,37 @@ def test_wait_for_finished_recording_catches_call_finished_in_last_poll_gap(tmp_
     result = regression_call.wait_for_finished_recording(recordings, set(), timeout_seconds=1)
     assert result.timed_out is False
     assert result.path == call_dir
+
+
+def test_no_redundant_reask_warns_on_paraphrased_repeats():
+    """#16 实测转写形态：同一诉求换措辞追问 ≥3 次 → WARN（非 FAIL）。"""
+    report = _report(
+        _base_events(
+            _event("transcript", role="agent", text="你好，我想查一下这个号码的流量使用情况。"),
+            _event("transcript", role="user", text="您当前号码尚未办理流量类套餐。"),
+            _event("transcript", role="agent", text="您好，我想查一下这个号码的流量使用情况。"),
+            _event("transcript", role="user", text="正在查询，请稍后。"),
+            _event("transcript", role="agent", text="您好，我想查一下这个号码的流量使用情况。"),
+            _event("transcript", role="user", text="您好。"),
+            _event(
+                "transcript",
+                role="agent",
+                text="您好，我想查一下这个号码的流量使用情况，麻烦您帮我看看。",
+            ),
+        )
+    )
+    result = _result(report, "no_redundant_reask")
+    assert result.status == "WARN"
+    assert "3 次" in result.detail
+    assert not report.has_failures  # WARN 不算失败
+
+
+def test_no_redundant_reask_passes_on_normal_dialog():
+    report = _report(
+        _base_events(
+            _event("transcript", role="agent", text="你好，我想查一下这个号码的流量使用情况。"),
+            _event("transcript", role="user", text="您当前号码尚未办理流量类套餐。"),
+            _event("transcript", role="agent", text="好的，明白了，那就不打扰了，再见。"),
+        )
+    )
+    assert _result(report, "no_redundant_reask").status == "PASS"

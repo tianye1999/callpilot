@@ -12,9 +12,11 @@ import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
@@ -97,6 +99,7 @@ def run_assertions(events: Sequence[Event], transcripts: Sequence[Transcript], m
             check_no_repeat_stuck(transcripts),
             check_normal_ending(events, meta),
             check_dtmf_audit(events, transcripts),
+            check_no_redundant_reask(transcripts),
         ]
     )
 
@@ -185,6 +188,42 @@ def check_no_repeat_stuck(transcripts: Sequence[Transcript]) -> CheckResult:
     return CheckResult("no_repeat_stuck", "5. 无复读卡死", "PASS", "无 agent 原文三连重复")
 
 
+def _normalize_for_similarity(text: str) -> str:
+    """相似度归一化：去空白/标点、casefold（与 repeat_suppression 同思路，脚本自包含）。"""
+    return "".join(
+        ch for ch in text.casefold() if not (ch.isspace() or unicodedata.category(ch)[0] in {"P", "Z"})
+    )
+
+
+def check_no_redundant_reask(transcripts: Sequence[Transcript]) -> CheckResult:
+    """复读式追问：同一诉求高相似句 ≥3 次 → WARN（#16：否定式终态答案后不收尾的信号）。
+
+    区别于 check 5 的"逐字三连"（卡死级 FAIL）：这里抓的是换了措辞、但语义几乎相同
+    的反复追问，阈值 0.85；WARN 不 FAIL——它是体验缺陷而非链路故障。
+    """
+    normalized: list[tuple[str, str]] = []
+    for item in transcripts:
+        if item.role != "agent":
+            continue
+        norm = _normalize_for_similarity(item.text)
+        if len(norm) < 8:  # 短句（问候/确认）跳过
+            continue
+        normalized.append((norm, item.text))
+    for i, (norm, raw) in enumerate(normalized):
+        similar = 1
+        for other_norm, _other_raw in normalized[i + 1 :]:
+            if SequenceMatcher(None, norm, other_norm).ratio() >= 0.85:
+                similar += 1
+        if similar >= 3:
+            return CheckResult(
+                "no_redundant_reask",
+                "8. 无复读式追问",
+                "WARN",
+                f"近似同句追问 {similar} 次: {_clip(raw)}",
+            )
+    return CheckResult("no_redundant_reask", "8. 无复读式追问", "PASS", "无高相似追问 ≥3 次")
+
+
 def check_normal_ending(events: Sequence[Event], meta: Event | None = None) -> CheckResult:
     ended_events = [event for event in events if event.get("type") == "ended"]
     if not ended_events:
@@ -192,9 +231,10 @@ def check_normal_ending(events: Sequence[Event], meta: Event | None = None) -> C
 
     failures: list[str] = []
     duration = _duration_seconds(events, meta)
-    # 上限 = 外呼硬时限 + 收尾余量：到点后还要说告别语并延迟挂断（HANGUP_TOOL_DELAY），
-    # 实测触发 150s 兜底的通话 ended 在 ~162s——写死 160 会把正常兜底收尾误判为 FAIL。
-    max_duration = float(os.environ.get("OUTBOUND_MAX_SECONDS", "150") or 150) + 20
+    # 上限 = 外呼硬时限 + 收尾余量：到点后还要跨一个判定 tick、说完告别语、
+    # 延迟挂断（HANGUP_TOOL_DELAY 默认 4.5s）再落盘。真机实测兜底收尾最长 170.5s
+    # （2026-07-10），余量 20s 会把正常兜底误伤成 FAIL——放宽到 30s。
+    max_duration = float(os.environ.get("OUTBOUND_MAX_SECONDS", "150") or 150) + 30
     if duration is None:
         failures.append("无法确定通话时长")
     elif duration >= max_duration:
@@ -420,6 +460,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     detail = f"{detail}；挂断请求失败: {hangup_error}"
                 else:
                     detail = f"{detail}；已请求挂断"
+                    # 挂断是异步收尾：events/meta 落盘还要 1-2s，等一小段再读，
+                    # 否则必然撞上"events.jsonl 不存在"（2026-07-10 真机复现）。
+                    if call_dir is not None:
+                        deadline = time.monotonic() + 10.0
+                        while time.monotonic() < deadline and not _recording_finished(call_dir):
+                            time.sleep(0.5)
                 timeout_result = CheckResult("wait_finished", "0. 等待通话结束", "FAIL", detail)
                 if call_dir is None:
                     report = Report([timeout_result])

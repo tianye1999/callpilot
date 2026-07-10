@@ -249,3 +249,15 @@ def test_judge_api_failure_defaults_continue(monkeypatch):
     monkeypatch.setattr(dashscope.Generation, "call", staticmethod(boom))
     r = judge_wrap_up(_JUDGE_TR, "查流量")
     assert r["decision"] == "continue" and r["ok"] is False
+
+
+def test_judge_prompt_treats_negative_answer_as_result():
+    """#16：裁判提示词必须把明确的否定式/空结果答复视为实质结果（zh/en）。"""
+    from agentcall.summarizer import _JUDGE_SYSTEM
+
+    zh = _JUDGE_SYSTEM["zh"]
+    assert "否定" in zh and "未办理" in zh
+    assert "wrap_up" in zh
+    en = _JUDGE_SYSTEM["en"]
+    assert "NEGATIVE" in en or "negative" in en
+    assert "final answer" in en

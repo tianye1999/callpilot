@@ -623,6 +623,15 @@ class CallSession:
         except Exception as exc:  # noqa: BLE001
             logger.debug("收尾裁判调度异常: %s", exc)
             return
+        # 每次裁判决策落 events：真机验证「否定式答复→收尾」与事后排障都靠它（#16）。
+        record = self._record
+        if record is not None:
+            record.log_event(
+                "wrap_up_judge",
+                decision=str(result.get("decision", "")),
+                reason=str(result.get("reason", ""))[:200],
+                ok=bool(result.get("ok")),
+            )
         if result.get("decision") == "wrap_up":
             self._wrap_up_requested = True
             self._wrap_up_reason = result.get("reason", "")

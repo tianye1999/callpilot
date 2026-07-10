@@ -35,6 +35,11 @@ logger = logging.getLogger(__name__)
 # 千问 Realtime 连接重试次数（SDK connect 硬超时 5s，冷连接抖动会踩线）。
 QWEN_CONNECT_MAX_ATTEMPTS = 3
 
+# 同步 ws send 的超时熔断（秒）：正常一帧 <50ms，超过即视为链路劣化按断线处理，
+# 保住音频主循环的心跳（硬时限/裁判判定都在主循环里）。
+_SEND_TIMEOUT_SECONDS = 2.0
+_SAY_TIMEOUT_SECONDS = 5.0
+
 # create_response 发出后等待 wire response.created 的独立超时。
 _MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS = 5.0
 
@@ -427,19 +432,43 @@ class QwenVoiceAgent(VoiceAgent):
             return
         audio_b64 = base64.b64encode(pcm).decode("ascii")
         try:
-            conversation.append_audio(audio_b64)
+            # dashscope SDK 的 ws send 是同步阻塞调用：网络劣化/死链时一次 send
+            # 可挂几十秒，音频主循环（含 150s 硬时限判定）随之停摆——2026-07-10
+            # 真机两通 180s+ 卡死实证。线程池 + 2s 超时熔断：超时按断线处理
+            # 丢帧走重连，主循环最多被拖一帧的超时时长。
+            await asyncio.wait_for(
+                asyncio.to_thread(conversation.append_audio, audio_b64),
+                timeout=_SEND_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("发送音频超过 %.0fs 未完成，标记断线", _SEND_TIMEOUT_SECONDS)
+            self._mark_disconnected()
         except Exception as exc:  # noqa: BLE001
             # 连接可能刚死但 on_close 未及时触发：标记断线，下一帧走重连。
             logger.warning("发送音频失败，标记断线: %s", exc)
             self._mark_disconnected()
 
     async def say(self, instructions: str) -> None:
-        if not self._conversation or self._disconnected.is_set():
+        conversation = self._conversation
+        if not conversation or self._disconnected.is_set():
             return
-        self._conversation.create_response(
-            instructions=instructions,
-            output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
-        )
+        try:
+            # 同 send_audio：同步 ws send 放线程池 + 超时熔断，防拖垮主循环。
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: conversation.create_response(
+                        instructions=instructions,
+                        output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
+                    )
+                ),
+                timeout=_SAY_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("发送说话指令超过 %.0fs 未完成，标记断线", _SAY_TIMEOUT_SECONDS)
+            self._mark_disconnected()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("发送说话指令失败，标记断线: %s", exc)
+            self._mark_disconnected()
 
     def _reset_manual_response_state(self) -> None:
         with self._manual_response_lock:
