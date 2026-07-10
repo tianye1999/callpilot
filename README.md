@@ -11,7 +11,7 @@ caller with a realtime voice AI, places outbound calls, sends/receives SMS,
 navigates IVR menus (DTMF), and records + summarizes every call — all on your
 own hardware and API keys.
 
-> **Status: Mac Beta (v0.4.2).** Runs on macOS with a Quectel EC20 today.
+> **Status: Mac Beta (v0.5.0).** Runs on macOS with a Quectel EC20 today.
 > Developers can run from source; regular users can install the signed,
 > notarized macOS DMG from the latest GitHub Release. See [Roadmap](docs/roadmap.md).
 
