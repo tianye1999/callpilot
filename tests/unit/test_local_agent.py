@@ -168,13 +168,15 @@ def test_repeat_suppression_blocks_third_identical_reply():
     agent, pipeline, _seen = _make_agent(replies)
     asyncio.run(agent.start(lambda pcm: None))
     try:
-        for text in ("第一句", "第二句", "第三句"):
+        # 逐段等待处理完再发下一段：否则三段并发入队会被 utterance 合并成一轮，
+        # 且计数随 worker 调度浮动（CI 慢时 flaky）。每段独立成轮才能验"第三次抑制"。
+        for i, text in enumerate(("第一句", "第二句", "第三句"), start=1):
             asyncio.run(agent.send_audio(text.encode()))
-        assert _wait_until(lambda: len(pipeline.transcripts) == 3)
-        time.sleep(0.3)
+            assert _wait_until(lambda n=i: len(pipeline.transcripts) == n)
     finally:
         asyncio.run(agent.stop())
     # RepeatSuppressor 语义：重复第二次仍放行（对方要求重复属合法），第三次抑制。
+    assert pipeline.transcripts == ["第一句", "第二句", "第三句"]
     assert len(pipeline.synthesized) == 2
 
 
