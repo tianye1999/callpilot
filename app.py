@@ -196,5 +196,33 @@ def main() -> None:
         os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
+def _selftest() -> int:
+    """--selftest：只做 import 自检，不起服务。用于打包后验证关键模块真进了 bundle
+    （教训：v0.5.0 DMG 漏了 local provider，find 文件名查不出 pyc，靠这个才能确证）。"""
+    import importlib
+
+    modules = [
+        "agentcall.agents.factory",
+        "agentcall.agents.qwen_agent",
+        "agentcall.agents.openai_agent",
+        "agentcall.agents.local_agent",
+        "agentcall.local_models",
+    ]
+    optional = {"sherpa_onnx"}
+    ok = True
+    for name in modules + list(optional):
+        try:
+            importlib.import_module(name)
+            print(f"OK  {name}")
+        except Exception as exc:  # noqa: BLE001
+            marker = "WARN" if name in optional else "FAIL"
+            if name not in optional:
+                ok = False
+            print(f"{marker} {name}: {type(exc).__name__}: {exc}")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(_selftest())
     main()

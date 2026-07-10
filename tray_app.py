@@ -293,6 +293,10 @@ def _import_rumps():
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     _prepend_runtime_paths()
+    if "--selftest" in sys.argv[1:]:
+        # 打包后 import 自检（不起服务/不装 launchd）：验证关键模块真进了 bundle。
+        import app
+        raise SystemExit(app._selftest())
     if "--service" in sys.argv[1:]:
         _run_service()
         return
