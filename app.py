@@ -79,6 +79,27 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # local provider 模型预下载：~300MB 必须在通话前备好，否则放到 agent.start()
+    # （通话已接通）里下载会超过外呼时限，通话空转到超时（2026-07-10 真机实证）。
+    # 后台线程下载，不阻塞 Web 启动；下载中来电会因模型未就绪走既有 fatal 降级。
+    if provider == "local":
+        def _prefetch_local_models() -> None:
+            try:
+                from agentcall import local_models
+
+                missing = local_models.missing_assets()
+                if missing:
+                    logger.info(
+                        "local provider 首次启动，后台预下载语音模型（%s，约 300MB）…",
+                        ", ".join(a.id for a in missing),
+                    )
+                    local_models.ensure_all()
+                    logger.info("local 语音模型已就绪")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("local 语音模型预下载失败（首次通话时会重试）: %s", exc)
+
+        threading.Thread(target=_prefetch_local_models, name="local-model-prefetch", daemon=True).start()
+
     # Qwen 连接预热：提前建好 TLS 连接，降低首通接听延迟。
     # start_prewarm_keepalive 由 W2 实现，未就绪时跳过即可，不阻塞启动。
     if provider == "qwen" and config.get_bool("QWEN_PREWARM") and not credential_errors:
