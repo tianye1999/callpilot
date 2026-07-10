@@ -4,6 +4,33 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.5.6] — 2026-07-11
+
+Skips 0.5.5, which was only ever a local test build (packaged before the
+Info.plist and setup-wizard fixes below landed); 0.5.6 is the first release to
+ship them.
+
+### Fixed
+
+- **Menu-bar "Open console" spawned a new window on every click**: the tray now
+  remembers the dashboard window and brings the existing one to the front via
+  `osascript` instead of launching a duplicate pywebview process each time
+  (logic extracted into the unit-tested `open_or_focus_dashboard`).
+- **Setup wizard looked "ready" when hardware wasn't**: the hardware step now
+  shows a red status when the EC20/EG25 module or AT port isn't detected,
+  instead of a neutral one (the check still does not block setup).
+
+### Added
+
+- **AppleEvents usage declaration** (`NSAppleEventsUsageDescription`) in the app
+  bundle, so first-launch actions that send system events (raising the console
+  window, opening the browser UI) declare their purpose to macOS.
+- **New-user docs**: `docs/faq.md` (install → first call — Gatekeeper, hardware /
+  SIM prerequisites, UAC auto-enable and first re-plug, API-key setup, permission
+  prompts, link self-test) and `docs/number-profiles.md` (task-library structure,
+  match order, scenario-writing guide with a minimal template); README links both
+  and notes audio needs no manual AT setup.
+
 ## [0.5.4] — 2026-07-10
 
 ### Fixed
