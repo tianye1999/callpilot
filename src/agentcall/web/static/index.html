@@ -2403,7 +2403,7 @@ function renderSetupHardware() {
     box.appendChild(row);
   }
   const ready = !!hw.usb_online && !!hw.modem_connected;
-  setupStatus("setupHwStatus", ready ? "ok" : "", ready ? t("setup_hw_ok") : t("setup_hw_wait"));
+  setupStatus("setupHwStatus", ready ? "ok" : "err", ready ? t("setup_hw_ok") : t("setup_hw_wait"));
 }
 
 function renderSetupReadySummary() {
