@@ -256,6 +256,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("DIAL_WHITELIST", "外呼白名单", "str", ""),
     ConfigSpec("DIAL_INTERVAL_SECONDS", "连续拨号间隔（秒）", "float", "5.0"),
     ConfigSpec("SMS_RATE_LIMIT_PER_HOUR", "短信发送频控（每小时）", "int", "10"),
+    # 收件短信进 app 后删 SIM 上那条，防 SIM 短信存储（常 ~20-50 条）满导致
+    # 新短信收不进来。默认开；关掉则 SIM 会堆积，满后需手动清。
+    ConfigSpec("SMS_DELETE_AFTER_INGEST", "短信入库后删 SIM 副本", "bool", "true"),
     ConfigSpec("SMS_EMAIL_FORWARD_ENABLED", "收到短信后转发到邮箱", "bool", "false"),
     ConfigSpec("SMS_EMAIL_RECIPIENT", "短信转发收件邮箱", "str", ""),
     ConfigSpec("SMS_EMAIL_SMTP_HOST", "发件 SMTP 主机", "str", ""),

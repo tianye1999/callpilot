@@ -10,7 +10,7 @@ from typing import Callable
 
 import serial
 
-from . import platforms, port_detect
+from . import config, platforms, port_detect
 
 logger = logging.getLogger(__name__)
 
@@ -308,25 +308,49 @@ class Eg25Modem:
             logger.info("模组内暂无已存短信")
             return
         logger.info("模组内已存短信 %d 条，补收（重复自动去重）", len(entries))
-        for sender, timestamp, body in entries:
+        delete_after = config.get_bool("SMS_DELETE_AFTER_INGEST")
+        for index, sender, timestamp, body in entries:
             logger.info(
                 "[补收短信] 来自 %s (%s): %s", sender or "未知", timestamp, body or "(空)"
             )
+            delivered = False
             if self._on_sms:
                 try:
                     self._on_sms(sender, body, timestamp)
+                    delivered = True
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("补收短信回调异常: %s", exc)
+            # 补收进 app（含去重跳过=已在 app）后删 SIM 上这条，腾存储防满。
+            if delivered and index and delete_after:
+                self._delete_stored_sms(index)
 
-    def _parse_cmgl(self, response: str) -> list[tuple[str | None, str, str]]:
+    def _delete_stored_sms(self, index: str) -> None:
+        """删除 SIM/模组存储位上的一条短信（AT+CMGD）；失败只告警不影响流程。
+
+        SIM 短信存储容量有限（常 ~20-50 条），满了新短信收不进来。短信补收/
+        实时读入 app 后即删，保证存储不堆满、+CMTI 实时上报持续可用。
+        """
+        try:
+            self._send(f"AT+CMGD={index}")
+            logger.debug("已删除 SIM 存储短信 index=%s", index)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除已存短信失败 (index=%s): %s", index, exc)
+
+    def _parse_cmgl(self, response: str) -> list[tuple[str, str | None, str, str]]:
+        """解析 ``AT+CMGL`` 响应为 ``(存储索引, 发件方, 时间戳, 正文)`` 列表。
+
+        索引供补收后 ``AT+CMGD`` 删除该条、腾出 SIM 存储（防满导致新短信收不到）。
+        """
         lines = response.splitlines()
-        entries: list[tuple[str | None, str, str]] = []
+        entries: list[tuple[str, str | None, str, str]] = []
         idx = 0
         while idx < len(lines):
             if not lines[idx].strip().startswith("+CMGL:"):
                 idx += 1
                 continue
             header_line = lines[idx]
+            index_match = re.match(r"\+CMGL:\s*(\d+)", header_line.strip())
+            index = index_match.group(1) if index_match else ""
             body_lines: list[str] = []
             idx += 1
             while idx < len(lines):
@@ -336,7 +360,8 @@ class Eg25Modem:
                 body_lines.append(lines[idx])
                 idx += 1
             raw_body = "\n".join(body_lines).strip()
-            entries.append(self._interpret_sms(header_line, raw_body))
+            sender, timestamp, body = self._interpret_sms(header_line, raw_body)
+            entries.append((index, sender, timestamp, body))
         return entries
 
     def initialize_for_voice(self, audio_mode: str = "uac") -> None:
@@ -756,11 +781,16 @@ class Eg25Modem:
         logger.info(
             "[短信] 来自 %s (%s): %s", sender or "未知", timestamp, body or "(空)"
         )
+        delivered = False
         if self._on_sms:
             try:
                 self._on_sms(sender, body, timestamp)
+                delivered = True
             except Exception as exc:  # noqa: BLE001
                 logger.warning("短信回调异常: %s", exc)
+        # 实时短信读入 app 后删 SIM 上这条，防存储堆满（默认开，可配关）。
+        if delivered and index and config.get_bool("SMS_DELETE_AFTER_INGEST"):
+            self._delete_stored_sms(index)
 
     def _interpret_sms(
         self, header_line: str, raw_body: str

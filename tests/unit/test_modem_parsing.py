@@ -119,7 +119,7 @@ def test_clcc_response_with_cmti_reads_sms():
         "OK\r\n"
     )
 
-    assert sent == ['AT+CPMS="SM"', "AT+CMGR=5"]
+    assert sent == ['AT+CPMS="SM"', "AT+CMGR=5", "AT+CMGD=5"]  # 读完删 SIM 副本
     assert messages == [("+8613800000000", "hello from cmti")]
 
 
@@ -455,7 +455,7 @@ def test_send_response_with_cmti_reads_sms():
     response = modem.send_command("AT+CSQ")
 
     assert "+CSQ:" in response
-    assert modem._ser.writes == ["AT+CSQ", 'AT+CPMS="SM"', "AT+CMGR=5"]
+    assert modem._ser.writes == ["AT+CSQ", 'AT+CPMS="SM"', "AT+CMGR=5", "AT+CMGD=5"]  # 读完删 SIM 副本
     assert messages == [("+8613800000000", "hello from send")]
 
 
@@ -572,3 +572,50 @@ def test_poll_failure_threshold_fires_hangup(monkeypatch):
 
     assert hangups == ["hangup"]
     assert not modem.is_call_connected()
+
+
+_CMGL_TWO = (
+    '+CMGL: 1,"REC READ","10086",,"26/07/08,20:03:24+32"\r\n'
+    "余额100元\r\n"
+    '+CMGL: 3,"REC READ","10001",,"26/07/09,14:01:34+32"\r\n'
+    "剩余1.00GB\r\n"
+    "OK\r\n"
+)
+
+
+def test_dump_stored_sms_backfills_and_deletes(monkeypatch):
+    """补收 SIM 已存短信入库后，逐条 AT+CMGD 删除腾存储（默认开）。"""
+    monkeypatch.setenv("SMS_DELETE_AFTER_INGEST", "true")
+    modem = make_modem()
+    sent: list[str] = []
+    received: list[tuple[str | None, str, str]] = []
+    modem.on_sms(lambda s, b, ts="": received.append((s, b, ts)))
+
+    def fake_send(cmd: str) -> str:
+        sent.append(cmd)
+        return _CMGL_TWO if cmd == 'AT+CMGL="ALL"' else "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem._dump_stored_sms()
+
+    # 两条都补收（走 on_sms，带时间戳）
+    assert [(s, b) for s, b, _ in received] == [("10086", "余额100元"), ("10001", "剩余1.00GB")]
+    # 补收后按 index 删除两条
+    assert "AT+CMGD=1" in sent and "AT+CMGD=3" in sent
+
+
+def test_dump_stored_sms_keeps_sim_when_delete_disabled(monkeypatch):
+    """SMS_DELETE_AFTER_INGEST=false 时补收但不删 SIM。"""
+    monkeypatch.setenv("SMS_DELETE_AFTER_INGEST", "false")
+    modem = make_modem()
+    sent: list[str] = []
+    modem.on_sms(lambda s, b, ts="": None)
+
+    def fake_send(cmd: str) -> str:
+        sent.append(cmd)
+        return _CMGL_TWO if cmd == 'AT+CMGL="ALL"' else "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem._dump_stored_sms()
+
+    assert not any(c.startswith("AT+CMGD") for c in sent)
