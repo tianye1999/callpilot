@@ -171,8 +171,9 @@ class Eg25Modem:
         self._closed = False
         self._serial_lock = threading.RLock()
         # 串口重连串行化：多线程（读循环/CLCC 轮询/发送）可能同时发现断连，
-        # 只让一个真正重连，其余等它完成。
+        # 所有获取都遵循 _serial_lock -> _reconnect_lock，禁止反向锁序。
         self._reconnect_lock = threading.Lock()
+        self._reconnect_generation = 0
         # 初始化序列进行中：此时 _send 失败不自触发重连（交给 _reconnect 的重试循环），
         # 避免同线程重入 _reconnect 造成死锁。
         self._opening = False
@@ -250,15 +251,17 @@ class Eg25Modem:
     def _reconnect(self) -> None:
         """串口断连后重开（USB→PTY 桥重插会换新的 /dev/ttys，需重开才能拿到新 fd）。
 
-        多线程可能同时触发，只让第一个真正重连，其余等它完成后返回。
+        多线程可能同时触发，只让第一个真正重连，其余等它完成后返回。锁序固定为
+        ``_serial_lock`` → ``_reconnect_lock``，与拨号/短信/挂断事务一致，避免
+        发送线程持串口锁等待重连锁、读线程反向持锁形成 ABBA 死锁。
         带指数退避重试，直到成功或服务停止。
         """
-        if not self._reconnect_lock.acquire(blocking=False):
-            # 已有线程在重连，等它完成即可。
-            with self._reconnect_lock:
+        observed_generation = self._reconnect_generation
+        with self._serial_lock:
+            # 等串口锁期间若别的线程已完成重连，本次无需重复关闭新连接。
+            if observed_generation != self._reconnect_generation:
                 return
-        try:
-            with self._serial_lock:
+            with self._reconnect_lock:
                 try:
                     if self._ser and self._ser.is_open:
                         self._ser.close()
@@ -266,18 +269,17 @@ class Eg25Modem:
                     pass
                 self._ser = None
                 self._buffer = ""
-            delay = 1.0
-            while self._running and not self._closed:
-                try:
-                    self._open_serial()
-                    logger.info("串口已重连: %s", self._active_port)
-                    return
-                except (serial.SerialException, OSError) as exc:
-                    logger.warning("串口重连失败，%.0fs 后重试: %s", delay, exc)
-                    time.sleep(delay)
-                    delay = min(delay * 2, 10.0)
-        finally:
-            self._reconnect_lock.release()
+                delay = 1.0
+                while self._running and not self._closed:
+                    try:
+                        self._open_serial()
+                        self._reconnect_generation += 1
+                        logger.info("串口已重连: %s", self._active_port)
+                        return
+                    except (serial.SerialException, OSError) as exc:
+                        logger.warning("串口重连失败，%.0fs 后重试: %s", delay, exc)
+                        time.sleep(delay)
+                        delay = min(delay * 2, 10.0)
 
     def _init_sms(self) -> None:
         """开启短信文本模式并让模组主动上报新短信 (+CMTI)。"""
