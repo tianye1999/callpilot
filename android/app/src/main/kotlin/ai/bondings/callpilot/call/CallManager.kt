@@ -1,0 +1,198 @@
+package ai.bondings.callpilot.call
+
+import ai.bondings.callpilot.media.RemoteSession
+import ai.bondings.callpilot.media.SessionEvent
+import ai.bondings.callpilot.pairing.StoredPairing
+import ai.bondings.callpilot.protocol.GatewayClient
+import ai.bondings.callpilot.protocol.Invite
+import ai.bondings.callpilot.protocol.InviteParser
+import ai.bondings.callpilot.protocol.Signaling
+import java.util.UUID
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/** 通话 UI 状态（拨号页/通话页据此切换与渲染）。 */
+sealed interface CallState {
+    data object Idle : CallState
+    data class Preparing(val number: String) : CallState
+    data class WaitingMedia(val number: String) : CallState
+    data class Dialing(val number: String) : CallState
+    data class InCall(val number: String) : CallState
+    data class Ended(val number: String, val reason: String) : CallState
+    data class Failed(val number: String, val reason: String) : CallState
+}
+
+/**
+ * 出站通话状态机（单通互斥，与 Edge 的一 SIM 一通对应）。
+ *
+ * 流程：createSession → 解 fragment → 连房间发麦 → 发 dial 命令 →
+ * 收 Edge status/remote_call 事件推进状态 → 任一端挂断/断连收尾（幂等）。
+ */
+class CallManager(
+    private val sessionFactory: () -> RemoteSession,
+    private val inviteProvider: (StoredPairing) -> Invite = { pairing ->
+        GatewayClient(pairing.gatewayUrl)
+            .also { it.credential = pairing.credential }
+            .createSession()
+    },
+    private val onForeground: (active: Boolean) -> Unit = {},
+    scope: CoroutineScope? = null,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) {
+    private val scope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    private val _state = MutableStateFlow<CallState>(CallState.Idle)
+    val state: StateFlow<CallState> = _state
+
+    private var session: RemoteSession? = null
+    private var eventJob: Job? = null
+
+    /** 等待 Edge media_ready 后才发出的 dial 命令（Edge 会拒绝抢跑的 dial）。 */
+    private var pendingDial: String? = null
+
+    val isActive: Boolean
+        get() = _state.value.let {
+            it !is CallState.Idle && it !is CallState.Ended && it !is CallState.Failed
+        }
+
+    fun startCall(pairing: StoredPairing, number: String) {
+        if (isActive) return
+        _state.value = CallState.Preparing(number)
+        scope.launch {
+            try {
+                val invite = withContext(ioDispatcher) {
+                    inviteProvider(pairing)
+                }
+                val structuredUrl = invite.livekitUrl
+                val structuredToken = invite.token
+                val (livekitUrl, token) =
+                    if (!structuredUrl.isNullOrBlank() && !structuredToken.isNullOrBlank()) {
+                        structuredUrl to structuredToken
+                    } else {
+                        val payload = InviteParser.parseInviteUrl(invite.url)
+                            ?: error("邀请解析失败（协议版本或格式不符）")
+                        payload.url to payload.token
+                    }
+                val s = sessionFactory()
+                session = s
+                eventJob = scope.launch { s.events.collect { handleEvent(number, it) } }
+                onForeground(true)
+                // Edge 在确认本端音频轨就绪（media_ready 事件）前会拒绝 dial，
+                // 所以 dial 挂起到 handleEvent 收到 media_ready 再发。
+                pendingDial = number
+                s.connect(livekitUrl, token)
+                _state.value = CallState.WaitingMedia(number)
+            } catch (e: Exception) {
+                cleanup()
+                _state.value = CallState.Failed(number, e.message ?: "拨号失败")
+            }
+        }
+    }
+
+    fun sendDtmf(digits: String) {
+        val s = session ?: return
+        scope.launch {
+            try {
+                s.sendCommand(Signaling.encodeDtmf(digits))
+            } catch (_: Exception) {
+                // DTMF 失败不改变通话状态
+            }
+        }
+    }
+
+    fun setSpeakerphone(enabled: Boolean) {
+        session?.setSpeakerphone(enabled)
+    }
+
+    fun hangup() {
+        val number = currentNumber() ?: return
+        val s = session
+        scope.launch {
+            try {
+                s?.sendCommand(Signaling.encodeHangup())
+            } catch (_: Exception) {
+                // 命令发不出去也要本地收尾；Edge 有断线 grace 兜底挂断
+            }
+            cleanup()
+            _state.value = CallState.Ended(number, "local_hangup")
+        }
+    }
+
+    /** UI 从 Ended/Failed 回到拨号页。 */
+    fun reset() {
+        if (!isActive) _state.value = CallState.Idle
+    }
+
+    private fun handleEvent(number: String, event: SessionEvent) {
+        when (event) {
+            is SessionEvent.Edge -> {
+                // Edge 经 LiveKit data channel 发的是 type=status 事件（#37 契约）；
+                // type=remote_call 只存在于 Edge 本地面板，这里兼容消费以防协议演进。
+                val (status, reason) = when (val e = event.event) {
+                    is Signaling.Event.Status -> e.status to e.reason
+                    is Signaling.Event.RemoteCall -> e.status to null
+                }
+                when (status) {
+                    "media_ready" -> firePendingDial()
+                    "dialing" -> _state.value = CallState.Dialing(number)
+                    "connected" -> _state.value = CallState.InCall(number)
+                    "ended", "hangup" -> {
+                        cleanup()
+                        _state.value = CallState.Ended(number, reason ?: status)
+                    }
+                    "failed" -> {
+                        cleanup()
+                        _state.value = CallState.Failed(number, reason ?: status)
+                    }
+                    // waiting_for_phone 等生命周期提示不改变状态
+                    else -> Unit
+                }
+            }
+            is SessionEvent.Disconnected -> {
+                if (isActive) {
+                    cleanup()
+                    _state.value = CallState.Ended(number, event.reason)
+                }
+            }
+        }
+    }
+
+    /** media_ready 后才把 dial 发给 Edge（幂等：只发一次）。 */
+    private fun firePendingDial() {
+        val number = pendingDial ?: return
+        pendingDial = null
+        val s = session ?: return
+        scope.launch {
+            try {
+                s.sendCommand(Signaling.encodeDial(number, UUID.randomUUID().toString()))
+            } catch (e: Exception) {
+                cleanup()
+                _state.value = CallState.Failed(number, e.message ?: "拨号失败")
+            }
+        }
+    }
+
+    private fun currentNumber(): String? = when (val s = _state.value) {
+        is CallState.Preparing -> s.number
+        is CallState.WaitingMedia -> s.number
+        is CallState.Dialing -> s.number
+        is CallState.InCall -> s.number
+        else -> null
+    }
+
+    private fun cleanup() {
+        pendingDial = null
+        eventJob?.cancel()
+        eventJob = null
+        session?.disconnect()
+        session = null
+        onForeground(false)
+    }
+}
