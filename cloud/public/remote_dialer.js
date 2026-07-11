@@ -143,7 +143,7 @@
     pairingSurface.hidden = true;
     callSurface.hidden = false;
     pairedRow.hidden = !device;
-    pairedDevice.textContent = device ? device.display_name : "";
+    pairedDevice.textContent = device ? device.displayName : "";
   }
 
   function stopMicrophone() {

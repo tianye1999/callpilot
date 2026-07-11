@@ -4,6 +4,27 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [0.6.0] — 2026-07-12
+
+First build that ships the hosted remote control plane, so an ordinary user can
+pair a phone and dial through the Dongle SIM without hand-setting up a tunnel.
+
+### Added
+
+- **Hosted cloud onboarding**: the packaged app now bundles the hosted control
+  plane client (Cloudflare Worker + LiveKit); pairing a phone works over the
+  managed `*-beta.bondings.ai` endpoints with a pairing code, without manual
+  tunnel setup. (#42)
+- **Android remote dialer**: first native Android client for dialing through the
+  Dongle SIM from a phone. (#36)
+
+### Fixed
+
+- **Hosted dialer showed a blank paired-device name**: the browser dialer read
+  the snake_case `display_name`, but the `/v1` API returns camelCase
+  `displayName`, so the paired-device label was always empty. Aligned the field
+  and locked it with a static regression test.
+
 ## [0.5.6] — 2026-07-11
 
 Skips 0.5.5, which was only ever a local test build (packaged before the

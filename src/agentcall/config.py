@@ -294,9 +294,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("REMOTE_CLOUD_ENABLED", "使用 CallPilot 云控制面", "bool", "false",
                requires_restart=True),
     ConfigSpec("REMOTE_CLOUD_URL", "CallPilot 云控制面地址", "str",
-               "https://api.bondings.ai", requires_restart=True),
+               "https://api-beta.bondings.ai", requires_restart=True),
     ConfigSpec("REMOTE_CLOUD_DIALER_URL", "CallPilot 手机拨号地址", "str",
-               "https://dial.bondings.ai/", editable=False, hidden=True),
+               "https://dial-beta.bondings.ai/", editable=False, hidden=True),
     ConfigSpec("REMOTE_MEDIA_PROVIDER", "远程媒体服务", "select", "livekit",
                choices=("livekit",)),
     # EC20/EG25 真机验证：UAC 路径只注入带内双音时，运营商 IVR 可能不识别；

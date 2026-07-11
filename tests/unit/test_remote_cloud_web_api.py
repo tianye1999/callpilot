@@ -120,7 +120,7 @@ def test_dashboard_enrolls_then_manages_cloud_pairing_without_returning_secret(m
             pairing = await client.post("/api/remote_dialer/pairing", json={})
             pairing_body = await pairing.json()
             assert pairing_body["pairing"]["url"] == (
-                "https://dial.bondings.ai/#pair=ABCD-EFGH"
+                "https://dial-beta.bondings.ai/#pair=ABCD-EFGH"
             )
 
             devices = await client.get("/api/remote_dialer/devices")

@@ -5,12 +5,22 @@ import { describe, expect, it } from "vitest";
 
 const script = readFileSync(join(process.cwd(), "public", "remote_dialer.js"), "utf8");
 const page = readFileSync(join(process.cwd(), "public", "index.html"), "utf8");
+const indexSource = readFileSync(join(process.cwd(), "src", "index.ts"), "utf8");
 
 describe("hosted dialer", () => {
   it("uses the cloud pairing and call resources", () => {
     expect(script).toContain('postJson("/v1/pairing-sessions/claim"');
     expect(script).toContain('postJson("/v1/calls"');
     expect(script).toContain('fetch(`/v1/calls/${encodeURIComponent(payload.callId)}`');
+  });
+
+  it("reads the paired device name via the camelCase field the /v1 API returns", () => {
+    // The dialer reads device.displayName; reading the snake_case DB column left
+    // the paired-device label always blank. Lock both sides so neither drifts.
+    expect(script).toContain("device.displayName");
+    expect(script).not.toContain("device.display_name");
+    // Producer side: getDevice maps the snake_case DB column to the camelCase API key.
+    expect(indexSource).toContain("displayName: device.display_name");
   });
 
   it("does not render server strings through HTML injection sinks", () => {
