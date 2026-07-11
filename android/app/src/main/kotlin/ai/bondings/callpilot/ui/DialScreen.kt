@@ -10,7 +10,9 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,8 +26,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -39,15 +39,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
-/** 拨号页 v2：状态卡片 + 大号输入 + 品牌渐变拨号键。 */
+/** 拨号页 v3：状态卡片 + 大号显示 + 自绘 12 键键盘（免系统输入法）+ 绿色拨号键。 */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun DialScreen(
     pairing: StoredPairing,
@@ -82,6 +84,16 @@ fun DialScreen(
         }
     }
 
+    // 键盘输入：+ 只允许作首字符（与 Validation.NUMBER_RE 对齐），总长不超过 32
+    fun appendKey(key: String) {
+        message = null
+        if (key == "+") {
+            if (number.isEmpty()) number = "+"
+            return
+        }
+        if (number.length < 32) number += key
+    }
+
     LaunchedEffect(client) {
         launch(Dispatchers.IO) {
             try {
@@ -97,7 +109,7 @@ fun DialScreen(
             .fillMaxSize()
             .padding(horizontal = 24.dp),
     ) {
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(16.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -163,53 +175,90 @@ fun DialScreen(
             }
         }
 
-        Spacer(Modifier.height(36.dp))
-        OutlinedTextField(
-            value = number,
-            onValueChange = {
-                number = it.filter { c -> c.isDigit() || c == '+' || c == '*' || c == '#' }
-            },
-            placeholder = {
+        Spacer(Modifier.weight(1f))
+
+        // 号码显示行：号码绝对居中，退格叠放在右缘（点删一位，长按清空）
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (number.isEmpty()) {
                 Text(
                     "输入号码",
-                    style = MaterialTheme.typography.headlineMedium,
+                    fontSize = 30.sp,
                     color = MaterialTheme.colorScheme.outline,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth(),
                 )
-            },
-            textStyle = MaterialTheme.typography.headlineMedium.copy(
-                textAlign = TextAlign.Center,
-                fontFamily = FontFamily.Monospace,
-            ),
-            singleLine = true,
-            shape = RoundedCornerShape(16.dp),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = MaterialTheme.colorScheme.primary,
-                unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
-            ),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "真机测试只拨 10000（免费客服热线）",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.outline,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth(),
-        )
-
-        message?.let {
-            Spacer(Modifier.height(10.dp))
-            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            } else {
+                Text(
+                    number,
+                    fontSize = when {
+                        number.length <= 12 -> 34.sp
+                        number.length <= 18 -> 26.sp
+                        else -> 20.sp
+                    },
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1,
+                    modifier = Modifier.padding(horizontal = 44.dp),
+                )
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .size(44.dp)
+                        .clip(CircleShape)
+                        .combinedClickable(
+                            onClick = { number = number.dropLast(1) },
+                            onLongClick = { number = "" },
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "⌫",
+                        fontSize = 22.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
 
-        Spacer(Modifier.weight(1f))
-        GradientButton(
-            text = "📞  拨号",
-            enabled = Validation.isValidNumber(number),
-            onClick = ::dial,
+        message?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                it,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+
+        Spacer(Modifier.height(18.dp))
+        Keypad(
+            onKey = ::appendKey,
+            zeroLongPressPlus = true,
+            modifier = Modifier.align(Alignment.CenterHorizontally),
         )
-        Spacer(Modifier.height(32.dp))
+
+        Spacer(Modifier.height(22.dp))
+        val canDial = Validation.isValidNumber(number)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(72.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (canDial) Brand.Green
+                        else MaterialTheme.colorScheme.surfaceVariant,
+                    )
+                    .combinedClickable(enabled = canDial, onClick = ::dial),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("📞", fontSize = 28.sp, color = Color.White)
+            }
+        }
+        Spacer(Modifier.height(28.dp))
     }
 }
