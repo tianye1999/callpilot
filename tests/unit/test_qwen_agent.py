@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import threading
 import time
 from queue import Empty
@@ -410,6 +411,27 @@ def test_manual_response_control_tool_response_blocks_overlap(monkeypatch):
             "response": {"id": "tool-response"},
         })
         assert _wait_until(lambda: len(conv.responses) == 2)
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_invalid_tool_arguments_log_omits_raw_payload(monkeypatch, caplog):
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    conversation = fake_cls.instances[-1]
+    arguments = '{"digits":"73#"'
+    try:
+        with caplog.at_level(logging.WARNING):
+            agent._dispatch_tool_call(
+                "send_dtmf", "call-invalid-json", arguments
+            )
+            assert _wait_until(lambda: len(conversation.items) == 1)
+
+        assert "73#" not in caplog.text
+        assert arguments not in caplog.text
+        assert "send_dtmf" in caplog.text
+        assert f"arguments_length={len(arguments)}" in caplog.text
+        assert "error_type=JSONDecodeError" in caplog.text
     finally:
         asyncio.run(agent.stop())
 

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fakes import FakeModem
 
@@ -219,18 +220,41 @@ def test_hangup_triggers_schedule_callback():
 
 # ---- send_dtmf ----
 
-def test_send_dtmf_dispatches_to_modem_and_logs_record():
+def test_send_dtmf_dispatch_redacts_logs_result_and_audit(caplog):
     modem = FakeModem()
     sent: list[str] = []
     modem.send_dtmf = lambda digits: sent.append(digits) or True  # type: ignore[attr-defined]
     record = SpyRecord()
     tools, _, _ = make_tools(modem=modem, record=record)
 
-    result = tools._send_dtmf({"digits": "103#"})
+    with caplog.at_level(logging.INFO):
+        result = tools.register().dispatch("send_dtmf", {"digits": "103#"})
 
     assert result["success"] is True
+    assert result["count"] == 4
+    assert result["mode"] == "qvts"
+    assert "digits" not in result
+    assert "103#" not in result["message"]
+    assert "103#" not in caplog.text
+    assert "count=4" in caplog.text
+    assert "mode=qvts" in caplog.text
+    assert "result=success" in caplog.text
     assert sent == ["103#"]
-    assert record.events == [("dtmf", {"digits": "103#", "mode": "qvts"})]  # 审计日志
+    assert record.events == [
+        ("dtmf", {"count": 4, "mode": "qvts", "result": "success"})
+    ]  # 审计日志
+
+
+def test_send_dtmf_audit_does_not_persist_plaintext_digits():
+    record = SpyRecord()
+    tools, _, _ = make_tools(record=record)
+
+    tools._send_dtmf({"digits": "103#"})
+
+    _event_type, fields = record.events[0]
+    assert fields["count"] == 4
+    assert "digits" not in fields
+    assert "103#" not in repr(fields)
 
 
 def test_send_dtmf_uses_injected_session_sender_and_logs_mode():
@@ -246,7 +270,9 @@ def test_send_dtmf_uses_injected_session_sender_and_logs_mode():
     assert result["success"] is True
     assert sent == ["9"]
     assert modem.calls == []
-    assert record.events == [("dtmf", {"digits": "9", "mode": "inband"})]
+    assert record.events == [
+        ("dtmf", {"count": 1, "mode": "inband", "result": "success"})
+    ]
 
 
 def test_send_dtmf_rejects_empty_digits():
@@ -255,14 +281,27 @@ def test_send_dtmf_rejects_empty_digits():
     assert modem.calls == []
 
 
-def test_send_dtmf_exception_reported_as_failure():
+def test_send_dtmf_failure_dispatch_redacts_logs_result_and_audit(caplog):
     modem = FakeModem()
     modem.send_dtmf = lambda digits: (_ for _ in ()).throw(RuntimeError("AT 超时"))  # type: ignore[attr-defined]
-    tools, _, _ = make_tools(modem=modem)
+    record = SpyRecord()
+    tools, _, _ = make_tools(modem=modem, record=record)
 
-    result = tools._send_dtmf({"digits": "1"})
+    with caplog.at_level(logging.INFO):
+        result = tools.register().dispatch("send_dtmf", {"digits": "73#"})
+
     assert result["success"] is False
-    assert "AT 超时" in result["message"]
+    assert result["count"] == 3
+    assert result["mode"] == "qvts"
+    assert "digits" not in result
+    assert "73#" not in result["message"]
+    assert "73#" not in caplog.text
+    assert "count=3" in caplog.text
+    assert "mode=qvts" in caplog.text
+    assert "result=failure" in caplog.text
+    assert record.events == [
+        ("dtmf", {"count": 3, "mode": "qvts", "result": "failure"})
+    ]
 
 
 # ---- query_verification_code ----

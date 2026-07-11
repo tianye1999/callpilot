@@ -814,13 +814,23 @@ class CallSession:
 
     def send_dtmf(self, digits: str) -> tuple[bool, str | None]:
         """发送 DTMF；UAC 模式默认把双音作为带内 PCM 注入下行队列。"""
+        mode = "unknown"
         try:
             ok, mode = self._send_dtmf_raw(digits)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("发送 DTMF 失败: %s", exc)
+            logger.warning("发送 DTMF 失败: error_type=%s", type(exc).__name__)
+            if self._record is not None:
+                self._record.log_event(
+                    "dtmf", count=len(digits), mode=mode, result="failure"
+                )
             return False, "按键发送失败"
-        if ok and self._record is not None:
-            self._record.log_event("dtmf", digits=digits, mode=mode)
+        if self._record is not None:
+            self._record.log_event(
+                "dtmf",
+                count=len(digits),
+                mode=mode,
+                result="success" if ok else "failure",
+            )
         return (True, None) if ok else (False, "按键发送失败")
 
     def _send_dtmf_raw(self, digits: str) -> tuple[bool, str]:

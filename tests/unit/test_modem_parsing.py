@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -199,14 +200,19 @@ def test_no_carrier_triggers_hangup():
 # ---- DTMF 发送 ----
 
 
-def test_send_dtmf_sends_each_digit(monkeypatch):
+def test_send_dtmf_sends_each_digit_without_logging_plaintext(monkeypatch, caplog):
     modem = make_modem()
     sent_cmds = []
     monkeypatch.setattr(modem, "_send", lambda cmd: sent_cmds.append(cmd) or "OK")
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
 
-    assert modem.send_dtmf("1a#") is True  # 小写自动转大写
+    with caplog.at_level(logging.INFO):
+        assert modem.send_dtmf("1a#") is True  # 小写自动转大写
+
     assert sent_cmds == ['AT+QVTS="1"', 'AT+QVTS="A"', 'AT+QVTS="#"']
+    assert "1A#" not in caplog.text
+    assert "count=3" in caplog.text
+    assert "result=success" in caplog.text
 
 
 def test_send_dtmf_falls_back_to_vts(monkeypatch):
@@ -224,11 +230,28 @@ def test_send_dtmf_falls_back_to_vts(monkeypatch):
     assert sent_cmds == ['AT+QVTS="5"', 'AT+VTS="5"']
 
 
-def test_send_dtmf_rejects_invalid(monkeypatch):
+def test_send_dtmf_rejects_invalid_without_logging_plaintext(monkeypatch, caplog):
     modem = make_modem()
     monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
-    assert modem.send_dtmf("12x") is False
+    with caplog.at_level(logging.WARNING):
+        assert modem.send_dtmf("12x") is False
+
     assert modem.send_dtmf("") is False
+    assert "12X" not in caplog.text
+    assert "count=3" in caplog.text
+    assert "result=failure" in caplog.text
+
+
+def test_send_dtmf_modem_failure_does_not_log_failed_digit(monkeypatch, caplog):
+    modem = make_modem()
+    monkeypatch.setattr(modem, "_send", lambda cmd: "ERROR")
+
+    with caplog.at_level(logging.WARNING):
+        assert modem.send_dtmf("#") is False
+
+    assert "#" not in caplog.text
+    assert "count=1" in caplog.text
+    assert "result=failure" in caplog.text
 
 
 # ---- hangup 原子性：指令序列不被并发 _send 插队 ----

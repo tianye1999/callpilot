@@ -373,8 +373,13 @@ class OpenAIVoiceAgent(VoiceAgent):
         try:
             try:
                 args = json.loads(arguments) if arguments.strip() else {}
-            except json.JSONDecodeError:
-                logger.warning("工具参数解析失败: %s", arguments)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "工具 %s 参数解析失败: arguments_length=%d, error_type=%s",
+                    name,
+                    len(arguments),
+                    type(exc).__name__,
+                )
                 args = {}
             if self._tools is not None:
                 # dispatch 可能有阻塞 IO（发短信/AT 指令），放线程池执行。

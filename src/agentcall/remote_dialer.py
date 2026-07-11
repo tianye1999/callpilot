@@ -443,8 +443,14 @@ class RemoteWebDialerCoordinator:
                 bridge.write_modem_chunks([tone])
         if mode in {"qvts", "both"}:
             ok = self.modem.send_dtmf(digits) and ok
-        if ok and self._record is not None:
-            self._record.log_event("dtmf", digits=digits, mode=mode, source=REMOTE_CALL_SOURCE)
+        if self._record is not None:
+            self._record.log_event(
+                "dtmf",
+                count=len(digits),
+                mode=mode,
+                result="success" if ok else "failure",
+                source=REMOTE_CALL_SOURCE,
+            )
         await self._send_ephemeral_status(
             "connected",
             event="dtmf_sent" if ok else "dtmf_failed",

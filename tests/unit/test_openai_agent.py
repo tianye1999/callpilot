@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 
 import pytest
 
@@ -405,6 +406,26 @@ def test_tool_call_round_trip(monkeypatch):
     # function_call_output 之后必须跟 response.create 让模型接着说
     idx = ws.sent.index(outputs[0])
     assert ws.sent[idx + 1] == {"type": "response.create"}
+
+
+def test_invalid_tool_arguments_log_omits_raw_payload(caplog):
+    agent = _make_agent()
+    ws = _FakeWs()
+    agent._ws = ws
+    arguments = '{"digits":"73#"'
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(
+            agent._dispatch_tool_call(
+                "send_dtmf", "call-invalid-json", arguments, ws
+            )
+        )
+
+    assert "73#" not in caplog.text
+    assert arguments not in caplog.text
+    assert "send_dtmf" in caplog.text
+    assert f"arguments_length={len(arguments)}" in caplog.text
+    assert "error_type=JSONDecodeError" in caplog.text
 
 
 def test_terminal_tool_skips_response_create(monkeypatch):
