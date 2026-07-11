@@ -52,6 +52,15 @@ def test_packaged_app_declares_microphone_permission_and_seed_data():
     assert '"seed"' in text
 
 
+def test_packaged_app_collects_both_livekit_namespace_distributions():
+    text = SPEC_FILE.read_text(encoding="utf-8")
+
+    assert '("livekit.rtc", "livekit.api")' in text
+    assert 'copy_metadata("livekit")' in text
+    assert 'copy_metadata("livekit-api")' in text
+    assert '"livekit.rtc"' in (PROJECT_ROOT / "app.py").read_text(encoding="utf-8")
+
+
 def test_build_installer_codesigns_app_with_audio_input_entitlement_only():
     text = BUILD_SCRIPT.read_text(encoding="utf-8")
     entitlements = ENTITLEMENTS_FILE.read_text(encoding="utf-8")

@@ -53,6 +53,7 @@ class SlidingWindowRateLimiter:
 
 
 _SMS_LIMITER = SlidingWindowRateLimiter(window_seconds=3600)
+_REMOTE_DIAL_LIMITER = SlidingWindowRateLimiter(window_seconds=3600)
 
 
 def acquire_sms_send_slot(limit_per_hour: int) -> RateLimitResult:
@@ -63,3 +64,15 @@ def acquire_sms_send_slot(limit_per_hour: int) -> RateLimitResult:
 def reset_sms_rate_limit_state() -> None:
     """测试/维护用：清空进程内短信频控状态。"""
     _SMS_LIMITER.reset()
+
+
+def acquire_remote_dial_slot(limit_per_hour: int) -> RateLimitResult:
+    """Reserve one remote Web Dialer call attempt in the shared hourly window."""
+
+    return _REMOTE_DIAL_LIMITER.acquire("remote_dial", limit_per_hour)
+
+
+def reset_remote_dial_rate_limit_state() -> None:
+    """Test/maintenance hook for the process-local remote dialing limiter."""
+
+    _REMOTE_DIAL_LIMITER.reset()

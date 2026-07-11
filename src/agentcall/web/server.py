@@ -38,9 +38,15 @@ from ..rate_limit import acquire_sms_send_slot
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+_REMOTE_DIALER_CSP = (
+    "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; "
+    "style-src 'self'; connect-src 'self' wss:; media-src blob:; worker-src 'self' blob:; "
+    "manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
 
 # 通话 ID 白名单字符（call_log 生成的目录名），防路径穿越。
 _CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_REMOTE_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 
 def _ensure_setup_sms_token(app: web.Application) -> str | None:
@@ -218,6 +224,7 @@ def build_app(
     meta: dict | None = None,
     restart_event=None,
     auth_token: str | None = None,
+    remote_pairing_store=None,
 ) -> web.Application:
     middlewares = [_error_middleware]
     if auth_token:
@@ -230,8 +237,19 @@ def build_app(
     # 由 app.py 传入的 threading.Event；置位后主循环停止并 os.execv 自重启。
     app["restart_event"] = restart_event
     app["setup_sms_token"] = [secrets.token_urlsafe(24)]
+    app["remote_pairing_store"] = remote_pairing_store
 
     app.router.add_get("/", _index)
+    app.router.add_get("/remote-dialer", _remote_dialer_redirect)
+    app.router.add_get("/remote-dialer/", _remote_dialer_page)
+    app.router.add_get("/remote-dialer/remote_dialer.css", _remote_dialer_asset)
+    app.router.add_get("/remote-dialer/remote_dialer.js", _remote_dialer_asset)
+    app.router.add_get("/remote_dialer.css", _remote_dialer_asset)
+    app.router.add_get("/remote_dialer.js", _remote_dialer_asset)
+    app.router.add_get("/manifest.webmanifest", _remote_dialer_asset)
+    app.router.add_get("/remote_dialer_sw.js", _remote_dialer_asset)
+    app.router.add_get("/callpilot-192.png", _remote_dialer_asset)
+    app.router.add_get("/callpilot-512.png", _remote_dialer_asset)
     app.router.add_get("/api/meta", _meta)
     app.router.add_get("/ws", _websocket)
     app.router.add_get("/ws/audio", _audio_websocket)
@@ -239,6 +257,14 @@ def build_app(
     app.router.add_post("/api/call/dial", _dial)
     app.router.add_post("/api/call/hangup", _hangup)
     app.router.add_post("/api/call/dtmf", _dtmf)
+    app.router.add_get("/api/remote_dialer/status", _remote_dialer_status)
+    app.router.add_post("/api/remote_dialer/invite", _remote_dialer_invite)
+    app.router.add_post("/api/remote_dialer/cancel", _remote_dialer_cancel)
+    app.router.add_post("/api/remote_dialer/pairing", _remote_dialer_pairing)
+    app.router.add_get("/api/remote_dialer/devices", _remote_dialer_devices)
+    app.router.add_delete(
+        "/api/remote_dialer/devices/{device_id}", _remote_dialer_device_revoke
+    )
     app.router.add_post("/api/call/batch_dial", _batch_dial)
     app.router.add_get("/api/call/queue", _queue_status)
     app.router.add_get("/api/number_profiles", _number_profiles)
@@ -268,6 +294,40 @@ async def _index(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(
         index_file,
         headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
+
+
+async def _remote_dialer_redirect(request: web.Request) -> web.StreamResponse:
+    raise web.HTTPFound("/remote-dialer/")
+
+
+async def _remote_dialer_page(request: web.Request) -> web.StreamResponse:
+    return web.FileResponse(
+        STATIC_DIR / "remote_dialer.html",
+        headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "Permissions-Policy": "microphone=(self), camera=()",
+            "Content-Security-Policy": _REMOTE_DIALER_CSP,
+        },
+    )
+
+
+async def _remote_dialer_asset(request: web.Request) -> web.StreamResponse:
+    filename = request.path.rsplit("/", 1)[-1]
+    if filename not in {
+        "remote_dialer.css",
+        "remote_dialer.js",
+        "manifest.webmanifest",
+        "remote_dialer_sw.js",
+        "callpilot-192.png",
+        "callpilot-512.png",
+    }:
+        raise web.HTTPNotFound()
+    return web.FileResponse(
+        STATIC_DIR / filename,
+        headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -460,6 +520,110 @@ async def _dtmf(request: web.Request) -> web.Response:
     if not ok and err == "当前没有进行中的通话":
         return web.json_response({"ok": False, "error": err}, status=409)
     return web.json_response({"ok": bool(ok)})
+
+
+async def _remote_dialer_status(request: web.Request) -> web.Response:
+    service = require_service(request)
+    return web.json_response({"ok": True, **service.remote_dialer_status()})
+
+
+async def _remote_dialer_invite(request: web.Request) -> web.Response:
+    service = require_service(request)
+    loop = asyncio.get_running_loop()
+    invite, error = await loop.run_in_executor(
+        None, service.create_remote_dialer_invite
+    )
+    if invite is None:
+        return web.json_response(
+            {"ok": False, "error": error or "无法创建远程拨号邀请"},
+            status=409,
+            headers={"Cache-Control": "no-store"},
+        )
+    return web.json_response(
+        {"ok": True, "invite": invite},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _remote_dialer_cancel(request: web.Request) -> web.Response:
+    service = require_service(request)
+    loop = asyncio.get_running_loop()
+    ok, error = await loop.run_in_executor(None, service.cancel_remote_dialer)
+    if not ok:
+        return web.json_response(
+            {"ok": False, "error": error or "当前没有远程拨号会话"},
+            status=409,
+        )
+    return web.json_response({"ok": True})
+
+
+async def _remote_dialer_pairing(request: web.Request) -> web.Response:
+    if not config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
+        return web.json_response(
+            {"ok": False, "error": "远程网页拨号未启用"}, status=403
+        )
+    store = request.app.get("remote_pairing_store")
+    if store is None:
+        return web.json_response(
+            {"ok": False, "error": "远程配对服务未就绪"}, status=503
+        )
+    try:
+        offer = store.create_pairing(
+            config.get_str("REMOTE_CONTROL_URL"),
+            ttl_seconds=config.get_int("REMOTE_PAIRING_TTL_SECONDS"),
+        )
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+    return web.json_response(
+        {
+            "ok": True,
+            "pairing": {
+                "code": offer.code,
+                "url": offer.pairing_url,
+                "expires_at": offer.expires_at,
+            },
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _remote_dialer_devices(request: web.Request) -> web.Response:
+    store = request.app.get("remote_pairing_store")
+    if store is None:
+        return web.json_response(
+            {"ok": False, "error": "远程配对服务未就绪"}, status=503
+        )
+    devices = [
+        {
+            "device_id": device.device_id,
+            "display_name": device.display_name,
+            "created_at": device.created_at,
+            "last_used_at": device.last_used_at,
+            "revoked_at": device.revoked_at,
+        }
+        for device in store.list_devices()
+    ]
+    return web.json_response(
+        {"ok": True, "devices": devices}, headers={"Cache-Control": "no-store"}
+    )
+
+
+async def _remote_dialer_device_revoke(request: web.Request) -> web.Response:
+    device_id = request.match_info.get("device_id", "")
+    if not _REMOTE_DEVICE_ID_RE.fullmatch(device_id):
+        return web.json_response(
+            {"ok": False, "error": "设备 ID 格式不合法"}, status=400
+        )
+    store = request.app.get("remote_pairing_store")
+    if store is None:
+        return web.json_response(
+            {"ok": False, "error": "远程配对服务未就绪"}, status=503
+        )
+    if not store.revoke(device_id):
+        return web.json_response(
+            {"ok": False, "error": "设备不存在或已撤销"}, status=404
+        )
+    return web.json_response({"ok": True})
 
 
 async def _batch_dial(request: web.Request) -> web.Response:

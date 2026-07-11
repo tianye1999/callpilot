@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from agentcall import config, number_profiles
 from agentcall.call_agent import CallAgentService
 from agentcall.events import EventHub
+from agentcall.remote_pairing import RemotePairingStore
+from agentcall.web.remote_gateway import build_remote_gateway
 from agentcall.web.server import build_app
 
 
@@ -166,6 +168,13 @@ def main() -> None:
     # 韧性启动：模组连接交给后台 supervisor 反复重试，Web 服务不因模组缺席而退出。
     service.start()
 
+    remote_pairing_store = None
+    if config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
+        remote_pairing_store = RemotePairingStore(
+            data_dir / "remote_devices.json",
+            max_devices=config.get_int("REMOTE_MAX_PAIRED_DEVICES"),
+        )
+
     dial_whitelist = config.get_str("DIAL_WHITELIST").strip()
     logger.info(
         "功能开关: 录音=%s(保留%s天) 摘要=%s 本地监听=%s 外呼白名单=%s",
@@ -186,11 +195,37 @@ def main() -> None:
         restart_event=restart_event,
         # loopback 下不启用令牌校验（行为不变）；非 loopback 上面已保证 token 非空。
         auth_token=web_auth_token if not config.is_loopback_host(host) else None,
+        remote_pairing_store=remote_pairing_store,
     )
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, host, port)
     loop.run_until_complete(site.start())
+
+    remote_runner = None
+    if remote_pairing_store is not None:
+        remote_app = build_remote_gateway(
+            service,
+            remote_pairing_store,
+            public_url=config.get_str("REMOTE_CONTROL_URL"),
+        )
+        remote_runner = web.AppRunner(remote_app, access_log=None)
+        try:
+            loop.run_until_complete(remote_runner.setup())
+            remote_site = web.TCPSite(
+                remote_runner,
+                "127.0.0.1",
+                config.get_int("REMOTE_GATEWAY_PORT"),
+            )
+            loop.run_until_complete(remote_site.start())
+            logger.info(
+                "远程拨号最小权限网关已启动: http://127.0.0.1:%s",
+                config.get_int("REMOTE_GATEWAY_PORT"),
+            )
+        except OSError as exc:
+            logger.error("远程拨号网关启动失败: %s", exc)
+            loop.run_until_complete(remote_runner.cleanup())
+            remote_runner = None
 
     url = f"http://{host}:{port}"
     logger.info("网页仪表盘已启动: %s", url)
@@ -208,6 +243,8 @@ def main() -> None:
             service.monitor.stop()
         if service.uplink_monitor is not None:
             service.uplink_monitor.stop()
+        if remote_runner is not None:
+            loop.run_until_complete(remote_runner.cleanup())
         loop.run_until_complete(runner.cleanup())
         loop.close()
 
@@ -229,6 +266,12 @@ def _selftest() -> int:
         "agentcall.agents.local_agent",
         "agentcall.local_models",
         "agentcall.sms_email_forwarder",
+        "agentcall.remote_dialer",
+        "agentcall.remote_pairing",
+        "agentcall.livekit_media",
+        "agentcall.web.remote_gateway",
+        "livekit.rtc",
+        "livekit.api",
     ]
     optional = {"sherpa_onnx"}
     ok = True

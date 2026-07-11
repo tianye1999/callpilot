@@ -11,7 +11,12 @@ import sys
 import tomllib
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_data_files,
+    collect_submodules,
+    copy_metadata,
+)
 
 project_root = Path(os.environ["AGENTCALL_BUILD_ROOT"]).resolve()
 
@@ -34,6 +39,17 @@ hiddenimports = [
 ]
 hiddenimports += collect_submodules("agentcall")
 datas += collect_data_files("agentcall")
+
+# Remote Web Dialer uses two distributions sharing the ``livekit`` namespace.
+# Collect each contribution explicitly; rtc also carries a platform-specific FFI
+# library that ordinary module discovery cannot see.
+for _livekit_package in ("livekit.rtc", "livekit.api"):
+    _lk_datas, _lk_binaries, _lk_hidden = collect_all(_livekit_package)
+    datas += _lk_datas
+    binaries += _lk_binaries
+    hiddenimports += _lk_hidden
+datas += copy_metadata("livekit")
+datas += copy_metadata("livekit-api")
 
 # 三段式 local provider 的 sherpa-onnx（可选依赖）：装了才收进包。
 # 打包 venv 由 build_installer.sh 的 [local] extra 装入；缺失时静默跳过，

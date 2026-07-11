@@ -41,6 +41,14 @@ from .prompts import (
     owner_name,
     winddown_instructions,
 )
+from .rate_limit import acquire_remote_dial_slot
+from .remote_dialer import (
+    RemoteDialerInvite,
+    RemoteDialerRuntimeConfig,
+    RemoteDialerWorker,
+    RemoteWebDialerCoordinator,
+    issue_livekit_session,
+)
 from .sms_email_forwarder import SmsEmailForwarder
 from .summarizer import judge_wrap_up, summarize_call
 
@@ -922,8 +930,16 @@ class CallAgentService:
         self.audio_keyword = audio_keyword
         self.provider = provider
         self.audio_mode = audio_mode
+        self.pcm_port = pcm_port
+        self.pcm_baudrate = pcm_baudrate
+        self.tx_gain = tx_gain
         self.hub = hub
         self._ring_lock = threading.Lock()
+        self._remote_setup_lock = threading.Lock()
+        self._remote_worker: RemoteDialerWorker | None = None
+        self._remote_invite: RemoteDialerInvite | None = None
+        self._remote_session_device_id: str | None = None
+        self._remote_call_owner: RemoteWebDialerCoordinator | None = None
         # 模组连接状态与后台 supervisor：首启时模组不在也不阻塞 Web，
         # supervisor 反复重连直到成功（首次连上后由 modem 读循环自愈接管）。
         # 注入 modem（测试/直连）视为已就绪；自建的由 supervisor 连上后置 True。
@@ -1021,7 +1037,7 @@ class CallAgentService:
             # 同一通来电会被 RING 主动上报和 CLCC 轮询重复触发，需去重：
             # 已有会话进行中时直接忽略，避免重复接听 / 抢占 PCM 串口导致崩溃。
             with self._ring_lock:
-                if self.session.is_active:
+                if self.session.is_active or self._remote_call_owner is not None:
                     logger.debug("已有通话进行中，忽略重复的 RING/CLCC: %s", caller)
                     return
                 logger.info("来电号码: %s", caller or "未知")
@@ -1042,6 +1058,11 @@ class CallAgentService:
                 self.session.start()
 
         def on_hangup() -> None:
+            with self._ring_lock:
+                remote_owner = self._remote_call_owner
+            if remote_owner is not None:
+                remote_owner.request_call_stop("remote_party_hangup")
+                return
             self.session.stop()
             self.modem.hangup()
 
@@ -1091,7 +1112,7 @@ class CallAgentService:
             return False, "模组未连接（检查 USB 桥与 EC20）"
         self._remember_outbound_task(task)
         with self._ring_lock:
-            if self.session.is_active:
+            if self.session.is_active or self._remote_call_owner is not None:
                 return False, "当前正在通话中，请稍后再拨"
             self.session.current_caller = number
             if preset_id is None:
@@ -1112,6 +1133,11 @@ class CallAgentService:
 
     def hangup(self) -> tuple[bool, str | None]:
         """挂断进行中的通话（AI 与 IVR 互相不挂断时的人工兜底）。"""
+        with self._ring_lock:
+            remote_owner = self._remote_call_owner
+        if remote_owner is not None:
+            remote_owner.request_call_stop("local_dashboard_hangup")
+            return True, None
         if not self.session.is_active:
             return False, "当前没有进行中的通话"
         self.session.stop()
@@ -1119,9 +1145,203 @@ class CallAgentService:
 
     def send_dtmf(self, digits: str) -> tuple[bool, str | None]:
         """通话中人工发送 DTMF 按键（IVR 菜单导航）。"""
+        with self._ring_lock:
+            remote_owner = self._remote_call_owner
+        if remote_owner is not None:
+            accepted = remote_owner.submit_local_command(
+                {"type": "dtmf", "digits": digits}
+            )
+            return (True, None) if accepted else (False, "按键发送失败")
         if not self.session.is_active:
             return False, "当前没有进行中的通话"
         return self.session.send_dtmf(digits)
+
+    def create_remote_dialer_invite(self) -> tuple[dict | None, str | None]:
+        """Prepare one short-lived browser call session; never exposes admin APIs."""
+
+        if not config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
+            return None, "远程网页拨号未启用"
+        if not self.modem_connected:
+            return None, "模组未连接（检查 USB 桥与 EC20）"
+
+        with self._remote_setup_lock:
+            worker = self._remote_worker
+            invite = self._remote_invite
+            if (
+                worker is not None
+                and worker.is_running
+                and self._remote_session_device_id is not None
+            ):
+                return None, "远程拨号线路正在被已配对手机使用"
+            if (
+                worker is not None
+                and worker.is_running
+                and invite is not None
+                and invite.expires_at > time.time()
+            ):
+                return self._invite_payload(invite), None
+            if worker is not None and worker.is_running:
+                worker.stop("invite_expired")
+
+            try:
+                invite, worker = self._build_remote_worker()
+                self._remote_worker = worker
+                self._remote_invite = invite
+                self._remote_session_device_id = None
+                worker.start(timeout=10.0)
+            except (ImportError, RuntimeError, ValueError) as exc:
+                self._remote_worker = None
+                self._remote_invite = None
+                self._remote_session_device_id = None
+                logger.warning(
+                    "创建远程拨号邀请失败: error_type=%s", type(exc).__name__
+                )
+                return None, "远程媒体连接失败，请检查 LiveKit 和拨号页配置"
+            return self._invite_payload(invite), None
+
+    def create_paired_remote_dialer_invite(
+        self, device_id: str
+    ) -> tuple[dict | None, str | None]:
+        """Create a fresh session for one paired phone without sharing active media."""
+
+        if not config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
+            return None, "远程网页拨号未启用"
+        if not self.modem_connected:
+            return None, "模组未连接（检查 USB 桥与 EC20）"
+
+        with self._remote_setup_lock:
+            worker = self._remote_worker
+            if worker is not None and worker.is_running:
+                return None, "远程拨号线路正在使用，请结束当前会话后重试"
+            try:
+                invite, worker = self._build_remote_worker()
+                self._remote_worker = worker
+                self._remote_invite = invite
+                self._remote_session_device_id = device_id
+                worker.start(timeout=10.0)
+            except (ImportError, RuntimeError, ValueError) as exc:
+                self._remote_worker = None
+                self._remote_invite = None
+                self._remote_session_device_id = None
+                logger.warning(
+                    "创建已配对远程拨号会话失败: error_type=%s", type(exc).__name__
+                )
+                return None, "远程媒体连接失败，请检查 LiveKit 和拨号页配置"
+            return self._invite_payload(invite), None
+
+    def remote_dialer_status(self) -> dict:
+        """Return non-secret readiness/session state for the local dashboard."""
+
+        enabled = config.get_bool("REMOTE_WEB_DIALER_ENABLED")
+        required = (
+            "REMOTE_CONTROL_URL",
+            "LIVEKIT_URL",
+            "LIVEKIT_API_KEY",
+            "LIVEKIT_API_SECRET",
+        )
+        missing = [key for key in required if not config.get_str(key).strip()]
+        worker = self._remote_worker
+        payload: dict = {
+            "enabled": enabled,
+            "configured": not missing,
+            "missing": missing,
+            "active": bool(worker and worker.is_running),
+        }
+        if worker is not None:
+            payload.update(worker.coordinator.status())
+        return payload
+
+    def cancel_remote_dialer(self) -> tuple[bool, str | None]:
+        with self._remote_setup_lock:
+            worker = self._remote_worker
+            if worker is None or not worker.is_running:
+                self._remote_worker = None
+                self._remote_invite = None
+                self._remote_session_device_id = None
+                return False, "当前没有远程拨号会话"
+            worker.stop("local_dashboard_cancel")
+            self._remote_worker = None
+            self._remote_invite = None
+            self._remote_session_device_id = None
+        return True, None
+
+    def _build_remote_worker(self) -> tuple[RemoteDialerInvite, RemoteDialerWorker]:
+        if config.get_str("REMOTE_MEDIA_PROVIDER").strip().lower() != "livekit":
+            raise ValueError("REMOTE_MEDIA_PROVIDER 仅支持 livekit")
+        issued = issue_livekit_session(
+            livekit_url=config.get_str("LIVEKIT_URL"),
+            api_key=config.get_str("LIVEKIT_API_KEY"),
+            api_secret=config.get_str("LIVEKIT_API_SECRET"),
+            public_url=config.get_str("REMOTE_CONTROL_URL"),
+            ttl_seconds=config.get_int("REMOTE_INVITE_TTL_SECONDS"),
+        )
+        from .livekit_media import LiveKitRemoteMediaEndpoint
+
+        endpoint = LiveKitRemoteMediaEndpoint(issued)
+        runtime = RemoteDialerRuntimeConfig(
+            audio_mode=self.audio_mode,
+            audio_keyword=self.audio_keyword,
+            pcm_port=self.pcm_port,
+            pcm_baudrate=self.pcm_baudrate,
+            tx_gain=self.tx_gain,
+            disconnect_grace_seconds=max(
+                0.0, config.get_float("REMOTE_DISCONNECT_GRACE_SECONDS")
+            ),
+            outbound_max_seconds=max(
+                0.0, float(config.get_int("REMOTE_OUTBOUND_MAX_SECONDS"))
+            ),
+            connect_timeout_seconds=max(
+                1.0, config.get_float("REMOTE_CONNECT_TIMEOUT_SECONDS")
+            ),
+            dtmf_mode=config.get_str("REMOTE_DTMF_MODE"),
+        )
+        coordinator = RemoteWebDialerCoordinator(
+            session_id=issued.invite.session_id,
+            expires_at=issued.invite.expires_at,
+            modem=self.modem,
+            endpoint=endpoint,
+            runtime=runtime,
+            call_logger=self.call_logger,
+            reserve_line=self._reserve_remote_line,
+            release_line=self._release_remote_line,
+            publish_event=self._publish,
+        )
+        return issued.invite, RemoteDialerWorker(coordinator)
+
+    def _reserve_remote_line(
+        self, owner: RemoteWebDialerCoordinator
+    ) -> str | None:
+        with self._ring_lock:
+            worker = self._remote_worker
+            if worker is None or worker.coordinator is not owner:
+                return "远程拨号会话已过期"
+            if not config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
+                return "远程网页拨号已关闭"
+            if not self.modem_connected:
+                return "模组未连接"
+            if self.session.is_active or self._remote_call_owner is not None:
+                return "当前正在通话中，请稍后再拨"
+            limit = acquire_remote_dial_slot(
+                config.get_int("REMOTE_DIAL_LIMIT_PER_HOUR")
+            )
+            if not limit.allowed:
+                retry_seconds = max(1, round(limit.retry_after))
+                return f"远程外呼过于频繁，请在 {retry_seconds} 秒后重试"
+            self._remote_call_owner = owner
+        return None
+
+    def _release_remote_line(self, owner: RemoteWebDialerCoordinator) -> None:
+        with self._ring_lock:
+            if self._remote_call_owner is owner:
+                self._remote_call_owner = None
+
+    @staticmethod
+    def _invite_payload(invite: RemoteDialerInvite) -> dict:
+        return {
+            "session_id": invite.session_id,
+            "url": invite.url,
+            "expires_at": invite.expires_at,
+        }
 
     @staticmethod
     def _remember_outbound_task(task: str | None) -> None:
@@ -1217,6 +1437,9 @@ class CallAgentService:
     def stop_service(self) -> None:
         """停止 supervisor 与当前会话，关闭模组（供退出时调用）。"""
         self._service_running = False
+        worker = self._remote_worker
+        if worker is not None:
+            worker.stop("service_shutdown")
         self.session.stop()
         self.modem.close()
         try:
