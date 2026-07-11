@@ -11,6 +11,7 @@ import json
 import os
 from types import SimpleNamespace
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from agentcall import config, platforms
@@ -422,6 +423,30 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
     assert "AGENT_PROVIDER=doubao" in text
     assert "RECORDING_ENABLED=false" in text
     assert os.environ["QWEN_VOICE"] == "Ethan"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_setup_recording_choice_writes_runtime_env_file(monkeypatch, tmp_path, enabled):
+    env_file = tmp_path / "runtime" / ".env"
+    real_update = config.update_env_file
+    monkeypatch.setattr(
+        config,
+        "update_env_file",
+        lambda updates: real_update(updates, env_path=env_file),
+    )
+    monkeypatch.setenv("RECORDING_ENABLED", "false" if enabled else "true")
+    async def fake_read_json(request):
+        return {"RECORDING_ENABLED": enabled}
+
+    monkeypatch.setattr(server, "read_json", fake_read_json)
+    request = make_mocked_request("POST", "/api/config")
+    response = asyncio.run(server._post_config(request))
+    assert response.status == 200
+    data = json.loads(response.body)
+    expected = "true" if enabled else "false"
+    assert data["updated"] == ["RECORDING_ENABLED"]
+    assert env_file.read_text(encoding="utf-8") == f"RECORDING_ENABLED={expected}\n"
+    assert os.environ["RECORDING_ENABLED"] == expected
 
 
 def test_config_post_invalid_rejected(monkeypatch, tmp_path):

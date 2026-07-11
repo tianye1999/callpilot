@@ -16,7 +16,7 @@
 环境变量（均有默认值，供 ``CallLogger.from_env()`` 使用）：
 
 - ``CALL_LOG_DIR``：通话记录根目录，默认运行时 data/recordings
-- ``RECORDING_ENABLED``：是否保存录音，默认开（判定走 ``config.get_bool``，
+- ``RECORDING_ENABLED``：是否保存录音，默认关（判定走 ``config.get_bool``，
   与设置面板同一套语义）
 - ``RECORDING_RETENTION_DAYS``：保留天数，默认 30；<=0 表示不自动清理
 """

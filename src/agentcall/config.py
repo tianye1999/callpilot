@@ -239,7 +239,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                editable=False, hidden=True),
     ConfigSpec("WRAP_UP_JUDGE_INTERVAL_SECONDS", "收尾裁判间隔（秒）", "float", "15.0",
                editable=False, hidden=True),
-    ConfigSpec("RECORDING_ENABLED", "通话录音开关", "bool", "true"),
+    ConfigSpec("RECORDING_ENABLED", "通话录音开关", "bool", "false"),
     ConfigSpec("RECORDING_RETENTION_DAYS", "录音保留天数", "int", "30"),
     ConfigSpec("SUMMARY_ENABLED", "通话摘要开关", "bool", "true"),
     ConfigSpec("SUMMARY_MODEL", "摘要模型", "str", "qwen-plus"),
@@ -535,6 +535,7 @@ def read_panel_values() -> list[dict]:
             "secret": spec.secret,
             "requires_restart": spec.requires_restart,
             "value": value,
+            "configured": spec.key in os.environ,
         })
     return rows
 

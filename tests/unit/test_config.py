@@ -79,9 +79,37 @@ def test_get_bool_truthy_values(monkeypatch):
 
 
 def test_get_bool_default(monkeypatch):
-    _unset(monkeypatch, "SUMMARY_ENABLED", "MONITOR_AI_PLAYBACK")
+    _unset(monkeypatch, "SUMMARY_ENABLED", "MONITOR_AI_PLAYBACK", "RECORDING_ENABLED")
     assert get_bool("SUMMARY_ENABLED") is True
     assert get_bool("MONITOR_AI_PLAYBACK") is False
+    assert get_bool("RECORDING_ENABLED") is False
+
+
+def test_recording_registry_and_env_example_default_to_off():
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert get_spec("RECORDING_ENABLED").default == "false"
+    assert re.search(r"^RECORDING_ENABLED=false$", example, re.MULTILINE)
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("true", True), ("false", False)])
+def test_recording_explicit_config_is_respected(monkeypatch, raw, expected):
+    monkeypatch.setenv("RECORDING_ENABLED", raw)
+
+    assert get_bool("RECORDING_ENABLED") is expected
+    row = next(item for item in read_panel_values() if item["key"] == "RECORDING_ENABLED")
+    assert row["value"] == raw
+    assert row["configured"] is True
+
+
+def test_recording_panel_marks_default_as_not_explicit(monkeypatch):
+    _unset(monkeypatch, "RECORDING_ENABLED")
+
+    row = next(item for item in read_panel_values() if item["key"] == "RECORDING_ENABLED")
+    assert row["value"] == "false"
+    assert row["configured"] is False
 
 
 def test_unknown_key_raises_keyerror():

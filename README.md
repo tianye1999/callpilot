@@ -301,10 +301,10 @@ New-user install & first-run Q&A: [`docs/faq.md`](docs/faq.md) (Chinese).
 
 - **Not for emergency calls.** Do not rely on CallPilot for any life-safety
   communication.
-- **Recording laws vary by jurisdiction** — call recording is **on by default**
-  and stored locally only; disable it in Settings or with
-  `RECORDING_ENABLED=false`. You are responsible for obtaining any consent the
-  law requires.
+- **Recording laws vary by jurisdiction** — call recording is **off by default**
+  and stored locally only when enabled. Choose explicitly during first-run setup,
+  and change it later in Settings or with `RECORDING_ENABLED=false`. You are
+  responsible for obtaining any consent the law requires.
 - **Anti-harassment / telemarketing rules apply** to outbound and batch dialing.
   Use the dial whitelist and dial your own numbers for testing.
 - **You bear all carrier charges and API costs.**
@@ -540,8 +540,8 @@ macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=
 
 ### 安全、隐私与合规
 
-**上真机前务必阅读。** 不用于紧急电话；通话录音**默认开启**、仅存储在本地，可在
-设置面板或 `RECORDING_ENABLED=false` 关闭——是否录音、是否需征得对方同意由你按
+**上真机前务必阅读。** 不用于紧急电话；通话录音**默认关闭**，首启时需明确选择，开启后
+仅存储在本地，可在设置面板或 `RECORDING_ENABLED=false` 关闭——是否录音、是否需征得对方同意由你按
 当地法律负责；外呼/批量呼叫须遵守反骚扰与营销合规；运营商资费与 API 费用由你自行
 承担；API Key 和 SMTP 应用密码只存于本地 `.env`（已 git 忽略），切勿提交。短信邮件
 转发默认关闭；开启后，短信发件号码、接收时间和正文会离开 App 并发往配置邮箱。本软件按「原样」提供，
