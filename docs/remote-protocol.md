@@ -105,7 +105,10 @@ EncryptedSharedPreferences），后续鉴权接口同理。
 
 1. Cookie 鉴权：原生手动携带 `__Host-callpilot-device` Cookie 头；
 2. Origin 校验：原生请求手动设置 `Origin: <public_origin>`；
-3. LiveKit 连接信息：请求 `/api/session` 后解析 `invite.url` 的 fragment。
+3. LiveKit 连接信息：请求 `/api/session` 后解析 `invite.url` 的 fragment；
+4. 网关地址免手填：配对链接 `{REMOTE_CONTROL_URL}#pair=CODE` 的 origin 即
+   `public_origin`（静态页与 /api 接口同源），原生端粘贴链接即可同时获得
+   网关地址与配对码。
 
 **提请 #31 侧评估的需求**（记录于对应 issue，非阻塞）：
 

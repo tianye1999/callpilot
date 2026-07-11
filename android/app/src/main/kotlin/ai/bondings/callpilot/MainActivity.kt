@@ -4,6 +4,7 @@ import ai.bondings.callpilot.call.CallGraph
 import ai.bondings.callpilot.call.CallState
 import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
+import ai.bondings.callpilot.ui.CallPilotTheme
 import ai.bondings.callpilot.ui.CallScreen
 import ai.bondings.callpilot.ui.DialScreen
 import ai.bondings.callpilot.ui.PairScreen
@@ -27,8 +28,11 @@ class MainActivity : ComponentActivity() {
         val store = CredentialStore(applicationContext)
         val manager = CallGraph.manager(applicationContext)
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
+            CallPilotTheme {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background,
+                ) {
                     var pairing by remember { mutableStateOf<StoredPairing?>(store.load()) }
                     val callState by manager.state.collectAsState()
                     val current = pairing

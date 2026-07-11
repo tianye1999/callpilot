@@ -38,14 +38,20 @@ class CredentialStore(context: Context) {
         return StoredPairing(gateway, name, DeviceCredential(deviceId, secret))
     }
 
+    /** 解除配对：清凭证但保留最近网关，下次配对免重新粘贴链接。 */
     fun clear() {
+        val lastGateway = prefs.getString(KEY_GATEWAY, null)
         prefs.edit().clear().apply()
+        lastGateway?.let { prefs.edit().putString(KEY_LAST_GATEWAY, it).apply() }
     }
+
+    fun loadLastGateway(): String? = prefs.getString(KEY_LAST_GATEWAY, null)
 
     private companion object {
         const val KEY_GATEWAY = "gateway_url"
         const val KEY_NAME = "display_name"
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_SECRET = "secret"
+        const val KEY_LAST_GATEWAY = "last_gateway_url"
     }
 }
