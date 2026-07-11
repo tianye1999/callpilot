@@ -1,0 +1,51 @@
+package ai.bondings.callpilot.pairing
+
+import ai.bondings.callpilot.protocol.DeviceCredential
+import android.content.Context
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+
+/** 已配对状态的持久化：网关地址 + 设备凭证，落 EncryptedSharedPreferences。 */
+data class StoredPairing(
+    val gatewayUrl: String,
+    val displayName: String,
+    val credential: DeviceCredential,
+)
+
+class CredentialStore(context: Context) {
+    private val prefs = EncryptedSharedPreferences.create(
+        context,
+        "callpilot_pairing",
+        MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+    )
+
+    fun save(pairing: StoredPairing) {
+        prefs.edit()
+            .putString(KEY_GATEWAY, pairing.gatewayUrl)
+            .putString(KEY_NAME, pairing.displayName)
+            .putString(KEY_DEVICE_ID, pairing.credential.deviceId)
+            .putString(KEY_SECRET, pairing.credential.secret)
+            .apply()
+    }
+
+    fun load(): StoredPairing? {
+        val gateway = prefs.getString(KEY_GATEWAY, null) ?: return null
+        val deviceId = prefs.getString(KEY_DEVICE_ID, null) ?: return null
+        val secret = prefs.getString(KEY_SECRET, null) ?: return null
+        val name = prefs.getString(KEY_NAME, "") ?: ""
+        return StoredPairing(gateway, name, DeviceCredential(deviceId, secret))
+    }
+
+    fun clear() {
+        prefs.edit().clear().apply()
+    }
+
+    private companion object {
+        const val KEY_GATEWAY = "gateway_url"
+        const val KEY_NAME = "display_name"
+        const val KEY_DEVICE_ID = "device_id"
+        const val KEY_SECRET = "secret"
+    }
+}
