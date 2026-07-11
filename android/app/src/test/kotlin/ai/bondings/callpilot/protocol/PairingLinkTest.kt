@@ -15,6 +15,13 @@ class PairingLinkTest {
     }
 
     @Test
+    fun `hosted 根路径配对链接只解析同源信息不猜协议`() {
+        val p = PairingLink.parse("https://dial.bondings.ai/#pair=ABCD-EFGH")
+        assertEquals("https://dial.bondings.ai", p.gatewayBase)
+        assertEquals("ABCDEFGH", p.code)
+    }
+
+    @Test
     fun `带端口的网关保留端口`() {
         val p = PairingLink.parse("https://dial.example.com:8443/x.html#pair=AAAA-BBBB")
         assertEquals("https://dial.example.com:8443", p.gatewayBase)
@@ -51,5 +58,11 @@ class PairingLinkTest {
         assertEquals("AB12CD34", PairingLink.normalizeCode(" ab12-cd34 ".trim()))
         assertNull(PairingLink.normalizeCode("ABC"))
         assertEquals("AB12-CD34", PairingLink.formatCode("AB12CD34"))
+    }
+
+    @Test
+    fun `旧存储缺少协议字段时默认 Tunnel`() {
+        assertEquals(PairingProtocol.TUNNEL, PairingProtocol.fromStored(null))
+        assertEquals(PairingProtocol.TUNNEL, PairingProtocol.fromStored("future"))
     }
 }

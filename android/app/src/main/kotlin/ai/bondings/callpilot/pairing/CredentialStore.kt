@@ -1,6 +1,7 @@
 package ai.bondings.callpilot.pairing
 
 import ai.bondings.callpilot.protocol.DeviceCredential
+import ai.bondings.callpilot.protocol.PairingProtocol
 import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
@@ -10,6 +11,8 @@ data class StoredPairing(
     val gatewayUrl: String,
     val displayName: String,
     val credential: DeviceCredential,
+    val protocol: PairingProtocol = PairingProtocol.TUNNEL,
+    val edgeId: String? = null,
 )
 
 class CredentialStore(context: Context) {
@@ -27,6 +30,8 @@ class CredentialStore(context: Context) {
             .putString(KEY_NAME, pairing.displayName)
             .putString(KEY_DEVICE_ID, pairing.credential.deviceId)
             .putString(KEY_SECRET, pairing.credential.secret)
+            .putString(KEY_PROTOCOL, pairing.protocol.storedValue)
+            .putString(KEY_EDGE_ID, pairing.edgeId)
             .apply()
     }
 
@@ -35,7 +40,10 @@ class CredentialStore(context: Context) {
         val deviceId = prefs.getString(KEY_DEVICE_ID, null) ?: return null
         val secret = prefs.getString(KEY_SECRET, null) ?: return null
         val name = prefs.getString(KEY_NAME, "") ?: ""
-        return StoredPairing(gateway, name, DeviceCredential(deviceId, secret))
+        val protocol = PairingProtocol.fromStored(prefs.getString(KEY_PROTOCOL, null))
+        val edgeId = prefs.getString(KEY_EDGE_ID, null)
+        if (protocol == PairingProtocol.HOSTED && edgeId.isNullOrBlank()) return null
+        return StoredPairing(gateway, name, DeviceCredential(deviceId, secret), protocol, edgeId)
     }
 
     /** 解除配对：清凭证但保留最近网关，下次配对免重新粘贴链接。 */
@@ -52,6 +60,8 @@ class CredentialStore(context: Context) {
         const val KEY_NAME = "display_name"
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_SECRET = "secret"
+        const val KEY_PROTOCOL = "protocol"
+        const val KEY_EDGE_ID = "edge_id"
         const val KEY_LAST_GATEWAY = "last_gateway_url"
     }
 }

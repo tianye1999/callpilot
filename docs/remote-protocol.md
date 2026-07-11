@@ -1,7 +1,7 @@
 # 远程拨号协议契约（Edge ↔ 远程客户端）
 
-Web Dialer（#31）与 Android App（#36）共同遵守的协议描述。**基线：`feat/issue-31-web-dialer`
-@ `8003677`**；该分支仍在演进，协议变动以 codex 确认为准，变动后同步更新本文档。
+Web Dialer（#31）与 Android App（#36）共同遵守的协议描述。**基线：已合入 `main`（#33）**；
+其后 #39/#40 仅为客户端缓存/交付修复，无协议变更。协议如有变动，确认后同步更新本文档。
 
 ## 总体架构
 
@@ -30,11 +30,20 @@ AgentCall Edge ──AT/PCM── EC20 Dongle ──PSTN── 对端
 设备/线路状态。凭 Cookie 鉴别是否已配对：
 
 ```jsonc
-// 未配对
+// 未配对（网关瘦身响应，只含两个布尔）
 {"ok": true, "paired": false, "edge": {"enabled": bool, "configured": bool}}
-// 已配对
-{"ok": true, "paired": true, "device": {...}, "edge": {/* remote_dialer_status() 全量 */}}
+// 已配对：edge = remote_dialer_status() 全量
+{"ok": true, "paired": true, "device": {...}, "edge": {
+  "enabled": bool, "cloud_enabled": bool, "configured": bool,
+  "missing": ["缺失的必需配置键"], "active": bool,
+  // ↓ coordinator 附加字段：仅在存在远程会话 worker 时出现，无 worker 时整组消失
+  "session_id": "...", "edge_ready": bool, "browser_connected": bool,
+  "media_ready": bool, "call_active": bool, "expires_at": 1234567890.0,
+  "status": "<最近一次 status 事件值，初始 starting>"
+}}
 ```
+
+`browser_connected` 为当前兼容命名——原生客户端同样以此字段判媒体端连接（#37 结论）。
 
 ### POST `/api/pair`　`{"code": "XXXX-XXXX", "display_name": "..."}`
 
@@ -80,12 +89,15 @@ EncryptedSharedPreferences），后续鉴权接口同理。
 | topic | 方向 | 消息 |
 |---|---|---|
 | `callpilot.control` | 客户端 → Edge | `{"type":"dial","number":"...","idempotency_key":"..."}`；`{"type":"hangup"}`；`{"type":"dtmf","digits":"..."}` |
-| `callpilot.status` | Edge → 客户端 | `{"type":"status","status":"<字符串>"}`；`{"type":"remote_call","status":"dialing"\|"connected"\|...}` |
+| `callpilot.status` | Edge → 客户端 | `{"type":"status","status":"<字符串>"}`（如 `media_ready`/`dialing`/`connected`/`ended`/`failed`，可带 `reason`/`code`） |
 
 - 号码格式：`\+?[0-9*#]{1,32}`；DTMF：`[0-9*#]{1,16}`。
 - 控制包经 topic、发送者身份、大小、schema、状态五重校验；重复 `dial`（同 idempotency
   key）不重复 ATD。
-- 身份命名：浏览器 `web-*`、Edge `edge-*`（原生拟用 `app-*`，待 #31 确认）。
+- `type=remote_call` 是 Edge 本地 EventHub/审计事件，**不经 data channel 下发**（#37 裁决），
+  客户端只需消费 `type=status`。
+- 身份命名：浏览器 `web-*`、Edge `edge-*`；`app-*` 原生身份类别按 #37 审计结论 **defer**
+  （原生沿用 `web-*` 兼容身份，暂不新增类别）。
 
 ## 三、媒体与安全语义
 
@@ -113,7 +125,30 @@ EncryptedSharedPreferences），后续鉴权接口同理。
 **提请 #31 侧评估的需求**（记录于对应 issue，非阻塞）：
 
 1. 支持 `Authorization: Bearer <device_id>.<secret>` 作为 Cookie 的等价鉴权（原生更自然）；
-2. 预留/允许 `app-*` 身份类别，审计可区分 web 与原生；
+2. 预留/允许 `app-*` 身份类别，审计可区分 web 与原生（按 #37 审计结论 **defer**，见 §二）；
 3. `/api/session` 响应直接返回结构化 `{livekit_url, token, session_id, expires_at}`
    字段（原生免解 fragment；fragment 形式保留给 web）；
-4. `remote_dialer_status()` 的字段清单文档化（App 首页线路状态依赖它）。
+4. ~~`remote_dialer_status()` 的字段清单文档化~~（已落地：见 §一 `GET /api/device` 字段说明）。
+
+## 五、Hosted 云控制面 `/v1`
+
+当 Edge 启用 `REMOTE_CLOUD_ENABLED=true` 时，Android App 按配对来源改走 hosted
+adapter；原有 Tunnel `/api/*` adapter 与已保存凭证保持不变。Hosted 的完整契约以
+[`remote-cloud-protocol.md`](remote-cloud-protocol.md) 为 SSOT，本文只记录原生端差异：
+
+- `POST /v1/pairing-sessions/claim` 使用 camelCase 请求字段，并从
+  `__Host-callpilot-device` 的 `Set-Cookie` 响应中提取长期设备凭证；原生端后续手动发送
+  同名 `Cookie` 与控制面 origin 对应的 `Origin`。
+- 配对结果额外保存 `edgeId` 和协议标记 `hosted`；未包含协议标记的旧存储数据一律按
+  `tunnel` 读取，避免升级后丢失已有配对。
+- `POST /v1/calls` 携带 `edgeId` 与每次呼叫唯一的 `idempotencyKey`，随后轮询
+  `GET /v1/calls/{callId}`；仅在响应的 `session` 中取得结构化 `livekitUrl`、`token`
+  和 `expiresAt` 后连接 LiveKit，不解析 URL fragment。
+- LiveKit 的 `callpilot.control` / `callpilot.status` topic 和 `media_ready` 后才发送
+  `dial` 的门控语义与 Tunnel 共用，不因控制面协议改变。
+- 信令边界：通话中 `dial`/`dtmf`/`hangup` 与 `status` 事件经 **LiveKit data packets
+  在参与者间直传**；云 Durable Object 只承载 Edge WSS（`session.start` 下发与状态/ACK
+  上报），不中转房间信令或媒体。
+- Hosted 与 Tunnel 配对链接都可能使用根路径，App 不按 URL 形态猜协议。自动模式先向同一
+  origin 提交 hosted claim；仅当 `/v1/pairing-sessions/claim` 返回 404/405 时回退
+  `/api/pair`。业务错误不回退，避免重复提交已被服务端处理的配对码；界面仍保留显式协议选择兜底。

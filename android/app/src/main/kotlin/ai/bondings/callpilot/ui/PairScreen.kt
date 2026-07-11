@@ -2,8 +2,9 @@ package ai.bondings.callpilot.ui
 
 import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
-import ai.bondings.callpilot.protocol.GatewayClient
 import ai.bondings.callpilot.protocol.PairingLink
+import ai.bondings.callpilot.protocol.PairingNegotiator
+import ai.bondings.callpilot.protocol.PairingProtocol
 import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -25,6 +26,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -50,6 +54,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun PairScreen(store: CredentialStore, onPaired: (StoredPairing) -> Unit) {
     var gatewayBase by remember { mutableStateOf(store.loadLastGateway()) }
+    var protocol by remember { mutableStateOf<PairingProtocol?>(null) }
     var code by remember { mutableStateOf("") }
     var deviceName by remember { mutableStateOf(Build.MODEL ?: "Android") }
     var busy by remember { mutableStateOf(false) }
@@ -61,7 +66,10 @@ fun PairScreen(store: CredentialStore, onPaired: (StoredPairing) -> Unit) {
     fun applyParsed(text: String): Boolean {
         val parsed = PairingLink.parse(text)
         if (parsed.isEmpty) return false
-        parsed.gatewayBase?.let { gatewayBase = it }
+        parsed.gatewayBase?.let {
+            gatewayBase = it
+            protocol = null
+        }
         parsed.code?.let { code = it }
         error = null
         return true
@@ -154,6 +162,23 @@ fun PairScreen(store: CredentialStore, onPaired: (StoredPairing) -> Unit) {
         )
 
         Spacer(Modifier.height(18.dp))
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            val options: List<Pair<PairingProtocol?, String>> = listOf(
+                null to "自动",
+                PairingProtocol.HOSTED to "云托管",
+                PairingProtocol.TUNNEL to "Tunnel",
+            )
+            options.forEachIndexed { index, (value, label) ->
+                SegmentedButton(
+                    selected = protocol == value,
+                    onClick = { protocol = value },
+                    shape = SegmentedButtonDefaults.itemShape(index, options.size),
+                    label = { Text(label) },
+                )
+            }
+        }
+
+        Spacer(Modifier.height(18.dp))
         OutlinedTextField(
             value = deviceName,
             onValueChange = { deviceName = it },
@@ -178,9 +203,20 @@ fun PairScreen(store: CredentialStore, onPaired: (StoredPairing) -> Unit) {
                 busy = true
                 scope.launch(Dispatchers.IO) {
                     try {
-                        val client = GatewayClient(base)
-                        val result = client.pair(PairingLink.formatCode(code), deviceName.trim())
-                        val pairing = StoredPairing(base, deviceName.trim(), result.credential)
+                        val name = deviceName.trim()
+                        val formattedCode = PairingLink.formatCode(code)
+                        val result = PairingNegotiator(base).pair(
+                            formattedCode,
+                            name,
+                            preferredProtocol = protocol,
+                        )
+                        val pairing = StoredPairing(
+                            gatewayUrl = base,
+                            displayName = name,
+                            credential = result.credential,
+                            protocol = result.protocol,
+                            edgeId = result.edgeId,
+                        )
                         store.save(pairing)
                         onPaired(pairing)
                     } catch (e: Exception) {
