@@ -1,11 +1,11 @@
 # Contributing to CallPilot / 贡献指南
 
-> **v0.1 Developer Preview.** The single most valuable contribution right now is a
+> **Mac Beta (0.6.x).** The single most valuable contribution right now is still a
 > **hardware reproduction report** from anyone running a Quectel EC20/EG25. See
 > [Hardware contributors](#hardware-contributors) below and open a
 > [Hardware reproduction report](../../issues/new?template=hardware-report.yml).
 >
-> **v0.1 开发者预览版。** 现阶段最有价值的贡献是**同型号硬件的复现报告**——参见下方
+> **Mac Beta（0.6.x）。** 现阶段最有价值的贡献仍是**同型号硬件的复现报告**——参见下方
 > [硬件贡献者](#硬件贡献者)，并开一个
 > [硬件复现报告](../../issues/new?template=hardware-report.yml) issue。
 
@@ -56,12 +56,15 @@ to contribute code or run tests.
   temp dir and sets `SUMMARY_ENABLED=false` so tests never write to your real
   recordings dir or hit the network. A test that needs different behavior can
   `monkeypatch.setenv` / `delenv` — test-level env wins over the fixture.
-- Please run `.venv/bin/pytest` and get a green suite **before** opening a PR.
+- Please run the three gates — `.venv/bin/ruff check .`, `.venv/bin/mypy`,
+  `.venv/bin/pytest` — and get them all green **before** opening a PR.
 
 ### Code style
 
-Match the existing code — no separate linter/formatter is enforced yet, so
-consistency is by convention:
+Match the existing code. Three gates run in CI and gate every change — keep all
+three green before you push: `.venv/bin/ruff check .` (lint), `.venv/bin/mypy`
+(types), and `.venv/bin/pytest` (tests). Beyond those, consistency is by
+convention:
 
 - **Chinese docstrings and inline comments.** Module/class/function docstrings and
   comments are written in Chinese (see any file under `src/agentcall/`). Keep new
@@ -82,7 +85,8 @@ consistency is by convention:
 
 - **Branch** off `main`; don't commit to `main` directly. Use a short descriptive
   branch name (e.g. `fix/second-call-silent`, `feat/dtmf-tool`).
-- **Run the tests first.** `.venv/bin/pytest` must be green before you push.
+- **Run the three gates first.** `.venv/bin/ruff check .`, `.venv/bin/mypy`, and
+  `.venv/bin/pytest` must all be green before you push.
 - **Commit messages** are concise and describe the *what/why*; a leading roadmap
   task ID (e.g. `P0-1`) is welcome when it maps to `docs/roadmap.md`. Chinese or
   English are both fine — match the surrounding history.
@@ -91,6 +95,17 @@ consistency is by convention:
   observations, since CI cannot exercise the modem).
 - If your change touches a hardware/audio path that the test suite can't cover,
   say so explicitly and describe your manual verification.
+
+### Release process
+
+From the next release (0.6.1) onward, every GitHub Release notes block must
+record — for supply-chain auditability — the packaged DMG's SHA-256, the Apple
+notarization submission id, the exact build-source commit (which may predate the
+merge commit when Android/docs-only changes don't enter the desktop DMG), and
+the git tag. (The v0.6.0 notes already carry the DMG SHA-256, build source, and
+signing result; the notarization submission id is folded in from 0.6.1.) Any
+cloud PWA change must be `wrangler deploy`-ed to the beta endpoints before the
+Release is cut, so the hosted onboarding a user hits matches the released source.
 
 ### Hardware contributors
 
@@ -158,7 +173,7 @@ cp .env.example .env                 # 然后按需编辑 .env
 .venv/bin/pytest
 ```
 
-- **无需硬件、无需联网、无需 API Key。** 当前 160 个用例可完全离线运行。
+- **无需硬件、无需联网、无需 API Key。** 整个用例集可完全离线运行。
 - 测试使用 `tests/fakes/` 下的内存**假件**，与真实组件鸭子类型对齐：`FakeModem`
   （对齐 `Eg25Modem`，记录 AT 调用并可触发 `RING`/挂断/短信）、`FakeAudioBridge`
   （内存环回音频桥，接口与 `ModemAudioBridge` 对齐）、`FakeAgent`（脚本化的
@@ -166,11 +181,11 @@ cp .env.example .env                 # 然后按需编辑 .env
 - `tests/conftest.py` 会自动隔离副作用：把 `CALL_LOG_DIR` 指向临时目录，并设
   `SUMMARY_ENABLED=false`，使测试不写你的真实录音目录、也不触网。需要不同行为的
   测试可自行 `monkeypatch.setenv` / `delenv`——测试级优先于该 fixture。
-- 开 PR **之前**请先跑 `.venv/bin/pytest` 并确保全绿。
+- 开 PR **之前**请先跑三件套（`.venv/bin/ruff check .`、`.venv/bin/mypy`、`.venv/bin/pytest`）并确保全绿。
 
 ### 代码风格
 
-与现有代码保持一致——目前尚未强制统一的 linter/formatter，靠约定保持一致：
+与现有代码保持一致。三件套在 CI 中为每次改动把关、推送前须全绿：`.venv/bin/ruff check .`（lint）、`.venv/bin/mypy`（类型）、`.venv/bin/pytest`（测试）；此外的风格靠约定：
 
 - **中文 docstring 与注释。** 模块/类/函数的 docstring 与注释用中文（参见
   `src/agentcall/` 下任意文件）。新代码保持一致；面向来电方/界面的用户可见文案，在
@@ -188,7 +203,7 @@ cp .env.example .env                 # 然后按需编辑 .env
 
 - 从 `main` **切分支**，不要直接提交到 `main`。分支名简短达意（如
   `fix/second-call-silent`、`feat/dtmf-tool`）。
-- **先跑测试。** 推送前 `.venv/bin/pytest` 必须全绿。
+- **先跑三件套。** 推送前 `.venv/bin/ruff check .`、`.venv/bin/mypy`、`.venv/bin/pytest` 必须全绿。
 - **Commit 信息**简洁、说清 *做了什么/为什么*；映射到 `docs/roadmap.md` 的任务时，
   欢迎带上路线图任务 ID 前缀（如 `P0-1`）。中英文皆可，与历史保持一致。
 - PR 保持聚焦。描述里写清**改了什么**、**为什么**、**如何验证**（测试输出；若涉及

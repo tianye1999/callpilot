@@ -4,8 +4,8 @@
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.2.x   | ✅ current release |
-| < 0.2   | ❌                 |
+| 0.6.x   | ✅ current release |
+| < 0.6   | ❌                 |
 
 Pre-1.0, only the latest minor release receives fixes.
 
@@ -30,7 +30,11 @@ In scope:
 - The CallPilot source tree (`src/agentcall`, `app.py`, `desktop_app.py`),
   helper scripts, and packaging.
 - The local web dashboard and its HTTP/WebSocket API.
-- How CallPilot handles credentials stored in your `.env`.
+- The hosted control plane (`cloud/`: Cloudflare Worker + D1 + Durable Objects)
+  and its `/v1` pairing/call API, plus the LiveKit media-relay path it brokers.
+- The Android remote-dialer app (`android/`) and its pairing/credential storage.
+- How CallPilot handles credentials stored in your `.env` and the device
+  credentials issued by the hosted control plane.
 
 Out of scope:
 

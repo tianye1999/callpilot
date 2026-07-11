@@ -3,7 +3,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform: macOS | Windows (beta)](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20(beta)-000000.svg?logo=apple&logoColor=white)](#hardware--platform-support)
-[![Status: Developer Preview](https://img.shields.io/badge/Status-Developer_Preview-orange.svg)](docs/roadmap.md)
+[![Status: Mac Beta](https://img.shields.io/badge/Status-Mac_Beta-orange.svg)](docs/roadmap.md)
 
 **Your calls, handled by AI.** An open-source AI phone agent that runs on a
 Quectel EC20/EG25 4G modem: it auto-answers incoming calls and talks to the
@@ -11,9 +11,11 @@ caller with a realtime voice AI, places outbound calls, sends/receives SMS,
 navigates IVR menus (DTMF), and records + summarizes every call — all on your
 own hardware and API keys.
 
-> **Status: Mac Beta (v0.5.0).** Runs on macOS with a Quectel EC20 today.
-> Developers can run from source; regular users can install the signed,
-> notarized macOS DMG from the latest GitHub Release. See [Roadmap](docs/roadmap.md).
+> **Status: Mac Beta (v0.6.0).** Runs on macOS with a Quectel EC20 today.
+> Developers can run from source; regular users install the signed, notarized
+> macOS DMG from the latest GitHub Release. As of 0.6.0 an optional hosted cloud
+> control plane lets you pair a phone and dial through the modem remotely with a
+> pairing code — no self-hosted tunnel needed. See [Roadmap](docs/roadmap.md).
 
 [English](#english) · [中文](#中文)
 
@@ -43,7 +45,7 @@ Phone call → EC20 modem ──(AT: RING/ATA/CLCC)── CallPilot
   **DTMF keypad**), per-call recording + latency metrics + LLM summary, live
   transcript, local speaker monitoring, bilingual (English/Chinese) desktop UI.
 
-**New in v0.5.0 — local three-stage provider** (`AGENT_PROVIDER=local`):
+**Local three-stage provider** (`AGENT_PROVIDER=local`, added in v0.5.0):
 on-device VAD → STT → text LLM → on-device TTS. Audio never leaves your
 machine; only the transcript goes to the text brain (default `qwen-plus`,
 same DashScope key, an order of magnitude cheaper than realtime audio).
@@ -316,7 +318,7 @@ New-user install & first-run Q&A: [`docs/faq.md`](docs/faq.md) (Chinese).
 
 ### Contributing
 
-Developer Preview wants hardware reproduction reports. If you have an EC20, please
+Mac Beta still wants hardware reproduction reports. If you have an EC20, please
 open an issue with your modem firmware, macOS version, and what worked / didn't.
 Tests: `.venv/bin/pytest` (no hardware needed — uses fake modem/bridge/agent).
 
@@ -329,6 +331,11 @@ License: [Apache-2.0](LICENSE).
 ---
 
 ## 中文
+
+> **状态：Mac Beta（v0.6.0）。** 今天可在装有 Quectel EC20 的 macOS 上运行。开发者可从
+> 源码运行；普通用户从最新 GitHub Release 安装已签名公证的 macOS DMG。0.6.0 起提供可选的
+> hosted 云控制面，用配对码即可让手机远程通过模组拨号，无需自建 tunnel。见
+> [路线图](docs/roadmap.md)。
 
 ### 这是什么
 
@@ -343,7 +350,7 @@ Quectel EC20/EG25，来电自动接听并与对方对话，可外呼、收发短
   （发短信/挂断/查验证码/**DTMF 按键**）、通话录音+摘要、实时转写、本机监听、
   中英双语桌面界面。
 
-**v0.5.0 新增——本地三段式 provider**（`AGENT_PROVIDER=local`）：本地 VAD →
+**本地三段式 provider**（`AGENT_PROVIDER=local`，v0.5.0 引入）：本地 VAD →
 本地转写 → 云端文本模型 → 本地合成。音频不出本机，只有转写文本上云（默认
 `qwen-plus`，同一个 DashScope key，比 realtime 音频便宜一个量级）。启用：
 `pip install 'callpilot[local]'` 后运行 `python -m agentcall.local_models`
@@ -549,7 +556,7 @@ macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=
 
 ### 贡献
 
-Developer Preview 阶段最需要同型号硬件的复现反馈。有 EC20 的话，欢迎带上模组固件、
+Mac Beta 阶段仍最需要同型号硬件的复现反馈。有 EC20 的话，欢迎带上模组固件、
 macOS 版本、以及哪里成功/失败开 issue。测试：`.venv/bin/pytest`（无需硬件）。
 
 架构与「想改 X 去哪」见 [`docs/architecture.md`](docs/architecture.md)；想单独学习/验证某个
