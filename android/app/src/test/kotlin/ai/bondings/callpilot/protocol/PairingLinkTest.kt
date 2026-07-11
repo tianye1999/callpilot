@@ -42,6 +42,11 @@ class PairingLinkTest {
     }
 
     @Test
+    fun `http 明文链接一律不识别`() {
+        assertTrue(PairingLink.parse("http://dial.example.com/x.html#pair=AB12-CD34").isEmpty)
+    }
+
+    @Test
     fun `normalize 与 format 往返`() {
         assertEquals("AB12CD34", PairingLink.normalizeCode(" ab12-cd34 ".trim()))
         assertNull(PairingLink.normalizeCode("ABC"))

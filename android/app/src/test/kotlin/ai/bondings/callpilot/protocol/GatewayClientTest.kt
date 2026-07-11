@@ -114,4 +114,11 @@ class GatewayClientTest {
         assertEquals(502, e.statusCode)
         assertTrue(e.message.contains("502"))
     }
+
+    @Test
+    fun `非回环 http 网关被拒绝`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            GatewayClient("http://dial.example.com/")
+        }
+    }
 }

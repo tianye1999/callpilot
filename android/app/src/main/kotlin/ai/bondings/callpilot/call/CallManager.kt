@@ -67,13 +67,21 @@ class CallManager(
                 val invite = withContext(ioDispatcher) {
                     inviteProvider(pairing)
                 }
-                val payload = InviteParser.parseInviteUrl(invite.url)
-                    ?: error("邀请解析失败（协议版本或格式不符）")
+                val structuredUrl = invite.livekitUrl
+                val structuredToken = invite.token
+                val (livekitUrl, token) =
+                    if (!structuredUrl.isNullOrBlank() && !structuredToken.isNullOrBlank()) {
+                        structuredUrl to structuredToken
+                    } else {
+                        val payload = InviteParser.parseInviteUrl(invite.url)
+                            ?: error("邀请解析失败（协议版本或格式不符）")
+                        payload.url to payload.token
+                    }
                 val s = sessionFactory()
                 session = s
                 eventJob = scope.launch { s.events.collect { handleEvent(number, it) } }
                 onForeground(true)
-                s.connect(payload.url, payload.token)
+                s.connect(livekitUrl, token)
                 _state.value = CallState.WaitingMedia(number)
                 s.sendCommand(Signaling.encodeDial(number, UUID.randomUUID().toString()))
             } catch (e: Exception) {

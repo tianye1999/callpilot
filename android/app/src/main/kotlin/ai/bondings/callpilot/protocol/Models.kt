@@ -18,12 +18,19 @@ data class PairedDevice(
     @SerialName("last_used_at") val lastUsedAt: Double = 0.0,
 )
 
-/** `/api/session` 响应里的一次性拨号会话邀请。 */
+/**
+ * `/api/session` 响应里的一次性拨号会话邀请。
+ *
+ * v0 契约（#37）：LiveKit 连接信息编码在 `url` 的 fragment 里；`token`/`livekitUrl`
+ * 是服务端未来直发结构化字段的向前兼容位（两者都非空才生效，否则回退解 fragment）。
+ */
 @Serializable
 data class Invite(
     @SerialName("session_id") val sessionId: String,
     val url: String,
-    @SerialName("expires_at") val expiresAt: Double,
+    @SerialName("expires_at") val expiresAt: Double = 0.0,
+    val token: String? = null,
+    @SerialName("livekit_url") val livekitUrl: String? = null,
 )
 
 /** 邀请 URL fragment 解码后的 LiveKit 连接信息（`{"v":1,...}`）。 */

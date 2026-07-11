@@ -3,6 +3,7 @@ package ai.bondings.callpilot.media
 import ai.bondings.callpilot.protocol.Signaling
 import ai.bondings.callpilot.protocol.Topics
 import android.content.Context
+import android.util.Log
 import com.twilio.audioswitch.AudioDevice
 import io.livekit.android.AudioOptions
 import io.livekit.android.AudioType
@@ -24,6 +25,10 @@ class LiveKitSession(
     context: Context,
     private val scope: CoroutineScope,
 ) : RemoteSession {
+
+    private companion object {
+        const val TAG = "CallPilotLiveKit"
+    }
 
     private val appContext = context.applicationContext
     private val audioHandler = AudioSwitchHandler(appContext)
@@ -51,16 +56,26 @@ class LiveKitSession(
                                 ?.let { _events.tryEmit(SessionEvent.Edge(it)) }
                         }
                     }
-                    is RoomEvent.Disconnected ->
+                    is RoomEvent.Disconnected -> {
+                        Log.w(TAG, "room disconnected reason=${event.reason?.name}")
                         _events.tryEmit(
                             SessionEvent.Disconnected(event.reason?.name ?: "disconnected")
                         )
+                    }
                     else -> Unit
                 }
             }
         }
-        room.connect(livekitUrl, token)
-        room.localParticipant.setMicrophoneEnabled(true)
+        // token 不入日志；仅记录连接目标与结果，供真机排障
+        Log.i(TAG, "connecting room=$livekitUrl")
+        try {
+            room.connect(livekitUrl, token)
+            room.localParticipant.setMicrophoneEnabled(true)
+            Log.i(TAG, "connected, microphone published")
+        } catch (e: Exception) {
+            Log.e(TAG, "connect failed: ${e.message}", e)
+            throw e
+        }
     }
 
     override suspend fun sendCommand(json: String) {

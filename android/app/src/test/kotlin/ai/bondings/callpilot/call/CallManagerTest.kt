@@ -52,12 +52,22 @@ class CallManagerTest {
         credential = DeviceCredential("dev", "secret"),
     )
 
-    private fun invite(sessionId: String = "s-1"): Invite {
+    /** Edge 首选形态：结构化 livekit_url + token。 */
+    private fun invite(sessionId: String = "s-1"): Invite = Invite(
+        sessionId = sessionId,
+        url = "https://d.example.com/#pair=",
+        token = "tok",
+        livekitUrl = "wss://lk.example.com",
+        expiresAt = 9999.0,
+    )
+
+    /** 兼容形态：仅 url fragment（web 邀请），无结构化字段，走回退解析。 */
+    private fun legacyInvite(sessionId: String = "s-1"): Invite {
         val payload =
             """{"v":1,"url":"wss://lk.example.com","token":"tok","sessionId":"$sessionId"}"""
         val fragment = Base64.getUrlEncoder().withoutPadding()
             .encodeToString(payload.toByteArray(Charsets.UTF_8))
-        return Invite(sessionId, "https://d.example.com/p.html#$fragment", 9999.0)
+        return Invite(sessionId = sessionId, url = "https://d.example.com/p.html#$fragment")
     }
 
     /** 用测试调度器驱动 manager 的 scope 与 IO，保证 advanceUntilIdle 完全确定。 */
@@ -157,12 +167,26 @@ class CallManagerTest {
     }
 
     @Test
-    fun `邀请 fragment 非法进入 Failed`() = runTest {
+    fun `邀请既无结构化字段又无合法 fragment 时 Failed`() = runTest {
         val h = Harness(this)
-        val manager = h.manager(FakeSession()) { Invite("s", "https://d/p.html#not-base64!!!", 1.0) }
+        val manager = h.manager(FakeSession()) {
+            Invite(sessionId = "s", url = "https://d/p.html#not-base64!!!")
+        }
         manager.startCall(pairing, "10000")
         advanceUntilIdle()
         assertTrue(manager.state.value is CallState.Failed)
+        h.close()
+    }
+
+    @Test
+    fun `仅 url fragment 的兼容邀请也能连上`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(session) { legacyInvite() }
+        manager.startCall(pairing, "10000")
+        advanceUntilIdle()
+        assertTrue(session.connected)
+        assertEquals(CallState.WaitingMedia("10000"), manager.state.value)
         h.close()
     }
 

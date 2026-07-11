@@ -32,7 +32,12 @@ class GatewayClient(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
     }
 
-    private val base: HttpUrl = baseUrl.toHttpUrl()
+    // 凭证以 __Host- Cookie 传输，明文网关会把它暴露在网络上；仅回环放行（本机调试/单测）
+    private val base: HttpUrl = baseUrl.toHttpUrl().also {
+        require(it.isHttps || it.host in setOf("localhost", "127.0.0.1", "::1")) {
+            "网关地址必须是 https"
+        }
+    }
     private val origin: String = buildString {
         append(base.scheme).append("://").append(base.host)
         if (base.port != HttpUrl.defaultPort(base.scheme)) append(":").append(base.port)

@@ -22,6 +22,8 @@ object PairingLink {
         if (t.isEmpty()) return Parsed(null, null)
         if (BARE_CODE_RE.matches(t)) return Parsed(null, normalizeCode(t))
         val url = t.toHttpUrlOrNull() ?: return Parsed(null, null)
+        // 网关凭证走 __Host- Cookie，只在 https 下有效；明文链接一律不识别
+        if (!url.isHttps) return Parsed(null, null)
         val code = InviteParser.parsePairingCode(url.fragment.orEmpty())?.let { normalizeCode(it) }
         return Parsed(originOf(url), code)
     }
