@@ -225,6 +225,9 @@ def build_app(
     restart_event=None,
     auth_token: str | None = None,
     remote_pairing_store=None,
+    remote_cloud_api=None,
+    remote_cloud_store=None,
+    remote_cloud_client=None,
 ) -> web.Application:
     middlewares = [_error_middleware]
     if auth_token:
@@ -238,6 +241,9 @@ def build_app(
     app["restart_event"] = restart_event
     app["setup_sms_token"] = [secrets.token_urlsafe(24)]
     app["remote_pairing_store"] = remote_pairing_store
+    app["remote_cloud_api"] = remote_cloud_api
+    app["remote_cloud_store"] = remote_cloud_store
+    app["remote_cloud_client"] = remote_cloud_client
 
     app.router.add_get("/", _index)
     app.router.add_get("/remote-dialer", _remote_dialer_redirect)
@@ -262,6 +268,8 @@ def build_app(
     app.router.add_post("/api/remote_dialer/cancel", _remote_dialer_cancel)
     app.router.add_post("/api/remote_dialer/pairing", _remote_dialer_pairing)
     app.router.add_get("/api/remote_dialer/devices", _remote_dialer_devices)
+    app.router.add_get("/api/remote_cloud/status", _remote_cloud_status)
+    app.router.add_post("/api/remote_cloud/enroll", _remote_cloud_enroll)
     app.router.add_delete(
         "/api/remote_dialer/devices/{device_id}", _remote_dialer_device_revoke
     )
@@ -562,6 +570,35 @@ async def _remote_dialer_pairing(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": "远程网页拨号未启用"}, status=403
         )
+    cloud_api = request.app.get("remote_cloud_api")
+    cloud_store = request.app.get("remote_cloud_store")
+    if cloud_api is not None and cloud_store is not None:
+        credential = cloud_store.load()
+        if credential is None:
+            return web.json_response(
+                {"ok": False, "error": "请先用 Beta 邀请码注册这台电脑"}, status=409
+            )
+        loop = asyncio.get_running_loop()
+        try:
+            pairing = await loop.run_in_executor(
+                None, cloud_api.create_pairing, credential
+            )
+        except (RuntimeError, ValueError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        code = str(pairing.get("code") or "")
+        public_url = config.get_str("REMOTE_CLOUD_DIALER_URL").rstrip("/") + "/"
+        return web.json_response(
+            {
+                "ok": True,
+                "pairing": {
+                    "code": code,
+                    "url": f"{public_url}#pair={code}",
+                    "expires_at": float(pairing.get("expiresAt") or 0) / 1000,
+                },
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     store = request.app.get("remote_pairing_store")
     if store is None:
         return web.json_response(
@@ -588,6 +625,32 @@ async def _remote_dialer_pairing(request: web.Request) -> web.Response:
 
 
 async def _remote_dialer_devices(request: web.Request) -> web.Response:
+    cloud_api = request.app.get("remote_cloud_api")
+    cloud_store = request.app.get("remote_cloud_store")
+    if cloud_api is not None and cloud_store is not None:
+        credential = cloud_store.load()
+        if credential is None:
+            return web.json_response({"ok": True, "devices": []})
+        loop = asyncio.get_running_loop()
+        try:
+            payload = await loop.run_in_executor(None, cloud_api.list_devices, credential)
+        except (RuntimeError, ValueError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=503)
+        devices = [
+            {
+                "device_id": item.get("device_id"),
+                "display_name": item.get("display_name"),
+                "created_at": float(item.get("created_at") or 0) / 1000,
+                "last_used_at": float(item.get("last_used_at") or 0) / 1000,
+                "revoked_at": None,
+            }
+            for item in payload.get("devices", [])
+            if isinstance(item, dict)
+        ]
+        return web.json_response(
+            {"ok": True, "devices": devices}, headers={"Cache-Control": "no-store"}
+        )
+
     store = request.app.get("remote_pairing_store")
     if store is None:
         return web.json_response(
@@ -614,6 +677,21 @@ async def _remote_dialer_device_revoke(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": "设备 ID 格式不合法"}, status=400
         )
+    cloud_api = request.app.get("remote_cloud_api")
+    cloud_store = request.app.get("remote_cloud_store")
+    if cloud_api is not None and cloud_store is not None:
+        credential = cloud_store.load()
+        if credential is None:
+            return web.json_response({"ok": False, "error": "电脑尚未注册"}, status=409)
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None, cloud_api.revoke_device, credential, device_id
+            )
+        except (RuntimeError, ValueError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        return web.json_response({"ok": True})
+
     store = request.app.get("remote_pairing_store")
     if store is None:
         return web.json_response(
@@ -624,6 +702,58 @@ async def _remote_dialer_device_revoke(request: web.Request) -> web.Response:
             {"ok": False, "error": "设备不存在或已撤销"}, status=404
         )
     return web.json_response({"ok": True})
+
+
+async def _remote_cloud_status(request: web.Request) -> web.Response:
+    client = request.app.get("remote_cloud_client")
+    if client is None:
+        return web.json_response(
+            {"ok": True, "enabled": False, "enrolled": False, "connected": False}
+        )
+    status = client.status()
+    return web.json_response(
+        {
+            "ok": True,
+            "enabled": status.enabled,
+            "enrolled": status.enrolled,
+            "connected": status.connected,
+            "edge_id": status.edge_id,
+            "last_error": status.last_error,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _remote_cloud_enroll(request: web.Request) -> web.Response:
+    cloud_api = request.app.get("remote_cloud_api")
+    cloud_store = request.app.get("remote_cloud_store")
+    if cloud_api is None or cloud_store is None:
+        return web.json_response(
+            {"ok": False, "error": "CallPilot 云控制面未启用"}, status=409
+        )
+    data = await read_json(request)
+    code = data.get("code") if isinstance(data, dict) else None
+    display_name = data.get("display_name") if isinstance(data, dict) else None
+    if not isinstance(code, str) or not 32 <= len(code.strip()) <= 256:
+        return web.json_response({"ok": False, "error": "Beta 邀请码格式不合法"}, status=400)
+    if not isinstance(display_name, str) or not 1 <= len(display_name.strip()) <= 64:
+        return web.json_response({"ok": False, "error": "电脑名称格式不合法"}, status=400)
+    loop = asyncio.get_running_loop()
+    try:
+        public_key = await loop.run_in_executor(None, cloud_store.load_or_create_public_key)
+        payload = await loop.run_in_executor(
+            None, cloud_api.enroll, code.strip(), display_name.strip(), public_key
+        )
+        credential = payload.get("credential")
+        if not isinstance(credential, str):
+            raise RuntimeError("云端未返回设备凭证")
+        stored = await loop.run_in_executor(None, cloud_store.save, credential)
+    except (RuntimeError, ValueError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+    return web.json_response(
+        {"ok": True, "edge_id": stored.edge_id},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def _batch_dial(request: web.Request) -> web.Response:

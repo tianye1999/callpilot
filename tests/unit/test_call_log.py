@@ -116,6 +116,23 @@ def test_recording_disabled_writes_no_wav(tmp_path):
     assert meta["uplink_bytes"] == 0
 
 
+def test_per_call_recording_override_keeps_events_but_no_audio(tmp_path):
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call(
+        "outbound",
+        "10000",
+        source="remote_web_dialer",
+        recording_enabled=False,
+    )
+    record.write_uplink(b"\x00\x01" * 100)
+    record.finish("completed")
+
+    meta = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["source"] == "remote_web_dialer"
+    assert meta["recording_enabled"] is False
+    assert not (record.path / "uplink.wav").exists()
+
+
 # ---- finish 幂等 ----
 
 

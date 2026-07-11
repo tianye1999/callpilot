@@ -92,3 +92,12 @@ def test_restart_after_cleanup_preserves_script_for_source_mode(monkeypatch):
     app._restart_after_cleanup()
 
     assert calls == [("/tmp/python", ["/tmp/python", "/repo/app.py", "--service"])]
+
+
+def test_invalid_optional_cloud_url_does_not_crash_core_app(monkeypatch, caplog):
+    monkeypatch.setattr(app.config, "get_str", lambda _key: "http://bad.example?secret=x")
+
+    api, store, client = app._create_cloud_components(object())
+
+    assert (api, store, client) == (None, None, None)
+    assert "已禁用远程云功能" in caplog.text

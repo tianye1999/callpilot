@@ -1,0 +1,386 @@
+import { authenticateDevice, authenticateEdge } from "./auth";
+import { EdgeRoom } from "./edge-room";
+import { error, HttpError, json, readJson, requireSameOrigin } from "./http";
+import { issueParticipantToken } from "./livekit";
+import {
+  claimEnrollmentSchema,
+  claimPairingSchema,
+  createCallSchema,
+  createEnrollmentInviteSchema,
+  createPairingSchema
+} from "./schemas";
+import { constantTimeEqual, randomId, randomPairingCode, randomSecret, sha256 } from "./security";
+import type { CallRecord, Env } from "./types";
+import { ZodError } from "zod";
+
+export { EdgeRoom };
+
+const COOKIE_MAX_AGE = 180 * 24 * 60 * 60;
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const requestId = randomId("req", 12);
+    try {
+      return await route(request, env, requestId);
+    } catch (caught) {
+      if (caught instanceof HttpError) return error(caught.code, caught.message, caught.status, requestId);
+      if (caught instanceof ZodError) return error("VALIDATION_ERROR", "Request fields are invalid", 400, requestId);
+      console.error(JSON.stringify({ requestId, errorType: caught instanceof Error ? caught.name : "unknown" }));
+      return error("INTERNAL_ERROR", "The request could not be completed", 500, requestId);
+    }
+  }
+};
+
+async function route(request: Request, env: Env, requestId: string): Promise<Response> {
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/\/$/, "") || "/";
+
+  if (path === "/healthz" && request.method === "GET") return json({ ok: true });
+  if (path === "/v1/admin/enrollment-invites" && request.method === "POST") {
+    return createEnrollmentInvite(request, env);
+  }
+  if (path === "/v1/edge-enrollments/claim" && request.method === "POST") {
+    return claimEnrollment(request, env);
+  }
+  if (path === "/v1/edges/connect" && request.method === "GET") return connectEdge(request, env);
+  if (path === "/v1/pairing-sessions/claim" && request.method === "POST") {
+    return claimPairing(request, env);
+  }
+  if ((path === "/api/device" || path === "/v1/device") && request.method === "GET") {
+    return getDevice(request, env);
+  }
+  if (path === "/v1/device" && request.method === "DELETE") return unpairCurrentDevice(request, env);
+  if (path === "/v1/calls" && request.method === "POST") return createCall(request, env);
+
+  const presence = path.match(/^\/v1\/edges\/(edge_[A-Za-z0-9_-]+)\/presence$/);
+  if (presence && request.method === "GET") return getPresence(request, env, presence[1] ?? "");
+  const pairing = path.match(/^\/v1\/edges\/(edge_[A-Za-z0-9_-]+)\/pairing-sessions$/);
+  if (pairing && request.method === "POST") return createPairing(request, env, pairing[1] ?? "");
+  const devices = path.match(/^\/v1\/edges\/(edge_[A-Za-z0-9_-]+)\/devices$/);
+  if (devices && request.method === "GET") return listDevices(request, env, devices[1] ?? "");
+  const device = path.match(/^\/v1\/devices\/(device_[A-Za-z0-9_-]+)$/);
+  if (device && request.method === "DELETE") return revokeDevice(request, env, device[1] ?? "");
+  const call = path.match(/^\/v1\/calls\/(call_[A-Za-z0-9_-]+)$/);
+  if (call && request.method === "GET") return getCall(request, env, call[1] ?? "");
+
+  if (path.startsWith("/v1/") || path.startsWith("/api/")) {
+    return error("NOT_FOUND", "Resource not found", 404, requestId);
+  }
+  return secureAsset(await env.ASSETS.fetch(request));
+}
+
+async function createEnrollmentInvite(request: Request, env: Env): Promise<Response> {
+  const header = request.headers.get("Authorization") ?? "";
+  if (!env.ADMIN_TOKEN || !await constantTimeEqual(header, `Bearer ${env.ADMIN_TOKEN}`)) {
+    throw new HttpError("UNAUTHORIZED", "Administrator credential is invalid", 401);
+  }
+  const input = createEnrollmentInviteSchema.parse(await readJson(request));
+  const code = randomSecret(32);
+  const now = Date.now();
+  await env.DB.prepare(
+    "INSERT INTO enrollment_invites(invite_hash, expires_at, created_at) VALUES (?1, ?2, ?3)"
+  ).bind(await sha256(code), now + input.ttlSeconds * 1000, now).run();
+  return json({ code, expiresAt: now + input.ttlSeconds * 1000 }, 201);
+}
+
+async function claimEnrollment(request: Request, env: Env): Promise<Response> {
+  await enforceRateLimit(env, request, "enrollment", 10, 300_000);
+  const input = claimEnrollmentSchema.parse(await readJson(request));
+  const now = Date.now();
+  const inviteHash = await sha256(input.code);
+  const claimed = await env.DB.prepare(
+    "UPDATE enrollment_invites SET used_at = ?1 WHERE invite_hash = ?2 AND used_at IS NULL AND expires_at > ?1 RETURNING invite_hash"
+  ).bind(now, inviteHash).first<{ invite_hash: string }>();
+  if (!claimed) throw new HttpError("INVALID_ENROLLMENT", "Enrollment code is invalid or expired", 401);
+
+  const edgeId = randomId("edge");
+  const secret = randomSecret();
+  await env.DB.prepare(
+    "INSERT INTO edges(edge_id, display_name, public_key, secret_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+  ).bind(edgeId, input.displayName, input.publicKey, await sha256(secret), now).run();
+  await audit(env, "beta_invite", "enrollment", "edge.enrolled", edgeId, "allowed");
+  return json({ edgeId, credential: `${edgeId}.${secret}` }, 201);
+}
+
+async function connectEdge(request: Request, env: Env): Promise<Response> {
+  const edge = await authenticateEdge(request, env);
+  const stub = edgeRoom(env, edge.edge_id);
+  const headers = new Headers(request.headers);
+  headers.set("X-CallPilot-Edge-Id", edge.edge_id);
+  return stub.fetch(new Request("https://edge-room/connect", { method: "GET", headers }));
+}
+
+async function getPresence(request: Request, env: Env, edgeId: string): Promise<Response> {
+  const actor = await authenticateActorForEdge(request, env, edgeId);
+  const response = await edgeRoom(env, edgeId).fetch("https://edge-room/presence");
+  const presence = await response.json();
+  return json({ edgeId, presence, actor: actor.kind });
+}
+
+async function createPairing(request: Request, env: Env, edgeId: string): Promise<Response> {
+  const edge = await authenticateEdge(request, env);
+  if (edge.edge_id !== edgeId) throw new HttpError("FORBIDDEN", "Edge does not own this resource", 403);
+  const input = createPairingSchema.parse(await readJson(request));
+  const active = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM devices WHERE edge_id = ?1 AND revoked_at IS NULL"
+  ).bind(edgeId).first<{ count: number }>();
+  if ((active?.count ?? 0) >= 5) throw new HttpError("DEVICE_LIMIT", "Paired device limit reached", 409);
+
+  const pairingId = randomId("pairing");
+  const code = randomPairingCode();
+  const now = Date.now();
+  await env.DB.prepare(
+    "INSERT INTO pairing_sessions(pairing_id, edge_id, code_hash, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+  ).bind(pairingId, edgeId, await sha256(normalizePairingCode(code)), now + input.ttlSeconds * 1000, now).run();
+  return json({ pairingId, code, expiresAt: now + input.ttlSeconds * 1000 }, 201);
+}
+
+async function claimPairing(request: Request, env: Env): Promise<Response> {
+  requireSameOrigin(request, env.PUBLIC_ORIGIN);
+  await enforceRateLimit(env, request, "pairing", 10, 300_000);
+  const input = claimPairingSchema.parse(await readJson(request));
+  const now = Date.now();
+  const codeHash = await sha256(normalizePairingCode(input.code));
+  const pairing = await env.DB.prepare(
+    "UPDATE pairing_sessions SET claimed_at = ?1 WHERE code_hash = ?2 AND claimed_at IS NULL AND expires_at > ?1 RETURNING pairing_id, edge_id"
+  ).bind(now, codeHash).first<{ pairing_id: string; edge_id: string }>();
+  if (!pairing) throw new HttpError("INVALID_PAIRING", "Pairing code is invalid or expired", 401);
+
+  const active = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM devices WHERE edge_id = ?1 AND revoked_at IS NULL"
+  ).bind(pairing.edge_id).first<{ count: number }>();
+  if ((active?.count ?? 0) >= 5) throw new HttpError("DEVICE_LIMIT", "Paired device limit reached", 409);
+
+  const deviceId = randomId("device");
+  const secret = randomSecret();
+  const inserted = await env.DB.prepare(
+    "INSERT INTO devices(device_id, edge_id, display_name, secret_hash, created_at, last_used_at) SELECT ?1, ?2, ?3, ?4, ?5, ?5 WHERE (SELECT COUNT(*) FROM devices WHERE edge_id = ?2 AND revoked_at IS NULL) < 5"
+  ).bind(deviceId, pairing.edge_id, input.displayName, await sha256(secret), now).run();
+  if (!inserted.meta.changes) throw new HttpError("DEVICE_LIMIT", "Paired device limit reached", 409);
+  await audit(env, "phone", deviceId, "device.paired", pairing.edge_id, "allowed");
+  return json(
+    { paired: true, device: { deviceId, edgeId: pairing.edge_id, displayName: input.displayName } },
+    201,
+    { "Set-Cookie": deviceCookie(`${deviceId}.${secret}`, COOKIE_MAX_AGE) }
+  );
+}
+
+async function getDevice(request: Request, env: Env): Promise<Response> {
+  try {
+    const device = await authenticateDevice(request, env);
+    const response = await edgeRoom(env, device.edge_id).fetch("https://edge-room/presence");
+    return json({
+      ok: true,
+      paired: true,
+      device: { deviceId: device.device_id, edgeId: device.edge_id, displayName: device.display_name },
+      edge: await response.json()
+    });
+  } catch (caught) {
+    if (caught instanceof HttpError && caught.status === 401) return json({ ok: true, paired: false });
+    throw caught;
+  }
+}
+
+async function listDevices(request: Request, env: Env, edgeId: string): Promise<Response> {
+  const edge = await authenticateEdge(request, env);
+  if (edge.edge_id !== edgeId) throw new HttpError("FORBIDDEN", "Edge does not own this resource", 403);
+  const result = await env.DB.prepare(
+    "SELECT device_id, display_name, created_at, last_used_at FROM devices WHERE edge_id = ?1 AND revoked_at IS NULL ORDER BY created_at DESC"
+  ).bind(edgeId).all();
+  return json({ devices: result.results });
+}
+
+async function unpairCurrentDevice(request: Request, env: Env): Promise<Response> {
+  requireSameOrigin(request, env.PUBLIC_ORIGIN);
+  const device = await authenticateDevice(request, env);
+  await env.DB.prepare("UPDATE devices SET revoked_at = ?1 WHERE device_id = ?2 AND revoked_at IS NULL")
+    .bind(Date.now(), device.device_id).run();
+  await audit(env, "phone", device.device_id, "device.unpaired", device.edge_id, "allowed");
+  return json(
+    { paired: false },
+    200,
+    { "Set-Cookie": deviceCookie("", 0) }
+  );
+}
+
+async function revokeDevice(request: Request, env: Env, deviceId: string): Promise<Response> {
+  const edge = await authenticateEdge(request, env);
+  const now = Date.now();
+  const result = await env.DB.prepare(
+    "UPDATE devices SET revoked_at = ?1 WHERE device_id = ?2 AND edge_id = ?3 AND revoked_at IS NULL"
+  ).bind(now, deviceId, edge.edge_id).run();
+  if (!result.meta.changes) throw new HttpError("NOT_FOUND", "Device not found", 404);
+  await audit(env, "edge", edge.edge_id, "device.revoked", deviceId, "allowed");
+  return json({ revoked: true });
+}
+
+async function createCall(request: Request, env: Env): Promise<Response> {
+  requireSameOrigin(request, env.PUBLIC_ORIGIN);
+  const device = await authenticateDevice(request, env);
+  const input = createCallSchema.parse(await readJson(request));
+  if (device.edge_id !== input.edgeId) throw new HttpError("FORBIDDEN", "Device is not paired to this Edge", 403);
+
+  const duplicate = await env.DB.prepare(
+    "SELECT * FROM calls WHERE device_id = ?1 AND idempotency_key = ?2"
+  ).bind(device.device_id, input.idempotencyKey).first<CallRecord>();
+  if (duplicate) return json(callPayload(duplicate), 200);
+
+  const recent = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM calls WHERE device_id = ?1 AND created_at > ?2"
+  ).bind(device.device_id, Date.now() - 60 * 60 * 1000).first<{ count: number }>();
+  if ((recent?.count ?? 0) >= 10) throw new HttpError("RATE_LIMITED", "Remote call limit reached", 429);
+
+  const presenceResponse = await edgeRoom(env, input.edgeId).fetch("https://edge-room/presence");
+  const presence = await presenceResponse.json<{ connected?: boolean; modemOnline?: boolean; lineBusy?: boolean }>();
+  if (!presence.connected) throw new HttpError("EDGE_OFFLINE", "Edge is offline", 409);
+  if (presence.modemOnline === false) throw new HttpError("MODEM_OFFLINE", "Modem is offline", 409);
+  if (presence.lineBusy) throw new HttpError("LINE_BUSY", "Line is busy", 409);
+
+  const now = Date.now();
+  const callId = randomId("call");
+  const commandId = randomId("command");
+  const sessionId = randomId("session");
+  const roomName = randomId("callpilot");
+  const phoneIdentity = randomId("web", 12);
+  const edgeIdentity = randomId("edgepart", 12);
+  const expiresAt = now + 5 * 60 * 1000;
+  const inserted = await env.DB.prepare(
+    "INSERT OR IGNORE INTO calls(call_id, edge_id, device_id, idempotency_key, room_name, phone_identity, edge_identity, status, created_at, expires_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?8)"
+  ).bind(callId, input.edgeId, device.device_id, input.idempotencyKey, roomName, phoneIdentity, edgeIdentity, now, expiresAt).run();
+  if (!inserted.meta.changes) {
+    const raced = await env.DB.prepare(
+      "SELECT * FROM calls WHERE device_id = ?1 AND idempotency_key = ?2"
+    ).bind(device.device_id, input.idempotencyKey).first<CallRecord>();
+    if (raced) return json(callPayload(raced), 200);
+    throw new HttpError("CONFLICT", "Call could not be created", 409);
+  }
+
+  const edgeToken = await issueParticipantToken(env, roomName, edgeIdentity);
+  const command = {
+    v: 1,
+    type: "session.start",
+    commandId,
+    callId,
+    expiresAt: new Date(expiresAt).toISOString(),
+    session: {
+      sessionId,
+      roomName,
+      browserIdentity: phoneIdentity,
+      edgeIdentity,
+      livekitUrl: env.LIVEKIT_URL,
+      token: edgeToken
+    }
+  };
+  const delivered = await edgeRoom(env, input.edgeId).fetch("https://edge-room/command", {
+    method: "POST",
+    body: JSON.stringify(command)
+  });
+  if (!delivered.ok) {
+    await env.DB.prepare("UPDATE calls SET status = 'failed', updated_at = ?1 WHERE call_id = ?2")
+      .bind(Date.now(), callId).run();
+    throw new HttpError("EDGE_OFFLINE", "Edge disconnected before the call could start", 409);
+  }
+  await audit(env, "phone", device.device_id, "call.created", callId, "allowed");
+  const call = await env.DB.prepare("SELECT * FROM calls WHERE call_id = ?1").bind(callId).first<CallRecord>();
+  return json(callPayload(call as CallRecord), 202);
+}
+
+async function getCall(request: Request, env: Env, callId: string): Promise<Response> {
+  const device = await authenticateDevice(request, env);
+  const call = await env.DB.prepare(
+    "SELECT * FROM calls WHERE call_id = ?1 AND device_id = ?2"
+  ).bind(callId, device.device_id).first<CallRecord>();
+  if (!call) throw new HttpError("NOT_FOUND", "Call not found", 404);
+  const payload: Record<string, unknown> = callPayload(call);
+  if (call.status === "ready" && call.expires_at > Date.now()) {
+    payload.session = {
+      livekitUrl: env.LIVEKIT_URL,
+      token: await issueParticipantToken(env, call.room_name, call.phone_identity),
+      expiresAt: call.expires_at
+    };
+  }
+  return json(payload);
+}
+
+async function authenticateActorForEdge(
+  request: Request,
+  env: Env,
+  edgeId: string
+): Promise<{ kind: "edge" | "device" }> {
+  try {
+    const edge = await authenticateEdge(request, env);
+    if (edge.edge_id !== edgeId) throw new HttpError("FORBIDDEN", "Edge does not own this resource", 403);
+    return { kind: "edge" };
+  } catch (caught) {
+    if (!(caught instanceof HttpError) || caught.status !== 401) throw caught;
+  }
+  const device = await authenticateDevice(request, env);
+  if (device.edge_id !== edgeId) throw new HttpError("FORBIDDEN", "Device is not paired to this Edge", 403);
+  return { kind: "device" };
+}
+
+function edgeRoom(env: Env, edgeId: string): DurableObjectStub {
+  return env.EDGE_ROOMS.get(env.EDGE_ROOMS.idFromName(edgeId));
+}
+
+function callPayload(call: CallRecord): Record<string, unknown> {
+  return {
+    callId: call.call_id,
+    edgeId: call.edge_id,
+    status: call.status,
+    createdAt: call.created_at,
+    expiresAt: call.expires_at
+  };
+}
+
+function normalizePairingCode(code: string): string {
+  return code.replace(/-/g, "").toUpperCase();
+}
+
+function deviceCookie(value: string, maxAge: number): string {
+  return `__Host-callpilot-device=${value}; Path=/; Max-Age=${maxAge}; Secure; HttpOnly; SameSite=Strict`;
+}
+
+function secureAsset(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self' https://*.livekit.cloud wss:; media-src blob:; worker-src 'self' blob:; manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+  headers.set("Permissions-Policy", "microphone=(self), camera=(), geolocation=()");
+  headers.set("Referrer-Policy", "no-referrer");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Frame-Options", "DENY");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+async function audit(
+  env: Env,
+  actorType: string,
+  actorId: string,
+  action: string,
+  resourceId: string,
+  result: string
+): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO audit_events(event_id, actor_type, actor_id, action, resource_id, result, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+  ).bind(randomId("event"), actorType, actorId, action, resourceId, result, Date.now()).run();
+}
+
+async function enforceRateLimit(
+  env: Env,
+  request: Request,
+  action: string,
+  limit: number,
+  windowMs: number
+): Promise<void> {
+  const client = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const now = Date.now();
+  const bucket = Math.floor(now / windowMs) * windowMs;
+  const key = `${action}:${client}:${bucket}`;
+  const row = await env.DB.prepare(
+    "INSERT INTO rate_limits(rate_key, window_start, count) VALUES (?1, ?2, 1) ON CONFLICT(rate_key) DO UPDATE SET count = count + 1 RETURNING count"
+  ).bind(key, bucket).first<{ count: number }>();
+  if ((row?.count ?? limit + 1) > limit) {
+    throw new HttpError("RATE_LIMITED", "Too many attempts", 429);
+  }
+}
+
+void EdgeRoom;

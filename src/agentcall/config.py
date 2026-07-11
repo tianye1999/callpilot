@@ -291,12 +291,19 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 远程网页拨号 POC ----
     ConfigSpec("REMOTE_WEB_DIALER_ENABLED", "启用远程网页拨号", "bool", "false",
                requires_restart=True),
+    ConfigSpec("REMOTE_CLOUD_ENABLED", "使用 CallPilot 云控制面", "bool", "false",
+               requires_restart=True),
+    ConfigSpec("REMOTE_CLOUD_URL", "CallPilot 云控制面地址", "str",
+               "https://api.bondings.ai", requires_restart=True),
+    ConfigSpec("REMOTE_CLOUD_DIALER_URL", "CallPilot 手机拨号地址", "str",
+               "https://dial.bondings.ai/", editable=False, hidden=True),
     ConfigSpec("REMOTE_MEDIA_PROVIDER", "远程媒体服务", "select", "livekit",
                choices=("livekit",)),
     # EC20/EG25 真机验证：UAC 路径只注入带内双音时，运营商 IVR 可能不识别；
     # 远程真人拨号默认走模组 QVTS，避免继承 AI 通话的带内默认值。
     ConfigSpec("REMOTE_DTMF_MODE", "远程拨号 DTMF 模式", "select", "qvts",
                choices=("qvts", "both", "inband")),
+    ConfigSpec("REMOTE_HUMAN_RECORDING_ENABLED", "远程真人通话录音", "bool", "false"),
     ConfigSpec("REMOTE_CONTROL_URL", "远程拨号页 HTTPS 地址", "str", ""),
     ConfigSpec("LIVEKIT_URL", "LiveKit WebSocket 地址", "str", ""),
     ConfigSpec("LIVEKIT_API_KEY", "LiveKit API Key", "str", "", secret=True),
@@ -626,6 +633,8 @@ def _validate_sms_email_updates(updates: dict[str, str]) -> None:
 
 _REMOTE_DIALER_CONFIG_KEYS = {
     "REMOTE_WEB_DIALER_ENABLED",
+    "REMOTE_CLOUD_ENABLED",
+    "REMOTE_CLOUD_URL",
     "REMOTE_MEDIA_PROVIDER",
     "REMOTE_CONTROL_URL",
     "LIVEKIT_URL",
@@ -648,34 +657,51 @@ def _validate_remote_dialer_updates(updates: dict[str, str]) -> None:
     enabled = merged("REMOTE_WEB_DIALER_ENABLED").lower() in _TRUTHY
     if not enabled:
         return
+    cloud_enabled = merged("REMOTE_CLOUD_ENABLED").lower() in _TRUTHY
     required = (
-        "REMOTE_CONTROL_URL",
-        "LIVEKIT_URL",
-        "LIVEKIT_API_KEY",
-        "LIVEKIT_API_SECRET",
+        ("REMOTE_CLOUD_URL",)
+        if cloud_enabled
+        else (
+            "REMOTE_CONTROL_URL",
+            "LIVEKIT_URL",
+            "LIVEKIT_API_KEY",
+            "LIVEKIT_API_SECRET",
+        )
     )
     missing = [key for key in required if not merged(key)]
     if missing:
         raise ValueError("启用远程网页拨号前请完整配置: " + ", ".join(missing))
 
-    public_url = urllib.parse.urlparse(merged("REMOTE_CONTROL_URL"))
-    if (
-        public_url.scheme != "https"
-        or not public_url.netloc
-        or public_url.username
-        or public_url.password
-        or public_url.fragment
-    ):
-        raise ValueError("配置 REMOTE_CONTROL_URL 必须是无内嵌凭证的 HTTPS URL")
-    livekit_url = urllib.parse.urlparse(merged("LIVEKIT_URL"))
-    if (
-        livekit_url.scheme != "wss"
-        or not livekit_url.netloc
-        or livekit_url.username
-        or livekit_url.password
-        or livekit_url.fragment
-    ):
-        raise ValueError("配置 LIVEKIT_URL 必须是无内嵌凭证的 WSS URL")
+    if cloud_enabled:
+        cloud_url = urllib.parse.urlparse(merged("REMOTE_CLOUD_URL"))
+        if (
+            cloud_url.scheme != "https"
+            or not cloud_url.netloc
+            or cloud_url.username
+            or cloud_url.password
+            or cloud_url.query
+            or cloud_url.fragment
+        ):
+            raise ValueError("配置 REMOTE_CLOUD_URL 必须是无内嵌凭证的 HTTPS URL")
+    else:
+        public_url = urllib.parse.urlparse(merged("REMOTE_CONTROL_URL"))
+        if (
+            public_url.scheme != "https"
+            or not public_url.netloc
+            or public_url.username
+            or public_url.password
+            or public_url.fragment
+        ):
+            raise ValueError("配置 REMOTE_CONTROL_URL 必须是无内嵌凭证的 HTTPS URL")
+        livekit_url = urllib.parse.urlparse(merged("LIVEKIT_URL"))
+        if (
+            livekit_url.scheme != "wss"
+            or not livekit_url.netloc
+            or livekit_url.username
+            or livekit_url.password
+            or livekit_url.fragment
+        ):
+            raise ValueError("配置 LIVEKIT_URL 必须是无内嵌凭证的 WSS URL")
 
     if float(merged("REMOTE_DISCONNECT_GRACE_SECONDS")) < 0:
         raise ValueError("配置 REMOTE_DISCONNECT_GRACE_SECONDS 不能小于 0")

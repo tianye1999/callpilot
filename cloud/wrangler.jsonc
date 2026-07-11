@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "callpilot-cloud-beta",
+  "main": "src/index.ts",
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "dial-beta.bondings.ai", "custom_domain": true },
+    { "pattern": "api-beta.bondings.ai", "custom_domain": true }
+  ],
+  "compatibility_date": "2026-07-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "callpilot-cloud-beta",
+      "database_id": "08754162-8d46-44a4-bf1e-e04cb64adc1f",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "EDGE_ROOMS", "class_name": "EdgeRoom" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["EdgeRoom"] }
+  ],
+  "vars": {
+    "PUBLIC_ORIGIN": "https://dial-beta.bondings.ai"
+  }
+}

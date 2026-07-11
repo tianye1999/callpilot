@@ -51,6 +51,14 @@ for _livekit_package in ("livekit.rtc", "livekit.api"):
 datas += copy_metadata("livekit")
 datas += copy_metadata("livekit-api")
 
+# Hosted control-plane credentials use platform-native Keychain/Credential Manager.
+# keyring discovers its backend dynamically, so collect the package explicitly.
+_keyring_datas, _keyring_binaries, _keyring_hidden = collect_all("keyring")
+datas += _keyring_datas
+binaries += _keyring_binaries
+hiddenimports += _keyring_hidden
+hiddenimports += collect_submodules("keyring.backends")
+
 # 三段式 local provider 的 sherpa-onnx（可选依赖）：装了才收进包。
 # 打包 venv 由 build_installer.sh 的 [local] extra 装入；缺失时静默跳过，
 # 产出仍是可用的 realtime-only 包（不硬依赖三段式）。

@@ -33,3 +33,9 @@ CLAUDE.local.md
 # setuptools/pip install -e 构建产物(不入库)
 *.egg-info/
 .playwright-cli/
+
+# Cloud control-plane local state and secrets
+cloud/node_modules/
+cloud/.wrangler/
+cloud/.dev.vars
+cloud/coverage/

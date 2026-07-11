@@ -194,6 +194,9 @@
   .remote-pair-head { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
   .remote-pair-code { font-family: var(--mono); font-weight: 700; color: var(--blue); }
   .remote-pair-head input { min-width: 0; font-size: 12px; }
+  .remote-cloud { display: none; gap: 8px; margin: 8px 0; padding: 10px; border: 1px solid var(--border); background: var(--well); }
+  .remote-cloud.show { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+  .remote-cloud-status { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
   .remote-devices { margin-top: 8px; display: grid; gap: 6px; }
   .remote-device { min-height: 32px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; }
   @media(max-width:520px) {
@@ -770,6 +773,12 @@
               <select id="dialPreset" class="preset-select"></select>
               <input id="dialNumber" class="dial-input" type="text" data-i18n-ph="ph_number" />
               <input id="dialTask" class="task-input" type="text" data-i18n-ph="ph_task" />
+              <div class="remote-cloud" id="remoteCloudPanel">
+                <span class="remote-cloud-status" id="remoteCloudStatus"></span>
+                <input id="remoteCloudCode" type="text" autocomplete="one-time-code" data-i18n-ph="remote_cloud_code" />
+                <input id="remoteCloudName" type="text" maxlength="64" data-i18n-ph="remote_cloud_name" />
+                <button class="btn sm primary" id="remoteCloudEnroll" data-i18n="remote_cloud_enroll"></button>
+              </div>
               <div class="dial-actions">
                 <button class="btn primary" id="dialBtn" data-i18n="dial"></button>
                 <button class="btn ghost" id="remotePairBtn" data-i18n="remote_pair" hidden></button>
@@ -1144,6 +1153,10 @@ const I18N = {
     remote_ready: "Mobile link ready", remote_copied: "Link copied", remote_fail: "Could not create link: ",
     remote_pairing: "Creating pairing code…", remote_pair_ready: "Pairing code ready",
     remote_devices_empty: "No paired phones", remote_revoke: "Revoke", remote_revoked: "Phone revoked",
+    remote_cloud_code: "Beta invitation code", remote_cloud_name: "This computer's name",
+    remote_cloud_enroll: "Register", remote_cloud_not_enrolled: "Register this computer before pairing a phone",
+    remote_cloud_connecting: "Cloud registered · connecting", remote_cloud_connected: "Cloud connected",
+    remote_cloud_enrolled: "Computer registered", remote_cloud_failed: "Registration failed: ",
     voice_preview: "Preview voices ↗",
     ph_task: "Call topic (blank = reuse last)", task_prefix: "Topic (blank = reuse): ",
     calling: "Calling…", call_sent: "Call started", call_fail: "Call failed",
@@ -1273,8 +1286,11 @@ const I18N = {
       SMS_EMAIL_SMTP_PASSWORD: "Sender SMTP app password",
       SMS_EMAIL_FROM: "Sender email address",
       REMOTE_WEB_DIALER_ENABLED: "Remote Web Dialer",
+      REMOTE_CLOUD_ENABLED: "Use hosted CallPilot control plane",
+      REMOTE_CLOUD_URL: "CallPilot control plane URL",
       REMOTE_MEDIA_PROVIDER: "Remote media provider",
       REMOTE_DTMF_MODE: "Remote DTMF mode",
+      REMOTE_HUMAN_RECORDING_ENABLED: "Record remote human calls",
       REMOTE_CONTROL_URL: "Remote dialer HTTPS URL",
       LIVEKIT_URL: "LiveKit WebSocket URL",
       LIVEKIT_API_KEY: "LiveKit API key",
@@ -1299,6 +1315,10 @@ const I18N = {
     remote_ready: "手机链接已生成", remote_copied: "链接已复制", remote_fail: "生成链接失败：",
     remote_pairing: "正在生成配对码…", remote_pair_ready: "配对码已生成",
     remote_devices_empty: "暂无已配对手机", remote_revoke: "撤销", remote_revoked: "手机已撤销",
+    remote_cloud_code: "Beta 邀请码", remote_cloud_name: "这台电脑的名称",
+    remote_cloud_enroll: "注册", remote_cloud_not_enrolled: "请先注册这台电脑，再配对手机",
+    remote_cloud_connecting: "云端已注册 · 正在连接", remote_cloud_connected: "云端已连接",
+    remote_cloud_enrolled: "电脑注册成功", remote_cloud_failed: "注册失败：",
     voice_preview: "官网试听 ↗",
     ph_task: "外呼主题（空=沿用上次）", task_prefix: "主题（空=沿用）：",
     calling: "呼叫中…", call_sent: "已发起呼叫", call_fail: "呼叫失败",
@@ -2100,14 +2120,55 @@ async function loadRemoteDialerStatus() {
     const response = await fetch("/api/remote_dialer/status", { cache: "no-store" });
     if (!response.ok) return;
     const status = await response.json();
-    $("remoteInviteBtn").hidden = !status.enabled;
-    $("remotePairBtn").hidden = !status.enabled;
-    if (status.enabled) await loadRemoteDevices();
+    const cloud = await loadRemoteCloudStatus();
+    $("remoteInviteBtn").hidden = !status.enabled || cloud.enabled;
+    $("remotePairBtn").hidden = !status.enabled || (cloud.enabled && !cloud.enrolled);
+    if (status.enabled && (!cloud.enabled || cloud.enrolled)) await loadRemoteDevices();
   } catch (e) {
     $("remoteInviteBtn").hidden = true;
     $("remotePairBtn").hidden = true;
   }
 }
+async function loadRemoteCloudStatus() {
+  const disabled = { enabled: false, enrolled: false, connected: false };
+  try {
+    const response = await fetch("/api/remote_cloud/status", { cache: "no-store" });
+    if (!response.ok) return disabled;
+    const status = await response.json();
+    $("remoteCloudPanel").classList.toggle("show", Boolean(status.enabled && !status.enrolled));
+    if (status.enabled) {
+      $("remoteCloudStatus").textContent = !status.enrolled
+        ? t("remote_cloud_not_enrolled")
+        : (status.connected ? t("remote_cloud_connected") : t("remote_cloud_connecting"));
+    }
+    return status;
+  } catch (e) {
+    return disabled;
+  }
+}
+$("remoteCloudEnroll").addEventListener("click", async () => {
+  const button = $("remoteCloudEnroll");
+  const code = $("remoteCloudCode").value.trim();
+  const displayName = $("remoteCloudName").value.trim();
+  button.disabled = true;
+  try {
+    const { httpOk, res } = await postJson("/api/remote_cloud/enroll", {
+      code,
+      display_name: displayName,
+    });
+    if (!httpOk || !res.ok) {
+      setToast("dialToast", "err", t("remote_cloud_failed") + (res.error || ""));
+      return;
+    }
+    $("remoteCloudCode").value = "";
+    setToast("dialToast", "ok", t("remote_cloud_enrolled"));
+    await loadRemoteDialerStatus();
+  } catch (e) {
+    setToast("dialToast", "err", t("req_error"));
+  } finally {
+    button.disabled = false;
+  }
+});
 $("remotePairBtn").addEventListener("click", async () => {
   const button = $("remotePairBtn");
   button.disabled = true;

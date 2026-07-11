@@ -19,10 +19,14 @@ from dotenv import load_dotenv
 
 from agentcall import config, number_profiles
 from agentcall.call_agent import CallAgentService
+from agentcall.cloud_control import CloudControlApi, CloudEdgeClient
+from agentcall.cloud_credentials import CloudCredentialStore
 from agentcall.events import EventHub
 from agentcall.remote_pairing import RemotePairingStore
 from agentcall.web.remote_gateway import build_remote_gateway
 from agentcall.web.server import build_app
+
+logger = logging.getLogger("app")
 
 
 def _open_browser_later(url: str, delay: float = 1.0) -> threading.Timer | None:
@@ -55,6 +59,25 @@ def _restart_after_cleanup() -> None:
     os.execv(sys.executable, argv)
 
 
+def _create_cloud_components(service):
+    """Build the optional cloud subsystem without risking core app startup."""
+
+    try:
+        store = CloudCredentialStore()
+        api = CloudControlApi(
+            config.get_str("REMOTE_CLOUD_URL"), sign=store.sign
+        )
+        client = CloudEdgeClient(config.get_str("REMOTE_CLOUD_URL"), service, store)
+        client.start()
+        return api, store, client
+    except (RuntimeError, ValueError) as exc:
+        logger.error(
+            "CallPilot 云控制面启动失败，已禁用远程云功能: error_type=%s",
+            type(exc).__name__,
+        )
+        return None, None, None
+
+
 def _force_utf8() -> None:
     """把标准输出改成 UTF-8，避免中文日志乱码（Windows GBK 控制台）。"""
     for stream in (sys.stdout, sys.stderr):
@@ -82,7 +105,6 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler(), file_handler],
     )
-    logger = logging.getLogger("app")
     logger.info("日志文件: %s", log_file)
 
     provider = config.get_str("AGENT_PROVIDER")
@@ -191,7 +213,14 @@ def main() -> None:
     service.start()
 
     remote_pairing_store = None
-    if config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
+    cloud_api = None
+    cloud_store = None
+    cloud_client = None
+    cloud_enabled = (
+        config.get_bool("REMOTE_WEB_DIALER_ENABLED")
+        and config.get_bool("REMOTE_CLOUD_ENABLED")
+    )
+    if config.get_bool("REMOTE_WEB_DIALER_ENABLED") and not cloud_enabled:
         remote_pairing_store = RemotePairingStore(
             data_dir / "remote_devices.json",
             max_devices=config.get_int("REMOTE_MAX_PAIRED_DEVICES"),
@@ -209,6 +238,9 @@ def main() -> None:
 
     # 需重启配置的自愈重启：/api/restart 置位该事件 → 停 loop → 清理后重启。
     restart_event = threading.Event()
+    if cloud_enabled:
+        cloud_api, cloud_store, cloud_client = _create_cloud_components(service)
+
     app = build_app(
         hub,
         service.modem,
@@ -218,6 +250,9 @@ def main() -> None:
         # loopback 下不启用令牌校验（行为不变）；非 loopback 上面已保证 token 非空。
         auth_token=web_auth_token if not config.is_loopback_host(host) else None,
         remote_pairing_store=remote_pairing_store,
+        remote_cloud_api=cloud_api,
+        remote_cloud_store=cloud_store,
+        remote_cloud_client=cloud_client,
     )
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())
@@ -260,6 +295,8 @@ def main() -> None:
     finally:
         if prewarm_thread is not None:
             prewarm_thread.stop_event.set()
+        if cloud_client is not None:
+            cloud_client.stop()
         service.stop_service()
         if service.monitor is not None:
             service.monitor.stop()
@@ -291,10 +328,14 @@ def _selftest() -> int:
         "agentcall.sms_email_forwarder",
         "agentcall.remote_dialer",
         "agentcall.remote_pairing",
+        "agentcall.cloud_control",
+        "agentcall.cloud_credentials",
         "agentcall.livekit_media",
         "agentcall.web.remote_gateway",
         "livekit.rtc",
         "livekit.api",
+        "keyring",
+        "cryptography.hazmat.primitives.asymmetric.ed25519",
     ]
     optional = {"sherpa_onnx"}
     ok = True
