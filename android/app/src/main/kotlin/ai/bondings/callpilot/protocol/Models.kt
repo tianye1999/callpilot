@@ -45,6 +45,8 @@ data class InvitePayload(
 /** 配对凭证：以 `__Host-callpilot-device=<deviceId>.<secret>` Cookie 形式回传网关。 */
 data class DeviceCredential(val deviceId: String, val secret: String) {
     fun asCookieValue(): String = "$deviceId.$secret"
+
+    override fun toString(): String = "DeviceCredential(deviceId=$deviceId, secret=***)"
 }
 
 /**

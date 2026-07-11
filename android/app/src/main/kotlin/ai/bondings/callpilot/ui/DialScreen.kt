@@ -3,8 +3,9 @@ package ai.bondings.callpilot.ui
 import ai.bondings.callpilot.call.CallManager
 import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
-import ai.bondings.callpilot.protocol.DeviceStatus
 import ai.bondings.callpilot.protocol.GatewayClient
+import ai.bondings.callpilot.protocol.HostedCloudClient
+import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.protocol.Validation
 import android.Manifest
 import android.content.pm.PackageManager
@@ -60,10 +61,7 @@ fun DialScreen(
     onUnpaired: () -> Unit,
 ) {
     val context = LocalContext.current
-    val client = remember(pairing) {
-        GatewayClient(pairing.gatewayUrl).also { it.credential = pairing.credential }
-    }
-    var status by remember { mutableStateOf<DeviceStatus?>(null) }
+    var lineReady by remember { mutableStateOf<Boolean?>(null) }
     var number by remember { mutableStateOf("") }
     var message by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
@@ -97,10 +95,17 @@ fun DialScreen(
         if (number.removePrefix("+").length < 32) number += key
     }
 
-    LaunchedEffect(client) {
+    LaunchedEffect(pairing) {
         launch(Dispatchers.IO) {
             try {
-                status = client.deviceStatus()
+                lineReady = when (pairing.protocol) {
+                    PairingProtocol.TUNNEL -> GatewayClient(pairing.gatewayUrl)
+                        .also { it.credential = pairing.credential }
+                        .deviceStatus().edgeEnabled
+                    PairingProtocol.HOSTED -> HostedCloudClient(pairing.gatewayUrl)
+                        .also { it.credential = pairing.credential }
+                        .deviceStatus().let { it.connected && it.modemOnline }
+                }
             } catch (e: Exception) {
                 message = "获取线路状态失败：${e.message}"
             }
@@ -125,7 +130,14 @@ fun DialScreen(
                 onClick = {
                     scope.launch(Dispatchers.IO) {
                         try {
-                            client.unpair()
+                            when (pairing.protocol) {
+                                PairingProtocol.TUNNEL -> GatewayClient(pairing.gatewayUrl)
+                                    .also { it.credential = pairing.credential }
+                                    .unpair()
+                                PairingProtocol.HOSTED -> HostedCloudClient(pairing.gatewayUrl)
+                                    .also { it.credential = pairing.credential }
+                                    .unpair()
+                            }
                         } catch (_: Exception) {
                             // 网关不可达时也允许本地解除
                         }
@@ -152,7 +164,7 @@ fun DialScreen(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                val enabled = status?.edgeEnabled == true
+                val enabled = lineReady == true
                 Box(
                     Modifier
                         .size(10.dp)
@@ -165,7 +177,7 @@ fun DialScreen(
                 Column {
                     Text(
                         when {
-                            status == null -> "线路状态获取中…"
+                            lineReady == null -> "线路状态获取中…"
                             enabled -> "远程拨号已就绪"
                             else -> "远程拨号未启用"
                         },

@@ -117,3 +117,23 @@ EncryptedSharedPreferences），后续鉴权接口同理。
 3. `/api/session` 响应直接返回结构化 `{livekit_url, token, session_id, expires_at}`
    字段（原生免解 fragment；fragment 形式保留给 web）；
 4. `remote_dialer_status()` 的字段清单文档化（App 首页线路状态依赖它）。
+
+## 五、Hosted 云控制面 `/v1`
+
+当 Edge 启用 `REMOTE_CLOUD_ENABLED=true` 时，Android App 按配对来源改走 hosted
+adapter；原有 Tunnel `/api/*` adapter 与已保存凭证保持不变。Hosted 的完整契约以
+[`remote-cloud-protocol.md`](remote-cloud-protocol.md) 为 SSOT，本文只记录原生端差异：
+
+- `POST /v1/pairing-sessions/claim` 使用 camelCase 请求字段，并从
+  `__Host-callpilot-device` 的 `Set-Cookie` 响应中提取长期设备凭证；原生端后续手动发送
+  同名 `Cookie` 与控制面 origin 对应的 `Origin`。
+- 配对结果额外保存 `edgeId` 和协议标记 `hosted`；未包含协议标记的旧存储数据一律按
+  `tunnel` 读取，避免升级后丢失已有配对。
+- `POST /v1/calls` 携带 `edgeId` 与每次呼叫唯一的 `idempotencyKey`，随后轮询
+  `GET /v1/calls/{callId}`；仅在响应的 `session` 中取得结构化 `livekitUrl`、`token`
+  和 `expiresAt` 后连接 LiveKit，不解析 URL fragment。
+- LiveKit 的 `callpilot.control` / `callpilot.status` topic 和 `media_ready` 后才发送
+  `dial` 的门控语义与 Tunnel 共用，不因控制面协议改变。
+- Hosted 与 Tunnel 配对链接都可能使用根路径，App 不按 URL 形态猜协议。自动模式先向同一
+  origin 提交 hosted claim；仅当 `/v1/pairing-sessions/claim` 返回 404/405 时回退
+  `/api/pair`。业务错误不回退，避免重复提交已被服务端处理的配对码；界面仍保留显式协议选择兜底。

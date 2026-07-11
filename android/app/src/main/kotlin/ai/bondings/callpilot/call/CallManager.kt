@@ -4,15 +4,23 @@ import ai.bondings.callpilot.media.RemoteSession
 import ai.bondings.callpilot.media.SessionEvent
 import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.GatewayClient
+import ai.bondings.callpilot.protocol.HostedCallSession
+import ai.bondings.callpilot.protocol.HostedCloudClient
+import ai.bondings.callpilot.protocol.HostedCloudException
 import ai.bondings.callpilot.protocol.Invite
 import ai.bondings.callpilot.protocol.InviteParser
+import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.protocol.Signaling
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -26,22 +34,30 @@ sealed interface CallState {
     data class Dialing(val number: String) : CallState
     data class InCall(val number: String) : CallState
     data class Ended(val number: String, val reason: String) : CallState
-    data class Failed(val number: String, val reason: String) : CallState
+    data class Failed(val number: String, val reason: String, val code: String? = null) : CallState
 }
 
 /**
  * 出站通话状态机（单通互斥，与 Edge 的一 SIM 一通对应）。
  *
- * 流程：createSession → 解 fragment → 连房间发麦 → 发 dial 命令 →
+ * 流程：按配对来源创建 Tunnel/v1 session → 连房间发麦 → 发 dial 命令 →
  * 收 Edge status/remote_call 事件推进状态 → 任一端挂断/断连收尾（幂等）。
  */
 class CallManager(
     private val sessionFactory: () -> RemoteSession,
-    private val inviteProvider: (StoredPairing) -> Invite = { pairing ->
+    private val inviteProvider: suspend (StoredPairing) -> Invite = { pairing ->
         GatewayClient(pairing.gatewayUrl)
             .also { it.credential = pairing.credential }
             .createSession()
     },
+    private val hostedSessionProvider: suspend (StoredPairing, String) -> HostedCallSession =
+        { pairing, idempotencyKey ->
+            val edgeId = pairing.edgeId ?: error("云配对缺少 Edge ID")
+            HostedCloudClient(pairing.gatewayUrl)
+                .also { it.credential = pairing.credential }
+                .createSession(edgeId, idempotencyKey)
+        },
+    private val idempotencyKeyProvider: () -> String = { "android-${UUID.randomUUID()}" },
     private val onForeground: (active: Boolean) -> Unit = {},
     scope: CoroutineScope? = null,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
@@ -53,6 +69,10 @@ class CallManager(
 
     private var session: RemoteSession? = null
     private var eventJob: Job? = null
+    private var setupJob: Job? = null
+    private var dialJob: Job? = null
+    private var hangupRequested = false
+    private val commandLock = Any()
 
     /** 等待 Edge media_ready 后才发出的 dial 命令（Edge 会拒绝抢跑的 dial）。 */
     private var pendingDial: String? = null
@@ -64,32 +84,42 @@ class CallManager(
 
     fun startCall(pairing: StoredPairing, number: String) {
         if (isActive) return
+        synchronized(commandLock) { hangupRequested = false }
         _state.value = CallState.Preparing(number)
-        scope.launch {
+        val idempotencyKey = idempotencyKeyProvider()
+        setupJob = scope.launch {
             try {
-                val invite = withContext(ioDispatcher) {
-                    inviteProvider(pairing)
-                }
-                val structuredUrl = invite.livekitUrl
-                val structuredToken = invite.token
-                val (livekitUrl, token) =
-                    if (!structuredUrl.isNullOrBlank() && !structuredToken.isNullOrBlank()) {
-                        structuredUrl to structuredToken
-                    } else {
-                        val payload = InviteParser.parseInviteUrl(invite.url)
-                            ?: error("邀请解析失败（协议版本或格式不符）")
-                        payload.url to payload.token
+                val (livekitUrl, token) = withContext(ioDispatcher) {
+                    when (pairing.protocol) {
+                        PairingProtocol.TUNNEL -> connectionFromInvite(inviteProvider(pairing))
+                        PairingProtocol.HOSTED -> hostedSessionProvider(pairing, idempotencyKey).let {
+                            it.livekitUrl to it.token
+                        }
                     }
+                }
                 val s = sessionFactory()
                 session = s
                 eventJob = scope.launch { s.events.collect { handleEvent(number, it) } }
                 onForeground(true)
                 // Edge 在确认本端音频轨就绪（media_ready 事件）前会拒绝 dial，
                 // 所以 dial 挂起到 handleEvent 收到 media_ready 再发。
-                pendingDial = number
+                currentCoroutineContext().ensureActive()
+                synchronized(commandLock) {
+                    if (_state.value !is CallState.Preparing) throw CancellationException()
+                    pendingDial = number
+                }
                 s.connect(livekitUrl, token)
+                currentCoroutineContext().ensureActive()
                 _state.value = CallState.WaitingMedia(number)
+                setupJob = null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: HostedCloudException) {
+                setupJob = null
+                cleanup()
+                _state.value = CallState.Failed(number, e.message, e.errorCode)
             } catch (e: Exception) {
+                setupJob = null
                 cleanup()
                 _state.value = CallState.Failed(number, e.message ?: "拨号失败")
             }
@@ -113,6 +143,15 @@ class CallManager(
 
     fun hangup() {
         val number = currentNumber() ?: return
+        synchronized(commandLock) {
+            if (hangupRequested) return
+            hangupRequested = true
+            pendingDial = null
+            setupJob?.cancel()
+            setupJob = null
+            dialJob?.cancel()
+            dialJob = null
+        }
         val s = session
         scope.launch {
             try {
@@ -131,6 +170,7 @@ class CallManager(
     }
 
     private fun handleEvent(number: String, event: SessionEvent) {
+        if (!isActive || synchronized(commandLock) { hangupRequested }) return
         when (event) {
             is SessionEvent.Edge -> {
                 // Edge 经 LiveKit data channel 发的是 type=status 事件（#37 契约）；
@@ -166,17 +206,37 @@ class CallManager(
 
     /** media_ready 后才把 dial 发给 Edge（幂等：只发一次）。 */
     private fun firePendingDial() {
-        val number = pendingDial ?: return
-        pendingDial = null
-        val s = session ?: return
-        scope.launch {
-            try {
-                s.sendCommand(Signaling.encodeDial(number, UUID.randomUUID().toString()))
-            } catch (e: Exception) {
-                cleanup()
-                _state.value = CallState.Failed(number, e.message ?: "拨号失败")
+        val job = synchronized(commandLock) {
+            if (hangupRequested ||
+                (_state.value !is CallState.WaitingMedia && _state.value !is CallState.Dialing)
+            ) {
+                return
             }
+            val number = pendingDial ?: return
+            pendingDial = null
+            val s = session ?: return
+            scope.launch(start = CoroutineStart.LAZY) {
+                if (!dialIsActive()) return@launch
+                try {
+                    s.sendCommand(Signaling.encodeDial(number, UUID.randomUUID().toString()))
+                    if (!dialIsActive()) return@launch
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    synchronized(commandLock) { dialJob = null }
+                    cleanup()
+                    _state.value = CallState.Failed(number, e.message ?: "拨号失败")
+                }
+            }.also { dialJob = it }
         }
+        job.start()
+    }
+
+    private fun dialIsActive(): Boolean = synchronized(commandLock) {
+        val state = _state.value
+        !hangupRequested &&
+            (state is CallState.WaitingMedia || state is CallState.Dialing) &&
+            dialJob?.isActive == true
     }
 
     private fun currentNumber(): String? = when (val s = _state.value) {
@@ -187,8 +247,25 @@ class CallManager(
         else -> null
     }
 
+    private fun connectionFromInvite(invite: Invite): Pair<String, String> {
+        val structuredUrl = invite.livekitUrl
+        val structuredToken = invite.token
+        if (!structuredUrl.isNullOrBlank() && !structuredToken.isNullOrBlank()) {
+            return structuredUrl to structuredToken
+        }
+        val payload = InviteParser.parseInviteUrl(invite.url)
+            ?: error("邀请解析失败（协议版本或格式不符）")
+        return payload.url to payload.token
+    }
+
     private fun cleanup() {
-        pendingDial = null
+        synchronized(commandLock) {
+            setupJob?.cancel()
+            setupJob = null
+            dialJob?.cancel()
+            dialJob = null
+            pendingDial = null
+        }
         eventJob?.cancel()
         eventJob = null
         session?.disconnect()
