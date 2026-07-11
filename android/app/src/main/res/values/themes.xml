@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose 应用只需系统级 NoActionBar 底座，视觉全部在 Compose 内 -->
+    <style name="Theme.CallPilot" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
