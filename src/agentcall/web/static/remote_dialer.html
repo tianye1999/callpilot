@@ -5,15 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <meta name="referrer" content="no-referrer">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src wss:; media-src blob:; worker-src blob:; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self' wss:; media-src blob:; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'self'">
   <title>CallPilot Remote</title>
-  <link rel="stylesheet" href="./remote_dialer.css">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/callpilot-192.png">
+  <link rel="stylesheet" href="/remote_dialer.css">
   <script
     defer
     src="https://cdn.jsdelivr.net/npm/livekit-client@2.20.1/dist/livekit-client.umd.min.js"
     integrity="sha384-IGu2q4tt1II4yly/zsJYCCLP+lffK6+KqCYd4wvwv7cEzBcULk1wHM1fKzBOLrqY"
     crossorigin="anonymous"></script>
-  <script defer src="./remote_dialer.js"></script>
+  <script defer src="/remote_dialer.js"></script>
 </head>
 <body>
   <main class="dialer-shell">
@@ -28,8 +30,33 @@
       </div>
     </header>
 
-    <section class="call-surface" aria-labelledby="dialerTitle">
+    <section class="pairing-surface" id="pairingSurface" aria-labelledby="pairingTitle" hidden>
+      <h1 id="pairingTitle" data-i18n="pair_title">Pair this phone</h1>
+      <label for="pairingCode" data-i18n="pair_code_label">Pairing code</label>
+      <input
+        id="pairingCode"
+        class="pairing-input"
+        type="text"
+        inputmode="text"
+        autocomplete="one-time-code"
+        maxlength="9"
+        placeholder="ABCD-EFGH">
+      <label for="deviceName" data-i18n="device_name_label">Device name</label>
+      <input
+        id="deviceName"
+        class="pairing-input"
+        type="text"
+        autocomplete="off"
+        maxlength="64">
+      <button id="pairButton" class="command pair" type="button" data-i18n="pair">Pair phone</button>
+    </section>
+
+    <section class="call-surface" id="callSurface" aria-labelledby="dialerTitle" hidden>
       <h1 id="dialerTitle" data-i18n="title">Call with your SIM</h1>
+      <div class="paired-row" id="pairedRow" hidden>
+        <span id="pairedDevice"></span>
+        <button id="unpairButton" type="button" data-i18n="unpair">Unpair</button>
+      </div>
       <label for="dialNumber" data-i18n="number_label">Phone number</label>
       <input
         id="dialNumber"

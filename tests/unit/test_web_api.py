@@ -15,6 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from agentcall import config, platforms
 from agentcall.call_log import CallLogger
+from agentcall.remote_pairing import RemotePairingStore
 from agentcall.web import server
 from agentcall.web.server import _history_audio, _history_delete, _history_events, build_app
 
@@ -121,8 +122,13 @@ class FakeModem:
         return self.send_result
 
 
-def make_app(service):
-    return build_app(hub=None, modem=None, service=service)  # type: ignore[arg-type]
+def make_app(service, *, remote_pairing_store=None):
+    return build_app(  # type: ignore[arg-type]
+        hub=None,
+        modem=None,
+        service=service,
+        remote_pairing_store=remote_pairing_store,
+    )
 
 
 def api(app, fn):
@@ -1150,6 +1156,69 @@ def test_remote_dialer_page_is_no_store_and_does_not_expose_admin_data():
         script = await client.get("/remote-dialer/remote_dialer.js")
         assert script.status == 200
         assert "callpilot.control" in await script.text()
+
+    api(app, fn)
+
+
+def test_local_dashboard_creates_pairing_and_lists_then_revokes_device(tmp_path, monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_CONTROL_URL", "https://dial.example/")
+    monkeypatch.setenv("REMOTE_PAIRING_TTL_SECONDS", "300")
+    store = RemotePairingStore(tmp_path / "devices.json")
+    app = make_app(FakeService(), remote_pairing_store=store)
+
+    async def fn(client):
+        pairing = await client.post(
+            "/api/remote_dialer/pairing", json={}
+        )
+        assert pairing.status == 200
+        pairing_body = await pairing.json()
+        assert pairing_body["pairing"]["url"].startswith(
+            "https://dial.example/#pair="
+        )
+        assert pairing_body["pairing"]["code"] not in pairing_body["pairing"]["url"].split("#", 1)[0]
+
+        credential = store.pair(pairing_body["pairing"]["code"], "My iPhone")
+        devices = await client.get("/api/remote_dialer/devices")
+        devices_body = await devices.json()
+        assert devices_body == {
+            "ok": True,
+            "devices": [
+                {
+                    "device_id": credential.device.device_id,
+                    "display_name": "My iPhone",
+                    "created_at": credential.device.created_at,
+                    "last_used_at": credential.device.last_used_at,
+                    "revoked_at": None,
+                }
+            ],
+        }
+
+        revoked = await client.delete(
+            f"/api/remote_dialer/devices/{credential.device.device_id}"
+        )
+        assert revoked.status == 200
+        assert (await revoked.json()) == {"ok": True}
+        assert store.authenticate(credential.device.device_id, credential.secret) is None
+
+    api(app, fn)
+
+
+def test_local_pairing_management_is_default_off_and_requires_store(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "false")
+    app = make_app(FakeService())
+
+    async def fn(client):
+        pairing = await client.post("/api/remote_dialer/pairing", json={})
+        assert pairing.status == 403
+
+        devices = await client.get("/api/remote_dialer/devices")
+        assert devices.status == 503
+
+        malformed_revoke = await client.delete(
+            "/api/remote_dialer/devices/not-a-device"
+        )
+        assert malformed_revoke.status == 400
 
     api(app, fn)
 

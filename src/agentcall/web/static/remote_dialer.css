@@ -79,13 +79,16 @@ button, input { font: inherit; letter-spacing: 0; }
 .status-pill[data-state="working"] .status-dot { background: var(--amber); }
 .status-pill[data-state="error"] .status-dot { background: var(--red); }
 
-.call-surface {
+.call-surface,
+.pairing-surface {
   flex: 1;
   display: flex;
   flex-direction: column;
   justify-content: center;
   min-height: 0;
 }
+
+[hidden] { display: none !important; }
 
 h1 {
   margin: 0 0 32px;
@@ -101,7 +104,8 @@ label {
   font-weight: 650;
 }
 
-.number-input {
+.number-input,
+.pairing-input {
   width: 100%;
   height: 64px;
   padding: 0 16px;
@@ -113,7 +117,19 @@ label {
   font-size: 26px;
 }
 
-.number-input:focus {
+.pairing-input {
+  height: 54px;
+  margin-bottom: 18px;
+  font-size: 18px;
+}
+
+.pairing-input:first-of-type {
+  font-variant-numeric: tabular-nums;
+  text-transform: uppercase;
+}
+
+.number-input:focus,
+.pairing-input:focus {
   border-color: var(--green-strong);
   box-shadow: 0 0 0 3px rgb(56 217 150 / 16%);
 }
@@ -138,10 +154,30 @@ label {
 }
 
 .command.call { background: var(--green); }
+.command.pair { margin-top: 2px; background: var(--green); }
 .command.call:active { background: var(--green-strong); }
 .command.hangup { background: var(--red); color: #fff; }
 .command.hangup:active { background: var(--red-strong); }
 .command:disabled { cursor: default; opacity: .36; }
+
+.paired-row {
+  min-height: 32px;
+  margin: -20px 0 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.paired-row button {
+  border: 0;
+  padding: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
 
 .keypad {
   display: grid;

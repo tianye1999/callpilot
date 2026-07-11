@@ -8,6 +8,8 @@ INDEX = Path(__file__).resolve().parents[2] / "src" / "agentcall" / "web" / "sta
 REMOTE_HTML = INDEX.with_name("remote_dialer.html")
 REMOTE_JS = INDEX.with_name("remote_dialer.js")
 REMOTE_CSS = INDEX.with_name("remote_dialer.css")
+REMOTE_MANIFEST = INDEX.with_name("manifest.webmanifest")
+REMOTE_SW = INDEX.with_name("remote_dialer_sw.js")
 
 
 def test_index_does_not_use_html_injection_apis():
@@ -127,3 +129,51 @@ def test_remote_dialer_uses_pinned_livekit_sri_and_fragment_credentials():
     assert "replaceChildren" in script
     assert script.index("history.replaceState") < script.index("JSON.parse(atob")
     assert "window.top !== window.self" in script
+
+
+def test_remote_dialer_supports_cookie_pairing_fixed_entry_and_pwa_without_browser_token_storage():
+    html = REMOTE_HTML.read_text(encoding="utf-8")
+    script = REMOTE_JS.read_text(encoding="utf-8")
+    manifest = REMOTE_MANIFEST.read_text(encoding="utf-8")
+    service_worker = REMOTE_SW.read_text(encoding="utf-8")
+
+    for element_id in (
+        "pairingSurface",
+        "pairingCode",
+        "deviceName",
+        "pairButton",
+        "pairedDevice",
+        "unpairButton",
+    ):
+        assert f'id="{element_id}"' in html
+    assert 'rel="manifest" href="/manifest.webmanifest"' in html
+    assert 'fetch("/api/device"' in script
+    assert 'postJson("/api/pair"' in script
+    assert 'postJson("/api/session"' in script
+    assert 'postJson("/api/unpair"' in script
+    assert "localStorage" not in script
+    assert "sessionStorage" not in script
+    assert "document.cookie" not in script
+    assert 'navigator.serviceWorker.register("/remote_dialer_sw.js")' in script
+    assert '"start_url": "/"' in manifest
+    assert '"src": "/callpilot-192.png"' in manifest
+    assert '"src": "/callpilot-512.png"' in manifest
+    assert 'url.pathname.startsWith("/api/")' in service_worker
+
+
+def test_dashboard_has_pairing_device_list_revoke_and_legacy_invite_fallback():
+    text = INDEX.read_text(encoding="utf-8")
+
+    for element_id in (
+        "remotePairBtn",
+        "remotePairPanel",
+        "remotePairCode",
+        "remotePairUrl",
+        "remoteDeviceList",
+        "remoteInviteBtn",
+    ):
+        assert f'id="{element_id}"' in text
+    assert 'postJson("/api/remote_dialer/pairing"' in text
+    assert 'fetch("/api/remote_dialer/devices"' in text
+    assert 'method: "DELETE"' in text
+    assert '"/api/remote_dialer/devices/" + encodeURIComponent(deviceId)' in text

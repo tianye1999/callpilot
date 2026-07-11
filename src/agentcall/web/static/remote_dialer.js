@@ -9,6 +9,7 @@
   const CONTROL_TOPIC = "callpilot.control";
   const STATUS_TOPIC = "callpilot.status";
   const NUMBER_RE = /^\+?[0-9*#]{1,32}$/;
+  const PAIR_CODE_RE = /^[23456789A-HJ-NP-Z]{4}-?[23456789A-HJ-NP-Z]{4}$/;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const $ = (id) => document.getElementById(id);
@@ -31,8 +32,20 @@
       invalid_invite: "Invalid or expired link",
       invalid_number: "Enter a valid number",
       microphone_denied: "Microphone access is required",
-      connection_failed: "Could not connect",
+      connection_failed: "Edge is unavailable",
       dtmf_failed: "Key was not sent",
+      pair_title: "Pair this phone",
+      pair_code_label: "Pairing code",
+      device_name_label: "Device name",
+      pair: "Pair phone",
+      pairing: "Pairing",
+      paired: "Paired",
+      pair_failed: "Pairing failed",
+      invalid_pair_code: "Enter the code shown by CallPilot",
+      unpair: "Unpair",
+      default_device_name: "My phone",
+      edge_disabled: "Remote dialing is disabled",
+      edge_unconfigured: "Remote dialing is not configured",
     },
     zh: {
       remote_line: "远程 SIM 线路",
@@ -51,8 +64,20 @@
       invalid_invite: "链接无效或已过期",
       invalid_number: "请输入有效号码",
       microphone_denied: "需要允许麦克风权限",
-      connection_failed: "连接失败",
+      connection_failed: "电脑端暂时不可用",
       dtmf_failed: "按键发送失败",
+      pair_title: "配对这台手机",
+      pair_code_label: "配对码",
+      device_name_label: "设备名称",
+      pair: "配对手机",
+      pairing: "正在配对",
+      paired: "已配对",
+      pair_failed: "配对失败",
+      invalid_pair_code: "请输入 CallPilot 电脑端显示的配对码",
+      unpair: "解除配对",
+      default_device_name: "我的手机",
+      edge_disabled: "电脑端未启用远程拨号",
+      edge_unconfigured: "电脑端远程拨号配置不完整",
     },
   };
 
@@ -65,6 +90,14 @@
 
   const statusPill = $("statusPill");
   const statusText = $("statusText");
+  const pairingSurface = $("pairingSurface");
+  const callSurface = $("callSurface");
+  const pairingCode = $("pairingCode");
+  const deviceName = $("deviceName");
+  const pairButton = $("pairButton");
+  const pairedRow = $("pairedRow");
+  const pairedDevice = $("pairedDevice");
+  const unpairButton = $("unpairButton");
   const numberInput = $("dialNumber");
   const callButton = $("callButton");
   const hangupButton = $("hangupButton");
@@ -72,6 +105,7 @@
   const audioHost = $("audioHost");
 
   let invite = null;
+  let paired = false;
   let room = null;
   let microphoneTrack = null;
   let mediaReady = false;
@@ -83,10 +117,9 @@
     callState = status;
     document.body.dataset.callState = status;
     let tone = "working";
-    if (status === "idle" || status === "media_ready") tone = "ready";
+    if (["idle", "media_ready", "paired", "ended"].includes(status)) tone = "ready";
     if (status === "connected") tone = "connected";
     if (status === "failed") tone = "error";
-    if (status === "ended") tone = "ready";
     statusPill.dataset.state = tone;
     const known = t(status);
     statusText.textContent = detail || (known === status ? t("connection_failed") : known);
@@ -94,9 +127,22 @@
     const connected = status === "connected";
     const busy = ["connecting", "waiting_for_phone", "media_ready", "dialing", "connected"].includes(status);
     numberInput.disabled = busy;
-    callButton.disabled = busy || terminal || !invite;
+    callButton.disabled = busy || terminal || (!paired && !invite);
     hangupButton.disabled = !["connecting", "media_ready", "dialing", "connected"].includes(status);
     keypadButtons.forEach((button) => { button.disabled = !connected; });
+  }
+
+  function showPairing() {
+    pairingSurface.hidden = false;
+    callSurface.hidden = true;
+    pairedRow.hidden = true;
+  }
+
+  function showDialer(device) {
+    pairingSurface.hidden = true;
+    callSurface.hidden = false;
+    pairedRow.hidden = !device;
+    pairedDevice.textContent = device ? device.display_name : "";
   }
 
   function stopMicrophone() {
@@ -104,10 +150,14 @@
     microphoneTrack = null;
   }
 
-  function parseInvite() {
+  function takeFragment() {
     const fragment = window.location.hash.slice(1);
     history.replaceState(null, "", window.location.pathname + window.location.search);
-    if (!fragment || fragment.length > 8192) return null;
+    return fragment.length <= 8192 ? fragment : "";
+  }
+
+  function parseInviteFragment(fragment) {
+    if (!fragment || fragment.startsWith("pair=")) return null;
     try {
       const normalized = fragment.replace(/-/g, "+").replace(/_/g, "/");
       const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
@@ -120,14 +170,17 @@
         payload.token.length < 40 ||
         typeof payload.sessionId !== "string" ||
         !/^[A-Za-z0-9_-]{8,64}$/.test(payload.sessionId)
-      ) {
-        return null;
-      }
-      return {
-        url: url.toString(),
-        token: payload.token,
-        sessionId: payload.sessionId,
-      };
+      ) return null;
+      return { url: url.toString(), token: payload.token, sessionId: payload.sessionId };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function parseInviteUrl(urlValue) {
+    try {
+      const url = new URL(urlValue, window.location.href);
+      return parseInviteFragment(url.hash.slice(1));
     } catch (_error) {
       return null;
     }
@@ -139,6 +192,18 @@
     return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
   }
 
+  async function postJson(path, body) {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+    let payload = {};
+    try { payload = await response.json(); } catch (_error) { payload = {}; }
+    return { response, payload };
+  }
+
   async function sendCommand(command) {
     if (!room) throw new Error("room not connected");
     await room.localParticipant.publishData(
@@ -147,13 +212,20 @@
     );
   }
 
+  function finishRemoteCall(status) {
+    stopMicrophone();
+    invite = null;
+    mediaReady = false;
+    mediaReadyResolve = null;
+    if (room) room.disconnect().catch(() => {});
+    room = null;
+    terminal = !paired;
+    setStatus(status);
+  }
+
   function onStatus(payload) {
     let event;
-    try {
-      event = JSON.parse(decoder.decode(payload));
-    } catch (_error) {
-      return;
-    }
+    try { event = JSON.parse(decoder.decode(payload)); } catch (_error) { return; }
     if (!event || event.type !== "status" || typeof event.status !== "string") return;
     if (event.event === "dtmf_failed") {
       setStatus("connected", t("dtmf_failed"));
@@ -164,9 +236,8 @@
       if (mediaReadyResolve) mediaReadyResolve();
     }
     if (event.status === "ended" || event.status === "failed") {
-      terminal = true;
-      stopMicrophone();
-      if (room) room.disconnect().catch(() => {});
+      finishRemoteCall(event.status);
+      return;
     }
     setStatus(event.status);
   }
@@ -181,6 +252,16 @@
     });
   }
 
+  async function requestInvite() {
+    const { response, payload } = await postJson("/api/session", {});
+    if (!response.ok || !payload.invite || typeof payload.invite.url !== "string") {
+      throw new Error(payload.error || "session unavailable");
+    }
+    const parsed = parseInviteUrl(payload.invite.url);
+    if (!parsed) throw new Error("invalid session");
+    return parsed;
+  }
+
   async function connectAndDial() {
     const number = numberInput.value.trim();
     if (!NUMBER_RE.test(number)) {
@@ -188,14 +269,22 @@
       numberInput.focus();
       return;
     }
-    if (!invite || !window.LivekitClient) {
-      terminal = true;
-      setStatus("failed", t("invalid_invite"));
+    if (!window.LivekitClient) {
+      terminal = !paired;
+      setStatus("failed", t("connection_failed"));
       return;
     }
 
     setStatus("connecting");
     try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
+      microphoneTrack = stream.getAudioTracks()[0];
+      if (!microphoneTrack) throw new Error("microphone track unavailable");
+      if (!invite) invite = await requestInvite();
+
       const { Room, RoomEvent, Track } = window.LivekitClient;
       room = new Room({ adaptiveStream: false, dynacast: false });
       room.on(RoomEvent.TrackSubscribed, (track) => {
@@ -209,18 +298,10 @@
         if (topic === STATUS_TOPIC) onStatus(payload);
       });
       room.on(RoomEvent.Disconnected, () => {
-        if (!terminal) {
-          terminal = true;
-          setStatus("failed", t("connection_failed"));
-        }
+        if (["ended", "failed"].includes(callState)) return;
+        finishRemoteCall("failed");
       });
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        video: false,
-      });
-      microphoneTrack = stream.getAudioTracks()[0];
-      if (!microphoneTrack) throw new Error("microphone track unavailable");
       await room.connect(invite.url, invite.token);
       await room.localParticipant.publishTrack(microphoneTrack, {
         name: "phone-mic",
@@ -229,17 +310,11 @@
       await room.startAudio();
       await waitForMediaReady(12000);
       setStatus("dialing");
-      await sendCommand({
-        type: "dial",
-        number,
-        idempotency_key: idempotencyKey(),
-      });
+      await sendCommand({ type: "dial", number, idempotency_key: idempotencyKey() });
     } catch (error) {
-      terminal = true;
       const denied = error && (error.name === "NotAllowedError" || error.name === "PermissionDeniedError");
+      finishRemoteCall("failed");
       setStatus("failed", denied ? t("microphone_denied") : t("connection_failed"));
-      stopMicrophone();
-      if (room) await room.disconnect().catch(() => {});
     }
   }
 
@@ -248,10 +323,62 @@
     try {
       await sendCommand({ type: "hangup" });
     } catch (_error) {
-      terminal = true;
-      setStatus("ended");
-      if (room) await room.disconnect().catch(() => {});
+      finishRemoteCall("ended");
     }
+  }
+
+  async function pairPhone() {
+    const code = pairingCode.value.trim().toUpperCase();
+    const name = deviceName.value.trim();
+    if (!PAIR_CODE_RE.test(code) || !name || name.length > 64) {
+      setStatus("failed", t("invalid_pair_code"));
+      return;
+    }
+    pairButton.disabled = true;
+    setStatus("pairing");
+    try {
+      const { response, payload } = await postJson("/api/pair", { code, display_name: name });
+      if (!response.ok || !payload.device) {
+        setStatus("failed", payload.error || t("pair_failed"));
+        return;
+      }
+      paired = true;
+      terminal = false;
+      showDialer(payload.device);
+      setStatus("paired", t("ready"));
+    } catch (_error) {
+      setStatus("failed", t("connection_failed"));
+    } finally {
+      pairButton.disabled = false;
+    }
+  }
+
+  async function refreshDevice() {
+    try {
+      const response = await fetch("/api/device", { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok || !payload.paired) return false;
+      paired = true;
+      terminal = false;
+      showDialer(payload.device);
+      if (!payload.edge || !payload.edge.enabled) setStatus("failed", t("edge_disabled"));
+      else if (!payload.edge.configured) setStatus("failed", t("edge_unconfigured"));
+      else setStatus("paired", t("ready"));
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async function unpairPhone() {
+    unpairButton.disabled = true;
+    try { await postJson("/api/unpair", {}); } catch (_error) { /* clear local view below */ }
+    paired = false;
+    terminal = false;
+    invite = null;
+    showPairing();
+    setStatus("idle", t("ready"));
+    unpairButton.disabled = false;
   }
 
   callButton.addEventListener("click", connectAndDial);
@@ -259,14 +386,16 @@
     if (event.key === "Enter") connectAndDial();
   });
   hangupButton.addEventListener("click", hangup);
+  pairButton.addEventListener("click", pairPhone);
+  pairingCode.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") pairPhone();
+  });
+  unpairButton.addEventListener("click", unpairPhone);
   keypadButtons.forEach((button) => {
     button.addEventListener("click", async () => {
       if (callState !== "connected") return;
-      try {
-        await sendCommand({ type: "dtmf", digits: button.dataset.digit });
-      } catch (_error) {
-        setStatus("connected", t("dtmf_failed"));
-      }
+      try { await sendCommand({ type: "dtmf", digits: button.dataset.digit }); }
+      catch (_error) { setStatus("connected", t("dtmf_failed")); }
     });
   });
   window.addEventListener("pagehide", () => {
@@ -279,11 +408,24 @@
     stopMicrophone();
   });
 
-  invite = parseInvite();
-  if (invite) {
+  async function initialize() {
+    deviceName.value = t("default_device_name");
+    const fragment = takeFragment();
+    invite = parseInviteFragment(fragment);
+    if (invite) {
+      terminal = false;
+      showDialer(null);
+      setStatus("idle", t("ready"));
+      return;
+    }
+    if (fragment.startsWith("pair=")) pairingCode.value = fragment.slice(5).toUpperCase();
+    if (await refreshDevice()) return;
+    showPairing();
     setStatus("idle", t("ready"));
-  } else {
-    terminal = true;
-    setStatus("failed", t("invalid_invite"));
   }
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/remote_dialer_sw.js").catch(() => {});
+  }
+  initialize();
 })();

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for the issue #31 POC
+Accepted for issue #31; amended for #31.1 fixed entry and pairing
 
 ## Date
 
@@ -66,13 +66,14 @@ transport and must not be described as end-to-end encrypted.
 REMOTE_WEB_DIALER_ENABLED=true
 REMOTE_MEDIA_PROVIDER=livekit
 REMOTE_DTMF_MODE=qvts
-REMOTE_CONTROL_URL=https://dial.example.com/remote_dialer.html
+REMOTE_CONTROL_URL=https://dial.example.com/
 LIVEKIT_URL=wss://your-project.livekit.cloud
 LIVEKIT_API_KEY=...
 LIVEKIT_API_SECRET=...
 REMOTE_DISCONNECT_GRACE_SECONDS=5
 REMOTE_OUTBOUND_MAX_SECONDS=1800
 REMOTE_DIAL_LIMIT_PER_HOUR=10
+REMOTE_GATEWAY_PORT=47445
 ```
 
 `REMOTE_DTMF_MODE` intentionally defaults to `qvts`. A real EC20/EG25 UAC call
@@ -80,21 +81,12 @@ showed that the carrier IVR ignored in-band-only tones, while QVTS triggered the
 menu and its resulting service SMS. `both` remains available for hardware that
 needs both paths.
 
-Deploy these files in the same HTTPS directory:
-
-- `remote_dialer.html`
-- `remote_dialer.css`
-- `remote_dialer.js`
-
-The static host should send `Content-Security-Policy` with the policy embedded in
-`web/server.py` (including `frame-ancestors 'none'`), plus `Referrer-Policy:
-no-referrer`, `Permissions-Policy: microphone=(self), camera=()`, and
-`X-Content-Type-Options: nosniff`. The page also blanks itself when framed, but an
-HTTP `frame-ancestors` header remains the primary clickjacking control.
-
-Then enable the feature in CallPilot settings and use **Mobile link / 生成手机链接**
-on the dial panel. Copy the resulting short-lived URL to the phone. The LiveKit API
-secret stays on Edge and must never be deployed with the static files.
+Route the HTTPS hostname to the dedicated loopback gateway port. The gateway
+serves the browser files with the required CSP, referrer, permissions, and content
+type headers. Then enable the feature, restart CallPilot, and use **Pair phone /
+配对手机** on the local dial panel. **Temporary link / 临时链接** retains the
+original fragment-only invitation flow for diagnostics. The LiveKit API secret
+stays on Edge and is never sent to the browser.
 
 ## Alternatives Considered
 
@@ -128,6 +120,41 @@ putting the admin server online.
 - The page must stay foreground for dependable mobile-browser audio. Locked-screen
   incoming-call behavior still belongs to parent issue #30 and a native app.
 - The Edge media/control contracts can later be reused by the native handset bridge.
+
+## #31.1 Amendment: Fixed Entry and Device Pairing
+
+The successful public POC exposed one usability gap: the user had to create and
+copy a new URL before every call. The browser iteration keeps the same LiveKit
+call scope while adding a narrow Edge HTTP gateway:
+
+- The phone reuses one fixed HTTPS origin and pairs once with a five-minute,
+  one-time code carried in a URL fragment.
+- The public gateway binds only to `127.0.0.1:47445` and is the sole Cloudflare
+  Tunnel origin. It does not mount the admin application's routes.
+- Successful pairing sets a host-only HttpOnly, Secure, SameSite=Strict cookie.
+  Edge stores only the SHA-256 hash of its random secret in a mode-0600 local
+  file; the local dashboard can list and revoke devices.
+- A paired phone calls `POST /api/session` for each call. The response contains a
+  new short-lived, room-scoped invitation; the durable cookie is never shared
+  with LiveKit or exposed to JavaScript.
+- Pairing and session mutations require an exact same-origin `Origin` header.
+  Pair attempts are rate-limited, codes expire and are one-time, and the active
+  paired-device cap defaults to five.
+- The previous URL-fragment invitation remains compatible as a diagnostic
+  fallback.
+
+Example Cloudflare Tunnel ingress:
+
+```yaml
+ingress:
+  - hostname: dial.example.com
+    service: http://127.0.0.1:47445
+  - service: http_status:404
+```
+
+The browser shell includes a manifest and service worker for home-screen use,
+but foreground browser limitations remain unchanged. No inbound ringing,
+background wake, PushKit, CallKit, or Android Telecom behavior is claimed.
 
 ## References
 

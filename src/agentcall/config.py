@@ -289,7 +289,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("QWEN_RECONNECT_MAX", "Qwen 最大重连次数", "int", "2"),
     ConfigSpec("OPENAI_RECONNECT_MAX", "OpenAI 最大重连次数", "int", "2"),
     # ---- 远程网页拨号 POC ----
-    ConfigSpec("REMOTE_WEB_DIALER_ENABLED", "启用远程网页拨号", "bool", "false"),
+    ConfigSpec("REMOTE_WEB_DIALER_ENABLED", "启用远程网页拨号", "bool", "false",
+               requires_restart=True),
     ConfigSpec("REMOTE_MEDIA_PROVIDER", "远程媒体服务", "select", "livekit",
                choices=("livekit",)),
     # EC20/EG25 真机验证：UAC 路径只注入带内双音时，运营商 IVR 可能不识别；
@@ -303,6 +304,12 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("REMOTE_DISCONNECT_GRACE_SECONDS", "远程断线宽限（秒）", "float", "5"),
     ConfigSpec("REMOTE_OUTBOUND_MAX_SECONDS", "远程外呼最长时长（秒）", "int", "1800"),
     ConfigSpec("REMOTE_DIAL_LIMIT_PER_HOUR", "远程外呼频控（每小时）", "int", "10"),
+    ConfigSpec("REMOTE_GATEWAY_PORT", "远程拨号隧道本机端口", "int", "47445",
+               requires_restart=True),
+    ConfigSpec("REMOTE_MAX_PAIRED_DEVICES", "远程配对设备上限", "int", "5",
+               editable=False, hidden=True),
+    ConfigSpec("REMOTE_PAIRING_TTL_SECONDS", "远程配对码有效期（秒）", "int", "300",
+               editable=False, hidden=True),
     ConfigSpec("REMOTE_INVITE_TTL_SECONDS", "远程拨号邀请有效期（秒）", "int", "300",
                editable=False, hidden=True),
     ConfigSpec("REMOTE_CONNECT_TIMEOUT_SECONDS", "远程外呼接通超时（秒）", "float", "45",
@@ -627,6 +634,7 @@ _REMOTE_DIALER_CONFIG_KEYS = {
     "REMOTE_DISCONNECT_GRACE_SECONDS",
     "REMOTE_OUTBOUND_MAX_SECONDS",
     "REMOTE_DIAL_LIMIT_PER_HOUR",
+    "REMOTE_GATEWAY_PORT",
 }
 
 
@@ -675,6 +683,9 @@ def _validate_remote_dialer_updates(updates: dict[str, str]) -> None:
         raise ValueError("配置 REMOTE_OUTBOUND_MAX_SECONDS 必须大于 0")
     if int(merged("REMOTE_DIAL_LIMIT_PER_HOUR")) < 0:
         raise ValueError("配置 REMOTE_DIAL_LIMIT_PER_HOUR 不能小于 0")
+    gateway_port = int(merged("REMOTE_GATEWAY_PORT"))
+    if gateway_port < 1 or gateway_port > 65535:
+        raise ValueError("配置 REMOTE_GATEWAY_PORT 必须在 1-65535 之间")
 
 
 def _format_assignment(key: str, value: str) -> str:

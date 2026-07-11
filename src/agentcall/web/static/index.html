@@ -189,9 +189,18 @@
   .remote-invite { display: none; margin-top: 10px; gap: 8px; align-items: center; }
   .remote-invite.show { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; }
   .remote-invite input { min-width: 0; font-size: 12px; }
+  .remote-pair { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
+  .remote-pair.show { display: block; }
+  .remote-pair-head { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+  .remote-pair-code { font-family: var(--mono); font-weight: 700; color: var(--blue); }
+  .remote-pair-head input { min-width: 0; font-size: 12px; }
+  .remote-devices { margin-top: 8px; display: grid; gap: 6px; }
+  .remote-device { min-height: 32px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; }
   @media(max-width:520px) {
     .remote-invite.show { grid-template-columns: 1fr 1fr; }
     .remote-invite input { grid-column: 1 / -1; }
+    .remote-pair-head { grid-template-columns: 1fr auto; }
+    .remote-pair-head input { grid-column: 1 / -1; grid-row: 2; }
   }
   .toast { font-size: 12px; min-height: 16px; color: var(--muted); margin-top: 8px; }
   .toast.ok { color: var(--ok); }
@@ -763,9 +772,18 @@
               <input id="dialTask" class="task-input" type="text" data-i18n-ph="ph_task" />
               <div class="dial-actions">
                 <button class="btn primary" id="dialBtn" data-i18n="dial"></button>
+                <button class="btn ghost" id="remotePairBtn" data-i18n="remote_pair" hidden></button>
                 <button class="btn ghost" id="remoteInviteBtn" data-i18n="remote_invite" hidden></button>
               </div>
               <div class="toast" id="dialToast"></div>
+              <div class="remote-pair" id="remotePairPanel">
+                <div class="remote-pair-head">
+                  <span class="remote-pair-code" id="remotePairCode"></span>
+                  <input id="remotePairUrl" type="text" readonly aria-label="Phone pairing link" />
+                  <button class="btn sm ghost" id="remotePairCopy" data-i18n="remote_copy"></button>
+                </div>
+                <div class="remote-devices" id="remoteDeviceList"></div>
+              </div>
               <div class="remote-invite" id="remoteInvitePanel">
                 <input id="remoteInviteUrl" type="text" readonly aria-label="Remote dialer link" />
                 <button class="btn sm ghost" id="remoteInviteCopy" data-i18n="remote_copy"></button>
@@ -1121,9 +1139,11 @@ const I18N = {
     modem_on: "Modem ready", modem_off: "Modem offline",
     keypad: "Keys", hangup: "Hang up",
     dial_label: "MAKE A CALL", preset_label: "PRESET TASK", preset_custom: "Custom (manual input)",
-    dial: "Call", ph_number: "Phone number", remote_invite: "Mobile link",
+    dial: "Call", ph_number: "Phone number", remote_pair: "Pair phone", remote_invite: "Temporary link",
     remote_copy: "Copy", remote_cancel: "Cancel", remote_creating: "Preparing mobile link…",
     remote_ready: "Mobile link ready", remote_copied: "Link copied", remote_fail: "Could not create link: ",
+    remote_pairing: "Creating pairing code…", remote_pair_ready: "Pairing code ready",
+    remote_devices_empty: "No paired phones", remote_revoke: "Revoke", remote_revoked: "Phone revoked",
     voice_preview: "Preview voices ↗",
     ph_task: "Call topic (blank = reuse last)", task_prefix: "Topic (blank = reuse): ",
     calling: "Calling…", call_sent: "Call started", call_fail: "Call failed",
@@ -1274,9 +1294,11 @@ const I18N = {
     modem_on: "模组就绪", modem_off: "模组未连接",
     keypad: "按键", hangup: "挂断",
     dial_label: "拨打电话", preset_label: "预设任务", preset_custom: "自定义（手动输入）",
-    dial: "拨打", ph_number: "输入号码", remote_invite: "生成手机链接",
+    dial: "拨打", ph_number: "输入号码", remote_pair: "配对手机", remote_invite: "临时链接",
     remote_copy: "复制", remote_cancel: "取消", remote_creating: "正在准备手机链接…",
     remote_ready: "手机链接已生成", remote_copied: "链接已复制", remote_fail: "生成链接失败：",
+    remote_pairing: "正在生成配对码…", remote_pair_ready: "配对码已生成",
+    remote_devices_empty: "暂无已配对手机", remote_revoke: "撤销", remote_revoked: "手机已撤销",
     voice_preview: "官网试听 ↗",
     ph_task: "外呼主题（空=沿用上次）", task_prefix: "主题（空=沿用）：",
     calling: "呼叫中…", call_sent: "已发起呼叫", call_fail: "呼叫失败",
@@ -2032,11 +2054,46 @@ $("dialBtn").addEventListener("click", doDial);
 $("dialNumber").addEventListener("keydown", (e) => { if (e.key === "Enter") doDial(); });
 
 let remoteInviteTimer = null;
+let remotePairTimer = null;
+let remoteDevicePoll = null;
 function clearRemoteInvite() {
   if (remoteInviteTimer) clearTimeout(remoteInviteTimer);
   remoteInviteTimer = null;
   $("remoteInviteUrl").value = "";
   $("remoteInvitePanel").classList.remove("show");
+}
+function renderRemoteDevices(devices) {
+  const list = $("remoteDeviceList");
+  list.replaceChildren();
+  const active = Array.isArray(devices) ? devices.filter((device) => !device.revoked_at) : [];
+  if (!active.length) {
+    list.appendChild(el("div", "remote-device", t("remote_devices_empty")));
+    return;
+  }
+  active.forEach((device) => {
+    const row = el("div", "remote-device");
+    row.appendChild(el("span", "", String(device.display_name || "")));
+    const revoke = el("button", "btn sm ghost", t("remote_revoke"));
+    revoke.type = "button";
+    revoke.addEventListener("click", async () => {
+      const deviceId = String(device.device_id || "");
+      const response = await fetch("/api/remote_dialer/devices/" + encodeURIComponent(deviceId), { method: "DELETE" });
+      if (response.ok) {
+        setToast("dialToast", "ok", t("remote_revoked"));
+        await loadRemoteDevices();
+      }
+    });
+    row.appendChild(revoke);
+    list.appendChild(row);
+  });
+}
+async function loadRemoteDevices() {
+  try {
+    const response = await fetch("/api/remote_dialer/devices", { cache: "no-store" });
+    if (!response.ok) return;
+    const payload = await response.json();
+    renderRemoteDevices(payload.devices);
+  } catch (e) { /* pairing management is optional while disabled */ }
 }
 async function loadRemoteDialerStatus() {
   try {
@@ -2044,10 +2101,55 @@ async function loadRemoteDialerStatus() {
     if (!response.ok) return;
     const status = await response.json();
     $("remoteInviteBtn").hidden = !status.enabled;
+    $("remotePairBtn").hidden = !status.enabled;
+    if (status.enabled) await loadRemoteDevices();
   } catch (e) {
     $("remoteInviteBtn").hidden = true;
+    $("remotePairBtn").hidden = true;
   }
 }
+$("remotePairBtn").addEventListener("click", async () => {
+  const button = $("remotePairBtn");
+  button.disabled = true;
+  setToast("dialToast", "", t("remote_pairing"));
+  try {
+    const { httpOk, res } = await postJson("/api/remote_dialer/pairing", {});
+    if (!httpOk || !res.pairing || !res.pairing.url) {
+      setToast("dialToast", "err", t("remote_fail") + (res.error || ""));
+      return;
+    }
+    if (remotePairTimer) clearTimeout(remotePairTimer);
+    if (remoteDevicePoll) clearInterval(remoteDevicePoll);
+    $("remotePairCode").textContent = String(res.pairing.code || "");
+    $("remotePairUrl").value = String(res.pairing.url);
+    $("remotePairPanel").classList.add("show");
+    setToast("dialToast", "ok", t("remote_pair_ready"));
+    await loadRemoteDevices();
+    remoteDevicePoll = setInterval(loadRemoteDevices, 3000);
+    const expiresIn = Math.max(0, Number(res.pairing.expires_at || 0) * 1000 - Date.now());
+    remotePairTimer = setTimeout(() => {
+      $("remotePairCode").textContent = "";
+      $("remotePairUrl").value = "";
+      if (remoteDevicePoll) clearInterval(remoteDevicePoll);
+      remoteDevicePoll = null;
+    }, expiresIn);
+  } catch (e) {
+    setToast("dialToast", "err", t("req_error"));
+  } finally {
+    button.disabled = false;
+  }
+});
+$("remotePairCopy").addEventListener("click", async () => {
+  const value = $("remotePairUrl").value;
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    setToast("dialToast", "ok", t("remote_copied"));
+  } catch (e) {
+    $("remotePairUrl").focus();
+    $("remotePairUrl").select();
+  }
+});
 $("remoteInviteBtn").addEventListener("click", async () => {
   const button = $("remoteInviteBtn");
   button.disabled = true;

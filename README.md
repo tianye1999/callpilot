@@ -195,21 +195,23 @@ secret only in the local, git-ignored `.env` and never returns it from the
 settings API. Public DMG/EXE builds intentionally contain no shared sender
 credential. Enabling forwarding sends SMS content to the configured mailbox.
 
-### Remote Web Dialer POC
+### Remote Web Dialer
 
-Issue #31 adds an **off-by-default** outbound proof: create a short-lived mobile
-link in the local dial panel, open it in a phone browser, grant microphone access,
-and let the Edge use the Dongle SIM to call the entered number. Browser audio and
-scoped dial/DTMF/hangup commands travel through one LiveKit room; the local admin
-port is not exposed.
+Issue #31 and #31.1 add an **off-by-default** remote handset: pair a phone once
+from the local dial panel, then reuse a fixed HTTPS page to place calls through the
+Dongle SIM. Each call still receives a new short-lived LiveKit credential. The
+durable phone credential is an HttpOnly, Secure, SameSite cookie; Edge persists
+only its hash and lets the local dashboard revoke a paired phone immediately.
 
-A real off-LAN test needs a LiveKit project and an HTTPS static host for
-`remote_dialer.html`, `remote_dialer.css`, and `remote_dialer.js`. Fill the
-`REMOTE_*` / `LIVEKIT_*` settings shown in [`.env.example`](.env.example), then
-enable **Remote Web Dialer**. Never publish or tunnel `WEB_PORT` (47100). See
-[ADR-001](docs/decisions/001-remote-web-dialer-livekit.md) for the security and
-deployment boundary. Mobile background/lock-screen calling and inbound takeover
-remain outside this browser POC.
+The public tunnel must target the dedicated loopback gateway
+`127.0.0.1:47445`, not the privileged admin port `WEB_PORT` (47100). The gateway
+serves only the dialer/PWA and pairing/session endpoints; SMS, settings, recordings,
+and arbitrary modem APIs do not exist on it. Fill the `REMOTE_*` / `LIVEKIT_*`
+settings in [`.env.example`](.env.example), restart after enabling, and route the
+fixed HTTPS domain to `REMOTE_GATEWAY_PORT`. The original one-time mobile link is
+kept as a fallback. See [ADR-001](docs/decisions/001-remote-web-dialer-livekit.md).
+Mobile background/lock-screen calling and inbound takeover still require a later
+native app.
 
 ### Quick start (Windows) — awaiting hardware reports
 
@@ -446,18 +448,20 @@ Google Workspace/Gmail 通常填写 `smtp.gmail.com`、端口 `587`、`starttls`
 在本机且被 git 忽略的 `.env`，设置 API 不会回显。公开 DMG/EXE 不内置任何共享发件
 凭证。开启此功能即表示短信发件号码、时间和正文会通过 TLS SMTP 发往所填收件邮箱。
 
-### 远程网页拨号 POC
+### 远程网页拨号
 
-issue #31 新增一个**默认关闭**的外呼验证链路：在本机拨号面板生成短期手机链接，
-用手机浏览器打开并授权麦克风，Edge 再使用 Dongle SIM 拨打网页中输入的号码。
-浏览器音频以及拨号、DTMF、挂断命令都走同一个 LiveKit 房间，不需要开放本地管理端口。
+issue #31 与 #31.1 新增一个**默认关闭**的远程手柄：先从本机拨号面板把手机配对
+一次，之后反复打开固定 HTTPS 页面，即可通过 Dongle SIM 外呼。每通仍签发新的短期
+LiveKit 凭证；长期手机凭证只存在 HttpOnly、Secure、SameSite Cookie 中，Edge 本地
+只保存哈希，并可从本机面板立即撤销设备。
 
-真机异地测试需要一个 LiveKit 项目，并把 `remote_dialer.html`、
-`remote_dialer.css`、`remote_dialer.js` 部署到同一个 HTTPS 静态目录。按
-[`.env.example`](.env.example) 填写 `REMOTE_*` / `LIVEKIT_*` 后打开「远程网页拨号」。
-绝不能把 `WEB_PORT`（47100）发布或映射到公网。安全边界和部署步骤见
-[ADR-001](docs/decisions/001-remote-web-dialer-livekit.md)。浏览器锁屏后台与入站接管
-不在本 POC 内，仍由 #30 后续原生 App 承担。
+公网隧道必须指向独立的最小权限网关 `127.0.0.1:47445`，绝不能指向管理端口
+`WEB_PORT`（47100）。该网关只有拨号页/PWA、配对和单通会话接口，不存在短信、设置、
+录音或任意模组 API。按 [`.env.example`](.env.example) 填写 `REMOTE_*` / `LIVEKIT_*`，
+启用后重启，再把固定 HTTPS 域名转发到 `REMOTE_GATEWAY_PORT`。原来的一次性手机链接
+继续作为故障排查后备入口。安全边界见
+[ADR-001](docs/decisions/001-remote-web-dialer-livekit.md)。锁屏后台与入站接管仍需后续
+原生 App。
 
 ### 快速开始（Windows）—— 待硬件复现反馈
 
