@@ -425,7 +425,9 @@
   }
 
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("/remote_dialer_sw.js").catch(() => {});
+    navigator.serviceWorker.register("/remote_dialer_sw.js?v=2", {
+      updateViaCache: "none",
+    }).catch(() => {});
   }
   initialize();
 })();

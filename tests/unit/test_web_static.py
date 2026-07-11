@@ -154,7 +154,15 @@ def test_remote_dialer_supports_cookie_pairing_fixed_entry_and_pwa_without_brows
     assert "localStorage" not in script
     assert "sessionStorage" not in script
     assert "document.cookie" not in script
-    assert 'navigator.serviceWorker.register("/remote_dialer_sw.js")' in script
+    assert 'navigator.serviceWorker.register("/remote_dialer_sw.js?v=2"' in script
+    assert 'updateViaCache: "none"' in script
+    assert 'href="/remote_dialer.css?v=2"' in html
+    assert 'src="/remote_dialer.js?v=2"' in html
+    assert 'const CACHE_NAME = "callpilot-remote-v2"' in service_worker
+    assert '"/remote_dialer.css?v=2"' in service_worker
+    assert '"/remote_dialer.js?v=2"' in service_worker
+    assert "self.skipWaiting()" in service_worker
+    assert "self.clients.claim()" in service_worker
     assert '"start_url": "/"' in manifest
     assert '"src": "/callpilot-192.png"' in manifest
     assert '"src": "/callpilot-512.png"' in manifest
