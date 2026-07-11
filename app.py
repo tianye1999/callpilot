@@ -26,6 +26,8 @@ from agentcall.remote_pairing import RemotePairingStore
 from agentcall.web.remote_gateway import build_remote_gateway
 from agentcall.web.server import build_app
 
+logger = logging.getLogger("app")
+
 
 def _open_browser_later(url: str, delay: float = 1.0) -> threading.Timer | None:
     if config._is_frozen():
@@ -57,6 +59,25 @@ def _restart_after_cleanup() -> None:
     os.execv(sys.executable, argv)
 
 
+def _create_cloud_components(service):
+    """Build the optional cloud subsystem without risking core app startup."""
+
+    try:
+        store = CloudCredentialStore()
+        api = CloudControlApi(
+            config.get_str("REMOTE_CLOUD_URL"), sign=store.sign
+        )
+        client = CloudEdgeClient(config.get_str("REMOTE_CLOUD_URL"), service, store)
+        client.start()
+        return api, store, client
+    except (RuntimeError, ValueError) as exc:
+        logger.error(
+            "CallPilot 云控制面启动失败，已禁用远程云功能: error_type=%s",
+            type(exc).__name__,
+        )
+        return None, None, None
+
+
 def _force_utf8() -> None:
     """把标准输出改成 UTF-8，避免中文日志乱码（Windows GBK 控制台）。"""
     for stream in (sys.stdout, sys.stderr):
@@ -84,7 +105,6 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler(), file_handler],
     )
-    logger = logging.getLogger("app")
     logger.info("日志文件: %s", log_file)
 
     provider = config.get_str("AGENT_PROVIDER")
@@ -219,12 +239,7 @@ def main() -> None:
     # 需重启配置的自愈重启：/api/restart 置位该事件 → 停 loop → 清理后重启。
     restart_event = threading.Event()
     if cloud_enabled:
-        cloud_store = CloudCredentialStore()
-        cloud_api = CloudControlApi(config.get_str("REMOTE_CLOUD_URL"))
-        cloud_client = CloudEdgeClient(
-            config.get_str("REMOTE_CLOUD_URL"), service, cloud_store
-        )
-        cloud_client.start()
+        cloud_api, cloud_store, cloud_client = _create_cloud_components(service)
 
     app = build_app(
         hub,
@@ -313,10 +328,14 @@ def _selftest() -> int:
         "agentcall.sms_email_forwarder",
         "agentcall.remote_dialer",
         "agentcall.remote_pairing",
+        "agentcall.cloud_control",
+        "agentcall.cloud_credentials",
         "agentcall.livekit_media",
         "agentcall.web.remote_gateway",
         "livekit.rtc",
         "livekit.api",
+        "keyring",
+        "cryptography.hazmat.primitives.asymmetric.ed25519",
     ]
     optional = {"sherpa_onnx"}
     ok = True

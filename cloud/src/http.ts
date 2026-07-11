@@ -20,8 +20,10 @@ export function error(code: string, message: string, status: number, requestId: 
 export async function readJson(request: Request): Promise<unknown> {
   const contentLength = Number(request.headers.get("Content-Length") ?? "0");
   if (contentLength > 16 * 1024) throw new HttpError("PAYLOAD_TOO_LARGE", "Request is too large", 413);
+  const raw = await request.arrayBuffer();
+  if (raw.byteLength > 16 * 1024) throw new HttpError("PAYLOAD_TOO_LARGE", "Request is too large", 413);
   try {
-    return await request.json();
+    return JSON.parse(new TextDecoder().decode(raw));
   } catch {
     throw new HttpError("INVALID_JSON", "Request body must be JSON", 400);
   }
@@ -43,4 +45,3 @@ export class HttpError extends Error {
     super(message);
   }
 }
-

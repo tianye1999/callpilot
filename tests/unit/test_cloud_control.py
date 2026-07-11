@@ -38,6 +38,9 @@ class _Store:
     def load(self) -> EdgeCredential | None:
         return self.credential
 
+    def sign(self, _message: bytes) -> str:
+        return "proof"
+
 
 def _command(**overrides) -> dict:
     expires = datetime.fromtimestamp(time.time() + 300, UTC).isoformat().replace(
@@ -92,11 +95,13 @@ def test_keychain_store_keeps_credential_and_private_key_outside_files(monkeypat
     assert store.load() == EdgeCredential("edge_abcdefghijkl", raw)
     first_public = store.load_or_create_public_key()
     second_public = store.load_or_create_public_key()
+    signature = store.sign(b"device proof")
 
     assert first_public == second_public
     assert len(first_public) == 43
     assert raw in values.values()
     assert first_public not in values.values()
+    assert len(signature) == 86
 
 
 def test_cloud_client_accepts_only_complete_unexpired_session_commands() -> None:
@@ -149,12 +154,51 @@ def test_cloud_api_never_includes_bearer_in_url_or_error(monkeypatch) -> None:
         return _Response()
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    result = CloudControlApi("https://api.bondings.ai").list_devices(credential)
+    result = CloudControlApi(
+        "https://api.bondings.ai", sign=lambda _message: "proof"
+    ).list_devices(credential)
 
     request, _timeout = captured[0]
     assert result == {"devices": []}
     assert credential.value not in request.full_url
     assert request.headers["Authorization"] == f"Bearer {credential.value}"
+    assert request.headers["X-callpilot-signature"] == "proof"
+    assert request.headers["User-agent"] == "CallPilot-Edge/1"
+
+
+def test_cloud_websocket_uses_product_user_agent() -> None:
+    credential = EdgeCredential(
+        "edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40
+    )
+
+    class _WebSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def send(self, _message):
+            client._stop_event.set()
+
+        def recv(self, *, timeout):
+            raise TimeoutError(timeout)
+
+    captured = {}
+
+    def connect(_url, **kwargs):
+        captured.update(kwargs)
+        return _WebSocket()
+
+    client = CloudEdgeClient(
+        "https://api.bondings.ai",
+        _Service(),
+        _Store(credential),
+        connect=connect,
+    )
+    client._run_connection(credential)
+
+    assert captured["user_agent_header"] == "CallPilot-Edge/1"
 
 
 @pytest.mark.parametrize(
@@ -181,4 +225,3 @@ def test_cloud_api_redacts_structured_http_failure(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="EDGE_REVOKED") as caught:
         CloudControlApi("https://api.bondings.ai")._request("GET", "/v1/test")
     assert "sensitive detail" not in str(caught.value)
-

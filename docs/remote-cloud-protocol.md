@@ -12,6 +12,9 @@ Unknown fields may be ignored; unknown message types are rejected.
 - Administrative Beta invite creation: `Authorization: Bearer <admin token>`.
 
 Long-lived secrets are shown once. The server stores only their SHA-256 hashes.
+Every authenticated Edge request also carries a one-minute Ed25519 proof in
+`X-CallPilot-Timestamp` and `X-CallPilot-Signature`, binding a stolen bearer to
+the device key created during enrollment.
 
 ## Error shape
 

@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 
 import WebSocket from "ws";
 
 const port = 18787;
 const base = `http://127.0.0.1:${port}`;
-const origin = "https://dial.bondings.ai";
+const origin = process.env.CALLPILOT_PUBLIC_ORIGIN ?? "https://dial-beta.bondings.ai";
 const adminToken = "integration-admin-token-with-at-least-32-characters";
 const livekitSecret = "integration-livekit-secret-with-at-least-32-characters";
 const clientIp = `198.51.100.${Math.floor(Math.random() * 200) + 1}`;
+const edgeKeys = generateKeyPairSync("ed25519");
+const publicDer = edgeKeys.publicKey.export({ format: "der", type: "spki" });
+const publicKey = publicDer.subarray(publicDer.length - 32).toString("base64url");
 
 const migration = spawnSync(
   "npx",
@@ -52,7 +56,7 @@ try {
   const enrollment = await post("/v1/edge-enrollments/claim", {
     code: invite.code,
     displayName: "Integration Edge",
-    publicKey: "integration-public-key-material-1234567890"
+    publicKey
   }, { "CF-Connecting-IP": clientIp });
   assert.match(enrollment.edgeId, /^edge_/);
   assert.doesNotMatch(JSON.stringify(enrollment), new RegExp(livekitSecret));
@@ -63,13 +67,13 @@ try {
     body: JSON.stringify({
       code: invite.code,
       displayName: "Replay",
-      publicKey: "integration-public-key-material-1234567890"
+      publicKey
     })
   });
   assert.equal(reusedEnrollment.status, 401);
 
   const pairing = await post(`/v1/edges/${enrollment.edgeId}/pairing-sessions`, { ttlSeconds: 300 }, {
-    Authorization: `Bearer ${enrollment.credential}`
+    ...edgeHeaders("POST", `/v1/edges/${enrollment.edgeId}/pairing-sessions`, enrollment)
   });
   assert.match(pairing.code, /^[23456789A-HJ-NP-Z]{4}-[23456789A-HJ-NP-Z]{4}$/);
 
@@ -91,7 +95,7 @@ try {
   assert.equal(untrustedOrigin.status, 403);
 
   const socket = new WebSocket(`${base.replace("http", "ws")}/v1/edges/connect`, {
-    headers: { Authorization: `Bearer ${enrollment.credential}` }
+    headers: edgeHeaders("GET", "/v1/edges/connect", enrollment)
   });
   await new Promise((resolve, reject) => {
     socket.once("open", resolve);
@@ -140,7 +144,7 @@ try {
 
   const revoke = await fetch(`${base}/v1/devices/${paired.device.deviceId}`, {
     method: "DELETE",
-    headers: { Authorization: `Bearer ${enrollment.credential}` }
+    headers: edgeHeaders("DELETE", `/v1/devices/${paired.device.deviceId}`, enrollment)
   });
   assert.equal(revoke.status, 200);
   const afterRevoke = await fetch(`${base}/api/device`, { headers: { Cookie: cookie } });
@@ -186,4 +190,15 @@ function nextMessage(socket) {
       resolve(JSON.parse(data.toString()));
     });
   });
+}
+
+function edgeHeaders(method, path, enrollment) {
+  const timestamp = String(Date.now());
+  const message = `${enrollment.edgeId}\n${timestamp}\n${method}\n${path}`;
+  const signature = sign(null, Buffer.from(message), edgeKeys.privateKey).toString("base64url");
+  return {
+    Authorization: `Bearer ${enrollment.credential}`,
+    "X-CallPilot-Timestamp": timestamp,
+    "X-CallPilot-Signature": signature,
+  };
 }

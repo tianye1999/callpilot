@@ -33,7 +33,8 @@ diagnostic fallback during migration.
 
 - Beta enrollment and phone pairing proofs are one-time and expire quickly.
 - Long-lived credentials are random bearer secrets; only SHA-256 hashes are
-  stored server-side. Edge secrets are stored in the operating-system keychain.
+  stored server-side. Each Edge request also proves possession of its Ed25519
+  device key. Both secrets stay in the operating-system keychain.
 - Every call and command has an opaque ID, expiry, and idempotency key.
 - Cloud authorization never bypasses local Edge policy, modem readiness, line
   ownership, or rate limiting.
@@ -49,4 +50,3 @@ Users no longer configure Cloudflare Tunnel or LiveKit secrets. CallPilot must
 operate a small public service and a data store, and must monitor its availability.
 The browser/Android protocol becomes a versioned external contract. Native inbound
 ringing and full account/billing systems remain outside this Beta.
-

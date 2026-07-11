@@ -71,17 +71,24 @@ class CloudCredentialStore:
                 Ed25519PrivateKey,
             )
 
-            encoded = keyring.get_password(_SERVICE, _KEY_ACCOUNT)
-            if encoded:
-                seed = _decode_key(encoded)
-                private_key = Ed25519PrivateKey.from_private_bytes(seed)
-            else:
-                private_key = Ed25519PrivateKey.generate()
-                seed = private_key.private_bytes_raw()
-                keyring.set_password(_SERVICE, _KEY_ACCOUNT, _encode_key(seed))
+            private_key = _load_or_create_private_key(keyring, Ed25519PrivateKey)
             return _encode_key(private_key.public_key().public_bytes_raw())
         except Exception as exc:
             raise RuntimeError("无法创建或读取云端设备密钥") from exc
+
+    def sign(self, message: bytes) -> str:
+        if not message or len(message) > 4096:
+            raise ValueError("设备签名消息格式不合法")
+        try:
+            import keyring
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PrivateKey,
+            )
+
+            private_key = _load_or_create_private_key(keyring, Ed25519PrivateKey)
+            return _encode_key(private_key.sign(message))
+        except Exception as exc:
+            raise RuntimeError("无法使用云端设备密钥签名") from exc
 
 
 def parse_edge_credential(value: str) -> EdgeCredential | None:
@@ -101,6 +108,17 @@ def _decode_key(value: str) -> bytes:
     if len(raw) != 32:
         raise ValueError("invalid device key")
     return raw
+
+
+def _load_or_create_private_key(keyring_module, key_type):
+    encoded = keyring_module.get_password(_SERVICE, _KEY_ACCOUNT)
+    if encoded:
+        return key_type.from_private_bytes(_decode_key(encoded))
+    private_key = key_type.generate()
+    keyring_module.set_password(
+        _SERVICE, _KEY_ACCOUNT, _encode_key(private_key.private_bytes_raw())
+    )
+    return private_key
 
 
 __all__ = ["CloudCredentialStore", "EdgeCredential", "parse_edge_credential"]

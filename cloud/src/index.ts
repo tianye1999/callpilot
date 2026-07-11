@@ -343,7 +343,7 @@ function deviceCookie(value: string, maxAge: number): string {
 
 function secureAsset(response: Response): Response {
   const headers = new Headers(response.headers);
-  headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self' wss:; media-src blob:; worker-src 'self' blob:; manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+  headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self' https://*.livekit.cloud wss:; media-src blob:; worker-src 'self' blob:; manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
   headers.set("Permissions-Policy", "microphone=(self), camera=(), geolocation=()");
   headers.set("Referrer-Policy", "no-referrer");
   headers.set("X-Content-Type-Options", "nosniff");

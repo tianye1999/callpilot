@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_JSON_BYTES = 16 * 1024
 _ID_RE = r"[a-z]+_[A-Za-z0-9_-]{12,80}"
+_USER_AGENT = "CallPilot-Edge/1"
 
 
 class CloudSessionService(Protocol):
@@ -40,9 +41,16 @@ class CloudControlStatus:
 
 
 class CloudControlApi:
-    def __init__(self, base_url: str, *, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 10.0,
+        sign: Callable[[bytes], str] | None = None,
+    ) -> None:
         self.base_url = _validate_cloud_url(base_url)
         self.timeout = max(1.0, min(timeout, 30.0))
+        self._sign = sign
 
     def enroll(self, code: str, display_name: str, public_key: str) -> dict[str, Any]:
         return self._request(
@@ -84,12 +92,21 @@ class CloudControlApi:
         credential: EdgeCredential | None = None,
     ) -> dict[str, Any]:
         body = None
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "User-Agent": _USER_AGENT}
         if payload is not None:
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json"
         if credential is not None:
+            if self._sign is None:
+                raise RuntimeError("云端设备签名器未配置")
             headers["Authorization"] = f"Bearer {credential.value}"
+            _add_device_proof(
+                headers,
+                credential.edge_id,
+                method,
+                urllib.parse.urlparse(path).path,
+                self._sign,
+            )
         request = urllib.request.Request(
             urllib.parse.urljoin(self.base_url + "/", path.lstrip("/")),
             data=body,
@@ -220,7 +237,8 @@ class CloudEdgeClient:
         websocket_url = _websocket_url(self.base_url)
         with connect(
             websocket_url,
-            additional_headers={"Authorization": f"Bearer {credential.value}"},
+            additional_headers=self._websocket_headers(credential),
+            user_agent_header=_USER_AGENT,
             open_timeout=10.0,
             close_timeout=3.0,
         ) as websocket:
@@ -238,6 +256,17 @@ class CloudEdgeClient:
                     continue
                 if isinstance(message, str):
                     self.handle_message(message, websocket.send)
+
+    def _websocket_headers(self, credential: EdgeCredential) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {credential.value}"}
+        _add_device_proof(
+            headers,
+            credential.edge_id,
+            "GET",
+            "/v1/edges/connect",
+            self.credential_store.sign,
+        )
+        return headers
 
     def _heartbeat(self) -> str:
         status = self.service.remote_dialer_status()
@@ -355,6 +384,21 @@ def _utc_now() -> str:
     from datetime import UTC, datetime
 
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _add_device_proof(
+    headers: dict[str, str],
+    edge_id: str,
+    method: str,
+    path: str,
+    signer: Callable[[bytes], str] | None,
+) -> None:
+    if signer is None:
+        return
+    timestamp = str(int(time.time() * 1000))
+    message = f"{edge_id}\n{timestamp}\n{method.upper()}\n{path}".encode("utf-8")
+    headers["X-CallPilot-Timestamp"] = timestamp
+    headers["X-CallPilot-Signature"] = signer(message)
 
 
 __all__ = [

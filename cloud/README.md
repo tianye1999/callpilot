@@ -35,15 +35,18 @@ npx wrangler secret put LIVEKIT_API_SECRET
 npx wrangler deploy
 ```
 
-Attach both `dial.bondings.ai` and `api.bondings.ai` as Worker custom domains.
+The Beta staging Worker is attached to `dial-beta.bondings.ai` and
+`api-beta.bondings.ai`. Attach `dial.bondings.ai` and `api.bondings.ai` only
+when promoting the accepted build to production.
 The same Worker serves static assets on the dial host and versioned API/WSS
-routes on both hosts. Keep `PUBLIC_ORIGIN=https://dial.bondings.ai`; mutation
-requests from any other browser Origin are rejected.
+routes on both hosts. Keep `PUBLIC_ORIGIN` equal to the active dialer origin
+(`https://dial-beta.bondings.ai` in staging); mutation requests from any other
+browser Origin are rejected.
 
 Create a Beta enrollment code through the admin endpoint without logging it:
 
 ```bash
-curl --fail-with-body -X POST https://api.bondings.ai/v1/admin/enrollment-invites \
+curl --fail-with-body -X POST https://api-beta.bondings.ai/v1/admin/enrollment-invites \
   -H "Authorization: Bearer $CALLPILOT_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   --data '{"ttlSeconds":3600}'
@@ -58,4 +61,3 @@ The hosted mode is independently gated by `REMOTE_CLOUD_ENABLED=false`. Turning
 it off and restarting restores the existing local gateway/Tunnel diagnostic path.
 Do not repoint `dial.bondings.ai` away from the currently accepted path until the
 staging Edge and phone flow has passed end-to-end hardware acceptance.
-

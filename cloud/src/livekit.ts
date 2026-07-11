@@ -1,4 +1,4 @@
-import { AccessToken } from "livekit-server-sdk";
+import { AccessToken, TrackSource } from "livekit-server-sdk";
 
 import type { Env } from "./types";
 
@@ -19,8 +19,7 @@ export async function issueParticipantToken(
     canPublish: true,
     canSubscribe: true,
     canPublishData: true,
-    canPublishSources: [1]
+    canPublishSources: [TrackSource.MICROPHONE]
   });
   return token.toJwt();
 }
-
