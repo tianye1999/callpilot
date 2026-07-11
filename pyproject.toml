@@ -1,6 +1,6 @@
 [project]
 name = "callpilot"
-version = "0.5.6"
+version = "0.6.0"
 description = "Open-source AI phone agent on a Quectel 4G modem: auto-answers, talks with a realtime voice AI, dials out, and sends/receives SMS."
 requires-python = ">=3.12"
 readme = "README.md"

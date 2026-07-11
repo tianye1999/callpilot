@@ -13,6 +13,13 @@ describe("hosted dialer", () => {
     expect(script).toContain('fetch(`/v1/calls/${encodeURIComponent(payload.callId)}`');
   });
 
+  it("reads the paired device name via the camelCase field the /v1 API returns", () => {
+    // /v1 device payloads are camelCase (schemas.ts deviceSchema.displayName);
+    // reading the snake_case DB column left the paired-device label always blank.
+    expect(script).toContain("device.displayName");
+    expect(script).not.toContain("device.display_name");
+  });
+
   it("does not render server strings through HTML injection sinks", () => {
     expect(script).not.toMatch(/\.innerHTML\s*=/);
     expect(script).not.toContain("insertAdjacentHTML");
