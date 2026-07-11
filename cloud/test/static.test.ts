@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 const script = readFileSync(join(process.cwd(), "public", "remote_dialer.js"), "utf8");
 const page = readFileSync(join(process.cwd(), "public", "index.html"), "utf8");
 const indexSource = readFileSync(join(process.cwd(), "src", "index.ts"), "utf8");
+const serviceWorker = readFileSync(join(process.cwd(), "public", "remote_dialer_sw.js"), "utf8");
 
 describe("hosted dialer", () => {
   it("uses the cloud pairing and call resources", () => {
@@ -33,6 +34,12 @@ describe("hosted dialer", () => {
     expect(script).not.toContain("localStorage");
     expect(script).not.toContain("sessionStorage");
     expect(script).not.toContain("Authorization");
+  });
+
+  it("only caches the shell and keeps API responses out of the service worker cache", () => {
+    expect(serviceWorker).toContain('url.pathname.startsWith("/api/")');
+    expect(serviceWorker).toContain('url.pathname.startsWith("/v1/")');
+    expect(serviceWorker).toContain('if (!SHELL.includes(`${url.pathname}${url.search}`)) return;');
   });
 
   it("allows the configured LiveKit Cloud discovery request", () => {

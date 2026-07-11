@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "callpilot-cloud-v1";
+const CACHE_NAME = "callpilot-cloud-v2";
 const SHELL = [
   "/",
   "/remote_dialer.css?v=3",
@@ -29,7 +29,8 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.origin !== self.location.origin) return;
-  if (url.pathname.startsWith("/api/")) return;
+  if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/v1/")) return;
+  if (!SHELL.includes(`${url.pathname}${url.search}`)) return;
   event.respondWith(
     fetch(event.request)
       .then((response) => {
