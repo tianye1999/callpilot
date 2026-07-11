@@ -79,9 +79,37 @@ def test_get_bool_truthy_values(monkeypatch):
 
 
 def test_get_bool_default(monkeypatch):
-    _unset(monkeypatch, "SUMMARY_ENABLED", "MONITOR_AI_PLAYBACK")
+    _unset(monkeypatch, "SUMMARY_ENABLED", "MONITOR_AI_PLAYBACK", "RECORDING_ENABLED")
     assert get_bool("SUMMARY_ENABLED") is True
     assert get_bool("MONITOR_AI_PLAYBACK") is False
+    assert get_bool("RECORDING_ENABLED") is False
+
+
+def test_recording_registry_and_env_example_default_to_off():
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert get_spec("RECORDING_ENABLED").default == "false"
+    assert re.search(r"^RECORDING_ENABLED=false$", example, re.MULTILINE)
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("true", True), ("false", False)])
+def test_recording_explicit_config_is_respected(monkeypatch, raw, expected):
+    monkeypatch.setenv("RECORDING_ENABLED", raw)
+
+    assert get_bool("RECORDING_ENABLED") is expected
+    row = next(item for item in read_panel_values() if item["key"] == "RECORDING_ENABLED")
+    assert row["value"] == raw
+    assert row["configured"] is True
+
+
+def test_recording_panel_marks_default_as_not_explicit(monkeypatch):
+    _unset(monkeypatch, "RECORDING_ENABLED")
+
+    row = next(item for item in read_panel_values() if item["key"] == "RECORDING_ENABLED")
+    assert row["value"] == "false"
+    assert row["configured"] is False
 
 
 def test_unknown_key_raises_keyerror():
@@ -712,13 +740,35 @@ def test_setup_done_hidden_and_setup_required_logic(monkeypatch, tmp_path):
     assert config.setup_required() is True
 
     monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-valid")
-    assert config.setup_required() is False
+    assert config.setup_required() is True
 
-    monkeypatch.delenv("DASHSCOPE_API_KEY")
-    config.mark_setup_done(env_path=tmp_path / ".env")
+    config.complete_setup(False, env_path=tmp_path / ".env")
     assert os.environ["SETUP_DONE"] == "true"
+    assert os.environ["RECORDING_ENABLED"] == "false"
     assert config.setup_required() is False
     assert "SETUP_DONE=true" in (tmp_path / ".env").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_complete_setup_atomically_persists_recording_choice(tmp_path, monkeypatch, enabled):
+    _unset(monkeypatch, "SETUP_DONE", "RECORDING_ENABLED")
+    env = tmp_path / ".env"
+
+    updated = config.complete_setup(enabled, env_path=env)
+
+    expected = "true" if enabled else "false"
+    assert updated == ["RECORDING_ENABLED", "SETUP_DONE"]
+    assert env.read_text(encoding="utf-8") == (
+        f"RECORDING_ENABLED={expected}\nSETUP_DONE=true\n"
+    )
+    assert config.setup_required() is False
+
+
+def test_existing_setup_done_remains_complete_without_recording_choice(monkeypatch):
+    _unset(monkeypatch, "RECORDING_ENABLED")
+    monkeypatch.setenv("SETUP_DONE", "true")
+
+    assert config.setup_required() is False
 
 
 def test_panel_reflects_env_value(monkeypatch):

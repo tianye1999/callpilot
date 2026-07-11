@@ -46,6 +46,46 @@ def test_setup_sms_copy_spells_out_receiver_number():
     assert "可在短信页查看" in text
 
 
+def test_setup_requires_explicit_recording_choice_and_shows_storage_details():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'name="setupRecording"' in text
+    assert 'value="true"' in text
+    assert 'value="false"' in text
+    assert "setupRecordingConfirmed" in text
+    assert "setupRecordingSaved" in text
+    assert "saveSetupRecording" in text
+    assert 'postJson("/api/config", { RECORDING_ENABLED: enabled })' in text
+    assert 'if (!setupRecordingSaved && !(await saveSetupRecording())) return;' in text
+    assert 'postJson("/api/setup/complete", { recording_enabled: enabled })' in text
+    assert 'radio.addEventListener("click"' in text
+    assert "recordings_dir" in text
+    assert 'cfgVal("RECORDING_RETENTION_DAYS")' in text
+
+
+def test_recording_setting_and_active_call_show_context():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'c.key === "RECORDING_ENABLED"' in text
+    assert 'el("span", "cfg-note", recordingDetailsText())' in text
+    assert 'id="recordingBadge"' in text
+    assert 'classList.toggle("show", callActive && recordingEnabled)' in text
+
+
+def test_setup_prefill_finishes_before_wizard_accepts_input():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert "async function showSetupWizard(manual, meta)" in text
+    assert "await prefillSetupFields();" in text
+
+
+def test_websocket_reconnect_clears_stale_call_and_recording_state():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'ws.onopen = () => {' in text
+    assert 'setCall("idle", "");' in text
+
+
 def test_settings_expose_sms_email_forwarding_with_bilingual_privacy_notice():
     text = INDEX.read_text(encoding="utf-8")
 

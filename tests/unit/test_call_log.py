@@ -43,7 +43,7 @@ def make_call_dir(base_dir, call_id, meta=..., summary=None):
 
 
 def test_full_lifecycle_produces_all_artifacts(tmp_path):
-    clog = CallLogger(tmp_path)
+    clog = CallLogger(tmp_path, recording_enabled=True)
     record = clog.begin_call("outbound", "10000")
 
     assert re.fullmatch(r"\d{8}-\d{6}-outbound-10000", record.id)
@@ -99,6 +99,14 @@ def test_begin_call_rejects_bad_direction_and_handles_none_number(tmp_path):
 
 
 # ---- 录音开关 ----
+
+
+def test_recording_defaults_are_disabled(tmp_path):
+    logger = CallLogger(tmp_path)
+    record = logger.begin_call("inbound", "13800000000")
+
+    assert logger.recording_enabled is False
+    assert record.recording_enabled is False
 
 
 def test_recording_disabled_writes_no_wav(tmp_path):
@@ -254,7 +262,7 @@ def test_from_env_bool_matches_config_panel(tmp_path, monkeypatch):
 
 
 def test_log_event_concurrent_smoke(tmp_path):
-    clog = CallLogger(tmp_path)
+    clog = CallLogger(tmp_path, recording_enabled=True)
     record = clog.begin_call("outbound", "10000")
     threads_n, per_thread = 8, 200
 

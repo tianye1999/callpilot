@@ -83,6 +83,12 @@
   .state-chip.ended { border-color: rgba(255, 69, 58, .4); color: var(--err); }
   .state-chip.ended .sdot { background: var(--err); }
   .state-chip .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .recording-badge {
+    display: none; align-items: center; gap: 5px; padding-left: 8px;
+    border-left: 1px solid var(--border-strong); color: var(--err); font-size: 10px; font-weight: 800;
+  }
+  .recording-badge.show { display: inline-flex; }
+  .recording-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--err); }
   @keyframes breathe { 50% { transform: scale(.7); opacity: .7; } }
 
   header .spacer { flex: 1; }
@@ -396,7 +402,7 @@
   .cfg-row .key { display: block; font-size: 10px; color: var(--dim); font-family: var(--mono); }
   .cfg-row .cfg-note {
     display: block; max-width: 430px; margin-top: 4px; color: var(--muted);
-    font-size: 11px; line-height: 1.45;
+    font-size: 11px; line-height: 1.45; overflow-wrap: anywhere;
   }
   .tag-restart { font-size: 10px; color: var(--warn); margin-left: 6px; }
   .cfg-row input[type=text], .cfg-row input[type=password], .cfg-row input[type=number], .cfg-row select {
@@ -645,7 +651,7 @@
   .setup-head h2 { margin: 4px 0 2px; font-size: 22px; line-height: 1.2; }
   .setup-head p { margin: 0; color: var(--muted); font-size: 13px; }
   .setup-steps {
-    display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px;
     padding: 12px 18px; border-bottom: 1px solid var(--border);
   }
   .setup-step {
@@ -670,6 +676,16 @@
   .setup-field input:focus, .setup-field select:focus, .setup-field textarea:focus {
     outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-dim);
   }
+  .recording-choice { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .recording-choice label { position: relative; cursor: pointer; }
+  .recording-choice input { position: absolute; opacity: 0; pointer-events: none; }
+  .recording-choice span {
+    display: flex; align-items: center; justify-content: center; min-height: 44px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--well);
+    color: var(--muted); font-size: 14px; font-weight: 700;
+  }
+  .recording-choice input:checked + span { color: #fff; border-color: var(--blue); background: var(--blue-dim); }
+  .recording-choice input:focus-visible + span { outline: 2px solid var(--blue); outline-offset: 2px; }
   .setup-key-help {
     margin-top: 12px; padding: 10px 12px; border-radius: 10px;
     background: var(--well); border: 1px solid var(--border);
@@ -694,7 +710,7 @@
   }
   .setup-summary .line {
     border: 1px solid var(--border); border-radius: 10px; padding: 9px 11px;
-    background: var(--well); color: var(--muted); font-size: 12px;
+    background: var(--well); color: var(--muted); font-size: 12px; overflow-wrap: anywhere;
   }
   .setup-summary b { display: block; color: var(--text); font-size: 13px; margin-bottom: 2px; }
   @media (max-width: 720px) {
@@ -703,6 +719,7 @@
     .setup-steps { grid-template-columns: repeat(3, 1fr); padding: 10px 12px; }
     .setup-body { padding: 16px; }
     .setup-grid, .setup-summary { grid-template-columns: 1fr; }
+    .recording-choice { grid-template-columns: 1fr; }
     .setup-actions { padding: 12px 16px 16px; flex-wrap: wrap; }
     .setup-actions .btn { flex: 1; min-width: 120px; }
   }
@@ -734,6 +751,7 @@
     <div class="titlebox"><b>CallPilot</b><span id="slogan"></span></div>
     <span class="state-chip idle" id="stateChip">
       <span class="sdot"></span><span id="stateText">待命</span><span class="num" id="stateNum"></span>
+      <span class="recording-badge" id="recordingBadge">REC</span>
     </span>
     <div class="quick-acts" id="quickActs">
       <button class="btn sm ghost" id="keypadBtn">⌗ <span data-i18n="keypad"></span></button>
@@ -1104,6 +1122,22 @@
           <div class="setup-status" id="setupPersonStatus"></div>
         </section>
         <section class="setup-pane" data-step="3">
+          <h3 id="setupRecordingTitle" data-i18n="setup_recording_title"></h3>
+          <p class="hint" data-i18n="setup_recording_hint"></p>
+          <div class="recording-choice" role="radiogroup" aria-labelledby="setupRecordingTitle">
+            <label>
+              <input type="radio" name="setupRecording" value="true" />
+              <span data-i18n="setup_recording_on"></span>
+            </label>
+            <label>
+              <input type="radio" name="setupRecording" value="false" />
+              <span data-i18n="setup_recording_off"></span>
+            </label>
+          </div>
+          <div class="setup-summary" id="setupRecordingDetails"></div>
+          <div class="setup-status" id="setupRecordingStatus"></div>
+        </section>
+        <section class="setup-pane" data-step="4">
           <h3 data-i18n="setup_test_title"></h3>
           <p class="hint" data-i18n="setup_test_hint"></p>
           <div class="setup-summary" id="setupReadySummary"></div>
@@ -1122,7 +1156,7 @@
           </div>
           <div class="setup-status" id="setupTestStatus"></div>
         </section>
-        <section class="setup-pane" data-step="4">
+        <section class="setup-pane" data-step="5">
           <h3 data-i18n="setup_done_title"></h3>
           <p class="hint" data-i18n="setup_done_hint"></p>
           <div class="setup-status ok" id="setupDoneStatus" data-i18n="setup_done_status"></div>
@@ -1232,7 +1266,7 @@ const I18N = {
     setup_kicker: "FIRST RUN", setup_title: "Set up CallPilot",
     setup_subtitle: "Connect the modem, add a provider key, and personalize the assistant.",
     setup_skip_all: "Skip setup", setup_skip_step: "Skip step", setup_back: "Back", setup_next: "Next",
-    setup_finish: "Finish", setup_steps: ["Hardware", "API Key", "Personalize", "Self-test", "Done"],
+    setup_finish: "Finish", setup_steps: ["Hardware", "API Key", "Personalize", "Recording", "Self-test", "Done"],
     setup_hw_title: "Hardware check", setup_hw_hint: "Plug in the EC20/EG25 module and keep the AT port connected. This check does not block setup.",
     setup_usb: "USB module", setup_at: "AT port", setup_port: "Port",
     setup_hw_ok: "Hardware looks ready.", setup_hw_wait: "Hardware is not fully ready yet. You can continue and retry after plugging it in.",
@@ -1249,6 +1283,12 @@ const I18N = {
     setup_person_title: "Personalize", setup_person_hint: "These values shape how the assistant introduces itself and which language it uses in calls.",
     setup_owner: "Owner name", setup_persona: "AI persona title", setup_call_lang: "Call language", setup_voice: "Voice",
     setup_person_saved: "Personalization saved.",
+    setup_recording_title: "Call recording", setup_recording_hint: "Choose whether calls may be recorded on this computer.",
+    setup_recording_on: "Turn on recording", setup_recording_off: "Keep recording off",
+    setup_recording_location: "Storage location", setup_recording_retention: "Retention",
+    setup_recording_days: (days) => `${days} days`, setup_recording_choose: "Choose on or off to continue.",
+    setup_recording_saved: "Recording preference saved.", recording_active: "Call recording is active",
+    recording_details: (path, days) => `Files are stored in ${path} and kept for ${days} days.`,
     setup_test_title: "Self-test", setup_test_hint: "Review readiness and optionally send one test SMS to a phone number you can receive on.",
     setup_sms_number: "Phone number to receive the test SMS", setup_sms_text: "Message", setup_send_sms: "Send test SMS",
     setup_sms_default: "CallPilot setup test.", setup_sms_sent: "Test SMS sent. It is listed in the SMS tab.", setup_sms_fail: "Test SMS failed: ",
@@ -1394,7 +1434,7 @@ const I18N = {
     setup_kicker: "首次启动", setup_title: "配置 CallPilot",
     setup_subtitle: "连接模组、填写 provider Key，并设定你的 AI 助理。",
     setup_skip_all: "跳过向导", setup_skip_step: "跳过本步", setup_back: "上一步", setup_next: "下一步",
-    setup_finish: "完成", setup_steps: ["硬件", "API Key", "个性化", "自测", "完成"],
+    setup_finish: "完成", setup_steps: ["硬件", "API Key", "个性化", "通话录音", "自测", "完成"],
     setup_hw_title: "硬件检测", setup_hw_hint: "请插入 EC20/EG25 模组并保持 AT 口连接。本检测不阻塞后续配置。",
     setup_usb: "USB 模组", setup_at: "AT 口", setup_port: "端口",
     setup_hw_ok: "硬件状态看起来已就绪。", setup_hw_wait: "硬件暂未完全就绪。你可以继续配置，插好后再重试。",
@@ -1411,6 +1451,12 @@ const I18N = {
     setup_person_title: "个性化", setup_person_hint: "这些信息会影响 AI 如何介绍自己，以及通话时使用的语言。",
     setup_owner: "机主姓名", setup_persona: "AI 人设称谓", setup_call_lang: "通话语言", setup_voice: "音色",
     setup_person_saved: "个性化设置已保存。",
+    setup_recording_title: "通话录音", setup_recording_hint: "请选择是否允许在本机保存通话录音。",
+    setup_recording_on: "开启录音", setup_recording_off: "保持关闭",
+    setup_recording_location: "保存位置", setup_recording_retention: "保留期",
+    setup_recording_days: (days) => `${days} 天`, setup_recording_choose: "请选择开启或关闭后继续。",
+    setup_recording_saved: "录音选择已保存。", recording_active: "通话录音已开启",
+    recording_details: (path, days) => `录音保存在 ${path}，保留 ${days} 天。`,
     setup_test_title: "自测", setup_test_hint: "检查模组与凭证状态，也可以向你能接收短信的手机号发送一条测试短信。",
     setup_sms_number: "接收测试短信的手机号", setup_sms_text: "短信内容", setup_send_sms: "发送测试短信",
     setup_sms_default: "CallPilot 配置测试。", setup_sms_sent: "测试短信已发送，可在短信页查看。", setup_sms_fail: "测试短信失败：",
@@ -1442,6 +1488,7 @@ function applyI18n() {
   if (typeof renderProfileList === "function") renderProfileList();
   if (typeof refreshProfileEditorText === "function") refreshProfileEditorText();
   if (typeof renderSetupWizard === "function") renderSetupWizard();
+  if (typeof syncRecordingUi === "function") syncRecordingUi();
 }
 
 
@@ -1579,6 +1626,7 @@ function setCall(status, caller) {
   $("quickActs").classList.toggle("show", callActive);
   $("liveTag").style.display = callActive ? "inline-flex" : "none";
   $("liveSub").textContent = callActive ? (caller || "") : t("live_sub_idle");
+  syncRecordingUi();
   if (!callActive) { $("keypad").classList.remove("show"); $("dtmfSent").textContent = ""; }
 
   if (callActive) {
@@ -1662,7 +1710,12 @@ let ws;
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => { $("dot").classList.add("on"); $("conn").textContent = t("conn_on"); };
+  ws.onopen = () => {
+    $("dot").classList.add("on");
+    $("conn").textContent = t("conn_on");
+    // 重连后先清掉上一条连接遗留的通话状态；服务端回放若仍在通话会立即恢复。
+    setCall("idle", "");
+  };
   ws.onclose = () => {
     $("dot").classList.remove("on"); $("conn").textContent = t("conn_retry");
     setTimeout(connect, 2000);
@@ -1677,6 +1730,7 @@ async function loadMeta() {
     $("provider").textContent = m.provider || "-";
     $("portSub").textContent = t("modem_prefix") + (m.port || "-");
     renderSetupHardware();
+    syncRecordingUi();
     if (m.setup_required && !$("setupWizard").classList.contains("show")) {
       showSetupWizard(false, m);
     }
@@ -2556,10 +2610,27 @@ const CFG_SUGGEST = {
 };
 let setupStep = 0;
 let setupValidated = false;
+let setupRecordingConfirmed = false;
+let setupRecordingSaved = false;
+let recordingEnabled = false;
 const QWEN_API_KEY_URL = "https://bailian.console.aliyun.com/?tab=api#/api-key";
 const setupProviderKey = (provider) => provider === "openai" ? "OPENAI_API_KEY" : "DASHSCOPE_API_KEY";
 const setupVoiceKey = (provider) => provider === "openai" ? "OPENAI_VOICE" : "QWEN_VOICE";
 const cfgVal = (key) => (cfgSpecs.find((c) => c.key === key) || {}).value || "";
+const recordingSpec = () => cfgSpecs.find((c) => c.key === "RECORDING_ENABLED") || {};
+function recordingDetailsText() {
+  const path = (lastMeta || {}).recordings_dir || "data/recordings/";
+  const days = cfgVal("RECORDING_RETENTION_DAYS") || "30";
+  return t("recording_details")(path, days);
+}
+function syncRecordingUi() {
+  recordingEnabled = boolChecked(recordingSpec().value);
+  const badge = $("recordingBadge");
+  if (badge) {
+    badge.classList.toggle("show", callActive && recordingEnabled);
+    badge.title = t("recording_active");
+  }
+}
 
 function renderSetupWizard() {
   const labels = t("setup_steps");
@@ -2575,11 +2646,12 @@ function renderSetupWizard() {
     pane.classList.toggle("active", Number(pane.dataset.step) === setupStep);
   });
   $("setupBack").style.visibility = setupStep === 0 ? "hidden" : "visible";
-  $("setupNext").textContent = setupStep === 4 ? t("setup_finish") : t("setup_next");
-  $("setupStepSkip").style.visibility = setupStep === 4 ? "hidden" : "visible";
+  $("setupNext").textContent = setupStep === 5 ? t("setup_finish") : t("setup_next");
+  $("setupStepSkip").style.visibility = (setupStep === 3 || setupStep === 5) ? "hidden" : "visible";
   $("setupSmsText").placeholder = t("setup_sms_default");
   renderSetupProviderFields();
   renderSetupHardware();
+  renderSetupRecordingDetails();
   renderSetupReadySummary();
 }
 
@@ -2602,16 +2674,23 @@ async function prefillSetupFields() {
   $("setupApiKey").value = "";
   $("setupDoubaoAppId").value = "";
   $("setupDoubaoAccessKey").value = "";
+  const rec = recordingSpec();
+  document.querySelectorAll('input[name="setupRecording"]').forEach((radio) => {
+    radio.checked = !!rec.configured && radio.value === String(rec.value).toLowerCase();
+  });
+  setupRecordingConfirmed = false;
+  setupRecordingSaved = false;
+  setupStatus("setupRecordingStatus", "", t("setup_recording_choose"));
   setupValidated = false;
   $("setupKeyStatus").className = "setup-status";
   $("setupKeyStatus").textContent = "";
   renderSetupProviderFields();
 }
 
-function showSetupWizard(manual, meta) {
+async function showSetupWizard(manual, meta) {
   if (meta) lastMeta = meta;
   setupStep = 0;
-  prefillSetupFields();
+  await prefillSetupFields();
   $("setupWizard").classList.add("show");
   renderSetupWizard();
   if (!manual) switchPage("phone");
@@ -2661,6 +2740,23 @@ function renderSetupReadySummary() {
   for (const [label, value] of [
     [t("setup_ready_creds"), statusWord(!!creds.ok)],
     [t("setup_ready_modem"), statusWord(!!hw.modem_connected)],
+  ]) {
+    const row = el("div", "line");
+    row.appendChild(el("b", "", label));
+    row.appendChild(el("span", "", value));
+    box.appendChild(row);
+  }
+}
+
+function renderSetupRecordingDetails() {
+  const box = $("setupRecordingDetails");
+  if (!box) return;
+  const path = (lastMeta || {}).recordings_dir || "data/recordings/";
+  const days = cfgVal("RECORDING_RETENTION_DAYS") || "30";
+  box.textContent = "";
+  for (const [label, value] of [
+    [t("setup_recording_location"), path],
+    [t("setup_recording_retention"), t("setup_recording_days")(days)],
   ]) {
     const row = el("div", "line");
     row.appendChild(el("b", "", label));
@@ -2781,9 +2877,39 @@ async function saveSetupPersonal() {
   return true;
 }
 
+async function saveSetupRecording() {
+  const selected = document.querySelector('input[name="setupRecording"]:checked');
+  if (!selected || !setupRecordingConfirmed) {
+    setupStatus("setupRecordingStatus", "err", t("setup_recording_choose"));
+    return false;
+  }
+  const enabled = selected.value === "true";
+  const { httpOk, res } = await postJson("/api/config", { RECORDING_ENABLED: enabled });
+  if (!httpOk || !res.ok) {
+    setupStatus("setupRecordingStatus", "err", t("cfg_savefail") + (res.error || ""));
+    return false;
+  }
+  const spec = recordingSpec();
+  spec.value = enabled ? "true" : "false";
+  spec.configured = true;
+  setupRecordingSaved = true;
+  syncRecordingUi();
+  setupStatus("setupRecordingStatus", "ok", t("setup_recording_saved"));
+  return true;
+}
+
 async function completeSetup() {
+  if (!setupRecordingConfirmed) {
+    setupStep = 3;
+    renderSetupWizard();
+    setupStatus("setupRecordingStatus", "err", t("setup_recording_choose"));
+    return;
+  }
+  if (!setupRecordingSaved && !(await saveSetupRecording())) return;
+  const selected = document.querySelector('input[name="setupRecording"]:checked');
+  const enabled = selected.value === "true";
   try {
-    const { httpOk, res } = await postJson("/api/setup/complete", {});
+    const { httpOk, res } = await postJson("/api/setup/complete", { recording_enabled: enabled });
     if (!httpOk || !res.ok) {
       setupStatus("setupDoneStatus", "err", t("setup_complete_fail") + (res.error || ""));
       return;
@@ -2802,9 +2928,10 @@ async function nextSetupStep() {
   try {
     if (setupStep === 1 && !(await saveSetupApi())) return;
     if (setupStep === 2 && !(await saveSetupPersonal())) return;
-    if (setupStep === 4) { await completeSetup(); return; }
-    setupStep = Math.min(4, setupStep + 1);
-    if (setupStep === 3) await loadMeta();
+    if (setupStep === 3 && !(await saveSetupRecording())) return;
+    if (setupStep === 5) { await completeSetup(); return; }
+    setupStep = Math.min(5, setupStep + 1);
+    if (setupStep === 4) await loadMeta();
     renderSetupWizard();
   } finally {
     $("setupNext").disabled = false;
@@ -2812,8 +2939,8 @@ async function nextSetupStep() {
 }
 
 async function skipSetupStep() {
-  setupStep = Math.min(4, setupStep + 1);
-  if (setupStep === 3) await loadMeta();
+  setupStep = Math.min(5, setupStep + 1);
+  if (setupStep === 4) await loadMeta();
   renderSetupWizard();
 }
 
@@ -2825,6 +2952,13 @@ $("setupProvider").addEventListener("change", () => {
   renderSetupProviderFields();
 });
 $("setupApiKey").addEventListener("input", () => { setupValidated = false; });
+document.querySelectorAll('input[name="setupRecording"]').forEach((radio) => {
+  radio.addEventListener("click", () => {
+    setupRecordingConfirmed = true;
+    setupRecordingSaved = false;
+    setupStatus("setupRecordingStatus", "", "");
+  });
+});
 $("setupValidateKey").addEventListener("click", validateSetupKey);
 $("setupBack").addEventListener("click", () => { setupStep = Math.max(0, setupStep - 1); renderSetupWizard(); });
 $("setupNext").addEventListener("click", nextSetupStep);
@@ -2891,6 +3025,9 @@ async function loadConfig() {
       label.appendChild(el("span", "key", c.key));
       if (c.key === "SMS_EMAIL_FORWARD_ENABLED") {
         label.appendChild(el("span", "cfg-note", t("sms_email_privacy")));
+      }
+      if (c.key === "RECORDING_ENABLED") {
+        label.appendChild(el("span", "cfg-note", recordingDetailsText()));
       }
       if (c.help && /^https?:\/\//.test(c.help)) {
         const hint = document.createElement("a");
@@ -2974,6 +3111,7 @@ async function loadConfig() {
       if (wrap.childElementCount <= 1) wrap.remove();
     }
     cfgDirty = false;  // 刚从服务端同步，视为无未保存修改
+    syncRecordingUi();
   } catch (e) { console.warn("[config] 加载设置面板失败", e); }
 }
 // 手动重启按钮：确认后重启服务（可从界面重连模组/恢复，无需命令行）。
