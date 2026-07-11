@@ -318,7 +318,7 @@ New-user install & first-run Q&A: [`docs/faq.md`](docs/faq.md) (Chinese).
 
 ### Contributing
 
-Developer Preview wants hardware reproduction reports. If you have an EC20, please
+Mac Beta still wants hardware reproduction reports. If you have an EC20, please
 open an issue with your modem firmware, macOS version, and what worked / didn't.
 Tests: `.venv/bin/pytest` (no hardware needed — uses fake modem/bridge/agent).
 
@@ -331,6 +331,11 @@ License: [Apache-2.0](LICENSE).
 ---
 
 ## 中文
+
+> **状态：Mac Beta（v0.6.0）。** 今天可在装有 Quectel EC20 的 macOS 上运行。开发者可从
+> 源码运行；普通用户从最新 GitHub Release 安装已签名公证的 macOS DMG。0.6.0 起提供可选的
+> hosted 云控制面，用配对码即可让手机远程通过模组拨号，无需自建 tunnel。见
+> [路线图](docs/roadmap.md)。
 
 ### 这是什么
 
@@ -551,7 +556,7 @@ macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=
 
 ### 贡献
 
-Developer Preview 阶段最需要同型号硬件的复现反馈。有 EC20 的话，欢迎带上模组固件、
+Mac Beta 阶段仍最需要同型号硬件的复现反馈。有 EC20 的话，欢迎带上模组固件、
 macOS 版本、以及哪里成功/失败开 issue。测试：`.venv/bin/pytest`（无需硬件）。
 
 架构与「想改 X 去哪」见 [`docs/architecture.md`](docs/architecture.md)；想单独学习/验证某个

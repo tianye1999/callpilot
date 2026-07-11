@@ -2,8 +2,8 @@
 
 > 版本：v2.2（2026-07-12）
 > 本文合并原 `01-requirements.md` / `02-task-breakdown.md` / `03-gap-analysis-vs-poc.md`，
-> 是当前唯一的计划文档。**本地三段式（VAD→STT→LLM→TTS）方案已整体延后**，本文只覆盖
-> 云端 realtime 路线下要做的功能，按优先级组织。三段式方案见文末附录 A（暂缓）。
+> 是当前唯一的计划文档。本文主线按云端 realtime 路线组织；**本地三段式（VAD→STT→LLM→TTS）
+> 已作为第四 provider `local` 落地**（2026-07-10，见文末附录 A），可与云端 provider 切换。
 > codex 评审全过程留存于 `.codex_dialog.md`；旧版三份文档留存于 git 历史（commit 08754fc）。
 >
 > **状态更新（v0.2，2026-07-08）**：FR-7/9/10/11（桌面 App、批量外呼、通话记录/录音、
@@ -11,19 +11,19 @@
 > provider 由 qwen/doubao 扩展为 **qwen（默认）/ doubao / openai**。
 >
 > **状态更新（0.6.0，2026-07-12）**：hosted 云控制面（Cloudflare Worker + D1 +
-> Durable Objects + LiveKit，见 #42/#43）与 Android 远程拨号 App（hosted `/v1` 协议，
-> 见 #36/#44）已发布——普通用户用配对码即可远程拨号，无需自建 tunnel。0.6.0 签名公证
-> DMG 已发 GitHub Release；hosted onboarding 指向 `*-beta.bondings.ai`，生产 DNS 切换
-> 待异网混沌验收后单独进行。
+> Durable Objects + LiveKit，见 #42/#43）已随 0.6.0 签名公证 DMG 发 GitHub Release，
+> 普通用户用配对码即可让手机远程通过模组拨号、无需自建 tunnel。Android 远程拨号 App
+> 的源码 / hosted `/v1` 协议 / 真机验收已落地（#36/#44），正式签名分发（AAB）待 0.7。
+> hosted onboarding 指向 `*-beta.bondings.ai`，生产 DNS 切换待异网混沌验收后单独进行。
 
 ## 0. 发布路线（开源 + 商业化免费）
 
 | 版本 | 目标 | 面向 | 状态 |
 |------|------|------|------|
-| **v0.1 Developer Preview** | 源码开源，开发者按 README 手动跑通，收集同型号 EC20 硬件反馈 | 会装 Python/填 Key/跑命令的开发者 | 🚧 本轮交付：Apache-2.0、去个人化、双语 README、风险声明、仓库清理 |
+| **v0.1 Developer Preview** | 源码开源，开发者按 README 手动跑通，收集同型号 EC20 硬件反馈 | 会装 Python/填 Key/跑命令的开发者 | ✅ 已落地（Apache-2.0、去个人化、双语 README、风险声明、仓库清理） |
 | **v0.2 Mac Beta** | 有 `.app`，仍需装依赖或跑安装脚本 | 技术用户 | ✅ 已落地 |
 | **v0.3 One-click Mac Beta** | `.dmg` 安装、首次启动向导、内置 runtime、自动 launchd、Developer ID 签名+公证 | 普通用户 | ✅ 已落地（v0.4.0 起 DMG 已签名+公证+staple） |
-| **v0.6.0 Hosted + Mobile** | hosted 云控制面（Cloudflare Worker + D1 + Durable Objects + LiveKit）+ Android 远程拨号 App，配对码远程拨号、无需自建 tunnel | 普通用户 | ✅ 已发布（2026-07-12；#42/#43 云控制面、#36/#44 Android v0 + hosted `/v1`） |
+| **v0.6.0 Hosted 桌面** | hosted 云控制面（Cloudflare Worker + D1 + Durable Objects + LiveKit）签名公证 DMG，配对码远程拨号、无需自建 tunnel；Android 远程拨号 App 源码/协议/真机验收已落地、正式分发待 0.7 | 普通用户（桌面 DMG） | ✅ 已发布（2026-07-12；#42/#43 云控制面、#36/#44 Android v0 + hosted `/v1`） |
 | **v1.0** | 稳定硬件矩阵、隐私说明、故障恢复、完整文档 | 通用 | 计划 |
 
 v0.1 原则（codex 建议，已采纳）：不追求一键安装，追求"陌生开发者 30 分钟能跑通、能提
@@ -283,7 +283,7 @@ provider 外呼静默失效、WS 推送偶发丢事件、hangup 无锁等）→ 
 ## 6. 关键决策与现状事实（保留）
 
 - **D1 以 AA 为基座**：AA 的 modem/音频/会话编排真机已跑通，整体迁入重组，未反向改造 poc。
-- **D2 realtime 优先，三段式延后**：当前只走云端 realtime；本地三段式作为未来可选 provider（附录 A）。
+- **D2 realtime 优先，三段式为可选 provider**：主线走云端 realtime；本地三段式已作为第四 provider `local` 落地（附录 A），可切换。
 - **D3 音频模式（双向均已真机验证）**：
   - 已证实：`uac`(PortAudio/sounddevice) 在本机**打不开** EC20 声卡（AUHAL -66740/-9986，
     coreaudiod 异常时更甚）；`nmea`(USB 串口 PCM) 在本机会**触发 USB 接口崩溃重枚举**
