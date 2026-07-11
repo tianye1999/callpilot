@@ -251,7 +251,7 @@ async def _wait_for(predicate, timeout: float = 1.0) -> None:
     raise AssertionError("condition was not met before timeout")
 
 
-def _runtime() -> RemoteDialerRuntimeConfig:
+def _runtime(*, dtmf_mode: str = "inband") -> RemoteDialerRuntimeConfig:
     return RemoteDialerRuntimeConfig(
         audio_mode="uac",
         audio_keyword="Interface",
@@ -261,7 +261,7 @@ def _runtime() -> RemoteDialerRuntimeConfig:
         disconnect_grace_seconds=0.05,
         outbound_max_seconds=2.0,
         connect_timeout_seconds=0.2,
-        dtmf_mode="inband",
+        dtmf_mode=dtmf_mode,
     )
 
 
@@ -271,13 +271,14 @@ def _coordinator(
     bridge: FakeBridge,
     *,
     call_logger: CallLogger | None = None,
+    dtmf_mode: str = "inband",
 ) -> RemoteWebDialerCoordinator:
     return RemoteWebDialerCoordinator(
         session_id="session-test",
         expires_at=time.time() + 60,
         modem=modem,  # type: ignore[arg-type]
         endpoint=endpoint,
-        runtime=_runtime(),
+        runtime=_runtime(dtmf_mode=dtmf_mode),
         bridge_factory=lambda **_kwargs: bridge,  # type: ignore[arg-type]
         call_logger=call_logger,
         reserve_line=lambda _owner: None,
@@ -353,6 +354,50 @@ def test_full_duplex_audio_recording_and_dtmf(tmp_path: Path) -> None:
         assert meta["source"] == "remote_web_dialer"
         assert meta["uplink_bytes"] == 320
         assert meta["downlink_bytes"] > 320  # browser speech plus in-band DTMF
+        events_path = meta_path.with_name("events.jsonl")
+        events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+        [dtmf_event] = [event for event in events if event["type"] == "dtmf"]
+        assert dtmf_event["count"] == 1
+        assert dtmf_event["mode"] == "inband"
+        assert dtmf_event["result"] == "success"
+        assert "digits" not in dtmf_event
+
+    asyncio.run(run())
+
+
+def test_failed_remote_dtmf_audit_does_not_contain_plaintext() -> None:
+    class SpyRecord:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, Any]]] = []
+
+        def log_event(self, type: str, **fields: Any) -> None:  # noqa: A002
+            self.events.append((type, fields))
+
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        modem = FakeModem()
+        modem.send_dtmf = lambda _digits: False  # type: ignore[method-assign]
+        bridge = FakeBridge()
+        coordinator = _coordinator(endpoint, modem, bridge, dtmf_mode="qvts")
+        record = SpyRecord()
+        coordinator.call_active.set()
+        coordinator._bridge = bridge
+        coordinator._record = record  # type: ignore[assignment]
+
+        await coordinator._handle_dtmf({"digits": "73#"})
+
+        assert record.events == [
+            (
+                "dtmf",
+                {
+                    "count": 3,
+                    "mode": "qvts",
+                    "result": "failure",
+                    "source": "remote_web_dialer",
+                },
+            )
+        ]
+        assert "73#" not in str(record.events)
 
     asyncio.run(run())
 

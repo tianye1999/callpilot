@@ -54,6 +54,18 @@ class FakeSmsEmailForwarder:
         self.stopped = True
 
 
+class SpyCallRecord:
+    def __init__(self) -> None:
+        self.downlink: list[bytes] = []
+        self.events: list[tuple[str, dict]] = []
+
+    def write_downlink(self, pcm: bytes) -> None:
+        self.downlink.append(pcm)
+
+    def log_event(self, type: str, **fields) -> None:  # noqa: A002
+        self.events.append((type, fields))
+
+
 class FakeRemoteCoordinator:
     def __init__(self) -> None:
         self.call_active = threading.Event()
@@ -217,22 +229,11 @@ def test_service_send_dtmf_requires_active_call():
 
 
 def test_service_send_dtmf_uses_inband_audio_for_uac(monkeypatch):
-    class SpyRecord:
-        def __init__(self) -> None:
-            self.downlink: list[bytes] = []
-            self.events: list[tuple[str, dict]] = []
-
-        def write_downlink(self, pcm: bytes) -> None:
-            self.downlink.append(pcm)
-
-        def log_event(self, type: str, **fields) -> None:  # noqa: A002
-            self.events.append((type, fields))
-
     monkeypatch.setenv("DTMF_MODE", "inband")
     modem = FakeModem()
     service = make_service(modem, audio_mode="uac")
     service.session._active = True
-    record = SpyRecord()
+    record = SpyCallRecord()
     service.session._record = record  # type: ignore[assignment]
 
     ok, err = service.send_dtmf("5")
@@ -245,7 +246,9 @@ def test_service_send_dtmf_uses_inband_audio_for_uac(monkeypatch):
     tone = bridge.downlink[0]
     assert len(tone) == int(8000 * 0.2) * 2
     assert record.downlink == [tone]
-    assert record.events == [("dtmf", {"digits": "5", "mode": "inband"})]
+    assert record.events == [
+        ("dtmf", {"count": 1, "mode": "inband", "result": "success"})
+    ]
 
 
 def test_service_send_dtmf_keeps_qvts_for_nmea(monkeypatch):
@@ -266,9 +269,37 @@ def test_service_send_dtmf_reports_modem_failure():
     modem.send_dtmf = lambda digits: False  # type: ignore[attr-defined]
     service = make_service(modem, audio_mode="nmea")
     service.session._active = True
+    record = SpyCallRecord()
+    service.session._record = record  # type: ignore[assignment]
 
-    ok, err = service.send_dtmf("1")
+    ok, err = service.send_dtmf("73#")
+
     assert not ok and "按键发送失败" in (err or "")
+    assert record.events == [
+        ("dtmf", {"count": 3, "mode": "qvts", "result": "failure"})
+    ]
+    assert "73#" not in str(record.events)
+
+
+def test_service_send_dtmf_mode_resolution_failure_is_redacted(monkeypatch):
+    modem = FakeModem()
+    service = make_service(modem, audio_mode="uac")
+    service.session._active = True
+    record = SpyCallRecord()
+    service.session._record = record  # type: ignore[assignment]
+
+    def fail_config_read(_key: str) -> str:
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr("agentcall.call_agent.config.get_str", fail_config_read)
+
+    ok, err = service.send_dtmf("73#")
+
+    assert not ok and "按键发送失败" in (err or "")
+    assert record.events == [
+        ("dtmf", {"count": 3, "mode": "unknown", "result": "failure"})
+    ]
+    assert "73#" not in str(record.events)
 
 
 # ---- 远程网页拨号会话 ----

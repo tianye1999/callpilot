@@ -450,7 +450,7 @@ class Eg25Modem:
             return False
         valid = set("0123456789*#ABCD")
         if any(ch not in valid for ch in digits):
-            logger.warning("DTMF 含非法字符: %r", digits)
+            logger.warning("DTMF 输入无效: count=%d, result=failure", len(digits))
             return False
         for ch in digits:
             # Quectel EC20/EG25 用 AT+QVTS（部分固件也接受 AT+VTS）。
@@ -458,10 +458,10 @@ class Eg25Modem:
             if "OK" not in response:
                 response = self._send(f'AT+VTS="{ch}"')
             if "OK" not in response:
-                logger.warning("DTMF 按键 %s 发送失败: %r", ch, response.strip())
+                logger.warning("DTMF 发送失败: count=%d, result=failure", len(digits))
                 return False
             time.sleep(0.15)  # 位间间隔，防止连音被 IVR 吞掉
-        logger.info("已发送 DTMF: %s", digits)
+        logger.info("DTMF 发送完成: count=%d, result=success", len(digits))
         return True
 
     def hangup(self) -> None:

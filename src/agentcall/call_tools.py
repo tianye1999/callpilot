@@ -59,6 +59,7 @@ class CallTools:
         # None = 不限制(直接构造 CallTools 的单测保持旧行为)。
         self._is_sms_target_allowed = is_sms_target_allowed
         self._send_dtmf_impl = send_dtmf or self._send_dtmf_via_modem
+        self._dtmf_fallback_mode = "unknown" if send_dtmf else "qvts"
 
     def register(self) -> ToolRegistry:
         registry = ToolRegistry()
@@ -181,19 +182,41 @@ class CallTools:
         """工具处理：Agent 请求发送 DTMF 按键（IVR 导航）。"""
         digits = (args.get("digits") or "").strip()
         if not digits:
-            return {"success": False, "message": "按键序列为空"}
+            return {
+                "success": False,
+                "count": 0,
+                "mode": "unknown",
+                "message": "按键序列为空",
+            }
+        mode = self._dtmf_fallback_mode
         try:
             ok, mode = self._send_dtmf_impl(digits)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("工具发送 DTMF 失败: %s", exc)
-            return {"success": False, "message": f"按键发送失败: {exc}"}
+            logger.warning("工具发送 DTMF 失败: error_type=%s", type(exc).__name__)
+            record = self._get_record()
+            if record is not None:
+                record.log_event(
+                    "dtmf", count=len(digits), mode=mode, result="failure"
+                )
+            return {
+                "success": False,
+                "count": len(digits),
+                "mode": mode,
+                "message": "按键发送失败",
+            }
         record = self._get_record()
-        if ok and record is not None:
-            record.log_event("dtmf", digits=digits, mode=mode)
+        if record is not None:
+            record.log_event(
+                "dtmf",
+                count=len(digits),
+                mode=mode,
+                result="success" if ok else "failure",
+            )
         return {
             "success": ok,
-            "digits": digits,
-            "message": f"已按 {digits}" if ok else "按键发送失败",
+            "count": len(digits),
+            "mode": mode,
+            "message": "按键发送成功" if ok else "按键发送失败",
         }
 
     def _send_dtmf_via_modem(self, digits: str) -> tuple[bool, str]:

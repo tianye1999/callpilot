@@ -99,6 +99,9 @@ QUERY_CODE_SPEC: dict[str, Any] = {
 # 触发 response.create，模型会在挂断延迟里多说一句（如“电话已经挂断…”），
 # 对端听到多余的话。故对这类工具只回传 function_call_output、不再要新回复。
 TERMINAL_TOOLS: frozenset[str] = frozenset({"hangup_call"})
+_DTMF_LOG_MODES: frozenset[str] = frozenset(
+    {"inband", "qvts", "both", "unknown"}
+)
 
 
 def _tool_name(spec: dict[str, Any]) -> str | None:
@@ -106,6 +109,16 @@ def _tool_name(spec: dict[str, Any]) -> str | None:
     if "function" in spec and isinstance(spec["function"], dict):
         return spec["function"].get("name")
     return spec.get("name")
+
+
+def _dtmf_count(args: dict[str, Any]) -> int:
+    digits = args.get("digits")
+    return len(digits.strip()) if isinstance(digits, str) else 0
+
+
+def _dtmf_log_mode(result: dict[str, Any]) -> str:
+    mode = result.get("mode")
+    return mode if isinstance(mode, str) and mode in _DTMF_LOG_MODES else "unknown"
 
 
 class ToolRegistry:
@@ -132,11 +145,40 @@ class ToolRegistry:
             logger.warning("请求了未知工具: %s", name)
             return {"success": False, "message": f"未知工具: {name}"}
         _spec, handler = entry
-        logger.info("执行工具 %s，参数=%s", name, args)
+        dtmf_count = _dtmf_count(args) if name == "send_dtmf" else None
+        if dtmf_count is None:
+            logger.info("执行工具 %s，参数=%s", name, args)
+        else:
+            logger.info("执行工具 %s: count=%d", name, dtmf_count)
         try:
             result = handler(args)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("工具 %s 执行异常: %s", name, exc)
+            if dtmf_count is not None:
+                logger.error(
+                    "工具 %s 执行异常: count=%d, mode=unknown, "
+                    "result=failure, error_type=%s",
+                    name,
+                    dtmf_count,
+                    type(exc).__name__,
+                )
+            else:
+                logger.exception("工具 %s 执行异常: %s", name, exc)
+            if dtmf_count is not None:
+                return {
+                    "success": False,
+                    "count": dtmf_count,
+                    "mode": "unknown",
+                    "message": "按键发送失败",
+                }
             return {"success": False, "message": f"工具执行异常: {exc}"}
-        logger.info("工具 %s 执行结果=%s", name, result)
+        if dtmf_count is None:
+            logger.info("工具 %s 执行结果=%s", name, result)
+        else:
+            logger.info(
+                "工具 %s 执行结果: count=%d, mode=%s, result=%s",
+                name,
+                dtmf_count,
+                _dtmf_log_mode(result),
+                "success" if result.get("success") is True else "failure",
+            )
         return result
