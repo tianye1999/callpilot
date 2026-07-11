@@ -234,7 +234,7 @@ def build_app(
     app["modem"] = modem
     app["service"] = service
     app["meta"] = meta or {}
-    # 由 app.py 传入的 threading.Event；置位后主循环停止并 os.execv 自重启。
+    # 由 app.py 传入的 threading.Event；置位后主循环停止、清理并按运行方式重启。
     app["restart_event"] = restart_event
     app["setup_sms_token"] = [secrets.token_urlsafe(24)]
     app["remote_pairing_store"] = remote_pairing_store
@@ -954,8 +954,9 @@ async def _setup_test_sms(request: web.Request) -> web.Response:
 async def _restart(request: web.Request) -> web.Response:
     """重启服务以应用需重启的配置。
 
-    置位 restart_event 后延迟停止事件循环——app.py 主循环随即清理并
-    os.execv 原地重启（重读 .env）。延迟 0.4s 是为了让本响应先发回前端。
+    置位 restart_event 后延迟停止事件循环——app.py 主循环随即清理；手动运行
+    原地 exec，launchd 管理时退出交由 KeepAlive 拉起。延迟 0.4s 是为了让本响应
+    先发回前端。
     """
     restart_event = request.app.get("restart_event")
     if restart_event is None:

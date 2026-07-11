@@ -7,7 +7,7 @@
 菜单：
     ● CallPilot            （标题，图标随服务状态：🟢 在线 / 🔴 离线）
     打开控制台             （开 pywebview 面板窗口，即 desktop_app.py 子进程）
-    重启服务               （POST /api/restart，原地重启后端）
+    重启服务               （POST /api/restart，按当前运行方式重启后端）
     ——
     退出                   （仅退出托盘；后端服务仍由 launchd 常驻）
 
