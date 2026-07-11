@@ -5,10 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 
 INDEX = Path(__file__).resolve().parents[2] / "src" / "agentcall" / "web" / "static" / "index.html"
+LAN_DIALER = Path(__file__).resolve().parents[2] / "src" / "agentcall" / "web" / "static" / "lan_dialer.html"
 
 
 def test_index_does_not_use_html_injection_apis():
     text = INDEX.read_text(encoding="utf-8")
+    assert "innerHTML" not in text
+    assert "outerHTML" not in text
+    assert "insertAdjacentHTML" not in text
+    assert "dangerouslySetInnerHTML" not in text
+
+
+def test_lan_dialer_does_not_use_html_injection_apis():
+    text = LAN_DIALER.read_text(encoding="utf-8")
     assert "innerHTML" not in text
     assert "outerHTML" not in text
     assert "insertAdjacentHTML" not in text

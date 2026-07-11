@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CallPilot LAN Dialer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101317;
+      --panel: #171b21;
+      --panel-2: #1e242c;
+      --text: #eef2f6;
+      --muted: #9aa6b2;
+      --line: #2c3440;
+      --accent: #4fb6ff;
+      --danger: #ff6b6b;
+      --ok: #66d48a;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(560px, 100%);
+      margin: 0 auto;
+      padding: 24px 16px 32px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+
+    .pill {
+      min-width: 84px;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 13px;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 16px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    input {
+      width: 100%;
+      height: 48px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      color: var(--text);
+      font: inherit;
+      padding: 0 12px;
+      outline: none;
+    }
+
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(79, 182, 255, 0.18);
+    }
+
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    button {
+      min-height: 48px;
+      border: 0;
+      border-radius: 8px;
+      font: inherit;
+      font-weight: 650;
+      color: #071018;
+      background: var(--accent);
+      touch-action: manipulation;
+    }
+
+    button.secondary {
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+    }
+
+    button.danger {
+      color: #1b0808;
+      background: var(--danger);
+    }
+
+    button:disabled {
+      opacity: 0.48;
+    }
+
+    .meter {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .metric {
+      padding: 12px;
+      border-radius: 8px;
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 4px;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+
+    .log {
+      margin-top: 14px;
+      min-height: 128px;
+      max-height: 220px;
+      overflow: auto;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0d1014;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+
+    .ok { color: var(--ok); }
+    .bad { color: var(--danger); }
+
+    @media (max-width: 420px) {
+      main { padding-top: 18px; }
+      h1 { font-size: 21px; }
+      .actions, .meter { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>CallPilot LAN Dialer</h1>
+      <div id="statePill" class="pill">待机</div>
+    </header>
+
+    <section class="panel">
+      <label for="number">拨打号码</label>
+      <input id="number" inputmode="tel" autocomplete="tel" placeholder="10000" value="10000">
+      <div class="actions">
+        <button id="callButton" type="button">拨号</button>
+        <button id="hangupButton" type="button" class="danger" disabled>挂断</button>
+      </div>
+      <div class="meter">
+        <div class="metric">
+          <span>麦克风</span>
+          <strong id="micState">未启用</strong>
+        </div>
+        <div class="metric">
+          <span>线路</span>
+          <strong id="lineState">未连接</strong>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="secondary" type="button" data-dtmf="1">1</button>
+        <button class="secondary" type="button" data-dtmf="2">2</button>
+        <button class="secondary" type="button" data-dtmf="3">3</button>
+        <button class="secondary" type="button" data-dtmf="0">0</button>
+      </div>
+      <div id="log" class="log" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <script>
+    const callButton = document.getElementById("callButton");
+    const hangupButton = document.getElementById("hangupButton");
+    const numberInput = document.getElementById("number");
+    const statePill = document.getElementById("statePill");
+    const micState = document.getElementById("micState");
+    const lineState = document.getElementById("lineState");
+    const logBox = document.getElementById("log");
+    const token = new URLSearchParams(window.location.search).get("token") || "";
+
+    let audioContext = null;
+    let mediaStream = null;
+    let processor = null;
+    let websocket = null;
+    let playHead = 0;
+    let calling = false;
+
+    function setText(node, text, className) {
+      node.textContent = text;
+      node.className = className || "";
+    }
+
+    function appendLog(text) {
+      const stamp = new Date().toLocaleTimeString();
+      logBox.textContent = `${stamp}  ${text}\n${logBox.textContent}`.slice(0, 3000);
+    }
+
+    function setCalling(next) {
+      calling = next;
+      callButton.disabled = next;
+      hangupButton.disabled = !next;
+      statePill.textContent = next ? "通话中" : "待机";
+    }
+
+    function withTimeout(promise, ms, message) {
+      let timer = null;
+      const timeout = new Promise((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error(message)), ms);
+      });
+      return Promise.race([promise, timeout]).finally(() => {
+        if (timer) {
+          window.clearTimeout(timer);
+        }
+      });
+    }
+
+    async function ensureAudio() {
+      if (!audioContext) {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        audioContext = new AudioContextClass({ latencyHint: "interactive" });
+      }
+      await audioContext.resume();
+      if (!mediaStream) {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          },
+          video: false
+        });
+        setText(micState, "已启用", "ok");
+      }
+      if (!processor) {
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        processor = audioContext.createScriptProcessor(2048, 1, 1);
+        processor.onaudioprocess = (event) => {
+          const out = event.outputBuffer.getChannelData(0);
+          out.fill(0);
+          if (!calling || !websocket || websocket.readyState !== WebSocket.OPEN) {
+            return;
+          }
+          const input = event.inputBuffer.getChannelData(0);
+          const pcm = new Int16Array(input.length);
+          for (let i = 0; i < input.length; i += 1) {
+            const sample = Math.max(-1, Math.min(1, input[i]));
+            pcm[i] = sample < 0 ? sample * 32768 : sample * 32767;
+          }
+          websocket.send(pcm.buffer);
+        };
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+      }
+    }
+
+    function playPcm8(arrayBuffer) {
+      if (!audioContext || arrayBuffer.byteLength === 0) {
+        return;
+      }
+      const input = new Int16Array(arrayBuffer);
+      const buffer = audioContext.createBuffer(1, input.length, 8000);
+      const channel = buffer.getChannelData(0);
+      for (let i = 0; i < input.length; i += 1) {
+        channel[i] = input[i] / 32768;
+      }
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioContext.destination);
+      const startAt = Math.max(audioContext.currentTime + 0.04, playHead);
+      source.start(startAt);
+      playHead = startAt + buffer.duration;
+    }
+
+    function closeCall() {
+      if (websocket && websocket.readyState === WebSocket.OPEN) {
+        websocket.send(JSON.stringify({ type: "hangup" }));
+        websocket.close();
+      }
+      setCalling(false);
+      setText(lineState, "未连接");
+    }
+
+    async function startCall() {
+      const number = numberInput.value.trim();
+      if (!/^\+?[0-9*#]{1,32}$/.test(number)) {
+        appendLog("号码格式不合法");
+        setText(lineState, "号码无效", "bad");
+        numberInput.focus();
+        return;
+      }
+      callButton.disabled = true;
+      setText(lineState, "启用麦克风中");
+      appendLog(`准备拨号 ${number}`);
+      try {
+        await withTimeout(ensureAudio(), 12000, "麦克风授权超时");
+      } catch (error) {
+        appendLog(`麦克风启用失败：${error && error.message ? error.message : "请检查浏览器权限"}`);
+        setText(micState, "失败", "bad");
+        setText(lineState, "麦克风失败", "bad");
+        callButton.disabled = false;
+        return;
+      }
+
+      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+      const wsUrl = `${scheme}://${window.location.host}/ws/call?token=${encodeURIComponent(token)}`;
+      websocket = new WebSocket(wsUrl);
+      websocket.binaryType = "arraybuffer";
+      setCalling(true);
+      setText(lineState, "连接中");
+      appendLog(`发送拨号 ${number}`);
+
+      websocket.addEventListener("open", () => {
+        playHead = audioContext.currentTime + 0.08;
+        websocket.send(JSON.stringify({
+          type: "start",
+          number,
+          sampleRate: Math.round(audioContext.sampleRate)
+        }));
+      });
+
+      websocket.addEventListener("message", async (event) => {
+        if (typeof event.data === "string") {
+          const data = JSON.parse(event.data);
+          if (data.type === "status") {
+            if (data.status === "dialing") {
+              setText(lineState, "拨号中");
+            } else if (data.status === "connected") {
+              setText(lineState, "已接通", "ok");
+              appendLog("线路已接通");
+            } else if (data.status === "ended") {
+              setText(lineState, "已结束");
+              appendLog("通话结束");
+            }
+          } else if (data.type === "error") {
+            appendLog(data.error || "通话异常");
+            setText(lineState, "异常", "bad");
+          }
+          return;
+        }
+        const audioData = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+        playPcm8(audioData);
+      });
+
+      websocket.addEventListener("close", () => {
+        setCalling(false);
+        setText(lineState, "未连接");
+      });
+
+      websocket.addEventListener("error", () => {
+        appendLog("WebSocket 连接失败");
+        setText(lineState, "异常", "bad");
+        setCalling(false);
+      });
+    }
+
+    callButton.addEventListener("click", startCall);
+    hangupButton.addEventListener("click", closeCall);
+    document.querySelectorAll("[data-dtmf]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+          websocket.send(JSON.stringify({ type: "dtmf", digits: button.dataset.dtmf }));
+        }
+      });
+    });
+  </script>
+</body>
+</html>
