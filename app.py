@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 from agentcall import config, number_profiles
 from agentcall.call_agent import CallAgentService
+from agentcall.cloud_control import CloudControlApi, CloudEdgeClient
+from agentcall.cloud_credentials import CloudCredentialStore
 from agentcall.events import EventHub
 from agentcall.remote_pairing import RemotePairingStore
 from agentcall.web.remote_gateway import build_remote_gateway
@@ -191,7 +193,14 @@ def main() -> None:
     service.start()
 
     remote_pairing_store = None
-    if config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
+    cloud_api = None
+    cloud_store = None
+    cloud_client = None
+    cloud_enabled = (
+        config.get_bool("REMOTE_WEB_DIALER_ENABLED")
+        and config.get_bool("REMOTE_CLOUD_ENABLED")
+    )
+    if config.get_bool("REMOTE_WEB_DIALER_ENABLED") and not cloud_enabled:
         remote_pairing_store = RemotePairingStore(
             data_dir / "remote_devices.json",
             max_devices=config.get_int("REMOTE_MAX_PAIRED_DEVICES"),
@@ -209,6 +218,14 @@ def main() -> None:
 
     # 需重启配置的自愈重启：/api/restart 置位该事件 → 停 loop → 清理后重启。
     restart_event = threading.Event()
+    if cloud_enabled:
+        cloud_store = CloudCredentialStore()
+        cloud_api = CloudControlApi(config.get_str("REMOTE_CLOUD_URL"))
+        cloud_client = CloudEdgeClient(
+            config.get_str("REMOTE_CLOUD_URL"), service, cloud_store
+        )
+        cloud_client.start()
+
     app = build_app(
         hub,
         service.modem,
@@ -218,6 +235,9 @@ def main() -> None:
         # loopback 下不启用令牌校验（行为不变）；非 loopback 上面已保证 token 非空。
         auth_token=web_auth_token if not config.is_loopback_host(host) else None,
         remote_pairing_store=remote_pairing_store,
+        remote_cloud_api=cloud_api,
+        remote_cloud_store=cloud_store,
+        remote_cloud_client=cloud_client,
     )
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())
@@ -260,6 +280,8 @@ def main() -> None:
     finally:
         if prewarm_thread is not None:
             prewarm_thread.stop_event.set()
+        if cloud_client is not None:
+            cloud_client.stop()
         service.stop_service()
         if service.monitor is not None:
             service.monitor.stop()

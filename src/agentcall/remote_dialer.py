@@ -112,6 +112,7 @@ class RemoteDialerRuntimeConfig:
     outbound_max_seconds: float = 1800.0
     connect_timeout_seconds: float = 45.0
     dtmf_mode: str = "inband"
+    recording_enabled: bool = True
 
 
 def _validate_url(value: str, *, schemes: set[str], label: str) -> str:
@@ -593,7 +594,10 @@ class RemoteWebDialerCoordinator:
             return None
         try:
             return self.call_logger.begin_call(
-                "outbound", number, source=REMOTE_CALL_SOURCE
+                "outbound",
+                number,
+                source=REMOTE_CALL_SOURCE,
+                recording_enabled=self.runtime.recording_enabled,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("创建远程通话记录失败: %s", type(exc).__name__)

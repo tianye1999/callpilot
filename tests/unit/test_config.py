@@ -596,6 +596,34 @@ def test_enabling_remote_web_dialer_requires_complete_secure_config(
     assert update_env_file(updates, env_path=env) == list(updates)
 
 
+def test_hosted_remote_mode_needs_no_local_tunnel_or_livekit_secret(
+    tmp_path, monkeypatch
+):
+    for key in (
+        "REMOTE_WEB_DIALER_ENABLED",
+        "REMOTE_CLOUD_ENABLED",
+        "REMOTE_CLOUD_URL",
+        "REMOTE_CONTROL_URL",
+        "LIVEKIT_URL",
+        "LIVEKIT_API_KEY",
+        "LIVEKIT_API_SECRET",
+    ):
+        _unset(monkeypatch, key)
+    updates = {
+        "REMOTE_WEB_DIALER_ENABLED": "true",
+        "REMOTE_CLOUD_ENABLED": "true",
+        "REMOTE_CLOUD_URL": "https://api.bondings.ai",
+    }
+
+    assert update_env_file(updates, env_path=tmp_path / ".env") == list(updates)
+
+    with pytest.raises(ValueError, match="HTTPS"):
+        update_env_file(
+            {"REMOTE_CLOUD_URL": "http://api.bondings.ai?token=secret"},
+            env_path=tmp_path / ".env",
+        )
+
+
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [

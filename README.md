@@ -213,6 +213,13 @@ kept as a fallback. See [ADR-001](docs/decisions/001-remote-web-dialer-livekit.m
 Mobile background/lock-screen calling and inbound takeover still require a later
 native app.
 
+Issue #42 adds a company-hosted Beta mode. With `REMOTE_CLOUD_ENABLED=true`, the
+Edge makes an outbound WSS connection to `REMOTE_CLOUD_URL`; users do not operate
+a Cloudflare Tunnel and the Edge does not receive a LiveKit API Secret. Enrollment
+uses a one-time Beta code, while the resulting Edge credential and Ed25519 device
+key stay in Keychain/Credential Manager. The existing loopback gateway remains an
+explicit diagnostic fallback.
+
 ### Quick start (Windows) — awaiting hardware reports
 
 Windows needs **no USB bridge**: install the official Quectel EC20 Windows

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self' wss:; media-src blob:; worker-src 'self' blob:; manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'">
+  <title>CallPilot Remote</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/callpilot-192.png">
+  <link rel="stylesheet" href="/remote_dialer.css?v=3">
+  <script
+    defer
+    src="https://cdn.jsdelivr.net/npm/livekit-client@2.20.1/dist/livekit-client.umd.min.js"
+    integrity="sha384-IGu2q4tt1II4yly/zsJYCCLP+lffK6+KqCYd4wvwv7cEzBcULk1wHM1fKzBOLrqY"
+    crossorigin="anonymous"></script>
+  <script defer src="/remote_dialer.js?v=3"></script>
+</head>
+<body>
+  <main class="dialer-shell">
+    <header class="topbar">
+      <div>
+        <div class="brand">CallPilot</div>
+        <div class="line-label" data-i18n="remote_line">REMOTE LINE</div>
+      </div>
+      <div class="status-pill" id="statusPill">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="statusText" role="status" aria-live="polite"></span>
+      </div>
+    </header>
+
+    <section class="pairing-surface" id="pairingSurface" aria-labelledby="pairingTitle" hidden>
+      <h1 id="pairingTitle" data-i18n="pair_title">Pair this phone</h1>
+      <label for="pairingCode" data-i18n="pair_code_label">Pairing code</label>
+      <input
+        id="pairingCode"
+        class="pairing-input"
+        type="text"
+        inputmode="text"
+        autocomplete="one-time-code"
+        maxlength="9"
+        placeholder="ABCD-EFGH">
+      <label for="deviceName" data-i18n="device_name_label">Device name</label>
+      <input
+        id="deviceName"
+        class="pairing-input"
+        type="text"
+        autocomplete="off"
+        maxlength="64">
+      <button id="pairButton" class="command pair" type="button" data-i18n="pair">Pair phone</button>
+    </section>
+
+    <section class="call-surface" id="callSurface" aria-labelledby="dialerTitle" hidden>
+      <h1 id="dialerTitle" data-i18n="title">Call with your SIM</h1>
+      <div class="paired-row" id="pairedRow" hidden>
+        <span id="pairedDevice"></span>
+        <button id="unpairButton" type="button" data-i18n="unpair">Unpair</button>
+      </div>
+      <label for="dialNumber" data-i18n="number_label">Phone number</label>
+      <input
+        id="dialNumber"
+        class="number-input"
+        type="tel"
+        inputmode="tel"
+        autocomplete="tel"
+        maxlength="32"
+        placeholder="10000"
+        aria-describedby="statusText">
+
+      <div class="primary-actions">
+        <button id="callButton" class="command call" type="button" data-i18n="call">Call</button>
+        <button id="hangupButton" class="command hangup" type="button" data-i18n="hangup" disabled>Hang up</button>
+      </div>
+
+      <div class="keypad" id="keypad" aria-label="DTMF keypad">
+        <button type="button" data-digit="1" disabled>1</button>
+        <button type="button" data-digit="2" disabled>2</button>
+        <button type="button" data-digit="3" disabled>3</button>
+        <button type="button" data-digit="4" disabled>4</button>
+        <button type="button" data-digit="5" disabled>5</button>
+        <button type="button" data-digit="6" disabled>6</button>
+        <button type="button" data-digit="7" disabled>7</button>
+        <button type="button" data-digit="8" disabled>8</button>
+        <button type="button" data-digit="9" disabled>9</button>
+        <button type="button" data-digit="*" disabled>*</button>
+        <button type="button" data-digit="0" disabled>0</button>
+        <button type="button" data-digit="#" disabled>#</button>
+      </div>
+
+      <div class="connection-row" aria-hidden="true">
+        <span></span><span></span><span></span><span></span>
+      </div>
+    </section>
+  </main>
+  <div id="audioHost" hidden></div>
+</body>
+</html>

@@ -1,0 +1,33 @@
+{
+  "name": "callpilot-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "npm run typecheck && npm run lint && npm test",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "lint": "eslint .",
+    "test": "vitest run && node test/integration.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "livekit-server-sdk": "^2.17.0",
+    "zod": "^4.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@cloudflare/workers-types": "^5.20260711.1",
+    "@eslint/js": "^10.0.0",
+    "eslint": "^10.0.0",
+    "globals": "^17.0.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.63.0",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.110.0",
+    "ws": "^8.18.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -43,6 +43,7 @@ from .prompts import (
 )
 from .rate_limit import acquire_remote_dial_slot
 from .remote_dialer import (
+    IssuedLiveKitSession,
     RemoteDialerInvite,
     RemoteDialerRuntimeConfig,
     RemoteDialerWorker,
@@ -1229,20 +1230,72 @@ class CallAgentService:
                 return None, "远程媒体连接失败，请检查 LiveKit 和拨号页配置"
             return self._invite_payload(invite), None
 
+    def start_cloud_remote_session(
+        self, command: dict
+    ) -> tuple[bool, str | None]:
+        """Start one server-issued LiveKit session without local signing secrets."""
+
+        if not config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
+            return False, "REMOTE_DISABLED"
+        if not config.get_bool("REMOTE_CLOUD_ENABLED"):
+            return False, "CLOUD_DISABLED"
+        if not self.modem_connected:
+            return False, "MODEM_OFFLINE"
+        session = command["session"]
+        expires_at = float(command["expiresAtUnix"])
+        issued = IssuedLiveKitSession(
+            invite=RemoteDialerInvite(
+                session_id=session["sessionId"],
+                url="",
+                expires_at=expires_at,
+            ),
+            room_name=session["roomName"],
+            browser_identity=session["browserIdentity"],
+            edge_identity=session["edgeIdentity"],
+            browser_token="",
+            edge_token=session["token"],
+            livekit_url=session["livekitUrl"],
+        )
+        with self._remote_setup_lock:
+            worker = self._remote_worker
+            if worker is not None and worker.is_running:
+                return False, "LINE_BUSY"
+            try:
+                worker = self._build_remote_worker_for_issued(issued)
+                self._remote_worker = worker
+                self._remote_invite = issued.invite
+                self._remote_session_device_id = f"cloud:{command['callId']}"
+                worker.start(timeout=10.0)
+            except (ImportError, RuntimeError, ValueError) as exc:
+                self._remote_worker = None
+                self._remote_invite = None
+                self._remote_session_device_id = None
+                logger.warning(
+                    "启动云端远程拨号会话失败: error_type=%s", type(exc).__name__
+                )
+                return False, "MEDIA_FAILED"
+        return True, None
+
     def remote_dialer_status(self) -> dict:
         """Return non-secret readiness/session state for the local dashboard."""
 
         enabled = config.get_bool("REMOTE_WEB_DIALER_ENABLED")
+        cloud_enabled = config.get_bool("REMOTE_CLOUD_ENABLED")
         required = (
-            "REMOTE_CONTROL_URL",
-            "LIVEKIT_URL",
-            "LIVEKIT_API_KEY",
-            "LIVEKIT_API_SECRET",
+            ("REMOTE_CLOUD_URL",)
+            if cloud_enabled
+            else (
+                "REMOTE_CONTROL_URL",
+                "LIVEKIT_URL",
+                "LIVEKIT_API_KEY",
+                "LIVEKIT_API_SECRET",
+            )
         )
         missing = [key for key in required if not config.get_str(key).strip()]
         worker = self._remote_worker
         payload: dict = {
             "enabled": enabled,
+            "cloud_enabled": cloud_enabled,
             "configured": not missing,
             "missing": missing,
             "active": bool(worker and worker.is_running),
@@ -1275,6 +1328,11 @@ class CallAgentService:
             public_url=config.get_str("REMOTE_CONTROL_URL"),
             ttl_seconds=config.get_int("REMOTE_INVITE_TTL_SECONDS"),
         )
+        return issued.invite, self._build_remote_worker_for_issued(issued)
+
+    def _build_remote_worker_for_issued(
+        self, issued: IssuedLiveKitSession
+    ) -> RemoteDialerWorker:
         from .livekit_media import LiveKitRemoteMediaEndpoint
 
         endpoint = LiveKitRemoteMediaEndpoint(issued)
@@ -1294,6 +1352,7 @@ class CallAgentService:
                 1.0, config.get_float("REMOTE_CONNECT_TIMEOUT_SECONDS")
             ),
             dtmf_mode=config.get_str("REMOTE_DTMF_MODE"),
+            recording_enabled=config.get_bool("REMOTE_HUMAN_RECORDING_ENABLED"),
         )
         coordinator = RemoteWebDialerCoordinator(
             session_id=issued.invite.session_id,
@@ -1306,7 +1365,7 @@ class CallAgentService:
             release_line=self._release_remote_line,
             publish_event=self._publish,
         )
-        return issued.invite, RemoteDialerWorker(coordinator)
+        return RemoteDialerWorker(coordinator)
 
     def _reserve_remote_line(
         self, owner: RemoteWebDialerCoordinator

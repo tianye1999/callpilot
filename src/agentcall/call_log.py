@@ -234,6 +234,7 @@ class CallLogger:
         number: str | None,
         *,
         source: str | None = None,
+        recording_enabled: bool | None = None,
     ) -> CallRecord:
         """开始记录一次通话；direction 必须是 inbound 或 outbound。"""
         if direction not in ("inbound", "outbound"):
@@ -252,7 +253,11 @@ class CallLogger:
             path=path,
             direction=direction,
             number=number,
-            recording_enabled=self.recording_enabled,
+            recording_enabled=(
+                self.recording_enabled
+                if recording_enabled is None
+                else recording_enabled
+            ),
             source=source,
         )
         started_fields: dict[str, Any] = {"direction": direction, "number": number}

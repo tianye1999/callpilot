@@ -381,6 +381,58 @@ def test_remote_worker_uses_remote_dtmf_mode_not_ai_call_mode(monkeypatch):
     _invite, worker = make_service(FakeModem())._build_remote_worker()
 
     assert worker.coordinator.runtime.dtmf_mode == "qvts"
+    assert worker.coordinator.runtime.recording_enabled is False
+
+
+def test_cloud_remote_session_uses_server_token_without_local_signing_secret(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_CLOUD_ENABLED", "true")
+    monkeypatch.delenv("LIVEKIT_API_KEY", raising=False)
+    monkeypatch.delenv("LIVEKIT_API_SECRET", raising=False)
+    service = make_service(FakeModem())
+    worker = FakeRemoteWorker(FakeRemoteCoordinator())
+    issued: list[IssuedLiveKitSession] = []
+
+    def build(server_issued: IssuedLiveKitSession):
+        issued.append(server_issued)
+        return worker
+
+    monkeypatch.setattr(service, "_build_remote_worker_for_issued", build)
+    command = {
+        "callId": "call_abcdefghijkl",
+        "expiresAtUnix": time.time() + 300,
+        "session": {
+            "sessionId": "session_abcdefghijkl",
+            "roomName": "callpilot_abcdefghijkl",
+            "browserIdentity": "web_abcdefghijkl",
+            "edgeIdentity": "edgepart_abcdefghijkl",
+            "livekitUrl": "wss://project.livekit.cloud",
+            "token": "server-issued-edge-token",
+        },
+    }
+
+    ok, error = service.start_cloud_remote_session(command)
+
+    assert ok is True and error is None
+    assert worker.started is True
+    assert issued[0].edge_token == "server-issued-edge-token"
+    assert issued[0].browser_token == ""
+    assert service._remote_session_device_id == "cloud:call_abcdefghijkl"
+
+
+def test_cloud_remote_session_default_off_is_byte_compatible(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.delenv("REMOTE_CLOUD_ENABLED", raising=False)
+    service = make_service(FakeModem())
+    built: list[bool] = []
+    monkeypatch.setattr(
+        service, "_build_remote_worker_for_issued", lambda _issued: built.append(True)
+    )
+
+    ok, error = service.start_cloud_remote_session({})
+
+    assert ok is False and error == "CLOUD_DISABLED"
+    assert built == []
 
 
 def test_expired_remote_invite_stops_old_worker_before_replacement(monkeypatch):

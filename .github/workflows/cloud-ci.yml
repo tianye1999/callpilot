@@ -1,0 +1,32 @@
+name: Cloud Control Plane CI
+
+on:
+  push:
+    paths:
+      - "cloud/**"
+      - ".github/workflows/cloud-ci.yml"
+  pull_request:
+    paths:
+      - "cloud/**"
+      - ".github/workflows/cloud-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloud
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npx wrangler deploy --dry-run
+
