@@ -56,12 +56,15 @@ to contribute code or run tests.
   temp dir and sets `SUMMARY_ENABLED=false` so tests never write to your real
   recordings dir or hit the network. A test that needs different behavior can
   `monkeypatch.setenv` / `delenv` — test-level env wins over the fixture.
-- Please run `.venv/bin/pytest` and get a green suite **before** opening a PR.
+- Please run the three gates — `.venv/bin/ruff check .`, `.venv/bin/mypy`,
+  `.venv/bin/pytest` — and get them all green **before** opening a PR.
 
 ### Code style
 
-Match the existing code — no separate linter/formatter is enforced yet, so
-consistency is by convention:
+Match the existing code. Three gates run in CI and gate every change — keep all
+three green before you push: `.venv/bin/ruff check .` (lint), `.venv/bin/mypy`
+(types), and `.venv/bin/pytest` (tests). Beyond those, consistency is by
+convention:
 
 - **Chinese docstrings and inline comments.** Module/class/function docstrings and
   comments are written in Chinese (see any file under `src/agentcall/`). Keep new
@@ -82,7 +85,8 @@ consistency is by convention:
 
 - **Branch** off `main`; don't commit to `main` directly. Use a short descriptive
   branch name (e.g. `fix/second-call-silent`, `feat/dtmf-tool`).
-- **Run the tests first.** `.venv/bin/pytest` must be green before you push.
+- **Run the three gates first.** `.venv/bin/ruff check .`, `.venv/bin/mypy`, and
+  `.venv/bin/pytest` must all be green before you push.
 - **Commit messages** are concise and describe the *what/why*; a leading roadmap
   task ID (e.g. `P0-1`) is welcome when it maps to `docs/roadmap.md`. Chinese or
   English are both fine — match the surrounding history.
@@ -91,6 +95,15 @@ consistency is by convention:
   observations, since CI cannot exercise the modem).
 - If your change touches a hardware/audio path that the test suite can't cover,
   say so explicitly and describe your manual verification.
+
+### Release process
+
+Since 0.6.0, every GitHub Release notes block records — for supply-chain
+auditability — the git tag, the packaged DMG's SHA-256, the Apple notarization
+submission id, and the exact build-source commit (which may predate the merge
+commit when Android/docs-only changes don't enter the desktop DMG). Any cloud
+PWA change must be `wrangler deploy`-ed to the beta endpoints before the Release
+is cut, so the hosted onboarding a user hits matches the released source.
 
 ### Hardware contributors
 
@@ -158,7 +171,7 @@ cp .env.example .env                 # 然后按需编辑 .env
 .venv/bin/pytest
 ```
 
-- **无需硬件、无需联网、无需 API Key。** 当前 160 个用例可完全离线运行。
+- **无需硬件、无需联网、无需 API Key。** 整个用例集可完全离线运行。
 - 测试使用 `tests/fakes/` 下的内存**假件**，与真实组件鸭子类型对齐：`FakeModem`
   （对齐 `Eg25Modem`，记录 AT 调用并可触发 `RING`/挂断/短信）、`FakeAudioBridge`
   （内存环回音频桥，接口与 `ModemAudioBridge` 对齐）、`FakeAgent`（脚本化的

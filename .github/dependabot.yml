@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # Python (pyproject.toml / requirements)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  # Cloud control plane (Cloudflare Worker)
+  - package-ecosystem: "npm"
+    directory: "/cloud"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  # Android remote-dialer app
+  - package-ecosystem: "gradle"
+    directory: "/android"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  # GitHub Actions used by the workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

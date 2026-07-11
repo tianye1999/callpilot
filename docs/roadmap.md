@@ -1,6 +1,6 @@
 # CallPilot 需求与路线图（Realtime 优先，单一 SSOT）
 
-> 版本：v2.1（2026-07-07）
+> 版本：v2.2（2026-07-12）
 > 本文合并原 `01-requirements.md` / `02-task-breakdown.md` / `03-gap-analysis-vs-poc.md`，
 > 是当前唯一的计划文档。**本地三段式（VAD→STT→LLM→TTS）方案已整体延后**，本文只覆盖
 > 云端 realtime 路线下要做的功能，按优先级组织。三段式方案见文末附录 A（暂缓）。
@@ -9,6 +9,12 @@
 > **状态更新（v0.2，2026-07-08）**：FR-7/9/10/11（桌面 App、批量外呼、通话记录/录音、
 > 通话后摘要）、首启向导、DMG 安装包、P0/P1/P2 主线与 §3 多数 P3 打磨项已回填状态；
 > provider 由 qwen/doubao 扩展为 **qwen（默认）/ doubao / openai**。
+>
+> **状态更新（0.6.0，2026-07-12）**：hosted 云控制面（Cloudflare Worker + D1 +
+> Durable Objects + LiveKit，见 #42/#43）与 Android 远程拨号 App（hosted `/v1` 协议，
+> 见 #36/#44）已发布——普通用户用配对码即可远程拨号，无需自建 tunnel。0.6.0 签名公证
+> DMG 已发 GitHub Release；hosted onboarding 指向 `*-beta.bondings.ai`，生产 DNS 切换
+> 待异网混沌验收后单独进行。
 
 ## 0. 发布路线（开源 + 商业化免费）
 
@@ -17,6 +23,7 @@
 | **v0.1 Developer Preview** | 源码开源，开发者按 README 手动跑通，收集同型号 EC20 硬件反馈 | 会装 Python/填 Key/跑命令的开发者 | 🚧 本轮交付：Apache-2.0、去个人化、双语 README、风险声明、仓库清理 |
 | **v0.2 Mac Beta** | 有 `.app`，仍需装依赖或跑安装脚本 | 技术用户 | ✅ 已落地 |
 | **v0.3 One-click Mac Beta** | `.dmg` 安装、首次启动向导、内置 runtime、自动 launchd、Developer ID 签名+公证 | 普通用户 | ✅ 已落地（v0.4.0 起 DMG 已签名+公证+staple） |
+| **v0.6.0 Hosted + Mobile** | hosted 云控制面（Cloudflare Worker + D1 + Durable Objects + LiveKit）+ Android 远程拨号 App，配对码远程拨号、无需自建 tunnel | 普通用户 | ✅ 已发布（2026-07-12；#42/#43 云控制面、#36/#44 Android v0 + hosted `/v1`） |
 | **v1.0** | 稳定硬件矩阵、隐私说明、故障恢复、完整文档 | 通用 | 计划 |
 
 v0.1 原则（codex 建议，已采纳）：不追求一键安装，追求"陌生开发者 30 分钟能跑通、能提
