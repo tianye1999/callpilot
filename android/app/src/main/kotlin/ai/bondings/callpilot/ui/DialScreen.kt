@@ -1,10 +1,15 @@
 package ai.bondings.callpilot.ui
 
+import ai.bondings.callpilot.call.CallManager
 import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.DeviceStatus
 import ai.bondings.callpilot.protocol.GatewayClient
 import ai.bondings.callpilot.protocol.Validation
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -23,16 +28,21 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
-/**
- * 拨号页（M3：协议联测形态）。
- * 「创建会话」验证 /api/session 链路；真实媒体拨号在 M4 接入 LiveKit 后启用。
- */
+/** 拨号页：线路状态 + 号码 + 真实拨号（先要麦克风权限）。 */
 @Composable
-fun DialScreen(pairing: StoredPairing, store: CredentialStore, onUnpaired: () -> Unit) {
+fun DialScreen(
+    pairing: StoredPairing,
+    store: CredentialStore,
+    manager: CallManager,
+    onUnpaired: () -> Unit,
+) {
+    val context = LocalContext.current
     val client = remember(pairing) {
         GatewayClient(pairing.gatewayUrl).also { it.credential = pairing.credential }
     }
@@ -40,6 +50,24 @@ fun DialScreen(pairing: StoredPairing, store: CredentialStore, onUnpaired: () ->
     var number by remember { mutableStateOf("") }
     var message by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+
+    val micPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            manager.startCall(pairing, number)
+        } else {
+            message = "需要麦克风权限才能通话"
+        }
+    }
+
+    fun dial() {
+        message = null
+        val granted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) manager.startCall(pairing, number) else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+    }
 
     LaunchedEffect(client) {
         launch(Dispatchers.IO) {
@@ -73,21 +101,11 @@ fun DialScreen(pairing: StoredPairing, store: CredentialStore, onUnpaired: () ->
             modifier = Modifier.fillMaxWidth(),
         )
         Button(
-            onClick = {
-                message = null
-                scope.launch(Dispatchers.IO) {
-                    try {
-                        val invite = client.createSession()
-                        message = "会话已创建：${invite.sessionId.take(8)}…（媒体拨号将在 M4 接入）"
-                    } catch (e: Exception) {
-                        message = "创建会话失败：${e.message}"
-                    }
-                }
-            },
+            onClick = ::dial,
             enabled = Validation.isValidNumber(number),
             modifier = Modifier.fillMaxWidth(),
-        ) { Text("创建会话（协议联测）") }
-        message?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+        ) { Text("拨号（经远端 SIM）") }
+        message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         OutlinedButton(
             onClick = {
                 scope.launch(Dispatchers.IO) {
