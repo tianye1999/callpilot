@@ -32,6 +32,7 @@ npx wrangler d1 migrations apply callpilot-cloud-beta --remote
 npx wrangler secret put ADMIN_TOKEN
 npx wrangler secret put LIVEKIT_API_KEY
 npx wrangler secret put LIVEKIT_API_SECRET
+npx wrangler secret put LIVEKIT_URL
 npx wrangler deploy
 ```
 
