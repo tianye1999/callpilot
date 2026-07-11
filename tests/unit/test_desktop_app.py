@@ -147,6 +147,21 @@ def test_ensure_already_running(monkeypatch):
     assert desktop_app.ensure_service_running("http://x/api/meta") == "already"
 
 
+def test_ensure_bundled_macos_waits_for_launchd_without_spawning_duplicate(monkeypatch):
+    results = iter([False, False, True])
+    monkeypatch.setattr(
+        desktop_app, "probe_service", lambda url, timeout=2.0: next(results)
+    )
+    monkeypatch.setattr(desktop_app.platforms, "IS_MACOS", True)
+    monkeypatch.setattr(desktop_app.sys, "frozen", True, raising=False)
+    _no_sleep(monkeypatch)
+    _forbid_popen(monkeypatch)
+
+    assert desktop_app.ensure_service_running(
+        "http://x/api/meta", max_wait=5.0, poll_interval=0
+    ) == "started"
+
+
 def test_ensure_starts_service(monkeypatch, tmp_path):
     state = {"up": False}
     monkeypatch.setattr(

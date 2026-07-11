@@ -5,8 +5,8 @@
 启动流程：
     1. 探测 ``<AGENTCALL_WEB_URL>/api/meta`` 判断服务是否已在运行；
     2. 在跑 → 直接开窗指向服务地址；
-    3. 没跑 → 用项目 venv 的 python 拉起 app.py（stdout/stderr 追加到
-       ``data/app_console.log``），轮询等待就绪后开窗；
+    3. 没跑 → 打包版 macOS 等待 launchd 拉起；其他运行方式用项目 venv 的
+       python 拉起 app.py（stdout/stderr 追加到 ``data/app_console.log``）；
     4. 拉起失败或等待超时 → 开一个错误提示窗，说明手动启动命令。
 
 用法：
@@ -110,6 +110,12 @@ def _launch_config() -> tuple[str, str, str]:
     return python_exe, app_script, log_path
 
 
+def _bundled_macos_service_is_system_managed() -> bool:
+    """Return whether launchd, rather than this window, owns the service."""
+    frozen = bool(getattr(sys, "frozen", False) or getattr(sys, "_MEIPASS", None))
+    return platforms.IS_MACOS and frozen
+
+
 # ---- 纯逻辑（可单测）----
 
 def probe_service(url: str, timeout: float = 2.0) -> bool:
@@ -182,6 +188,22 @@ def ensure_service_running(
     if probe_service(meta_url, timeout=probe_timeout):
         logger.info("服务已在运行: %s", meta_url)
         return "already"
+
+    # The bundled tray installs a KeepAlive launchd job before opening this
+    # window. Spawning another --service process during launchd startup/restart
+    # races both instances for WEB_PORT and can leave the old configuration live.
+    if _bundled_macos_service_is_system_managed():
+        logger.info("服务暂未就绪，等待 launchd 托管实例启动: %s", meta_url)
+        return (
+            "started"
+            if wait_service_ready(
+                meta_url,
+                max_wait=max_wait,
+                interval=poll_interval,
+                probe_timeout=probe_timeout,
+            )
+            else "failed"
+        )
 
     log_file = Path(log_path)
     try:

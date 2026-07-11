@@ -33,6 +33,28 @@ def _open_browser_later(url: str, delay: float = 1.0) -> threading.Timer | None:
     return timer
 
 
+def _restart_after_cleanup() -> None:
+    """Restart manually-run services in place; let launchd restart its own job.
+
+    Re-executing the frozen child underneath ``caffeinate`` can race a second
+    launchd instance for the listening port.  A launchd-managed service instead
+    exits only after cleanup has released its sockets; ``KeepAlive`` then starts
+    one fresh job with the persisted environment file.
+    """
+    if sys.platform == "darwin":
+        from agentcall.macos_launchd import APP_LABEL
+
+        if os.environ.get("XPC_SERVICE_NAME") == APP_LABEL:
+            logging.getLogger("app").info("清理完成，退出并交由 launchd 重新启动服务…")
+            return
+    argv = (
+        [sys.executable, *sys.argv[1:]]
+        if config._is_frozen()
+        else [sys.executable, *sys.argv]
+    )
+    os.execv(sys.executable, argv)
+
+
 def _force_utf8() -> None:
     """把标准输出改成 UTF-8，避免中文日志乱码（Windows GBK 控制台）。"""
     for stream in (sys.stdout, sys.stderr):
@@ -185,7 +207,7 @@ def main() -> None:
         dial_whitelist or "未设置(全部放行)",
     )
 
-    # 需重启配置的自愈重启：/api/restart 置位该事件 → 停 loop → 清理后 os.execv。
+    # 需重启配置的自愈重启：/api/restart 置位该事件 → 停 loop → 清理后重启。
     restart_event = threading.Event()
     app = build_app(
         hub,
@@ -248,10 +270,11 @@ def main() -> None:
         loop.run_until_complete(runner.cleanup())
         loop.close()
 
-    # 端口已随 runner.cleanup() 释放；此时原地重启（重读 .env）可干净重新绑定。
+    # 端口已随 runner.cleanup() 释放；手动运行原地 exec，launchd 运行则退出交由
+    # KeepAlive 拉起，避免 frozen 子进程与 launchd 新实例争抢同一端口。
     if restart_event.is_set():
         logger.info("按请求重启服务以应用需重启的配置…")
-        os.execv(sys.executable, [sys.executable, *sys.argv])
+        _restart_after_cleanup()
 
 
 def _selftest() -> int:
