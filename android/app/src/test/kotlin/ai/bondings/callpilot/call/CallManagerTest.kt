@@ -105,11 +105,16 @@ class CallManagerTest {
         assertTrue(session.commands[0].contains("10000"))
         assertEquals(listOf(true), h.foreground)
 
-        session.emit(SessionEvent.Edge(Signaling.Event.RemoteCall("dialing")))
+        // Edge 实际经 data channel 发的是 type=status 事件（#37 契约）
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
+        advanceUntilIdle()
+        assertEquals(CallState.WaitingMedia("10000"), manager.state.value)
+
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("dialing")))
         advanceUntilIdle()
         assertEquals(CallState.Dialing("10000"), manager.state.value)
 
-        session.emit(SessionEvent.Edge(Signaling.Event.RemoteCall("connected")))
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("connected")))
         advanceUntilIdle()
         assertEquals(CallState.InCall("10000"), manager.state.value)
 
@@ -133,10 +138,39 @@ class CallManagerTest {
         manager.startCall(pairing, "10000")
         advanceUntilIdle()
 
-        session.emit(SessionEvent.Edge(Signaling.Event.RemoteCall("ended")))
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("ended")))
         advanceUntilIdle()
         assertEquals(CallState.Ended("10000", "ended"), manager.state.value)
         assertTrue(session.disconnected)
+        h.close()
+    }
+
+    @Test
+    fun `Edge failed 事件进入 Failed`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(session) { invite() }
+        manager.startCall(pairing, "10000")
+        advanceUntilIdle()
+
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("failed")))
+        advanceUntilIdle()
+        assertEquals(CallState.Failed("10000", "failed"), manager.state.value)
+        assertTrue(session.disconnected)
+        h.close()
+    }
+
+    @Test
+    fun `remote_call 事件兼容推进状态`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(session) { invite() }
+        manager.startCall(pairing, "10000")
+        advanceUntilIdle()
+
+        session.emit(SessionEvent.Edge(Signaling.Event.RemoteCall("connected")))
+        advanceUntilIdle()
+        assertEquals(CallState.InCall("10000"), manager.state.value)
         h.close()
     }
 

@@ -58,8 +58,11 @@ fun CallScreen(state: CallState, manager: CallManager) {
         is CallState.Failed -> state.number to "失败：${state.reason}"
         CallState.Idle -> "" to ""
     }
-    // 拨号中与通话中都允许按键（部分 IVR 在振铃阶段即接受 DTMF）
-    val canDtmf = state is CallState.InCall || state is CallState.Dialing
+    // 通话活跃全程都给键盘：客服 IVR 从会话建立到接通任一阶段都可能要按键，
+    // 即使状态事件延迟，用户也不能没有键盘可按
+    val canDtmf = state !is CallState.Idle &&
+        state !is CallState.Ended &&
+        state !is CallState.Failed
 
     Column(
         modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),

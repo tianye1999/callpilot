@@ -127,17 +127,27 @@ class CallManager(
 
     private fun handleEvent(number: String, event: SessionEvent) {
         when (event) {
-            is SessionEvent.Edge -> when (val e = event.event) {
-                is Signaling.Event.RemoteCall -> when (e.status) {
+            is SessionEvent.Edge -> {
+                // Edge 经 LiveKit data channel 发的是 type=status 事件（#37 契约）；
+                // type=remote_call 只存在于 Edge 本地面板，这里兼容消费以防协议演进。
+                val status = when (val e = event.event) {
+                    is Signaling.Event.Status -> e.status
+                    is Signaling.Event.RemoteCall -> e.status
+                }
+                when (status) {
                     "dialing" -> _state.value = CallState.Dialing(number)
                     "connected" -> _state.value = CallState.InCall(number)
-                    "ended", "hangup", "failed" -> {
+                    "ended", "hangup" -> {
                         cleanup()
-                        _state.value = CallState.Ended(number, e.status)
+                        _state.value = CallState.Ended(number, status)
                     }
-                    else -> Unit // 未知状态透传给日志层，不破坏状态机
+                    "failed" -> {
+                        cleanup()
+                        _state.value = CallState.Failed(number, status)
+                    }
+                    // waiting_for_phone / media_ready 等生命周期提示不改变状态
+                    else -> Unit
                 }
-                is Signaling.Event.Status -> Unit // 生命周期提示，UI 可选展示
             }
             is SessionEvent.Disconnected -> {
                 if (isActive) {
