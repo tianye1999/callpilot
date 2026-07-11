@@ -339,26 +339,49 @@ def test_validate_key_endpoint_valid_invalid_and_network(monkeypatch):
     api(app, fn)
 
 
-def test_setup_complete_marks_setup_done(monkeypatch, tmp_path):
+@pytest.mark.parametrize("enabled", [True, False])
+def test_setup_complete_atomically_saves_recording_choice(monkeypatch, tmp_path, enabled):
     env_file = tmp_path / ".env"
+    real_complete = config.complete_setup
     monkeypatch.setattr(
         config,
-        "mark_setup_done",
-        lambda env_path=None: config.update_env_file(
-            {"SETUP_DONE": "true"},
-            env_path=env_file,
-            allow_hidden=True,
-        ),
+        "complete_setup",
+        lambda recording_enabled: real_complete(recording_enabled, env_path=env_file),
     )
-    app = make_app(FakeService())
+    async def fake_read_json(request):
+        return {"recording_enabled": enabled}
 
-    async def fn(client):
-        resp = await client.post("/api/setup/complete", json={})
-        assert resp.status == 200
-        return await resp.json()
+    monkeypatch.setattr(server, "read_json", fake_read_json)
+    request = make_mocked_request("POST", "/api/setup/complete", app={"setup_sms_token": ["token"]})
+    response = asyncio.run(server._setup_complete(request))
+    assert response.status == 200
+    assert json.loads(response.body) == {
+        "ok": True,
+        "updated": ["RECORDING_ENABLED", "SETUP_DONE"],
+    }
+    expected = "true" if enabled else "false"
+    assert env_file.read_text(encoding="utf-8") == (
+        f"RECORDING_ENABLED={expected}\nSETUP_DONE=true\n"
+    )
 
-    assert api(app, fn) == {"ok": True, "updated": ["SETUP_DONE"]}
-    assert "SETUP_DONE=true" in env_file.read_text(encoding="utf-8")
+
+@pytest.mark.parametrize("body", [{}, {"recording_enabled": "true"}, {"recording_enabled": 1}])
+def test_setup_complete_rejects_missing_or_non_boolean_choice(monkeypatch, tmp_path, body):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("AGENTCALL_ENV_FILE", str(env_file))
+    monkeypatch.delenv("SETUP_DONE", raising=False)
+
+    async def fake_read_json(request):
+        return body
+
+    monkeypatch.setattr(server, "read_json", fake_read_json)
+    request = make_mocked_request("POST", "/api/setup/complete", app={"setup_sms_token": ["token"]})
+    response = asyncio.run(server._setup_complete(request))
+
+    assert response.status == 400
+    assert json.loads(response.body)["ok"] is False
+    assert not env_file.exists()
+    assert config.setup_required() is True
 
 
 def test_config_get_returns_all_visible_specs():
@@ -434,6 +457,7 @@ def test_setup_recording_choice_writes_runtime_env_file(monkeypatch, tmp_path, e
         "update_env_file",
         lambda updates: real_update(updates, env_path=env_file),
     )
+    monkeypatch.delenv("SETUP_DONE", raising=False)
     monkeypatch.setenv("RECORDING_ENABLED", "false" if enabled else "true")
     async def fake_read_json(request):
         return {"RECORDING_ENABLED": enabled}
@@ -447,6 +471,7 @@ def test_setup_recording_choice_writes_runtime_env_file(monkeypatch, tmp_path, e
     assert data["updated"] == ["RECORDING_ENABLED"]
     assert env_file.read_text(encoding="utf-8") == f"RECORDING_ENABLED={expected}\n"
     assert os.environ["RECORDING_ENABLED"] == expected
+    assert config.setup_required() is True
 
 
 def test_config_post_invalid_rejected(monkeypatch, tmp_path):
@@ -678,7 +703,7 @@ def test_history_clear_all_deletes_finished_and_skips_active(tmp_path):
 
 
 def test_history_audio_serves_recorded_wav(tmp_path):
-    call_logger = CallLogger(base_dir=tmp_path / "calls")
+    call_logger = CallLogger(base_dir=tmp_path / "calls", recording_enabled=True)
     rec = call_logger.begin_call("outbound", "10086")
     rec.write_downlink(b"\x01\x00" * 200)
     rec.finish("completed")
@@ -698,7 +723,7 @@ def test_history_audio_serves_recorded_wav(tmp_path):
 def test_history_audio_uplink_amplified(tmp_path, monkeypatch):
     """上行回放前放大到可闻：原始极轻的样本经路由后峰值明显变大。"""
     monkeypatch.setenv("MONITOR_UPLINK_GAIN", "10")
-    call_logger = CallLogger(base_dir=tmp_path / "calls")
+    call_logger = CallLogger(base_dir=tmp_path / "calls", recording_enabled=True)
     rec = call_logger.begin_call("outbound", "10086")
     rec.write_uplink((100).to_bytes(2, "little", signed=True) * 400)  # 很轻的上行
     rec.finish("completed")

@@ -433,8 +433,8 @@ def any_provider_credentials_ready() -> bool:
 
 
 def setup_required() -> bool:
-    """First-run wizard is needed when setup was not completed and no provider is usable."""
-    return not get_bool("SETUP_DONE") and not any_provider_credentials_ready()
+    """Require the first-run wizard until its explicit consent step is complete."""
+    return not get_bool("SETUP_DONE")
 
 
 def runtime_meta(provider: str, model: str, port: str) -> dict:
@@ -787,9 +787,21 @@ def update_env_file(
     return list(updates)
 
 
-def mark_setup_done(env_path: str | Path | None = None) -> list[str]:
-    """Persist first-run wizard completion."""
-    return update_env_file({"SETUP_DONE": "true"}, env_path=env_path, allow_hidden=True)
+def complete_setup(
+    recording_enabled: bool,
+    env_path: str | Path | None = None,
+) -> list[str]:
+    """Atomically persist recording consent and first-run completion."""
+    if not isinstance(recording_enabled, bool):
+        raise ValueError("recording_enabled 必须是布尔值")
+    return update_env_file(
+        {
+            "RECORDING_ENABLED": "true" if recording_enabled else "false",
+            "SETUP_DONE": "true",
+        },
+        env_path=env_path,
+        allow_hidden=True,
+    )
 
 
 __all__ = [
@@ -801,6 +813,7 @@ __all__ = [
     "any_provider_credentials_ready",
     "app_support_dir",
     "call_log_dir",
+    "complete_setup",
     "credential_status",
     "data_dir",
     "env_file_path",
@@ -810,7 +823,6 @@ __all__ = [
     "get_spec",
     "get_str",
     "log_dir",
-    "mark_setup_done",
     "read_panel_values",
     "runtime_meta",
     "setup_required",

@@ -509,11 +509,15 @@ class CallSession:
         self._hangup_delay_seconds = config.get_float("HANGUP_TOOL_DELAY_SECONDS")
 
     def _begin_record(self, direction: str, number: str | None) -> CallRecord | None:
-        """创建通话记录；失败只告警不影响通话。"""
+        """创建通话记录；录音选择在每通开始时锁定，本通中途不再变化。"""
         if self.call_logger is None:
             return None
         try:
-            return self.call_logger.begin_call(direction, number)
+            return self.call_logger.begin_call(
+                direction,
+                number,
+                recording_enabled=config.get_bool("RECORDING_ENABLED"),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("创建通话记录失败: %s", exc)
             return None
@@ -952,7 +956,6 @@ class CallAgentService:
         )
         self.call_logger = call_logger or CallLogger(
             base_dir=os.getenv("CALL_LOG_DIR", str(config.call_log_dir())),
-            recording_enabled=config.get_bool("RECORDING_ENABLED"),
             retention_days=config.get_int("RECORDING_RETENTION_DAYS"),
         )
         self.monitor = self._create_monitor()

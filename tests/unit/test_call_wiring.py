@@ -109,6 +109,7 @@ class MultiChunkGreetingAgent(FakeAgent):
 # ---- P0-2 通话记录：events.jsonl 全生命周期 + 录音落盘 ----
 
 def test_inbound_call_writes_events_and_recordings(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECORDING_ENABLED", "true")
     base = tmp_path / "rec"
     clog = CallLogger(base, recording_enabled=True)
     run_inbound_call(monkeypatch, clog)
@@ -210,6 +211,23 @@ def test_recording_disabled_skips_wav_but_keeps_events(tmp_path, monkeypatch):
     assert not (call_dir / "downlink.wav").exists()
     meta = json.loads((call_dir / "meta.json").read_text(encoding="utf-8"))
     assert meta["recording_enabled"] is False
+
+
+@pytest.mark.parametrize("direction", ["inbound", "outbound"])
+def test_recording_config_change_applies_to_next_call_only(tmp_path, monkeypatch, direction):
+    logger = CallLogger(tmp_path / "rec", recording_enabled=True)
+    service = make_service(FakeModem(), call_logger=logger)
+
+    monkeypatch.setenv("RECORDING_ENABLED", "false")
+    current = service.session._begin_record(direction, "10000")
+    assert current is not None
+    assert current.recording_enabled is False
+
+    monkeypatch.setenv("RECORDING_ENABLED", "true")
+    following = service.session._begin_record(direction, "10000")
+    assert following is not None
+    assert current.recording_enabled is False
+    assert following.recording_enabled is True
 
 
 def test_service_start_purges_expired_once(tmp_path, monkeypatch):

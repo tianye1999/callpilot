@@ -1024,11 +1024,18 @@ async def _validate_key(request: web.Request) -> web.Response:
 
 
 async def _setup_complete(request: web.Request) -> web.Response:
-    """Persist the hidden SETUP_DONE flag after the wizard finishes or is skipped."""
-    await read_json(request)
+    """Atomically persist explicit recording consent and setup completion."""
+    data = await read_json(request)
+    if not isinstance(data, dict) or not isinstance(data.get("recording_enabled"), bool):
+        return web.json_response(
+            {"ok": False, "error": "recording_enabled 必须是布尔值"}, status=400
+        )
+    recording_enabled = data["recording_enabled"]
     loop = asyncio.get_running_loop()
     try:
-        updated = await loop.run_in_executor(None, config.mark_setup_done)
+        updated = await loop.run_in_executor(
+            None, config.complete_setup, recording_enabled
+        )
     except ValueError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=400)
     request.app["setup_sms_token"][0] = None

@@ -740,13 +740,35 @@ def test_setup_done_hidden_and_setup_required_logic(monkeypatch, tmp_path):
     assert config.setup_required() is True
 
     monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-valid")
-    assert config.setup_required() is False
+    assert config.setup_required() is True
 
-    monkeypatch.delenv("DASHSCOPE_API_KEY")
-    config.mark_setup_done(env_path=tmp_path / ".env")
+    config.complete_setup(False, env_path=tmp_path / ".env")
     assert os.environ["SETUP_DONE"] == "true"
+    assert os.environ["RECORDING_ENABLED"] == "false"
     assert config.setup_required() is False
     assert "SETUP_DONE=true" in (tmp_path / ".env").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_complete_setup_atomically_persists_recording_choice(tmp_path, monkeypatch, enabled):
+    _unset(monkeypatch, "SETUP_DONE", "RECORDING_ENABLED")
+    env = tmp_path / ".env"
+
+    updated = config.complete_setup(enabled, env_path=env)
+
+    expected = "true" if enabled else "false"
+    assert updated == ["RECORDING_ENABLED", "SETUP_DONE"]
+    assert env.read_text(encoding="utf-8") == (
+        f"RECORDING_ENABLED={expected}\nSETUP_DONE=true\n"
+    )
+    assert config.setup_required() is False
+
+
+def test_existing_setup_done_remains_complete_without_recording_choice(monkeypatch):
+    _unset(monkeypatch, "RECORDING_ENABLED")
+    monkeypatch.setenv("SETUP_DONE", "true")
+
+    assert config.setup_required() is False
 
 
 def test_panel_reflects_env_value(monkeypatch):

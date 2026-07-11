@@ -77,7 +77,7 @@ class CallRecord:
         path: Path,
         direction: str,
         number: str | None,
-        recording_enabled: bool = True,
+        recording_enabled: bool = False,
         source: str | None = None,
     ) -> None:
         self.id = id
@@ -211,7 +211,7 @@ class CallLogger:
     def __init__(
         self,
         base_dir: str | Path,
-        recording_enabled: bool = True,
+        recording_enabled: bool = False,
         retention_days: int = 30,
     ) -> None:
         self.base_dir = Path(base_dir)

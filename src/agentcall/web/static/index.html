@@ -1710,7 +1710,12 @@ let ws;
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => { $("dot").classList.add("on"); $("conn").textContent = t("conn_on"); };
+  ws.onopen = () => {
+    $("dot").classList.add("on");
+    $("conn").textContent = t("conn_on");
+    // 重连后先清掉上一条连接遗留的通话状态；服务端回放若仍在通话会立即恢复。
+    setCall("idle", "");
+  };
   ws.onclose = () => {
     $("dot").classList.remove("on"); $("conn").textContent = t("conn_retry");
     setTimeout(connect, 2000);
@@ -2682,10 +2687,10 @@ async function prefillSetupFields() {
   renderSetupProviderFields();
 }
 
-function showSetupWizard(manual, meta) {
+async function showSetupWizard(manual, meta) {
   if (meta) lastMeta = meta;
   setupStep = 0;
-  prefillSetupFields();
+  await prefillSetupFields();
   $("setupWizard").classList.add("show");
   renderSetupWizard();
   if (!manual) switchPage("phone");
@@ -2901,8 +2906,10 @@ async function completeSetup() {
     return;
   }
   if (!setupRecordingSaved && !(await saveSetupRecording())) return;
+  const selected = document.querySelector('input[name="setupRecording"]:checked');
+  const enabled = selected.value === "true";
   try {
-    const { httpOk, res } = await postJson("/api/setup/complete", {});
+    const { httpOk, res } = await postJson("/api/setup/complete", { recording_enabled: enabled });
     if (!httpOk || !res.ok) {
       setupStatus("setupDoneStatus", "err", t("setup_complete_fail") + (res.error || ""));
       return;
