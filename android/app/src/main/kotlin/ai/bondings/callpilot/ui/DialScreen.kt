@@ -13,6 +13,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -84,14 +86,15 @@ fun DialScreen(
         }
     }
 
-    // 键盘输入：+ 只允许作首字符（与 Validation.NUMBER_RE 对齐），总长不超过 32
+    // 键盘输入：+ 只允许作首字符、不占位数额度（与 Validation.NUMBER_RE 对齐），
+    // 数字部分不超过 32
     fun appendKey(key: String) {
         message = null
         if (key == "+") {
             if (number.isEmpty()) number = "+"
             return
         }
-        if (number.length < 32) number += key
+        if (number.removePrefix("+").length < 32) number += key
     }
 
     LaunchedEffect(client) {
@@ -107,6 +110,8 @@ fun DialScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            // 小屏/横屏/大字体下内容超高时可滚动，保证拨号键永远可达
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 24.dp),
     ) {
         Spacer(Modifier.height(16.dp))
@@ -175,7 +180,7 @@ fun DialScreen(
             }
         }
 
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.height(40.dp))
 
         // 号码显示行：号码绝对居中，退格叠放在右缘（点删一位，长按清空）
         Box(

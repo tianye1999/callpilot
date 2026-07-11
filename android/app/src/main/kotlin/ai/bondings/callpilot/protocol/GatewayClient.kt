@@ -32,7 +32,8 @@ class GatewayClient(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
     }
 
-    // 凭证以 __Host- Cookie 传输，明文网关会把它暴露在网络上；仅回环放行（本机调试/单测）
+    // 凭证以 __Host- Cookie 传输，明文网关会把它暴露在网络上。回环例外仅服务
+    // JVM 单测（MockWebServer）；真机运行时 Manifest 已全局禁明文，例外不可达。
     private val base: HttpUrl = baseUrl.toHttpUrl().also {
         require(it.isHttps || it.host in setOf("localhost", "127.0.0.1", "::1")) {
             "网关地址必须是 https"

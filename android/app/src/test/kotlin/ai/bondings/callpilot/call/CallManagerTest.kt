@@ -101,14 +101,21 @@ class CallManagerTest {
 
         assertTrue(session.connected)
         assertEquals(CallState.WaitingMedia("10000"), manager.state.value)
-        assertTrue(session.commands[0].contains("\"dial\""))
-        assertTrue(session.commands[0].contains("10000"))
+        // dial 必须等 Edge 确认 media_ready 才发出（Edge 会拒绝抢跑的 dial）
+        assertTrue(session.commands.isEmpty())
         assertEquals(listOf(true), h.foreground)
 
         // Edge 实际经 data channel 发的是 type=status 事件（#37 契约）
         session.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
         advanceUntilIdle()
         assertEquals(CallState.WaitingMedia("10000"), manager.state.value)
+        assertTrue(session.commands[0].contains("\"dial\""))
+        assertTrue(session.commands[0].contains("10000"))
+
+        // media_ready 重复到达不会重发 dial
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
+        advanceUntilIdle()
+        assertEquals(1, session.commands.size)
 
         session.emit(SessionEvent.Edge(Signaling.Event.Status("dialing")))
         advanceUntilIdle()
@@ -153,9 +160,11 @@ class CallManagerTest {
         manager.startCall(pairing, "10000")
         advanceUntilIdle()
 
-        session.emit(SessionEvent.Edge(Signaling.Event.Status("failed")))
+        session.emit(
+            SessionEvent.Edge(Signaling.Event.Status("failed", reason = "line_unavailable"))
+        )
         advanceUntilIdle()
-        assertEquals(CallState.Failed("10000", "failed"), manager.state.value)
+        assertEquals(CallState.Failed("10000", "line_unavailable"), manager.state.value)
         assertTrue(session.disconnected)
         h.close()
     }

@@ -14,7 +14,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -65,7 +67,11 @@ fun CallScreen(state: CallState, manager: CallManager) {
         state !is CallState.Failed
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            // 小屏/横屏/大字体下内容超高时可滚动，保证挂断键永远可达
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Spacer(Modifier.height(40.dp))
@@ -90,7 +96,7 @@ fun CallScreen(state: CallState, manager: CallManager) {
             )
         }
 
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.height(28.dp))
         when (state) {
             is CallState.Ended, is CallState.Failed ->
                 GradientButton(text = "返回", onClick = { manager.reset() })

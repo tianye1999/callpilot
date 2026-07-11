@@ -64,6 +64,18 @@ class SignalingTest {
     }
 
     @Test
+    fun `status 事件解析 reason 或 code`() {
+        assertEquals(
+            Signaling.Event.Status("ended", reason = "user_hangup"),
+            Signaling.decodeEvent("""{"type":"status","status":"ended","reason":"user_hangup"}"""),
+        )
+        assertEquals(
+            Signaling.Event.Status("failed", reason = "media_not_ready"),
+            Signaling.decodeEvent("""{"type":"status","status":"failed","code":"media_not_ready"}"""),
+        )
+    }
+
+    @Test
     fun `未知类型与坏 JSON 返回 null 而不是崩溃`() {
         assertNull(Signaling.decodeEvent("""{"type":"future_thing","status":"x"}"""))
         assertNull(Signaling.decodeEvent("""{"type":"status"}"""))

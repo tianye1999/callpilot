@@ -54,6 +54,9 @@ class CallManager(
     private var session: RemoteSession? = null
     private var eventJob: Job? = null
 
+    /** 等待 Edge media_ready 后才发出的 dial 命令（Edge 会拒绝抢跑的 dial）。 */
+    private var pendingDial: String? = null
+
     val isActive: Boolean
         get() = _state.value.let {
             it !is CallState.Idle && it !is CallState.Ended && it !is CallState.Failed
@@ -81,9 +84,11 @@ class CallManager(
                 session = s
                 eventJob = scope.launch { s.events.collect { handleEvent(number, it) } }
                 onForeground(true)
+                // Edge 在确认本端音频轨就绪（media_ready 事件）前会拒绝 dial，
+                // 所以 dial 挂起到 handleEvent 收到 media_ready 再发。
+                pendingDial = number
                 s.connect(livekitUrl, token)
                 _state.value = CallState.WaitingMedia(number)
-                s.sendCommand(Signaling.encodeDial(number, UUID.randomUUID().toString()))
             } catch (e: Exception) {
                 cleanup()
                 _state.value = CallState.Failed(number, e.message ?: "拨号失败")
@@ -130,22 +135,23 @@ class CallManager(
             is SessionEvent.Edge -> {
                 // Edge 经 LiveKit data channel 发的是 type=status 事件（#37 契约）；
                 // type=remote_call 只存在于 Edge 本地面板，这里兼容消费以防协议演进。
-                val status = when (val e = event.event) {
-                    is Signaling.Event.Status -> e.status
-                    is Signaling.Event.RemoteCall -> e.status
+                val (status, reason) = when (val e = event.event) {
+                    is Signaling.Event.Status -> e.status to e.reason
+                    is Signaling.Event.RemoteCall -> e.status to null
                 }
                 when (status) {
+                    "media_ready" -> firePendingDial()
                     "dialing" -> _state.value = CallState.Dialing(number)
                     "connected" -> _state.value = CallState.InCall(number)
                     "ended", "hangup" -> {
                         cleanup()
-                        _state.value = CallState.Ended(number, status)
+                        _state.value = CallState.Ended(number, reason ?: status)
                     }
                     "failed" -> {
                         cleanup()
-                        _state.value = CallState.Failed(number, status)
+                        _state.value = CallState.Failed(number, reason ?: status)
                     }
-                    // waiting_for_phone / media_ready 等生命周期提示不改变状态
+                    // waiting_for_phone 等生命周期提示不改变状态
                     else -> Unit
                 }
             }
@@ -154,6 +160,21 @@ class CallManager(
                     cleanup()
                     _state.value = CallState.Ended(number, event.reason)
                 }
+            }
+        }
+    }
+
+    /** media_ready 后才把 dial 发给 Edge（幂等：只发一次）。 */
+    private fun firePendingDial() {
+        val number = pendingDial ?: return
+        pendingDial = null
+        val s = session ?: return
+        scope.launch {
+            try {
+                s.sendCommand(Signaling.encodeDial(number, UUID.randomUUID().toString()))
+            } catch (e: Exception) {
+                cleanup()
+                _state.value = CallState.Failed(number, e.message ?: "拨号失败")
             }
         }
     }
@@ -167,6 +188,7 @@ class CallManager(
     }
 
     private fun cleanup() {
+        pendingDial = null
         eventJob?.cancel()
         eventJob = null
         session?.disconnect()
