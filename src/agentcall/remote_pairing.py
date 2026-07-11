@@ -84,7 +84,7 @@ class RemotePairingStore:
     ) -> None:
         self.path = Path(path)
         self._now = now
-        self._max_devices = max(1, max_devices)
+        self._max_devices = min(5, max(1, max_devices))
         self._lock = threading.RLock()
         self._offers: dict[str, float] = {}
         self._devices = self._load()
@@ -142,7 +142,6 @@ class RemotePairingStore:
             ):
                 return None
             stored.last_used_at = self._now()
-            self._persist()
             return stored.public()
 
     def list_devices(self) -> list[PairedDevice]:
@@ -182,10 +181,13 @@ class RemotePairingStore:
                 raise ValueError("unsupported pairing store")
             devices: dict[str, _StoredDevice] = {}
             for item in payload["devices"]:
-                stored = _StoredDevice(**item)
-                if not _DEVICE_ID_RE.fullmatch(stored.device_id):
-                    raise ValueError("invalid device id")
-                devices[stored.device_id] = stored
+                try:
+                    stored = _StoredDevice(**item)
+                    if not _DEVICE_ID_RE.fullmatch(stored.device_id):
+                        raise ValueError("invalid device id")
+                    devices[stored.device_id] = stored
+                except (TypeError, ValueError):
+                    logger.warning("跳过损坏的远程配对设备记录")
             return devices
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning("读取远程配对设备失败，按空库处理: error_type=%s", type(exc).__name__)

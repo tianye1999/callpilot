@@ -322,6 +322,30 @@ def test_remote_invite_starts_once_and_reuses_active_invite(monkeypatch):
     assert builds == [True]
 
 
+def test_paired_remote_session_never_reuses_or_interrupts_an_active_worker(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    service = make_service(FakeModem())
+    worker = FakeRemoteWorker(FakeRemoteCoordinator())
+    invite = RemoteDialerInvite(
+        session_id="session-1",
+        url="https://dial.example/#short-lived-token",
+        expires_at=time.time() + 300,
+    )
+    monkeypatch.setattr(service, "_build_remote_worker", lambda: (invite, worker))
+
+    first, first_error = service.create_paired_remote_dialer_invite("device-a-123456789")
+    same_device, same_error = service.create_paired_remote_dialer_invite("device-a-123456789")
+    other_device, other_error = service.create_paired_remote_dialer_invite("device-b-123456789")
+    legacy, legacy_error = service.create_remote_dialer_invite()
+
+    assert first_error is None
+    assert first and first["session_id"] == "session-1"
+    assert same_device is None and "正在使用" in (same_error or "")
+    assert other_device is None and "正在使用" in (other_error or "")
+    assert legacy is None and "已配对手机" in (legacy_error or "")
+    assert worker.stop_reasons == []
+
+
 def test_remote_worker_uses_remote_dtmf_mode_not_ai_call_mode(monkeypatch):
     monkeypatch.setenv("REMOTE_DTMF_MODE", "qvts")
     monkeypatch.setenv("DTMF_MODE", "inband")

@@ -14,6 +14,7 @@ from agentcall.web.remote_gateway import DEVICE_COOKIE, build_remote_gateway
 class _Service:
     def __init__(self) -> None:
         self.invite_calls = 0
+        self.paired_invite_calls: list[str] = []
         self.invite_result: tuple[dict | None, str | None] = (
             {
                 "session_id": "session-1",
@@ -26,6 +27,12 @@ class _Service:
     def create_remote_dialer_invite(self) -> tuple[dict | None, str | None]:
         self.invite_calls += 1
         return self.invite_result
+
+    def create_paired_remote_dialer_invite(
+        self, device_id: str
+    ) -> tuple[dict | None, str | None]:
+        self.paired_invite_calls.append(device_id)
+        return self.create_remote_dialer_invite()
 
     def remote_dialer_status(self) -> dict:
         return {"enabled": True, "configured": True, "active": False}
@@ -63,11 +70,15 @@ def test_fixed_entry_pairs_once_then_issues_short_lived_call_session(tmp_path: P
             headers={"Origin": "https://dial.example"},
         )
         assert pair.status == 200
-        assert (await pair.json())["device"]["display_name"] == "My iPhone"
+        pair_body = await pair.json()
+        assert pair_body["device"]["display_name"] == "My iPhone"
+        body_device_id = pair_body["device"]["device_id"]
         cookie = pair.cookies[DEVICE_COOKIE]
+        assert DEVICE_COOKIE.startswith("__Host-")
         assert cookie["secure"]
         assert cookie["httponly"]
         assert cookie["samesite"] == "Strict"
+        assert not cookie["domain"]
 
         auth = {"Cookie": f"{DEVICE_COOKIE}={_cookie_value(pair)}"}
         device = await client.get("/api/device", headers=auth)
@@ -82,6 +93,7 @@ def test_fixed_entry_pairs_once_then_issues_short_lived_call_session(tmp_path: P
         assert (await session.json())["invite"]["session_id"] == "session-1"
         assert session.headers["Cache-Control"] == "no-store"
         assert service.invite_calls == 1
+        assert service.paired_invite_calls == [body_device_id]
 
         unpair = await client.post(
             "/api/unpair",
@@ -108,6 +120,20 @@ def test_public_gateway_denies_unpaired_revoked_cross_origin_and_admin_requests(
     app = build_remote_gateway(service, store, public_url="https://dial.example/")
 
     async def fn(client: TestClient) -> None:
+        service.remote_dialer_status = lambda: {  # type: ignore[method-assign]
+            "enabled": True,
+            "configured": True,
+            "active": True,
+            "session_id": "private-session",
+            "call_active": True,
+        }
+        anonymous_status = await client.get("/api/device")
+        assert await anonymous_status.json() == {
+            "ok": True,
+            "paired": False,
+            "edge": {"enabled": True, "configured": True},
+        }
+
         no_cookie = await client.post(
             "/api/session", json={}, headers={"Origin": "https://dial.example"}
         )
@@ -173,9 +199,21 @@ def test_gateway_is_default_off_and_pairing_attempts_are_rate_limited(tmp_path: 
             response = await client.post(
                 "/api/pair",
                 json={"code": "WRONG123", "display_name": "phone"},
-                headers={"Origin": "https://dial.example"},
+                headers={
+                    "Origin": "https://dial.example",
+                    "CF-Connecting-IP": "203.0.113.10",
+                },
             )
             assert response.status == expected
+        separate_client = await client.post(
+            "/api/pair",
+            json={"code": "WRONG123", "display_name": "phone"},
+            headers={
+                "Origin": "https://dial.example",
+                "CF-Connecting-IP": "203.0.113.11",
+            },
+        )
+        assert separate_client.status == 401
 
     _api(limited_app, limited)
 

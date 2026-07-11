@@ -137,6 +137,9 @@ call scope while adding a narrow Edge HTTP gateway:
 - A paired phone calls `POST /api/session` for each call. The response contains a
   new short-lived, room-scoped invitation; the durable cookie is never shared
   with LiveKit or exposed to JavaScript.
+- While any remote worker is alive, every other paired or legacy session request
+  is rejected instead of reusing its room/token; one phone therefore cannot join
+  or interrupt another phone's in-flight media session.
 - Pairing and session mutations require an exact same-origin `Origin` header.
   Pair attempts are rate-limited, codes expire and are one-time, and the active
   paired-device cap defaults to five.

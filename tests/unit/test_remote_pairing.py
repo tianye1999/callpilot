@@ -92,6 +92,26 @@ def test_missing_or_corrupt_store_loads_as_empty_without_raising(tmp_path: Path)
     assert RemotePairingStore(path).list_devices() == []
 
 
+def test_corrupt_device_entry_does_not_discard_other_valid_devices(tmp_path: Path) -> None:
+    path = tmp_path / "remote_devices.json"
+    store = RemotePairingStore(path)
+    store.pair(store.create_pairing("https://dial.example/").code, "valid phone")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["devices"].append({"device_id": "bad"})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    devices = RemotePairingStore(path).list_devices()
+    assert [device.display_name for device in devices] == ["valid phone"]
+
+
+def test_device_cap_is_hard_limited_to_five(tmp_path: Path) -> None:
+    store = RemotePairingStore(tmp_path / "remote_devices.json", max_devices=99)
+    for index in range(5):
+        store.pair(store.create_pairing("https://dial.example/").code, f"phone {index}")
+    with pytest.raises(PairingCapacityError):
+        store.pair(store.create_pairing("https://dial.example/").code, "sixth phone")
+
+
 @pytest.mark.parametrize("name", ["", "x" * 65, "bad\nname"])
 def test_invalid_device_names_are_rejected(tmp_path: Path, name: str) -> None:
     store = RemotePairingStore(tmp_path / "remote_devices.json")

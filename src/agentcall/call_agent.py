@@ -938,6 +938,7 @@ class CallAgentService:
         self._remote_setup_lock = threading.Lock()
         self._remote_worker: RemoteDialerWorker | None = None
         self._remote_invite: RemoteDialerInvite | None = None
+        self._remote_session_device_id: str | None = None
         self._remote_call_owner: RemoteWebDialerCoordinator | None = None
         # 模组连接状态与后台 supervisor：首启时模组不在也不阻塞 Web，
         # supervisor 反复重连直到成功（首次连上后由 modem 读循环自愈接管）。
@@ -1169,6 +1170,12 @@ class CallAgentService:
             if (
                 worker is not None
                 and worker.is_running
+                and self._remote_session_device_id is not None
+            ):
+                return None, "远程拨号线路正在被已配对手机使用"
+            if (
+                worker is not None
+                and worker.is_running
                 and invite is not None
                 and invite.expires_at > time.time()
             ):
@@ -1180,12 +1187,44 @@ class CallAgentService:
                 invite, worker = self._build_remote_worker()
                 self._remote_worker = worker
                 self._remote_invite = invite
+                self._remote_session_device_id = None
                 worker.start(timeout=10.0)
             except (ImportError, RuntimeError, ValueError) as exc:
                 self._remote_worker = None
                 self._remote_invite = None
+                self._remote_session_device_id = None
                 logger.warning(
                     "创建远程拨号邀请失败: error_type=%s", type(exc).__name__
+                )
+                return None, "远程媒体连接失败，请检查 LiveKit 和拨号页配置"
+            return self._invite_payload(invite), None
+
+    def create_paired_remote_dialer_invite(
+        self, device_id: str
+    ) -> tuple[dict | None, str | None]:
+        """Create a fresh session for one paired phone without sharing active media."""
+
+        if not config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
+            return None, "远程网页拨号未启用"
+        if not self.modem_connected:
+            return None, "模组未连接（检查 USB 桥与 EC20）"
+
+        with self._remote_setup_lock:
+            worker = self._remote_worker
+            if worker is not None and worker.is_running:
+                return None, "远程拨号线路正在使用，请结束当前会话后重试"
+            try:
+                invite, worker = self._build_remote_worker()
+                self._remote_worker = worker
+                self._remote_invite = invite
+                self._remote_session_device_id = device_id
+                worker.start(timeout=10.0)
+            except (ImportError, RuntimeError, ValueError) as exc:
+                self._remote_worker = None
+                self._remote_invite = None
+                self._remote_session_device_id = None
+                logger.warning(
+                    "创建已配对远程拨号会话失败: error_type=%s", type(exc).__name__
                 )
                 return None, "远程媒体连接失败，请检查 LiveKit 和拨号页配置"
             return self._invite_payload(invite), None
@@ -1218,10 +1257,12 @@ class CallAgentService:
             if worker is None or not worker.is_running:
                 self._remote_worker = None
                 self._remote_invite = None
+                self._remote_session_device_id = None
                 return False, "当前没有远程拨号会话"
             worker.stop("local_dashboard_cancel")
             self._remote_worker = None
             self._remote_invite = None
+            self._remote_session_device_id = None
         return True, None
 
     def _build_remote_worker(self) -> tuple[RemoteDialerInvite, RemoteDialerWorker]:

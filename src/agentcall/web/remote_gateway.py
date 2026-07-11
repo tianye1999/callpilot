@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import secrets
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -41,16 +42,21 @@ class _AttemptLimiter:
     def __init__(self, limit: int, window_seconds: float = 300.0) -> None:
         self.limit = max(1, limit)
         self.window_seconds = window_seconds
-        self._attempts: dict[str, deque[float]] = defaultdict(deque)
+        self._attempts: OrderedDict[str, deque[float]] = OrderedDict()
+        self._max_keys = 4096
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
-        attempts = self._attempts[key]
+        attempts = self._attempts.pop(key, deque())
         while attempts and attempts[0] <= now - self.window_seconds:
             attempts.popleft()
         if len(attempts) >= self.limit:
+            self._attempts[key] = attempts
             return False
         attempts.append(now)
+        self._attempts[key] = attempts
+        if len(self._attempts) > self._max_keys:
+            self._attempts.popitem(last=False)
         return True
 
 
@@ -125,7 +131,16 @@ async def _device(request: web.Request) -> web.Response:
     service = request.app["service"]
     status = service.remote_dialer_status()
     if device is None:
-        return _json({"ok": True, "paired": False, "edge": status})
+        return _json(
+            {
+                "ok": True,
+                "paired": False,
+                "edge": {
+                    "enabled": bool(status.get("enabled")),
+                    "configured": bool(status.get("configured")),
+                },
+            }
+        )
     return _json(
         {
             "ok": True,
@@ -142,7 +157,7 @@ async def _pair(request: web.Request) -> web.Response:
     if not _same_origin(request):
         return _error("请求来源不受信任", 403)
     limiter: _AttemptLimiter = request.app["pair_limiter"]
-    peer = request.remote or "unknown"
+    peer = _client_key(request)
     if not limiter.allow(peer):
         return _error("配对尝试过于频繁，请稍后再试", 429)
     data = await _read_json(request)
@@ -184,11 +199,14 @@ async def _session(request: web.Request) -> web.Response:
         return _error("请求来源不受信任", 403)
     if await _read_json(request) is None:
         return _error("请求体不是合法 JSON", 400)
-    if _authenticated_device(request) is None:
+    device = _authenticated_device(request)
+    if device is None:
         return _error("设备未配对或已撤销", 401)
     service = request.app["service"]
     loop = asyncio.get_running_loop()
-    invite, error = await loop.run_in_executor(None, service.create_remote_dialer_invite)
+    invite, error = await loop.run_in_executor(
+        None, service.create_paired_remote_dialer_invite, device.device_id
+    )
     if invite is None:
         return _error(error or "无法创建远程拨号会话", 409)
     return _json({"ok": True, "invite": invite})
@@ -231,6 +249,21 @@ def _same_origin(request: web.Request) -> bool:
     origin = request.headers.get("Origin", "")
     expected = request.app["public_origin"]
     return bool(origin) and secrets.compare_digest(origin, expected)
+
+
+def _client_key(request: web.Request) -> str:
+    peer = request.remote or "unknown"
+    try:
+        is_loopback = ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        is_loopback = False
+    if is_loopback:
+        forwarded = request.headers.get("CF-Connecting-IP", "").strip()
+        try:
+            return str(ipaddress.ip_address(forwarded))
+        except ValueError:
+            pass
+    return peer
 
 
 async def _read_json(request: web.Request) -> dict | None:
