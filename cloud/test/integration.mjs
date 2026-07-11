@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { generateKeyPairSync, sign } from "node:crypto";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 
 import WebSocket from "ws";
 
@@ -14,24 +16,31 @@ const clientIp = `198.51.100.${Math.floor(Math.random() * 200) + 1}`;
 const edgeKeys = generateKeyPairSync("ed25519");
 const publicDer = edgeKeys.publicKey.export({ format: "der", type: "spki" });
 const publicKey = publicDer.subarray(publicDer.length - 32).toString("base64url");
+const cloudDir = fileURLToPath(new URL("..", import.meta.url));
+const wrangler = join(
+  cloudDir,
+  "node_modules",
+  ".bin",
+  process.platform === "win32" ? "wrangler.cmd" : "wrangler",
+);
 
 const migration = spawnSync(
-  "npx",
-  ["wrangler", "d1", "migrations", "apply", "DB", "--local"],
-  { cwd: new URL("..", import.meta.url), encoding: "utf8" }
+  wrangler,
+  ["d1", "migrations", "apply", "DB", "--local"],
+  { cwd: cloudDir, encoding: "utf8" }
 );
 if (migration.status !== 0) throw new Error(migration.stderr || migration.stdout);
 
 const worker = spawn(
-  "npx",
+  wrangler,
   [
-    "wrangler", "dev", "--local", "--ip", "127.0.0.1", "--port", String(port),
+    "dev", "--local", "--ip", "127.0.0.1", "--port", String(port),
     "--var", `ADMIN_TOKEN:${adminToken}`,
     "--var", "LIVEKIT_API_KEY:integration-key",
     "--var", `LIVEKIT_API_SECRET:${livekitSecret}`,
     "--var", "LIVEKIT_URL:wss://integration.livekit.cloud"
   ],
-  { cwd: new URL("..", import.meta.url), stdio: ["ignore", "pipe", "pipe"] }
+  { cwd: cloudDir, stdio: ["ignore", "pipe", "pipe"] }
 );
 
 let workerOutput = "";
@@ -156,7 +165,7 @@ try {
   console.error(workerOutput);
   throw error;
 } finally {
-  worker.kill("SIGTERM");
+  await stopWorker(worker);
 }
 
 async function waitForHealth() {
@@ -201,4 +210,15 @@ function edgeHeaders(method, path, enrollment) {
     "X-CallPilot-Timestamp": timestamp,
     "X-CallPilot-Signature": signature,
   };
+}
+
+async function stopWorker(process) {
+  if (process.exitCode !== null) return;
+  const closed = new Promise((resolve) => process.once("close", resolve));
+  process.kill("SIGTERM");
+  await Promise.race([closed, delay(3000)]);
+  if (process.exitCode === null) {
+    process.kill("SIGKILL");
+    await closed;
+  }
 }
