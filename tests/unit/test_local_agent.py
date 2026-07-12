@@ -6,7 +6,7 @@ import asyncio
 import time
 
 from agentcall.agents.local_agent import LocalPipelineAgent
-from agentcall.agents.tools import SEND_SMS_SPEC, ToolRegistry
+from agentcall.agents.tools import SEND_DTMF_SPEC, SEND_SMS_SPEC, ToolRegistry
 
 
 class FakePipeline:
@@ -148,6 +148,35 @@ def test_tool_call_roundtrip_and_result_feedback():
     assert calls == [{"to": "10000", "content": "hi"}]
     # 第二次 LLM 请求应带 tool 角色的结果回填
     assert any(m.get("role") == "tool" for m in seen[1])
+
+
+def test_send_dtmf_result_waits_for_next_utterance_without_followup_speech():
+    calls: list[dict] = []
+    registry = ToolRegistry()
+    registry.register(
+        SEND_DTMF_SPEC,
+        lambda args: calls.append(args) or {"success": True, "mode": "inband"},
+    )
+    replies = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call_key",
+            "type": "function",
+            "function": {"name": "send_dtmf", "arguments": '{"digits":"1"}'},
+        }],
+    }]
+    agent, pipeline, seen = _make_agent(replies)
+    agent.set_tools(registry)
+    asyncio.run(agent.start(lambda pcm: None))
+    try:
+        asyncio.run(agent.send_audio(b"press one"))
+        assert _wait_until(lambda: calls == [{"digits": "1"}])
+    finally:
+        asyncio.run(agent.stop())
+
+    assert len(seen) == 1
+    assert pipeline.synthesized == []
 
 
 def test_llm_failures_mark_fatal():

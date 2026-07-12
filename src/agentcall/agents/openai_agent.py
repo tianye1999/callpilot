@@ -24,7 +24,7 @@ from .. import config
 from ..prompts import agent_language, repeat_nudge_instructions
 from ..repeat_suppression import ResponseAudioGate
 from .base import VoiceAgent
-from .tools import TERMINAL_TOOLS
+from .tools import SILENT_AFTER_TOOLS, TERMINAL_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -413,9 +413,8 @@ class OpenAIVoiceAgent(VoiceAgent):
                     "output": output,
                 },
             }))
-            # 终结性工具（hangup_call）不再要新回复：告别语已在调用前说完，
-            # 挂断延迟里应保持安静，避免多播一句“电话已经挂断…”。
-            if name not in TERMINAL_TOOLS:
+            # hangup 后不再回复；DTMF 后等待 IVR 的下一段音频自然触发回复。
+            if name not in TERMINAL_TOOLS and name not in SILENT_AFTER_TOOLS:
                 await ws.send(json.dumps({"type": "response.create"}))
         except Exception as exc:  # noqa: BLE001
             logger.warning("回传工具结果失败: %s", exc)

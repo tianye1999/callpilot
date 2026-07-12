@@ -99,6 +99,9 @@ QUERY_CODE_SPEC: dict[str, Any] = {
 # 触发 response.create，模型会在挂断延迟里多说一句（如“电话已经挂断…”），
 # 对端听到多余的话。故对这类工具只回传 function_call_output、不再要新回复。
 TERMINAL_TOOLS: frozenset[str] = frozenset({"hangup_call"})
+# 这类工具执行后会话仍继续，但应等待对端下一段音频，而不是立即让模型说话。
+# DTMF 后立刻口播会覆盖 IVR 的确认/下一层菜单，并触发半双工上行屏蔽。
+SILENT_AFTER_TOOLS: frozenset[str] = frozenset({"send_dtmf"})
 _DTMF_LOG_MODES: frozenset[str] = frozenset(
     {"inband", "qvts", "both", "unknown"}
 )

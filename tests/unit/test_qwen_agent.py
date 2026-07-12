@@ -10,6 +10,7 @@ import time
 from queue import Empty
 
 from agentcall.agents import qwen_agent
+from agentcall.agents.tools import SEND_DTMF_SPEC, ToolRegistry
 
 # ---------------------------------------------------------------------------
 # 夹具：伪造 OmniRealtimeConversation
@@ -411,6 +412,26 @@ def test_manual_response_control_tool_response_blocks_overlap(monkeypatch):
             "response": {"id": "tool-response"},
         })
         assert _wait_until(lambda: len(conv.responses) == 2)
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_send_dtmf_result_waits_for_next_ivr_without_new_response(monkeypatch):
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    registry = ToolRegistry()
+    registry.register(
+        SEND_DTMF_SPEC,
+        lambda args: {"success": True, "count": 1, "mode": "inband"},
+    )
+    agent.set_tools(registry)
+    conversation = fake_cls.instances[-1]
+    try:
+        agent._dispatch_tool_call("send_dtmf", "call-key", '{"digits":"1"}')
+        assert _wait_until(lambda: len(conversation.items) == 1)
+
+        assert conversation.items[0]["type"] == "function_call_output"
+        assert conversation.responses == []
     finally:
         asyncio.run(agent.stop())
 
