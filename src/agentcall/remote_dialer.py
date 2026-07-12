@@ -117,7 +117,7 @@ class RemoteDialerRuntimeConfig:
     dtmf_tone_amplitude: float = 0.50
     # 推给手机/浏览器的对方声音增益:电话线路窄带信号电平偏低(对端峰值实测
     # 约 -36dBFS),不放大用户耳朵里很小。录音仍存 raw,只放大推流。
-    uplink_gain: float = 2.0
+    uplink_gain: float = 8.0
     recording_enabled: bool = True
 
 

@@ -259,7 +259,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 远程通话推给手机/浏览器的对方声音增益:电话线路窄带信号电平偏低
     # (真机对端峰值实测仅约 -36dBFS),不放大用户耳朵里就很小。每通现读,
     # 改配置下一通生效;apply_pcm_gain 自带削顶保护。
-    ConfigSpec("REMOTE_UPLINK_GAIN", "远程通话对方音量增益", "float", "2.0"),
+    ConfigSpec("REMOTE_UPLINK_GAIN", "远程通话对方音量增益", "float", "8.0"),
     # ---- 白名单与节流 ----
     ConfigSpec("DIAL_WHITELIST", "外呼白名单", "str", ""),
     ConfigSpec("DIAL_INTERVAL_SECONDS", "连续拨号间隔（秒）", "float", "5.0"),
