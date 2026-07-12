@@ -53,6 +53,7 @@ _MANAGED_FIELDS = {
     "task",
     "scenario",
     "opening",
+    "opening_mode",
 }
 
 
@@ -416,6 +417,9 @@ def _localized_map(value: Any) -> dict[str, str]:
 def _managed_profile(item: dict[str, Any], profile_id: str) -> dict[str, Any]:
     task = _localized_map(item.get("task"))
     match_mode = "exact" if any(task.values()) else "number"
+    opening_mode = str(item.get("opening_mode") or "").strip().lower()
+    if opening_mode not in {"say", "wait"}:
+        opening_mode = "say"
     return {
         "id": profile_id,
         "enabled": _is_enabled(item),
@@ -425,6 +429,7 @@ def _managed_profile(item: dict[str, Any], profile_id: str) -> dict[str, Any]:
         "task": task,
         "scenario": _localized_map(item.get("scenario")),
         "opening": _localized_map(item.get("opening")),
+        "opening_mode": opening_mode,
     }
 
 
@@ -457,12 +462,20 @@ def _validate_profile_payload(payload: Any) -> dict[str, Any]:
     if match_mode == "exact" and not _localized_values(task):
         raise ProfileValidationError("精确匹配预设的 task 不能为空")
 
+    # #80-B:opening_mode 仅 say/wait；非法值拒绝，不静默回落
+    opening_mode = _norm(payload.get("opening_mode"))
+    if opening_mode and opening_mode not in {"say", "wait"}:
+        raise ProfileValidationError("opening_mode 只能是 say 或 wait")
+    if not opening_mode:
+        opening_mode = "say"
+
     profile: dict[str, Any] = {
         "enabled": enabled,
         "number": number,
         "label": label,
         "scenario": scenario,
         "opening": opening,
+        "opening_mode": opening_mode,
     }
     if match_mode == "exact":
         profile["task"] = task
