@@ -426,3 +426,20 @@ def test_profile_scenario_limit_preserves_full_bundled_english_strategy():
     assert result is not None
     assert len(result["scenario"]) > 200
     assert "never claim you have the figures" in result["scenario"]
+
+
+def test_lookup_profile_opening_mode_wait_and_fallbacks(tmp_path):
+    """#80-B:opening_mode 归一——wait 透传;缺省/非法/大小写混排回落 say。"""
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [
+            {"number": "10086", "scenario": "IVR 热线", "opening_mode": " Wait "},
+            {"number": "10000", "scenario": "默认开场"},
+            {"number": "10010", "scenario": "非法值", "opening_mode": "shout"},
+        ],
+    )
+
+    assert number_profiles.lookup_profile("10086", "x", path=path)["opening_mode"] == "wait"
+    assert number_profiles.lookup_profile("10000", "x", path=path)["opening_mode"] == "say"
+    assert number_profiles.lookup_profile("10010", "x", path=path)["opening_mode"] == "say"
