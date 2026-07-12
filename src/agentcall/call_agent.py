@@ -601,7 +601,11 @@ class CallSession:
         与落盘的短信/来电记录一起判定。
         """
         return is_reply_target_allowed(
-            number, self.hub, self.call_logger, extra_allowed=self.current_caller
+            number,
+            self.hub,
+            self.call_logger,
+            extra_allowed=self.current_caller,
+            allow_any=config.get_bool("SMS_ALLOW_ANY_TARGET"),
         )
 
     def _build_agent_instructions(self, direction: str) -> str:

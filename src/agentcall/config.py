@@ -284,6 +284,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                requires_restart=True),
     # 发短信目标限制改为「只能回复已联系过的号码」(见 contacts.py),
     # 不再用静态白名单,故移除原 SMS_WHITELIST 配置项。
+    # 开发期总开关:置 true 时放行给任意号码发短信(仅本机开发测试用,默认关)。
+    ConfigSpec("SMS_ALLOW_ANY_TARGET", "短信允许发给任意号码(开发用)", "bool", "false"),
     # ---- 连接管理 ----
     ConfigSpec("QWEN_PREWARM", "Qwen 连接预热", "bool", "true"),
     ConfigSpec("QWEN_RECONNECT_MAX", "Qwen 最大重连次数", "int", "2"),

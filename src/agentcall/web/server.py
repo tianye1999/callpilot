@@ -429,7 +429,11 @@ async def _send_sms(request: web.Request) -> web.Response:
         else None
     )
     if not is_reply_target_allowed(
-        number, hub, call_logger, extra_allowed=current_caller
+        number,
+        hub,
+        call_logger,
+        extra_allowed=current_caller,
+        allow_any=config.get_bool("SMS_ALLOW_ANY_TARGET"),
     ):
         return web.json_response(
             {"ok": False, "error": "只能给曾通话（来电/已接通的外呼）或发过短信的号码发送短信"},
