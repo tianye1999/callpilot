@@ -253,7 +253,11 @@ async def _wait_for(predicate, timeout: float = 1.0) -> None:
 
 
 def _runtime(
-    *, dtmf_mode: str = "inband", grace: float = 0.05, connect_timeout: float = 0.2
+    *,
+    dtmf_mode: str = "inband",
+    grace: float = 0.05,
+    connect_timeout: float = 0.2,
+    uplink_gain: float = 1.0,
 ) -> RemoteDialerRuntimeConfig:
     return RemoteDialerRuntimeConfig(
         audio_mode="uac",
@@ -265,6 +269,7 @@ def _runtime(
         outbound_max_seconds=2.0,
         connect_timeout_seconds=connect_timeout,
         dtmf_mode=dtmf_mode,
+        uplink_gain=uplink_gain,
     )
 
 
@@ -277,6 +282,7 @@ def _coordinator(
     dtmf_mode: str = "inband",
     grace: float = 0.05,
     connect_timeout: float = 0.2,
+    uplink_gain: float = 1.0,
 ) -> RemoteWebDialerCoordinator:
     return RemoteWebDialerCoordinator(
         session_id="session-test",
@@ -284,7 +290,10 @@ def _coordinator(
         modem=modem,  # type: ignore[arg-type]
         endpoint=endpoint,
         runtime=_runtime(
-            dtmf_mode=dtmf_mode, grace=grace, connect_timeout=connect_timeout
+            dtmf_mode=dtmf_mode,
+            grace=grace,
+            connect_timeout=connect_timeout,
+            uplink_gain=uplink_gain,
         ),
         bridge_factory=lambda **_kwargs: bridge,  # type: ignore[arg-type]
         call_logger=call_logger,
@@ -740,3 +749,37 @@ def test_all_real_audio_bridges_satisfy_remote_full_duplex_contract() -> None:
     assert {"mode", "device_keyword", "pcm_port", "pcm_baudrate", "tx_gain"} <= set(
         factory_params
     )
+
+
+def test_uplink_gain_amplifies_pushed_audio_but_records_raw(tmp_path: Path) -> None:
+    """#REMOTE_UPLINK_GAIN:推给手机的对方声音按增益放大;录音仍存 raw。"""
+
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        modem = FakeModem()
+        bridge = FakeBridge()
+        bridge.modem_reads.append(b"\x10\x00" * 160)  # 采样值 16
+        logger = CallLogger(tmp_path / "recordings")
+        coordinator = _coordinator(
+            endpoint, modem, bridge, call_logger=logger, uplink_gain=2.0
+        )
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: endpoint.connected)
+        await endpoint.commands.put(
+            {"type": "dial", "number": "10000", "idempotency_key": "gain-call-key"}
+        )
+        await _wait_for(lambda: bool(endpoint.modem_audio))
+        await endpoint.commands.put({"type": "hangup"})
+        await task
+
+        # 推流被放大 2 倍:16 -> 32
+        assert endpoint.modem_audio[0] == b"\x20\x00" * 160
+        # 录音(uplink.wav)保持 raw:16
+        [uplink_wav] = list((tmp_path / "recordings").glob("*/uplink.wav"))
+        import wave
+
+        with wave.open(str(uplink_wav)) as wf:
+            frames = wf.readframes(wf.getnframes())
+        assert frames[:4] == b"\x10\x00\x10\x00"
+
+    asyncio.run(run())

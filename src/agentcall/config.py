@@ -256,6 +256,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("MONITOR_AI_GAIN", "监听增益（AI 下行）", "float", "1.0"),
     # 电话上行是窄带信号且电平偏低，监听需大幅放大（真机调到 15 倍才够听清）。
     ConfigSpec("MONITOR_UPLINK_GAIN", "监听增益（对方上行）", "float", "8.0"),
+    # 远程通话推给手机/浏览器的对方声音增益:电话线路窄带信号电平偏低
+    # (真机对端峰值实测仅约 -36dBFS),不放大用户耳朵里就很小。每通现读,
+    # 改配置下一通生效;apply_pcm_gain 自带削顶保护。
+    ConfigSpec("REMOTE_UPLINK_GAIN", "远程通话对方音量增益", "float", "2.0"),
     # ---- 白名单与节流 ----
     ConfigSpec("DIAL_WHITELIST", "外呼白名单", "str", ""),
     ConfigSpec("DIAL_INTERVAL_SECONDS", "连续拨号间隔（秒）", "float", "5.0"),
@@ -554,6 +558,7 @@ def read_panel_values() -> list[dict]:
 _NUMERIC_RANGES: dict[str, tuple[float, float, bool]] = {
     "DTMF_TONE_MS": (0, 2000, True),          # >0 且 ≤2000ms
     "DTMF_TONE_AMPLITUDE": (0.0, 1.0, True),  # (0, 1]
+    "REMOTE_UPLINK_GAIN": (0.0, 32.0, True),  # (0, 32]:0 会静音,过大早已削顶
 }
 
 

@@ -1388,6 +1388,7 @@ class CallAgentService:
             dtmf_mode=config.get_str("REMOTE_DTMF_MODE"),
             dtmf_tone_ms=config.get_int("DTMF_TONE_MS"),
             dtmf_tone_amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
+            uplink_gain=max(0.1, config.get_float("REMOTE_UPLINK_GAIN")),
             recording_enabled=config.get_bool("REMOTE_HUMAN_RECORDING_ENABLED"),
         )
         coordinator = RemoteWebDialerCoordinator(

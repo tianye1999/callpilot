@@ -21,7 +21,7 @@ from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterable, Protocol
 from urllib.parse import urlparse
 
-from .audio_bridge import MODEM_RATE, create_audio_bridge
+from .audio_bridge import MODEM_RATE, apply_pcm_gain, create_audio_bridge
 from .call_log import CallLogger, CallRecord
 from .dtmf import dtmf_tone
 from .pcm_stats import PcmFlowStats
@@ -115,6 +115,9 @@ class RemoteDialerRuntimeConfig:
     dtmf_mode: str = "inband"
     dtmf_tone_ms: int = 200
     dtmf_tone_amplitude: float = 0.50
+    # 推给手机/浏览器的对方声音增益:电话线路窄带信号电平偏低(对端峰值实测
+    # 约 -36dBFS),不放大用户耳朵里很小。录音仍存 raw,只放大推流。
+    uplink_gain: float = 2.0
     recording_enabled: bool = True
 
 
@@ -630,8 +633,10 @@ class RemoteWebDialerCoordinator:
                 modem_pcm = bridge.read_modem_chunk()
                 if modem_pcm:
                     if record is not None:
-                        record.write_uplink(modem_pcm)
-                    self.endpoint.push_modem_audio(modem_pcm)
+                        record.write_uplink(modem_pcm)  # 录音存 raw,增益只作用推流
+                    self.endpoint.push_modem_audio(
+                        apply_pcm_gain(modem_pcm, self.runtime.uplink_gain)
+                    )
 
                 await asyncio.sleep(0.01)
 
