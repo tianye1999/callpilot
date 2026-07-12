@@ -840,6 +840,17 @@ def test_voice_specs_are_selects_with_default_in_choices():
     }
 
 
+def test_local_monitor_settings_require_service_restart():
+    """监听播放器只在服务启动时构造，面板保存后必须触发重启。"""
+    for key in (
+        "MONITOR_AI_PLAYBACK",
+        "MONITOR_OUTPUT_DEVICE",
+        "MONITOR_AI_GAIN",
+        "MONITOR_UPLINK_GAIN",
+    ):
+        assert get_spec(key).requires_restart, key
+
+
 def test_is_loopback_host():
     from agentcall.config import is_loopback_host
 

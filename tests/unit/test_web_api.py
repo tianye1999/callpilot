@@ -421,6 +421,7 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
     monkeypatch.setenv("QWEN_VOICE", "Raymond")
     monkeypatch.setenv("AGENT_PROVIDER", "qwen")
     monkeypatch.setenv("RECORDING_ENABLED", "true")
+    monkeypatch.setenv("MONITOR_AI_PLAYBACK", "false")
 
     app = make_app(FakeService())
 
@@ -431,6 +432,7 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
                 "QWEN_VOICE": "Ethan",
                 "AGENT_PROVIDER": "doubao",
                 "RECORDING_ENABLED": False,  # JSON bool 应被宽容转成 "false"
+                "MONITOR_AI_PLAYBACK": True,
             },
         )
         assert resp.status == 200
@@ -438,13 +440,19 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
 
     data = api(app, fn)
     assert data["ok"] is True
-    assert data["updated"] == ["QWEN_VOICE", "AGENT_PROVIDER", "RECORDING_ENABLED"]
-    assert data["requires_restart"] == ["AGENT_PROVIDER"]
+    assert data["updated"] == [
+        "QWEN_VOICE",
+        "AGENT_PROVIDER",
+        "RECORDING_ENABLED",
+        "MONITOR_AI_PLAYBACK",
+    ]
+    assert data["requires_restart"] == ["AGENT_PROVIDER", "MONITOR_AI_PLAYBACK"]
 
     text = env_file.read_text(encoding="utf-8")
     assert "QWEN_VOICE=Ethan" in text
     assert "AGENT_PROVIDER=doubao" in text
     assert "RECORDING_ENABLED=false" in text
+    assert "MONITOR_AI_PLAYBACK=true" in text
     assert os.environ["QWEN_VOICE"] == "Ethan"
 
 

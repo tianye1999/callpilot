@@ -1739,13 +1739,21 @@ async function loadMeta() {
 
 /* ========= 实时旁听：Web Audio 播放下行 PCM（走浏览器→系统音频，绕开 native）========= */
 // 下行(AI)与上行(对方)各一条播放时间线，按帧首字节的方向标记分流，两路同时出声。
-let audioWs = null, audioCtx = null;
+let audioWs = null, audioCtx = null, audioResumePending = false;
 const listenRate = {0: 24000, 1: 8000};   // 0=下行 1=上行
 const listenNextAt = {0: 0, 1: 0};
-function toggleListen() {
-  if (audioWs) { stopListen(); return; }
+async function ensureListenAudioRunning() {
+  if (!audioCtx) return false;
+  if (audioCtx.state === "running") return true;
+  try { await audioCtx.resume(); }
+  catch (e) { console.warn("[listen] AudioContext 恢复失败", e); return false; }
+  return audioCtx.state === "running";
+}
+async function toggleListen() {
+  if (audioWs || audioCtx) { stopListen(); return; }
   try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
   catch (e) { console.warn("[listen] AudioContext 不可用", e); return; }
+  if (!(await ensureListenAudioRunning())) { stopListen(); return; }
   listenNextAt[0] = 0; listenNextAt[1] = 0;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   audioWs = new WebSocket(`${proto}://${location.host}/ws/audio`);
@@ -1760,11 +1768,31 @@ function toggleListen() {
       return;
     }
     const kind = new Uint8Array(e.data, 0, 1)[0];        // 首字节：方向
-    playPcm(new Int16Array(e.data.slice(1)), kind);      // 其余：s16le PCM
+    const int16 = new Int16Array(e.data.slice(1));       // 其余：s16le PCM
+    if (!audioCtx || audioCtx.state !== "running") {
+      void resumeAndPlayPcm(int16, kind);
+      return;
+    }
+    playPcm(int16, kind);
   };
   audioWs.onclose = () => { if (audioWs) stopListen(); };
   const btn = $("listenBtn");
   btn.classList.add("on"); btn.textContent = t("listen_on");
+}
+async function resumeAndPlayPcm(int16, kind) {
+  if (audioResumePending) return;
+  audioResumePending = true;
+  const context = audioCtx;
+  try {
+    if (!(await ensureListenAudioRunning()) || audioCtx !== context) {
+      if (audioCtx === context) stopListen();
+      return;
+    }
+    listenNextAt[kind] = 0;
+    playPcm(int16, kind);
+  } finally {
+    audioResumePending = false;
+  }
 }
 function playPcm(int16, kind) {
   if (!audioCtx || !int16.length) return;
@@ -1781,6 +1809,7 @@ function playPcm(int16, kind) {
   listenNextAt[kind] += buf.duration;
 }
 function stopListen() {
+  audioResumePending = false;
   if (audioWs) { try { audioWs.onclose = null; audioWs.close(); } catch (_) {} audioWs = null; }
   if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; }
   const btn = $("listenBtn");

@@ -86,6 +86,17 @@ def test_websocket_reconnect_clears_stale_call_and_recording_state():
     assert 'setCall("idle", "");' in text
 
 
+def test_dashboard_listener_recovers_suspended_web_audio():
+    """WebKit 打断 AudioContext 后，旁听要恢复而不是保持“旁听中”但静音。"""
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert "async function ensureListenAudioRunning()" in text
+    assert 'if (audioCtx.state === "running") return true;' in text
+    assert "await audioCtx.resume();" in text
+    assert "if (!(await ensureListenAudioRunning()))" in text
+    assert "void resumeAndPlayPcm(int16, kind);" in text
+
+
 def test_settings_expose_sms_email_forwarding_with_bilingual_privacy_notice():
     text = INDEX.read_text(encoding="utf-8")
 
