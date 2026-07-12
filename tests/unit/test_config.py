@@ -848,3 +848,28 @@ def test_is_loopback_host():
     assert is_loopback_host(" ::1 ")
     assert not is_loopback_host("0.0.0.0")
     assert not is_loopback_host("192.168.1.10")
+
+
+def test_dtmf_tone_numeric_ranges_rejected_on_write(tmp_path):
+    """#80-D:DTMF 标定参数写回前做范围校验,防面板误填炸掉远程按键路径。"""
+    env_file = tmp_path / ".env"
+
+    for key, bad in (
+        ("DTMF_TONE_MS", "0"),          # 必须 >0
+        ("DTMF_TONE_MS", "5000"),       # 上限 2000
+        ("DTMF_TONE_AMPLITUDE", "0"),   # (0,1] 下界排他
+        ("DTMF_TONE_AMPLITUDE", "1.5"), # 上界 1
+        ("DTMF_TONE_AMPLITUDE", "nan"), # NaN 拒绝
+    ):
+        with pytest.raises(ValueError, match=key):
+            update_env_file({key: bad}, env_path=env_file)
+    assert not env_file.exists()
+
+    # 合法边界值可写
+    updated = update_env_file(
+        {"DTMF_TONE_MS": "200", "DTMF_TONE_AMPLITUDE": "1"},
+        env_path=env_file,
+    )
+    assert set(updated) == {"DTMF_TONE_MS", "DTMF_TONE_AMPLITUDE"}
+    os.environ.pop("DTMF_TONE_MS", None)
+    os.environ.pop("DTMF_TONE_AMPLITUDE", None)
