@@ -130,6 +130,7 @@ class CallSession:
         self._prompt_gen_timed_out = False
         self._prompt_gen_generation = 0
         self._prompt_gen_opening = ""
+        self._prompt_gen_opening_mode = "say"
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -162,6 +163,7 @@ class CallSession:
         self._prompt_gen_timed_out = False
         self._prompt_gen_generation += 1
         self._prompt_gen_opening = ""
+        self._prompt_gen_opening_mode = "say"
         # 世代号推进与置活必须同锁原子完成：与 _deferred_hangup 的
         # 「校验世代号 → stop()」互斥，保证旧回调要么在新会话置活前跑完
         # （只影响已结束的旧会话），要么校验失败直接放弃。
@@ -308,7 +310,14 @@ class CallSession:
                 )
             )
             mark("agent_started")
-            await agent.say(self._opening_instructions(direction))
+            # #80-B:IVR 热线 profile 可声明 opening_mode=wait——不发开场白,
+            # 静默等对方(菜单播报)先说,避免 AI 开场压掉首段 IVR。仅外呼且
+            # profile 显式 wait 时生效;人呼人/来电行为不变。
+            if direction == "outbound" and self._prompt_gen_opening_mode == "wait":
+                mark("opening_skipped", mode="wait")
+                logger.info("按 profile opening_mode=wait 跳过开场白,等待对方先说")
+            else:
+                await agent.say(self._opening_instructions(direction))
             mark_greeting_sent()
 
             try:
@@ -753,6 +762,8 @@ class CallSession:
     def _apply_prompt_gen_result(self) -> str | None:
         result = self._prompt_gen_result or {}
         self._prompt_gen_opening = str(result.get("opening") or "")
+        mode = str(result.get("opening_mode") or "").strip().lower()
+        self._prompt_gen_opening_mode = "wait" if mode == "wait" else "say"
         if result.get("ok") and str(result.get("scenario", "")).strip():
             return str(result["scenario"])
         return None

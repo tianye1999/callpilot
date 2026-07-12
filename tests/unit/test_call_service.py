@@ -671,3 +671,91 @@ def test_same_text_different_timestamp_both_delivered():
     assert len(sms_in) == 2
     assert len(forwarder.enqueued) == 2
 
+def test_outbound_opening_mode_wait_skips_opening(monkeypatch, tmp_path):
+    """#80-B:profile opening_mode=wait → 外呼接通后不发开场白,等对方先说。"""
+    import json as _json
+
+    profiles = tmp_path / "number_profiles.json"
+    profiles.write_text(
+        _json.dumps(
+            {
+                "profiles": [
+                    {
+                        "number": "10000",
+                        "scenario": "IVR 热线:按键菜单必须调 send_dtmf",
+                        "opening_mode": "wait",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profiles))
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    service = make_service(modem)
+    ok, err = service.dial("10000")
+    assert ok, err
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not agent.started:
+        time.sleep(0.05)
+    time.sleep(0.3)  # 留出会说开场白的窗口(错误实现会在此期间 say)
+
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    assert agent.said == []  # wait 模式:全程未主动开场
+    assert "IVR 热线" in agent._session_instructions  # profile scenario 已生效
+
+
+def test_outbound_opening_mode_default_still_says_opening(monkeypatch, tmp_path):
+    """对照:profile 未声明 opening_mode → 行为不变,照说开场白。"""
+    import json as _json
+
+    profiles = tmp_path / "number_profiles.json"
+    profiles.write_text(
+        _json.dumps(
+            {"profiles": [{"number": "10000", "scenario": "普通场景"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profiles))
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    service = make_service(modem)
+    ok, err = service.dial("10000")
+    assert ok, err
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not agent.said:
+        time.sleep(0.05)
+
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    assert len(agent.said) == 1  # 默认行为:开场白照发

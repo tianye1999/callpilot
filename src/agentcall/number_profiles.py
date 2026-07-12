@@ -11,6 +11,10 @@ string (language-neutral) or an object like ``{"zh": "...", "en": "..."}``.
 Missing language falls back to the other language, then any non-empty value,
 so single-language profiles keep working unchanged. Fallback is per-field, so
 prefer supplying both languages for every field to avoid mixed-language output.
+
+``opening_mode``(#80-B,可选): ``say``(默认)拨通即说开场白;``wait``
+静默等对方先说——IVR 热线(如运营商客服)用,避免 AI 开场白压掉首段菜单
+播报。语言无关的普通字符串;非法值按 ``say`` 处理。
 """
 
 from __future__ import annotations
@@ -349,10 +353,16 @@ def _normalize_profile(
         logger.warning("号码任务库条目缺少有效 scenario: number=%s task=%s", number, task)
         return None
     opening = _normalize_opening(_pick_lang(item.get("opening"), lang))
+    # 开场模式(#80-B):say=拨通即说开场白(默认);wait=静默等对方先说
+    # (IVR 热线场景,AI 开场白会压掉首段菜单播报)。非法值回落 say。
+    opening_mode = str(item.get("opening_mode") or "").strip().lower()
+    if opening_mode not in {"say", "wait"}:
+        opening_mode = "say"
     return {
         "ok": True,
         "scenario": scenario,
         "opening": opening,
+        "opening_mode": opening_mode,
         "error": None,
         "provider": "",
         "model": "",
