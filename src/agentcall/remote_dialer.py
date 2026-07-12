@@ -461,6 +461,7 @@ class RemoteWebDialerCoordinator:
         bridge: AudioBridgeLike | None = None
         record: CallRecord | None = None
         connected = False
+        snapshot_task: asyncio.Task[None] | None = None
         finish_status = "failed"
         finish_reason = "edge_error"
         try:
@@ -524,6 +525,12 @@ class RemoteWebDialerCoordinator:
                 record.log_event("answered", source=REMOTE_CALL_SOURCE)
             await self._send_status("connected")
             self._publish({"type": "remote_call", "status": "connected"})
+            # connected 若因数据通道瞬时断连丢包，靠独立任务周期重发规范快照兜住
+            # （固定 connected，不随 _last_status 漂移）；与音频泵解耦，网络发送不
+            # 阻塞 10ms 热循环（#74）。
+            snapshot_task = asyncio.create_task(
+                self._status_snapshot_loop({"type": "status", "status": "connected"})
+            )
 
             started_at = time.monotonic()
             while not self._call_stop_requested.is_set():
@@ -549,6 +556,7 @@ class RemoteWebDialerCoordinator:
                     if record is not None:
                         record.write_uplink(modem_pcm)
                     self.endpoint.push_modem_audio(modem_pcm)
+
                 await asyncio.sleep(0.01)
 
             finish_status = "completed"
@@ -562,6 +570,8 @@ class RemoteWebDialerCoordinator:
                 "failed", code="edge_error", reason="edge_error"
             )
         finally:
+            if snapshot_task is not None:
+                snapshot_task.cancel()
             self._bridge = None
             if bridge is not None:
                 try:
@@ -635,6 +645,27 @@ class RemoteWebDialerCoordinator:
             await self.endpoint.send_event(event)
         except Exception as exc:  # noqa: BLE001
             logger.debug("远程状态发送失败: %s", type(exc).__name__)
+
+    async def _status_snapshot_loop(
+        self, snapshot: dict[str, Any], interval: float = 1.0
+    ) -> None:
+        """通话期间每 ~1s 重发一个**固定**状态快照的独立任务。
+
+        ``send_event`` 在数据通道瞬时断连（``browser_connected`` 为 False）时会
+        静默丢弃，首个 ``connected`` 若恰好丢包，客户端会卡在旧状态（真人号响铃
+        较久时更易触发）。本任务与音频泵解耦（网络发送不阻塞 10ms 热循环），且
+        重发调用方传入的固定快照，不读可能被 ``media_ready``/``failed`` 覆盖的
+        ``_last_status``。最小修复；完整 seq/ping/HTTP 兜底方案见 #74。
+        """
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self.endpoint.send_event(dict(snapshot))
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("远程状态快照重发失败: %s", type(exc).__name__)
+        except asyncio.CancelledError:
+            pass
 
     def _publish(self, event: dict[str, Any]) -> None:
         if self._publish_event is not None:

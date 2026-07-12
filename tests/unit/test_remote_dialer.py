@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import inspect
 import json
 import time
@@ -302,6 +303,33 @@ def test_media_must_be_ready_before_dial() -> None:
 
         assert not any(name == "dial" for name, _args in modem.calls)
         assert endpoint.closed is True
+
+    asyncio.run(run())
+
+
+def test_status_snapshot_loop_resends_fixed_connected() -> None:
+    """#74：快照循环周期性重发**固定** connected，兜住首个 connected 丢包；
+    即使 _last_status 被 media_ready 覆盖，重发的仍是 connected。"""
+
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        coordinator = _coordinator(endpoint, FakeModem(), FakeBridge())
+        # 模拟通话中 _last_status 被 media_ready 覆盖——快照不得读它
+        coordinator._last_status = {"type": "status", "status": "media_ready"}
+        task = asyncio.create_task(
+            coordinator._status_snapshot_loop(
+                {"type": "status", "status": "connected"}, interval=0.01
+            )
+        )
+        await _wait_for(
+            lambda: sum(e.get("status") == "connected" for e in endpoint.events) >= 2
+        )
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        # 重发的全部是固定的 connected，没有把被覆盖的 media_ready 发出去
+        assert all(e.get("status") == "connected" for e in endpoint.events)
+        assert sum(e.get("status") == "connected" for e in endpoint.events) >= 2
 
     asyncio.run(run())
 
