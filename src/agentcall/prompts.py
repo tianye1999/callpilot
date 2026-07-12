@@ -127,8 +127,9 @@ def _build_zh(
         "可用工具：发送短信(send_sms，发给本人时号码留空)、挂断电话(hangup_call，"
         "挂断前先说一句告别语)、发送按键音/DTMF(send_dtmf，用于电话菜单)、"
         "查询最近收到的短信验证码(query_verification_code)。遇到需要按键的菜单，"
-        "必须调用 send_dtmf 工具真正发送按键，不是只在话里说要按哪个键。"
-        "需要时主动调用对应工具，操作完成后用一句话口头确认结果。"
+        "必须调用 send_dtmf 工具真正发送按键，不是只在话里说要按哪个键；"
+        "调用前后不要口头宣布按键动作，发送后保持沉默，等待下一段菜单。"
+        "需要时主动调用其他对应工具，操作完成后用一句话口头确认结果。"
     )
 
     if direction == "outbound":
@@ -250,9 +251,12 @@ def _build_en(
         "owner), hang up (hangup_call; say a goodbye line before hanging up), send "
         "DTMF keypad tones (send_dtmf; for phone menus), look up "
         "the latest SMS verification code (query_verification_code). Call the right "
-        "tool when needed, and confirm the result in one spoken sentence afterward. "
+        "tool when needed. For tools other than send_dtmf, confirm the result in one "
+        "spoken sentence afterward. "
         "When a menu requires a key press, you must call send_dtmf to actually send "
-        "the keypress, not merely say that you will press a key."
+        "the keypress, not merely say that you will press a key; do not announce the "
+        "keypress before or after the tool call. After sending it, stay silent and "
+        "wait for the next menu prompt."
     )
 
     if direction == "outbound":

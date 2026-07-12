@@ -163,6 +163,8 @@ def test_common_prompt_requires_real_dtmf_tool_call():
     assert "发送按键音/DTMF(send_dtmf" in text
     assert "必须调用 send_dtmf 工具真正发送按键" in text
     assert "不是只在话里说" in text
+    assert "调用前后不要口头宣布按键动作" in text
+    assert "发送后保持沉默" in text
 
 
 def test_common_prompt_requires_real_dtmf_tool_call_english():
@@ -171,6 +173,8 @@ def test_common_prompt_requires_real_dtmf_tool_call_english():
     assert "send DTMF keypad tones (send_dtmf" in text
     assert "must call send_dtmf to actually send the keypress" in text
     assert "not merely say" in text
+    assert "do not announce the keypress before or after" in text
+    assert "stay silent and wait for the next menu prompt" in text
 
 
 def test_outbound_prompt_rejects_customer_service_impersonation():
