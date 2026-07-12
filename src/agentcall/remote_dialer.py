@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 from .audio_bridge import MODEM_RATE, create_audio_bridge
 from .call_log import CallLogger, CallRecord
 from .dtmf import dtmf_tone
+from .pcm_stats import PcmFlowStats
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +252,9 @@ class RemoteWebDialerCoordinator:
         self.edge_ready = threading.Event()
         self.finished = threading.Event()
         self.call_active = threading.Event()
+        # call_active 在 ATD 前即置位（振铃阶段）；_call_connected 仅在模组物理
+        # 接通后置位，用于区分「振铃期」与「已接通」两种断线守护策略（#75）。
+        self._call_connected = threading.Event()
         self.last_error: str | None = None
         self._stop_requested = threading.Event()
         self._stop_reason = "edge_shutdown"
@@ -297,7 +301,8 @@ class RemoteWebDialerCoordinator:
 
     async def run(self) -> None:
         media_was_ready = False
-        media_lost_at: float | None = None
+        disconnect_since: float | None = None
+        prev_connected_phase = False
         try:
             await self.endpoint.connect()
             self.edge_ready.set()
@@ -312,20 +317,45 @@ class RemoteWebDialerCoordinator:
 
                 if self.endpoint.media_ready and not media_was_ready:
                     media_was_ready = True
-                    media_lost_at = None
                     await self._send_status("media_ready")
                 elif not self.endpoint.media_ready and media_was_ready:
                     media_was_ready = False
-                    media_lost_at = time.monotonic()
 
-                if self.call_active.is_set() and not self.endpoint.media_ready:
-                    if media_lost_at is None:
-                        media_lost_at = time.monotonic()
-                    if (
-                        time.monotonic() - media_lost_at
-                        >= self.runtime.disconnect_grace_seconds
-                    ):
-                        self.request_call_stop("media_disconnected")
+                # phase-aware 断线守护（#75）：
+                # - 振铃期（未物理接通）：只有**控制连接**真断（browser_connected
+                #   =False）才按 grace 挂断；音轨暂时 mute/重协商（media_ready=False
+                #   但参与者仍在）不中断振铃，否则长振铃真人号会被误挂（接通即掉）。
+                # - 已接通：媒体轨长期丢失才按 grace 安全收尾。
+                if self.call_active.is_set():
+                    connected_phase = self._call_connected.is_set()
+                    if connected_phase != prev_connected_phase:
+                        # 阶段切换（振铃→接通）：判据身份变化，重置计时——
+                        # 接通后应享有完整媒体 grace，不沿用振铃期的控制断计时
+                        # （否则接通瞬间残留计时到点会立即误挂，仍表现为「接通即掉」）。
+                        disconnect_since = None
+                        prev_connected_phase = connected_phase
+                    if connected_phase:
+                        disconnected = not self.endpoint.media_ready
+                        stop_reason, phase = "media_disconnected", "connected"
+                    else:
+                        disconnected = not self.endpoint.browser_connected
+                        stop_reason, phase = "control_disconnected", "ringing"
+                    if disconnected:
+                        if disconnect_since is None:
+                            disconnect_since = time.monotonic()
+                        elif (
+                            time.monotonic() - disconnect_since
+                            >= self.runtime.disconnect_grace_seconds
+                        ):
+                            logger.info(
+                                "远程通话本端 ATH: reason=%s phase=%s", stop_reason, phase
+                            )
+                            self.request_call_stop(stop_reason)
+                    else:
+                        disconnect_since = None
+                else:
+                    disconnect_since = None
+                    prev_connected_phase = False
 
                 command: dict[str, Any] | None
                 try:
@@ -461,6 +491,7 @@ class RemoteWebDialerCoordinator:
         bridge: AudioBridgeLike | None = None
         record: CallRecord | None = None
         connected = False
+        snapshot_task: asyncio.Task[None] | None = None
         finish_status = "failed"
         finish_reason = "edge_error"
         try:
@@ -493,9 +524,13 @@ class RemoteWebDialerCoordinator:
                 record.log_event("dialing", source=REMOTE_CALL_SOURCE)
 
             deadline = time.monotonic() + self.runtime.connect_timeout_seconds
-            while time.monotonic() < deadline and not self._call_stop_requested.is_set():
+            while time.monotonic() < deadline:
+                # 先判接通、再判 stop：避免接通与 grace 同 tick 时 stop 抢先，
+                # 把已接起的电话误判为 not_connected（#75）。
                 if self.modem.is_call_connected():
                     connected = True
+                    break
+                if self._call_stop_requested.is_set():
                     break
                 await asyncio.sleep(0.05)
             if not connected:
@@ -505,9 +540,14 @@ class RemoteWebDialerCoordinator:
                     if self._call_stop_requested.is_set()
                     else "not_connected"
                 )
+                logger.info(
+                    "远程外呼未接通即收尾: reason=%s phase=ringing", finish_reason
+                )
                 await self._send_status("ended", reason=finish_reason)
                 return
 
+            # 物理接通：此后断线守护改用「媒体轨」判据（振铃期用「控制连接」）。
+            self._call_connected.set()
             self.modem.initialize_for_voice(self.runtime.audio_mode)
             bridge = self.bridge_factory(
                 mode=self.runtime.audio_mode,
@@ -524,8 +564,19 @@ class RemoteWebDialerCoordinator:
                 record.log_event("answered", source=REMOTE_CALL_SOURCE)
             await self._send_status("connected")
             self._publish({"type": "remote_call", "status": "connected"})
+            # connected 若因数据通道瞬时断连丢包，靠独立任务周期重发规范快照兜住
+            # （固定 connected，不随 _last_status 漂移）；与音频泵解耦，网络发送不
+            # 阻塞 10ms 热循环（#74）。
+            snapshot_task = asyncio.create_task(
+                self._status_snapshot_loop({"type": "status", "status": "connected"})
+            )
 
             started_at = time.monotonic()
+            # 上行第二段观测：泵从 endpoint 取走并写入音频桥的帧统计。
+            # 与 uplink1_lk_in（LiveKit 入站）、uplink3_as_write（ffmpeg AS
+            # 写入）对照，可二分「链路建立但无声」断在哪一段。
+            take_stats = PcmFlowStats("uplink2_pump_take")
+            pending_output_bytes = getattr(bridge, "pending_output_bytes", None)
             while not self._call_stop_requested.is_set():
                 if not self.modem.is_call_connected():
                     self._call_stop_reason = "remote_party_hangup"
@@ -543,12 +594,21 @@ class RemoteWebDialerCoordinator:
                         for chunk in browser_chunks:
                             record.write_downlink(chunk)
                     bridge.write_modem_chunks(browser_chunks)
+                    for chunk in browser_chunks:
+                        take_stats.add(chunk)
+                if take_stats.due():  # 到期才取 pending，避免每 10ms 拿一次桥锁
+                    take_stats.maybe_log(
+                        pending=(
+                            pending_output_bytes() if pending_output_bytes else "n/a"
+                        ),
+                    )
 
                 modem_pcm = bridge.read_modem_chunk()
                 if modem_pcm:
                     if record is not None:
                         record.write_uplink(modem_pcm)
                     self.endpoint.push_modem_audio(modem_pcm)
+
                 await asyncio.sleep(0.01)
 
             finish_status = "completed"
@@ -562,6 +622,8 @@ class RemoteWebDialerCoordinator:
                 "failed", code="edge_error", reason="edge_error"
             )
         finally:
+            if snapshot_task is not None:
+                snapshot_task.cancel()
             self._bridge = None
             if bridge is not None:
                 try:
@@ -583,6 +645,7 @@ class RemoteWebDialerCoordinator:
                 self._line_reserved = False
             self._record = None
             self.call_active.clear()
+            self._call_connected.clear()
             await self._send_status(
                 "ended", reason=finish_reason, outcome=finish_status
             )
@@ -635,6 +698,27 @@ class RemoteWebDialerCoordinator:
             await self.endpoint.send_event(event)
         except Exception as exc:  # noqa: BLE001
             logger.debug("远程状态发送失败: %s", type(exc).__name__)
+
+    async def _status_snapshot_loop(
+        self, snapshot: dict[str, Any], interval: float = 1.0
+    ) -> None:
+        """通话期间每 ~1s 重发一个**固定**状态快照的独立任务。
+
+        ``send_event`` 在数据通道瞬时断连（``browser_connected`` 为 False）时会
+        静默丢弃，首个 ``connected`` 若恰好丢包，客户端会卡在旧状态（真人号响铃
+        较久时更易触发）。本任务与音频泵解耦（网络发送不阻塞 10ms 热循环），且
+        重发调用方传入的固定快照，不读可能被 ``media_ready``/``failed`` 覆盖的
+        ``_last_status``。最小修复；完整 seq/ping/HTTP 兜底方案见 #74。
+        """
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self.endpoint.send_event(dict(snapshot))
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("远程状态快照重发失败: %s", type(exc).__name__)
+        except asyncio.CancelledError:
+            pass
 
     def _publish(self, event: dict[str, Any]) -> None:
         if self._publish_event is not None:

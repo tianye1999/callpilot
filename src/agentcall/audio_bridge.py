@@ -15,6 +15,7 @@ import serial
 
 # 导入模块而非 from-import 常量：让测试能 monkeypatch platforms.IS_MACOS。
 from . import platforms
+from .pcm_stats import PcmFlowStats
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,10 @@ class FfmpegAudioBridge:
         self._tx_lock = threading.Lock()
         self._writer_thread: threading.Thread | None = None
         self._running = False
+        # 上行第三段观测：真实写入 AS（audiotoolbox 播放）的帧统计，
+        # 只统计非静音 payload；补零静音单独计次。仅写线程内使用。
+        self._write_stats = PcmFlowStats("uplink3_as_write")
+        self._silence_writes = 0
 
     @staticmethod
     def _find_avfoundation_input(keyword: str) -> int | None:
@@ -459,26 +464,43 @@ class FfmpegAudioBridge:
                 time.sleep(0.5)
                 next_write_at = time.monotonic()
                 continue
-            payload = self._next_write_payload(silence)
+            payload, real_bytes = self._next_write_payload(silence)
             if self._play and self._play.stdin:
                 try:
                     self._play.stdin.write(payload)
                     self._play.stdin.flush()
                 except (BrokenPipeError, ValueError):
                     continue  # 进程已退出，下一轮由上面的 poll() 统一处理重启
+                # 只统计写成功的：真实 payload 记帧/峰值，纯静音只计次。
+                if real_bytes:
+                    self._write_stats.add(payload[:real_bytes])
+                else:
+                    self._silence_writes += 1
+                if self._write_stats.maybe_log(
+                    silence_writes=self._silence_writes,
+                    play_alive=self._play.poll() is None,
+                    pending=self.pending_output_bytes(),
+                ):
+                    self._silence_writes = 0
             next_write_at += NMEA_WRITE_INTERVAL_SECONDS
 
-    def _next_write_payload(self, silence: bytes) -> bytes:
+    def _next_write_payload(self, silence: bytes) -> tuple[bytes, int]:
+        """取下一块待写数据，返回 (payload, 其中真实数据的字节数)。
+
+        真实字节数供写线程区分「转发的上行 PCM」与「保持时钟的补零静音」——
+        观测统计只对前者记帧/峰值。
+        """
         with self._tx_lock:
             if len(self._tx_buffer) >= NMEA_WRITE_SIZE:
                 payload = bytes(self._tx_buffer[:NMEA_WRITE_SIZE])
                 del self._tx_buffer[:NMEA_WRITE_SIZE]
-                return payload
+                return payload, len(payload)
             if self._tx_buffer:
                 payload = bytes(self._tx_buffer)
                 self._tx_buffer.clear()
-                return payload + silence[: NMEA_WRITE_SIZE - len(payload)]
-        return silence
+                padded = payload + silence[: NMEA_WRITE_SIZE - len(payload)]
+                return padded, len(payload)
+        return silence, 0
 
     @staticmethod
     def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import inspect
 import json
 import time
@@ -251,16 +252,18 @@ async def _wait_for(predicate, timeout: float = 1.0) -> None:
     raise AssertionError("condition was not met before timeout")
 
 
-def _runtime(*, dtmf_mode: str = "inband") -> RemoteDialerRuntimeConfig:
+def _runtime(
+    *, dtmf_mode: str = "inband", grace: float = 0.05, connect_timeout: float = 0.2
+) -> RemoteDialerRuntimeConfig:
     return RemoteDialerRuntimeConfig(
         audio_mode="uac",
         audio_keyword="Interface",
         pcm_port=None,
         pcm_baudrate=921600,
         tx_gain=1.0,
-        disconnect_grace_seconds=0.05,
+        disconnect_grace_seconds=grace,
         outbound_max_seconds=2.0,
-        connect_timeout_seconds=0.2,
+        connect_timeout_seconds=connect_timeout,
         dtmf_mode=dtmf_mode,
     )
 
@@ -272,13 +275,17 @@ def _coordinator(
     *,
     call_logger: CallLogger | None = None,
     dtmf_mode: str = "inband",
+    grace: float = 0.05,
+    connect_timeout: float = 0.2,
 ) -> RemoteWebDialerCoordinator:
     return RemoteWebDialerCoordinator(
         session_id="session-test",
         expires_at=time.time() + 60,
         modem=modem,  # type: ignore[arg-type]
         endpoint=endpoint,
-        runtime=_runtime(dtmf_mode=dtmf_mode),
+        runtime=_runtime(
+            dtmf_mode=dtmf_mode, grace=grace, connect_timeout=connect_timeout
+        ),
         bridge_factory=lambda **_kwargs: bridge,  # type: ignore[arg-type]
         call_logger=call_logger,
         reserve_line=lambda _owner: None,
@@ -302,6 +309,117 @@ def test_media_must_be_ready_before_dial() -> None:
 
         assert not any(name == "dial" for name, _args in modem.calls)
         assert endpoint.closed is True
+
+    asyncio.run(run())
+
+
+def test_status_snapshot_loop_resends_fixed_connected() -> None:
+    """#74：快照循环周期性重发**固定** connected，兜住首个 connected 丢包；
+    即使 _last_status 被 media_ready 覆盖，重发的仍是 connected。"""
+
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        coordinator = _coordinator(endpoint, FakeModem(), FakeBridge())
+        # 模拟通话中 _last_status 被 media_ready 覆盖——快照不得读它
+        coordinator._last_status = {"type": "status", "status": "media_ready"}
+        task = asyncio.create_task(
+            coordinator._status_snapshot_loop(
+                {"type": "status", "status": "connected"}, interval=0.01
+            )
+        )
+        await _wait_for(
+            lambda: sum(e.get("status") == "connected" for e in endpoint.events) >= 2
+        )
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        # 重发的全部是固定的 connected，没有把被覆盖的 media_ready 发出去
+        assert all(e.get("status") == "connected" for e in endpoint.events)
+        assert sum(e.get("status") == "connected" for e in endpoint.events) >= 2
+
+    asyncio.run(run())
+
+
+def test_ringing_media_blip_does_not_hang_up() -> None:
+    """#75：振铃期（未接通）手机音轨短暂丢失、但控制连接仍在时，不得挂断物理
+    振铃；应因 connect_timeout 走 not_connected，而非 media/control_disconnected。"""
+
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=True)
+        modem = FakeModem(auto_connect=False)  # 维持振铃、始终不接通
+        coordinator = _coordinator(endpoint, modem, FakeBridge())
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: endpoint.connected)
+        await endpoint.commands.put(
+            {"type": "dial", "number": "10086", "idempotency_key": "ring-phase-test"}
+        )
+        await _wait_for(lambda: any(name == "dial" for name, _ in modem.calls))
+        # 音轨抖动（media_ready=False），但控制连接（browser_connected）保持
+        endpoint._media_ready = False
+        await _wait_for(lambda: any(e.get("status") == "ended" for e in endpoint.events))
+        coordinator.request_stop("test_done")
+        await task
+        ended = [e for e in endpoint.events if e.get("status") == "ended"]
+        assert ended and ended[-1].get("reason") == "not_connected"
+        assert all(e.get("reason") != "control_disconnected" for e in endpoint.events)
+        assert all(e.get("reason") != "media_disconnected" for e in endpoint.events)
+
+    asyncio.run(run())
+
+
+def test_ringing_control_disconnect_hangs_up() -> None:
+    """#75：振铃期控制连接（browser_connected）真断超过 grace，仍按预期挂断，
+    reason=control_disconnected（不回归断线保护）。"""
+
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=True)
+        modem = FakeModem(auto_connect=False)
+        coordinator = _coordinator(endpoint, modem, FakeBridge())
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: endpoint.connected)
+        await endpoint.commands.put(
+            {"type": "dial", "number": "10086", "idempotency_key": "ring-phase-test"}
+        )
+        await _wait_for(lambda: any(name == "dial" for name, _ in modem.calls))
+        endpoint._browser_connected = False  # 控制连接真断
+        await _wait_for(lambda: any(e.get("status") == "ended" for e in endpoint.events))
+        coordinator.request_stop("test_done")
+        await task
+        ended = [e for e in endpoint.events if e.get("status") == "ended"]
+        assert ended and ended[-1].get("reason") == "control_disconnected"
+
+    asyncio.run(run())
+
+
+def test_phase_switch_resets_disconnect_timer() -> None:
+    """#75：振铃期控制断计时未到 grace 时物理接通、媒体仍未恢复——阶段切到
+    「已接通」必须重置计时，享有完整媒体 grace；不得沿用残留计时立即挂断
+    （否则仍表现为「接通即掉」）。"""
+
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=True)
+        modem = FakeModem(auto_connect=False)
+        coordinator = _coordinator(
+            endpoint, modem, FakeBridge(), grace=0.5, connect_timeout=3.0
+        )
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: endpoint.connected)
+        await endpoint.commands.put(
+            {"type": "dial", "number": "10086", "idempotency_key": "phase-switch-key"}
+        )
+        await _wait_for(lambda: any(name == "dial" for name, _ in modem.calls))
+        # 振铃期：控制连接断，计时开始（grace=0.5）
+        endpoint._browser_connected = False
+        await asyncio.sleep(0.2)  # < grace，计时进行中未触发
+        # 物理接通，但媒体仍未恢复：进入接通阶段，判据切 media_ready
+        endpoint._media_ready = False
+        modem.connected = True
+        await _wait_for(lambda: coordinator._call_connected.is_set(), timeout=1.0)
+        await asyncio.sleep(0.4)  # 接通后 0.4s（< 完整 grace 0.5）
+        # 若未重置：残留计时(0.2s起)在接通后约 0.3s 即挂断；重置后此刻不应挂
+        assert not coordinator._call_stop_requested.is_set()
+        coordinator.request_stop("test_done")
+        await task
 
     asyncio.run(run())
 

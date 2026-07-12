@@ -84,18 +84,22 @@ def is_reply_target_allowed(
     call_logger: "CallLogger | None",
     *,
     extra_allowed: str | None = None,
+    allow_any: bool = False,
 ) -> bool:
     """判断能否给 ``number`` 发短信。
 
     放行条件(满足其一):
+    - ``allow_any`` 为真(开发期总开关 ``SMS_ALLOW_ANY_TARGET``,放行任意非空号码);
     - 等于 ``extra_allowed``(当前通话对端,通话中可直接回短信);
     - 是收到过短信的号码、任一来电方,或已接通的外呼号码。
 
-    空号码一律拒绝。
+    空号码一律拒绝(``allow_any`` 也不放行空号码)。
     """
     target = _norm(number)
     if not target:
         return False
+    if allow_any:
+        return True
     if extra_allowed and _norm(extra_allowed) == target:
         return True
     return target in known_contact_numbers(hub, call_logger)

@@ -92,3 +92,17 @@ def test_extra_allowed_current_caller_bypasses_history():
 def test_none_sources_reject_but_extra_allowed_still_works():
     assert not is_reply_target_allowed("10086", None, None)
     assert is_reply_target_allowed("10086", None, None, extra_allowed="10086")
+
+
+def test_allow_any_bypasses_contact_check_for_nonempty_number():
+    """开发期总开关:allow_any 放行任意非空号码,无需已联系过。"""
+    assert is_reply_target_allowed(
+        "18800000000", FakeHub([]), FakeCallLogger([]), allow_any=True
+    )
+    assert is_reply_target_allowed("13900000000", None, None, allow_any=True)
+
+
+def test_allow_any_still_rejects_empty_number():
+    """allow_any 也不放行空号码(空号码一律拒绝)。"""
+    assert not is_reply_target_allowed("", None, None, allow_any=True)
+    assert not is_reply_target_allowed("   ", None, None, allow_any=True)
