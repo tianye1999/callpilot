@@ -465,20 +465,31 @@ class RemoteWebDialerCoordinator:
 
         mode = self._resolved_dtmf_mode()
         ok = True
+        inband_config_error = False
         if mode in {"inband", "both"}:
-            tone = dtmf_tone(
-                digits,
-                REMOTE_AUDIO_RATE,
-                tone_ms=self.runtime.dtmf_tone_ms,
-                amplitude=self.runtime.dtmf_tone_amplitude,
-            )
-            if not tone:
+            try:
+                tone = dtmf_tone(
+                    digits,
+                    REMOTE_AUDIO_RATE,
+                    tone_ms=self.runtime.dtmf_tone_ms,
+                    amplitude=self.runtime.dtmf_tone_amplitude,
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                logger.warning(
+                    "远程 DTMF 配置无效（通话继续）: error_type=%s",
+                    type(exc).__name__,
+                )
                 ok = False
+                inband_config_error = True
             else:
-                if self._record is not None:
-                    self._record.write_downlink(tone)
-                bridge.write_modem_chunks([tone])
+                if not tone:
+                    ok = False
+                else:
+                    if self._record is not None:
+                        self._record.write_downlink(tone)
+                    bridge.write_modem_chunks([tone])
         if mode in {"qvts", "both"}:
+            # both 模式下 inband 失败不影响 qvts 发送（独立 fallback）
             ok = self.modem.send_dtmf(digits) and ok
         if self._record is not None:
             self._record.log_event(
@@ -488,10 +499,16 @@ class RemoteWebDialerCoordinator:
                 result="success" if ok else "failure",
                 source=REMOTE_CALL_SOURCE,
             )
+        if ok:
+            fail_code = None
+        elif inband_config_error:
+            fail_code = "invalid_dtmf_config"
+        else:
+            fail_code = "dtmf_failed"
         await self._send_ephemeral_status(
             "connected",
             event="dtmf_sent" if ok else "dtmf_failed",
-            code=None if ok else "dtmf_failed",
+            code=fail_code,
         )
 
     async def _run_call(self, number: str) -> None:
