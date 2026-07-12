@@ -914,21 +914,43 @@ def test_number_profile_management_api_crud_and_validation(tmp_path, monkeypatch
             "task": {"zh": "查流量", "en": "check data"},
             "scenario": {"zh": "中文策略", "en": "English strategy"},
             "opening": {"zh": "查流量", "en": "Check data"},
+            "opening_mode": "wait",
         }
         response = await client.post("/api/number_profiles", json=payload)
         assert response.status == 201
         created = (await response.json())["profile"]
+        assert created["opening_mode"] == "wait"
 
+        # PATCH 同时改 enabled 和 opening_mode → say
         response = await client.patch(
-            f"/api/number_profiles/{created['id']}", json={**created, "enabled": False}
+            f"/api/number_profiles/{created['id']}",
+            json={**created, "enabled": False, "opening_mode": "say"},
         )
         assert response.status == 200
-        assert (await response.json())["profile"]["enabled"] is False
+        patched = (await response.json())["profile"]
+        assert patched["enabled"] is False
+        assert patched["opening_mode"] == "say"
+
+        # GET /manage 确认字段不丢
+        response = await client.get("/api/number_profiles/manage")
+        assert response.status == 200
+        managed = (await response.json())["profiles"]
+        assert len(managed) == 1
+        assert managed[0]["opening_mode"] == "say"
+        assert managed[0]["enabled"] is False
 
         response = await client.post(
             "/api/number_profiles", json={**payload, "opening": {"zh": "开" * 41, "en": ""}}
         )
         assert response.status == 400
+
+        # #80-B:非法 opening_mode → HTTP 400
+        response = await client.post(
+            "/api/number_profiles", json={**payload, "opening_mode": "shout"}
+        )
+        assert response.status == 400
+        body = await response.json()
+        assert "opening_mode" in body.get("error", "")
 
         response = await client.delete(f"/api/number_profiles/{created['id']}")
         assert response.status == 200

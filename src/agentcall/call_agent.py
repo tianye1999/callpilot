@@ -318,7 +318,7 @@ class CallSession:
                 logger.info("按 profile opening_mode=wait 跳过开场白,等待对方先说")
             else:
                 await agent.say(self._opening_instructions(direction))
-            mark_greeting_sent()
+                mark_greeting_sent()
 
             try:
                 await self._run_agent_loop(agent, bridge, record, transcripts)
@@ -794,6 +794,7 @@ class CallSession:
                 ok=ok,
                 scenario=scenario,
                 opening=opening,
+                opening_mode=str(result.get("opening_mode") or "").strip().lower() or "say",
                 error=error,
                 provider=provider,
                 model=model,

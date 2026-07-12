@@ -443,3 +443,89 @@ def test_lookup_profile_opening_mode_wait_and_fallbacks(tmp_path):
     assert number_profiles.lookup_profile("10086", "x", path=path)["opening_mode"] == "wait"
     assert number_profiles.lookup_profile("10000", "x", path=path)["opening_mode"] == "say"
     assert number_profiles.lookup_profile("10010", "x", path=path)["opening_mode"] == "say"
+
+
+def test_opening_mode_crud_roundtrip(tmp_path):
+    """#80-B:opening_mode 全程贯穿 create→list→update→verify。"""
+    path = tmp_path / "number_profiles.json"
+
+    # 创建 wait 模式预设
+    created = number_profiles.create_profile(
+        {
+            "enabled": True,
+            "number": "10086",
+            "match_mode": "number",
+            "task": {"zh": "", "en": ""},
+            "scenario": {"zh": "IVR热线", "en": "IVR hotline"},
+            "opening_mode": "wait",
+        },
+        path=path,
+    )
+    assert created["opening_mode"] == "wait"
+    profile_id = created["id"]
+
+    # 列表验证
+    managed = number_profiles.list_managed_profiles(path=path)
+    found = [m for m in managed if m["id"] == profile_id]
+    assert len(found) == 1
+    assert found[0]["opening_mode"] == "wait"
+
+    # 更新为 say
+    updated = number_profiles.update_profile(
+        profile_id,
+        {"opening_mode": "say", "number": "10086", "scenario": {"zh": "IVR热线"}},
+        path=path,
+    )
+    assert updated["opening_mode"] == "say"
+
+    # 再次列表验证
+    managed2 = number_profiles.list_managed_profiles(path=path)
+    found2 = [m for m in managed2 if m["id"] == profile_id]
+    assert len(found2) == 1
+    assert found2[0]["opening_mode"] == "say"
+
+    # lookup 也返回正确值
+    result = number_profiles.lookup_profile("10086", "x", path=path)
+    assert result is not None
+    assert result["opening_mode"] == "say"
+
+
+@pytest.mark.parametrize("bad_mode", ["shout", " Say ", "SAY"])
+def test_opening_mode_rejects_invalid_values(bad_mode, tmp_path):
+    """#80-B:非法 opening_mode 在 create/update 抛 ProfileValidationError。"""
+    path = tmp_path / "number_profiles.json"
+
+    with pytest.raises(number_profiles.ProfileValidationError, match="opening_mode"):
+        number_profiles.create_profile(
+            {
+                "enabled": True,
+                "number": "10086",
+                "match_mode": "number",
+                "task": {"zh": "", "en": ""},
+                "scenario": {"zh": "测试", "en": "Test"},
+                "opening_mode": bad_mode,
+            },
+            path=path,
+        )
+
+
+def test_bundled_seed_carrier_ivr_profiles_have_opening_mode_wait():
+    """#80-B:bundled seed 的运营商 IVR (10000/10086/10010) 显式 opening_mode=wait，
+    确保新用户免配即可生效。"""
+    seed = number_profiles.bundled_seed_file()
+    data = json.loads(seed.read_text(encoding="utf-8"))
+    profiles = data.get("profiles", [])
+    carrier_ivr_ids = {
+        "china_telecom_data", "china_telecom_balance",
+        "china_mobile_data", "china_unicom_data",
+    }
+    found = 0
+    for item in profiles:
+        if isinstance(item, dict) and item.get("id") in carrier_ivr_ids:
+            mode = str(item.get("opening_mode") or "").strip().lower()
+            assert mode == "wait", (
+                f"seed 条目 {item['id']} 的 opening_mode 应为 wait，"
+                f"当前 {mode!r}——修复对目标场景不生效"
+            )
+            found += 1
+    assert found == 4, f"应找到 4 条运营商 IVR seed，实际 {found}"
