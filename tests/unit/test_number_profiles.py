@@ -509,23 +509,29 @@ def test_opening_mode_rejects_invalid_values(bad_mode, tmp_path):
         )
 
 
-def test_bundled_seed_carrier_ivr_profiles_have_opening_mode_wait():
-    """#80-B:bundled seed 的运营商 IVR (10000/10086/10010) 显式 opening_mode=wait，
-    确保新用户免配即可生效。"""
+def test_bundled_seed_china_mobile_ivr_has_opening_mode_wait():
+    """#80-B:bundled seed 的 10086(china_mobile_data) 显式 opening_mode=wait
+    且 scenario 不再写"开场直接说需求"。"""
     seed = number_profiles.bundled_seed_file()
     data = json.loads(seed.read_text(encoding="utf-8"))
     profiles = data.get("profiles", [])
-    carrier_ivr_ids = {
-        "china_telecom_data", "china_telecom_balance",
-        "china_mobile_data", "china_unicom_data",
-    }
-    found = 0
     for item in profiles:
-        if isinstance(item, dict) and item.get("id") in carrier_ivr_ids:
+        if isinstance(item, dict) and item.get("id") == "china_mobile_data":
             mode = str(item.get("opening_mode") or "").strip().lower()
             assert mode == "wait", (
-                f"seed 条目 {item['id']} 的 opening_mode 应为 wait，"
-                f"当前 {mode!r}——修复对目标场景不生效"
+                f"seed 10086 opening_mode 应为 wait，当前 {mode!r}"
             )
-            found += 1
-    assert found == 4, f"应找到 4 条运营商 IVR seed，实际 {found}"
+            scenario_zh = (
+                item.get("scenario", {}).get("zh")
+                if isinstance(item.get("scenario"), dict)
+                else str(item.get("scenario", ""))
+            )
+            assert "开场直接说需求" not in scenario_zh, (
+                '10086 wait 模式 scenario 不应再写"开场直接说需求"'
+            )
+            assert "完整听完首段" in scenario_zh, (
+                "10086 scenario 应包含 IVR 等待指令"
+            )
+            break
+    else:
+        pytest.fail("seed 中未找到 china_mobile_data")

@@ -132,6 +132,15 @@ def test_profile_manager_has_crud_controls_and_safe_rendering():
     assert 'preset_id: dialPresetId' in text
     assert 'title.appendChild(el("b", "", profileLangValue(profile, "label")' in text
 
+    # #80-B:opening_mode UI 控件存在（select + read/open/blank/form payload 四处）
+    assert 'id="profileOpeningMode"' in text
+    assert 'value="say"' in text       # option
+    assert 'value="wait"' in text      # option
+    assert 'profile_opening_mode' in text   # i18n key
+    assert 'opening_mode: "say"' in text    # blankManagedProfile 默认
+    assert 'opening_mode: $("profileOpeningMode").value' in text  # readProfileForm
+    assert '$("profileOpeningMode").value' in text  # openProfileEditor set
+
 
 def test_remote_dialer_assets_are_mobile_safe_and_xss_hardened():
     html = REMOTE_HTML.read_text(encoding="utf-8")

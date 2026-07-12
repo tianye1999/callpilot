@@ -933,6 +933,15 @@
                     </label>
                   </div>
                 </div>
+                <div class="profile-topline">
+                  <div class="profile-field">
+                    <label for="profileOpeningMode" data-i18n="profile_opening_mode"></label>
+                    <select id="profileOpeningMode">
+                      <option value="say" data-i18n="profile_opening_mode_say"></option>
+                      <option value="wait" data-i18n="profile_opening_mode_wait"></option>
+                    </select>
+                  </div>
+                </div>
                 <div class="profile-languages">
                   <fieldset class="profile-language">
                     <legend data-i18n="profile_lang_zh"></legend>
@@ -1209,6 +1218,7 @@ const I18N = {
     profile_number: "Phone number", profile_match: "Match rule", profile_exact: "Exact task", profile_number_default: "Number fallback",
     profile_enabled: "Enabled", profile_lang_zh: "CHINESE", profile_lang_en: "ENGLISH",
     profile_label: "Dropdown label", profile_task: "Matching task", profile_scenario: "Scenario strategy", profile_opening: "First sentence",
+    profile_opening_mode: "Opening mode", profile_opening_mode_say: "Say immediately (default)", profile_opening_mode_wait: "Wait for IVR menu",
     profile_save: "Save", profile_cancel: "Cancel", profile_duplicate: "Duplicate", profile_delete: "Delete",
     profile_saving: "Saving…", profile_saved: "Preset saved", profile_deleted: "Preset deleted",
     profile_need_number: "Enter a dialable phone number.", profile_need_scenario: "Add a scenario strategy in at least one language.",
@@ -1377,6 +1387,7 @@ const I18N = {
     profile_number: "电话号码", profile_match: "匹配规则", profile_exact: "号码+任务", profile_number_default: "号码通配",
     profile_enabled: "启用本条", profile_lang_zh: "中文", profile_lang_en: "英文",
     profile_label: "下拉显示名称", profile_task: "匹配任务", profile_scenario: "场景策略", profile_opening: "第一句话",
+    profile_opening_mode: "开场模式", profile_opening_mode_say: "直接说开场白（默认）", profile_opening_mode_wait: "等待 IVR 菜单播报",
     profile_save: "保存", profile_cancel: "取消", profile_duplicate: "复制", profile_delete: "删除",
     profile_saving: "保存中…", profile_saved: "预设已保存", profile_deleted: "预设已删除",
     profile_need_number: "请输入可以拨打的电话号码。", profile_need_scenario: "请至少填写一种语言的场景策略。",
@@ -1812,6 +1823,7 @@ function blankManagedProfile() {
   return {
     id: "", enabled: true, number: "", match_mode: "exact",
     label: { ...blank }, task: { ...blank }, scenario: { ...blank }, opening: { ...blank },
+    opening_mode: "say",
   };
 }
 
@@ -1900,6 +1912,7 @@ function openProfileEditor(profile) {
     setProfileField(`profile${suffix}En`, profileExactLangValue(item, field, "en"));
   }
   setProfileMatchMode(item.match_mode || "exact");
+  $("profileOpeningMode").value = (item.opening_mode === "wait" ? "wait" : "say");
   $("profileDelete").hidden = !item.id;
   $("profileToast").className = "toast profile-toast";
   $("profileToast").textContent = "";
@@ -1925,6 +1938,7 @@ function readProfileForm() {
     task: { zh: $("profileTaskZh").value.trim(), en: $("profileTaskEn").value.trim() },
     scenario: { zh: $("profileScenarioZh").value.trim(), en: $("profileScenarioEn").value.trim() },
     opening: { zh: $("profileOpeningZh").value.trim(), en: $("profileOpeningEn").value.trim() },
+    opening_mode: $("profileOpeningMode").value,
   };
 }
 
