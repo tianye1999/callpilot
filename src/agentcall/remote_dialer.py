@@ -113,6 +113,8 @@ class RemoteDialerRuntimeConfig:
     outbound_max_seconds: float = 1800.0
     connect_timeout_seconds: float = 45.0
     dtmf_mode: str = "inband"
+    dtmf_tone_ms: int = 200
+    dtmf_tone_amplitude: float = 0.50
     recording_enabled: bool = True
 
 
@@ -464,7 +466,12 @@ class RemoteWebDialerCoordinator:
         mode = self._resolved_dtmf_mode()
         ok = True
         if mode in {"inband", "both"}:
-            tone = dtmf_tone(digits, REMOTE_AUDIO_RATE)
+            tone = dtmf_tone(
+                digits,
+                REMOTE_AUDIO_RATE,
+                tone_ms=self.runtime.dtmf_tone_ms,
+                amplitude=self.runtime.dtmf_tone_amplitude,
+            )
             if not tone:
                 ok = False
             else:
