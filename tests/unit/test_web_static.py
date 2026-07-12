@@ -142,6 +142,19 @@ def test_profile_manager_has_crud_controls_and_safe_rendering():
     assert '$("profileOpeningMode").value' in text  # openProfileEditor set
 
 
+def test_manual_dial_requires_explicit_task_or_selected_preset():
+    """#80-F:空任务不能静默沿用历史配置；用户必须填写或选择预设。"""
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'ph_task: "Describe what this call should accomplish"' in text
+    assert 'ph_task: "描述本次要完成的事项"' in text
+    assert 'if (!task && !dialPresetId)' in text
+    assert 'setToast("dialToast", "err", t("need_task"));' in text
+    assert "loadDefaultTask();" not in text
+    assert "blank = reuse" not in text
+    assert "空=沿用" not in text
+
+
 def test_remote_dialer_assets_are_mobile_safe_and_xss_hardened():
     html = REMOTE_HTML.read_text(encoding="utf-8")
     script = REMOTE_JS.read_text(encoding="utf-8")
