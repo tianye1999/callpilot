@@ -560,6 +560,15 @@ def read_panel_values() -> list[dict]:
 # ---- .env 写回 ----
 
 
+# 数值型配置的写回取值范围：(下界, 上界, 下界是否排他)。防止设置面板/API 把
+# 0、超界值写进 .env——运行时才炸(如 dtmf_tone 对 amplitude∉(0,1] 抛
+# ValueError,会导致按键失败；在写入边界提前拒绝(#80-D review)。
+_NUMERIC_RANGES: dict[str, tuple[float, float, bool]] = {
+    "DTMF_TONE_MS": (0, 2000, True),          # >0 且 ≤2000ms
+    "DTMF_TONE_AMPLITUDE": (0.0, 1.0, True),  # (0, 1]
+}
+
+
 def _check_value(spec: ConfigSpec, value: str) -> None:
     """按 kind 校验待写入的值；非法抛 ``ValueError``。"""
     if not isinstance(value, str):
@@ -584,6 +593,17 @@ def _check_value(spec: ConfigSpec, value: str) -> None:
         raise ValueError(
             f"配置 {spec.key} 需要布尔值（true/false/1/0/yes/no），收到 {value!r}"
         )
+    if spec.kind in {"int", "float"}:
+        bounds = _NUMERIC_RANGES.get(spec.key)
+        if bounds is not None:
+            low, high, low_exclusive = bounds
+            number = float(value.strip())
+            below = number <= low if low_exclusive else number < low
+            if below or number > high or number != number:  # NaN != NaN
+                low_op = ">" if low_exclusive else "≥"
+                raise ValueError(
+                    f"配置 {spec.key} 需满足 {low_op}{low:g} 且 ≤{high:g}，收到 {value!r}"
+                )
 
 
 _SMS_EMAIL_CONFIG_KEYS = {
