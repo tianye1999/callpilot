@@ -231,6 +231,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("HANGUP_TOOL_DELAY_SECONDS", "挂断工具延迟（秒）", "float", "4.5"),
     ConfigSpec("DTMF_MODE", "DTMF 发送模式", "select", "inband",
                choices=("inband", "qvts", "both")),
+    # 带内双音候选标定(#80-D):200ms/0.50 为候选基线（约 -6dBFS）;待 G2 真机验证。
+    ConfigSpec("DTMF_TONE_MS", "带内按键音时长（毫秒）", "int", "200"),
+    ConfigSpec("DTMF_TONE_AMPLITUDE", "带内按键音幅度 (0, 1]，默认 0.5（约 -6dBFS）", "float", "0.5"),
     ConfigSpec("REPEAT_SUPPRESS_SIMILARITY", "复读抑制相似度阈值", "float", "0.9"),
     # 外呼硬时限（秒）：LLM 收尾裁判失灵/漏判时的最后防线，到点自动道别挂断；
     # 0 = 不限制。（正常收尾由 summarizer.judge_wrap_up 提前判定。）

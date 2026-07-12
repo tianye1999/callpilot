@@ -6,6 +6,7 @@ import asyncio
 import threading
 import time
 
+import numpy as np
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
 from agentcall.call_agent import CallAgentService
@@ -244,7 +245,15 @@ def test_service_send_dtmf_uses_inband_audio_for_uac(monkeypatch):
     service.session._drain_agent_audio(bridge)
     assert len(bridge.downlink) == 1
     tone = bridge.downlink[0]
-    assert len(tone) == int(8000 * 0.2) * 2
+    # #80-D 实际送桥 payload:lead 100ms 静音 + tone 200ms + tail 120ms
+    # 静音 = 420ms（单键无末尾 gap，gap 仅用于 digit 之间）。
+    assert len(tone) == int(8000 * 0.42) * 2
+    samples = np.frombuffer(tone, dtype=np.int16)
+    lead = int(8000 * 0.10)
+    tone_end = lead + int(8000 * 0.20)
+    assert np.all(samples[:lead] == 0)          # 头部隔离带
+    assert np.any(samples[lead:tone_end] != 0)  # 双音本体
+    assert np.all(samples[tone_end:] == 0)      # 尾部隔离带（单键无末尾 gap）
     assert record.downlink == [tone]
     assert record.events == [
         ("dtmf", {"count": 1, "mode": "inband", "result": "success"})
@@ -661,3 +670,4 @@ def test_same_text_different_timestamp_both_delivered():
     sms_in = [e for e in hub.history() if e.get("type") == "sms_in"]
     assert len(sms_in) == 2
     assert len(forwarder.enqueued) == 2
+

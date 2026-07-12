@@ -841,7 +841,12 @@ class CallSession:
         mode = self._resolve_dtmf_mode()
         ok = True
         if mode in {"inband", "both"}:
-            tone = dtmf_tone(digits, MODEM_RATE)
+            tone = dtmf_tone(
+                digits,
+                MODEM_RATE,
+                tone_ms=config.get_int("DTMF_TONE_MS"),
+                amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
+            )
             if not tone:
                 return False, mode
             # 与 Agent 语音共用 _outgoing_audio，后续由 _drain_agent_audio
@@ -1369,6 +1374,8 @@ class CallAgentService:
                 1.0, config.get_float("REMOTE_CONNECT_TIMEOUT_SECONDS")
             ),
             dtmf_mode=config.get_str("REMOTE_DTMF_MODE"),
+            dtmf_tone_ms=config.get_int("DTMF_TONE_MS"),
+            dtmf_tone_amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
             recording_enabled=config.get_bool("REMOTE_HUMAN_RECORDING_ENABLED"),
         )
         coordinator = RemoteWebDialerCoordinator(
