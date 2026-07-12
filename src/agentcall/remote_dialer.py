@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 from .audio_bridge import MODEM_RATE, create_audio_bridge
 from .call_log import CallLogger, CallRecord
 from .dtmf import dtmf_tone
+from .pcm_stats import PcmFlowStats
 
 logger = logging.getLogger(__name__)
 
@@ -571,6 +572,11 @@ class RemoteWebDialerCoordinator:
             )
 
             started_at = time.monotonic()
+            # 上行第二段观测：泵从 endpoint 取走并写入音频桥的帧统计。
+            # 与 uplink1_lk_in（LiveKit 入站）、uplink3_as_write（ffmpeg AS
+            # 写入）对照，可二分「链路建立但无声」断在哪一段。
+            take_stats = PcmFlowStats("uplink2_pump_take")
+            pending_output_bytes = getattr(bridge, "pending_output_bytes", None)
             while not self._call_stop_requested.is_set():
                 if not self.modem.is_call_connected():
                     self._call_stop_reason = "remote_party_hangup"
@@ -588,6 +594,14 @@ class RemoteWebDialerCoordinator:
                         for chunk in browser_chunks:
                             record.write_downlink(chunk)
                     bridge.write_modem_chunks(browser_chunks)
+                    for chunk in browser_chunks:
+                        take_stats.add(chunk)
+                if take_stats.due():  # 到期才取 pending，避免每 10ms 拿一次桥锁
+                    take_stats.maybe_log(
+                        pending=(
+                            pending_output_bytes() if pending_output_bytes else "n/a"
+                        ),
+                    )
 
                 modem_pcm = bridge.read_modem_chunk()
                 if modem_pcm:

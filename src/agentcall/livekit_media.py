@@ -7,6 +7,7 @@ import json
 import logging
 from typing import Any
 
+from .pcm_stats import PcmFlowStats
 from .remote_dialer import (
     REMOTE_AUDIO_RATE,
     REMOTE_CONTROL_TOPIC,
@@ -82,6 +83,10 @@ class LiveKitRemoteMediaEndpoint:
         self._browser_connected = False
         self._media_ready = False
         self._closed = False
+        # 上行第一段观测：浏览器（手机）→ LiveKit → Edge 的入站帧统计。
+        # 打点由 take_browser_audio（remote pump 每 10ms 调）驱动，
+        # 因此 LiveKit 一帧未推时也会按期打出 frames=0。
+        self._browser_in_stats = PcmFlowStats("uplink1_lk_in")
 
     @property
     def media_ready(self) -> bool:
@@ -251,6 +256,10 @@ class LiveKitRemoteMediaEndpoint:
                 chunks.append(self._browser_audio.get_nowait())
             except asyncio.QueueEmpty:
                 break
+        self._browser_in_stats.maybe_log(
+            queued=self._browser_audio.qsize(),
+            media_ready=self._media_ready,
+        )
         return chunks
 
     def push_modem_audio(self, pcm: bytes) -> None:
@@ -284,6 +293,7 @@ class LiveKitRemoteMediaEndpoint:
             async for event in stream:
                 pcm = bytes(event.frame.data)
                 if pcm:
+                    self._browser_in_stats.add(pcm)
                     _put_latest(self._browser_audio, pcm)
         except asyncio.CancelledError:
             raise

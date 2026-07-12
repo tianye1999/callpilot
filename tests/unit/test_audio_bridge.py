@@ -47,7 +47,7 @@ def test_ffmpeg_uac_write_payload_keeps_silence_clock_when_empty():
     bridge = make_ffmpeg_bridge()
     silence = b"\x00" * NMEA_WRITE_SIZE
 
-    assert bridge._next_write_payload(silence) == silence
+    assert bridge._next_write_payload(silence) == (silence, 0)
 
 
 def test_ffmpeg_uac_write_payload_pads_partial_agent_audio():
@@ -55,11 +55,12 @@ def test_ffmpeg_uac_write_payload_pads_partial_agent_audio():
     silence = b"\x00" * NMEA_WRITE_SIZE
     bridge.write_modem_chunks([b"\x01\x02\x03"])
 
-    payload = bridge._next_write_payload(silence)
+    payload, real_bytes = bridge._next_write_payload(silence)
 
     assert len(payload) == NMEA_WRITE_SIZE
     assert payload[:3] == b"\x01\x02\x03"
     assert payload[3:] == b"\x00" * (NMEA_WRITE_SIZE - 3)
+    assert real_bytes == 3
     assert bridge.pending_output_bytes() == 0
 
 
@@ -70,9 +71,10 @@ def test_ffmpeg_uac_write_payload_consumes_one_realtime_frame():
     remainder = b"\x22" * 7
     bridge.write_modem_chunks([first_frame + remainder])
 
-    payload = bridge._next_write_payload(silence)
+    payload, real_bytes = bridge._next_write_payload(silence)
 
     assert payload == first_frame
+    assert real_bytes == NMEA_WRITE_SIZE
     assert bridge.pending_output_bytes() == len(remainder)
 
 
