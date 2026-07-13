@@ -91,7 +91,12 @@ def extract_transcripts(events: Sequence[Event]) -> list[Transcript]:
     return transcripts
 
 
-def run_assertions(events: Sequence[Event], transcripts: Sequence[Transcript], meta: Event | None = None) -> Report:
+def run_assertions(
+    events: Sequence[Event],
+    transcripts: Sequence[Transcript],
+    meta: Event | None = None,
+    judge_shadow: Sequence[Event] = (),
+) -> Report:
     return Report(
         results=[
             check_profile_hit(events),
@@ -103,6 +108,7 @@ def run_assertions(events: Sequence[Event], transcripts: Sequence[Transcript], m
             check_dtmf_audit(events, transcripts),
             check_dtmf_followup(events),
             check_no_redundant_reask(transcripts),
+            check_dtmf_judge_shadow(events, judge_shadow),
         ]
     )
 
@@ -399,6 +405,100 @@ def check_dtmf_followup(events: Sequence[Event]) -> CheckResult:
     )
 
 
+def check_dtmf_judge_shadow(
+    events: Sequence[Event], private_entries: Sequence[Event]
+) -> CheckResult:
+    """Summarize shadow/realtime alignment without printing cleartext digits."""
+    title = "10. DTMF 判官 shadow 对齐"
+    public_decision_ids = {
+        value
+        for event in events
+        if event.get("type") == "dtmf_judge"
+        for value in [event.get("decision_id")]
+        if isinstance(value, str)
+    }
+    if not public_decision_ids:
+        return CheckResult(
+            "dtmf_judge_shadow", title, "PASS", "本通未产生 shadow 判定"
+        )
+
+    public_action_ids = {
+        value
+        for event in events
+        if event.get("type") == "dtmf_action"
+        for value in [event.get("action_id")]
+        if isinstance(value, str)
+    }
+    decisions = [
+        entry
+        for entry in private_entries
+        if entry.get("kind") == "decision"
+        and entry.get("decision_id") in public_decision_ids
+    ]
+    actions = [
+        entry
+        for entry in private_entries
+        if entry.get("kind") == "action"
+        and entry.get("action_id") in public_action_ids
+    ]
+    missing_private = len(public_decision_ids) - len(decisions)
+    press_decisions = [entry for entry in decisions if entry.get("action") == "press"]
+    exact = 0
+    mismatch = 0
+    no_action = 0
+    unused_action_ids = {
+        action_id
+        for action in actions
+        for action_id in [action.get("action_id")]
+        if isinstance(action_id, str)
+    }
+    for decision in sorted(
+        press_decisions, key=lambda item: _number(item.get("ts")) or 0.0
+    ):
+        decision_ts = _number(decision.get("ts"))
+        decision_digits = decision.get("digits")
+        if decision_ts is None or not isinstance(decision_digits, str):
+            missing_private += 1
+            continue
+        candidates = [
+            action
+            for action in actions
+            if action.get("action_id") in unused_action_ids
+            if (action_ts := _number(action.get("ts"))) is not None
+            and abs(action_ts - decision_ts) <= 5.0
+        ]
+        if not candidates:
+            no_action += 1
+            continue
+        nearest = min(
+            candidates,
+            key=lambda action: abs((_number(action.get("ts")) or 0.0) - decision_ts),
+        )
+        nearest_id = nearest.get("action_id")
+        if isinstance(nearest_id, str):
+            unused_action_ids.discard(nearest_id)
+        if nearest.get("digits") == decision_digits:
+            exact += 1
+        else:
+            mismatch += 1
+
+    modes: dict[str, int] = {}
+    for decision in decisions:
+        mode = decision.get("window_mode")
+        label = mode if isinstance(mode, str) else "unknown"
+        modes[label] = modes.get(label, 0) + 1
+    mode_detail = ",".join(f"{key}={value}" for key, value in sorted(modes.items()))
+    detail = (
+        f"decisions={len(decisions)} press={len(press_decisions)} exact={exact} "
+        f"mismatch={mismatch} no_action={no_action} missing_private={missing_private}; "
+        f"window_mode[{mode_detail or 'none'}]"
+    )
+    status: Status = (
+        "WARN" if mismatch or no_action or missing_private else "PASS"
+    )
+    return CheckResult("dtmf_judge_shadow", title, status, detail)
+
+
 def load_events(call_dir: Path) -> list[dict[str, object]]:
     path = call_dir / "events.jsonl"
     if not path.exists():
@@ -428,6 +528,29 @@ def load_meta(call_dir: Path) -> dict[str, object] | None:
     if not isinstance(meta, dict):
         raise RegressionError(f"{path} 不是 JSON object")
     return meta
+
+
+def load_judge_shadow(call_dir: Path) -> list[dict[str, object]]:
+    """Load the optional gitignored cleartext analysis file for local-only replay."""
+    path = call_dir / "judge_shadow.jsonl"
+    if not path.exists():
+        return []
+    entries: list[dict[str, object]] = []
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RegressionError(
+                f"{path}:{line_number} JSON 解析失败: {exc}"
+            ) from exc
+        if not isinstance(entry, dict):
+            raise RegressionError(f"{path}:{line_number} 不是 JSON object")
+        entries.append(entry)
+    return entries
 
 
 def find_latest_recording(recordings_dir: Path = RECORDINGS_DIR) -> Path:
@@ -598,8 +721,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RegressionError("未找到通话录音目录")
         events = load_events(call_dir)
         meta = load_meta(call_dir)
+        judge_shadow = load_judge_shadow(call_dir)
         transcripts = extract_transcripts(events)
-        report = run_assertions(events, transcripts, meta)
+        report = run_assertions(events, transcripts, meta, judge_shadow)
         if timeout_result is not None:
             report = Report([timeout_result, *report.results])
         print_report(report, call_dir)

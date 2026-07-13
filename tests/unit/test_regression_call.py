@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts import regression_call
@@ -191,6 +193,91 @@ def test_dtmf_without_remote_transcript_in_observation_window_warns():
     assert result.status == "WARN"
     assert "8s" in result.detail
     assert "9.1s" in result.detail
+
+
+def test_dtmf_judge_shadow_reports_exact_match_without_exposing_digits():
+    events = _base_events(
+        _event(
+            "dtmf_judge",
+            decision_id="decision-a",
+            action="press",
+            digits_len=1,
+            window_mode="merged",
+            ts=5.0,
+        ),
+        _event(
+            "dtmf_action",
+            action_id="action-a",
+            source="realtime",
+            digits_len=1,
+            ts=5.5,
+        ),
+    )
+    private = [
+        {
+            "kind": "decision",
+            "decision_id": "decision-a",
+            "action": "press",
+            "digits": "7",
+            "ts": 5.0,
+            "window_mode": "merged",
+        },
+        {
+            "kind": "action",
+            "action_id": "action-a",
+            "source": "realtime",
+            "digits": "7",
+            "ts": 5.5,
+        },
+    ]
+
+    result = regression_call.check_dtmf_judge_shadow(events, private)
+
+    assert result.status == "PASS"
+    assert "exact=1" in result.detail
+    assert "7" not in result.detail
+
+
+def test_dtmf_judge_shadow_disagreement_is_warning_not_gate_failure():
+    events = _base_events(
+        _event(
+            "dtmf_judge",
+            decision_id="decision-a",
+            action="press",
+            digits_len=1,
+            window_mode="fragmented",
+            ts=5.0,
+        )
+    )
+    private = [
+        {
+            "kind": "decision",
+            "decision_id": "decision-a",
+            "action": "press",
+            "digits": "7",
+            "ts": 5.0,
+            "window_mode": "fragmented",
+        }
+    ]
+
+    result = regression_call.check_dtmf_judge_shadow(events, private)
+
+    assert result.status == "WARN"
+    assert "no_action=1" in result.detail
+    assert "7" not in result.detail
+
+
+def test_load_judge_shadow_is_optional_and_validates_jsonl(tmp_path):
+    assert regression_call.load_judge_shadow(tmp_path) == []
+    path = tmp_path / "judge_shadow.jsonl"
+    path.write_text('{"kind":"decision","digits":"1"}\n', encoding="utf-8")
+    assert regression_call.load_judge_shadow(tmp_path) == [
+        {"kind": "decision", "digits": "1"}
+    ]
+
+    path.write_text("not-json\n", encoding="utf-8")
+    with pytest.raises(regression_call.RegressionError):
+        regression_call.load_judge_shadow(tmp_path)
 
 
 def test_agent_repeats_user_supplied_value_passes_fabrication_check():

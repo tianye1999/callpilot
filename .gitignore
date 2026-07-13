@@ -8,6 +8,8 @@ data/
 !data/
 data/*
 !data/number_profiles.example.json
+# DTMF judge cleartext analysis stays inside private per-call records.
+**/judge_shadow.jsonl
 
 # 生成的音频文件
 *.wav
