@@ -10,6 +10,7 @@ import threading
 import time
 from pathlib import Path
 
+import dashscope
 import pytest
 
 from agentcall.dtmf_judge import (
@@ -124,6 +125,16 @@ def test_parse_judge_decision_accepts_strict_contract():
 )
 def test_parse_judge_decision_rejects_malformed_or_unsafe_payload(payload):
     with pytest.raises(JudgeValidationError):
+        parse_judge_decision(payload)
+
+
+def test_parse_judge_decision_rejects_duplicate_json_keys():
+    payload = (
+        '{"action":"wait","action":"press","digits":"1",'
+        '"confidence":0.9,"reason_code":"menu_matched","reason":"x"}'
+    )
+
+    with pytest.raises(JudgeValidationError, match="duplicate_fields"):
         parse_judge_decision(payload)
 
 
@@ -340,6 +351,55 @@ def test_model_call_exceeding_timeout_is_abandoned_without_blocking_worker(tmp_p
     assert error["code"] == "timeout"
 
 
+def test_default_model_timeout_never_starts_a_second_live_sdk_request(
+    tmp_path, monkeypatch
+):
+    record = SpyRecord(tmp_path / "recording")
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def blocked_sdk_call(**kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        release.wait(timeout=10)
+        return None
+
+    monkeypatch.setattr(
+        dashscope.Generation, "call", staticmethod(blocked_sdk_call)
+    )
+    judge = DtmfJudge(
+        record=record,
+        task_goal="查询套餐余量",
+        ledger=DtmfActionLedger(),
+        model="qwen-plus",
+        window_mode="fragmented",
+        throttle_seconds=0.01,
+        timeout_seconds=0.03,
+    )
+    judge.start()
+    judge.submit_remote_transcript("第一段", t_ms=10.0)
+    assert entered.wait(timeout=1)
+    wait_until(
+        lambda: len([kind for kind, _ in record.events if kind == "judge_error"])
+        >= 1
+    )
+
+    for index in range(3):
+        judge.submit_remote_transcript(f"后续段{index}", t_ms=20.0 + index)
+        wait_until(
+            lambda index=index: len(
+                [kind for kind, _ in record.events if kind == "judge_error"]
+            )
+            >= index + 2
+        )
+
+    judge.stop()
+    release.set()
+    assert calls == 1
+
+
 def test_blocked_judge_does_not_block_submit_or_stop_and_stale_result_is_dropped(
     tmp_path,
 ):
@@ -375,6 +435,64 @@ def test_blocked_judge_does_not_block_submit_or_stop_and_stale_result_is_dropped
 
     assert record.events == []
     assert not (record.path / "judge_shadow.jsonl").exists()
+
+
+def test_stop_between_model_result_and_commit_rejects_late_result(tmp_path):
+    entered_commit = threading.Event()
+    release_commit = threading.Event()
+
+    class PausedCommitJudge(DtmfJudge):
+        def _commit_decision(self, generation, decision, latency_ms):
+            entered_commit.set()
+            release_commit.wait(timeout=2)
+            return super()._commit_decision(generation, decision, latency_ms)
+
+    record = SpyRecord(tmp_path / "recording")
+    judge = PausedCommitJudge(
+        record=record,
+        task_goal="查询套餐余量",
+        ledger=DtmfActionLedger(),
+        model="qwen-plus",
+        window_mode="fragmented",
+        model_call=lambda messages, model, timeout: (valid_response(), None),
+        throttle_seconds=0.01,
+    )
+    judge.start()
+    judge.submit_remote_transcript("请按一", t_ms=10.0)
+    assert entered_commit.wait(timeout=1)
+
+    judge.stop(join_timeout=0.01)
+    release_commit.set()
+    time.sleep(0.05)
+
+    assert record.events == []
+    assert not (record.path / "judge_shadow.jsonl").exists()
+
+
+def test_record_action_does_not_do_disk_io_on_the_live_dtmf_path(
+    tmp_path, monkeypatch
+):
+    record = SpyRecord(tmp_path / "recording")
+    ledger = DtmfActionLedger()
+    judge = DtmfJudge(
+        record=record,
+        task_goal="查询套餐余量",
+        ledger=ledger,
+        model="qwen-plus",
+        window_mode="fragmented",
+    )
+    judge.start()
+    real_open = open
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError("record_action must not open files")
+
+    monkeypatch.setattr("builtins.open", fail_open)
+    judge.record_action(ledger.record("1", "realtime", timestamp=1.0))
+    monkeypatch.setattr("builtins.open", real_open)
+    judge.stop()
+
+    assert (record.path / "judge_shadow.jsonl").exists()
 
 
 def test_gitignore_explicitly_covers_private_judge_file():

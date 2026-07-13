@@ -21,7 +21,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, cast
 
-from .prompt_gen import _call_qwen
+import dashscope
+
+from .summarizer import _extract_text
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +158,9 @@ class DtmfActionLedger:
 def parse_judge_decision(text: str) -> JudgeDecision:
     """Parse one strict JSON decision; never coerce unsafe model output."""
     try:
-        payload = json.loads(text)
+        payload = json.loads(text, object_pairs_hook=_unique_object)
+    except JudgeValidationError:
+        raise
     except (json.JSONDecodeError, TypeError):
         raise JudgeValidationError("invalid_json") from None
     if not isinstance(payload, dict):
@@ -266,6 +270,7 @@ class DtmfJudge:
         self._thread: threading.Thread | None = None
         self._model_thread: threading.Thread | None = None
         self._private_lock = threading.Lock()
+        self._private_lines: list[str] = []
 
     def start(self) -> None:
         with self._condition:
@@ -304,9 +309,10 @@ class DtmfJudge:
             self._condition.notify_all()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, join_timeout))
+        self._flush_private()
 
     def record_action(self, entry: DtmfAction) -> None:
-        """Append cleartext action data only to the private per-call analysis file."""
+        """Buffer cleartext action data for the private per-call analysis file."""
         with self._condition:
             if not self._running:
                 return
@@ -319,7 +325,7 @@ class DtmfJudge:
                 "digits": entry.digits,
                 "digits_len": len(entry.digits),
             }
-            self._append_private(private)
+            self._buffer_private_locked(private)
 
     def _run(self, generation: int) -> None:
         while True:
@@ -344,19 +350,20 @@ class DtmfJudge:
             text, error_code = self._invoke_model(messages)
             latency_ms = round((time.monotonic() - started) * 1000, 1)
 
-            if not self._is_current(generation):
-                return
             if error_code is not None:
-                self._log_error(_sanitize_error_code(error_code), latency_ms)
+                if not self._commit_error(
+                    generation, _sanitize_error_code(error_code), latency_ms
+                ):
+                    return
                 continue
             try:
                 decision = parse_judge_decision(text or "")
             except JudgeValidationError as exc:
-                self._log_error(exc.code, latency_ms)
+                if not self._commit_error(generation, exc.code, latency_ms):
+                    return
                 continue
-            if not self._is_current(generation):
+            if not self._commit_decision(generation, decision, latency_ms):
                 return
-            self._log_decision(decision, latency_ms)
 
     def _invoke_model(
         self, messages: list[dict[str, str]]
@@ -401,47 +408,69 @@ class DtmfJudge:
             return None, "model_error"
         return result
 
-    def _is_current(self, generation: int) -> bool:
+    def _commit_error(
+        self, generation: int, code: str, latency_ms: float
+    ) -> bool:
+        """Atomically reject stale results or append one public in-memory event."""
         with self._condition:
-            return self._running and generation == self._generation
+            if not self._running or generation != self._generation:
+                return False
+            self._record.log_event(
+                "judge_error",
+                code=code,
+                latency_ms=latency_ms,
+                window_mode=self._window_mode,
+            )
+            return True
 
-    def _log_error(self, code: str, latency_ms: float) -> None:
-        self._record.log_event(
-            "judge_error",
-            code=code,
-            latency_ms=latency_ms,
-            window_mode=self._window_mode,
-        )
+    def _commit_decision(
+        self,
+        generation: int,
+        decision: JudgeDecision,
+        latency_ms: float,
+    ) -> bool:
+        """Atomically commit correlated public/private in-memory records."""
+        with self._condition:
+            if not self._running or generation != self._generation:
+                return False
+            decision_id = self._id_factory()
+            digits_len = len(decision.digits or "")
+            timestamp = time.time()
+            self._record.log_event(
+                "dtmf_judge",
+                action=decision.action,
+                confidence=decision.confidence,
+                reason_code=decision.reason_code,
+                latency_ms=latency_ms,
+                window_mode=self._window_mode,
+                digits_len=digits_len,
+                decision_id=decision_id,
+            )
+            self._buffer_private_locked(
+                {
+                    "kind": "decision",
+                    "decision_id": decision_id,
+                    "ts": timestamp,
+                    "action": decision.action,
+                    "digits": decision.digits,
+                    "confidence": decision.confidence,
+                    "reason_code": decision.reason_code,
+                    "reason": decision.reason,
+                    "latency_ms": latency_ms,
+                    "window_mode": self._window_mode,
+                }
+            )
+            return True
 
-    def _log_decision(self, decision: JudgeDecision, latency_ms: float) -> None:
-        decision_id = self._id_factory()
-        digits_len = len(decision.digits or "")
-        self._record.log_event(
-            "dtmf_judge",
-            action=decision.action,
-            confidence=decision.confidence,
-            reason_code=decision.reason_code,
-            latency_ms=latency_ms,
-            window_mode=self._window_mode,
-            digits_len=digits_len,
-            decision_id=decision_id,
-        )
-        private = {
-            "kind": "decision",
-            "decision_id": decision_id,
-            "ts": time.time(),
-            "action": decision.action,
-            "digits": decision.digits,
-            "confidence": decision.confidence,
-            "reason_code": decision.reason_code,
-            "reason": decision.reason,
-            "latency_ms": latency_ms,
-            "window_mode": self._window_mode,
-        }
-        self._append_private(private)
+    def _buffer_private_locked(self, item: dict[str, object]) -> None:
+        self._private_lines.append(json.dumps(item, ensure_ascii=False) + "\n")
 
-    def _append_private(self, item: dict[str, object]) -> None:
-        line = json.dumps(item, ensure_ascii=False) + "\n"
+    def _flush_private(self) -> None:
+        with self._condition:
+            lines = self._private_lines
+            self._private_lines = []
+        if not lines:
+            return
         path = self._record.path / "judge_shadow.jsonl"
         try:
             with self._private_lock:
@@ -451,7 +480,7 @@ class DtmfJudge:
                     encoding="utf-8",
                     opener=lambda file_path, flags: os.open(file_path, flags, 0o600),
                 ) as file:
-                    file.write(line)
+                    file.writelines(lines)
         except OSError as exc:
             logger.warning(
                 "DTMF 判官隐私分析记录写入失败: error_type=%s",
@@ -460,14 +489,22 @@ class DtmfJudge:
 
 
 def _default_model_call(
-    messages: list[dict[str, str]], model: str, timeout: float
+    messages: list[dict[str, str]], model: str, _timeout: float
 ) -> tuple[str | None, str | None]:
-    text, error = _call_qwen(messages, model, timeout)
-    if error is None:
-        return text, None
-    if "超时" in error or "timeout" in error.lower():
-        return None, "timeout"
-    return None, "model_error"
+    """Make one synchronous SDK request; ``_invoke_model`` owns its timeout."""
+    if not os.environ.get("DASHSCOPE_API_KEY", "").strip():
+        return None, "model_error"
+    response = dashscope.Generation.call(
+        model=model,
+        messages=messages,
+        result_format="message",
+        api_key=os.environ.get("DASHSCOPE_API_KEY"),
+    )
+    status = getattr(response, "status_code", None)
+    if status is not None and status != 200:
+        return None, "model_error"
+    text = _extract_text(response)
+    return (text, None) if text else (None, "model_error")
 
 
 def _sanitize_error_code(code: str) -> str:
@@ -482,9 +519,19 @@ def _sanitize_error_code(code: str) -> str:
         "invalid_confidence",
         "invalid_reason_code",
         "invalid_reason",
+        "duplicate_fields",
     }
     return code if code in allowed else "model_error"
 
 
 def _opaque_id() -> str:
     return uuid.uuid4().hex
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise JudgeValidationError("duplicate_fields")
+        result[key] = value
+    return result

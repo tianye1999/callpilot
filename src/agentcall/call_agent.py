@@ -159,7 +159,7 @@ class CallSession:
         self._next_dtmf_followup_id = 0
         self._dtmf_dispatch_context = threading.local()
         self._active_tools: ToolRegistry | None = None
-        self._dtmf_ledger = DtmfActionLedger()
+        self._dtmf_ledger: DtmfActionLedger | None = None
         self._dtmf_judge: DtmfJudge | None = None
         self._dtmf_judge_started_at = 0.0
 
@@ -199,7 +199,6 @@ class CallSession:
         self._cancel_spoken_dtmf_followups(clear_recent=True)
         self._stop_dtmf_judge(join_timeout=0.0)
         self._dtmf_judge_started_at = 0.0
-        self._dtmf_ledger.clear()
         # 世代号推进与置活必须同锁原子完成：与 _deferred_hangup 的
         # 「校验世代号 → stop()」互斥，保证旧回调要么在新会话置活前跑完
         # （只影响已结束的旧会话），要么校验失败直接放弃。
@@ -700,12 +699,13 @@ class CallSession:
         window_mode: WindowMode = (
             "merged" if config.get_bool("MANUAL_RESPONSE_CONTROL") else "fragmented"
         )
+        ledger = DtmfActionLedger()
         judge: DtmfJudge | None = None
         try:
             judge = DtmfJudge(
                 record=record,
                 task_goal=task_goal,
-                ledger=self._dtmf_ledger,
+                ledger=ledger,
                 model=model,
                 window_mode=window_mode,
             )
@@ -726,12 +726,17 @@ class CallSession:
                 window_mode=window_mode,
             )
             return
-        self._dtmf_judge_started_at = session_t0
-        self._dtmf_judge = judge
+        with self._dtmf_lock:
+            self._dtmf_judge_started_at = session_t0
+            self._dtmf_ledger = ledger
+            self._dtmf_judge = judge
 
     def _stop_dtmf_judge(self, *, join_timeout: float = 0.2) -> None:
-        judge = self._dtmf_judge
-        self._dtmf_judge = None
+        with self._dtmf_lock:
+            judge = self._dtmf_judge
+            self._dtmf_judge = None
+            self._dtmf_ledger = None
+            self._dtmf_judge_started_at = 0.0
         if judge is not None:
             try:
                 judge.stop(join_timeout=join_timeout)
@@ -1199,13 +1204,17 @@ class CallSession:
         }.get(source)
         if public_source is None:
             return
+        ledger = self._dtmf_ledger
+        judge = self._dtmf_judge
+        if ledger is None or judge is None:
+            return
         relative_time = (
             max(0.0, time.monotonic() - self._dtmf_judge_started_at)
             if self._dtmf_judge_started_at > 0
             else 0.0
         )
         try:
-            entry = self._dtmf_ledger.record(
+            entry = ledger.record(
                 digits,
                 public_source,  # type: ignore[arg-type]
                 timestamp=relative_time,
@@ -1218,9 +1227,7 @@ class CallSession:
         record = self._record
         if record is not None:
             record.log_event("dtmf_action", **entry.public_fields())
-        judge = self._dtmf_judge
-        if judge is not None:
-            judge.record_action(entry)
+        judge.record_action(entry)
 
     def _resolve_dtmf_mode(self) -> str:
         configured = config.get_str("DTMF_MODE").strip().lower()

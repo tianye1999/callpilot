@@ -8,6 +8,7 @@ import pytest
 from fakes import FakeAgent, FakeModem
 
 from agentcall.call_agent import CallSession
+from agentcall.dtmf_judge import DtmfActionLedger
 
 
 class SpyRecord:
@@ -56,6 +57,13 @@ def test_judge_off_creates_no_worker(tmp_path, monkeypatch):
     session._start_dtmf_judge(record, session_t0=10.0)
 
     assert session._dtmf_judge is None
+    assert session._dtmf_ledger is None
+
+    session._record = record  # type: ignore[assignment]
+    monkeypatch.setenv("DTMF_MODE", "qvts")
+    ok, _mode = session._send_dtmf_raw("1", source="agent_tool")
+    assert ok
+    assert record.events == []
 
 
 def test_shadow_start_failure_does_not_fail_call_session(tmp_path, monkeypatch):
@@ -150,9 +158,12 @@ def test_session_stop_invalidates_judge_worker():
 def test_sent_dtmf_records_redacted_action_ledger_for_three_sources(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setenv("DTMF_JUDGE_MODE", "shadow")
     monkeypatch.setenv("DTMF_MODE", "qvts")
     session = make_session()
     session._record = SpyRecord(tmp_path / "call")  # type: ignore[assignment]
+    session._dtmf_ledger = DtmfActionLedger()
+    session._dtmf_judge = FakeJudge()  # type: ignore[assignment]
 
     for digits, source in (
         ("1", "agent_tool"),
@@ -177,6 +188,7 @@ def test_sent_dtmf_notifies_shadow_private_ledger(tmp_path, monkeypatch):
     session._record = SpyRecord(tmp_path / "call")  # type: ignore[assignment]
     judge = FakeJudge()
     session._dtmf_judge = judge  # type: ignore[assignment]
+    session._dtmf_ledger = DtmfActionLedger()
 
     ok, _mode = session._send_dtmf_raw("1", source="agent_tool")
 
