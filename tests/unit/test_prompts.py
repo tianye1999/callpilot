@@ -128,6 +128,25 @@ def test_inbound_prompt_does_not_get_outbound_result_persistence():
     assert "politely steer back" not in en
 
 
+def test_inbound_pending_topic_injected_when_set(monkeypatch):
+    """设置 INBOUND_PENDING_TOPIC 后，来电提示词注入待办；默认空则不注入。"""
+    monkeypatch.setenv("INBOUND_PENDING_TOPIC", "问清某笔费用怎么产生的")
+    zh = build_instructions("inbound", "李明", "数字分身", "")
+    assert "待办事项" in zh and "问清某笔费用怎么产生的" in zh
+    en = build_instructions("inbound", "Alex", "AI assistant", "", "en")
+    assert "Pending matter" in en and "问清某笔费用怎么产生的" in en
+
+
+def test_inbound_pending_topic_absent_by_default(monkeypatch):
+    monkeypatch.delenv("INBOUND_PENDING_TOPIC", raising=False)
+    zh = build_instructions("inbound", "李明", "数字分身", "")
+    assert "待办事项" not in zh
+    # 外呼方向不注入来电待办
+    monkeypatch.setenv("INBOUND_PENDING_TOPIC", "不该出现在外呼里")
+    out = build_instructions("outbound", "李明", "数字分身", "查话费")
+    assert "不该出现在外呼里" not in out
+
+
 def test_winddown_instructions_bilingual():
     from agentcall.prompts import winddown_instructions
     assert "告别" in winddown_instructions("zh") and "再见" in winddown_instructions("zh")
