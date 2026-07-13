@@ -43,6 +43,15 @@ def wait_until(predicate, timeout: float = 2.0) -> None:
     raise AssertionError("condition was not met before timeout")
 
 
+def wait_for_model_threads() -> None:
+    wait_until(
+        lambda: not any(
+            thread.name == "dtmf-judge-model-call" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+    )
+
+
 def valid_response(*, digits: str = "1") -> str:
     return json.dumps(
         {
@@ -346,6 +355,7 @@ def test_model_call_exceeding_timeout_is_abandoned_without_blocking_worker(tmp_p
     wait_until(lambda: any(kind == "judge_error" for kind, _ in record.events))
     judge.stop()
     release.set()
+    wait_for_model_threads()
 
     error = next(fields for kind, fields in record.events if kind == "judge_error")
     assert error["code"] == "timeout"
@@ -397,6 +407,61 @@ def test_default_model_timeout_never_starts_a_second_live_sdk_request(
 
     judge.stop()
     release.set()
+    wait_for_model_threads()
+    assert calls == 1
+
+
+def test_default_model_single_flight_is_shared_across_call_instances(
+    tmp_path, monkeypatch
+):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def blocked_sdk_call(**kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        release.wait(timeout=10)
+        return None
+
+    monkeypatch.setattr(
+        dashscope.Generation, "call", staticmethod(blocked_sdk_call)
+    )
+    first = DtmfJudge(
+        record=SpyRecord(tmp_path / "first"),
+        task_goal="查询套餐余量",
+        ledger=DtmfActionLedger(),
+        model="qwen-plus",
+        window_mode="fragmented",
+        throttle_seconds=0.01,
+        timeout_seconds=0.03,
+    )
+    first.start()
+    first.submit_remote_transcript("第一通菜单", t_ms=10.0)
+    assert entered.wait(timeout=1)
+    time.sleep(0.05)
+    first.stop()
+
+    second_record = SpyRecord(tmp_path / "second")
+    second = DtmfJudge(
+        record=second_record,
+        task_goal="查询套餐余量",
+        ledger=DtmfActionLedger(),
+        model="qwen-plus",
+        window_mode="fragmented",
+        throttle_seconds=0.01,
+        timeout_seconds=0.03,
+    )
+    second.start()
+    second.submit_remote_transcript("第二通菜单", t_ms=10.0)
+    wait_until(
+        lambda: any(kind == "judge_error" for kind, _ in second_record.events)
+    )
+    second.stop()
+    release.set()
+    wait_for_model_threads()
+
     assert calls == 1
 
 
@@ -431,7 +496,7 @@ def test_blocked_judge_does_not_block_submit_or_stop_and_stale_result_is_dropped
     judge.stop(join_timeout=0.05)
     assert time.monotonic() - stopped_at < 0.2
     release.set()
-    time.sleep(0.05)
+    wait_for_model_threads()
 
     assert record.events == []
     assert not (record.path / "judge_shadow.jsonl").exists()

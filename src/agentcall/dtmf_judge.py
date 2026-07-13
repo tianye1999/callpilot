@@ -57,6 +57,8 @@ _EXPECTED_FIELDS = frozenset(
 )
 _MAX_TRANSCRIPTS = 8
 _MAX_RECENT_ACTIONS = 3
+_MODEL_SINGLE_FLIGHT_LOCK = threading.Lock()
+_MODEL_SINGLE_FLIGHT_THREAD: threading.Thread | None = None
 
 _SYSTEM_PROMPT = (
     "你是电话按键决策器。只输出一个严格合法的 JSON 对象，不要 Markdown 或额外文字。"
@@ -268,7 +270,6 @@ class DtmfJudge:
         self._running = False
         self._generation = 0
         self._thread: threading.Thread | None = None
-        self._model_thread: threading.Thread | None = None
         self._private_lock = threading.Lock()
         self._private_lines: list[str] = []
 
@@ -369,31 +370,41 @@ class DtmfJudge:
         self, messages: list[dict[str, str]]
     ) -> tuple[str | None, str | None]:
         """Enforce the judge timeout even if an SDK call ignores its timeout hint."""
-        previous = self._model_thread
-        if previous is not None and previous.is_alive():
-            return None, "timeout"
+        global _MODEL_SINGLE_FLIGHT_THREAD
 
         box: dict[str, object] = {}
 
         def call() -> None:
+            global _MODEL_SINGLE_FLIGHT_THREAD
             try:
                 box["result"] = self._model_call(
                     messages, self._model, self._timeout_seconds
                 )
             except Exception as exc:  # noqa: BLE001
                 box["error_type"] = type(exc).__name__
+            finally:
+                with _MODEL_SINGLE_FLIGHT_LOCK:
+                    if _MODEL_SINGLE_FLIGHT_THREAD is threading.current_thread():
+                        _MODEL_SINGLE_FLIGHT_THREAD = None
 
         thread = threading.Thread(
             target=call,
             name="dtmf-judge-model-call",
             daemon=True,
         )
-        self._model_thread = thread
-        thread.start()
+        with _MODEL_SINGLE_FLIGHT_LOCK:
+            previous = _MODEL_SINGLE_FLIGHT_THREAD
+            if previous is not None and previous.is_alive():
+                return None, "timeout"
+            _MODEL_SINGLE_FLIGHT_THREAD = thread
+            try:
+                thread.start()
+            except Exception:  # noqa: BLE001
+                _MODEL_SINGLE_FLIGHT_THREAD = None
+                return None, "model_error"
         thread.join(self._timeout_seconds)
         if thread.is_alive():
             return None, "timeout"
-        self._model_thread = None
         error_type = box.get("error_type")
         if isinstance(error_type, str):
             logger.warning("DTMF 判官调用异常: error_type=%s", error_type)

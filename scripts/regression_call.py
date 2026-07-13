@@ -57,6 +57,7 @@ JUDGE_REASON_CODES = frozenset(
 JUDGE_WINDOW_MODES = frozenset({"merged", "fragmented"})
 DTMF_ACTION_SOURCES = frozenset({"realtime", "judge", "guard"})
 PRIVATE_DTMF_RE = re.compile(r"^[0-9*#]+$")
+PUBLIC_PRIVATE_TS_TOLERANCE_SECONDS = 1.0
 
 
 class RegressionError(RuntimeError):
@@ -449,6 +450,10 @@ def check_dtmf_judge_shadow(
         private_entries, "action", "action_id"
     )
     schema_errors += duplicate_private_decisions + duplicate_private_actions
+    schema_errors += sum(
+        entry.get("kind") not in {"decision", "action"}
+        for entry in private_entries
+    )
 
     decisions: list[Event] = []
     seen_decision_ids: set[str] = set()
@@ -637,6 +642,8 @@ def _valid_decision_pair(public: Event, private: Event) -> bool:
         return False
     private_confidence = _number(private.get("confidence"))
     private_latency = _number(private.get("latency_ms"))
+    public_ts = _number(public.get("ts"))
+    private_ts = _number(private.get("ts"))
     reason = private.get("reason")
     return bool(
         private.get("decision_id") == public.get("decision_id")
@@ -647,7 +654,9 @@ def _valid_decision_pair(public: Event, private: Event) -> bool:
         and len(reason) <= 50
         and private_latency == latency
         and private.get("window_mode") == public.get("window_mode")
-        and _number(private.get("ts")) is not None
+        and public_ts is not None
+        and private_ts is not None
+        and abs(public_ts - private_ts) <= PUBLIC_PRIVATE_TS_TOLERANCE_SECONDS
     )
 
 
@@ -655,6 +664,8 @@ def _valid_action_pair(public: Event, private: Event) -> bool:
     source = public.get("source")
     digits_len = public.get("digits_len")
     digits = private.get("digits")
+    public_ts = _number(public.get("ts"))
+    private_ts = _number(private.get("ts"))
     return bool(
         isinstance(public.get("action_id"), str)
         and isinstance(source, str)
@@ -662,13 +673,14 @@ def _valid_action_pair(public: Event, private: Event) -> bool:
         and isinstance(digits_len, int)
         and not isinstance(digits_len, bool)
         and digits_len > 0
-        and _number(public.get("ts")) is not None
+        and public_ts is not None
         and private.get("action_id") == public.get("action_id")
         and private.get("source") == source
         and isinstance(digits, str)
         and PRIVATE_DTMF_RE.fullmatch(digits) is not None
         and private.get("digits_len") == digits_len == len(digits)
-        and _number(private.get("ts")) is not None
+        and private_ts is not None
+        and abs(public_ts - private_ts) <= PUBLIC_PRIVATE_TS_TOLERANCE_SECONDS
         and _number(private.get("t_ms")) is not None
     )
 
