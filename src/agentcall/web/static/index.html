@@ -1285,7 +1285,7 @@ const I18N = {
     setup_skip_all: "Skip setup", setup_skip_step: "Skip step", setup_back: "Back", setup_next: "Next",
     setup_finish: "Finish", setup_steps: ["Hardware", "API Key", "Personalize", "Recording", "Self-test", "Done"],
     setup_hw_title: "Hardware check", setup_hw_hint: "Plug in the EC20/EG25 module and keep the AT port connected. This check does not block setup.",
-    setup_usb: "USB module", setup_at: "AT port", setup_port: "Port",
+    setup_usb: "USB module", setup_at: "AT port", setup_port: "Port", setup_sim: "SIM",
     setup_hw_ok: "Hardware looks ready.", setup_hw_wait: "Hardware is not fully ready yet. You can continue and retry after plugging it in.",
     setup_key_title: "Provider API key", setup_key_hint: "Qwen and OpenAI keys are validated online before saving. The key is never echoed back.",
     setup_qwen_key_help: {
@@ -1454,7 +1454,7 @@ const I18N = {
     setup_skip_all: "跳过向导", setup_skip_step: "跳过本步", setup_back: "上一步", setup_next: "下一步",
     setup_finish: "完成", setup_steps: ["硬件", "API Key", "个性化", "通话录音", "自测", "完成"],
     setup_hw_title: "硬件检测", setup_hw_hint: "请插入 EC20/EG25 模组并保持 AT 口连接。本检测不阻塞后续配置。",
-    setup_usb: "USB 模组", setup_at: "AT 口", setup_port: "端口",
+    setup_usb: "USB 模组", setup_at: "AT 口", setup_port: "端口", setup_sim: "SIM 卡",
     setup_hw_ok: "硬件状态看起来已就绪。", setup_hw_wait: "硬件暂未完全就绪。你可以继续配置，插好后再重试。",
     setup_key_title: "Provider API Key", setup_key_hint: "Qwen 与 OpenAI 会先在线校验再保存；Key 不会被回显。",
     setup_qwen_key_help: {
@@ -2755,10 +2755,15 @@ function renderSetupHardware() {
   const box = $("setupHardware");
   if (!box) return;
   box.textContent = "";
+  const sim = meta.sim || {};
+  const simText = sim.present
+    ? `${sim.carrier} · ${sim.reg_status}` + (sim.service_number ? ` · 客服 ${sim.service_number}` : "")
+    : "-";
   for (const [label, value] of [
     [t("setup_usb"), statusWord(!!hw.usb_online)],
     [t("setup_at"), statusWord(!!hw.modem_connected)],
     [t("setup_port"), hw.port || "-"],
+    [t("setup_sim"), simText],
   ]) {
     const row = el("div", "line");
     row.appendChild(el("b", "", label));

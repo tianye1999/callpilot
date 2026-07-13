@@ -1503,3 +1503,75 @@ def test_auth_disabled_when_token_none_keeps_loopback_behavior():
         return resp.status
 
     assert api(app, fn) == 200
+
+
+def test_meta_omits_sim_when_no_modem():
+    """service 无 modem → /api/meta 不含 sim 键,不炸(#88 边界)。"""
+    service = FakeService()
+    app = build_app(
+        hub=None,  # type: ignore[arg-type]
+        modem=None,  # type: ignore[arg-type]
+        service=service,
+        meta={"provider": "qwen"},
+    )
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        assert resp.status == 200
+        return await resp.json()
+
+    assert "sim" not in api(app, fn)
+
+
+def test_meta_exposes_sim_without_full_imsi():
+    """/api/meta 透出 sim 块,含运营商/客服号,绝不含完整 IMSI(#88 隐私)。"""
+    import json as _json
+
+    from agentcall.sim_identity import identify
+
+    class _FakeModem:
+        sim_identity = identify("460110123456789\r\nOK", "+CREG: 0,1")
+
+    service = FakeService()
+    service.modem = _FakeModem()  # type: ignore[attr-defined]
+    app = build_app(
+        hub=None,  # type: ignore[arg-type]
+        modem=None,  # type: ignore[arg-type]
+        service=service,
+        meta={"provider": "qwen"},
+    )
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        assert resp.status == 200
+        return await resp.json()
+
+    meta = api(app, fn)
+    assert meta["sim"]["carrier"] == "中国电信"
+    assert meta["sim"]["service_number"] == "10000"
+    assert meta["sim"]["plmn"] == "46011"
+    assert "460110123456789" not in _json.dumps(meta, ensure_ascii=False)
+
+
+def test_meta_exposes_unknown_sim_block():
+    """无卡时 sim 块仍在(present=False),UI 可显示'未插卡'(#88)。"""
+    from agentcall.sim_identity import UNKNOWN_SIM
+
+    class _FakeModem:
+        sim_identity = UNKNOWN_SIM
+
+    service = FakeService()
+    service.modem = _FakeModem()  # type: ignore[attr-defined]
+    app = build_app(
+        hub=None,  # type: ignore[arg-type]
+        modem=None,  # type: ignore[arg-type]
+        service=service,
+        meta={"provider": "qwen"},
+    )
+
+    async def fn(client):
+        resp = await client.get("/api/meta")
+        return await resp.json()
+
+    sim = api(app, fn)["sim"]
+    assert sim["present"] is False and sim["carrier"] == "未知"
