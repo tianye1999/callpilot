@@ -15,7 +15,7 @@ import pytest
 
 from agentcall.agents import factory, openai_agent
 from agentcall.agents.openai_agent import OpenAIVoiceAgent
-from agentcall.agents.tools import ToolRegistry
+from agentcall.agents.tools import SEND_DTMF_SPEC, ToolRegistry
 
 # ---------------------------------------------------------------------------
 # 夹具：伪造 websocket 与 websockets.connect
@@ -464,6 +464,39 @@ def test_terminal_tool_skips_response_create(monkeypatch):
     assert len(outputs) == 1
     assert outputs[0]["item"]["type"] == "function_call_output"
     # 但绝不能再要新回复（本会话开场没有 say，故整通 sent 里不应出现 response.create）
+    assert "response.create" not in ws.sent_types()
+
+
+def test_send_dtmf_result_waits_for_next_ivr_without_response_create(monkeypatch):
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    registry = ToolRegistry()
+    registry.register(
+        SEND_DTMF_SPEC,
+        lambda args: {"success": True, "count": 1, "mode": "inband"},
+    )
+    agent.set_tools(registry)
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            instances[0].feed({
+                "type": "response.function_call_arguments.done",
+                "name": "send_dtmf",
+                "call_id": "call-key",
+                "arguments": '{"digits":"1"}',
+            })
+            await _drain()
+            await asyncio.sleep(0.05)
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+    ws = instances[0]
+    outputs = [m for m in ws.sent if m["type"] == "conversation.item.create"]
+    assert len(outputs) == 1
+    assert outputs[0]["item"]["type"] == "function_call_output"
     assert "response.create" not in ws.sent_types()
 
 

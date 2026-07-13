@@ -426,3 +426,112 @@ def test_profile_scenario_limit_preserves_full_bundled_english_strategy():
     assert result is not None
     assert len(result["scenario"]) > 200
     assert "never claim you have the figures" in result["scenario"]
+
+
+def test_lookup_profile_opening_mode_wait_and_fallbacks(tmp_path):
+    """#80-B:opening_mode 归一——wait 透传;缺省/非法/大小写混排回落 say。"""
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [
+            {"number": "10086", "scenario": "IVR 热线", "opening_mode": " Wait "},
+            {"number": "10000", "scenario": "默认开场"},
+            {"number": "10010", "scenario": "非法值", "opening_mode": "shout"},
+        ],
+    )
+
+    assert number_profiles.lookup_profile("10086", "x", path=path)["opening_mode"] == "wait"
+    assert number_profiles.lookup_profile("10000", "x", path=path)["opening_mode"] == "say"
+    assert number_profiles.lookup_profile("10010", "x", path=path)["opening_mode"] == "say"
+
+
+def test_opening_mode_crud_roundtrip(tmp_path):
+    """#80-B:opening_mode 全程贯穿 create→list→update→verify。"""
+    path = tmp_path / "number_profiles.json"
+
+    # 创建 wait 模式预设
+    created = number_profiles.create_profile(
+        {
+            "enabled": True,
+            "number": "10086",
+            "match_mode": "number",
+            "task": {"zh": "", "en": ""},
+            "scenario": {"zh": "IVR热线", "en": "IVR hotline"},
+            "opening_mode": "wait",
+        },
+        path=path,
+    )
+    assert created["opening_mode"] == "wait"
+    profile_id = created["id"]
+
+    # 列表验证
+    managed = number_profiles.list_managed_profiles(path=path)
+    found = [m for m in managed if m["id"] == profile_id]
+    assert len(found) == 1
+    assert found[0]["opening_mode"] == "wait"
+
+    # 更新为 say
+    updated = number_profiles.update_profile(
+        profile_id,
+        {"opening_mode": "say", "number": "10086", "scenario": {"zh": "IVR热线"}},
+        path=path,
+    )
+    assert updated["opening_mode"] == "say"
+
+    # 再次列表验证
+    managed2 = number_profiles.list_managed_profiles(path=path)
+    found2 = [m for m in managed2 if m["id"] == profile_id]
+    assert len(found2) == 1
+    assert found2[0]["opening_mode"] == "say"
+
+    # lookup 也返回正确值
+    result = number_profiles.lookup_profile("10086", "x", path=path)
+    assert result is not None
+    assert result["opening_mode"] == "say"
+
+
+@pytest.mark.parametrize("bad_mode", ["shout", " Say ", "SAY"])
+def test_opening_mode_rejects_invalid_values(bad_mode, tmp_path):
+    """#80-B:非法 opening_mode 在 create/update 抛 ProfileValidationError。"""
+    path = tmp_path / "number_profiles.json"
+
+    with pytest.raises(number_profiles.ProfileValidationError, match="opening_mode"):
+        number_profiles.create_profile(
+            {
+                "enabled": True,
+                "number": "10086",
+                "match_mode": "number",
+                "task": {"zh": "", "en": ""},
+                "scenario": {"zh": "测试", "en": "Test"},
+                "opening_mode": bad_mode,
+            },
+            path=path,
+        )
+
+
+def test_bundled_seed_china_mobile_ivr_has_opening_mode_wait():
+    """#80-B:bundled seed 的 10086(china_mobile_data) 显式 opening_mode=wait
+    且 scenario 不再写"开场直接说需求"。"""
+    seed = number_profiles.bundled_seed_file()
+    data = json.loads(seed.read_text(encoding="utf-8"))
+    profiles = data.get("profiles", [])
+    for item in profiles:
+        if isinstance(item, dict) and item.get("id") == "china_mobile_data":
+            mode = str(item.get("opening_mode") or "").strip().lower()
+            assert mode == "wait", (
+                f"seed 10086 opening_mode 应为 wait，当前 {mode!r}"
+            )
+            scenario_zh = (
+                item.get("scenario", {}).get("zh")
+                if isinstance(item.get("scenario"), dict)
+                else str(item.get("scenario", ""))
+            )
+            assert "开场直接说需求" not in scenario_zh, (
+                '10086 wait 模式 scenario 不应再写"开场直接说需求"'
+            )
+            assert "完整听完首段" in scenario_zh, (
+                "10086 scenario 应包含 IVR 等待指令"
+            )
+            break
+    else:
+        pytest.fail("seed 中未找到 china_mobile_data")

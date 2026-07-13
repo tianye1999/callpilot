@@ -28,7 +28,7 @@ from .. import config
 from ..prompts import agent_language, repeat_nudge_instructions
 from ..repeat_suppression import ResponseAudioGate
 from .base import VoiceAgent
-from .tools import TERMINAL_TOOLS
+from .tools import SILENT_AFTER_TOOLS, TERMINAL_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -706,9 +706,8 @@ class QwenVoiceAgent(VoiceAgent):
                         "output": json.dumps(result, ensure_ascii=False),
                     }
                 )
-                # 终结性工具（hangup_call）不再要新回复：告别语已在调用前说完，
-                # 挂断延迟里应保持安静，避免多播一句“电话已经挂断…”。
-                if name not in TERMINAL_TOOLS:
+                # hangup 后不再回复；DTMF 后等待 IVR 的下一段音频自然触发回复。
+                if name not in TERMINAL_TOOLS and name not in SILENT_AFTER_TOOLS:
                     conversation.create_response(
                         output_modalities=[MultiModality.AUDIO, MultiModality.TEXT]
                     )

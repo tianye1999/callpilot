@@ -29,10 +29,11 @@
       "task": {"zh": "咨询流量使用情况", "en": "check data usage"},
       "label": {"zh": "中国移动·查流量", "en": "China Mobile · Data usage"},
       "scenario": {
-        "zh": "你在替机主拨打中国移动客服热线10086，查机主名下这个号码的流量使用情况（剩余、已用）。你是主叫、替机主求助的一方，不是客服、不代表移动、不冒充机主本人。开场直接说需求、不自我介绍；遇语音菜单说短词，遇按键菜单调用 send_dtmf 真正按键；对方未明确给出数据前不编造、不声称已查到，没拿到就说还在等对方。拿到结果口头确认一句。",
-        "en": "You are calling China Mobile's hotline 10086 on the owner's behalf to check the data usage on the owner's number. You are the caller asking for help — not an agent, not Mobile, never impersonate the owner. State the need directly, no self-introduction; short keywords to voice menus, call send_dtmf for keypad menus; never make up figures or claim you have them before they are given. Confirm the result in one sentence."
+        "zh": "你在替机主拨打中国移动客服热线10086，查机主名下这个号码的流量使用情况（剩余、已用）。你是主叫、替机主求助的一方，不是客服、不代表移动、不冒充机主本人。拨通后先完整听完首段 IVR 菜单播报，IVR 播报中或转接等待期间不要说话；仅在对方明确提示语音输入时才说短词（如\"流量\"、\"查流量\"），切勿抢话或自我介绍；遇按键菜单必须调用 send_dtmf 工具真正按键、绝不能只嘴上说要按几；转人工成功后用一句话说明需求。对方未明确给出流量数据前，绝不说\"已查到\"或编造数字，没拿到就说还在等对方。拿到剩余/已用后口头确认一句。",
+        "en": "You are calling China Mobile's hotline 10086 on the owner's behalf to check the data usage on the owner's number. You are the caller asking for help — not an agent, never impersonate the owner. After the call connects, listen through the first IVR menu announcement completely; do not speak during IVR playback or transfer hold. Only say short keywords when the system explicitly prompts for voice input, and never interrupt or introduce yourself. For keypad menus you must call the send_dtmf tool to actually press keys, not just say a digit. Once transferred to a human, explain your need in one sentence. Never make up figures or claim you have them before they are given — say you're still waiting. Confirm the result in one sentence."
       },
-      "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."}
+      "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."},
+      "opening_mode": "wait"
     },
     {
       "id": "china_unicom_data",

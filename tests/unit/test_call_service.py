@@ -6,6 +6,7 @@ import asyncio
 import threading
 import time
 
+import numpy as np
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
 from agentcall.call_agent import CallAgentService
@@ -244,7 +245,15 @@ def test_service_send_dtmf_uses_inband_audio_for_uac(monkeypatch):
     service.session._drain_agent_audio(bridge)
     assert len(bridge.downlink) == 1
     tone = bridge.downlink[0]
-    assert len(tone) == int(8000 * 0.2) * 2
+    # #80-D 实际送桥 payload:lead 100ms 静音 + tone 200ms + tail 120ms
+    # 静音 = 420ms（单键无末尾 gap，gap 仅用于 digit 之间）。
+    assert len(tone) == int(8000 * 0.42) * 2
+    samples = np.frombuffer(tone, dtype=np.int16)
+    lead = int(8000 * 0.10)
+    tone_end = lead + int(8000 * 0.20)
+    assert np.all(samples[:lead] == 0)          # 头部隔离带
+    assert np.any(samples[lead:tone_end] != 0)  # 双音本体
+    assert np.all(samples[tone_end:] == 0)      # 尾部隔离带（单键无末尾 gap）
     assert record.downlink == [tone]
     assert record.events == [
         ("dtmf", {"count": 1, "mode": "inband", "result": "success"})
@@ -661,3 +670,234 @@ def test_same_text_different_timestamp_both_delivered():
     sms_in = [e for e in hub.history() if e.get("type") == "sms_in"]
     assert len(sms_in) == 2
     assert len(forwarder.enqueued) == 2
+
+def test_outbound_opening_mode_wait_skips_opening(monkeypatch, tmp_path):
+    """#80-B:profile opening_mode=wait → 外呼接通后不发开场白,等对方先说。"""
+    import json as _json
+
+    profiles = tmp_path / "number_profiles.json"
+    profiles.write_text(
+        _json.dumps(
+            {
+                "profiles": [
+                    {
+                        "number": "10000",
+                        "scenario": "IVR 热线:按键菜单必须调 send_dtmf",
+                        "opening_mode": "wait",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profiles))
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    service = make_service(modem)
+    ok, err = service.dial("10000")
+    assert ok, err
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not agent.started:
+        time.sleep(0.05)
+    time.sleep(0.3)  # 留出会说开场白的窗口(错误实现会在此期间 say)
+
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    assert agent.said == []  # wait 模式:全程未主动开场
+    assert "IVR 热线" in agent._session_instructions  # profile scenario 已生效
+
+
+def test_outbound_opening_mode_default_still_says_opening(monkeypatch, tmp_path):
+    """对照:profile 未声明 opening_mode → 行为不变,照说开场白。"""
+    import json as _json
+
+    profiles = tmp_path / "number_profiles.json"
+    profiles.write_text(
+        _json.dumps(
+            {"profiles": [{"number": "10000", "scenario": "普通场景"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profiles))
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    service = make_service(modem)
+    ok, err = service.dial("10000")
+    assert ok, err
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not agent.said:
+        time.sleep(0.05)
+
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    assert len(agent.said) == 1  # 默认行为:开场白照发
+
+
+def test_opening_mode_wait_does_not_record_greeting_sent(monkeypatch, tmp_path):
+    """#80-B:opening_mode=wait 不发开场白 → 不记录 greeting_sent 事件。"""
+    import json as _json
+
+    profiles = tmp_path / "number_profiles.json"
+    profiles.write_text(
+        _json.dumps(
+            {"profiles": [{"number": "10000", "scenario": "IVR", "opening_mode": "wait"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profiles))
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    record = SpyCallRecord()
+    # _begin_record 每次会话第一个动作就是建 record，monkeypatch 注入 spy
+    monkeypatch.setattr("agentcall.call_agent.CallSession._begin_record",
+                        lambda self, direction, number: record)
+
+    service = make_service(modem)
+    ok, err = service.dial("10000")
+    assert ok, err
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not agent.started:
+        time.sleep(0.05)
+    time.sleep(0.3)
+
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    event_types = [e[0] for e in record.events]
+    assert "greeting_sent" not in event_types, (
+        "wait 模式不应记录 greeting_sent: " + ", ".join(event_types)
+    )
+    skipped = [e for e in record.events if e[0] == "opening_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0][1].get("mode") == "wait"
+
+    # prompt_gen 事件也记录 opening_mode
+    pg_events = [e for e in record.events if e[0] == "prompt_gen"]
+    assert len(pg_events) == 1
+    assert pg_events[0][1].get("opening_mode") == "wait"
+
+
+def test_opening_mode_reset_across_calls_no_leak(monkeypatch, tmp_path):
+    """#80-B:CallSession 每通 start 硬重置 _prompt_gen_opening_mode="say"；
+    上一通 wait 不泄漏到下一通默认 say。"""
+    import json as _json
+
+    profiles = tmp_path / "number_profiles.json"
+    profiles.write_text(
+        _json.dumps(
+            {
+                "profiles": [
+                    {"number": "10000", "scenario": "wait profile", "opening_mode": "wait"},
+                    {"number": "10086", "scenario": "default profile"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NUMBER_PROFILES_ENABLED", "true")
+    monkeypatch.setenv("NUMBER_PROFILES_FILE", str(profiles))
+    monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    agents: list[FakeAgent] = []
+
+    def _make_agent(_provider):
+        ag = FakeAgent()
+        agents.append(ag)
+        return ag
+
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", _make_agent)
+
+    # === 第一通:wait 模式 ===
+    record1 = SpyCallRecord()
+    monkeypatch.setattr("agentcall.call_agent.CallSession._begin_record",
+                        lambda self, direction, number: record1)
+
+    service = make_service(modem)
+    ok, err = service.dial("10000")
+    assert ok, err
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+    # agent 在后台线程中创建，合并条件：先出现再 started，避免 IndexError
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and (not agents or not agents[0].started):
+        time.sleep(0.05)
+    assert agents and agents[0].started, "第一通 agent 未在时限内 started"
+    time.sleep(0.3)
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    # 第一通 wait → 无 greeting_sent
+    assert "greeting_sent" not in [e[0] for e in record1.events]
+
+    # === 第二通:默认 say 模式 ===
+    record2 = SpyCallRecord()
+    monkeypatch.setattr("agentcall.call_agent.CallSession._begin_record",
+                        lambda self, direction, number: record2)
+    modem.calls.clear()
+
+    ok, err = service.dial("10086")
+    assert ok, err
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10086",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10086")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and (len(agents) < 2 or not agents[1].started):
+        time.sleep(0.05)
+    time.sleep(0.3)
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+
+    # 第二通 默认 → 应有 greeting_sent（证明 wait 未泄漏）
+    assert "greeting_sent" in [e[0] for e in record2.events], (
+        "第二通默认 say 应记录 greeting_sent: " + ", ".join(e[0] for e in record2.events)
+    )

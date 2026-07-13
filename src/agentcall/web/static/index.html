@@ -933,6 +933,15 @@
                     </label>
                   </div>
                 </div>
+                <div class="profile-topline">
+                  <div class="profile-field">
+                    <label for="profileOpeningMode" data-i18n="profile_opening_mode"></label>
+                    <select id="profileOpeningMode">
+                      <option value="say" data-i18n="profile_opening_mode_say"></option>
+                      <option value="wait" data-i18n="profile_opening_mode_wait"></option>
+                    </select>
+                  </div>
+                </div>
                 <div class="profile-languages">
                   <fieldset class="profile-language">
                     <legend data-i18n="profile_lang_zh"></legend>
@@ -1192,9 +1201,9 @@ const I18N = {
     remote_cloud_connecting: "Cloud registered · connecting", remote_cloud_connected: "Cloud connected",
     remote_cloud_enrolled: "Computer registered", remote_cloud_failed: "Registration failed: ",
     voice_preview: "Preview voices ↗",
-    ph_task: "Call topic (blank = reuse last)", task_prefix: "Topic (blank = reuse): ",
+    ph_task: "Describe what this call should accomplish",
     calling: "Calling…", call_sent: "Call started", call_fail: "Call failed",
-    need_number: "Enter a number", req_error: "Request error",
+    need_number: "Enter a number", need_task: "Describe this call or select a preset", req_error: "Request error",
     batch_label: "BATCH DIALING", ph_batch_numbers: "One number per line",
     ph_batch_task: "Task for this batch (optional)", enqueue: "Enqueue",
     enqueuing: "Enqueuing…", enq_ok: (n) => `Queued ${n}`, enq_rej: (n) => `, rejected ${n}`,
@@ -1209,6 +1218,7 @@ const I18N = {
     profile_number: "Phone number", profile_match: "Match rule", profile_exact: "Exact task", profile_number_default: "Number fallback",
     profile_enabled: "Enabled", profile_lang_zh: "CHINESE", profile_lang_en: "ENGLISH",
     profile_label: "Dropdown label", profile_task: "Matching task", profile_scenario: "Scenario strategy", profile_opening: "First sentence",
+    profile_opening_mode: "Opening mode", profile_opening_mode_say: "Say immediately (default)", profile_opening_mode_wait: "Wait for IVR menu",
     profile_save: "Save", profile_cancel: "Cancel", profile_duplicate: "Duplicate", profile_delete: "Delete",
     profile_saving: "Saving…", profile_saved: "Preset saved", profile_deleted: "Preset deleted",
     profile_need_number: "Enter a dialable phone number.", profile_need_scenario: "Add a scenario strategy in at least one language.",
@@ -1360,9 +1370,9 @@ const I18N = {
     remote_cloud_connecting: "云端已注册 · 正在连接", remote_cloud_connected: "云端已连接",
     remote_cloud_enrolled: "电脑注册成功", remote_cloud_failed: "注册失败：",
     voice_preview: "官网试听 ↗",
-    ph_task: "外呼主题（空=沿用上次）", task_prefix: "主题（空=沿用）：",
+    ph_task: "描述本次要完成的事项",
     calling: "呼叫中…", call_sent: "已发起呼叫", call_fail: "呼叫失败",
-    need_number: "请填写号码", req_error: "请求出错",
+    need_number: "请填写号码", need_task: "请填写本次任务或选择预设", req_error: "请求出错",
     batch_label: "批量外呼", ph_batch_numbers: "每行一个号码，可批量粘贴",
     ph_batch_task: "本批次任务说明（可选）", enqueue: "加入队列",
     enqueuing: "入队中…", enq_ok: (n) => `已入队 ${n} 个`, enq_rej: (n) => `，拒绝 ${n} 个`,
@@ -1377,6 +1387,7 @@ const I18N = {
     profile_number: "电话号码", profile_match: "匹配规则", profile_exact: "号码+任务", profile_number_default: "号码通配",
     profile_enabled: "启用本条", profile_lang_zh: "中文", profile_lang_en: "英文",
     profile_label: "下拉显示名称", profile_task: "匹配任务", profile_scenario: "场景策略", profile_opening: "第一句话",
+    profile_opening_mode: "开场模式", profile_opening_mode_say: "直接说开场白（默认）", profile_opening_mode_wait: "等待 IVR 菜单播报",
     profile_save: "保存", profile_cancel: "取消", profile_duplicate: "复制", profile_delete: "删除",
     profile_saving: "保存中…", profile_saved: "预设已保存", profile_deleted: "预设已删除",
     profile_need_number: "请输入可以拨打的电话号码。", profile_need_scenario: "请至少填写一种语言的场景策略。",
@@ -1841,6 +1852,7 @@ function blankManagedProfile() {
   return {
     id: "", enabled: true, number: "", match_mode: "exact",
     label: { ...blank }, task: { ...blank }, scenario: { ...blank }, opening: { ...blank },
+    opening_mode: "say",
   };
 }
 
@@ -1929,6 +1941,7 @@ function openProfileEditor(profile) {
     setProfileField(`profile${suffix}En`, profileExactLangValue(item, field, "en"));
   }
   setProfileMatchMode(item.match_mode || "exact");
+  $("profileOpeningMode").value = (item.opening_mode === "wait" ? "wait" : "say");
   $("profileDelete").hidden = !item.id;
   $("profileToast").className = "toast profile-toast";
   $("profileToast").textContent = "";
@@ -1954,6 +1967,7 @@ function readProfileForm() {
     task: { zh: $("profileTaskZh").value.trim(), en: $("profileTaskEn").value.trim() },
     scenario: { zh: $("profileScenarioZh").value.trim(), en: $("profileScenarioEn").value.trim() },
     opening: { zh: $("profileOpeningZh").value.trim(), en: $("profileOpeningEn").value.trim() },
+    opening_mode: $("profileOpeningMode").value,
   };
 }
 
@@ -2142,13 +2156,14 @@ async function doDial() {
   const number = $("dialNumber").value.trim();
   if (!number) { setToast("dialToast", "err", t("need_number")); return; }
   const task = $("dialTask").value.trim();
+  if (!task && !dialPresetId) { setToast("dialToast", "err", t("need_task")); return; }
   const btn = $("dialBtn");
   btn.disabled = true; setToast("dialToast", "", t("calling"));
   try {
     const { res } = await postJson("/api/call/dial", { number, task: task || null, preset_task: dialPresetHint, preset_id: dialPresetId });
     if (res.ok) {
       setToast("dialToast", "ok", t("call_sent"));
-      if (task) { updateTaskPlaceholder(task); $("dialTask").value = ""; }
+      if (task) $("dialTask").value = "";
     } else setToast("dialToast", "err", res.error || t("call_fail"));
   } catch (err) { setToast("dialToast", "err", t("req_error")); }
   finally { btn.disabled = false; }
@@ -2331,19 +2346,6 @@ $("remoteInviteCancel").addEventListener("click", async () => {
   try { await postJson("/api/remote_dialer/cancel", {}); } catch (e) { /* local cleanup still applies */ }
   clearRemoteInvite();
 });
-
-function updateTaskPlaceholder(task) {
-  const t2 = (task || "").trim();
-  window._lastTask = t2 || window._lastTask;
-  if (t2) $("dialTask").placeholder = t("task_prefix") + (t2.length > 22 ? t2.slice(0, 22) + "…" : t2);
-}
-async function loadDefaultTask() {
-  try {
-    const specs = await (await fetch("/api/config")).json();
-    const spec = specs.find((c) => c.key === "AGENT_OUTBOUND_TASK");
-    if (spec) updateTaskPlaceholder(spec.value);
-  } catch (e) { console.warn("[config] 加载默认外呼主题失败", e); }
-}
 
 $("hangupBtn").addEventListener("click", async () => {
   const choice = await showModal({
@@ -2622,7 +2624,6 @@ $("batchDialBtn").addEventListener("click", async () => {
       if (res.rejected.length) msg += t("enq_rej")(res.rejected.length);
       setToast("batchToast", res.accepted.length ? "ok" : "err", msg);
       if (res.accepted.length) $("batchNumbers").value = "";
-      if (task) updateTaskPlaceholder(task);
       refreshQueue();
     } else setToast("batchToast", "err", t("enq_fail") + (res.error || ""));
   } catch (err) { setToast("batchToast", "err", t("req_error")); }
@@ -3239,7 +3240,6 @@ function setLang(code) {
   loadConfig();
   refreshQueue();
   loadDialPresets();  // 语言切换后重取预设，label/task 跟随界面语言
-  if (window._lastTask) updateTaskPlaceholder(window._lastTask);
 }
 $("langBtn").addEventListener("click", (e) => {
   e.stopPropagation();
@@ -3259,7 +3259,6 @@ connect();
 loadHistory().then(loadRecent);
 refreshQueue();
 loadConfig();
-loadDefaultTask();
 loadDialPresets();
 loadRemoteDialerStatus();
 setInterval(refreshQueue, 2000);

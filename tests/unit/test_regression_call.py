@@ -136,6 +136,63 @@ def test_says_i_press_without_dtmf_warns_but_does_not_fail():
     assert not report.has_failures
 
 
+def test_dtmf_waits_for_next_remote_transcript():
+    events = _base_events(
+        _event("transcript", role="agent", text="你好，我想查流量。", ts=2.0),
+        _event("dtmf", mode="inband", result="success", ts=5.0),
+        _event("transcript", role="user", text="正在为您连接。", ts=7.4),
+    )
+
+    result = _result(_report(events), "dtmf_followup")
+
+    assert result.status == "PASS"
+    assert "+2.4s" in result.detail
+    assert "正在为您连接" in result.detail
+
+
+def test_legacy_dtmf_without_result_is_still_observed():
+    events = _base_events(
+        _event("transcript", role="agent", text="你好，我想查流量。", ts=2.0),
+        _event("dtmf", mode="inband", ts=5.0),
+        _event("transcript", role="user", text="正在为您连接。", ts=9.1),
+    )
+
+    result = _result(_report(events), "dtmf_followup")
+
+    assert result.status == "PASS"
+    assert "+4.1s" in result.detail
+
+
+def test_agent_speaking_after_dtmf_before_remote_transcript_fails():
+    events = _base_events(
+        _event("transcript", role="agent", text="你好，我想查流量。", ts=2.0),
+        _event("dtmf", mode="inband", result="success", ts=5.0),
+        _event("transcript", role="user", text="请按一。", ts=5.1),
+        _event("transcript", role="agent", text="好的，我已经按一了。", ts=5.6),
+        _event("transcript", role="user", text="正在为您连接。", ts=7.0),
+    )
+
+    result = _result(_report(events), "dtmf_followup")
+
+    assert result.status == "FAIL"
+    assert "0.6s" in result.detail
+    assert "已经按一" in result.detail
+
+
+def test_dtmf_without_remote_transcript_in_observation_window_warns():
+    events = _base_events(
+        _event("transcript", role="agent", text="你好，我想查流量。", ts=2.0),
+        _event("dtmf", mode="inband", result="success", ts=5.0),
+        _event("transcript", role="user", text="稍后才出现的播报。", ts=14.1),
+    )
+
+    result = _result(_report(events), "dtmf_followup")
+
+    assert result.status == "WARN"
+    assert "8s" in result.detail
+    assert "9.1s" in result.detail
+
+
 def test_agent_repeats_user_supplied_value_passes_fabrication_check():
     report = _report(
         _base_events(

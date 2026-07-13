@@ -33,7 +33,7 @@ from .. import config
 from ..prompts import agent_language, repeat_nudge_instructions
 from ..repeat_suppression import RepeatSuppressor
 from .base import VoiceAgent
-from .tools import TERMINAL_TOOLS
+from .tools import SILENT_AFTER_TOOLS, TERMINAL_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -446,16 +446,16 @@ class LocalPipelineAgent(VoiceAgent):
                 self._messages.append(message)
             if not tool_calls:
                 return str(message.get("content") or "")
-            terminal = self._run_tool_calls(tool_calls)
-            if terminal:
-                # 终结性工具（挂断）：告别语已在调用前说完，不再要新回复。
+            wait_for_remote = self._run_tool_calls(tool_calls)
+            if wait_for_remote:
+                # 挂断后结束；DTMF 后等待对端下一段话，不生成口头确认。
                 return None
         logger.warning("工具调用超过 %d 轮仍未产出应答，跳过本轮", _MAX_TOOL_ROUNDS)
         return None
 
     def _run_tool_calls(self, tool_calls: list[dict]) -> bool:
-        """执行工具并把结果回填对话；返回是否触发了终结性工具。"""
-        terminal = False
+        """执行工具并回填结果；返回本轮是否应停止生成后续回复。"""
+        wait_for_remote = False
         for call in tool_calls:
             function = call.get("function") or {}
             name = str(function.get("name") or "")
@@ -469,8 +469,8 @@ class LocalPipelineAgent(VoiceAgent):
                 result = self._tools.dispatch(name, args)
             else:
                 result = {"success": False, "message": "无可用工具"}
-            if name in TERMINAL_TOOLS:
-                terminal = True
+            if name in TERMINAL_TOOLS or name in SILENT_AFTER_TOOLS:
+                wait_for_remote = True
             with self._messages_lock:
                 self._messages.append(
                     {
@@ -479,7 +479,7 @@ class LocalPipelineAgent(VoiceAgent):
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
-        return terminal
+        return wait_for_remote
 
     def _speak(self, text: str) -> None:
         pipeline = self._pipeline

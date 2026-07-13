@@ -520,6 +520,62 @@ def test_failed_remote_dtmf_audit_does_not_contain_plaintext() -> None:
     asyncio.run(run())
 
 
+def test_dtmf_config_error_does_not_crash_remote_session() -> None:
+    """非法 runtime DTMF 配置(tone_ms=0)应发 invalid_dtmf_config 但不杀会话。
+
+    回归验证(#80-D):dtmf_tone() 新增 ValueError 校验后,remote_dialer
+    必须局部 catch 而不能让异常冒到 coordinator.run() 的通用 handler,
+    否则会把整通远程通话标记为 edge_error 并关闭 endpoint。
+    """
+
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        modem = FakeModem()
+        bridge = FakeBridge()
+        runtime = RemoteDialerRuntimeConfig(
+            audio_mode="uac",
+            audio_keyword="Interface",
+            pcm_port=None,
+            pcm_baudrate=921600,
+            tx_gain=1.0,
+            disconnect_grace_seconds=0.05,
+            outbound_max_seconds=2.0,
+            connect_timeout_seconds=0.2,
+            dtmf_mode="inband",
+            dtmf_tone_ms=0,  # 非法:触发 dtmf_tone() ValueError
+        )
+        coordinator = RemoteWebDialerCoordinator(
+            session_id="session-test",
+            expires_at=time.time() + 60,
+            modem=modem,  # type: ignore[arg-type]
+            endpoint=endpoint,
+            runtime=runtime,
+            call_logger=None,
+            reserve_line=lambda _owner: None,
+            release_line=lambda _owner: None,
+            publish_event=lambda _event: None,
+        )
+        coordinator.call_active.set()
+        coordinator._bridge = bridge  # type: ignore[assignment]
+
+        # DTMF with invalid config should NOT raise
+        await coordinator._handle_dtmf({"digits": "5"})
+
+        # call_active should still be set (session not killed)
+        assert coordinator.call_active.is_set()
+
+        # should have received dtmf_failed with invalid_dtmf_config code
+        dtmf_events = [e for e in endpoint.events if e.get("event") == "dtmf_failed"]
+        assert len(dtmf_events) == 1
+        assert dtmf_events[0].get("code") == "invalid_dtmf_config"
+
+        # no edge_error event
+        error_events = [e for e in endpoint.events if e.get("code") == "edge_error"]
+        assert len(error_events) == 0
+
+    asyncio.run(run())
+
+
 def test_media_disconnect_grace_hangs_up_real_call() -> None:
     async def run() -> None:
         endpoint = FakeRemoteEndpoint()

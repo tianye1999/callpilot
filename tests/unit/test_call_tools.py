@@ -11,6 +11,7 @@ import logging
 
 from fakes import FakeModem
 
+from agentcall.agents.tools import SEND_DTMF_SPEC
 from agentcall.call_tools import CallTools
 from agentcall.events import EventHub
 
@@ -59,6 +60,13 @@ def test_register_exposes_all_four_tools():
     registry = tools.register()
     names = {spec["function"]["name"] for spec in registry.specs()}
     assert names == {"send_sms", "hangup_call", "query_verification_code", "send_dtmf"}
+
+
+def test_send_dtmf_tool_description_requires_silent_execution():
+    description = SEND_DTMF_SPEC["function"]["description"]
+
+    assert "不要口头宣布按键动作" in description
+    assert "发送后保持沉默" in description
 
 
 def test_query_code_tool_can_be_disabled(monkeypatch):

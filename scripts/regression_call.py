@@ -40,6 +40,8 @@ VALUE_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:GB|MB|G|兆|元)", re.IGNORECASE)
 INSTITUTION_RE = re.compile(r"这里是.{0,8}(客服|热线)")
 PRESS_RE = re.compile(r"我(?:来)?按(?:一下|下)?\s*[0-9一二三四五六七八九零#*]")
 OWNER_FIELD_NAMES = ("owner", "owner_name", "ownerName", "user_name", "userName")
+DTMF_OBSERVATION_SECONDS = 8.0
+DTMF_SILENCE_GUARD_SECONDS = 3.0
 
 
 class RegressionError(RuntimeError):
@@ -99,6 +101,7 @@ def run_assertions(events: Sequence[Event], transcripts: Sequence[Transcript], m
             check_no_repeat_stuck(transcripts),
             check_normal_ending(events, meta),
             check_dtmf_audit(events, transcripts),
+            check_dtmf_followup(events),
             check_no_redundant_reask(transcripts),
         ]
     )
@@ -217,11 +220,11 @@ def check_no_redundant_reask(transcripts: Sequence[Transcript]) -> CheckResult:
         if similar >= 3:
             return CheckResult(
                 "no_redundant_reask",
-                "8. 无复读式追问",
+                "9. 无复读式追问",
                 "WARN",
                 f"近似同句追问 {similar} 次: {_clip(raw)}",
             )
-    return CheckResult("no_redundant_reask", "8. 无复读式追问", "PASS", "无高相似追问 ≥3 次")
+    return CheckResult("no_redundant_reask", "9. 无复读式追问", "PASS", "无高相似追问 ≥3 次")
 
 
 def check_normal_ending(events: Sequence[Event], meta: Event | None = None) -> CheckResult:
@@ -275,6 +278,125 @@ def check_dtmf_audit(events: Sequence[Event], transcripts: Sequence[Transcript])
     if dtmf_events:
         return CheckResult("dtmf_audit", "7. DTMF 审计一致", "PASS", "所有 dtmf 事件 mode=inband")
     return CheckResult("dtmf_audit", "7. DTMF 审计一致", "PASS", "未出现按键表述，也无 dtmf 事件")
+
+
+def check_dtmf_followup(events: Sequence[Event]) -> CheckResult:
+    """Observe whether the agent stays silent until the next remote transcript.
+
+    This deliberately does not classify menu text as success/failure. IVR wording
+    is open-ended; the timing and transcript excerpt are evidence for a human A/B
+    decision, not a keyword-driven IVR state machine.
+    """
+    observations: list[CheckResult] = []
+    for index, event in enumerate(events):
+        if event.get("type") != "dtmf" or event.get("result") == "failure":
+            continue
+        sent_at = _number(event.get("ts"))
+        if sent_at is None:
+            observations.append(CheckResult(
+                "dtmf_followup",
+                "8. DTMF 后静默与菜单观测",
+                "WARN",
+                "成功 dtmf 事件缺少 ts，无法计算后续菜单延迟",
+            ))
+            continue
+
+        remote_candidates: list[tuple[float, str]] = []
+        immediate_agent: tuple[float, str] | None = None
+        for later in events[index + 1 :]:
+            if later.get("type") == "dtmf":
+                break
+            if later.get("type") != "transcript":
+                continue
+            at = _number(later.get("ts"))
+            text = later.get("text")
+            if at is None or not isinstance(text, str) or not text.strip():
+                continue
+            role = later.get("role")
+            delay = max(0.0, at - sent_at)
+            if (
+                role == "agent"
+                and immediate_agent is None
+                and delay <= DTMF_SILENCE_GUARD_SECONDS
+            ):
+                immediate_agent = (delay, text.strip())
+            elif (
+                role == "user"
+                and delay <= DTMF_OBSERVATION_SECONDS
+                and len(remote_candidates) < 3
+            ):
+                remote_candidates.append((delay, text.strip()))
+
+        if immediate_agent is not None:
+            observations.append(CheckResult(
+                "dtmf_followup",
+                "8. DTMF 后静默与菜单观测",
+                "FAIL",
+                f"DTMF 后 {immediate_agent[0]:.1f}s Agent 在静默保护窗内说话: "
+                f"{_clip(immediate_agent[1])}",
+            ))
+            continue
+
+        if not remote_candidates:
+            later_remote: tuple[float, str] | None = None
+            for later in events[index + 1 :]:
+                if later.get("type") == "dtmf":
+                    break
+                later_at = _number(later.get("ts"))
+                later_text = later.get("text")
+                if (
+                    later.get("type") == "transcript"
+                    and later.get("role") == "user"
+                    and later_at is not None
+                    and isinstance(later_text, str)
+                    and later_text.strip()
+                ):
+                    later_remote = (
+                        max(0.0, later_at - sent_at),
+                        later_text.strip(),
+                    )
+                    break
+            later_detail = ""
+            if later_remote is not None:
+                later_detail = f"；首段在 {later_remote[0]:.1f}s: {_clip(later_remote[1])}"
+            observations.append(CheckResult(
+                "dtmf_followup",
+                "8. DTMF 后静默与菜单观测",
+                "WARN",
+                f"DTMF 后 {DTMF_OBSERVATION_SECONDS:g}s 观测窗内无后续对端转写"
+                f"{later_detail}",
+            ))
+            continue
+        candidates = " | ".join(
+            f"+{delay:.1f}s {_clip(text, 60)}" for delay, text in remote_candidates
+        )
+        observations.append(CheckResult(
+            "dtmf_followup",
+            "8. DTMF 后静默与菜单观测",
+            "PASS",
+            f"Agent 静默 ≥{DTMF_SILENCE_GUARD_SECONDS:g}s；"
+            f"对端候选（人工判菜单是否推进）: {candidates}",
+        ))
+
+    if not observations:
+        return CheckResult(
+            "dtmf_followup",
+            "8. DTMF 后静默与菜单观测",
+            "PASS",
+            "无已发送 DTMF 事件",
+        )
+    for status in ("FAIL", "WARN"):
+        result = next((item for item in observations if item.status == status), None)
+        if result is not None:
+            return result
+    if len(observations) == 1:
+        return observations[0]
+    return CheckResult(
+        "dtmf_followup",
+        "8. DTMF 后静默与菜单观测",
+        "PASS",
+        f"{len(observations)} 次 DTMF 后均先收到对端转写",
+    )
 
 
 def load_events(call_dir: Path) -> list[dict[str, object]]:
