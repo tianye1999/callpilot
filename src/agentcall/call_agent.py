@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import threading
@@ -31,6 +32,7 @@ from .events import EventHub
 from .modem import Eg25Modem
 from .monitor_playback import MonitorPlayback
 from .number_profiles import lookup_profile, lookup_profile_by_id
+from .pcm_stats import PcmFlowStats
 from .prompt_gen import generate_prompt_scenario
 from .prompts import (
     agent_language,
@@ -437,6 +439,15 @@ class CallSession:
         goal = self._outbound_task(agent_language()) if judge_enabled else ""
         # 浏览器实时旁听：对方上行电平低，推给浏览器前按此增益放大到可闻。
         uplink_listen_gain = config.get_float("MONITOR_UPLINK_GAIN")
+        agent_uplink_gain = config.get_float("AGENT_UPLINK_GAIN")
+        if not math.isfinite(agent_uplink_gain) or agent_uplink_gain <= 0:
+            logger.warning(
+                "AGENT_UPLINK_GAIN=%r 非法，当前通话回落为 1.0",
+                agent_uplink_gain,
+            )
+            agent_uplink_gain = 1.0
+        uplink_pre_stats = PcmFlowStats("agent_uplink_pre_gain")
+        uplink_post_stats = PcmFlowStats("agent_uplink_post_gain")
         winddown_deadline: float | None = None
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
@@ -509,7 +520,12 @@ class CallSession:
                     self.uplink_monitor.feed(pcm_8k)
                 if not suppress_uplink:
                     pcm_agent = bridge.modem_to_agent(pcm_8k, agent.input_rate)
+                    uplink_pre_stats.add(pcm_agent)
+                    pcm_agent = apply_pcm_gain(pcm_agent, agent_uplink_gain)
+                    uplink_post_stats.add(pcm_agent)
                     await agent.send_audio(pcm_agent)
+            uplink_pre_stats.maybe_log(gain=agent_uplink_gain)
+            uplink_post_stats.maybe_log(gain=agent_uplink_gain)
             await asyncio.sleep(0.01)
 
     def _load_session_config(self) -> None:
