@@ -206,6 +206,22 @@ class _QwenCallback(OmniRealtimeCallback):
                 self._agent._audio_gate.complete_response(_response_id(response))  # noqa: SLF001
                 self._agent._on_response_done()  # noqa: SLF001
             logger.debug("千问回复轮次完成")
+        elif event_type == "session.updated":
+            session = response.get("session")
+            session_data = session if isinstance(session, dict) else {}
+            turn_detection = session_data.get("turn_detection")
+            turn_data = turn_detection if isinstance(turn_detection, dict) else {}
+            create_response = turn_data.get("create_response", "unknown")
+            requested = bool(
+                self._agent is not None
+                and self._agent._manual_response_enabled  # noqa: SLF001
+            )
+            logger.info(
+                "千问 Realtime session.updated: "
+                "manual_response_requested=%s create_response=%s",
+                requested,
+                create_response,
+            )
         elif event_type == "error":
             logger.error("千问 Realtime 错误: %s", response)
 

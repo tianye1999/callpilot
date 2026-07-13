@@ -179,6 +179,25 @@ def test_send_dtmf_result_waits_for_next_utterance_without_followup_speech():
     assert pipeline.synthesized == []
 
 
+def test_external_tool_result_appends_system_fact_without_generating_speech():
+    agent = LocalPipelineAgent(pipeline_factory=FakePipeline)
+    agent._messages = [{"role": "system", "content": "base"}]
+
+    accepted = asyncio.run(
+        agent.external_tool_result(
+            "send_dtmf",
+            {"success": True, "count": 1, "mode": "qvts"},
+            source="spoken_followup",
+        )
+    )
+
+    assert accepted is True
+    assert len(agent._messages) == 2
+    assert agent._messages[-1]["role"] == "system"
+    assert "send_dtmf" in agent._messages[-1]["content"]
+    assert agent._brain_queue.empty()
+
+
 def test_llm_failures_mark_fatal():
     replies = [RuntimeError("boom"), RuntimeError("boom"), RuntimeError("boom")]
     agent, _pipeline, _seen = _make_agent(replies)

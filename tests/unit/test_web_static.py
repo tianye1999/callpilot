@@ -151,6 +151,9 @@ def test_profile_manager_has_crud_controls_and_safe_rendering():
     assert 'opening_mode: "say"' in text    # blankManagedProfile 默认
     assert 'opening_mode: $("profileOpeningMode").value' in text  # readProfileForm
     assert '$("profileOpeningMode").value' in text  # openProfileEditor set
+    assert 'id="profileDtmfSpokenFollowup"' in text
+    assert "dtmf_spoken_followup: false" in text
+    assert 'dtmf_spoken_followup: $("profileDtmfSpokenFollowup").checked' in text
 
 
 def test_manual_dial_requires_explicit_task_or_selected_preset():

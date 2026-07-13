@@ -198,6 +198,31 @@ def test_manual_response_control_off_keeps_session_and_completed_path(monkeypatc
         asyncio.run(agent.stop())
 
 
+def test_session_updated_logs_manual_response_ack_without_session_payload(
+    monkeypatch, caplog
+):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        with caplog.at_level(logging.INFO, logger="agentcall.agents.qwen_agent"):
+            agent._callback.on_event(
+                {
+                    "type": "session.updated",
+                    "session": {
+                        "turn_detection": {"create_response": False},
+                        "instructions": "private profile content",
+                    },
+                }
+            )
+        assert "session.updated" in caplog.text
+        assert "manual_response_requested=True" in caplog.text
+        assert "create_response=False" in caplog.text
+        assert "private profile content" not in caplog.text
+    finally:
+        asyncio.run(agent.stop())
+
+
 def test_manual_response_control_debounces_completed_events(monkeypatch):
     monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
     monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "30")

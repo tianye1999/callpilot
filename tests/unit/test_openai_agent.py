@@ -95,6 +95,22 @@ async def _drain() -> None:
         await asyncio.sleep(0)
 
 
+async def _wait_for_sent_count(
+    ws: _FakeWs,
+    event_type: str,
+    expected: int,
+    *,
+    timeout: float = 2.0,
+) -> None:
+    """Wait for timer-thread work without assuming runner scheduling speed."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while ws.sent_types().count(event_type) < expected and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    assert ws.sent_types().count(event_type) == expected
+
+
 # ---------------------------------------------------------------------------
 # 连接与 session.update
 # ---------------------------------------------------------------------------
@@ -167,6 +183,156 @@ def test_session_instructions_override_default(monkeypatch):
             session = instances[0].sent[0]["session"]
             assert session["instructions"] == "外呼任务：确认预约"
             assert "tools" not in session  # 未注册工具时不带 tools 字段
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_manual_response_control_sets_create_response_false_and_debounces(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "25")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            turn_detection = ws.sent[0]["session"]["audio"]["input"]["turn_detection"]
+            assert turn_detection == {"type": "server_vad", "create_response": False}
+            for text in ("第一段菜单", "第二段菜单", "第三段菜单"):
+                ws.feed(
+                    {
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": text,
+                    }
+                )
+                await asyncio.sleep(0.01)
+            await _wait_for_sent_count(ws, "response.create", 1)
+            creates = [item for item in ws.sent if item["type"] == "response.create"]
+            assert creates == [{"type": "response.create"}]
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_manual_response_control_waits_for_active_response_done(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "20")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "AI 说话期间 IVR 继续播报",
+                }
+            )
+            await _drain()
+            await asyncio.sleep(0.05)
+            assert "response.create" not in ws.sent_types()
+
+            ws.feed({"type": "response.done", "response": {"id": "r1"}})
+            await _drain()
+            await _wait_for_sent_count(ws, "response.create", 1)
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_manual_response_control_stop_cancels_pending_timer(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "80")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        ws = instances[0]
+        ws.feed(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "稍后才该回复",
+            }
+        )
+        await _drain()
+        await agent.stop()
+        await asyncio.sleep(0.12)
+        assert "response.create" not in ws.sent_types()
+
+    asyncio.run(scenario())
+
+
+def test_manual_response_control_request_watchdog_recovers_missing_created(
+    monkeypatch,
+):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "15")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "0")
+    monkeypatch.setattr(
+        openai_agent, "_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS", 0.04
+    )
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "第一段播报",
+                }
+            )
+            await _drain()
+            await _wait_for_sent_count(ws, "response.create", 1)
+
+            ws.feed(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "created 丢失后的新播报",
+                }
+            )
+            await _drain()
+            await _wait_for_sent_count(ws, "response.create", 2)
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_manual_response_control_max_wait_forces_response(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "1000")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "45")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            for index in range(5):
+                ws.feed(
+                    {
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": f"连续播报 {index}",
+                    }
+                )
+                await asyncio.sleep(0.01)
+            await _wait_for_sent_count(ws, "response.create", 1)
         finally:
             await agent.stop()
 
@@ -497,6 +663,36 @@ def test_send_dtmf_result_waits_for_next_ivr_without_response_create(monkeypatch
     outputs = [m for m in ws.sent if m["type"] == "conversation.item.create"]
     assert len(outputs) == 1
     assert outputs[0]["item"]["type"] == "function_call_output"
+    assert "response.create" not in ws.sent_types()
+
+
+def test_external_tool_result_adds_system_fact_without_fake_call_or_response(monkeypatch):
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            accepted = await agent.external_tool_result(
+                "send_dtmf",
+                {"success": True, "count": 4, "mode": "inband"},
+                source="spoken_followup",
+            )
+            assert accepted is True
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+    ws = instances[0]
+    created = [item for item in ws.sent if item["type"] == "conversation.item.create"]
+    assert len(created) == 1
+    item = created[0]["item"]
+    assert item["type"] == "message"
+    assert item["role"] == "system"
+    assert item["content"][0]["type"] == "input_text"
+    assert "send_dtmf" in item["content"][0]["text"]
+    assert "call_id" not in item
     assert "response.create" not in ws.sent_types()
 
 

@@ -15,6 +15,8 @@ import asyncio
 import base64
 import json
 import logging
+import threading
+import time
 from datetime import datetime
 from typing import Any, Callable
 
@@ -33,6 +35,8 @@ DEFAULT_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
 # 输入音频转写模型（session.input_audio_transcription）。
 TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS = 5.0
+_MANUAL_RESPONSE_SEND_TIMEOUT_SECONDS = 5.0
 
 # 重连成功后让 Agent 主动安抚对方的提示词（与 qwen_agent 语义一致）。
 RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继续。"
@@ -101,6 +105,17 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._running = False
         self._handled_tool_calls: set[str] = set()
         self._instructions: str | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._manual_response_enabled = False
+        self._manual_response_lock = threading.Lock()
+        self._manual_response_timer: threading.Timer | None = None
+        self._manual_response_generation = 0
+        self._manual_response_watchdog_timer: threading.Timer | None = None
+        self._manual_response_watchdog_generation = 0
+        self._manual_response_first_at: float | None = None
+        self._manual_response_request_pending = False
+        self._manual_response_outstanding = 0
+        self._manual_response_pending_after_flight = False
 
     # ---- 连接管理 ----
 
@@ -149,7 +164,14 @@ class OpenAIVoiceAgent(VoiceAgent):
                 "input": {
                     "format": {"type": "audio/pcm", "rate": self.input_rate},
                     # 打断事件本轮忽略，半双工由 call_agent 统一管理。
-                    "turn_detection": {"type": "server_vad"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        **(
+                            {"create_response": False}
+                            if self._manual_response_enabled
+                            else {}
+                        ),
+                    },
                     "transcription": {"model": TRANSCRIPTION_MODEL},
                 },
                 "output": {
@@ -168,8 +190,11 @@ class OpenAIVoiceAgent(VoiceAgent):
         logger.info("OpenAI Realtime 连接已建立: %s", self.model)
 
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
+        self._loop = asyncio.get_running_loop()
         self._on_audio_out = on_audio_out
         self._running = True
+        self._manual_response_enabled = config.get_bool("MANUAL_RESPONSE_CONTROL")
+        self._reset_manual_response_state()
         self._instructions = self._session_instructions or _default_instructions()
         await self._connect()
         self._recv_task = asyncio.create_task(self._recv_loop())
@@ -242,6 +267,239 @@ class OpenAIVoiceAgent(VoiceAgent):
             # 重连由接收循环统一负责。
             logger.warning("发送说话指令失败: %s", exc)
 
+    async def external_tool_result(
+        self,
+        name: str,
+        result: dict[str, Any],
+        *,
+        source: str,
+    ) -> bool:
+        """Append a supported system item; do not fabricate a function call."""
+
+        ws = self._ws
+        if ws is None:
+            return False
+        success = result.get("success") is True
+        count = result.get("count")
+        safe_count = count if isinstance(count, int) and count >= 0 else 0
+        mode = result.get("mode")
+        safe_mode = mode if isinstance(mode, str) else "unknown"
+        text = (
+            f"[external_tool_result] {name} was executed by {source}; "
+            f"success={str(success).lower()}, count={safe_count}, mode={safe_mode}. "
+            "This is context only; do not speak merely to acknowledge it."
+        )
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "system",
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                    }
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("写入外部工具结果失败: error_type=%s", type(exc).__name__)
+            return False
+        return True
+
+    def _reset_manual_response_state(self) -> None:
+        with self._manual_response_lock:
+            self._cancel_manual_response_timer_locked()
+            self._cancel_manual_response_watchdog_locked()
+            self._manual_response_first_at = None
+            self._manual_response_request_pending = False
+            self._manual_response_outstanding = 0
+            self._manual_response_pending_after_flight = False
+
+    def _cancel_manual_response_control(self) -> None:
+        with self._manual_response_lock:
+            self._cancel_manual_response_timer_locked()
+            self._cancel_manual_response_watchdog_locked()
+            self._manual_response_first_at = None
+            self._manual_response_request_pending = False
+            self._manual_response_outstanding = 0
+            self._manual_response_pending_after_flight = False
+
+    def _cancel_manual_response_timer_locked(self) -> None:
+        timer = self._manual_response_timer
+        self._manual_response_timer = None
+        self._manual_response_generation += 1
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_manual_response_watchdog_locked(self) -> None:
+        timer = self._manual_response_watchdog_timer
+        self._manual_response_watchdog_timer = None
+        self._manual_response_watchdog_generation += 1
+        if timer is not None:
+            timer.cancel()
+
+    def _on_user_transcription_completed(self) -> None:
+        if self._manual_response_enabled:
+            self._schedule_manual_response_timer()
+
+    def _schedule_manual_response_timer(self) -> None:
+        now = time.monotonic()
+        with self._manual_response_lock:
+            if not self._running or self._ws is None:
+                return
+            if self._manual_response_request_pending:
+                self._manual_response_pending_after_flight = True
+                self._manual_response_first_at = None
+                return
+            if self._manual_response_first_at is None:
+                self._manual_response_first_at = now
+            timer = self._manual_response_timer
+            if timer is not None:
+                timer.cancel()
+            self._manual_response_generation += 1
+            generation = self._manual_response_generation
+            delay = self._manual_response_delay_locked(now)
+            next_timer = threading.Timer(
+                delay, self._fire_manual_response_timer, args=(generation,)
+            )
+            next_timer.daemon = True
+            self._manual_response_timer = next_timer
+            next_timer.start()
+
+    def _manual_response_delay_locked(self, now: float) -> float:
+        silence_seconds = max(0, config.get_int("MANUAL_RESPONSE_SILENCE_MS")) / 1000
+        max_wait_seconds = max(0, config.get_int("MANUAL_RESPONSE_MAX_WAIT_MS")) / 1000
+        if max_wait_seconds <= 0 or self._manual_response_first_at is None:
+            return silence_seconds
+        elapsed = now - self._manual_response_first_at
+        return min(silence_seconds, max(0.0, max_wait_seconds - elapsed))
+
+    def _fire_manual_response_timer(self, generation: int) -> None:
+        with self._manual_response_lock:
+            if generation != self._manual_response_generation or not self._running:
+                return
+            self._manual_response_timer = None
+            if self._manual_response_outstanding > 0:
+                self._manual_response_pending_after_flight = True
+                self._manual_response_first_at = None
+                return
+            ws = self._ws
+            loop = self._loop
+            if ws is None or loop is None or not loop.is_running():
+                self._manual_response_first_at = None
+                return
+            self._manual_response_first_at = None
+            self._manual_response_request_pending = True
+            self._start_manual_response_watchdog_locked(
+                _MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS
+            )
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._send_manual_response(ws), loop
+            )
+            future.result(timeout=_MANUAL_RESPONSE_SEND_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "手动触发 OpenAI 回复失败: error_type=%s", type(exc).__name__
+            )
+            should_schedule = False
+            with self._manual_response_lock:
+                self._manual_response_request_pending = False
+                if self._manual_response_outstanding == 0:
+                    self._cancel_manual_response_watchdog_locked()
+                if self._manual_response_pending_after_flight and self._running:
+                    self._manual_response_pending_after_flight = False
+                    should_schedule = True
+            if should_schedule:
+                self._schedule_manual_response_timer()
+
+    async def _send_manual_response(self, ws: Any) -> None:
+        if ws is not self._ws or not self._running:
+            raise ConnectionError("Realtime connection changed")
+        await ws.send(json.dumps({"type": "response.create"}))
+
+    def _on_response_created(self) -> None:
+        if not self._manual_response_enabled:
+            return
+        with self._manual_response_lock:
+            if not self._running:
+                return
+            self._manual_response_request_pending = False
+            self._manual_response_outstanding += 1
+            if self._manual_response_outstanding == 1:
+                self._start_manual_response_watchdog_locked()
+
+    def _start_manual_response_watchdog_locked(
+        self, timeout_seconds: float | None = None
+    ) -> None:
+        timer = self._manual_response_watchdog_timer
+        if timer is not None:
+            timer.cancel()
+        self._manual_response_watchdog_generation += 1
+        generation = self._manual_response_watchdog_generation
+        if timeout_seconds is None:
+            timeout_seconds = (
+                max(0, config.get_int("MANUAL_RESPONSE_MAX_WAIT_MS")) / 1000
+            )
+        if timeout_seconds <= 0:
+            return
+        next_timer = threading.Timer(
+            timeout_seconds,
+            self._fire_manual_response_watchdog,
+            args=(generation,),
+        )
+        next_timer.daemon = True
+        self._manual_response_watchdog_timer = next_timer
+        next_timer.start()
+
+    def _fire_manual_response_watchdog(self, generation: int) -> None:
+        should_schedule = False
+        with self._manual_response_lock:
+            if (
+                generation != self._manual_response_watchdog_generation
+                or not self._running
+                or (
+                    not self._manual_response_request_pending
+                    and self._manual_response_outstanding <= 0
+                )
+            ):
+                return
+            logger.warning(
+                "手动应答控制等待 OpenAI response.created/done 超时，清理状态"
+            )
+            self._manual_response_watchdog_timer = None
+            self._manual_response_request_pending = False
+            self._manual_response_outstanding = 0
+            if self._manual_response_pending_after_flight:
+                self._manual_response_pending_after_flight = False
+                should_schedule = True
+        if should_schedule:
+            self._schedule_manual_response_timer()
+
+    def _on_response_done(self) -> None:
+        if not self._manual_response_enabled:
+            return
+        should_schedule = False
+        with self._manual_response_lock:
+            if self._manual_response_outstanding > 0:
+                self._manual_response_outstanding -= 1
+            if (
+                self._manual_response_outstanding == 0
+                and not self._manual_response_request_pending
+            ):
+                self._cancel_manual_response_watchdog_locked()
+            if (
+                self._manual_response_outstanding == 0
+                and self._manual_response_pending_after_flight
+                and self._running
+            ):
+                self._manual_response_pending_after_flight = False
+                should_schedule = True
+        if should_schedule:
+            self._schedule_manual_response_timer()
+
     def _nudge_after_repeat_suppressed(self, _transcript: str) -> None:
         try:
             asyncio.get_running_loop().create_task(
@@ -254,7 +512,14 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._emit_repeat_stuck(f"复读抑制连续触发 {count} 次，判定模型卡死")
 
     async def stop(self) -> None:
-        self._running = False
+        with self._manual_response_lock:
+            self._running = False
+            self._cancel_manual_response_timer_locked()
+            self._cancel_manual_response_watchdog_locked()
+            self._manual_response_first_at = None
+            self._manual_response_request_pending = False
+            self._manual_response_outstanding = 0
+            self._manual_response_pending_after_flight = False
         ws, self._ws = self._ws, None
         if ws:
             try:
@@ -298,6 +563,7 @@ class OpenAIVoiceAgent(VoiceAgent):
                 logger.error("OpenAI 接收循环异常: %s", exc)
             if not self._running:
                 break
+            self._cancel_manual_response_control()
             # 立即摘掉死连接：重连期间 send_audio/say 看到 _ws 为 None 会
             # 静默丢帧（对齐 qwen 语义），否则每 10ms 一帧的上行都对死连接
             # send 并各刷一条 warning（重连数秒内可积数百条）。
@@ -324,6 +590,7 @@ class OpenAIVoiceAgent(VoiceAgent):
             if transcript:
                 logger.info("[上行·用户] %s", transcript)
                 self._emit_transcript("user", transcript)
+                self._on_user_transcription_completed()
         elif event_type in (
             "response.audio_transcript.done",
             "response.output_audio_transcript.done",
@@ -347,6 +614,8 @@ class OpenAIVoiceAgent(VoiceAgent):
                 asyncio.get_running_loop().create_task(
                     self._dispatch_tool_call(name, call_id, arguments, self._ws)
                 )
+        elif event_type == "response.created":
+            self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
             # server_vad 的打断事件本轮忽略（半双工由 call_agent 管理）。
             pass
@@ -359,6 +628,7 @@ class OpenAIVoiceAgent(VoiceAgent):
             else:
                 self._audio_gate.complete_response(_response_id(event))
                 logger.debug("OpenAI 回复轮次完成")
+            self._on_response_done()
         elif event_type == "error":
             logger.error("OpenAI Realtime 错误: %s", event)
 

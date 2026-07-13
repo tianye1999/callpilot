@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .tools import ToolRegistry
@@ -78,6 +78,21 @@ class VoiceAgent(ABC):
 
     async def say(self, instructions: str) -> None:
         """让 Agent 主动说一段话；不支持的实现可以忽略。"""
+
+    async def external_tool_result(
+        self,
+        name: str,
+        result: dict[str, Any],
+        *,
+        source: str,
+    ) -> bool:
+        """Record an externally executed tool fact without requesting a reply.
+
+        Providers that cannot add a reliable standalone context item return
+        ``False``. Callers must never fabricate a function-call id as fallback.
+        """
+
+        return False
 
     @abstractmethod
     async def stop(self) -> None:

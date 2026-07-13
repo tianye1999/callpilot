@@ -315,6 +315,31 @@ class LocalPipelineAgent(VoiceAgent):
         if self._running:
             self._brain_queue.put(_SayRequest(instructions))
 
+    async def external_tool_result(
+        self,
+        name: str,
+        result: dict[str, Any],
+        *,
+        source: str,
+    ) -> bool:
+        success = result.get("success") is True
+        count = result.get("count")
+        safe_count = count if isinstance(count, int) and count >= 0 else 0
+        mode = result.get("mode")
+        safe_mode = mode if isinstance(mode, str) else "unknown"
+        with self._messages_lock:
+            self._messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"[external_tool_result] {name} was executed by {source}; "
+                        f"success={str(success).lower()}, count={safe_count}, "
+                        f"mode={safe_mode}. Do not speak merely to acknowledge it."
+                    ),
+                }
+            )
+        return True
+
     async def stop(self) -> None:
         self._running = False
         for thread in (self._vad_thread, self._brain_thread):

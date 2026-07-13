@@ -15,6 +15,9 @@ prefer supplying both languages for every field to avoid mixed-language output.
 ``opening_mode``(#80-B,可选): ``say``(默认)拨通即说开场白;``wait``
 静默等对方先说——IVR 热线(如运营商客服)用,避免 AI 开场白压掉首段菜单
 播报。语言无关的普通字符串;非法值按 ``say`` 处理。
+
+``dtmf_spoken_followup``(可选): 默认 ``false``。仅对显式启用的 IVR
+profile，在 Agent 明确说出自己将按键却未调用工具时启用执行层安全网。
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ _MANAGED_FIELDS = {
     "scenario",
     "opening",
     "opening_mode",
+    "dtmf_spoken_followup",
 }
 
 
@@ -364,6 +368,7 @@ def _normalize_profile(
         "scenario": scenario,
         "opening": opening,
         "opening_mode": opening_mode,
+        "dtmf_spoken_followup": item.get("dtmf_spoken_followup") is True,
         "error": None,
         "provider": "",
         "model": "",
@@ -430,6 +435,7 @@ def _managed_profile(item: dict[str, Any], profile_id: str) -> dict[str, Any]:
         "scenario": _localized_map(item.get("scenario")),
         "opening": _localized_map(item.get("opening")),
         "opening_mode": opening_mode,
+        "dtmf_spoken_followup": item.get("dtmf_spoken_followup") is True,
     }
 
 
@@ -468,6 +474,9 @@ def _validate_profile_payload(payload: Any) -> dict[str, Any]:
         raise ProfileValidationError("opening_mode 只能是 say 或 wait")
     if not opening_mode:
         opening_mode = "say"
+    dtmf_spoken_followup = payload.get("dtmf_spoken_followup", False)
+    if not isinstance(dtmf_spoken_followup, bool):
+        raise ProfileValidationError("dtmf_spoken_followup 必须是布尔值")
 
     profile: dict[str, Any] = {
         "enabled": enabled,
@@ -476,6 +485,7 @@ def _validate_profile_payload(payload: Any) -> dict[str, Any]:
         "scenario": scenario,
         "opening": opening,
         "opening_mode": opening_mode,
+        "dtmf_spoken_followup": dtmf_spoken_followup,
     }
     if match_mode == "exact":
         profile["task"] = task
