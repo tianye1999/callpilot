@@ -84,6 +84,13 @@ class _SpyCallRecord:
         pass
 
 
+def _wait_until(condition, *, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert condition()
+
+
 def _start_profile_call(
     monkeypatch,
     tmp_path,
@@ -139,6 +146,7 @@ def _start_profile_call(
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and ("dial", ("10086",)) not in modem.calls:
         time.sleep(0.01)
+    assert ("dial", ("10086",)) in modem.calls
     modem.trigger_call_connected("10086")
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and not agent.started:
@@ -165,9 +173,10 @@ def test_spoken_followup_dispatches_multi_digit_once_and_injects_result(
     )
     try:
         agent._emit_transcript("agent", "好的，我帮您按幺零三#")
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and not _dtmf_calls(modem):
-            time.sleep(0.01)
+        _wait_until(
+            lambda: len(agent.external_results) == 1
+            and any(kind == "dtmf_auto_followup" for kind, _fields in record.events)
+        )
 
         assert _dtmf_calls(modem) == [("send_dtmf", ("103#",))]
         assert len(agent.external_results) == 1
@@ -239,9 +248,7 @@ def test_real_tool_after_auto_followup_is_deduplicated(monkeypatch, tmp_path):
     )
     try:
         agent._emit_transcript("agent", "我按1")
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and not _dtmf_calls(modem):
-            time.sleep(0.01)
+        _wait_until(lambda: len(_dtmf_calls(modem)) == 1)
         assert agent._tools is not None
         result = agent._tools.dispatch("send_dtmf", {"digits": "1"})
         assert result["success"] is True
@@ -276,9 +283,7 @@ def test_external_result_rejection_does_not_repeat_or_kill_call(monkeypatch, tmp
     )
     try:
         agent._emit_transcript("agent", "我按1")
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and not agent.external_results:
-            time.sleep(0.01)
+        _wait_until(lambda: len(agent.external_results) == 1)
         assert _dtmf_calls(modem) == [("send_dtmf", ("1",))]
         assert service.session.is_active
         assert len(agent.external_results) == 1
