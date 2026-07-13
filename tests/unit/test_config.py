@@ -69,6 +69,18 @@ def test_get_float_default_and_env_override(monkeypatch):
     assert get_float("MODEM_TX_GAIN") == pytest.approx(0.8)
 
 
+def test_agent_uplink_gain_default_and_env_example(monkeypatch):
+    """#80-E:模型输入增益默认不改变音频，并有可发现的示例配置。"""
+    _unset(monkeypatch, "AGENT_UPLINK_GAIN")
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert get_float("AGENT_UPLINK_GAIN") == pytest.approx(1.0)
+    assert get_spec("AGENT_UPLINK_GAIN").requires_restart is False
+    assert re.search(r"^AGENT_UPLINK_GAIN=1\.0$", example, re.MULTILINE)
+
+
 def test_get_bool_truthy_values(monkeypatch):
     for raw in ("true", "TRUE", "1", "yes", "Yes"):
         monkeypatch.setenv("RECORDING_ENABLED", raw)

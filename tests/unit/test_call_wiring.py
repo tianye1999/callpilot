@@ -13,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
@@ -49,6 +50,44 @@ def wait_until(cond, timeout: float = 5.0) -> bool:
             return True
         time.sleep(0.02)
     return False
+
+
+def run_single_agent_uplink_frame(
+    monkeypatch, raw: bytes, *, gain: str
+) -> tuple[bytes, list[bytes]]:
+    """直接跑一帧模组→模型上行，返回模型 PCM 与录音收到的原始 PCM。"""
+    monkeypatch.setenv("AGENT_UPLINK_GAIN", gain)
+    service = make_service(FakeModem())
+    bridge = FakeAudioBridge()
+    bridge.feed_uplink(raw)
+
+    class RecordSpy:
+        def __init__(self) -> None:
+            self.uplink: list[bytes] = []
+
+        def write_uplink(self, pcm: bytes) -> None:
+            self.uplink.append(pcm)
+
+    record = RecordSpy()
+    agent = FakeAgent()
+
+    async def stop_after_first_frame(pcm: bytes) -> None:
+        agent.received_audio.append(pcm)
+        service.session._active = False
+
+    monkeypatch.setattr(agent, "send_audio", stop_after_first_frame)
+    service.session._active = True
+    service.session._hangover_seconds = 0.0
+    asyncio.run(
+        service.session._run_agent_loop(
+            agent,
+            bridge,
+            record,  # type: ignore[arg-type]
+            [],
+        )
+    )
+    assert len(agent.received_audio) == 1
+    return agent.received_audio[0], record.uplink
 
 
 def run_inbound_call(
@@ -972,6 +1011,56 @@ def test_session_reloads_tunables_from_env(monkeypatch):
 
     assert service.session._hangover_seconds == 0.9
     assert service.session._hangup_delay_seconds == 1.5
+
+
+def test_agent_uplink_gain_only_changes_audio_sent_to_model(monkeypatch):
+    """#80-E:模型上行可放大，但通话录音仍保留模组原始 PCM。"""
+    raw = np.full(160, 1000, dtype=np.int16).tobytes()
+    sent_pcm, recorded = run_single_agent_uplink_frame(monkeypatch, raw, gain="2.0")
+
+    assert recorded == [raw]
+    sent = np.frombuffer(sent_pcm, dtype=np.int16)
+    assert np.all(sent == 2000)
+
+
+def test_agent_uplink_gain_records_pre_and_post_flow_stats(monkeypatch):
+    """#80-E:校准日志观测 gain 前后峰值，不保存 PCM 内容。"""
+    class StatsSpy:
+        def __init__(self, label: str) -> None:
+            self.frames: list[bytes] = []
+            created[label] = self
+
+        def add(self, pcm: bytes) -> None:
+            self.frames.append(pcm)
+
+        def maybe_log(self, **_extra: object) -> bool:
+            return False
+
+    created: dict[str, StatsSpy] = {}
+    monkeypatch.setattr("agentcall.call_agent.PcmFlowStats", StatsSpy)
+    raw = np.full(160, 500, dtype=np.int16).tobytes()
+    run_single_agent_uplink_frame(monkeypatch, raw, gain="2.0")
+
+    pre = created["agent_uplink_pre_gain"]
+    post = created["agent_uplink_post_gain"]
+    assert np.max(np.frombuffer(pre.frames[0], dtype=np.int16)) == 500
+    assert np.max(np.frombuffer(post.frames[0], dtype=np.int16)) == 1000
+
+
+@pytest.mark.parametrize("invalid_gain", ["0", "-2", "nan", "inf"])
+def test_agent_uplink_invalid_gain_falls_back_to_identity(monkeypatch, invalid_gain):
+    """手工 .env 绕过面板校验时，非法增益也不能破坏模型音频。"""
+    applied: list[float] = []
+
+    def capture_gain(pcm: bytes, gain: float) -> bytes:
+        applied.append(gain)
+        return pcm
+
+    monkeypatch.setattr("agentcall.call_agent.apply_pcm_gain", capture_gain)
+    raw = np.full(160, 500, dtype=np.int16).tobytes()
+    run_single_agent_uplink_frame(monkeypatch, raw, gain=invalid_gain)
+
+    assert applied == [1.0]
 
 
 # ---- 外呼主题：持久化为下次默认 ----
