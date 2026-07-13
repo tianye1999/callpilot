@@ -173,6 +173,160 @@ def test_session_instructions_override_default(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_manual_response_control_sets_create_response_false_and_debounces(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "25")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            turn_detection = ws.sent[0]["session"]["audio"]["input"]["turn_detection"]
+            assert turn_detection == {"type": "server_vad", "create_response": False}
+            for text in ("第一段菜单", "第二段菜单", "第三段菜单"):
+                ws.feed(
+                    {
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": text,
+                    }
+                )
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.08)
+            creates = [item for item in ws.sent if item["type"] == "response.create"]
+            assert creates == [{"type": "response.create"}]
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_manual_response_control_waits_for_active_response_done(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "20")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "AI 说话期间 IVR 继续播报",
+                }
+            )
+            await _drain()
+            await asyncio.sleep(0.05)
+            assert "response.create" not in ws.sent_types()
+
+            ws.feed({"type": "response.done", "response": {"id": "r1"}})
+            await _drain()
+            await asyncio.sleep(0.05)
+            assert ws.sent_types().count("response.create") == 1
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_manual_response_control_stop_cancels_pending_timer(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "80")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "500")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        ws = instances[0]
+        ws.feed(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "稍后才该回复",
+            }
+        )
+        await _drain()
+        await agent.stop()
+        await asyncio.sleep(0.12)
+        assert "response.create" not in ws.sent_types()
+
+    asyncio.run(scenario())
+
+
+def test_manual_response_control_request_watchdog_recovers_missing_created(
+    monkeypatch,
+):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "15")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "0")
+    monkeypatch.setattr(
+        openai_agent, "_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS", 0.04
+    )
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "第一段播报",
+                }
+            )
+            await _drain()
+            await asyncio.sleep(0.03)
+            assert ws.sent_types().count("response.create") == 1
+
+            ws.feed(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "created 丢失后的新播报",
+                }
+            )
+            await _drain()
+            await asyncio.sleep(0.08)
+            assert ws.sent_types().count("response.create") == 2
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_manual_response_control_max_wait_forces_response(monkeypatch):
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "1000")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "45")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            for index in range(5):
+                ws.feed(
+                    {
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": f"连续播报 {index}",
+                    }
+                )
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.06)
+            assert ws.sent_types().count("response.create") == 1
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
 def test_realtime_url_override(monkeypatch):
     """OPENAI_REALTIME_URL 覆盖 base（反向代理/Azure 兼容端点）。"""
     _instances, calls = _patch_connect(monkeypatch)
