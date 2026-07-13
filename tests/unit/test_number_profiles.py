@@ -535,3 +535,54 @@ def test_bundled_seed_china_mobile_ivr_has_opening_mode_wait():
             break
     else:
         pytest.fail("seed 中未找到 china_mobile_data")
+
+
+def test_dtmf_spoken_followup_defaults_false_and_roundtrips(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    path.write_text(
+        json.dumps(
+            {"profiles": [{"number": "10000", "scenario": "default"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    assert number_profiles.lookup_profile("10000", "", path=path)[
+        "dtmf_spoken_followup"
+    ] is False
+
+    created = number_profiles.create_profile(
+        {
+            "number": "10086",
+            "scenario": {"zh": "IVR"},
+            "match_mode": "number",
+            "dtmf_spoken_followup": True,
+        },
+        path=path,
+    )
+    assert created["dtmf_spoken_followup"] is True
+    assert number_profiles.lookup_profile("10086", "", path=path)[
+        "dtmf_spoken_followup"
+    ] is True
+
+
+def test_dtmf_spoken_followup_rejects_non_boolean(tmp_path):
+    with pytest.raises(number_profiles.ProfileValidationError, match="dtmf_spoken_followup"):
+        number_profiles.create_profile(
+            {
+                "number": "10086",
+                "scenario": "IVR",
+                "match_mode": "number",
+                "dtmf_spoken_followup": "true",
+            },
+            path=tmp_path / "number_profiles.json",
+        )
+
+
+def test_bundled_seed_only_enables_spoken_followup_for_10086():
+    data = json.loads(number_profiles.bundled_seed_file().read_text(encoding="utf-8"))
+    enabled = [
+        item.get("number")
+        for item in data["profiles"]
+        if item.get("dtmf_spoken_followup") is True
+    ]
+    assert enabled == ["10086"]

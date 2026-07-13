@@ -13,6 +13,7 @@ from queue import Empty, Queue
 from typing import Callable
 
 from . import config
+from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.tools import ToolRegistry
 from .audio_bridge import (
@@ -28,6 +29,7 @@ from .call_tools import CallTools
 from .contacts import is_reply_target_allowed
 from .dial_queue import DialQueue, whitelist_from_env
 from .dtmf import dtmf_tone
+from .dtmf_followup import extract_spoken_dtmf
 from .events import EventHub
 from .modem import Eg25Modem
 from .monitor_playback import MonitorPlayback
@@ -67,6 +69,12 @@ HALF_DUPLEX_HANGOVER_SECONDS = 0.5
 # 挂断工具触发后延迟这么久再真正挂断，先让 Agent 播完告别语。
 # （仅作缺省值；每通会话开始时从 config.HANGUP_TOOL_DELAY_SECONDS 重新读取。）
 HANGUP_TOOL_DELAY_SECONDS = 4.5
+
+# Profile-gated fallback: wait briefly for a genuine tool call after the Agent
+# says it is pressing a key. The recent-send window closes transcript/tool races.
+DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS = 3.0
+DTMF_RECENT_SEND_WINDOW_SECONDS = 5.0
+_EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
 
 
 class CallSession:
@@ -133,6 +141,23 @@ class CallSession:
         self._prompt_gen_generation = 0
         self._prompt_gen_opening = ""
         self._prompt_gen_opening_mode = "say"
+        self._prompt_gen_dtmf_spoken_followup = False
+        self._dtmf_lock = threading.RLock()
+        self._recent_dtmf_sent: dict[str, tuple[float, str]] = {}
+        self._pending_dtmf_followups: dict[
+            int,
+            tuple[
+                threading.Timer,
+                str,
+                int,
+                float,
+                VoiceAgent,
+                CallRecord | None,
+            ],
+        ] = {}
+        self._next_dtmf_followup_id = 0
+        self._dtmf_dispatch_context = threading.local()
+        self._active_tools: ToolRegistry | None = None
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -166,6 +191,8 @@ class CallSession:
         self._prompt_gen_generation += 1
         self._prompt_gen_opening = ""
         self._prompt_gen_opening_mode = "say"
+        self._prompt_gen_dtmf_spoken_followup = False
+        self._cancel_spoken_dtmf_followups(clear_recent=True)
         # 世代号推进与置活必须同锁原子完成：与 _deferred_hangup 的
         # 「校验世代号 → stop()」互斥，保证旧回调要么在新会话置活前跑完
         # （只影响已结束的旧会话），要么校验失败直接放弃。
@@ -177,7 +204,9 @@ class CallSession:
         self._thread.start()
 
     def stop(self) -> None:
-        self._active = False
+        with self._dtmf_lock:
+            self._active = False
+            self._cancel_spoken_dtmf_followups_locked()
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
 
@@ -189,7 +218,10 @@ class CallSession:
         except Exception as exc:  # noqa: BLE001
             logger.exception("通话处理异常: %s", exc)
         finally:
-            self._active = False
+            with self._dtmf_lock:
+                self._active = False
+                self._cancel_spoken_dtmf_followups_locked()
+                self._active_tools = None
             # 会话收尾统一取消未触发的延迟挂断，不让它跨到下一通。
             self._cancel_hangup_timer()
             self._loop.close()
@@ -293,14 +325,17 @@ class CallSession:
             agent = create_agent(self.provider)
             agent.set_session_instructions(self._build_agent_instructions(direction))
             agent.set_transcript_handler(
-                self._make_transcript_handler(record, transcripts)
+                self._make_transcript_handler(record, transcripts, agent)
             )
             agent.set_repeat_stuck_handler(self._request_repeat_stuck_wrap_up)
             # 面向用户的状态提示（如 local provider 首启下载模型进度）经 EventHub 播给 UI。
             agent.set_status_handler(
                 lambda text: self._publish({"type": "system", "text": text})
             )
-            agent.set_tools(self._build_tools())
+            tools = self._build_tools()
+            with self._dtmf_lock:
+                self._active_tools = tools
+            agent.set_tools(tools)
             if isinstance(bridge, SerialPcmAudioBridge):
                 bridge.set_ready_check(self.modem.pcm_ready)
             bridge.start()
@@ -366,6 +401,7 @@ class CallSession:
         self,
         record: CallRecord | None,
         transcripts: list[tuple[str, str]],
+        agent: VoiceAgent,
     ) -> Callable[[str, str], None]:
         """转写回调：累积到 transcripts（供摘要）、写通话记录、推送 UI。"""
 
@@ -381,6 +417,8 @@ class CallSession:
                     "caller": self.current_caller,
                 }
             )
+            if role == "agent":
+                self._schedule_spoken_dtmf_followup(agent, text)
 
         return on_transcript
 
@@ -615,7 +653,7 @@ class CallSession:
             get_record=lambda: self._record,
             schedule_hangup=self._schedule_deferred_hangup,
             is_sms_target_allowed=self._sms_target_allowed,
-            send_dtmf=self._send_dtmf_raw,
+            send_dtmf=self._send_dtmf_from_tool,
         )
         return tools.register()
 
@@ -780,6 +818,9 @@ class CallSession:
         self._prompt_gen_opening = str(result.get("opening") or "")
         mode = str(result.get("opening_mode") or "").strip().lower()
         self._prompt_gen_opening_mode = "wait" if mode == "wait" else "say"
+        self._prompt_gen_dtmf_spoken_followup = (
+            result.get("dtmf_spoken_followup") is True
+        )
         if result.get("ok") and str(result.get("scenario", "")).strip():
             return str(result["scenario"])
         return None
@@ -811,6 +852,7 @@ class CallSession:
                 scenario=scenario,
                 opening=opening,
                 opening_mode=str(result.get("opening_mode") or "").strip().lower() or "say",
+                dtmf_spoken_followup=result.get("dtmf_spoken_followup") is True,
                 error=error,
                 provider=provider,
                 model=model,
@@ -844,11 +886,153 @@ class CallSession:
             self._hangup_timer = timer
             timer.start()
 
+    def _schedule_spoken_dtmf_followup(
+        self, agent: VoiceAgent, transcript: str
+    ) -> None:
+        if not self._prompt_gen_dtmf_spoken_followup:
+            return
+        digits = extract_spoken_dtmf(transcript)
+        if digits is None:
+            return
+        with self._dtmf_lock:
+            if not self._active or not self._prompt_gen_dtmf_spoken_followup:
+                return
+            self._next_dtmf_followup_id += 1
+            followup_id = self._next_dtmf_followup_id
+            generation = self._session_generation
+            created_at = time.monotonic()
+            timer = threading.Timer(
+                DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS,
+                self._fire_spoken_dtmf_followup,
+                args=(followup_id,),
+            )
+            timer.daemon = True
+            self._pending_dtmf_followups[followup_id] = (
+                timer,
+                digits,
+                generation,
+                created_at,
+                agent,
+                self._record,
+            )
+            timer.start()
+
+    def _fire_spoken_dtmf_followup(self, followup_id: int) -> None:
+        with self._dtmf_lock:
+            pending = self._pending_dtmf_followups.pop(followup_id, None)
+            if pending is None:
+                return
+            _timer, digits, generation, created_at, agent, record = pending
+            if (
+                not self._active
+                or generation != self._session_generation
+                or not self._prompt_gen_dtmf_spoken_followup
+            ):
+                return
+            now = time.monotonic()
+            self._prune_recent_dtmf_locked(now)
+            previous = self._recent_dtmf_sent.get(digits)
+            if (
+                previous is not None
+                and now - previous[0] < DTMF_RECENT_SEND_WINDOW_SECONDS
+            ):
+                return
+            tools = self._active_tools
+            if tools is None:
+                return
+            self._dtmf_dispatch_context.source = "spoken_followup"
+            try:
+                # The timer thread is the worker: qvts/AT cannot block an Agent
+                # callback or the CallSession audio loop.
+                result = tools.dispatch("send_dtmf", {"digits": digits})
+            finally:
+                try:
+                    del self._dtmf_dispatch_context.source
+                except AttributeError:
+                    pass
+            executed_at = time.monotonic()
+
+        context_injected = self._notify_external_tool_result(agent, result)
+        if record is not None:
+            mode = result.get("mode")
+            record.log_event(
+                "dtmf_auto_followup",
+                count=len(digits),
+                mode=mode if isinstance(mode, str) else "unknown",
+                result="success" if result.get("success") is True else "failure",
+                delay_ms=round((executed_at - created_at) * 1000, 1),
+                source="agent_transcript",
+                context_injected=context_injected,
+            )
+
+    def _notify_external_tool_result(
+        self, agent: VoiceAgent, result: dict
+    ) -> bool:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return False
+        safe_result = {
+            "success": result.get("success") is True,
+            "count": result.get("count") if isinstance(result.get("count"), int) else 0,
+            "mode": result.get("mode") if isinstance(result.get("mode"), str) else "unknown",
+        }
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                agent.external_tool_result(
+                    "send_dtmf", safe_result, source="spoken_followup"
+                ),
+                loop,
+            )
+            return bool(
+                future.result(timeout=_EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "外部 DTMF 结果未写入模型上下文: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    def _cancel_spoken_dtmf_followups(self, *, clear_recent: bool = False) -> None:
+        with self._dtmf_lock:
+            self._cancel_spoken_dtmf_followups_locked()
+            if clear_recent:
+                self._recent_dtmf_sent.clear()
+
+    def _cancel_spoken_dtmf_followups_locked(self) -> None:
+        pending = list(self._pending_dtmf_followups.values())
+        self._pending_dtmf_followups.clear()
+        for timer, _digits, _generation, _created_at, _agent, _record in pending:
+            timer.cancel()
+
+    def _cancel_pending_dtmf_locked(self, digits: str) -> None:
+        matching = [
+            followup_id
+            for followup_id, pending in self._pending_dtmf_followups.items()
+            if pending[1] == digits
+        ]
+        for followup_id in matching:
+            timer, _digits, _generation, _created_at, _agent, _record = (
+                self._pending_dtmf_followups.pop(followup_id)
+            )
+            timer.cancel()
+
+    def _prune_recent_dtmf_locked(self, now: float) -> None:
+        expired = [
+            digits
+            for digits, (sent_at, _source) in self._recent_dtmf_sent.items()
+            if now - sent_at >= DTMF_RECENT_SEND_WINDOW_SECONDS
+        ]
+        for digits in expired:
+            del self._recent_dtmf_sent[digits]
+
     def send_dtmf(self, digits: str) -> tuple[bool, str | None]:
         """发送 DTMF；UAC 模式默认把双音作为带内 PCM 注入下行队列。"""
         mode = "unknown"
         try:
-            ok, mode = self._send_dtmf_raw(digits)
+            ok, mode = self._send_dtmf_raw(
+                digits, source="manual", deduplicate=False
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("发送 DTMF 失败: error_type=%s", type(exc).__name__)
             if self._record is not None:
@@ -865,26 +1049,63 @@ class CallSession:
             )
         return (True, None) if ok else (False, "按键发送失败")
 
-    def _send_dtmf_raw(self, digits: str) -> tuple[bool, str]:
+    def _send_dtmf_from_tool(self, digits: str) -> tuple[bool, str]:
+        source = getattr(self._dtmf_dispatch_context, "source", "agent_tool")
+        return self._send_dtmf_raw(digits, source=source, deduplicate=True)
+
+    def _send_dtmf_raw(
+        self,
+        digits: str,
+        *,
+        source: str = "agent_tool",
+        deduplicate: bool = True,
+    ) -> tuple[bool, str]:
         mode = self._resolve_dtmf_mode()
-        ok = True
-        if mode in {"inband", "both"}:
-            tone = dtmf_tone(
-                digits,
-                MODEM_RATE,
-                tone_ms=config.get_int("DTMF_TONE_MS"),
-                amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
-            )
-            if not tone:
-                return False, mode
-            # 与 Agent 语音共用 _outgoing_audio，后续由 _drain_agent_audio
-            # 按既有下行链路送入桥；半双工 pending 判定也会自然把它当成正在说话。
-            if self._record is not None:
-                self._record.write_downlink(tone)
-            self._outgoing_audio.put(tone)
-        if mode in {"qvts", "both"}:
-            ok = self.modem.send_dtmf(digits)
-        return ok, mode
+        with self._dtmf_lock:
+            now = time.monotonic()
+            self._prune_recent_dtmf_locked(now)
+            previous = self._recent_dtmf_sent.get(digits)
+            if (
+                deduplicate
+                and previous is not None
+                and now - previous[0] < DTMF_RECENT_SEND_WINDOW_SECONDS
+                and (
+                    source == "spoken_followup"
+                    or previous[1] == "spoken_followup"
+                )
+            ):
+                logger.info(
+                    "抑制重复 DTMF: count=%d source=%s", len(digits), source
+                )
+                if source != "spoken_followup":
+                    self._cancel_pending_dtmf_locked(digits)
+                return True, mode
+
+            ok = True
+            sent = False
+            if mode in {"inband", "both"}:
+                tone = dtmf_tone(
+                    digits,
+                    MODEM_RATE,
+                    tone_ms=config.get_int("DTMF_TONE_MS"),
+                    amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
+                )
+                if not tone:
+                    return False, mode
+                # 与 Agent 语音共用 _outgoing_audio，后续由 _drain_agent_audio
+                # 按既有下行链路送入桥；半双工 pending 判定也会自然把它当成正在说话。
+                if self._record is not None:
+                    self._record.write_downlink(tone)
+                self._outgoing_audio.put(tone)
+                sent = True
+            if mode in {"qvts", "both"}:
+                ok = self.modem.send_dtmf(digits)
+                sent = sent or ok
+            if sent:
+                self._recent_dtmf_sent[digits] = (time.monotonic(), source)
+                if source != "spoken_followup":
+                    self._cancel_pending_dtmf_locked(digits)
+            return ok, mode
 
     def _resolve_dtmf_mode(self) -> str:
         configured = config.get_str("DTMF_MODE").strip().lower()

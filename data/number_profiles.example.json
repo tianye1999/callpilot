@@ -33,7 +33,8 @@
         "en": "You are calling China Mobile's hotline 10086 on the owner's behalf to check the data usage on the owner's number. You are the caller asking for help — not an agent, never impersonate the owner. After the call connects, listen through the first IVR menu announcement completely; do not speak during IVR playback or transfer hold. Only say short keywords when the system explicitly prompts for voice input, and never interrupt or introduce yourself. For keypad menus you must call the send_dtmf tool to actually press keys, not just say a digit. Once transferred to a human, explain your need in one sentence. Never make up figures or claim you have them before they are given — say you're still waiting. Confirm the result in one sentence."
       },
       "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."},
-      "opening_mode": "wait"
+      "opening_mode": "wait",
+      "dtmf_spoken_followup": true
     },
     {
       "id": "china_unicom_data",

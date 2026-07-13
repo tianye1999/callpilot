@@ -242,6 +242,46 @@ class OpenAIVoiceAgent(VoiceAgent):
             # 重连由接收循环统一负责。
             logger.warning("发送说话指令失败: %s", exc)
 
+    async def external_tool_result(
+        self,
+        name: str,
+        result: dict[str, Any],
+        *,
+        source: str,
+    ) -> bool:
+        """Append a supported system item; do not fabricate a function call."""
+
+        ws = self._ws
+        if ws is None:
+            return False
+        success = result.get("success") is True
+        count = result.get("count")
+        safe_count = count if isinstance(count, int) and count >= 0 else 0
+        mode = result.get("mode")
+        safe_mode = mode if isinstance(mode, str) else "unknown"
+        text = (
+            f"[external_tool_result] {name} was executed by {source}; "
+            f"success={str(success).lower()}, count={safe_count}, mode={safe_mode}. "
+            "This is context only; do not speak merely to acknowledge it."
+        )
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "system",
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                    }
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("写入外部工具结果失败: error_type=%s", type(exc).__name__)
+            return False
+        return True
+
     def _nudge_after_repeat_suppressed(self, _transcript: str) -> None:
         try:
             asyncio.get_running_loop().create_task(

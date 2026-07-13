@@ -500,6 +500,36 @@ def test_send_dtmf_result_waits_for_next_ivr_without_response_create(monkeypatch
     assert "response.create" not in ws.sent_types()
 
 
+def test_external_tool_result_adds_system_fact_without_fake_call_or_response(monkeypatch):
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            accepted = await agent.external_tool_result(
+                "send_dtmf",
+                {"success": True, "count": 4, "mode": "inband"},
+                source="spoken_followup",
+            )
+            assert accepted is True
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+    ws = instances[0]
+    created = [item for item in ws.sent if item["type"] == "conversation.item.create"]
+    assert len(created) == 1
+    item = created[0]["item"]
+    assert item["type"] == "message"
+    assert item["role"] == "system"
+    assert item["content"][0]["type"] == "input_text"
+    assert "send_dtmf" in item["content"][0]["text"]
+    assert "call_id" not in item
+    assert "response.create" not in ws.sent_types()
+
+
 def test_tool_result_dropped_when_connection_replaced(monkeypatch):
     """工具执行期间断线重连：旧 call_id 的结果不得发进新会话（codex review P1）。"""
     import threading
