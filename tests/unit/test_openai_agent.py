@@ -95,6 +95,22 @@ async def _drain() -> None:
         await asyncio.sleep(0)
 
 
+async def _wait_for_sent_count(
+    ws: _FakeWs,
+    event_type: str,
+    expected: int,
+    *,
+    timeout: float = 2.0,
+) -> None:
+    """Wait for timer-thread work without assuming runner scheduling speed."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while ws.sent_types().count(event_type) < expected and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    assert ws.sent_types().count(event_type) == expected
+
+
 # ---------------------------------------------------------------------------
 # 连接与 session.update
 # ---------------------------------------------------------------------------
@@ -194,7 +210,7 @@ def test_manual_response_control_sets_create_response_false_and_debounces(monkey
                     }
                 )
                 await asyncio.sleep(0.01)
-            await asyncio.sleep(0.08)
+            await _wait_for_sent_count(ws, "response.create", 1)
             creates = [item for item in ws.sent if item["type"] == "response.create"]
             assert creates == [{"type": "response.create"}]
         finally:
@@ -227,8 +243,7 @@ def test_manual_response_control_waits_for_active_response_done(monkeypatch):
 
             ws.feed({"type": "response.done", "response": {"id": "r1"}})
             await _drain()
-            await asyncio.sleep(0.05)
-            assert ws.sent_types().count("response.create") == 1
+            await _wait_for_sent_count(ws, "response.create", 1)
         finally:
             await agent.stop()
 
@@ -282,8 +297,7 @@ def test_manual_response_control_request_watchdog_recovers_missing_created(
                 }
             )
             await _drain()
-            await asyncio.sleep(0.03)
-            assert ws.sent_types().count("response.create") == 1
+            await _wait_for_sent_count(ws, "response.create", 1)
 
             ws.feed(
                 {
@@ -292,8 +306,7 @@ def test_manual_response_control_request_watchdog_recovers_missing_created(
                 }
             )
             await _drain()
-            await asyncio.sleep(0.08)
-            assert ws.sent_types().count("response.create") == 2
+            await _wait_for_sent_count(ws, "response.create", 2)
         finally:
             await agent.stop()
 
@@ -319,8 +332,7 @@ def test_manual_response_control_max_wait_forces_response(monkeypatch):
                     }
                 )
                 await asyncio.sleep(0.01)
-            await asyncio.sleep(0.06)
-            assert ws.sent_types().count("response.create") == 1
+            await _wait_for_sent_count(ws, "response.create", 1)
         finally:
             await agent.stop()
 
