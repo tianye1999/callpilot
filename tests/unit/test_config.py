@@ -106,6 +106,37 @@ def test_recording_registry_and_env_example_default_to_off():
     assert re.search(r"^RECORDING_ENABLED=false$", example, re.MULTILINE)
 
 
+def test_dtmf_judge_registry_defaults_off_and_rejects_enforce(tmp_path, monkeypatch):
+    _unset(monkeypatch, "DTMF_JUDGE_MODE", "DTMF_JUDGE_MODEL")
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+
+    mode_spec = get_spec("DTMF_JUDGE_MODE")
+    assert mode_spec.kind == "select"
+    assert mode_spec.default == "off"
+    assert mode_spec.choices == ("off", "shadow")
+    assert mode_spec.requires_restart is False
+    assert get_str("DTMF_JUDGE_MODEL") == ""
+    assert re.search(r"^DTMF_JUDGE_MODE=off$", example, re.MULTILINE)
+    assert re.search(r"^DTMF_JUDGE_MODEL=$", example, re.MULTILINE)
+
+    with pytest.raises(ValueError, match="off, shadow"):
+        update_env_file(
+            {"DTMF_JUDGE_MODE": "enforce"}, env_path=tmp_path / ".env"
+        )
+
+
+def test_shadow_judge_requires_dashscope_key_even_with_openai_agent(monkeypatch):
+    monkeypatch.setenv("DTMF_JUDGE_MODE", "shadow")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+
+    errors = validate_provider_credentials("openai")
+
+    assert any("DASHSCOPE_API_KEY" in error and "DTMF" in error for error in errors)
+
+
 @pytest.mark.parametrize(("raw", "expected"), [("true", True), ("false", False)])
 def test_recording_explicit_config_is_respected(monkeypatch, raw, expected):
     monkeypatch.setenv("RECORDING_ENABLED", raw)
