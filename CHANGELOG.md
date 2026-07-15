@@ -26,9 +26,12 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
   official carrier SMS replaces the model's transcription in the summary, so
   a misheard amount can no longer survive; without an SMS the summary is
   structurally marked unverified.
-- Auxiliary text chains (summary / wrap-up judge / DTMF judge / triage judge)
-  now follow AGENT_PROVIDER: OpenAI by default, Qwen preserved as a switchable
-  path.
+- **Default agent upgraded to Qwen on `qwen3.5-omni-plus-realtime`** (released
+  Mar 2026): native function calling (the AI now really presses DTMF and hangs
+  up via tools), semantic VAD, accurate transcription — verified live dialing
+  10086. OpenAI remains a switchable path. Auxiliary text chains (summary /
+  wrap-up / DTMF / triage judge) follow AGENT_PROVIDER. The Realtime endpoint
+  stays the public DashScope endpoint (no private workspace URL needed).
 
 ### Fixed
 
