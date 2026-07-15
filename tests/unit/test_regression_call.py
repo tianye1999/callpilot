@@ -135,7 +135,30 @@ def test_says_i_press_without_dtmf_warns_but_does_not_fail():
 
     result = _result(report, "dtmf_audit")
     assert result.status == "WARN"
+    assert "按1" not in result.detail
+    assert "按[已隐藏]" in result.detail
     assert not report.has_failures
+
+
+def test_dtmf_audit_accepts_explicit_qvts_expected_mode():
+    events = _base_events(
+        _event("transcript", role="agent", text="你好，我想查流量。", ts=2.0),
+        _event("dtmf", mode="qvts", result="success", ts=5.0),
+    )
+    transcripts = regression_call.extract_transcripts(events)
+
+    expected = regression_call.check_dtmf_audit(
+        events, transcripts, expected_mode="qvts"
+    )
+    mismatch = regression_call.check_dtmf_audit(
+        events, transcripts, expected_mode="inband"
+    )
+
+    assert expected.status == "PASS"
+    assert "mode=qvts" in expected.detail
+    assert mismatch.status == "WARN"
+    assert "expected=inband" in mismatch.detail
+    assert "actual=qvts" in mismatch.detail
 
 
 def test_dtmf_waits_for_next_remote_transcript():
@@ -150,6 +173,26 @@ def test_dtmf_waits_for_next_remote_transcript():
     assert result.status == "PASS"
     assert "+2.4s" in result.detail
     assert "正在为您连接" in result.detail
+    assert "mode=inband" in result.detail
+    assert "t+4.0s" in result.detail
+
+
+def test_multiple_dtmf_observations_keep_each_mode_and_timing():
+    events = _base_events(
+        _event("transcript", role="agent", text="你好，我想查流量。", ts=2.0),
+        _event("dtmf", mode="qvts", result="success", ts=5.0),
+        _event("transcript", role="user", text="正在连接。", ts=7.0),
+        _event("dtmf", mode="qvts", result="success", ts=10.0),
+        _event("transcript", role="user", text="上午好。", ts=12.0),
+    )
+
+    result = regression_call.check_dtmf_followup(events)
+
+    assert result.status == "PASS"
+    assert "#1 mode=qvts t+4.0s" in result.detail
+    assert "#2 mode=qvts t+9.0s" in result.detail
+    assert "正在连接" in result.detail
+    assert "上午好" in result.detail
 
 
 def test_legacy_dtmf_without_result_is_still_observed():
@@ -178,7 +221,8 @@ def test_agent_speaking_after_dtmf_before_remote_transcript_fails():
 
     assert result.status == "FAIL"
     assert "0.6s" in result.detail
-    assert "已经按一" in result.detail
+    assert "已经按一" not in result.detail
+    assert "按[已隐藏]" in result.detail
 
 
 def test_dtmf_without_remote_transcript_in_observation_window_warns():
@@ -535,6 +579,28 @@ def test_recording_arg_resolves_relative_path_and_reports_missing_dir(tmp_path, 
     missing_out = capsys.readouterr().out
     assert "录音目录不存在" in missing_out
     assert str((tmp_path / "recordings" / "missing").resolve()) in missing_out
+
+
+def test_cli_accepts_only_explicit_ab_dtmf_modes():
+    assert regression_call._parse_args(["--no-dial"]).dtmf_mode == "inband"
+    assert (
+        regression_call._parse_args(["--no-dial", "--dtmf-mode", "qvts"]).dtmf_mode
+        == "qvts"
+    )
+    with pytest.raises(SystemExit):
+        regression_call._parse_args(["--no-dial", "--dtmf-mode", "both"])
+
+
+def test_cli_requires_explicit_number_for_live_dial_and_validates_it():
+    with pytest.raises(SystemExit):
+        regression_call._parse_args([])
+
+    args = regression_call._parse_args(["--number", "10086", "--dtmf-mode", "qvts"])
+    assert args.number == "10086"
+    assert args.dtmf_mode == "qvts"
+
+    with pytest.raises(SystemExit):
+        regression_call._parse_args(["--no-dial", "--number", "10086;AT"])
 
 
 def test_resolve_recordings_dir_priority(tmp_path, monkeypatch):

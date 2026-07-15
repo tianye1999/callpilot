@@ -1,4 +1,4 @@
-"""Dial 10000 once and assert the latest call transcript/events.
+"""Dial an explicitly selected public test number and inspect call evidence.
 
 The assertion functions are intentionally pure so the same checks can be unit-tested
 and reused for offline replay with ``--no-dial``.
@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
 API_BASE = "http://127.0.0.1:47100"
-CALL_NUMBER = "10000"
 DEFAULT_TASK = "咨询流量使用情况"
 DEFAULT_WAIT_SECONDS = 180
 # 开发版（仓库 cwd/data）与打包版（Application Support）的录音目录不同；
@@ -36,10 +35,12 @@ RECORDINGS_DIR = REPO_RECORDINGS_DIR
 
 Event = Mapping[str, object]
 Status = Literal["PASS", "FAIL", "WARN"]
+DtmfMode = Literal["inband", "qvts"]
 
 VALUE_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:GB|MB|G|兆|元)", re.IGNORECASE)
 INSTITUTION_RE = re.compile(r"这里是.{0,8}(客服|热线)")
 PRESS_RE = re.compile(r"我(?:来)?按(?:一下|下)?\s*[0-9一二三四五六七八九零#*]")
+SPOKEN_DTMF_RE = re.compile(r"(按(?:一下|下)?\s*)[0-9一二三四五六七八九零#*]")
 OWNER_FIELD_NAMES = ("owner", "owner_name", "ownerName", "user_name", "userName")
 DTMF_OBSERVATION_SECONDS = 8.0
 DTMF_SILENCE_GUARD_SECONDS = 3.0
@@ -112,6 +113,8 @@ def run_assertions(
     transcripts: Sequence[Transcript],
     meta: Event | None = None,
     judge_shadow: Sequence[Event] = (),
+    *,
+    expected_dtmf_mode: DtmfMode = "inband",
 ) -> Report:
     return Report(
         results=[
@@ -121,7 +124,9 @@ def run_assertions(
             check_no_fabricated_values(transcripts),
             check_no_repeat_stuck(transcripts),
             check_normal_ending(events, meta),
-            check_dtmf_audit(events, transcripts),
+            check_dtmf_audit(
+                events, transcripts, expected_mode=expected_dtmf_mode
+            ),
             check_dtmf_followup(events),
             check_no_redundant_reask(transcripts),
             check_dtmf_judge_shadow(events, judge_shadow),
@@ -276,7 +281,12 @@ def check_normal_ending(events: Sequence[Event], meta: Event | None = None) -> C
     return CheckResult("normal_ending", "6. 正常收尾", "PASS", detail)
 
 
-def check_dtmf_audit(events: Sequence[Event], transcripts: Sequence[Transcript]) -> CheckResult:
+def check_dtmf_audit(
+    events: Sequence[Event],
+    transcripts: Sequence[Transcript],
+    *,
+    expected_mode: DtmfMode = "inband",
+) -> CheckResult:
     dtmf_events = [event for event in events if event.get("type") == "dtmf"]
     press_line = next((item for item in transcripts if item.role == "agent" and PRESS_RE.search(item.text)), None)
 
@@ -285,20 +295,32 @@ def check_dtmf_audit(events: Sequence[Event], transcripts: Sequence[Transcript])
             "dtmf_audit",
             "7. DTMF 审计一致",
             "WARN",
-            f"agent 说了按键但没有 dtmf 事件: {_clip(press_line.text)}",
+            "agent 说了按键但没有 dtmf 事件: "
+            f"{_clip(_redact_spoken_dtmf(press_line.text))}",
         )
 
-    bad_modes = [str(event.get("mode") or "") for event in dtmf_events if event.get("mode") != "inband"]
+    bad_modes = sorted(
+        {
+            str(event.get("mode") or "unknown")
+            for event in dtmf_events
+            if event.get("mode") != expected_mode
+        }
+    )
     if bad_modes:
         return CheckResult(
             "dtmf_audit",
             "7. DTMF 审计一致",
             "WARN",
-            f"存在非 inband DTMF mode: {', '.join(bad_modes)}",
+            f"mode 不符: expected={expected_mode} actual={','.join(bad_modes)}",
         )
 
     if dtmf_events:
-        return CheckResult("dtmf_audit", "7. DTMF 审计一致", "PASS", "所有 dtmf 事件 mode=inband")
+        return CheckResult(
+            "dtmf_audit",
+            "7. DTMF 审计一致",
+            "PASS",
+            f"所有 dtmf 事件 mode={expected_mode}",
+        )
     return CheckResult("dtmf_audit", "7. DTMF 审计一致", "PASS", "未出现按键表述，也无 dtmf 事件")
 
 
@@ -310,16 +332,34 @@ def check_dtmf_followup(events: Sequence[Event]) -> CheckResult:
     decision, not a keyword-driven IVR state machine.
     """
     observations: list[CheckResult] = []
+    call_started_at = next(
+        (
+            value
+            for event in events
+            if event.get("type") == "call_started"
+            if (value := _number(event.get("ts"))) is not None
+        ),
+        None,
+    )
     for index, event in enumerate(events):
         if event.get("type") != "dtmf" or event.get("result") == "failure":
             continue
         sent_at = _number(event.get("ts"))
+        ordinal = len(observations) + 1
+        mode = str(event.get("mode") or "unknown")
+        relative = (
+            max(0.0, sent_at - call_started_at)
+            if sent_at is not None and call_started_at is not None
+            else None
+        )
+        timing = f"t+{relative:.1f}s" if relative is not None else "t+?"
+        prefix = f"#{ordinal} mode={mode} {timing}"
         if sent_at is None:
             observations.append(CheckResult(
                 "dtmf_followup",
                 "8. DTMF 后静默与菜单观测",
                 "WARN",
-                "成功 dtmf 事件缺少 ts，无法计算后续菜单延迟",
+                f"{prefix}: 成功 dtmf 事件缺少 ts，无法计算后续菜单延迟",
             ))
             continue
 
@@ -354,8 +394,8 @@ def check_dtmf_followup(events: Sequence[Event]) -> CheckResult:
                 "dtmf_followup",
                 "8. DTMF 后静默与菜单观测",
                 "FAIL",
-                f"DTMF 后 {immediate_agent[0]:.1f}s Agent 在静默保护窗内说话: "
-                f"{_clip(immediate_agent[1])}",
+                f"{prefix}: DTMF 后 {immediate_agent[0]:.1f}s Agent 在静默保护窗内说话: "
+                f"{_clip(_redact_spoken_dtmf(immediate_agent[1]))}",
             ))
             continue
 
@@ -385,7 +425,7 @@ def check_dtmf_followup(events: Sequence[Event]) -> CheckResult:
                 "dtmf_followup",
                 "8. DTMF 后静默与菜单观测",
                 "WARN",
-                f"DTMF 后 {DTMF_OBSERVATION_SECONDS:g}s 观测窗内无后续对端转写"
+                f"{prefix}: DTMF 后 {DTMF_OBSERVATION_SECONDS:g}s 观测窗内无后续对端转写"
                 f"{later_detail}",
             ))
             continue
@@ -396,7 +436,7 @@ def check_dtmf_followup(events: Sequence[Event]) -> CheckResult:
             "dtmf_followup",
             "8. DTMF 后静默与菜单观测",
             "PASS",
-            f"Agent 静默 ≥{DTMF_SILENCE_GUARD_SECONDS:g}s；"
+            f"{prefix}: Agent 静默 ≥{DTMF_SILENCE_GUARD_SECONDS:g}s；"
             f"对端候选（人工判菜单是否推进）: {candidates}",
         ))
 
@@ -407,17 +447,16 @@ def check_dtmf_followup(events: Sequence[Event]) -> CheckResult:
             "PASS",
             "无已发送 DTMF 事件",
         )
-    for status in ("FAIL", "WARN"):
-        result = next((item for item in observations if item.status == status), None)
-        if result is not None:
-            return result
-    if len(observations) == 1:
-        return observations[0]
+    status: Status = "PASS"
+    if any(item.status == "FAIL" for item in observations):
+        status = "FAIL"
+    elif any(item.status == "WARN" for item in observations):
+        status = "WARN"
     return CheckResult(
         "dtmf_followup",
         "8. DTMF 后静默与菜单观测",
-        "PASS",
-        f"{len(observations)} 次 DTMF 后均先收到对端转写",
+        status,
+        " || ".join(item.detail for item in observations),
     )
 
 
@@ -804,8 +843,8 @@ def resolve_recordings_dir(
     return REPO_RECORDINGS_DIR
 
 
-def dial_call(task: str) -> None:
-    body = {"number": CALL_NUMBER, "task": task, "preset_task": task}
+def dial_call(number: str, task: str) -> None:
+    body = {"number": number, "task": task, "preset_task": task}
     _post_json("/api/call/dial", body)
 
 
@@ -881,7 +920,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             recordings_dir = resolve_recordings_dir(args.recordings_dir)
             before_dirs = list_recording_dirs(recordings_dir)
-            dial_call(args.task)
+            dial_call(args.number, args.task)
             wait_result = wait_for_finished_recording(recordings_dir, before_dirs, args.wait)
             call_dir = wait_result.path
             if wait_result.timed_out:
@@ -909,7 +948,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         meta = load_meta(call_dir)
         judge_shadow = load_judge_shadow(call_dir)
         transcripts = extract_transcripts(events)
-        report = run_assertions(events, transcripts, meta, judge_shadow)
+        report = run_assertions(
+            events,
+            transcripts,
+            meta,
+            judge_shadow,
+            expected_dtmf_mode=args.dtmf_mode,
+        )
         if timeout_result is not None:
             report = Report([timeout_result, *report.results])
         print_report(report, call_dir)
@@ -925,7 +970,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Dial 10000 and assert call events/transcripts.")
+    parser = argparse.ArgumentParser(
+        description="Dial an explicit public test number and inspect call evidence."
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--no-dial", action="store_true", help="不拨打，分析录音根目录下最近一通录音")
     mode.add_argument("--recording", help="不拨打，分析指定录音目录（绝对或相对路径）")
@@ -934,10 +981,26 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="录音根目录；缺省依次取运行中服务的 /api/meta、CALL_LOG_DIR、打包版数据目录、仓库 data/recordings",
     )
     parser.add_argument("--task", default=DEFAULT_TASK, help=f"外呼任务，默认：{DEFAULT_TASK}")
+    parser.add_argument(
+        "--number",
+        help="要拨打的公共测试号码；实际拨号时必填（当前移动 SIM 验收用 10086）",
+    )
+    parser.add_argument(
+        "--dtmf-mode",
+        choices=("inband", "qvts"),
+        default="inband",
+        help="本轮预期 DTMF 模式；A/B 离线回放时必须显式匹配录音配置",
+    )
     parser.add_argument("--wait", type=int, default=DEFAULT_WAIT_SECONDS, help="等待通话结束的秒数，默认 180")
     args = parser.parse_args(argv)
     if args.wait <= 0:
         parser.error("--wait 必须是正整数")
+    if args.number is not None:
+        args.number = str(args.number).strip()
+        if not re.fullmatch(r"\+?[0-9*#]{1,32}", args.number):
+            parser.error("--number 格式不合法")
+    if not args.no_dial and args.recording is None and args.number is None:
+        parser.error("实际拨号必须显式提供 --number")
     task = str(args.task).strip()
     if not task:
         parser.error("--task 不能为空")
@@ -1042,6 +1105,10 @@ def _find_owner_name(events: Sequence[Event]) -> str | None:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return None
+
+
+def _redact_spoken_dtmf(text: str) -> str:
+    return SPOKEN_DTMF_RE.sub(r"\1[已隐藏]", text)
 
 
 def _clip(text: str, limit: int = 120) -> str:
