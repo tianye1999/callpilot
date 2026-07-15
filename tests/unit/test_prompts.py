@@ -172,6 +172,30 @@ def test_inbound_takeover_preference_is_free_text_with_injection_boundary():
     assert "caller" in en.lower() and "cannot" in en.lower()
 
 
+def test_inbound_triage_pending_restricts_realtime_without_owner_preference():
+    zh = build_instructions(
+        "inbound",
+        "李明",
+        "数字分身",
+        "",
+        triage_pending=True,
+    )
+    en = build_instructions(
+        "inbound",
+        "Alex",
+        "AI assistant",
+        "",
+        "en",
+        triage_pending=True,
+    )
+
+    assert "分诊等待态" in zh
+    assert "不得承诺回电" in zh
+    assert "最多追问一个中性短问题" in zh
+    assert "TRIAGE_PENDING" in en
+    assert "at most one short neutral question" in en
+
+
 def test_takeover_preference_is_inbound_only():
     text = build_instructions(
         "outbound",

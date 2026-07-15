@@ -80,6 +80,12 @@ from .takeover_coordinator import (
     TakeoverResult,
     TakeoverState,
 )
+from .triage_judge import (
+    InboundTriageJudge,
+    TriageConsumption,
+    TriageVerdict,
+    TriageVerdictConsumer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +108,8 @@ _EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
 _INBOUND_TAKEOVER_OFFER_TTL_SECONDS = 30.0
 _INBOUND_TAKEOVER_HOLD_TEXT = "请稍等，我确认一下，马上帮您转接。"
 _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
+_INBOUND_TRIAGE_CLARIFY_TEXT = "请简单确认一下，您是有具体事情找本人，还是一般业务介绍？"
+_INBOUND_TRIAGE_REJECT_TEXT = "谢谢您的来电，目前不需要这项服务。再见。"
 
 
 class _CallSessionMediaRouter:
@@ -219,6 +227,14 @@ class CallSession:
         self._takeover_session_queue: Queue[InboundTakeoverSession] = Queue(maxsize=1)
         self._takeover_hold_generation: int | None = None
         self._takeover_hold_done = False
+        self._triage_judge: InboundTriageJudge | None = None
+        self._triage_mode = "off"
+        self._triage_results: Queue[TriageVerdict] = Queue(maxsize=4)
+        self._triage_consumer = TriageVerdictConsumer()
+        self._triage_pending = False
+        self._triage_terminal = False
+        self._triage_reject_deadline: float | None = None
+        self._triage_clarification_spoken = False
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -256,6 +272,7 @@ class CallSession:
         self._result_verification_mode = "none"
         self._cancel_spoken_dtmf_followups(clear_recent=True)
         self._stop_dtmf_judge(join_timeout=0.0)
+        self._stop_triage_judge(join_timeout=0.0)
         self._dtmf_judge_started_at = 0.0
         # 世代号推进与置活必须同锁原子完成：与 _deferred_hangup 的
         # 「校验世代号 → stop()」互斥，保证旧回调要么在新会话置活前跑完
@@ -272,6 +289,7 @@ class CallSession:
             self._active = False
             self._cancel_spoken_dtmf_followups_locked()
         self._stop_dtmf_judge()
+        self._stop_triage_judge()
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
 
@@ -288,6 +306,7 @@ class CallSession:
                 self._cancel_spoken_dtmf_followups_locked()
                 self._active_tools = None
             self._stop_dtmf_judge()
+            self._stop_triage_judge()
             # 会话收尾统一取消未触发的延迟挂断，不让它跨到下一通。
             self._cancel_hangup_timer()
             self._loop.close()
@@ -308,6 +327,7 @@ class CallSession:
         record = self._begin_record(direction, number)
         self._record = record
         self._initialize_takeover_context(direction)
+        self._initialize_triage_context(direction, record)
         transcripts: list[tuple[str, str]] = []
 
         def mark(event_type: str, **fields) -> float:
@@ -438,6 +458,7 @@ class CallSession:
         finally:
             # 先作废判官世代再 finish record，避免迟到结果在 meta 落盘后追加事件。
             self._stop_dtmf_judge()
+            self._stop_triage_judge()
             self._end_takeover_context("CALL_ENDED")
             mark("ended", status=status)
             self._finalize_record(record, status, transcripts, direction, number)
@@ -507,6 +528,9 @@ class CallSession:
                             (time.monotonic() - self._dtmf_judge_started_at) * 1000,
                         ),
                     )
+            triage = self._triage_judge
+            if triage is not None:
+                triage.submit_turn(role, text)
 
         return on_transcript
 
@@ -609,6 +633,11 @@ class CallSession:
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
         while self._active and not agent.fatal:
+            triage_action = await self._consume_triage_results(
+                agent, bridge, generation
+            )
+            if triage_action == "reject":
+                winddown_deadline = self._triage_reject_deadline
             await self._speak_takeover_hold_if_needed(agent, bridge, generation)
             claimed = self.take_takeover_session()
             if claimed is not None:
@@ -972,7 +1001,11 @@ class CallSession:
             effect_guard=lambda: self._agent_effect_allowed(generation),
         )
         registry = tools.register()
-        if direction == "inbound" and config.get_bool("INBOUND_TAKEOVER_ENABLED"):
+        if (
+            direction == "inbound"
+            and config.get_bool("INBOUND_TAKEOVER_ENABLED")
+            and self._triage_mode == "off"
+        ):
             registry.register(
                 REQUEST_OWNER_TAKEOVER_SPEC,
                 lambda _args: self._request_owner_takeover(generation),
@@ -1046,6 +1079,162 @@ class CallSession:
                     "DTMF 判官停止失败: error_type=%s", type(exc).__name__
                 )
 
+    def _initialize_triage_context(
+        self, direction: str, record: CallRecord | None
+    ) -> None:
+        self._stop_triage_judge(join_timeout=0.0)
+        mode = config.get_str("INBOUND_TRIAGE_MODE").strip().lower()
+        self._triage_mode = mode if mode in {"off", "shadow", "enforce"} else "off"
+        self._triage_results = Queue(maxsize=4)
+        self._triage_consumer = TriageVerdictConsumer(
+            transfer_threshold=0.7,
+            reject_threshold=0.85,
+        )
+        self._triage_pending = direction == "inbound" and self._triage_mode == "enforce"
+        self._triage_terminal = False
+        self._triage_reject_deadline = None
+        self._triage_clarification_spoken = False
+        if direction != "inbound" or self._triage_mode == "off":
+            return
+
+        def on_verdict(verdict: TriageVerdict, latency_ms: float) -> None:
+            if record is not None:
+                record.log_event(
+                    "inbound_triage_judge",
+                    mode=self._triage_mode,
+                    latency_ms=latency_ms,
+                    **verdict.public_fields(),
+                )
+            self._publish(
+                {
+                    "type": "inbound_triage",
+                    "status": "judged",
+                    "mode": self._triage_mode,
+                    **verdict.public_fields(),
+                }
+            )
+            if self._triage_mode != "enforce":
+                return
+            try:
+                self._triage_results.put_nowait(verdict)
+            except Full:
+                try:
+                    self._triage_results.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    self._triage_results.put_nowait(verdict)
+                except Full:
+                    pass
+
+        def on_error(
+            code: str,
+            turn_id: int,
+            call_generation: int,
+            latency_ms: float,
+        ) -> None:
+            if record is not None:
+                record.log_event(
+                    "inbound_triage_error",
+                    code=code,
+                    turn_id=turn_id,
+                    call_generation=call_generation,
+                    latency_ms=latency_ms,
+                )
+
+        judge = InboundTriageJudge(
+            call_generation=self._session_generation,
+            preference=config.get_str("INBOUND_TAKEOVER_PREFERENCE"),
+            on_verdict=on_verdict,
+            on_error=on_error,
+        )
+        self._triage_judge = judge
+        judge.start()
+
+    def _stop_triage_judge(self, *, join_timeout: float = 0.2) -> None:
+        judge = self._triage_judge
+        self._triage_judge = None
+        if judge is not None:
+            try:
+                judge.stop(join_timeout=join_timeout)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "来电分诊判官停止失败: error_type=%s", type(exc).__name__
+                )
+
+    async def _consume_triage_results(
+        self, agent: VoiceAgent, bridge: AudioBridge, generation: int
+    ) -> str | None:
+        terminal_action: str | None = None
+        while True:
+            try:
+                verdict = self._triage_results.get_nowait()
+            except Empty:
+                break
+            result = self._triage_consumer.consume(
+                verdict, current_generation=generation
+            )
+            self._log_triage_consumption(result)
+            if result.outcome in {"ignored", "observe"}:
+                continue
+            if result.outcome == "continue_ai":
+                self._triage_pending = False
+                continue
+            if result.outcome == "clarify":
+                if self._triage_clarification_spoken:
+                    continue
+                self._triage_clarification_spoken = True
+                try:
+                    await agent.say(_INBOUND_TRIAGE_CLARIFY_TEXT)
+                    self._drain_agent_audio(bridge)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "分诊澄清语播放失败: error_type=%s", type(exc).__name__
+                    )
+                continue
+            if result.outcome == "transfer":
+                # Fence normal Realtime output before orchestration. The takeover
+                # hold line has its own one-shot generation gate.
+                self._triage_terminal = True
+                request = self.begin_owner_takeover(trigger="triage_judge")
+                if request.get("success") is not True:
+                    self._triage_terminal = False
+                    self._triage_consumer.rollback_terminal()
+                    logger.warning(
+                        "分诊转接编排失败: code=%s", request.get("code", "unknown")
+                    )
+                    continue
+                terminal_action = "transfer"
+                continue
+            if result.outcome == "reject":
+                # The fixed line is generated by orchestration, not by Realtime's
+                # free-form policy. Fence immediately after its audio is flushed.
+                self._clear_outgoing_audio()
+                try:
+                    await agent.say(_INBOUND_TRIAGE_REJECT_TEXT)
+                    self._drain_agent_audio(bridge)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "分诊拒绝语播放失败: error_type=%s", type(exc).__name__
+                    )
+                self._triage_terminal = True
+                self._triage_pending = False
+                self._triage_reject_deadline = time.monotonic() + min(
+                    3.0, max(0.5, self._hangup_delay_seconds)
+                )
+                terminal_action = "reject"
+        return terminal_action
+
+    def _log_triage_consumption(self, result: TriageConsumption) -> None:
+        record = self._record
+        if record is not None:
+            record.log_event(
+                "inbound_triage_consumed",
+                outcome=result.outcome,
+                reason=result.reason,
+                **result.verdict.public_fields(),
+            )
+
     def _sms_target_allowed(self, number: str) -> bool:
         """发短信目标限制:只允许回复已联系过的号码或当前通话对端。
 
@@ -1064,10 +1253,12 @@ class CallSession:
         """会话系统提示词：文本构造在 prompts 模块（纯函数，可独测）。"""
         lang = agent_language()
         scenario = self._take_prompt_scenario() if direction == "outbound" else None
+        triage_mode = self._triage_mode if direction == "inbound" else "off"
         takeover_preference = (
             config.get_str("INBOUND_TAKEOVER_PREFERENCE")
             if direction == "inbound"
             and config.get_bool("INBOUND_TAKEOVER_ENABLED")
+            and triage_mode == "off"
             else None
         )
         return build_instructions(
@@ -1078,6 +1269,7 @@ class CallSession:
             lang,
             scenario=scenario,
             takeover_preference=takeover_preference,
+            triage_pending=triage_mode == "enforce",
         )
 
     def _opening_instructions(self, direction: str) -> str:
@@ -1585,14 +1777,15 @@ class CallSession:
             return False
         with self._takeover_lock:
             coordinator = self._takeover_coordinator
-            return (
-                coordinator is None
-                or coordinator.state is TakeoverState.AI_ACTIVE
-                or (
-                    self._takeover_hold_generation == generation
-                    and not self._takeover_hold_done
-                )
+            hold_allowed = (
+                self._takeover_hold_generation == generation
+                and not self._takeover_hold_done
             )
+            if hold_allowed:
+                return True
+            if self._triage_terminal:
+                return False
+            return coordinator is None or coordinator.state is TakeoverState.AI_ACTIVE
 
     @property
     def takeover_state(self) -> TakeoverState | None:
@@ -1624,8 +1817,51 @@ class CallSession:
                 media_router=router,
             )
 
-    def _request_owner_takeover(self, generation: int) -> dict:
-        if not config.get_bool("INBOUND_TAKEOVER_ENABLED"):
+    def begin_owner_takeover(self, *, trigger: str = "orchestrator") -> dict:
+        """Request takeover for the current inbound call from deterministic policy."""
+        return self._request_owner_takeover(
+            self._session_generation,
+            trigger=trigger,
+        )
+
+    def force_takeover_request(self) -> dict:
+        """Debug smoke hook: force takeover on the current active call."""
+        generation = self._session_generation
+        if not self._agent_generation_current(generation):
+            return {
+                "success": False,
+                "code": "NO_ACTIVE_CALL",
+                "message": "当前没有进行中的通话",
+            }
+        if not self.modem.is_call_connected():
+            return {
+                "success": False,
+                "code": "CALL_NOT_CONNECTED",
+                "message": "当前物理通话尚未接通",
+            }
+        with self._takeover_lock:
+            if self._takeover_coordinator is None:
+                self._takeover_coordinator = InboundTakeoverCoordinator(
+                    call_id=f"call_{secrets.token_urlsafe(18)}",
+                    generation=generation,
+                    media_router=_CallSessionMediaRouter(),
+                )
+        return self._request_owner_takeover(
+            generation,
+            trigger="debug_force",
+            allow_outbound=True,
+            bypass_enabled=True,
+        )
+
+    def _request_owner_takeover(
+        self,
+        generation: int,
+        *,
+        trigger: str = "agent_tool",
+        allow_outbound: bool = False,
+        bypass_enabled: bool = False,
+    ) -> dict:
+        if not bypass_enabled and not config.get_bool("INBOUND_TAKEOVER_ENABLED"):
             return {
                 "success": False,
                 "code": "TAKEOVER_DISABLED",
@@ -1637,7 +1873,7 @@ class CallSession:
                 "code": "STALE_AGENT_GENERATION",
                 "message": "当前 Agent 会话已失效",
             }
-        if self._outbound_number is not None:
+        if self._outbound_number is not None and not allow_outbound:
             return {
                 "success": False,
                 "code": "TAKEOVER_INBOUND_ONLY",
@@ -1689,7 +1925,7 @@ class CallSession:
                 "takeover_requested",
                 call_id=request.call_id,
                 generation=request.generation,
-                trigger="agent_tool",
+                trigger=trigger,
                 preference_configured=bool(
                     config.get_str("INBOUND_TAKEOVER_PREFERENCE").strip()
                 ),
@@ -2147,6 +2383,10 @@ class CallAgentService:
             return False, "当前没有进行中的通话"
         self.session.stop()
         return True, None
+
+    def force_takeover_request(self) -> dict:
+        """Expose the active-session debug smoke hook to the local web layer."""
+        return self.session.force_takeover_request()
 
     def send_dtmf(self, digits: str) -> tuple[bool, str | None]:
         """通话中人工发送 DTMF 按键（IVR 菜单导航）。"""

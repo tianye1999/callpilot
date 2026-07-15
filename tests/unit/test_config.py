@@ -660,6 +660,7 @@ def test_inbound_takeover_defaults_off_and_example_stays_free_text(monkeypatch):
         monkeypatch,
         "INBOUND_TAKEOVER_ENABLED",
         "INBOUND_TAKEOVER_PREFERENCE",
+        "INBOUND_TRIAGE_MODE",
     )
     example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
         encoding="utf-8"
@@ -667,8 +668,10 @@ def test_inbound_takeover_defaults_off_and_example_stays_free_text(monkeypatch):
 
     assert get_bool("INBOUND_TAKEOVER_ENABLED") is False
     assert get_str("INBOUND_TAKEOVER_PREFERENCE") == ""
+    assert get_str("INBOUND_TRIAGE_MODE") == "off"
     assert "INBOUND_TAKEOVER_ENABLED=false" in example
     assert "INBOUND_TAKEOVER_PREFERENCE=" in example
+    assert "INBOUND_TRIAGE_MODE=off" in example
 
 
 def test_enabling_remote_web_dialer_requires_complete_secure_config(

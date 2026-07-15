@@ -90,6 +90,9 @@ def test_takeover_tool_is_registered_only_for_enabled_inbound(monkeypatch) -> No
     assert "request_owner_takeover" in _tool_names(service, "inbound")
     assert "request_owner_takeover" not in _tool_names(service, "outbound")
 
+    service.session._triage_mode = "enforce"
+    assert "request_owner_takeover" not in _tool_names(service, "inbound")
+
 
 def test_tool_request_is_opaque_bounded_and_double_gated(monkeypatch) -> None:
     monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
@@ -212,3 +215,24 @@ def test_offer_request_does_not_publish_nonce_or_preference(monkeypatch) -> None
     history = service.hub.history() if service.hub is not None else []
     assert request.nonce not in repr(history)
     assert "快递也转接" not in repr(history)
+
+
+def test_service_force_takeover_hook_supports_active_outbound_smoke() -> None:
+    service = _service()
+    session = service.session
+    session._active = True
+    session._outbound_number = "10086"
+    session._session_generation = 11
+    session._initialize_takeover_context("outbound")
+
+    not_connected = service.force_takeover_request()
+    assert not_connected["code"] == "CALL_NOT_CONNECTED"
+    service.modem.trigger_call_connected("10086")
+
+    result = service.force_takeover_request()
+    request = service.next_inbound_takeover_offer()
+
+    assert result["success"] is True
+    assert request is not None
+    assert request.generation == 11
+    assert session.takeover_state is TakeoverState.TAKEOVER_PREPARING

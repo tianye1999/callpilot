@@ -194,6 +194,14 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
         "",
         requires_restart=True,
     ),
+    ConfigSpec(
+        "INBOUND_TRIAGE_MODE",
+        "来电智能分诊模式",
+        "select",
+        "off",
+        choices=("off", "shadow", "enforce"),
+        requires_restart=True,
+    ),
     # 默认留空：让 prompts.agent_persona() 按 AGENT_LANGUAGE 回退到
     # 「AI 助理」/「AI assistant」，英文模式下不会硬塞中文人设。
     ConfigSpec("AGENT_PERSONA", "AI 人设称谓", "str", ""),
