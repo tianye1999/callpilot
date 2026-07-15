@@ -23,6 +23,7 @@ from agentcall.audio_bridge import (
     create_audio_bridge,
 )
 from agentcall.call_log import CallLogger
+from agentcall.dial_guard import DialGuardFailure
 from agentcall.livekit_media import LiveKitRemoteMediaEndpoint, _decode_control_payload
 from agentcall.remote_dialer import (
     REMOTE_AUDIO_RATE,
@@ -277,6 +278,7 @@ def _coordinator(
     dtmf_mode: str = "inband",
     grace: float = 0.05,
     connect_timeout: float = 0.2,
+    dial_guard=None,
 ) -> RemoteWebDialerCoordinator:
     return RemoteWebDialerCoordinator(
         session_id="session-test",
@@ -290,7 +292,72 @@ def _coordinator(
         call_logger=call_logger,
         reserve_line=lambda _owner: None,
         release_line=lambda _owner: None,
+        dial_guard=dial_guard,
     )
+
+
+def test_guard_failure_does_not_consume_remote_dial_attempt():
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        coordinator = _coordinator(
+            endpoint,
+            FakeModem(),
+            FakeBridge(),
+            dial_guard=lambda _number: DialGuardFailure(
+                "SIM_NOT_READY", "SIM 卡尚未就绪"
+            ),
+        )
+
+        await coordinator._handle_dial(
+            {"type": "dial", "number": "10086", "idempotency_key": "guard-entry"}
+        )
+
+        assert coordinator._dial_attempted is False
+        assert coordinator._call_task is None
+        assert endpoint.events[-1]["code"] == "SIM_NOT_READY"
+
+    asyncio.run(run())
+
+
+def test_guard_state_flip_before_atd_skips_record_bridge_and_modem_dial():
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        modem = FakeModem()
+        bridge = FakeBridge()
+        checks = 0
+
+        def guard(_number):
+            nonlocal checks
+            checks += 1
+            if checks == 1:
+                return None
+            return DialGuardFailure("SIM_NOT_REGISTERED", "SIM 卡尚未注册到网络")
+
+        class NoRecordLogger:
+            def begin_call(self, *_args, **_kwargs):
+                raise AssertionError("guard failure must happen before record creation")
+
+        coordinator = _coordinator(
+            endpoint,
+            modem,
+            bridge,
+            call_logger=NoRecordLogger(),  # type: ignore[arg-type]
+            dial_guard=guard,
+        )
+        await coordinator._handle_dial(
+            {"type": "dial", "number": "10086", "idempotency_key": "guard-race"}
+        )
+        assert coordinator._call_task is not None
+        await coordinator._call_task
+
+        assert checks >= 2
+        assert not any(name == "dial" for name, _args in modem.calls)
+        assert bridge.started is False
+        assert any(
+            event.get("code") == "SIM_NOT_REGISTERED" for event in endpoint.events
+        )
+
+    asyncio.run(run())
 
 
 def test_media_must_be_ready_before_dial() -> None:

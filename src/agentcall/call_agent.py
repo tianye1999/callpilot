@@ -28,6 +28,7 @@ from .audio_bridge import (
 from .call_log import CallLogger, CallRecord
 from .call_tools import CallTools
 from .contacts import is_reply_target_allowed
+from .dial_guard import DialGuardFailure, check_dial_guard
 from .dial_queue import DialQueue, whitelist_from_env
 from .dtmf import dtmf_tone
 from .dtmf_followup import extract_spoken_dtmf
@@ -1516,11 +1517,12 @@ class CallAgentService:
         # 乱输入，否则占用会话直到 45s 接通超时才释放。
         if not re.fullmatch(r"\+?[0-9*#]{1,32}", number):
             return False, f"号码格式不合法: {number}"
+        guard_failure = self._dial_guard(number)
+        if guard_failure is not None:
+            return False, guard_failure.message
         missing_credentials, message = self._reject_if_credentials_missing()
         if missing_credentials:
             return False, message
-        if not self.modem_connected:
-            return False, "模组未连接（检查 USB 桥与 EC20）"
         self._remember_outbound_task(task)
         with self._ring_lock:
             if self.session.is_active or self._remote_call_owner is not None:
@@ -1649,8 +1651,9 @@ class CallAgentService:
             return False, "REMOTE_DISABLED"
         if not config.get_bool("REMOTE_CLOUD_ENABLED"):
             return False, "CLOUD_DISABLED"
-        if not self.modem_connected:
-            return False, "MODEM_OFFLINE"
+        guard_failure = self._dial_guard(None)
+        if guard_failure is not None:
+            return False, guard_failure.code
         session = command["session"]
         expires_at = float(command["expiresAtUnix"])
         issued = IssuedLiveKitSession(
@@ -1777,20 +1780,22 @@ class CallAgentService:
             reserve_line=self._reserve_remote_line,
             release_line=self._release_remote_line,
             publish_event=self._publish,
+            dial_guard=self._dial_guard,
         )
         return RemoteDialerWorker(coordinator)
 
     def _reserve_remote_line(
         self, owner: RemoteWebDialerCoordinator
-    ) -> str | None:
+    ) -> str | DialGuardFailure | None:
         with self._ring_lock:
             worker = self._remote_worker
             if worker is None or worker.coordinator is not owner:
                 return "远程拨号会话已过期"
             if not config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
                 return "远程网页拨号已关闭"
-            if not self.modem_connected:
-                return "模组未连接"
+            guard_failure = self._dial_guard(None)
+            if guard_failure is not None:
+                return guard_failure
             if self.session.is_active or self._remote_call_owner is not None:
                 return "当前正在通话中，请稍后再拨"
             limit = acquire_remote_dial_slot(
@@ -1801,6 +1806,13 @@ class CallAgentService:
                 return f"远程外呼过于频繁，请在 {retry_seconds} 秒后重试"
             self._remote_call_owner = owner
         return None
+
+    def _dial_guard(self, number: str | None) -> DialGuardFailure | None:
+        return check_dial_guard(
+            modem_online=self.modem_connected,
+            sim_identity=getattr(self.modem, "sim_identity", None),
+            number=number,
+        )
 
     def _release_remote_line(self, owner: RemoteWebDialerCoordinator) -> None:
         with self._ring_lock:

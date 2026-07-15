@@ -7,11 +7,13 @@ import threading
 import time
 
 import numpy as np
+import pytest
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
 from agentcall.call_agent import CallAgentService
 from agentcall.events import EventHub
 from agentcall.remote_dialer import IssuedLiveKitSession, RemoteDialerInvite
+from agentcall.sim_identity import UNKNOWN_SIM, SimIdentity
 
 
 def make_service(
@@ -179,6 +181,118 @@ def test_dial_empty_number_rejected():
     service = make_service(FakeModem())
     ok, err = service.dial("  ")
     assert not ok
+
+
+def test_local_dial_guard_rejects_before_remembering_task_or_starting_session(
+    monkeypatch,
+):
+    modem = FakeModem()
+    modem.sim_identity = SimIdentity(  # type: ignore[attr-defined]
+        present=True,
+        plmn="46000",
+        carrier="中国移动",
+        service_number="10086",
+        registered=True,
+        reg_status="已注册",
+    )
+    service = make_service(modem)
+    monkeypatch.setattr(service, "_credential_errors", lambda: [])
+    remembered: list[str | None] = []
+    started: list[str] = []
+    monkeypatch.setattr(service, "_remember_outbound_task", remembered.append)
+    monkeypatch.setattr(
+        service.session,
+        "start",
+        lambda outbound_number=None, **_kwargs: started.append(outbound_number),
+    )
+
+    ok, error = service.dial("10010", task="不应保存")
+
+    assert ok is False
+    assert "运营商" in (error or "")
+    assert remembered == []
+    assert started == []
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected"),
+    [
+        (UNKNOWN_SIM, "SIM 卡未插入"),
+        (
+            SimIdentity(
+                present=True,
+                plmn="46000",
+                carrier="中国移动",
+                service_number="10086",
+                registered=False,
+                reg_status="搜网中",
+            ),
+            "尚未注册",
+        ),
+    ],
+)
+def test_local_dial_guard_rejects_missing_and_unregistered_sim(
+    monkeypatch, identity, expected
+):
+    modem = FakeModem()
+    modem.sim_identity = identity  # type: ignore[attr-defined]
+    service = make_service(modem)
+    monkeypatch.setattr(service, "_credential_errors", lambda: [])
+    monkeypatch.setattr(
+        service.session,
+        "start",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not start")),
+    )
+
+    ok, error = service.dial("10086")
+
+    assert ok is False
+    assert expected in (error or "")
+
+
+@pytest.mark.parametrize("number", ["10086", "13900000000"])
+def test_local_dial_guard_allows_same_carrier_hotline_and_ordinary_numbers(
+    monkeypatch, number
+):
+    modem = FakeModem()
+    modem.sim_identity = SimIdentity(  # type: ignore[attr-defined]
+        present=True,
+        plmn="46000",
+        carrier="中国移动",
+        service_number="10086",
+        registered=True,
+        reg_status="已注册",
+    )
+    service = make_service(modem)
+    monkeypatch.setattr(service, "_credential_errors", lambda: [])
+    started: list[str] = []
+    monkeypatch.setattr(
+        service.session,
+        "start",
+        lambda outbound_number=None, **_kwargs: started.append(outbound_number),
+    )
+
+    ok, error = service.dial(number)
+
+    assert ok is True and error is None
+    assert started == [number]
+
+
+def test_cloud_remote_session_rejects_unknown_sim_before_media_setup(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_CLOUD_ENABLED", "true")
+    modem = FakeModem()
+    modem.sim_identity = UNKNOWN_SIM  # type: ignore[attr-defined]
+    service = make_service(modem)
+    built: list[bool] = []
+    monkeypatch.setattr(
+        service, "_build_remote_worker_for_issued", lambda _issued: built.append(True)
+    )
+
+    ok, error = service.start_cloud_remote_session({})
+
+    assert ok is False and error == "SIM_NOT_READY"
+    assert built == []
 
 
 def test_wait_connected_times_out():

@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 from .audio_bridge import MODEM_RATE, create_audio_bridge
 from .call_log import CallLogger, CallRecord
+from .dial_guard import DialGuardFailure
 from .dtmf import dtmf_tone
 from .pcm_stats import PcmFlowStats
 
@@ -236,9 +237,12 @@ class RemoteWebDialerCoordinator:
         runtime: RemoteDialerRuntimeConfig,
         bridge_factory: Callable[..., AudioBridgeLike] = create_audio_bridge,
         call_logger: CallLogger | None = None,
-        reserve_line: Callable[[RemoteWebDialerCoordinator], str | None] | None = None,
+        reserve_line: (
+            Callable[[RemoteWebDialerCoordinator], str | DialGuardFailure | None] | None
+        ) = None,
         release_line: Callable[[RemoteWebDialerCoordinator], None] | None = None,
         publish_event: Callable[[dict[str, Any]], None] | None = None,
+        dial_guard: Callable[[str | None], DialGuardFailure | None] | None = None,
     ) -> None:
         self.session_id = session_id
         self.expires_at = expires_at
@@ -250,6 +254,7 @@ class RemoteWebDialerCoordinator:
         self._reserve_line = reserve_line or (lambda _owner: None)
         self._release_line = release_line or (lambda _owner: None)
         self._publish_event = publish_event
+        self._dial_guard = dial_guard or (lambda _number: None)
 
         self.edge_ready = threading.Event()
         self.finished = threading.Event()
@@ -291,7 +296,7 @@ class RemoteWebDialerCoordinator:
         return True
 
     def status(self) -> dict[str, Any]:
-        return {
+        status = {
             "session_id": self.session_id,
             "edge_ready": self.edge_ready.is_set(),
             "browser_connected": self.endpoint.browser_connected,
@@ -300,6 +305,9 @@ class RemoteWebDialerCoordinator:
             "expires_at": self.expires_at,
             "status": self._last_status.get("status", "starting"),
         }
+        if "code" in self._last_status:
+            status["code"] = self._last_status["code"]
+        return status
 
     async def run(self) -> None:
         media_was_ready = False
@@ -434,6 +442,14 @@ class RemoteWebDialerCoordinator:
                 "failed", code="call_already_started", reason="call_already_started"
             )
             return
+        guard_failure = self._dial_guard(number.strip())
+        if guard_failure is not None:
+            await self._send_status(
+                "failed",
+                code=guard_failure.code,
+                reason=guard_failure.message,
+            )
+            return
         if not self.endpoint.media_ready:
             await self._send_status(
                 "failed", code="media_not_ready", reason="media_not_ready"
@@ -518,20 +534,24 @@ class RemoteWebDialerCoordinator:
         snapshot_task: asyncio.Task[None] | None = None
         finish_status = "failed"
         finish_reason = "edge_error"
+        finish_code: str | None = None
         try:
             reserve_error = self._reserve_line(self)
             if reserve_error:
-                finish_reason = "line_unavailable"
-                await self._send_status(
-                    "failed", code="line_unavailable", reason=reserve_error
-                )
+                if isinstance(reserve_error, DialGuardFailure):
+                    finish_reason = reserve_error.code
+                    finish_code = reserve_error.code
+                    await self._send_status(
+                        "failed", code=reserve_error.code, reason=reserve_error.message
+                    )
+                else:
+                    finish_reason = "line_unavailable"
+                    await self._send_status(
+                        "failed", code="line_unavailable", reason=reserve_error
+                    )
                 return
             self._line_reserved = True
             self.call_active.set()
-            record = self._begin_record(number)
-            self._record = record
-            if record is not None:
-                record.log_event("remote_session", source=REMOTE_CALL_SOURCE)
 
             # The media-ready check is intentionally repeated immediately before ATD.
             if not self.endpoint.media_ready:
@@ -540,6 +560,22 @@ class RemoteWebDialerCoordinator:
                     "failed", code="media_not_ready", reason=finish_reason
                 )
                 return
+
+            guard_failure = self._dial_guard(number)
+            if guard_failure is not None:
+                finish_reason = guard_failure.code
+                finish_code = guard_failure.code
+                await self._send_status(
+                    "failed",
+                    code=guard_failure.code,
+                    reason=guard_failure.message,
+                )
+                return
+
+            record = self._begin_record(number)
+            self._record = record
+            if record is not None:
+                record.log_event("remote_session", source=REMOTE_CALL_SOURCE)
 
             self.modem.dial(number)
             await self._send_status("dialing")
@@ -670,9 +706,13 @@ class RemoteWebDialerCoordinator:
             self._record = None
             self.call_active.clear()
             self._call_connected.clear()
-            await self._send_status(
-                "ended", reason=finish_reason, outcome=finish_status
-            )
+            ended_fields: dict[str, Any] = {
+                "reason": finish_reason,
+                "outcome": finish_status,
+            }
+            if finish_code is not None:
+                ended_fields["code"] = finish_code
+            await self._send_status("ended", **ended_fields)
             self._publish(
                 {
                     "type": "remote_call",

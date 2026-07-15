@@ -133,6 +133,26 @@ def test_cloud_client_accepts_only_complete_unexpired_session_commands() -> None
     assert len(sent) == 1
 
 
+def test_cloud_ack_preserves_stable_edge_preflight_error_code() -> None:
+    class _RejectingService(_Service):
+        def start_cloud_remote_session(
+            self, command: dict
+        ) -> tuple[bool, str | None]:
+            self.commands.append(command)
+            return False, "SIM_NOT_REGISTERED"
+
+    service = _RejectingService()
+    client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
+    sent: list[dict] = []
+
+    client.handle_message(
+        json.dumps(_command()), lambda value: sent.append(json.loads(value))
+    )
+
+    assert sent[0]["status"] == "rejected"
+    assert sent[0]["errorCode"] == "SIM_NOT_REGISTERED"
+
+
 def test_heartbeat_tracks_live_modem_connection_state() -> None:
     service = _Service()
     client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
