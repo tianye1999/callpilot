@@ -25,6 +25,7 @@ class FakeEndpoint:
         self.closed = False
         self.connected = False
         self.browser_chunks = [b"mobile-to-caller"]
+        self.commands: list[dict] = []
         self.events: list[dict] = []
 
     async def connect(self) -> None:
@@ -34,7 +35,7 @@ class FakeEndpoint:
         self.closed = True
 
     async def next_command(self, timeout: float):
-        return None
+        return self.commands.pop(0) if self.commands else None
 
     def take_browser_audio(self, max_chunks: int = 10) -> list[bytes]:
         chunks, self.browser_chunks = self.browser_chunks, []
@@ -46,6 +47,14 @@ class FakeEndpoint:
 
     async def send_event(self, event: dict) -> None:
         self.events.append(event)
+
+
+class FakeRecord:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def log_event(self, event_type: str, **fields) -> None:
+        self.events.append({"type": event_type, **fields})
 
 
 def _service() -> CallAgentService:
@@ -215,9 +224,49 @@ def test_postcommit_media_loss_expires_to_notice_then_hangup(monkeypatch) -> Non
     endpoint = FakeEndpoint(session)
     endpoint.media_ready = False
     session.modem.connected_flag.set()
+    record = FakeRecord()
 
     asyncio.run(
-        session._pump_mobile_media(endpoint, FakeAudioBridge(), None, claimed)
+        session._pump_mobile_media(
+            endpoint,
+            FakeAudioBridge(),
+            record,  # type: ignore[arg-type]
+            claimed,
+        )
     )
 
     assert session.takeover_state is TakeoverState.ENDED
+    assert coordinator.end_reason == "mobile_reconnect_timeout"
+    assert record.events == [{"type": "takeover_notice_then_hangup"}]
+
+
+def test_owner_hangup_command_ends_without_disconnect_notice(monkeypatch) -> None:
+    service = _service()
+    session = service.session
+    claimed = _claimed(service, monkeypatch)
+    coordinator = session._takeover_coordinator
+    assert coordinator is not None
+    assert coordinator.mark_mobile_media_ready(claimed.fence).accepted
+    assert coordinator.commit_mobile(claimed.fence).accepted
+    endpoint = FakeEndpoint(session)
+    endpoint.browser_chunks = []
+    endpoint.commands.append({"type": "hangup"})
+    session.modem.connected_flag.set()
+    record = FakeRecord()
+
+    asyncio.run(
+        asyncio.wait_for(
+            session._pump_mobile_media(
+                endpoint,
+                FakeAudioBridge(),
+                record,  # type: ignore[arg-type]
+                claimed,
+            ),
+            timeout=0.2,
+        )
+    )
+
+    assert session.takeover_state is TakeoverState.ENDED
+    assert coordinator.end_reason == "owner_hangup"
+    assert record.events == [{"type": "takeover_owner_hangup"}]
+    assert session.modem.calls == []

@@ -846,6 +846,13 @@ class CallSession:
         fence = claimed.fence
         disconnected_at: float | None = None
         while self._active and self.modem.is_call_connected():
+            # Keep control responsive without stretching the 10 ms media cadence.
+            command = await endpoint.next_command(timeout=0.001)
+            if command is not None and command.get("type") == "hangup":
+                self._takeover_coordinator.end_call("owner_hangup")  # type: ignore[union-attr]
+                if record is not None:
+                    record.log_event("takeover_owner_hangup")
+                break
             if endpoint.media_ready:
                 if self.takeover_state is TakeoverState.MOBILE_RECONNECTING:
                     self._takeover_coordinator.mark_mobile_reconnected(fence)  # type: ignore[union-attr]
