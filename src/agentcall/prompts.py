@@ -160,12 +160,22 @@ def _build_zh(
             + common
         )
 
+    pending = config.get_str("INBOUND_PENDING_TOPIC").strip()
+    pending_line = (
+        f"待办事项：如果来电方是{pending}相关的一方（如对应的机构/客服），"
+        f"在自然接待、确认对方身份后，主动代{owner}把下面的事项问清楚、听取答复并记下要点：\n"
+        f"{pending}\n"
+        "若来电与此事项无关，按常规接待处理即可，不要生硬提起。\n"
+        if pending
+        else ""
+    )
     return (
         f"你是{owner}的{persona}，正在替{owner}接听打进来的电话，"
         f"{owner}现在不方便接。\n"
         f"来电任务：自然接待，了解对方是谁、找{owner}什么事、急不急、"
         f"是否需要{owner}回拨，并记下要点转告{owner}。\n"
-        "来电规则：\n"
+        + pending_line
+        + "来电规则：\n"
         f"1. 不要冒充{owner}本人；被问身份时说你是{owner}的{persona}。\n"
         f"2. 不要暗示是{owner}主动联系对方。\n"
         f"3. 不承诺回拨时间、不替{owner}做决定；只说会转告{owner}。\n"
@@ -298,13 +308,25 @@ def _build_en(
             + common
         )
 
+    pending = config.get_str("INBOUND_PENDING_TOPIC").strip()
+    pending_line = (
+        f"Pending matter: if the caller is a party related to [{pending}] (e.g. the "
+        f"relevant organization/agent), then after greeting and confirming who they "
+        f"are, proactively raise the following on {owner}'s behalf, get their answer, "
+        f"and note the key points:\n{pending}\n"
+        "If the call is unrelated to this matter, just handle it as a normal "
+        "reception — don't force the topic.\n"
+        if pending
+        else ""
+    )
     return (
         f"You are {owner}'s {persona}, answering an incoming call for {owner}, "
         f"who can't take it right now.\n"
         f"Task for this call: greet naturally, find out who's calling, what they "
         f"need {owner} for, how urgent it is, and whether {owner} should call back; "
         f"note the key points to pass on to {owner}.\n"
-        "Incoming-call rules:\n"
+        + pending_line
+        + "Incoming-call rules:\n"
         f"1. Never impersonate {owner} in person; when asked, say you are {owner}'s "
         f"{persona}.\n"
         f"2. Don't imply that {owner} initiated contact.\n"

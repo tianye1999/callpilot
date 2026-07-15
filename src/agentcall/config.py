@@ -193,6 +193,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 默认留空 = 无预设事项（提示词走「无预设」优雅分支，不会硬塞元指令当主题）；
     # 外呼时通常在页面临时填具体主题。
     ConfigSpec("AGENT_OUTBOUND_TASK", "外呼任务指令", "str", ""),
+    # 来电待办：非空时，AI 接听相关方来电会主动代机主问清这些事项（默认空=纯接待）。
+    ConfigSpec("INBOUND_PENDING_TOPIC", "来电待办事项", "str", ""),
     ConfigSpec("PROMPT_GEN_ENABLED", "动态场景提示词", "bool", "true"),
     ConfigSpec("PROMPT_GEN_MODEL", "动态场景提示词模型", "str", ""),
     ConfigSpec("PROMPT_GEN_TIMEOUT", "动态场景提示词超时（秒）", "float", "5.0",
