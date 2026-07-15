@@ -36,13 +36,20 @@ describe("hosted dialer", () => {
     expect(script).not.toContain("Authorization");
   });
 
+  it("accepts pairing fragments but not legacy direct LiveKit invites", () => {
+    expect(script).toContain('fragment.startsWith("pair=")');
+    expect(script).not.toContain("parseInviteFragment");
+    expect(script).not.toContain("parseInviteUrl");
+    expect(script).not.toContain("atob(");
+  });
+
   it("only caches the shell and keeps API responses out of the service worker cache", () => {
     expect(serviceWorker).toContain('url.pathname.startsWith("/api/")');
     expect(serviceWorker).toContain('url.pathname.startsWith("/v1/")');
     expect(serviceWorker).toContain('if (!SHELL.includes(`${url.pathname}${url.search}`)) return;');
   });
 
-  it("allows the configured LiveKit Cloud discovery request", () => {
-    expect(page).toContain("connect-src 'self' https://*.livekit.cloud wss:");
+  it("leaves the Worker response header as the CSP source of truth", () => {
+    expect(page).not.toContain('http-equiv="Content-Security-Policy"');
   });
 });

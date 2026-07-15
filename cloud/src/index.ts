@@ -1,4 +1,5 @@
 import { authenticateDevice, authenticateEdge } from "./auth";
+import { liveKitConnectSources } from "./csp";
 import { EdgeRoom } from "./edge-room";
 import { error, HttpError, json, readJson, requireSameOrigin } from "./http";
 import { issueParticipantToken } from "./livekit";
@@ -66,7 +67,7 @@ async function route(request: Request, env: Env, requestId: string): Promise<Res
   if (path.startsWith("/v1/") || path.startsWith("/api/")) {
     return error("NOT_FOUND", "Resource not found", 404, requestId);
   }
-  return secureAsset(await env.ASSETS.fetch(request));
+  return secureAsset(await env.ASSETS.fetch(request), env);
 }
 
 async function createEnrollmentInvite(request: Request, env: Env): Promise<Response> {
@@ -341,9 +342,10 @@ function deviceCookie(value: string, maxAge: number): string {
   return `__Host-callpilot-device=${value}; Path=/; Max-Age=${maxAge}; Secure; HttpOnly; SameSite=Strict`;
 }
 
-function secureAsset(response: Response): Response {
+function secureAsset(response: Response, env: Env): Response {
   const headers = new Headers(response.headers);
-  headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self' https://*.livekit.cloud wss:; media-src blob:; worker-src 'self' blob:; manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+  const liveKitSources = liveKitConnectSources(env.LIVEKIT_URL);
+  headers.set("Content-Security-Policy", `default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self'${liveKitSources}; media-src blob:; worker-src 'self' blob:; manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`);
   headers.set("Permissions-Policy", "microphone=(self), camera=(), geolocation=()");
   headers.set("Referrer-Policy", "no-referrer");
   headers.set("X-Content-Type-Options", "nosniff");

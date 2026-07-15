@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { liveKitConnectSources } from "../src/csp";
 import {
   bearerCredential,
   constantTimeEqual,
@@ -62,3 +63,19 @@ describe("protocol schema", () => {
   });
 });
 
+describe("asset CSP", () => {
+  it("allows only the configured secure LiveKit origin", () => {
+    expect(liveKitConnectSources("wss://tenant.livekit.cloud")).toBe(
+      " https://tenant.livekit.cloud wss://tenant.livekit.cloud",
+    );
+    expect(liveKitConnectSources("wss://localhost:7880/path")).toBe(
+      " https://localhost:7880 wss://localhost:7880",
+    );
+  });
+
+  it("fails closed for malformed or insecure LiveKit URLs", () => {
+    expect(liveKitConnectSources("not a url")).toBe("");
+    expect(liveKitConnectSources("https://tenant.livekit.cloud")).toBe("");
+    expect(liveKitConnectSources("wss://user:secret@tenant.livekit.cloud")).toBe("");
+  });
+});

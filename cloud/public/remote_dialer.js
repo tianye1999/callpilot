@@ -157,36 +157,6 @@
     return fragment.length <= 8192 ? fragment : "";
   }
 
-  function parseInviteFragment(fragment) {
-    if (!fragment || fragment.startsWith("pair=")) return null;
-    try {
-      const normalized = fragment.replace(/-/g, "+").replace(/_/g, "/");
-      const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
-      const payload = JSON.parse(atob(padded));
-      const url = new URL(payload.url);
-      if (
-        payload.v !== 1 ||
-        url.protocol !== "wss:" ||
-        typeof payload.token !== "string" ||
-        payload.token.length < 40 ||
-        typeof payload.sessionId !== "string" ||
-        !/^[A-Za-z0-9_-]{8,64}$/.test(payload.sessionId)
-      ) return null;
-      return { url: url.toString(), token: payload.token, sessionId: payload.sessionId };
-    } catch (_error) {
-      return null;
-    }
-  }
-
-  function parseInviteUrl(urlValue) {
-    try {
-      const url = new URL(urlValue, window.location.href);
-      return parseInviteFragment(url.hash.slice(1));
-    } catch (_error) {
-      return null;
-    }
-  }
-
   function idempotencyKey() {
     if (crypto.randomUUID) return crypto.randomUUID();
     const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -439,13 +409,6 @@
   async function initialize() {
     deviceName.value = t("default_device_name");
     const fragment = takeFragment();
-    invite = parseInviteFragment(fragment);
-    if (invite) {
-      terminal = false;
-      showDialer(null);
-      setStatus("idle", t("ready"));
-      return;
-    }
     if (fragment.startsWith("pair=")) pairingCode.value = fragment.slice(5).toUpperCase();
     if (await refreshDevice()) return;
     showPairing();

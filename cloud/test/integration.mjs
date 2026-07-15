@@ -50,6 +50,16 @@ worker.stderr.on("data", (chunk) => { workerOutput += chunk; });
 try {
   await waitForHealth();
 
+  const pageResponse = await fetch(`${base}/`);
+  assert.equal(pageResponse.status, 200);
+  const csp = pageResponse.headers.get("content-security-policy") ?? "";
+  assert.match(
+    csp,
+    /connect-src 'self' https:\/\/integration\.livekit\.cloud wss:\/\/integration\.livekit\.cloud;/,
+  );
+  assert.doesNotMatch(csp, /https:\/\/\*\.livekit\.cloud/);
+  assert.doesNotMatch(csp, /(?:^|\s)wss:(?:\s|;|$)/);
+
   const unauthorized = await fetch(`${base}/v1/admin/enrollment-invites`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
