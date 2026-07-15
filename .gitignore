@@ -41,3 +41,11 @@ cloud/node_modules/
 cloud/.wrangler/
 cloud/.dev.vars
 cloud/coverage/
+
+# iOS (xcodegen 生成工程 + 构建产物,不入库;project.yml 与源码入库)
+ios/*.xcodeproj/
+ios/DerivedData/
+ios/build/
+ios/**/xcuserdata/
+ios/*.ipa
+ios/Pods/

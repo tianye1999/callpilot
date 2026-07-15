@@ -1,0 +1,38 @@
+# xcodegen 工程声明(装 Xcode + `brew install xcodegen` 后 `xcodegen generate`)。
+# 声明式、可入库、可复现——不手写易错的 .xcodeproj。
+name: CallPilot
+options:
+  bundleIdPrefix: ai.bondings
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # 开源友好:不硬编码公司 Team。本地 `export DEVELOPMENT_TEAM=<你的TeamID>`
+    # (本机 Azores Labs = 34KBLZ6RX3),或在 Xcode 的 Signing 面板选择。
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+
+packages:
+  LiveKit:
+    url: https://github.com/livekit/client-sdk-swift
+    from: "2.0.0"
+
+targets:
+  CallPilot:
+    type: application
+    platform: iOS
+    sources:
+      - path: CallPilot
+    dependencies:
+      - package: LiveKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot
+        GENERATE_INFOPLIST_FILE: "NO"
+        INFOPLIST_FILE: CallPilot/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"  # iPhone
+        CODE_SIGN_STYLE: Automatic
