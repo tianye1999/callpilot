@@ -55,6 +55,7 @@ from .remote_dialer import (
     RemoteDialerInvite,
     RemoteDialerRuntimeConfig,
     RemoteDialerWorker,
+    RemoteMediaEndpoint,
     RemoteWebDialerCoordinator,
     issue_livekit_session,
 )
@@ -73,6 +74,7 @@ from .takeover_coordinator import (
     InboundTakeoverRevoke,
     InboundTakeoverSession,
     MediaOwner,
+    TakeoverAction,
     TakeoverOffer,
     TakeoverRejection,
     TakeoverResult,
@@ -98,6 +100,8 @@ DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS = 3.0
 DTMF_RECENT_SEND_WINDOW_SECONDS = 5.0
 _EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
 _INBOUND_TAKEOVER_OFFER_TTL_SECONDS = 30.0
+_INBOUND_TAKEOVER_HOLD_TEXT = "请稍等，我确认一下，马上帮您转接。"
+_INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
 
 
 class _CallSessionMediaRouter:
@@ -132,6 +136,8 @@ class CallSession:
         monitor: MonitorPlayback | None = None,
         uplink_monitor: MonitorPlayback | None = None,
         on_ended: Callable[[], None] | None = None,
+        takeover_endpoint_factory: Callable[[IssuedLiveKitSession], RemoteMediaEndpoint]
+        | None = None,
     ) -> None:
         self.modem = modem
         self.audio_keyword = audio_keyword
@@ -145,6 +151,7 @@ class CallSession:
         self.monitor = monitor
         self.uplink_monitor = uplink_monitor
         self._on_ended = on_ended
+        self._takeover_endpoint_factory = takeover_endpoint_factory
         self.current_caller: str | None = None
         self._outbound_number: str | None = None
         # 本通外呼主题：start() 显式传入；未传时回退 AGENT_OUTBOUND_TASK 配置。
@@ -210,6 +217,8 @@ class CallSession:
         )
         self._takeover_revoke_queue: Queue[InboundTakeoverRevoke] = Queue(maxsize=1)
         self._takeover_session_queue: Queue[InboundTakeoverSession] = Queue(maxsize=1)
+        self._takeover_hold_generation: int | None = None
+        self._takeover_hold_done = False
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -416,10 +425,13 @@ class CallSession:
                 await agent.say(self._opening_instructions(direction))
                 mark_greeting_sent()
 
+            active_bridge = bridge
             try:
-                await self._run_agent_loop(agent, bridge, record, transcripts)
+                active_bridge = await self._run_agent_loop(
+                    agent, bridge, record, transcripts
+                )
             finally:
-                await self._shutdown_agent(agent, bridge)
+                await self._shutdown_agent(agent, active_bridge)
         except BaseException:
             status = "failed"
             raise
@@ -534,13 +546,39 @@ class CallSession:
 
         return on_agent_audio
 
+    async def _speak_takeover_hold_if_needed(
+        self, agent: VoiceAgent, bridge: AudioBridge, generation: int
+    ) -> None:
+        """Play one deterministic hold line before the AI transport is fenced."""
+
+        with self._takeover_lock:
+            coordinator = self._takeover_coordinator
+            should_speak = (
+                coordinator is not None
+                and coordinator.state is TakeoverState.TAKEOVER_PREPARING
+                and self._takeover_hold_generation == generation
+                and not self._takeover_hold_done
+            )
+        if not should_speak:
+            return
+        try:
+            await agent.say(_INBOUND_TAKEOVER_HOLD_TEXT)
+            # Flush the one permitted hold line before closing the AI gate; the
+            # regular loop deliberately drops queued AI audio after this point.
+            self._drain_agent_audio(bridge)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("播放接管垫话失败: error_type=%s", type(exc).__name__)
+        finally:
+            with self._takeover_lock:
+                self._takeover_hold_done = True
+
     async def _run_agent_loop(
         self,
         agent,
         bridge: AudioBridge,
         record: CallRecord | None,
         transcripts: list[tuple[str, str]],
-    ) -> None:
+    ) -> AudioBridge:
         """通话主循环：下行音频搬运 + 半双工防回环的上行转发。"""
         last_play_at = 0.0
         loop_started = time.monotonic()
@@ -571,6 +609,14 @@ class CallSession:
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
         while self._active and not agent.fatal:
+            await self._speak_takeover_hold_if_needed(agent, bridge, generation)
+            claimed = self.take_takeover_session()
+            if claimed is not None:
+                handed_off = await self._handoff_to_mobile(
+                    agent, bridge, claimed, record, generation
+                )
+                if handed_off is not None:
+                    return handed_off
             agent_effects_allowed = self._agent_effect_allowed(generation)
             if agent_effects_allowed:
                 self._drain_agent_audio(bridge)
@@ -650,6 +696,131 @@ class CallSession:
             uplink_pre_stats.maybe_log(gain=agent_uplink_gain)
             uplink_post_stats.maybe_log(gain=agent_uplink_gain)
             await asyncio.sleep(0.01)
+        return bridge
+
+    async def _handoff_to_mobile(
+        self,
+        agent: VoiceAgent,
+        old_bridge: AudioBridge,
+        claimed: InboundTakeoverSession,
+        record: CallRecord | None,
+        generation: int,
+    ) -> AudioBridge | None:
+        """Prepare a second media owner, then atomically fence the AI owner."""
+
+        factory = self._takeover_endpoint_factory
+        coordinator = self._takeover_coordinator
+        if factory is None or coordinator is None:
+            if coordinator is not None:
+                coordinator.rollback_precommit("endpoint_unavailable")
+            return None
+        endpoint: RemoteMediaEndpoint | None = None
+        new_bridge: AudioBridge | None = None
+        committed = False
+        old_stopped = False
+        try:
+            endpoint = factory(claimed.issued)
+            await endpoint.connect()
+            deadline = time.monotonic() + _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS
+            while not endpoint.media_ready and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            if not endpoint.media_ready:
+                raise RuntimeError("takeover_media_not_ready")
+
+            # No two writers: stop the AI bridge before creating the mobile bridge.
+            old_bridge.stop()
+            old_stopped = True
+            new_bridge = create_audio_bridge(
+                mode=self.audio_mode,
+                device_keyword=self.audio_keyword,
+                pcm_port=self.pcm_port,
+                pcm_baudrate=self.pcm_baudrate,
+                tx_gain=self.tx_gain,
+            )
+            if isinstance(new_bridge, SerialPcmAudioBridge):
+                new_bridge.set_ready_check(self.modem.pcm_ready)
+            new_bridge.start()
+
+            ready = coordinator.mark_mobile_media_ready(claimed.fence)
+            committed_result = (
+                coordinator.commit_mobile(claimed.fence) if ready.accepted else ready
+            )
+            if not committed_result.accepted:
+                raise RuntimeError(
+                    f"takeover_commit_rejected:{committed_result.code or 'unknown'}"
+                )
+            committed = True
+            await self.detach_agent(agent, None)
+            if record is not None:
+                record.log_event("takeover_committed", generation=generation)
+            return await self._pump_mobile_media(endpoint, new_bridge, record, claimed)
+        except Exception as exc:  # noqa: BLE001
+            if committed:
+                logger.warning("接管后媒体泵失败: error_type=%s", type(exc).__name__)
+                return new_bridge
+            logger.warning("接管切换失败，回滚 AI: error_type=%s", type(exc).__name__)
+            if new_bridge is not None:
+                try:
+                    new_bridge.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            if old_stopped:
+                try:
+                    old_bridge.start()
+                except Exception as restart_exc:  # noqa: BLE001
+                    logger.warning(
+                        "回滚重启旧音频桥失败: error_type=%s",
+                        type(restart_exc).__name__,
+                    )
+            coordinator.rollback_precommit(type(exc).__name__)
+            if record is not None:
+                record.log_event("takeover_rollback", reason=type(exc).__name__)
+            return None
+        finally:
+            if endpoint is not None:
+                await endpoint.close()
+
+    async def _pump_mobile_media(
+        self,
+        endpoint: RemoteMediaEndpoint,
+        bridge: AudioBridge,
+        record: CallRecord | None,
+        claimed: InboundTakeoverSession,
+    ) -> AudioBridge:
+        fence = claimed.fence
+        disconnected_at: float | None = None
+        while self._active and self.modem.is_call_connected():
+            if endpoint.media_ready:
+                if self.takeover_state is TakeoverState.MOBILE_RECONNECTING:
+                    self._takeover_coordinator.mark_mobile_reconnected(fence)  # type: ignore[union-attr]
+                disconnected_at = None
+                browser_chunks = endpoint.take_browser_audio()
+                if browser_chunks:
+                    if record is not None:
+                        for chunk in browser_chunks:
+                            record.write_downlink(chunk)
+                    bridge.write_modem_chunks(browser_chunks)
+                modem_pcm = bridge.read_modem_chunk()
+                if modem_pcm:
+                    if record is not None:
+                        record.write_uplink(modem_pcm)
+                    endpoint.push_modem_audio(modem_pcm)
+            else:
+                if self.takeover_state is TakeoverState.MOBILE_ACTIVE:
+                    self._takeover_coordinator.mark_mobile_disconnected(fence)  # type: ignore[union-attr]
+                    disconnected_at = time.monotonic()
+                elif (
+                    self.takeover_state is TakeoverState.MOBILE_RECONNECTING
+                    and disconnected_at is not None
+                    and time.monotonic() - disconnected_at
+                    >= max(0.0, config.get_float("REMOTE_DISCONNECT_GRACE_SECONDS"))
+                ):
+                    result = self._takeover_coordinator.expire_mobile_reconnect(fence)  # type: ignore[union-attr]
+                    if result.action is TakeoverAction.NOTICE_THEN_HANGUP and record is not None:
+                        record.log_event("takeover_notice_then_hangup")
+                    break
+            await asyncio.sleep(0.01)
+        return bridge
 
     def _load_session_config(self) -> None:
         """每通会话开始时重读可调参数，支持不重启改参。"""
@@ -1417,6 +1588,10 @@ class CallSession:
             return (
                 coordinator is None
                 or coordinator.state is TakeoverState.AI_ACTIVE
+                or (
+                    self._takeover_hold_generation == generation
+                    and not self._takeover_hold_done
+                )
             )
 
     @property
@@ -1437,6 +1612,8 @@ class CallSession:
             self._takeover_revoke_queue = Queue(maxsize=1)
             self._takeover_session_queue = Queue(maxsize=1)
             self._takeover_request = None
+            self._takeover_hold_generation = None
+            self._takeover_hold_done = False
             if direction != "inbound":
                 self._takeover_coordinator = None
                 return
@@ -1492,6 +1669,8 @@ class CallSession:
                 expires_at=created_at + _INBOUND_TAKEOVER_OFFER_TTL_SECONDS,
             )
             self._takeover_request = request
+            self._takeover_hold_generation = generation
+            self._takeover_hold_done = False
             try:
                 self._takeover_offer_queue.put_nowait(request)
             except Full:
@@ -1786,6 +1965,7 @@ class CallAgentService:
             monitor=self.monitor,
             uplink_monitor=self.uplink_monitor,
             on_ended=self._handle_session_ended,
+            takeover_endpoint_factory=self._build_takeover_endpoint,
         )
         self._setup_callbacks()
 
@@ -2232,6 +2412,14 @@ class CallAgentService:
             dial_guard=self._dial_guard,
         )
         return RemoteDialerWorker(coordinator)
+
+    @staticmethod
+    def _build_takeover_endpoint(issued: IssuedLiveKitSession) -> RemoteMediaEndpoint:
+        """Create the existing LiveKit endpoint without starting a dialer worker."""
+
+        from .livekit_media import LiveKitRemoteMediaEndpoint
+
+        return LiveKitRemoteMediaEndpoint(issued)
 
     def _reserve_remote_line(
         self, owner: RemoteWebDialerCoordinator
