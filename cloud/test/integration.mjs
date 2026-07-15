@@ -161,6 +161,33 @@ try {
   });
   assert.equal(duplicate.callId, call.callId);
 
+  const rejectedCommandPromise = nextMessage(socket);
+  const rejectedCall = await post("/v1/calls", {
+    edgeId: enrollment.edgeId,
+    idempotencyKey: "integration-call-rejected-0002"
+  }, {
+    Cookie: cookie,
+    Origin: origin
+  }, 202);
+  const rejectedCommand = await rejectedCommandPromise;
+  socket.send(JSON.stringify({
+    v: 1,
+    type: "command.ack",
+    commandId: rejectedCommand.commandId,
+    callId: rejectedCommand.callId,
+    status: "rejected",
+    errorCode: "SIM_NOT_REGISTERED"
+  }));
+  await delay(100);
+
+  const rejectedResponse = await fetch(`${base}/v1/calls/${rejectedCall.callId}`, {
+    headers: { Cookie: cookie }
+  });
+  assert.equal(rejectedResponse.status, 200);
+  const rejected = await rejectedResponse.json();
+  assert.equal(rejected.status, "failed");
+  assert.equal(rejected.errorCode, "SIM_NOT_REGISTERED");
+
   const revoke = await fetch(`${base}/v1/devices/${paired.device.deviceId}`, {
     method: "DELETE",
     headers: edgeHeaders("DELETE", `/v1/devices/${paired.device.deviceId}`, enrollment)

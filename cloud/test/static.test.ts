@@ -15,6 +15,19 @@ describe("hosted dialer", () => {
     expect(script).toContain('fetch(`/v1/calls/${encodeURIComponent(payload.callId)}`');
   });
 
+  it("maps stable modem and SIM failures from API polling and LiveKit status", () => {
+    for (const code of [
+      "MODEM_OFFLINE",
+      "SIM_NOT_READY",
+      "SIM_NOT_REGISTERED",
+      "SERVICE_NUMBER_MISMATCH",
+    ]) {
+      expect(script).toContain(`${code}:`);
+    }
+    expect(script).toContain("status.errorCode || \"session unavailable\"");
+    expect(script).toContain("dialFailureText(event.code)");
+  });
+
   it("reads the paired device name via the camelCase field the /v1 API returns", () => {
     // The dialer reads device.displayName; reading the snake_case DB column left
     // the paired-device label always blank. Lock both sides so neither drifts.

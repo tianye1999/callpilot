@@ -100,6 +100,21 @@ class GatewayClientTest {
     }
 
     @Test
+    fun `deviceStatus 暴露 Tunnel modem online 状态`() {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody(
+                    """{"ok":true,"paired":true,"edge":{"enabled":true,"configured":true,"modem_online":true}}"""
+                ),
+        )
+
+        val status = client.deviceStatus()
+
+        assertTrue(status.edgeEnabled)
+        assertTrue(status.modemOnline)
+    }
+
+    @Test
     fun `unpair 后清空本地凭证`() {
         client.credential = DeviceCredential("dev123", "secret456")
         server.enqueue(MockResponse().setResponseCode(200).setBody("""{"ok":true}"""))

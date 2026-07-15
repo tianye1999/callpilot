@@ -35,7 +35,12 @@ class _Service:
         return self.create_remote_dialer_invite()
 
     def remote_dialer_status(self) -> dict:
-        return {"enabled": True, "configured": True, "active": False}
+        return {
+            "enabled": True,
+            "configured": True,
+            "active": False,
+            "modem_online": True,
+        }
 
 
 def _api(app, fn):
@@ -82,7 +87,9 @@ def test_fixed_entry_pairs_once_then_issues_short_lived_call_session(tmp_path: P
 
         auth = {"Cookie": f"{DEVICE_COOKIE}={_cookie_value(pair)}"}
         device = await client.get("/api/device", headers=auth)
-        assert (await device.json())["paired"] is True
+        device_body = await device.json()
+        assert device_body["paired"] is True
+        assert device_body["edge"]["modem_online"] is True
 
         session = await client.post(
             "/api/session",

@@ -46,6 +46,10 @@
       default_device_name: "My phone",
       edge_disabled: "Remote dialing is disabled",
       edge_unconfigured: "Remote dialing is not configured",
+      modem_offline: "The modem is offline. Check its USB connection.",
+      sim_not_ready: "The SIM is missing or not ready.",
+      sim_not_registered: "The SIM is not registered on the mobile network.",
+      service_number_mismatch: "That carrier service number does not match the installed SIM.",
     },
     zh: {
       remote_line: "远程 SIM 线路",
@@ -78,11 +82,22 @@
       default_device_name: "我的手机",
       edge_disabled: "电脑端未启用远程拨号",
       edge_unconfigured: "电脑端远程拨号配置不完整",
+      modem_offline: "通信模组已离线，请检查 USB 连接。",
+      sim_not_ready: "SIM 卡缺失或尚未就绪。",
+      sim_not_registered: "SIM 卡尚未注册到移动网络。",
+      service_number_mismatch: "该运营商客服号码与当前 SIM 卡不匹配。",
     },
   };
 
   const language = navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
   const t = (key) => text[language][key] || text.en[key] || key;
+  const dialFailureKeys = {
+    MODEM_OFFLINE: "modem_offline",
+    SIM_NOT_READY: "sim_not_ready",
+    SIM_NOT_REGISTERED: "sim_not_registered",
+    SERVICE_NUMBER_MISMATCH: "service_number_mismatch",
+  };
+  const dialFailureText = (code) => dialFailureKeys[code] ? t(dialFailureKeys[code]) : null;
   document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
   document.querySelectorAll("[data-i18n]").forEach((element) => {
     element.textContent = t(element.dataset.i18n);
@@ -183,7 +198,7 @@
     );
   }
 
-  function finishRemoteCall(status) {
+  function finishRemoteCall(status, detail) {
     stopMicrophone();
     invite = null;
     mediaReady = false;
@@ -191,7 +206,7 @@
     if (room) room.disconnect().catch(() => {});
     room = null;
     terminal = !paired;
-    setStatus(status);
+    setStatus(status, detail);
   }
 
   function onStatus(payload) {
@@ -207,7 +222,7 @@
       if (mediaReadyResolve) mediaReadyResolve();
     }
     if (event.status === "ended" || event.status === "failed") {
-      finishRemoteCall(event.status);
+      finishRemoteCall(event.status, dialFailureText(event.code));
       return;
     }
     setStatus(event.status);
@@ -238,7 +253,8 @@
         cache: "no-store",
       });
       const status = await statusResponse.json();
-      if (!statusResponse.ok || status.status === "failed") throw new Error("session unavailable");
+      if (!statusResponse.ok) throw new Error(status.error?.code || "session unavailable");
+      if (status.status === "failed") throw new Error(status.errorCode || "session unavailable");
       if (status.session && typeof status.session.livekitUrl === "string" && typeof status.session.token === "string") {
         return {
           url: status.session.livekitUrl,
@@ -302,8 +318,11 @@
       await sendCommand({ type: "dial", number, idempotency_key: idempotencyKey() });
     } catch (error) {
       const denied = error && (error.name === "NotAllowedError" || error.name === "PermissionDeniedError");
-      finishRemoteCall("failed");
-      setStatus("failed", denied ? t("microphone_denied") : t("connection_failed"));
+      const guardFailure = error && dialFailureText(error.message);
+      finishRemoteCall(
+        "failed",
+        denied ? t("microphone_denied") : (guardFailure || t("connection_failed")),
+      );
     }
   }
 
@@ -353,6 +372,7 @@
       terminal = false;
       showDialer(payload.device);
       if (!payload.edge || !payload.edge.connected) setStatus("failed", t("edge_disabled"));
+      else if (payload.edge.modemOnline === false) setStatus("failed", t("modem_offline"));
       else setStatus("paired", t("ready"));
       return true;
     } catch (_error) {

@@ -325,13 +325,15 @@ function edgeRoom(env: Env, edgeId: string): DurableObjectStub {
 }
 
 function callPayload(call: CallRecord): Record<string, unknown> {
-  return {
+  const payload: Record<string, unknown> = {
     callId: call.call_id,
     edgeId: call.edge_id,
     status: call.status,
     createdAt: call.created_at,
     expiresAt: call.expires_at
   };
+  if (call.error_code) payload.errorCode = call.error_code;
+  return payload;
 }
 
 function normalizePairingCode(code: string): string {

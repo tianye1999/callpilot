@@ -38,6 +38,7 @@ export interface CallRecord {
   phone_identity: string;
   edge_identity: string;
   status: string;
+  error_code: string | null;
   created_at: number;
   expires_at: number;
   updated_at: number;
@@ -50,4 +51,3 @@ export interface EdgePresence {
   lineBusy?: boolean;
   version?: string;
 }
-

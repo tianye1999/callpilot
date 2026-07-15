@@ -62,6 +62,8 @@ data class DeviceStatus(
         get() = edge["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
     val edgeConfigured: Boolean
         get() = edge["configured"]?.jsonPrimitive?.booleanOrNull ?: false
+    val modemOnline: Boolean
+        get() = edge["modem_online"]?.jsonPrimitive?.booleanOrNull ?: false
 }
 
 /** 网关返回 `{"ok":false,"error":"..."}` 时抛出。 */

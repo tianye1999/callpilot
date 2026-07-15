@@ -61,6 +61,17 @@ describe("protocol schema", () => {
     }).success).toBe(true);
     expect(edgeMessageSchema.safeParse({ v: 1, type: "run.shell", command: "rm" }).success).toBe(false);
   });
+
+  it("accepts a stable error code on rejected command acknowledgements", () => {
+    expect(edgeMessageSchema.safeParse({
+      v: 1,
+      type: "command.ack",
+      commandId: "command_abcdefghijkl",
+      callId: "call_abcdefghijkl",
+      status: "rejected",
+      errorCode: "SIM_NOT_REGISTERED"
+    }).success).toBe(true);
+  });
 });
 
 describe("asset CSP", () => {

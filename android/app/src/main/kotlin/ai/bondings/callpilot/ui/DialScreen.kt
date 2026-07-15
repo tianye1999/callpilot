@@ -3,8 +3,10 @@ package ai.bondings.callpilot.ui
 import ai.bondings.callpilot.call.CallManager
 import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
+import ai.bondings.callpilot.protocol.DeviceStatus
 import ai.bondings.callpilot.protocol.GatewayClient
 import ai.bondings.callpilot.protocol.HostedCloudClient
+import ai.bondings.callpilot.protocol.HostedDeviceStatus
 import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.protocol.Validation
 import android.Manifest
@@ -48,8 +50,18 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+private const val LINE_STATUS_REFRESH_MS = 15_000L
+
+internal fun isDialEnabled(number: String, lineReady: Boolean?): Boolean =
+    Validation.isValidNumber(number) && lineReady == true
 
 /** 拨号页 v3：状态卡片 + 大号显示 + 自绘 12 键键盘（免系统输入法）+ 绿色拨号键。 */
 @OptIn(ExperimentalFoundationApi::class)
@@ -61,7 +73,9 @@ fun DialScreen(
     onUnpaired: () -> Unit,
 ) {
     val context = LocalContext.current
-    var lineReady by remember { mutableStateOf<Boolean?>(null) }
+    var lineReady by remember(pairing) { mutableStateOf<Boolean?>(null) }
+    var lineStatusLabel by remember(pairing) { mutableStateOf("线路状态获取中…") }
+    var lineStatusError by remember(pairing) { mutableStateOf<String?>(null) }
     var number by remember { mutableStateOf("") }
     var message by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
@@ -95,19 +109,61 @@ fun DialScreen(
         if (number.removePrefix("+").length < 32) number += key
     }
 
-    LaunchedEffect(pairing) {
-        launch(Dispatchers.IO) {
+    LaunchedEffect(pairing, context) {
+        val tunnelClient = if (pairing.protocol == PairingProtocol.TUNNEL) {
+            GatewayClient(pairing.gatewayUrl).also { it.credential = pairing.credential }
+        } else {
+            null
+        }
+        val hostedClient = if (pairing.protocol == PairingProtocol.HOSTED) {
+            HostedCloudClient(pairing.gatewayUrl).also { it.credential = pairing.credential }
+        } else {
+            null
+        }
+
+        suspend fun refreshLineStatus() {
             try {
-                lineReady = when (pairing.protocol) {
-                    PairingProtocol.TUNNEL -> GatewayClient(pairing.gatewayUrl)
-                        .also { it.credential = pairing.credential }
-                        .deviceStatus().edgeEnabled
-                    PairingProtocol.HOSTED -> HostedCloudClient(pairing.gatewayUrl)
-                        .also { it.credential = pairing.credential }
-                        .deviceStatus().let { it.connected && it.modemOnline }
+                val status = withContext(Dispatchers.IO) {
+                    when (pairing.protocol) {
+                        PairingProtocol.TUNNEL -> checkNotNull(tunnelClient).deviceStatus()
+                        PairingProtocol.HOSTED -> checkNotNull(hostedClient).deviceStatus()
+                    }
                 }
+                when (status) {
+                    is DeviceStatus -> {
+                        lineReady = status.edgeEnabled && status.modemOnline
+                        lineStatusLabel = when {
+                            !status.edgeEnabled -> "远程拨号未启用"
+                            !status.modemOnline -> "SIM 线路离线"
+                            else -> "远程拨号已就绪"
+                        }
+                    }
+                    is HostedDeviceStatus -> {
+                        lineReady = status.connected && status.modemOnline
+                        lineStatusLabel = when {
+                            !status.connected -> "电脑端离线"
+                            !status.modemOnline -> "SIM 线路离线"
+                            else -> "远程拨号已就绪"
+                        }
+                    }
+                }
+                lineStatusError = null
             } catch (e: Exception) {
-                message = "获取线路状态失败：${e.message}"
+                lineReady = false
+                lineStatusLabel = "线路状态暂不可用"
+                lineStatusError = "获取线路状态失败：${e.message}"
+            }
+        }
+
+        val lifecycleOwner = context as? LifecycleOwner
+        if (lifecycleOwner == null) {
+            refreshLineStatus()
+        } else {
+            lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (true) {
+                    refreshLineStatus()
+                    delay(LINE_STATUS_REFRESH_MS)
+                }
             }
         }
     }
@@ -176,11 +232,7 @@ fun DialScreen(
                 Spacer(Modifier.size(10.dp))
                 Column {
                     Text(
-                        when {
-                            lineReady == null -> "线路状态获取中…"
-                            enabled -> "远程拨号已就绪"
-                            else -> "远程拨号未启用"
-                        },
+                        lineStatusLabel,
                         style = MaterialTheme.typography.titleSmall,
                     )
                     Text(
@@ -239,7 +291,7 @@ fun DialScreen(
             }
         }
 
-        message?.let {
+        (message ?: lineStatusError)?.let {
             Spacer(Modifier.height(6.dp))
             Text(
                 it,
@@ -257,7 +309,7 @@ fun DialScreen(
         )
 
         Spacer(Modifier.height(22.dp))
-        val canDial = Validation.isValidNumber(number)
+        val canDial = isDialEnabled(number, lineReady)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.Center,

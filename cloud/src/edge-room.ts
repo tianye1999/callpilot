@@ -92,9 +92,10 @@ export class EdgeRoom extends DurableObject<Env> {
     }
     if (result.data.type === "command.ack") {
       const status = result.data.status === "accepted" ? "ready" : "failed";
+      const errorCode = result.data.status === "rejected" ? (result.data.errorCode ?? null) : null;
       await this.env.DB.prepare(
-        "UPDATE calls SET status = ?1, updated_at = ?2 WHERE call_id = ?3 AND edge_id = ?4"
-      ).bind(status, now, result.data.callId, attachment.edgeId).run();
+        "UPDATE calls SET status = ?1, error_code = ?2, updated_at = ?3 WHERE call_id = ?4 AND edge_id = ?5"
+      ).bind(status, errorCode, now, result.data.callId, attachment.edgeId).run();
       return;
     }
     await this.env.DB.prepare(
