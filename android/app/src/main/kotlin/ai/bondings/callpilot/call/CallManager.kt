@@ -20,6 +20,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -67,6 +68,8 @@ class CallManager(
     private val onForeground: (active: Boolean) -> Unit = {},
     scope: CoroutineScope? = null,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val takeoverMediaTimeoutMs: Long = 20_000L,
+    private val takeoverFailureVisibleMs: Long = 2_000L,
 ) {
     private val scope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -77,6 +80,7 @@ class CallManager(
     private var eventJob: Job? = null
     private var setupJob: Job? = null
     private var dialJob: Job? = null
+    private var takeoverMediaTimeoutJob: Job? = null
     private var hangupRequested = false
     private val commandLock = Any()
 
@@ -90,7 +94,11 @@ class CallManager(
 
     fun startCall(pairing: StoredPairing, number: String) {
         if (isActive) return
-        synchronized(commandLock) { hangupRequested = false }
+        synchronized(commandLock) {
+            takeoverMediaTimeoutJob?.cancel()
+            takeoverMediaTimeoutJob = null
+            hangupRequested = false
+        }
         _state.value = CallState.Preparing(number)
         val idempotencyKey = idempotencyKeyProvider()
         setupJob = scope.launch {
@@ -142,6 +150,8 @@ class CallManager(
         if (pairing.protocol != PairingProtocol.HOSTED) return
         val label = "来电接管"
         synchronized(commandLock) {
+            takeoverMediaTimeoutJob?.cancel()
+            takeoverMediaTimeoutJob = null
             hangupRequested = false
             pendingDial = null
         }
@@ -158,6 +168,7 @@ class CallManager(
                 // 可能在 connect()/麦克风发布期间就到达（接管的物理通话已在进行），
                 // 若 connect 后再覆写状态会把 handleEvent 已置的 InCall 打回等待态。
                 _state.value = CallState.WaitingMedia(label)
+                armTakeoverMediaTimeout(s, label)
                 s.connect(claimed.livekitUrl, claimed.token)
                 setupJob = null
             } catch (e: CancellationException) {
@@ -230,7 +241,7 @@ class CallManager(
                 when (status) {
                     "media_ready" -> firePendingDial()
                     "dialing" -> _state.value = CallState.Dialing(number)
-                    "connected" -> _state.value = CallState.InCall(number)
+                    "connected" -> markConnected(number)
                     "ended", "hangup" -> {
                         cleanup()
                         _state.value = CallState.Ended(number, reason ?: status)
@@ -287,6 +298,46 @@ class CallManager(
             dialJob?.isActive == true
     }
 
+    private fun armTakeoverMediaTimeout(expectedSession: RemoteSession, label: String) {
+        val job = synchronized(commandLock) {
+            takeoverMediaTimeoutJob?.cancel()
+            scope.launch(start = CoroutineStart.LAZY) {
+                delay(takeoverMediaTimeoutMs)
+                val failed = CallState.Failed(
+                    label,
+                    "接管媒体建立超时",
+                    code = "TAKEOVER_MEDIA_TIMEOUT",
+                )
+                val expired = synchronized(commandLock) {
+                    if (hangupRequested || session !== expectedSession ||
+                        _state.value !is CallState.WaitingMedia
+                    ) {
+                        false
+                    } else {
+                        takeoverMediaTimeoutJob = null
+                        _state.value = failed
+                        true
+                    }
+                }
+                if (!expired) return@launch
+
+                cleanup()
+                delay(takeoverFailureVisibleMs)
+                if (_state.value == failed) _state.value = CallState.Idle
+            }.also { takeoverMediaTimeoutJob = it }
+        }
+        job.start()
+    }
+
+    private fun markConnected(number: String) {
+        synchronized(commandLock) {
+            if (hangupRequested || !isActive) return
+            takeoverMediaTimeoutJob?.cancel()
+            takeoverMediaTimeoutJob = null
+            _state.value = CallState.InCall(number)
+        }
+    }
+
     private fun currentNumber(): String? = when (val s = _state.value) {
         is CallState.Preparing -> s.number
         is CallState.WaitingMedia -> s.number
@@ -312,6 +363,8 @@ class CallManager(
             setupJob = null
             dialJob?.cancel()
             dialJob = null
+            takeoverMediaTimeoutJob?.cancel()
+            takeoverMediaTimeoutJob = null
             pendingDial = null
         }
         eventJob?.cancel()

@@ -18,7 +18,9 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -97,6 +99,8 @@ class CallManagerTest {
             takeoverClaimProvider: suspend (StoredPairing, String) -> HostedCallSession = { _, _ ->
                 error("takeover provider should not be called")
             },
+            takeoverMediaTimeoutMs: Long = 20_000L,
+            takeoverFailureVisibleMs: Long = 2_000L,
             inviteProvider: suspend (StoredPairing) -> Invite,
         ): CallManager = CallManager(
             sessionFactory = { session },
@@ -107,6 +111,8 @@ class CallManagerTest {
             onForeground = { foreground += it },
             scope = scope,
             ioDispatcher = dispatcher,
+            takeoverMediaTimeoutMs = takeoverMediaTimeoutMs,
+            takeoverFailureVisibleMs = takeoverFailureVisibleMs,
         )
 
         fun close() = scope.cancel()
@@ -439,14 +445,18 @@ class CallManagerTest {
         val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
 
         manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
-        advanceUntilIdle()
+        runCurrent()
 
         assertTrue(session.connected)
         assertTrue(manager.state.value is CallState.WaitingMedia)
         assertTrue(session.commands.none { it.contains("\"dial\"") })
 
         session.emit(SessionEvent.Edge(Signaling.Event.Status("connected", null)))
-        advanceUntilIdle()
+        runCurrent()
+        assertTrue(manager.state.value is CallState.InCall)
+
+        advanceTimeBy(60_000)
+        runCurrent()
         assertTrue(manager.state.value is CallState.InCall)
         h.close()
     }
@@ -468,9 +478,44 @@ class CallManagerTest {
         val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
 
         manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
-        advanceUntilIdle()
+        runCurrent()
 
         assertTrue(manager.state.value is CallState.InCall)
+        h.close()
+    }
+
+    @Test
+    fun `answerTakeover 等待媒体超时后清理并自动回到 Idle`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(
+            session,
+            takeoverClaimProvider = { _, _ -> takeoverSession() },
+            takeoverMediaTimeoutMs = 1_000L,
+            takeoverFailureVisibleMs = 500L,
+        ) { error("invite path should not run") }
+        val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
+
+        manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
+        runCurrent()
+        assertEquals(CallState.WaitingMedia("来电接管"), manager.state.value)
+
+        advanceTimeBy(999L)
+        runCurrent()
+        assertEquals(CallState.WaitingMedia("来电接管"), manager.state.value)
+
+        advanceTimeBy(1L)
+        runCurrent()
+        assertEquals(
+            CallState.Failed("来电接管", "接管媒体建立超时", "TAKEOVER_MEDIA_TIMEOUT"),
+            manager.state.value,
+        )
+        assertTrue(session.disconnected)
+        assertEquals(listOf(true, false), h.foreground)
+
+        advanceTimeBy(500L)
+        runCurrent()
+        assertEquals(CallState.Idle, manager.state.value)
         h.close()
     }
 
