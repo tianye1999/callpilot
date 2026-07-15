@@ -18,7 +18,7 @@ dependencies = [
     "livekit>=1.1.13,<2",
     "livekit-api>=1.1,<2",
     "keyring>=25,<27",
-    "cryptography>=43,<47",
+    "cryptography>=43,<50",
     "rumps>=0.4.0; sys_platform == 'darwin'",
 ]
 
