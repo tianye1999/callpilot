@@ -11,6 +11,7 @@ from typing import Callable
 import serial
 
 from . import config, platforms, port_detect
+from .sim_identity import UNKNOWN_SIM, SimIdentity, identify
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,8 @@ class Eg25Modem:
         self.baudrate = baudrate
         # port 为 auto 哨兵时每次打开都重新探测，这里存本次解析出的实际端口（供日志）。
         self._active_port: str | None = None
+        # SIM 身份缓存(#88):连接/重连后读一次 CIMI/CREG;换卡靠重插/重连触发刷新。
+        self._sim_identity: SimIdentity = UNKNOWN_SIM
         self._ser: serial.Serial | None = None
         self._reader_thread: threading.Thread | None = None
         self._poll_thread: threading.Thread | None = None
@@ -214,6 +217,57 @@ class Eg25Modem:
         """
         return self._send(command)
 
+    # SIM 上电后 CIMI 可能短暂 ERROR(卡未 ready);重试覆盖上电延迟。
+    _SIM_READ_RETRIES = 3
+    _SIM_READ_RETRY_DELAY = 1.0
+
+    def refresh_sim_identity(self) -> None:
+        """读 CIMI/CREG 刷新 SIM 身份缓存(#88);AT 逻辑失败降级为 UNKNOWN_SIM,
+        传输层故障上抛。connect/重连(``_open_serial``,已持串口锁)自动调用,
+        换卡经拔插重连天然刷新;也可被上层主动调用重刷。
+
+        已知限制(follow-up):不拔卡热换 SIM、注册状态后续变化不会自动上报刷新
+        (需 +QSIMSTAT / +CREG=1 URC,列入 #88 follow-up)。CIMI 上电延迟已由
+        本方法内短重试覆盖。
+        """
+        imsi_raw = ""
+        for attempt in range(self._SIM_READ_RETRIES):
+            try:
+                imsi_raw = self._send("AT+CIMI")
+            except (serial.SerialException, OSError):
+                # 传输层故障必须上抛给 _open_serial 的退避循环——不能吞成"识别失败"
+                # 而让重连误判成功(codex #88 review BLOCK-3)。
+                self._sim_identity = UNKNOWN_SIM
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SIM CIMI 读取异常: %s", type(exc).__name__)
+                imsi_raw = ""
+            if identify(imsi_raw).present:
+                break  # 卡已 ready,不必再等
+            if attempt < self._SIM_READ_RETRIES - 1:
+                time.sleep(self._SIM_READ_RETRY_DELAY)  # 卡未 ready,等上电
+        try:
+            creg_raw = self._send("AT+CREG?")
+        except (serial.SerialException, OSError):
+            self._sim_identity = UNKNOWN_SIM
+            raise
+        except Exception:  # noqa: BLE001
+            creg_raw = ""
+        self._sim_identity = identify(imsi_raw, creg_raw)
+        sim = self._sim_identity
+        if sim.present:
+            logger.info(
+                "SIM 识别: %s (PLMN %s) → 免费客服 %s | 网络: %s",
+                sim.carrier, sim.plmn, sim.service_number or "?", sim.reg_status,
+            )
+        else:
+            logger.warning("SIM 识别失败(未插卡/未就绪): %s", sim.reg_status)
+
+    @property
+    def sim_identity(self) -> SimIdentity:
+        """最近一次连接/重连时读到的 SIM 身份(缓存,不触发 AT)。"""
+        return self._sim_identity
+
     def _resolve_port(self) -> str:
         """把 auto 哨兵解析为实际串口；每次打开都重扫（Windows 重插后 COM 号会变）。
 
@@ -245,6 +299,7 @@ class Eg25Modem:
                 self._send("ATE0")
                 self._send("AT+CLIP=1")
                 self._init_sms()
+                self.refresh_sim_identity()
             finally:
                 self._opening = False
 

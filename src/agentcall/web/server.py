@@ -349,6 +349,11 @@ async def _meta(request: web.Request) -> web.Response:
         "modem_connected": bool(getattr(service, "modem_connected", False)),
         "port": meta.get("port") or config.get_str("MODEM_PORT"),
     }
+    # SIM 身份(#88):运营商/免费客服号/注册状态——换卡后 UI 与拨测目标自适应。
+    modem = getattr(service, "modem", None)
+    sim = getattr(modem, "sim_identity", None)
+    if sim is not None:
+        meta["sim"] = sim.as_dict()
     # 录音根目录的单一事实出处：外部工具（回归脚本等）从这里拿，
     # 避免开发版/打包版数据目录不一致导致对着空目录空等（issue #15）。
     call_logger = getattr(service, "call_logger", None)
