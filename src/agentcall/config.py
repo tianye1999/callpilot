@@ -211,6 +211,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("MANUAL_RESPONSE_CONTROL", "手动应答控制", "bool", "false"),
     ConfigSpec("MANUAL_RESPONSE_SILENCE_MS", "手动应答静默窗口（毫秒）", "int", "1000"),
     ConfigSpec("MANUAL_RESPONSE_MAX_WAIT_MS", "手动应答最长等待（毫秒）", "int", "8000"),
+    # 文本判官本批仅实现旁观模式；enforce 不进 choices，配置写回会在边界拒绝。
+    ConfigSpec("DTMF_JUDGE_MODE", "DTMF 文本判官", "select", "off",
+               choices=("off", "shadow")),
+    ConfigSpec("DTMF_JUDGE_MODEL", "DTMF 判官文本模型", "str", ""),
     # ---- 模组 ----
     # 默认值按当前平台在模块加载时定死（Windows 为 auto 哨兵，连接时扫描）。
     ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", platforms.default_modem_port(),
@@ -436,6 +440,12 @@ def validate_provider_credentials(provider: str) -> list[str]:
     for key in required:
         if not os.environ.get(key, "").strip():
             errors.append(f"缺少环境变量 {key}（{provider} 必需）")
+    if (
+        get_str("DTMF_JUDGE_MODE") == "shadow"
+        and not os.environ.get("DASHSCOPE_API_KEY", "").strip()
+        and "DASHSCOPE_API_KEY" not in required
+    ):
+        errors.append("缺少环境变量 DASHSCOPE_API_KEY（DTMF 文本判官 shadow 必需）")
     return errors
 
 

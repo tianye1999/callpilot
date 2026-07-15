@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts import regression_call
@@ -191,6 +193,311 @@ def test_dtmf_without_remote_transcript_in_observation_window_warns():
     assert result.status == "WARN"
     assert "8s" in result.detail
     assert "9.1s" in result.detail
+
+
+def test_dtmf_judge_shadow_reports_exact_match_without_exposing_digits():
+    events = _base_events(
+        _event(
+            "dtmf_judge",
+            decision_id="decision-a",
+            action="press",
+            confidence=0.9,
+            reason_code="menu_matched",
+            latency_ms=12.0,
+            digits_len=1,
+            window_mode="merged",
+            ts=5.0,
+        ),
+        _event(
+            "dtmf_action",
+            action_id="action-a",
+            source="realtime",
+            digits_len=1,
+            ts=5.5,
+        ),
+    )
+    private = [
+        {
+            "kind": "decision",
+            "decision_id": "decision-a",
+            "action": "press",
+            "digits": "7",
+            "confidence": 0.9,
+            "reason_code": "menu_matched",
+            "reason": "明确菜单",
+            "latency_ms": 12.0,
+            "ts": 5.0,
+            "window_mode": "merged",
+        },
+        {
+            "kind": "action",
+            "action_id": "action-a",
+            "source": "realtime",
+            "digits": "7",
+            "digits_len": 1,
+            "ts": 5.5,
+            "t_ms": 500.0,
+        },
+    ]
+
+    result = regression_call.check_dtmf_judge_shadow(events, private)
+
+    assert result.status == "PASS"
+    assert "exact=1" in result.detail
+    assert "7" not in result.detail
+
+
+def test_dtmf_judge_shadow_disagreement_is_warning_not_gate_failure():
+    events = _base_events(
+        _event(
+            "dtmf_judge",
+            decision_id="decision-a",
+            action="press",
+            confidence=0.9,
+            reason_code="menu_matched",
+            latency_ms=12.0,
+            digits_len=1,
+            window_mode="fragmented",
+            ts=5.0,
+        )
+    )
+    private = [
+        {
+            "kind": "decision",
+            "decision_id": "decision-a",
+            "action": "press",
+            "digits": "7",
+            "confidence": 0.9,
+            "reason_code": "menu_matched",
+            "reason": "明确菜单",
+            "latency_ms": 12.0,
+            "ts": 5.0,
+            "window_mode": "fragmented",
+        }
+    ]
+
+    result = regression_call.check_dtmf_judge_shadow(events, private)
+
+    assert result.status == "WARN"
+    assert "no_action=1" in result.detail
+    assert "7" not in result.detail
+
+
+def test_dtmf_judge_shadow_wait_followed_by_press_is_not_false_pass():
+    events = _base_events(
+        _event(
+            "dtmf_judge",
+            decision_id="decision-a",
+            action="wait",
+            confidence=0.8,
+            reason_code="menu_incomplete",
+            latency_ms=12.0,
+            digits_len=0,
+            window_mode="merged",
+            ts=5.0,
+        ),
+        _event(
+            "dtmf_action",
+            action_id="action-a",
+            source="realtime",
+            digits_len=1,
+            ts=5.5,
+        ),
+    )
+    private = [
+        {
+            "kind": "decision",
+            "decision_id": "decision-a",
+            "action": "wait",
+            "digits": None,
+            "confidence": 0.8,
+            "reason_code": "menu_incomplete",
+            "reason": "菜单未完",
+            "latency_ms": 12.0,
+            "window_mode": "merged",
+            "ts": 5.0,
+        },
+        {
+            "kind": "action",
+            "action_id": "action-a",
+            "source": "realtime",
+            "digits": "7",
+            "digits_len": 1,
+            "ts": 5.5,
+            "t_ms": 500.0,
+        },
+    ]
+
+    result = regression_call.check_dtmf_judge_shadow(events, private)
+
+    assert result.status == "WARN"
+    assert "unexpected_action=1" in result.detail
+    assert "7" not in result.detail
+
+
+@pytest.mark.parametrize(
+    ("public_override", "private_override"),
+    [
+        ({"digits_len": 2}, {}),
+        ({"action": "wait"}, {}),
+        ({"window_mode": "banana"}, {}),
+        ({}, {"window_mode": "banana"}),
+    ],
+)
+def test_dtmf_judge_shadow_rejects_public_private_schema_mismatch(
+    public_override, private_override
+):
+    public = {
+        "type": "dtmf_judge",
+        "decision_id": "decision-a",
+        "action": "press",
+        "confidence": 0.9,
+        "reason_code": "menu_matched",
+        "latency_ms": 12.0,
+        "digits_len": 1,
+        "window_mode": "merged",
+        "ts": 5.0,
+        **public_override,
+    }
+    private = {
+        "kind": "decision",
+        "decision_id": "decision-a",
+        "action": "press",
+        "digits": "7",
+        "confidence": 0.9,
+        "reason_code": "menu_matched",
+        "reason": "明确菜单",
+        "latency_ms": 12.0,
+        "window_mode": "merged",
+        "ts": 5.0,
+        **private_override,
+    }
+
+    result = regression_call.check_dtmf_judge_shadow(
+        _base_events(public), [private]
+    )
+
+    assert result.status == "WARN"
+    assert "schema_errors=" in result.detail
+    assert "7" not in result.detail
+
+
+def test_dtmf_judge_shadow_errors_without_decisions_warn():
+    events = _base_events(
+        _event(
+            "judge_error",
+            code="timeout",
+            latency_ms=3000.0,
+            window_mode="fragmented",
+            ts=5.0,
+        )
+    )
+
+    result = regression_call.check_dtmf_judge_shadow(events, [])
+
+    assert result.status == "WARN"
+    assert "errors=1" in result.detail
+
+
+def test_dtmf_judge_shadow_rejects_public_private_timestamp_rewrite():
+    events = _base_events(
+        _event(
+            "dtmf_judge",
+            decision_id="decision-a",
+            action="press",
+            confidence=0.9,
+            reason_code="menu_matched",
+            latency_ms=12.0,
+            digits_len=1,
+            window_mode="merged",
+            ts=5.0,
+        ),
+        _event(
+            "dtmf_action",
+            action_id="action-a",
+            source="realtime",
+            digits_len=1,
+            ts=100.0,
+        ),
+    )
+    private = [
+        {
+            "kind": "decision",
+            "decision_id": "decision-a",
+            "action": "press",
+            "digits": "7",
+            "confidence": 0.9,
+            "reason_code": "menu_matched",
+            "reason": "明确菜单",
+            "latency_ms": 12.0,
+            "window_mode": "merged",
+            "ts": 5.0,
+        },
+        {
+            "kind": "action",
+            "action_id": "action-a",
+            "source": "realtime",
+            "digits": "7",
+            "digits_len": 1,
+            "ts": 5.1,
+            "t_ms": 100.0,
+        },
+    ]
+
+    result = regression_call.check_dtmf_judge_shadow(events, private)
+
+    assert result.status == "WARN"
+    assert "schema_errors=1" in result.detail
+    assert "7" not in result.detail
+
+
+def test_dtmf_judge_shadow_rejects_unknown_private_record_kind():
+    events = _base_events(
+        _event(
+            "dtmf_judge",
+            decision_id="decision-a",
+            action="wait",
+            confidence=0.8,
+            reason_code="menu_incomplete",
+            latency_ms=12.0,
+            digits_len=0,
+            window_mode="merged",
+            ts=5.0,
+        )
+    )
+    private = [
+        {
+            "kind": "decision",
+            "decision_id": "decision-a",
+            "action": "wait",
+            "digits": None,
+            "confidence": 0.8,
+            "reason_code": "menu_incomplete",
+            "reason": "菜单未完",
+            "latency_ms": 12.0,
+            "window_mode": "merged",
+            "ts": 5.0,
+        },
+        {"kind": "mystery", "ts": 5.1},
+    ]
+
+    result = regression_call.check_dtmf_judge_shadow(events, private)
+
+    assert result.status == "WARN"
+    assert "schema_errors=1" in result.detail
+
+
+def test_load_judge_shadow_is_optional_and_validates_jsonl(tmp_path):
+    assert regression_call.load_judge_shadow(tmp_path) == []
+    path = tmp_path / "judge_shadow.jsonl"
+    path.write_text('{"kind":"decision","digits":"1"}\n', encoding="utf-8")
+    assert regression_call.load_judge_shadow(tmp_path) == [
+        {"kind": "decision", "digits": "1"}
+    ]
+
+    path.write_text("not-json\n", encoding="utf-8")
+    with pytest.raises(regression_call.RegressionError):
+        regression_call.load_judge_shadow(tmp_path)
 
 
 def test_agent_repeats_user_supplied_value_passes_fabrication_check():

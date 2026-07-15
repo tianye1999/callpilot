@@ -30,6 +30,7 @@ from .contacts import is_reply_target_allowed
 from .dial_queue import DialQueue, whitelist_from_env
 from .dtmf import dtmf_tone
 from .dtmf_followup import extract_spoken_dtmf
+from .dtmf_judge import DtmfActionLedger, DtmfJudge, WindowMode
 from .events import EventHub
 from .modem import Eg25Modem
 from .monitor_playback import MonitorPlayback
@@ -158,6 +159,9 @@ class CallSession:
         self._next_dtmf_followup_id = 0
         self._dtmf_dispatch_context = threading.local()
         self._active_tools: ToolRegistry | None = None
+        self._dtmf_ledger: DtmfActionLedger | None = None
+        self._dtmf_judge: DtmfJudge | None = None
+        self._dtmf_judge_started_at = 0.0
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -193,6 +197,8 @@ class CallSession:
         self._prompt_gen_opening_mode = "say"
         self._prompt_gen_dtmf_spoken_followup = False
         self._cancel_spoken_dtmf_followups(clear_recent=True)
+        self._stop_dtmf_judge(join_timeout=0.0)
+        self._dtmf_judge_started_at = 0.0
         # 世代号推进与置活必须同锁原子完成：与 _deferred_hangup 的
         # 「校验世代号 → stop()」互斥，保证旧回调要么在新会话置活前跑完
         # （只影响已结束的旧会话），要么校验失败直接放弃。
@@ -207,6 +213,7 @@ class CallSession:
         with self._dtmf_lock:
             self._active = False
             self._cancel_spoken_dtmf_followups_locked()
+        self._stop_dtmf_judge()
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
 
@@ -222,6 +229,7 @@ class CallSession:
                 self._active = False
                 self._cancel_spoken_dtmf_followups_locked()
                 self._active_tools = None
+            self._stop_dtmf_judge()
             # 会话收尾统一取消未触发的延迟挂断，不让它跨到下一通。
             self._cancel_hangup_timer()
             self._loop.close()
@@ -323,6 +331,7 @@ class CallSession:
                 tx_gain=self.tx_gain,
             )
             agent = create_agent(self.provider)
+            self._start_dtmf_judge(record, session_t0=session_t0)
             agent.set_session_instructions(self._build_agent_instructions(direction))
             agent.set_transcript_handler(
                 self._make_transcript_handler(record, transcripts, agent)
@@ -365,6 +374,8 @@ class CallSession:
             status = "failed"
             raise
         finally:
+            # 先作废判官世代再 finish record，避免迟到结果在 meta 落盘后追加事件。
+            self._stop_dtmf_judge()
             mark("ended", status=status)
             self._finalize_record(record, status, transcripts, direction, number)
 
@@ -419,6 +430,16 @@ class CallSession:
             )
             if role == "agent":
                 self._schedule_spoken_dtmf_followup(agent, text)
+            elif role == "user":
+                judge = self._dtmf_judge
+                if judge is not None:
+                    judge.submit_remote_transcript(
+                        text,
+                        t_ms=max(
+                            0.0,
+                            (time.monotonic() - self._dtmf_judge_started_at) * 1000,
+                        ),
+                    )
 
         return on_transcript
 
@@ -656,6 +677,73 @@ class CallSession:
             send_dtmf=self._send_dtmf_from_tool,
         )
         return tools.register()
+
+    def _start_dtmf_judge(
+        self, record: CallRecord | None, *, session_t0: float
+    ) -> None:
+        """Start the per-call shadow worker only when explicitly enabled."""
+        self._stop_dtmf_judge(join_timeout=0.0)
+        if record is None or config.get_str("DTMF_JUDGE_MODE").strip() != "shadow":
+            return
+        model = (
+            config.get_str("DTMF_JUDGE_MODEL").strip()
+            or config.get_str("PROMPT_GEN_MODEL").strip()
+            or "qwen-plus"
+        )
+        lang = agent_language()
+        task_goal = (
+            self._outbound_task(lang)
+            if self._outbound_number
+            else ("处理本次来电" if lang == "zh" else "handle this inbound call")
+        )
+        window_mode: WindowMode = (
+            "merged" if config.get_bool("MANUAL_RESPONSE_CONTROL") else "fragmented"
+        )
+        ledger = DtmfActionLedger()
+        judge: DtmfJudge | None = None
+        try:
+            judge = DtmfJudge(
+                record=record,
+                task_goal=task_goal,
+                ledger=ledger,
+                model=model,
+                window_mode=window_mode,
+            )
+            judge.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "DTMF 判官启动失败: error_type=%s", type(exc).__name__
+            )
+            if judge is not None:
+                try:
+                    judge.stop(join_timeout=0.0)
+                except Exception:  # noqa: BLE001
+                    pass
+            record.log_event(
+                "judge_error",
+                code="startup_error",
+                latency_ms=0.0,
+                window_mode=window_mode,
+            )
+            return
+        with self._dtmf_lock:
+            self._dtmf_judge_started_at = session_t0
+            self._dtmf_ledger = ledger
+            self._dtmf_judge = judge
+
+    def _stop_dtmf_judge(self, *, join_timeout: float = 0.2) -> None:
+        with self._dtmf_lock:
+            judge = self._dtmf_judge
+            self._dtmf_judge = None
+            self._dtmf_ledger = None
+            self._dtmf_judge_started_at = 0.0
+        if judge is not None:
+            try:
+                judge.stop(join_timeout=join_timeout)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "DTMF 判官停止失败: error_type=%s", type(exc).__name__
+                )
 
     def _sms_target_allowed(self, number: str) -> bool:
         """发短信目标限制:只允许回复已联系过的号码或当前通话对端。
@@ -1103,9 +1191,43 @@ class CallSession:
                 sent = sent or ok
             if sent:
                 self._recent_dtmf_sent[digits] = (time.monotonic(), source)
+                self._record_dtmf_action(digits, source)
                 if source != "spoken_followup":
                     self._cancel_pending_dtmf_locked(digits)
             return ok, mode
+
+    def _record_dtmf_action(self, digits: str, source: str) -> None:
+        public_source = {
+            "agent_tool": "realtime",
+            "spoken_followup": "guard",
+            "judge": "judge",
+        }.get(source)
+        if public_source is None:
+            return
+        ledger = self._dtmf_ledger
+        judge = self._dtmf_judge
+        if ledger is None or judge is None:
+            return
+        relative_time = (
+            max(0.0, time.monotonic() - self._dtmf_judge_started_at)
+            if self._dtmf_judge_started_at > 0
+            else 0.0
+        )
+        try:
+            entry = ledger.record(
+                digits,
+                public_source,  # type: ignore[arg-type]
+                timestamp=relative_time,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "DTMF action ledger 拒绝记录: error_type=%s", type(exc).__name__
+            )
+            return
+        record = self._record
+        if record is not None:
+            record.log_event("dtmf_action", **entry.public_fields())
+        judge.record_action(entry)
 
     def _resolve_dtmf_mode(self) -> str:
         configured = config.get_str("DTMF_MODE").strip().lower()
