@@ -122,7 +122,7 @@ class KeyValidationResult:
 
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- Agent ----
-    ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "qwen",
+    ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "openai",
                choices=("qwen", "doubao", "openai", "local"), requires_restart=True,
                choice_labels={"doubao": "doubao (experimental)",
                               "local": "local (三段式，音频不出本机)"}),
@@ -251,7 +251,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("RECORDING_ENABLED", "通话录音开关", "bool", "false"),
     ConfigSpec("RECORDING_RETENTION_DAYS", "录音保留天数", "int", "30"),
     ConfigSpec("SUMMARY_ENABLED", "通话摘要开关", "bool", "true"),
-    ConfigSpec("SUMMARY_MODEL", "摘要模型", "str", "qwen-plus"),
+    ConfigSpec("SUMMARY_MODEL", "摘要模型", "str", ""),
     # 摘要 API 超时秒数（真机实测 15s 对长转写不够用），调试项不进面板。
     ConfigSpec("SUMMARY_TIMEOUT", "摘要超时（秒）", "float", "30",
                editable=False, hidden=True),
@@ -440,12 +440,13 @@ def validate_provider_credentials(provider: str) -> list[str]:
     for key in required:
         if not os.environ.get(key, "").strip():
             errors.append(f"缺少环境变量 {key}（{provider} 必需）")
+    text_key = "OPENAI_API_KEY" if provider == "openai" else "DASHSCOPE_API_KEY"
     if (
         get_str("DTMF_JUDGE_MODE") == "shadow"
-        and not os.environ.get("DASHSCOPE_API_KEY", "").strip()
-        and "DASHSCOPE_API_KEY" not in required
+        and not os.environ.get(text_key, "").strip()
+        and text_key not in required
     ):
-        errors.append("缺少环境变量 DASHSCOPE_API_KEY（DTMF 文本判官 shadow 必需）")
+        errors.append(f"缺少环境变量 {text_key}（DTMF 文本判官 shadow 必需）")
     return errors
 
 

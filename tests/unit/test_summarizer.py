@@ -12,6 +12,14 @@ import pytest
 
 from agentcall.summarizer import summarize_call
 
+
+@pytest.fixture(autouse=True)
+def _default_summary_backend_is_qwen(monkeypatch):
+    """Keep legacy SDK fixtures explicit while production defaults move to OpenAI."""
+    monkeypatch.setenv("AGENT_PROVIDER", "qwen")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test")
+    monkeypatch.setenv("SUMMARY_MODEL", "")
+
 TRANSCRIPTS = [
     ("agent", "您好，我是李明的数字分身。"),
     ("user", "你好，我是顺丰快递员，有个包裹放驿站了，请让他尽快取。"),
@@ -65,6 +73,73 @@ def test_normal_parse(monkeypatch):
     user_msg = captured["messages"][-1]["content"]
     assert "13800138000" in user_msg
     assert "顺丰快递员" in user_msg
+
+
+def test_openai_summary_uses_auto_model_and_chat_completions(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_http(url, *, method="GET", headers=None, body=None, timeout=5.0):
+        captured.update(
+            {
+                "url": url,
+                "method": method,
+                "headers": headers,
+                "body": json.loads((body or b"").decode("utf-8")),
+                "timeout": timeout,
+            }
+        )
+        payload = {
+            "choices": [
+                {"message": {"content": json.dumps(GOOD_PAYLOAD, ensure_ascii=False)}}
+            ]
+        }
+        return 200, json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setenv("AGENT_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("SUMMARY_MODEL", "")
+    monkeypatch.setattr("agentcall.prompt_gen._http_request_json", fake_http)
+
+    result = summarize_call(TRANSCRIPTS, "inbound", "13800138000")
+
+    assert result["ok"] is True
+    assert captured["url"] == "https://api.openai.com/v1/chat/completions"
+    assert captured["method"] == "POST"
+    assert captured["body"]["model"] == "gpt-4o-mini"
+    assert captured["headers"]["Authorization"] == "Bearer sk-test"
+
+
+def test_openai_401_and_timeout_fail_with_backend_neutral_errors(monkeypatch):
+    monkeypatch.setenv("AGENT_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("SUMMARY_MODEL", "")
+
+    monkeypatch.setattr(
+        "agentcall.prompt_gen._http_request_json",
+        lambda *args, **kwargs: (401, b'{"error":{"message":"unauthorized"}}'),
+    )
+    unauthorized = summarize_call(TRANSCRIPTS, "inbound", None)
+
+    assert unauthorized["ok"] is False
+    assert "文本模型返回 401" in unauthorized["error"]
+    assert "dashscope" not in unauthorized["error"].lower()
+    assert "openai" not in unauthorized["error"].lower()
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_http(*args, **kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return 200, b'{}'
+
+    monkeypatch.setattr("agentcall.prompt_gen._http_request_json", slow_http)
+    timed_out = summarize_call(TRANSCRIPTS, "inbound", None, timeout=0.03)
+    release.set()
+
+    assert started.is_set()
+    assert timed_out["ok"] is False
+    assert "文本模型请求超时" in timed_out["error"]
 
 
 def test_markdown_fenced_json(monkeypatch):
@@ -140,6 +215,8 @@ def test_non_200_status_returns_error(monkeypatch):
 
     assert result["ok"] is False
     assert "429" in result["error"]
+    assert "文本模型返回 429" in result["error"]
+    assert "dashscope" not in result["error"].lower()
 
 
 def test_invalid_json_returns_error(monkeypatch):
@@ -225,6 +302,44 @@ def test_judge_wrap_up_and_continue_decisions(monkeypatch):
         staticmethod(lambda **kw: make_response('{"decision":"continue","reason":"仍在查询"}')),
     )
     assert judge_wrap_up(_JUDGE_TR, "查流量")["decision"] == "continue"
+
+
+def test_judge_wrap_up_uses_openai_backend_and_degrades_on_401(monkeypatch):
+    from agentcall.summarizer import judge_wrap_up
+
+    captured: dict[str, object] = {}
+
+    def fake_http(url, *, method="GET", headers=None, body=None, timeout=5.0):
+        captured["body"] = json.loads((body or b"").decode("utf-8"))
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"decision":"wrap_up","reason":"目标已达成"}'
+                    }
+                }
+            ]
+        }
+        return 200, json.dumps(response).encode("utf-8")
+
+    monkeypatch.setenv("AGENT_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("SUMMARY_MODEL", "")
+    monkeypatch.setattr("agentcall.prompt_gen._http_request_json", fake_http)
+
+    wrapped = judge_wrap_up(_JUDGE_TR, "查流量")
+
+    assert wrapped["ok"] is True and wrapped["decision"] == "wrap_up"
+    assert captured["body"]["model"] == "gpt-4o-mini"
+
+    monkeypatch.setattr(
+        "agentcall.prompt_gen._http_request_json",
+        lambda *args, **kwargs: (401, b"unauthorized"),
+    )
+    fallback = judge_wrap_up(_JUDGE_TR, "查流量")
+
+    assert fallback["ok"] is False and fallback["decision"] == "continue"
+    assert "文本模型返回 401" in fallback["reason"]
 
 
 def test_judge_short_transcript_continues_without_model(monkeypatch):

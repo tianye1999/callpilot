@@ -9,14 +9,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
+import urllib.error
 import urllib.request
 from collections import OrderedDict
 from typing import Any
 
 from . import config
 from .prompts import agent_persona, normalize_lang, owner_name
-from .summarizer import _call_with_timeout, _extract_text, _parse_json_payload
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ _DEFAULT_MODEL_BY_PROVIDER = {
     "qwen": "qwen-plus",
     "openai": "gpt-4o-mini",
 }
+_TEXT_BACKENDS = frozenset(_DEFAULT_MODEL_BY_PROVIDER)
 
 _SYSTEM_PROMPT = {
     "zh": (
@@ -78,6 +80,178 @@ _USER_TEMPLATE = {
 def clear_cache() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
+
+
+def text_backend_for_agent(provider: str | None = None) -> str:
+    """Map the voice provider to the compatible auxiliary text backend.
+
+    OpenAI uses its own chat completions endpoint. Other voice providers keep
+    the historical Qwen text path; this preserves local/doubao behavior without
+    changing their realtime agent implementations.
+    """
+    selected = (provider or config.get_str("AGENT_PROVIDER")).strip().lower()
+    return "openai" if selected == "openai" else "qwen"
+
+
+def select_text_model(provider: str, override: str | None = None) -> str:
+    """Resolve an explicit model or the backend's inexpensive default."""
+    selected = (provider or "").strip().lower()
+    explicit = (override or "").strip()
+    if explicit:
+        return explicit
+    return _DEFAULT_MODEL_BY_PROVIDER.get(selected, "qwen-plus")
+
+
+def call_text_model(
+    messages: list[dict[str, str]],
+    *,
+    provider: str,
+    model: str,
+    timeout: float,
+    max_tokens: int = 160,
+    hard_timeout: bool = True,
+) -> tuple[str | None, str | None]:
+    """Call one supported text backend with a hard caller-side timeout."""
+    selected = (provider or "").strip().lower()
+    if selected not in _TEXT_BACKENDS:
+        return None, f"不支持的文本模型提供方: {selected or 'unknown'}"
+    resolved_model = select_text_model(selected, model)
+    if selected == "qwen" and not os.environ.get("DASHSCOPE_API_KEY", "").strip():
+        return None, "缺少环境变量 DASHSCOPE_API_KEY"
+    if selected == "openai" and not os.environ.get("OPENAI_API_KEY", "").strip():
+        return None, "缺少环境变量 OPENAI_API_KEY"
+
+    def invoke() -> tuple[str | None, str | None]:
+        try:
+            if selected == "qwen":
+                return _call_qwen_sync(messages, resolved_model)
+            return _call_openai_sync(
+                messages,
+                resolved_model,
+                timeout,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001 - daemon request must not escape
+            return None, f"文本模型请求失败: {type(exc).__name__}: {exc}"
+
+    if not hard_timeout:
+        return invoke()
+
+    box: dict[str, tuple[str | None, str | None]] = {}
+
+    def worker() -> None:
+        box["result"] = invoke()
+
+    thread = threading.Thread(target=worker, name="text-model-call", daemon=True)
+    thread.start()
+    thread.join(max(0.0, timeout))
+    if thread.is_alive():
+        return None, f"文本模型请求超时（>{timeout:g}s）"
+    result = box.get("result")
+    if isinstance(result, tuple):
+        return result
+    return None, "文本模型请求未返回结果"
+
+
+def parse_json_payload(text: str) -> dict[str, Any] | None:
+    """Parse a JSON object while tolerating a Markdown fence or outer noise."""
+    normalized = (text or "").strip()
+    fence = re.match(r"^```[a-zA-Z]*\s*(.*?)\s*```\s*$", normalized, re.DOTALL)
+    if fence:
+        normalized = fence.group(1).strip()
+    try:
+        data = json.loads(normalized)
+    except json.JSONDecodeError:
+        start, end = normalized.find("{"), normalized.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(normalized[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_qwen_text(response: Any) -> str | None:
+    try:
+        content = response.output.choices[0].message.content
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return None
+    if isinstance(content, list):
+        content = "".join(
+            item["text"]
+            for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        )
+    return content if isinstance(content, str) else None
+
+
+def _call_qwen_sync(
+    messages: list[dict[str, str]], model: str
+) -> tuple[str | None, str | None]:
+    import dashscope
+
+    response = dashscope.Generation.call(
+        model=model,
+        messages=messages,
+        result_format="message",
+        api_key=os.environ.get("DASHSCOPE_API_KEY"),
+    )
+    status = getattr(response, "status_code", None)
+    if status is not None and status != 200:
+        detail = getattr(response, "message", "") or getattr(response, "code", "")
+        return None, f"文本模型返回 {status}: {detail}"
+    text = _extract_qwen_text(response)
+    return (text, None) if text else (None, "文本模型响应中没有文本内容")
+
+
+def _call_openai_sync(
+    messages: list[dict[str, str]],
+    model: str,
+    timeout: float,
+    *,
+    max_tokens: int,
+) -> tuple[str | None, str | None]:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+        }
+    ).encode("utf-8")
+    try:
+        status, body = _http_request_json(
+            "https://api.openai.com/v1/chat/completions",
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            body=payload,
+            timeout=timeout,
+        )
+    except urllib.error.HTTPError as exc:
+        body = exc.read()[:200]
+        return None, _status_error(exc.code, body)
+    if status != 200:
+        return None, _status_error(status, body)
+    try:
+        data = json.loads(body.decode("utf-8"))
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, "文本模型响应解析失败"
+    return (
+        (content, None)
+        if isinstance(content, str) and content
+        else (None, "文本模型响应中没有文本内容")
+    )
+
+
+def _status_error(status: int, body: bytes) -> str:
+    detail = body[:200].decode("utf-8", "replace")
+    return f"文本模型返回 {status}: {detail}"
 
 
 def build_prompt_messages(
@@ -162,62 +336,29 @@ def generate_prompt_scenario(
 
 
 def _select_model(provider: str) -> str:
-    override = config.get_str("PROMPT_GEN_MODEL").strip()
-    if override:
-        return override
-    return _DEFAULT_MODEL_BY_PROVIDER.get(provider, "qwen-plus")
+    return select_text_model(provider, config.get_str("PROMPT_GEN_MODEL"))
 
 
 def _call_qwen(
     messages: list[dict[str, str]], model: str, timeout: float
 ) -> tuple[str | None, str | None]:
-    if not os.environ.get("DASHSCOPE_API_KEY", "").strip():
-        return None, "缺少环境变量 DASHSCOPE_API_KEY"
-    response, error = _call_with_timeout(messages, model, timeout)
-    if error is not None:
-        return None, error
-    status = getattr(response, "status_code", None)
-    if status is not None and status != 200:
-        return None, (
-            f"dashscope 返回 {status}: "
-            f"{getattr(response, 'message', '') or getattr(response, 'code', '')}"
-        )
-    return _extract_text(response), None
+    return call_text_model(
+        messages,
+        provider="qwen",
+        model=model,
+        timeout=timeout,
+    )
 
 
 def _call_openai(
     messages: list[dict[str, str]], model: str, timeout: float
 ) -> tuple[str | None, str | None]:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return None, "缺少环境变量 OPENAI_API_KEY"
-    payload = json.dumps({
-        "model": model,
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": 160,
-    }).encode("utf-8")
-    try:
-        status, body = _http_request_json(
-            "https://api.openai.com/v1/chat/completions",
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            body=payload,
-            timeout=timeout,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return None, f"{type(exc).__name__}: {exc}"
-    if status != 200:
-        return None, f"openai 返回 {status}: {body[:200].decode('utf-8', 'replace')}"
-    try:
-        data = json.loads(body.decode("utf-8"))
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        return None, f"openai 响应解析失败: {exc}"
-    return content if isinstance(content, str) else None, None
+    return call_text_model(
+        messages,
+        provider="openai",
+        model=model,
+        timeout=timeout,
+    )
 
 
 def _http_request_json(
@@ -248,7 +389,7 @@ def _normalize_opening(text: str) -> str:
 
 
 def _parse_model_text(text: str) -> tuple[str, str]:
-    data = _parse_json_payload(text)
+    data = parse_json_payload(text)
     if data is None:
         return _normalize_scenario(text), ""
     scenario = data.get("scenario")

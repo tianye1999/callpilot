@@ -127,14 +127,29 @@ def test_dtmf_judge_registry_defaults_off_and_rejects_enforce(tmp_path, monkeypa
         )
 
 
-def test_shadow_judge_requires_dashscope_key_even_with_openai_agent(monkeypatch):
+def test_shadow_judge_uses_selected_text_backend_credentials(monkeypatch):
     monkeypatch.setenv("DTMF_JUDGE_MODE", "shadow")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
 
-    errors = validate_provider_credentials("openai")
+    assert validate_provider_credentials("openai") == []
 
-    assert any("DASHSCOPE_API_KEY" in error and "DTMF" in error for error in errors)
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "qwen-key")
+    assert validate_provider_credentials("qwen") == []
+
+
+def test_default_provider_and_text_models_match_env_example(monkeypatch):
+    _unset(monkeypatch, "AGENT_PROVIDER", "SUMMARY_MODEL", "DTMF_JUDGE_MODEL")
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert get_str("AGENT_PROVIDER") == "openai"
+    assert get_str("SUMMARY_MODEL") == ""
+    assert get_str("DTMF_JUDGE_MODEL") == ""
+    assert re.search(r"^AGENT_PROVIDER=openai$", example, re.MULTILINE)
+    assert re.search(r"^SUMMARY_MODEL=$", example, re.MULTILINE)
+    assert re.search(r"^DTMF_JUDGE_MODEL=$", example, re.MULTILINE)
 
 
 @pytest.mark.parametrize(("raw", "expected"), [("true", True), ("false", False)])

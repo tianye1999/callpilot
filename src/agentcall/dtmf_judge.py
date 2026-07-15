@@ -21,9 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, cast
 
-import dashscope
-
-from .summarizer import _extract_text
+from . import config
+from .prompt_gen import call_text_model, select_text_model, text_backend_for_agent
 
 logger = logging.getLogger(__name__)
 
@@ -500,22 +499,23 @@ class DtmfJudge:
 
 
 def _default_model_call(
-    messages: list[dict[str, str]], model: str, _timeout: float
+    messages: list[dict[str, str]], _model: str, timeout: float
 ) -> tuple[str | None, str | None]:
-    """Make one synchronous SDK request; ``_invoke_model`` owns its timeout."""
-    if not os.environ.get("DASHSCOPE_API_KEY", "").strip():
-        return None, "model_error"
-    response = dashscope.Generation.call(
-        model=model,
-        messages=messages,
-        result_format="message",
-        api_key=os.environ.get("DASHSCOPE_API_KEY"),
+    """Dispatch the shadow judge to the selected auxiliary text backend."""
+    provider = text_backend_for_agent()
+    # The caller still supplies its legacy qwen fallback. An empty judge config
+    # means provider-aware auto selection; only this field is an explicit override.
+    override = config.get_str("DTMF_JUDGE_MODEL").strip()
+    selected_model = select_text_model(provider, override)
+    text, error = call_text_model(
+        messages,
+        provider=provider,
+        model=selected_model,
+        timeout=timeout,
+        max_tokens=180,
+        hard_timeout=False,
     )
-    status = getattr(response, "status_code", None)
-    if status is not None and status != 200:
-        return None, "model_error"
-    text = _extract_text(response)
-    return (text, None) if text else (None, "model_error")
+    return (text, None) if text and error is None else (None, "model_error")
 
 
 def _sanitize_error_code(code: str) -> str:

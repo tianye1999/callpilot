@@ -35,6 +35,12 @@ def test_build_messages_contain_number_task_and_no_code_mapping():
     assert "映射" not in text
 
 
+def test_text_model_auto_selection_tracks_provider_and_honors_override():
+    assert prompt_gen.select_text_model("qwen", "") == "qwen-plus"
+    assert prompt_gen.select_text_model("openai", "") == "gpt-4o-mini"
+    assert prompt_gen.select_text_model("openai", "gpt-4.1-mini") == "gpt-4.1-mini"
+
+
 def test_qwen_prompt_generation_truncates_and_caches(monkeypatch):
     prompt_gen.clear_cache()
     calls: list[dict] = []

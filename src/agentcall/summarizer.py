@@ -1,4 +1,4 @@
-"""通话后结构化总结：把整通转写交给 dashscope 文本模型，产出结构化摘要。
+"""通话后结构化总结：按当前 Agent provider 调文本模型产出摘要。
 
 调用方通常在通话结束后的后台线程里执行，因此本模块保证 ``summarize_call``
 **绝不抛出异常**——任何失败（无有效转写、API 报错、超时、JSON 解析失败）
@@ -7,16 +7,16 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import re
-import threading
 from typing import Any
 
-import dashscope
-
 from . import config
+from .prompt_gen import (
+    call_text_model,
+    parse_json_payload,
+    select_text_model,
+    text_backend_for_agent,
+)
 from .prompts import agent_language, owner_name
 
 logger = logging.getLogger(__name__)
@@ -154,15 +154,18 @@ def judge_wrap_up(
             },
             {"role": "user", "content": convo},
         ]
-        model = config.get_str("SUMMARY_MODEL")
-        response, error = _call_with_timeout(
-            messages, model, timeout or _JUDGE_TIMEOUT
+        provider = text_backend_for_agent()
+        model = select_text_model(provider, config.get_str("SUMMARY_MODEL"))
+        text, error = call_text_model(
+            messages,
+            provider=provider,
+            model=model,
+            timeout=timeout or _JUDGE_TIMEOUT,
         )
         if error is not None:
             logger.debug("收尾裁判失败（默认继续）: %s", error)
             return {"ok": False, "decision": "continue", "reason": error}
-        text = _extract_text(response)
-        data = _parse_json_payload(text) if text else None
+        data = parse_json_payload(text) if text else None
         reason = str((data or {}).get("reason", ""))[:120]
         if (data or {}).get("decision") == "wrap_up":
             return {"ok": True, "decision": "wrap_up", "reason": reason}
@@ -213,43 +216,6 @@ def _build_messages(
     ]
 
 
-def _extract_text(response: Any) -> str | None:
-    """从 GenerationResponse（result_format='message'）里取出正文文本。"""
-    try:
-        content = response.output.choices[0].message.content
-    except (AttributeError, IndexError, KeyError, TypeError):
-        return None
-    # 多模态模型可能返回 [{"text": "..."}] 形式，做一层兼容。
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-        content = "".join(parts)
-    return content if isinstance(content, str) else None
-
-
-def _parse_json_payload(text: str) -> dict[str, Any] | None:
-    """解析模型输出的 JSON，容忍 markdown 围栏和前后杂讯。"""
-    text = text.strip()
-    # 剥掉 ```json ... ``` / ``` ... ``` 围栏。
-    fence = re.match(r"^```[a-zA-Z]*\s*(.*?)\s*```\s*$", text, re.DOTALL)
-    if fence:
-        text = fence.group(1).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        # 兜底：截取首个 "{" 到最后一个 "}" 之间的子串再试一次。
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-    return data if isinstance(data, dict) else None
-
-
 def _coerce_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -286,36 +252,6 @@ def _normalize(data: dict[str, Any], lang: str = "zh") -> dict[str, Any]:
     return result
 
 
-def _call_with_timeout(
-    messages: list[dict[str, str]], model: str, timeout: float
-) -> tuple[Any, str | None]:
-    """在守护线程里调 dashscope，超时不阻塞调用方。
-
-    返回 ``(response, error)``；超时或异常时 response 为 None。
-    """
-    box: dict[str, Any] = {}
-
-    def _worker() -> None:
-        try:
-            box["response"] = dashscope.Generation.call(
-                model=model,
-                messages=messages,
-                result_format="message",
-                api_key=os.environ.get("DASHSCOPE_API_KEY"),
-            )
-        except Exception as exc:  # noqa: BLE001 —— 后台线程里不允许异常外逸
-            box["error"] = f"{type(exc).__name__}: {exc}"
-
-    thread = threading.Thread(target=_worker, name="call-summarizer", daemon=True)
-    thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
-        return None, f"总结请求超时（>{timeout:g}s）"
-    if "error" in box:
-        return None, box["error"]
-    return box.get("response"), None
-
-
 def summarize_call(
     transcripts: list[tuple[str, str]],
     direction: str,
@@ -345,28 +281,24 @@ def summarize_call(
         if timeout is None:
             timeout = config.get_float("SUMMARY_TIMEOUT")
 
-        model = config.get_str("SUMMARY_MODEL")
+        provider = text_backend_for_agent()
+        model = select_text_model(provider, config.get_str("SUMMARY_MODEL"))
         messages = _build_messages(transcripts, direction, number, lang)
 
-        response, error = _call_with_timeout(messages, model, timeout)
+        text, error = call_text_model(
+            messages,
+            provider=provider,
+            model=model,
+            timeout=timeout,
+            max_tokens=600,
+        )
         if error is not None:
             logger.warning("通话总结失败: %s", error)
             return _fail(error, lang)
-
-        status = getattr(response, "status_code", None)
-        if status is not None and status != 200:
-            error = (
-                f"dashscope 返回 {status}: "
-                f"{getattr(response, 'message', '') or getattr(response, 'code', '')}"
-            )
-            logger.warning("通话总结失败: %s", error)
-            return _fail(error, lang)
-
-        text = _extract_text(response)
         if not text:
-            return _fail("dashscope 响应中没有文本内容", lang)
+            return _fail("文本模型响应中没有文本内容", lang)
 
-        data = _parse_json_payload(text)
+        data = parse_json_payload(text)
         if data is None:
             logger.warning("通话总结 JSON 解析失败，原文: %.200s", text)
             return _fail("模型输出不是合法 JSON", lang)

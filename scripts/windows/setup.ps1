@@ -85,7 +85,8 @@ if (Test-Path ".env") {
 
 Write-Host ""
 Write-Info "Setup complete. Next steps:"
-Write-Host "  1. Edit .env — set DASHSCOPE_API_KEY (get one at https://dashscope.console.aliyun.com/);"
+Write-Host "  1. Edit .env — default OpenAI: set OPENAI_API_KEY;"
+Write-Host "     to use Qwen, set AGENT_PROVIDER=qwen and DASHSCOPE_API_KEY;"
 Write-Host "     on Windows also set MODEM_PORT=auto and MODEM_AUDIO_MODE=uac"
 Write-Host "  2. Install the official Quectel EC20 Windows driver, then plug in the modem"
 Write-Host "     (it shows up as native COM ports — no USB bridge needed; see scripts\windows\README.md)"

@@ -22,6 +22,32 @@ from agentcall.dtmf_judge import (
 )
 
 
+def test_default_model_call_uses_agent_provider_and_dtmf_auto_model(monkeypatch):
+    from agentcall import dtmf_judge
+
+    captured: list[tuple[str, str, float]] = []
+
+    def fake_call(
+        messages, *, provider, model, timeout, max_tokens=160, hard_timeout=True
+    ):
+        captured.append((provider, model, timeout))
+        assert hard_timeout is False
+        return '{"action":"wait","confidence":1,"reason_code":"queue_hold","reason":"等待"}', None
+
+    monkeypatch.setattr(dtmf_judge, "call_text_model", fake_call)
+    monkeypatch.setenv("AGENT_PROVIDER", "openai")
+    monkeypatch.setenv("DTMF_JUDGE_MODEL", "")
+    text, error = dtmf_judge._default_model_call([], "qwen-plus", 0.5)
+
+    assert error is None and text is not None
+    assert captured == [("openai", "gpt-4o-mini", 0.5)]
+
+    monkeypatch.setenv("AGENT_PROVIDER", "qwen")
+    monkeypatch.setenv("DTMF_JUDGE_MODEL", "qwen-max")
+    dtmf_judge._default_model_call([], "ignored-legacy-fallback", 0.75)
+    assert captured[-1] == ("qwen", "qwen-max", 0.75)
+
+
 class SpyRecord:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -376,6 +402,9 @@ def test_default_model_timeout_never_starts_a_second_live_sdk_request(
         release.wait(timeout=10)
         return None
 
+    monkeypatch.setenv("AGENT_PROVIDER", "qwen")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test")
+    monkeypatch.setenv("DTMF_JUDGE_MODEL", "")
     monkeypatch.setattr(
         dashscope.Generation, "call", staticmethod(blocked_sdk_call)
     )
@@ -425,6 +454,9 @@ def test_default_model_single_flight_is_shared_across_call_instances(
         release.wait(timeout=10)
         return None
 
+    monkeypatch.setenv("AGENT_PROVIDER", "qwen")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test")
+    monkeypatch.setenv("DTMF_JUDGE_MODEL", "")
     monkeypatch.setattr(
         dashscope.Generation, "call", staticmethod(blocked_sdk_call)
     )
