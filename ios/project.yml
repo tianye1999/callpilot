@@ -12,8 +12,8 @@ settings:
     SWIFT_VERSION: "6.0"
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
-    # 开源友好:不硬编码公司 Team。本地 `export DEVELOPMENT_TEAM=<你的TeamID>`
-    # (本机 Azores Labs = 34KBLZ6RX3),或在 Xcode 的 Signing 面板选择。
+    # 开源友好:不硬编码 Team。本地 `export DEVELOPMENT_TEAM=<你的 Apple Team ID>`
+    # (见 Xcode > Settings > Accounts),或在 Xcode 的 Signing 面板选择。
     DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
 
 packages:
