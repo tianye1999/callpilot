@@ -4,10 +4,22 @@
 <dict>
 	<key>CFBundleDisplayName</key>
 	<string>CallPilot</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
 	<!-- 麦克风:远程通话经 LiveKit 采集本机麦克风(对齐 Android RECORD_AUDIO) -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>用于在通过远端 SIM 的通话中传输您的语音。</string>
