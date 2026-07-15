@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import select
 import subprocess
 import threading
 import time
@@ -314,6 +315,16 @@ class FfmpegAudioBridge:
     直接走 ModemAudioBridge（uac 模式）即可，无需此 workaround。
     """
 
+    # realtime TTS 是 burst 推送（远快于实时），tx_buffer 本就是"快到达、按
+    # 100ms 实时放出"的蓄水池，正常长句 pending 峰值可达 10-30s——上限必须远大于
+    # 正常 burst，否则会丢正常语音的开头（真机实测 3s 上限把开场白切掉 12.6s）。
+    # 它只是写线程僵死时的内存兜底（僵死本身由写超时 ~250ms 检出并重启）。
+    _MAX_TX_BUFFER_BYTES = MODEM_RATE * MODEM_CHANNELS * 2 * 60
+    _WRITE_DEADLINE_SECONDS = 0.25
+    _PLAY_RESTART_DELAY_SECONDS = 0.5
+    _PROCESS_STOP_TIMEOUT_SECONDS = 0.5
+    _MAX_PLAY_RESTARTS = 20
+
     def __init__(self, device_keyword: str, tx_gain: float = 1.0) -> None:
         if not platforms.IS_MACOS:
             raise RuntimeError(
@@ -337,6 +348,9 @@ class FfmpegAudioBridge:
         self._tx_lock = threading.Lock()
         self._writer_thread: threading.Thread | None = None
         self._running = False
+        self._dropped_bytes = 0
+        self._drop_events = 0
+        self._consecutive_play_restarts = 0
         # 上行第三段观测：真实写入 AS（audiotoolbox 播放）的帧统计，
         # 只统计非静音 payload；补零静音单独计次。仅写线程内使用。
         self._write_stats = PcmFlowStats("uplink3_as_write")
@@ -376,6 +390,8 @@ class FfmpegAudioBridge:
              "-audio_device_index", str(self.output_index), "none"],
             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        stdin = cast(BinaryIO, self._play.stdin)
+        os.set_blocking(stdin.fileno(), False)
 
     def start(self) -> None:
         common = ["-hide_banner", "-loglevel", "error"]
@@ -389,6 +405,9 @@ class FfmpegAudioBridge:
         os.set_blocking(stdout.fileno(), False)
         self._spawn_play()
         self._running = True
+        self._dropped_bytes = 0
+        self._drop_events = 0
+        self._consecutive_play_restarts = 0
         self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
         self._writer_thread.start()
         logger.info(
@@ -398,15 +417,11 @@ class FfmpegAudioBridge:
 
     def stop(self) -> None:
         self._running = False
+        # 先关闭播放管道，立即唤醒可能卡在 select/os.write 的写线程。
+        self._terminate_process(self._play)
         if self._writer_thread:
             self._writer_thread.join(timeout=2)
-        for proc in (self._cap, self._play):
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:  # noqa: BLE001
-                    proc.kill()
+        self._terminate_process(self._cap)
         self._cap = None
         self._play = None
         with self._tx_lock:
@@ -425,13 +440,116 @@ class FfmpegAudioBridge:
             return len(self._tx_buffer)
 
     def write_modem_chunks(self, chunks: Iterable[bytes]) -> None:
+        dropped = 0
         with self._tx_lock:
             for chunk in chunks:
                 if chunk:
                     self._tx_buffer.extend(chunk)
+            overflow = len(self._tx_buffer) - self._MAX_TX_BUFFER_BYTES
+            if overflow > 0:
+                # PCM 是 int16；从队首丢弃偶数字节，不能把后续样本切到半字边界。
+                dropped = overflow + overflow % 2
+                del self._tx_buffer[:dropped]
+                self._dropped_bytes += dropped
+                self._drop_events += 1
+                should_log_drop = self._drop_events == 1 or self._drop_events % 50 == 0
+        if dropped and should_log_drop:
+            logger.warning(
+                "ffmpeg 下行 PCM 积压超限，丢弃最旧音频: dropped=%d total=%d pending=%d",
+                dropped,
+                self._dropped_bytes,
+                self.pending_output_bytes(),
+            )
 
-    # 播放进程退出后的最大重启次数（× ~0.5s ≈ 覆盖 EC20 UAC 设备就绪窗口）。
-    _MAX_PLAY_RESTARTS = 20
+    @classmethod
+    def _terminate_process(cls, proc: subprocess.Popen | None) -> None:
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=cls._PROCESS_STOP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=cls._PROCESS_STOP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.error("ffmpeg 进程强杀后仍未退出")
+        except OSError:
+            return
+
+    def _drop_stale_tx_buffer(self) -> None:
+        with self._tx_lock:
+            dropped = len(self._tx_buffer)
+            self._tx_buffer.clear()
+            self._dropped_bytes += dropped
+        if dropped:
+            logger.warning("ffmpeg 播放重启，丢弃陈旧下行 PCM: dropped=%d", dropped)
+
+    def _restart_play(self, reason: str) -> bool:
+        if not self._running:
+            return False
+        if self._consecutive_play_restarts >= self._MAX_PLAY_RESTARTS:
+            logger.error(
+                "ffmpeg 播放连续失败（已重启 %d 次），下行放弃——"
+                "检查 EC20 UAC 输出设备是否被其它 App 占用",
+                self._consecutive_play_restarts,
+            )
+            self._running = False
+            return False
+
+        self._consecutive_play_restarts += 1
+        logger.warning(
+            "ffmpeg 播放%s，%.1fs 后重启（连续第 %d 次）",
+            reason,
+            self._PLAY_RESTART_DELAY_SECONDS,
+            self._consecutive_play_restarts,
+        )
+        old_play = self._play
+        self._play = None
+        self._terminate_process(old_play)
+        self._drop_stale_tx_buffer()
+        if self._PLAY_RESTART_DELAY_SECONDS:
+            time.sleep(self._PLAY_RESTART_DELAY_SECONDS)
+        if not self._running:
+            return False
+        self._spawn_play()
+        return True
+
+    def _write_play_payload(self, payload: bytes) -> bool:
+        """在单帧 deadline 内把 payload 完整写入非阻塞 ffmpeg stdin。"""
+        play = self._play
+        if play is None or play.stdin is None:
+            return False
+        try:
+            fd = play.stdin.fileno()
+        except (OSError, ValueError):
+            return False
+
+        deadline = time.monotonic() + self._WRITE_DEADLINE_SECONDS
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            if not self._running:
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                _, writable, _ = select.select([], [fd], [], remaining)
+            except (OSError, ValueError):
+                return False
+            if not writable:
+                continue
+            try:
+                count = os.write(fd, view[written:])
+            except BlockingIOError:
+                continue
+            except (BrokenPipeError, OSError, ValueError):
+                return False
+            if count <= 0:
+                return False
+            written += count
+        return True
 
     def _write_loop(self) -> None:
         """按 100ms 实时节奏喂给播放进程，空闲时也补静音保持 UAC 下行时钟。
@@ -441,7 +559,6 @@ class FfmpegAudioBridge:
         """
         next_write_at = time.monotonic()
         silence = b"\x00" * NMEA_WRITE_SIZE
-        restarts = 0
         while self._running:
             now = time.monotonic()
             if now < next_write_at:
@@ -450,38 +567,33 @@ class FfmpegAudioBridge:
             # 用 poll() 判定播放进程是否真的退出——不能靠 write 是否抛异常：
             # 进程刚退出时 write 仍可能把数据塞进管道缓冲而“看似成功”，
             # 会误清重启计数、导致无限重试刷屏（曾整通每 0.5s 重启上百次）。
-            if self._play is not None and self._play.poll() is not None:
-                if restarts >= self._MAX_PLAY_RESTARTS:
-                    logger.error(
-                        "ffmpeg 播放进程反复退出（已重启 %d 次），下行放弃——"
-                        "检查 EC20 UAC 输出设备是否被其它 App 占用", restarts
-                    )
-                    self._running = False
+            if self._play is None or self._play.poll() is not None:
+                if not self._restart_play("进程退出"):
                     return
-                restarts += 1
-                logger.warning("ffmpeg 播放进程退出，0.5s 后重启（第 %d 次）", restarts)
-                self._spawn_play()
-                time.sleep(0.5)
                 next_write_at = time.monotonic()
                 continue
             payload, real_bytes = self._next_write_payload(silence)
-            if self._play and self._play.stdin:
-                try:
-                    self._play.stdin.write(payload)
-                    self._play.stdin.flush()
-                except (BrokenPipeError, ValueError):
-                    continue  # 进程已退出，下一轮由上面的 poll() 统一处理重启
-                # 只统计写成功的：真实 payload 记帧/峰值，纯静音只计次。
-                if real_bytes:
-                    self._write_stats.add(payload[:real_bytes])
-                else:
-                    self._silence_writes += 1
-                if self._write_stats.maybe_log(
-                    silence_writes=self._silence_writes,
-                    play_alive=self._play.poll() is None,
-                    pending=self.pending_output_bytes(),
-                ):
-                    self._silence_writes = 0
+            play = self._play
+            wrote_full_payload = self._write_play_payload(payload)
+            if not wrote_full_payload or play is None or play.poll() is not None:
+                if not self._running or not self._restart_play("写入僵死/管道断开"):
+                    return
+                next_write_at = time.monotonic()
+                continue
+
+            self._consecutive_play_restarts = 0
+            # 只统计完整写成功的：真实 payload 记帧/峰值，纯静音只计次。
+            if real_bytes:
+                self._write_stats.add(payload[:real_bytes])
+            else:
+                self._silence_writes += 1
+            if self._write_stats.maybe_log(
+                silence_writes=self._silence_writes,
+                play_alive=play.poll() is None,
+                pending=self.pending_output_bytes(),
+                dropped=self._dropped_bytes,
+            ):
+                self._silence_writes = 0
             next_write_at += NMEA_WRITE_INTERVAL_SECONDS
 
     def _next_write_payload(self, silence: bytes) -> tuple[bytes, int]:
