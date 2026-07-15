@@ -5,9 +5,51 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 
 from agentcall.events import EventHub
+
+
+def test_wait_for_event_unblocks_on_matching_publish():
+    hub = EventHub(asyncio.new_event_loop())
+    result: list[dict | None] = []
+
+    thread = threading.Thread(
+        target=lambda: result.append(
+            hub.wait_for_event(
+                lambda event: event.get("type") == "sms_in"
+                and event.get("sender") == "10086",
+                timeout=1.0,
+            )
+        )
+    )
+    thread.start()
+    time.sleep(0.02)
+    hub.publish({"type": "sms_in", "sender": "10010", "text": "ignore"})
+    hub.publish({"type": "sms_in", "sender": "10086", "text": "official"})
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert result and result[0] is not None
+    assert result[0]["text"] == "official"
+
+
+def test_wait_for_event_can_match_existing_history_and_times_out():
+    hub = EventHub(asyncio.new_event_loop())
+    hub.publish({"type": "sms_in", "sender": "10086", "text": "existing", "ts": 10.0})
+
+    found = hub.wait_for_event(
+        lambda event: event.get("type") == "sms_in" and event.get("ts", 0) >= 10.0,
+        timeout=0.01,
+    )
+    missing = hub.wait_for_event(
+        lambda event: event.get("sender") == "10010",
+        timeout=0.01,
+    )
+
+    assert found is not None and found["text"] == "existing"
+    assert missing is None
 
 
 def make_loop() -> asyncio.AbstractEventLoop:

@@ -255,6 +255,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 摘要 API 超时秒数（真机实测 15s 对长转写不够用），调试项不进面板。
     ConfigSpec("SUMMARY_TIMEOUT", "摘要超时（秒）", "float", "30",
                editable=False, hidden=True),
+    ConfigSpec("SMS_VERIFICATION_WAIT_SECONDS", "官方短信校验等待（秒）", "float", "30",
+               editable=False, hidden=True),
     # ---- 本地监听 ----
     ConfigSpec(
         "MONITOR_AI_PLAYBACK", "本地监听 AI 语音", "bool", "false",

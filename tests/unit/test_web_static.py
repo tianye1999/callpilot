@@ -163,6 +163,19 @@ def test_profile_manager_has_crud_controls_and_safe_rendering():
     assert 'id="profileDtmfSpokenFollowup"' in text
     assert "dtmf_spoken_followup: false" in text
     assert 'dtmf_spoken_followup: $("profileDtmfSpokenFollowup").checked' in text
+    assert 'id="profileResultVerification"' in text
+    assert 'result_verification: "none"' in text
+    assert 'result_verification: $("profileResultVerification").value' in text
+    assert 'item.result_verification === "carrier_sms"' in text
+
+
+def test_history_marks_verified_and_unverified_result_sources():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'summary.result_verification === "verified"' in text
+    assert 'summary.result_verification === "unverified"' in text
+    assert 't("summary_verified_sms")' in text
+    assert 't("summary_unverified")' in text
 
 
 def test_manual_dial_requires_explicit_task_or_selected_preset():

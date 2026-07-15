@@ -37,6 +37,19 @@
       "dtmf_spoken_followup": true
     },
     {
+      "id": "china_mobile_balance",
+      "number": "10086",
+      "task": {"zh": "查上个月消费金额", "en": "check last month's charges"},
+      "label": {"zh": "中国移动·查上月消费", "en": "China Mobile · Last month's charges"},
+      "scenario": {
+        "zh": "你在替机主拨打中国移动客服热线10086，查询机主名下这个号码上个月的消费金额。你是主叫、替机主求助的一方，不是客服、不代表移动、不冒充机主本人。拨通后完整听完首段 IVR，按提示用短词或调用 send_dtmf 真正按键；请求对方把查询结果通过官方短信发到本机。通话里听到的金额只作过程参考，不得作为已经核实的最终结果；告诉机主最终数字以通话后收到的官方短信为准。",
+        "en": "You are calling China Mobile's 10086 hotline on the owner's behalf to check last month's charges on the owner's number. You are the caller asking for help, not a carrier agent, and never impersonate the owner. Listen through the first IVR announcement, then use short spoken choices or the send_dtmf tool as prompted. Ask the carrier to send the result to this device by official SMS. Treat any spoken amount only as provisional; the final figures must come from the official post-call SMS."
+      },
+      "opening": {"zh": "你好，我想查询上个月的消费金额。", "en": "Hi, I'd like to check last month's charges."},
+      "opening_mode": "wait",
+      "result_verification": "carrier_sms"
+    },
+    {
       "id": "china_unicom_data",
       "number": "10010",
       "task": {"zh": "咨询流量使用情况", "en": "check data usage"},

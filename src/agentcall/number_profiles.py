@@ -18,6 +18,9 @@ prefer supplying both languages for every field to avoid mixed-language output.
 
 ``dtmf_spoken_followup``(可选): 默认 ``false``。仅对显式启用的 IVR
 profile，在 Agent 明确说出自己将按键却未调用工具时启用执行层安全网。
+
+``result_verification``(可选): ``none``(默认)或 ``carrier_sms``。后者仅用于
+运营商账户查询，要求通话结果由同一运营商公共客服号发来的短信做可信校验。
 """
 
 from __future__ import annotations
@@ -58,6 +61,7 @@ _MANAGED_FIELDS = {
     "opening",
     "opening_mode",
     "dtmf_spoken_followup",
+    "result_verification",
 }
 
 
@@ -369,6 +373,11 @@ def _normalize_profile(
         "opening": opening,
         "opening_mode": opening_mode,
         "dtmf_spoken_followup": item.get("dtmf_spoken_followup") is True,
+        "result_verification": (
+            "carrier_sms"
+            if item.get("result_verification") == "carrier_sms"
+            else "none"
+        ),
         "error": None,
         "provider": "",
         "model": "",
@@ -436,6 +445,11 @@ def _managed_profile(item: dict[str, Any], profile_id: str) -> dict[str, Any]:
         "opening": _localized_map(item.get("opening")),
         "opening_mode": opening_mode,
         "dtmf_spoken_followup": item.get("dtmf_spoken_followup") is True,
+        "result_verification": (
+            "carrier_sms"
+            if item.get("result_verification") == "carrier_sms"
+            else "none"
+        ),
     }
 
 
@@ -477,6 +491,11 @@ def _validate_profile_payload(payload: Any) -> dict[str, Any]:
     dtmf_spoken_followup = payload.get("dtmf_spoken_followup", False)
     if not isinstance(dtmf_spoken_followup, bool):
         raise ProfileValidationError("dtmf_spoken_followup 必须是布尔值")
+    result_verification = payload.get("result_verification", "none")
+    if result_verification not in {"none", "carrier_sms"}:
+        raise ProfileValidationError(
+            "result_verification 只能是 none 或 carrier_sms"
+        )
 
     profile: dict[str, Any] = {
         "enabled": enabled,
@@ -486,6 +505,7 @@ def _validate_profile_payload(payload: Any) -> dict[str, Any]:
         "opening": opening,
         "opening_mode": opening_mode,
         "dtmf_spoken_followup": dtmf_spoken_followup,
+        "result_verification": result_verification,
     }
     if match_mode == "exact":
         profile["task"] = task

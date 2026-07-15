@@ -57,6 +57,11 @@ from .remote_dialer import (
     RemoteWebDialerCoordinator,
     issue_livekit_session,
 )
+from .result_verification import (
+    apply_carrier_sms_verification,
+    carrier_sms_evidence,
+    is_carrier_service_call,
+)
 from .sim_identity import SimIdentity
 from .sms_email_forwarder import SmsEmailForwarder
 from .summarizer import judge_wrap_up, summarize_call
@@ -146,6 +151,7 @@ class CallSession:
         self._prompt_gen_opening = ""
         self._prompt_gen_opening_mode = "say"
         self._prompt_gen_dtmf_spoken_followup = False
+        self._result_verification_mode = "none"
         self._dtmf_lock = threading.RLock()
         self._recent_dtmf_sent: dict[str, tuple[float, str]] = {}
         self._pending_dtmf_followups: dict[
@@ -199,6 +205,7 @@ class CallSession:
         self._prompt_gen_opening = ""
         self._prompt_gen_opening_mode = "say"
         self._prompt_gen_dtmf_spoken_followup = False
+        self._result_verification_mode = "none"
         self._cancel_spoken_dtmf_followups(clear_recent=True)
         self._stop_dtmf_judge(join_timeout=0.0)
         self._dtmf_judge_started_at = 0.0
@@ -624,7 +631,16 @@ class CallSession:
             record.finish(status)
         except Exception as exc:  # noqa: BLE001
             logger.warning("落盘通话记录 %s 失败: %s", record.id, exc)
-        self._maybe_summarize(record, transcripts, direction, number)
+        sim_identity = getattr(self.modem, "sim_identity", None)
+        service_number = str(getattr(sim_identity, "service_number", "") or "")
+        self._maybe_summarize(
+            record,
+            transcripts,
+            direction,
+            number,
+            self._result_verification_mode,
+            service_number,
+        )
 
     def _maybe_summarize(
         self,
@@ -632,16 +648,28 @@ class CallSession:
         transcripts: list[tuple[str, str]],
         direction: str,
         number: str | None,
+        result_verification: str = "none",
+        service_number: str = "",
     ) -> None:
         """通话摘要开关打开且对方说过话时，起后台线程生成摘要。"""
         try:
             if not config.get_bool("SUMMARY_ENABLED"):
                 return
-            if not any(role == "user" and text.strip() for role, text in transcripts):
+            if (
+                result_verification != "carrier_sms"
+                and not any(role == "user" and text.strip() for role, text in transcripts)
+            ):
                 return
             thread = threading.Thread(
                 target=self._summarize_worker,
-                args=(record, list(transcripts), direction, number),
+                args=(
+                    record,
+                    list(transcripts),
+                    direction,
+                    number,
+                    result_verification,
+                    service_number,
+                ),
                 daemon=True,
                 name="call-summary",
             )
@@ -656,10 +684,44 @@ class CallSession:
         transcripts: list[tuple[str, str]],
         direction: str,
         number: str | None,
+        result_verification: str = "none",
+        service_number: str = "",
     ) -> None:
         """后台线程：调大模型生成结构化摘要并写盘/推送。"""
         try:
             result = summarize_call(transcripts, direction, number)
+            if result_verification == "carrier_sms":
+                wait_seconds = max(
+                    0.0, config.get_float("SMS_VERIFICATION_WAIT_SECONDS")
+                )
+                should_collect_evidence = (
+                    direction == "outbound"
+                    and is_carrier_service_call(number, service_number)
+                )
+                if self.hub is not None and should_collect_evidence:
+                    self.hub.wait_for_event(
+                        lambda event: bool(
+                            carrier_sms_evidence(
+                                [event],
+                                service_number=service_number,
+                                started_at=record.started_at,
+                            )
+                        ),
+                        timeout=wait_seconds,
+                    )
+                    evidence = carrier_sms_evidence(
+                        self.hub.history(),
+                        service_number=service_number,
+                        started_at=record.started_at,
+                        ended_at=time.time(),
+                    )
+                else:
+                    evidence = []
+                result = apply_carrier_sms_verification(
+                    result,
+                    evidence,
+                    lang=agent_language(),
+                )
             if result.get("ok"):
                 record.set_summary(result)
                 self._publish({"type": "call_summary", "call_id": record.id, **result})
@@ -911,6 +973,11 @@ class CallSession:
         self._prompt_gen_opening_mode = "wait" if mode == "wait" else "say"
         self._prompt_gen_dtmf_spoken_followup = (
             result.get("dtmf_spoken_followup") is True
+        )
+        self._result_verification_mode = (
+            "carrier_sms"
+            if result.get("result_verification") == "carrier_sms"
+            else "none"
         )
         if result.get("ok") and str(result.get("scenario", "")).strip():
             return str(result["scenario"])

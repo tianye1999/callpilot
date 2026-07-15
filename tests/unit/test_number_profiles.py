@@ -27,6 +27,7 @@ def test_bundled_seed_has_public_hotline_profiles_without_private_data():
         "10000",
         "10000",
         "10086",
+        "10086",
         "10010",
         "95588",
         "95533",
@@ -578,6 +579,45 @@ def test_dtmf_spoken_followup_rejects_non_boolean(tmp_path):
         )
 
 
+def test_result_verification_defaults_none_and_roundtrips(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    path.write_text(
+        json.dumps({"profiles": [{"number": "10000", "scenario": "default"}]}),
+        encoding="utf-8",
+    )
+    assert number_profiles.lookup_profile("10000", "", path=path)[
+        "result_verification"
+    ] == "none"
+
+    created = number_profiles.create_profile(
+        {
+            "number": "10086",
+            "scenario": {"zh": "查费后等官方短信"},
+            "match_mode": "number",
+            "result_verification": "carrier_sms",
+        },
+        path=path,
+    )
+    assert created["result_verification"] == "carrier_sms"
+    assert number_profiles.lookup_profile("10086", "", path=path)[
+        "result_verification"
+    ] == "carrier_sms"
+
+
+@pytest.mark.parametrize("bad_mode", ["sms", "CARRIER_SMS", True])
+def test_result_verification_rejects_unknown_mode(bad_mode, tmp_path):
+    with pytest.raises(number_profiles.ProfileValidationError, match="result_verification"):
+        number_profiles.create_profile(
+            {
+                "number": "10086",
+                "scenario": "IVR",
+                "match_mode": "number",
+                "result_verification": bad_mode,
+            },
+            path=tmp_path / "number_profiles.json",
+        )
+
+
 def test_bundled_seed_only_enables_spoken_followup_for_10086():
     data = json.loads(number_profiles.bundled_seed_file().read_text(encoding="utf-8"))
     enabled = [
@@ -586,3 +626,15 @@ def test_bundled_seed_only_enables_spoken_followup_for_10086():
         if item.get("dtmf_spoken_followup") is True
     ]
     assert enabled == ["10086"]
+
+
+def test_bundled_seed_has_sms_verified_china_mobile_billing_profile():
+    data = json.loads(number_profiles.bundled_seed_file().read_text(encoding="utf-8"))
+    matches = [item for item in data["profiles"] if item.get("id") == "china_mobile_balance"]
+
+    assert len(matches) == 1
+    profile = matches[0]
+    assert profile["number"] == "10086"
+    assert profile["opening_mode"] == "wait"
+    assert profile["result_verification"] == "carrier_sms"
+    assert "官方短信" in profile["scenario"]["zh"]

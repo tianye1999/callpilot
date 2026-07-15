@@ -32,6 +32,9 @@
 | `label` | ✅ | UI 里显示的名称 |
 | `scenario` | ✅ | 通话 scenario（本体，见下节编写要点） |
 | `opening` | — | 开场白（接通后第一句） |
+| `opening_mode` | — | `say`（默认）或 `wait`（先听完 IVR） |
+| `dtmf_spoken_followup` | — | 是否补发已口述但未调用工具的按键，默认 `false` |
+| `result_verification` | — | `none`（默认）或 `carrier_sms`（官方短信校验） |
 
 `task` / `label` / `scenario` / `opening` 均支持**普通字符串**或 **`{zh, en}` 对象**：
 `scenario` / `opening` 跟随通话语言（`AGENT_LANGUAGE`），`label` / `task` 跟随 UI 语言，
@@ -60,6 +63,12 @@
    没拿到就说还在等。拿到后口头确认一句。
 5. **安全边界**（银行等敏感场景必写）：绝不索要或读出完整卡号、密码、短信验证码、CVV。
 6. **双语对齐**：提供 `{zh, en}` 时两个语种语义保持一致。
+
+查话费、流量或账单等数字结果时，可把 `result_verification` 设为
+`carrier_sms`。系统只关联本通开始后、由当前 SIM 对应公共客服号发来的新短信；有匹配短信时，
+摘要结论只采用短信正文并标为「已核实」，不保留模型听写的金额。等待窗口内没有匹配短信时，
+摘要会明确标为「待核实」，听写数字只作参考。等待时长由
+`SMS_VERIFICATION_WAIT_SECONDS` 控制。
 
 ## 最小模板
 

@@ -378,6 +378,8 @@
     white-space: pre-wrap; word-break: break-word;
     border-left: 2px solid rgba(10, 132, 255, .4); padding-left: 10px;
   }
+  .hist-item .sum-source { margin-top: 7px; font-size: 11px; font-weight: 700; color: var(--warn); }
+  .hist-item .sum-source.verified { color: var(--ok); }
   .timeline { display: none; margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px; }
   .hist-item.open .timeline { display: block; }
   .tl-row { display: flex; gap: 10px; font-size: 11.5px; color: var(--muted); padding: 2.5px 0; font-family: var(--mono); }
@@ -941,6 +943,13 @@
                       <option value="wait" data-i18n="profile_opening_mode_wait"></option>
                     </select>
                   </div>
+                  <div class="profile-field">
+                    <label for="profileResultVerification" data-i18n="profile_result_verification"></label>
+                    <select id="profileResultVerification">
+                      <option value="none" data-i18n="profile_result_verification_none"></option>
+                      <option value="carrier_sms" data-i18n="profile_result_verification_carrier_sms"></option>
+                    </select>
+                  </div>
                   <div class="profile-enabled-field">
                     <span class="profile-switch-label" id="profileDtmfSpokenFollowupLabel" data-i18n="profile_dtmf_spoken_followup"></span>
                     <label class="switch" for="profileDtmfSpokenFollowup">
@@ -1226,6 +1235,7 @@ const I18N = {
     profile_enabled: "Enabled", profile_lang_zh: "CHINESE", profile_lang_en: "ENGLISH",
     profile_label: "Dropdown label", profile_task: "Matching task", profile_scenario: "Scenario strategy", profile_opening: "First sentence",
     profile_opening_mode: "Opening mode", profile_opening_mode_say: "Say immediately (default)", profile_opening_mode_wait: "Wait for IVR menu", profile_dtmf_spoken_followup: "Recover spoken keypress",
+    profile_result_verification: "Result verification", profile_result_verification_none: "Transcript only", profile_result_verification_carrier_sms: "Official carrier SMS",
     profile_save: "Save", profile_cancel: "Cancel", profile_duplicate: "Duplicate", profile_delete: "Delete",
     profile_saving: "Saving…", profile_saved: "Preset saved", profile_deleted: "Preset deleted",
     profile_need_number: "Enter a dialable phone number.", profile_need_scenario: "Add a scenario strategy in at least one language.",
@@ -1234,7 +1244,7 @@ const I18N = {
     profile_delete_ok: "Delete", profile_delete_fail: "Could not delete: ", profile_copy_suffix: " (copy)",
     profile_global_fail: "Could not update the preset switch: ", profile_leave_title: "Unsaved preset changes",
     profile_leave_msg: "Discard the changes to this preset?", profile_leave_discard: "Discard changes", profile_leave_stay: "Keep editing",
-    recent_label: "RECENT CALLS", empty_calls: "No calls yet", view_all: "View all history",
+    recent_label: "RECENT CALLS", empty_calls: "No calls yet", view_all: "View all history", summary_verified_sms: "Verified · official carrier SMS", summary_unverified: "Pending verification · transcript only",
     live_title: "Live Transcript", live_sub_idle: "Opens automatically when a call starts",
     listen_off: "🔊 Listen live", listen_on: "🔊 Listening…",
     live_empty: "Waiting for transcript…", dtmf_send_fail: "Send failed", new_call: "NEW CALL",
@@ -1395,6 +1405,7 @@ const I18N = {
     profile_enabled: "启用本条", profile_lang_zh: "中文", profile_lang_en: "英文",
     profile_label: "下拉显示名称", profile_task: "匹配任务", profile_scenario: "场景策略", profile_opening: "第一句话",
     profile_opening_mode: "开场模式", profile_opening_mode_say: "直接说开场白（默认）", profile_opening_mode_wait: "等待 IVR 菜单播报", profile_dtmf_spoken_followup: "补发已口述按键",
+    profile_result_verification: "结果校验", profile_result_verification_none: "仅通话听写", profile_result_verification_carrier_sms: "运营商官方短信",
     profile_save: "保存", profile_cancel: "取消", profile_duplicate: "复制", profile_delete: "删除",
     profile_saving: "保存中…", profile_saved: "预设已保存", profile_deleted: "预设已删除",
     profile_need_number: "请输入可以拨打的电话号码。", profile_need_scenario: "请至少填写一种语言的场景策略。",
@@ -1403,7 +1414,7 @@ const I18N = {
     profile_delete_ok: "删除", profile_delete_fail: "删除失败：", profile_copy_suffix: "（副本）",
     profile_global_fail: "更新预设开关失败：", profile_leave_title: "预设有未保存修改",
     profile_leave_msg: "要放弃当前预设的修改吗？", profile_leave_discard: "放弃修改", profile_leave_stay: "继续编辑",
-    recent_label: "最近通话", empty_calls: "暂无通话", view_all: "查看全部历史",
+    recent_label: "最近通话", empty_calls: "暂无通话", view_all: "查看全部历史", summary_verified_sms: "已核实 · 运营商官方短信", summary_unverified: "待核实 · 仅通话听写",
     live_title: "实时对话", live_sub_idle: "通话开始后自动进入本页",
     listen_off: "🔊 实时旁听", listen_on: "🔊 旁听中…",
     live_empty: "等待通话转写…", dtmf_send_fail: "发送失败", new_call: "新通话",
@@ -1865,7 +1876,7 @@ function blankManagedProfile() {
   return {
     id: "", enabled: true, number: "", match_mode: "exact",
     label: { ...blank }, task: { ...blank }, scenario: { ...blank }, opening: { ...blank },
-    opening_mode: "say", dtmf_spoken_followup: false,
+    opening_mode: "say", dtmf_spoken_followup: false, result_verification: "none",
   };
 }
 
@@ -1956,6 +1967,9 @@ function openProfileEditor(profile) {
   setProfileMatchMode(item.match_mode || "exact");
   $("profileOpeningMode").value = (item.opening_mode === "wait" ? "wait" : "say");
   $("profileDtmfSpokenFollowup").checked = item.dtmf_spoken_followup === true;
+  $("profileResultVerification").value = (
+    item.result_verification === "carrier_sms" ? "carrier_sms" : "none"
+  );
   $("profileDelete").hidden = !item.id;
   $("profileToast").className = "toast profile-toast";
   $("profileToast").textContent = "";
@@ -1983,6 +1997,7 @@ function readProfileForm() {
     opening: { zh: $("profileOpeningZh").value.trim(), en: $("profileOpeningEn").value.trim() },
     opening_mode: $("profileOpeningMode").value,
     dtmf_spoken_followup: $("profileDtmfSpokenFollowup").checked,
+    result_verification: $("profileResultVerification").value,
   };
 }
 
@@ -2502,7 +2517,13 @@ async function loadHistory() {
       const head2 = el("div", "head");
       head2.appendChild(el("span", "", fmtDateTime(c.started_at)));
       item.appendChild(head2);
-      const summaryText = c.summary && c.summary.summary ? c.summary.summary : "";
+      const summary = c.summary || {};
+      if (summary.result_verification === "verified") {
+        item.appendChild(el("div", "sum-source verified", t("summary_verified_sms")));
+      } else if (summary.result_verification === "unverified") {
+        item.appendChild(el("div", "sum-source", t("summary_unverified")));
+      }
+      const summaryText = summary.summary || "";
       if (summaryText) item.appendChild(el("div", "sum", summaryText));
       item.appendChild(el("div", "timeline"));
       item.addEventListener("click", () => toggleHistItem(item, c.id));

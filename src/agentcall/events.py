@@ -9,7 +9,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from aiohttp import web
 
@@ -36,6 +36,7 @@ class EventHub:
         self._clients: set[web.WebSocketResponse] = set()
         self._history: deque[dict[str, Any]] = deque(maxlen=history_limit)
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._persist_lock = threading.Lock()
         # 推送 task 需持强引用直至完成，否则可能被 GC 提前回收导致 WS 丢事件。
         self._tasks: set[asyncio.Task[None]] = set()
@@ -111,6 +112,29 @@ class EventHub:
         with self._lock:
             return list(self._history)
 
+    def wait_for_event(
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        """Wait for the first current/future event matching ``predicate``.
+
+        Used only by post-call background work. Publishers merely notify the
+        condition while holding the existing history lock; persistence and
+        WebSocket broadcasting remain outside that lock.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            while True:
+                for event in self._history:
+                    if predicate(event):
+                        return dict(event)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+
     # ---- 发布端（任意线程）----
 
     @staticmethod
@@ -133,15 +157,14 @@ class EventHub:
         """
         event.setdefault("ts", time.time())
         # 收件短信去重：指纹已见过则直接丢弃（不入库、不广播、返回 False）。
-        if event.get("type") == "sms_in":
-            fp = self._sms_fingerprint(event)
-            with self._lock:
+        with self._condition:
+            if event.get("type") == "sms_in":
+                fp = self._sms_fingerprint(event)
                 if fp in self._seen_sms:
                     return False
                 self._seen_sms.add(fp)
-        should_persist = False
-        with self._lock:
             self._history.append(event)
+            self._condition.notify_all()
             should_persist = bool(
                 self._store_path and event.get("type") in _PERSISTED_TYPES
             )

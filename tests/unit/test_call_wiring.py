@@ -448,6 +448,126 @@ def test_summary_skipped_without_user_speech(tmp_path, monkeypatch):
     assert service.session._summary_thread is None  # FakeAgent 只有 agent 转写
 
 
+def test_carrier_sms_profile_replaces_misheard_summary_with_official_result(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SUMMARY_ENABLED", "true")
+    monkeypatch.setenv("SMS_VERIFICATION_WAIT_SECONDS", "0.05")
+    monkeypatch.setattr(
+        "agentcall.call_agent.summarize_call",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "caller_identity": "中国移动客服",
+            "intent": "查询话费",
+            "urgency": "低",
+            "callback_needed": False,
+            "summary": "听写金额是19.00元。",
+            "error": None,
+        },
+    )
+    hub = make_hub()
+    service = make_service(FakeModem(), hub=hub, call_logger=CallLogger(tmp_path / "rec"))
+    record = service.session._begin_record("outbound", "10086")
+    assert record is not None
+    record.finish("completed")
+    hub.publish(
+        {
+            "type": "sms_in",
+            "sender": "10086",
+            "text": "当月累计话费29.00元。",
+        }
+    )
+
+    service.session._summarize_worker(
+        record,
+        [("user", "上月话费十九元")],
+        "outbound",
+        "10086",
+        "carrier_sms",
+        "10086",
+    )
+
+    summary = json.loads((record.path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["result_verification"] == "verified"
+    assert "29.00" in summary["summary"]
+    assert "19.00" not in summary["summary"]
+
+
+def test_carrier_sms_profile_summarizes_without_transcript_speech(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUMMARY_ENABLED", "true")
+    monkeypatch.setenv("SMS_VERIFICATION_WAIT_SECONDS", "0.05")
+    monkeypatch.setattr(
+        "agentcall.call_agent.summarize_call",
+        lambda *args, **kwargs: {"ok": False, "summary": "", "error": "no transcript"},
+    )
+    hub = make_hub()
+    service = make_service(FakeModem(), hub=hub, call_logger=CallLogger(tmp_path / "rec"))
+    record = service.session._begin_record("outbound", "10086")
+    assert record is not None
+    record.finish("completed")
+    hub.publish({"type": "sms_in", "sender": "10086", "text": "余额41.40元。"})
+
+    service.session._maybe_summarize(
+        record,
+        [],
+        "outbound",
+        "10086",
+        "carrier_sms",
+        "10086",
+    )
+    assert service.session._summary_thread is not None
+    service.session._summary_thread.join(timeout=1.0)
+
+    summary = json.loads((record.path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["result_verification"] == "verified"
+    assert summary["summary"] == "已由官方运营商短信核实：余额41.40元。"
+
+
+def test_carrier_sms_mode_does_not_attach_service_sms_to_ordinary_call(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SMS_VERIFICATION_WAIT_SECONDS", "0")
+    monkeypatch.setattr(
+        "agentcall.call_agent.summarize_call",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "summary": "普通通话听写。",
+            "error": None,
+        },
+    )
+    hub = make_hub()
+    service = make_service(FakeModem(), hub=hub, call_logger=CallLogger(tmp_path / "rec"))
+    record = service.session._begin_record("outbound", "13900000000")
+    assert record is not None
+    record.finish("completed")
+    hub.publish({"type": "sms_in", "sender": "10086", "text": "余额41.40元。"})
+
+    service.session._summarize_worker(
+        record,
+        [("user", "普通通话")],
+        "outbound",
+        "13900000000",
+        "carrier_sms",
+        "10086",
+    )
+
+    summary = json.loads((record.path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["result_verification"] == "unverified"
+    assert summary["evidence"] == []
+
+
+def test_prompt_profile_applies_carrier_sms_verification_mode():
+    session = make_service(FakeModem()).session
+    session._prompt_gen_result = {
+        "ok": True,
+        "scenario": "查费后以官方短信为准",
+        "result_verification": "carrier_sms",
+    }
+
+    assert session._apply_prompt_gen_result() == "查费后以官方短信为准"
+    assert session._result_verification_mode == "carrier_sms"
+
+
 # ---- P2-1 批量外呼：入队顺序拨打 + 白名单 + 状态查询 ----
 
 def test_batch_dial_dials_in_order(tmp_path, monkeypatch):
