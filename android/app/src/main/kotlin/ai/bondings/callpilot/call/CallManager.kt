@@ -57,6 +57,12 @@ class CallManager(
                 .also { it.credential = pairing.credential }
                 .createSession(edgeId, idempotencyKey)
         },
+    private val takeoverClaimProvider: suspend (StoredPairing, String) -> HostedCallSession =
+        { pairing, offerId ->
+            HostedCloudClient(pairing.gatewayUrl)
+                .also { it.credential = pairing.credential }
+                .claimInboundOffer(offerId)
+        },
     private val idempotencyKeyProvider: () -> String = { "android-${UUID.randomUUID()}" },
     private val onForeground: (active: Boolean) -> Unit = {},
     scope: CoroutineScope? = null,
@@ -99,7 +105,7 @@ class CallManager(
                 }
                 val s = sessionFactory()
                 session = s
-                eventJob = scope.launch { s.events.collect { handleEvent(number, it) } }
+                eventJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { s.events.collect { handleEvent(number, it) } }
                 onForeground(true)
                 // Edge 在确认本端音频轨就绪（media_ready 事件）前会拒绝 dial，
                 // 所以 dial 挂起到 handleEvent 收到 media_ready 再发。
@@ -122,6 +128,48 @@ class CallManager(
                 setupJob = null
                 cleanup()
                 _state.value = CallState.Failed(number, e.message ?: "拨号失败")
+            }
+        }
+    }
+
+    /**
+     * #95 inbound takeover：claim 一个来电 offer 并入房接管（hosted-only）。
+     * 与 startCall 的差异：不发 dial（物理通话已在 Edge 侧进行），入房即等
+     * Edge commit 切流后经既有 status 事件推进到 InCall。
+     */
+    fun answerTakeover(pairing: StoredPairing, offerId: String) {
+        if (isActive) return
+        if (pairing.protocol != PairingProtocol.HOSTED) return
+        val label = "来电接管"
+        synchronized(commandLock) {
+            hangupRequested = false
+            pendingDial = null
+        }
+        _state.value = CallState.Preparing(label)
+        setupJob = scope.launch {
+            try {
+                val claimed = withContext(ioDispatcher) { takeoverClaimProvider(pairing, offerId) }
+                val s = sessionFactory()
+                session = s
+                eventJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { s.events.collect { handleEvent(label, it) } }
+                onForeground(true)
+                currentCoroutineContext().ensureActive()
+                // WaitingMedia 必须在 connect 之前置位：Edge 的 connected 状态事件
+                // 可能在 connect()/麦克风发布期间就到达（接管的物理通话已在进行），
+                // 若 connect 后再覆写状态会把 handleEvent 已置的 InCall 打回等待态。
+                _state.value = CallState.WaitingMedia(label)
+                s.connect(claimed.livekitUrl, claimed.token)
+                setupJob = null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: HostedCloudException) {
+                setupJob = null
+                cleanup()
+                _state.value = CallState.Failed(label, e.message, e.errorCode)
+            } catch (e: Exception) {
+                setupJob = null
+                cleanup()
+                _state.value = CallState.Failed(label, e.message ?: "接管失败")
             }
         }
     }

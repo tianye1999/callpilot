@@ -4,24 +4,41 @@ import ai.bondings.callpilot.call.CallGraph
 import ai.bondings.callpilot.call.CallState
 import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
+import ai.bondings.callpilot.protocol.HostedCloudClient
+import ai.bondings.callpilot.protocol.InboundOffer
+import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.ui.CallPilotTheme
 import ai.bondings.callpilot.ui.CallScreen
 import ai.bondings.callpilot.ui.DialScreen
+import ai.bondings.callpilot.ui.IncomingOfferScreen
 import ai.bondings.callpilot.ui.PairScreen
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
-/** 导航：未配对 → 配对页；已配对空闲 → 拨号页；通话生命周期内 → 通话页。 */
+private const val OFFER_POLL_INTERVAL_MS = 3_000L
+
+/** 导航：未配对 → 配对页；已配对空闲 → 拨号页（含来电接管卡）；通话生命周期内 → 通话页。 */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,9 +52,71 @@ class MainActivity : ComponentActivity() {
                 ) {
                     var pairing by remember { mutableStateOf<StoredPairing?>(store.load()) }
                     val callState by manager.state.collectAsState()
+                    var incomingOffer by remember { mutableStateOf<InboundOffer?>(null) }
+                    val dismissedOffers = remember { mutableSetOf<String>() }
                     val current = pairing
+
+                    // #95：hosted 配对且前台空闲时轮询可接管的来电 offer（MVP=前台在线）。
+                    if (current != null && current.protocol == PairingProtocol.HOSTED) {
+                        // 复用单个 client：每轮 new HostedCloudClient 会泄漏 OkHttp 连接池。
+                        val offerClient = remember(current) {
+                            HostedCloudClient(current.gatewayUrl).also {
+                                it.credential = current.credential
+                            }
+                        }
+                        LaunchedEffect(current) {
+                            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                                while (true) {
+                                    if (manager.state.value is CallState.Idle) {
+                                        val offer = runCatching {
+                                            withContext(Dispatchers.IO) {
+                                                offerClient.listInboundOffers()
+                                            }
+                                        }.getOrDefault(emptyList()).firstOrNull {
+                                            it.offerId !in dismissedOffers &&
+                                                it.expiresAt > System.currentTimeMillis()
+                                        }
+                                        incomingOffer = offer
+                                    } else {
+                                        incomingOffer = null
+                                    }
+                                    delay(OFFER_POLL_INTERVAL_MS)
+                                }
+                            }
+                        }
+                    }
+
+                    val activeOffer = incomingOffer
+                    val micPermission = rememberLauncherForActivityResult(
+                        ActivityResultContracts.RequestPermission(),
+                    ) { granted ->
+                        val offer = incomingOffer
+                        val paired = pairing
+                        if (granted && offer != null && paired != null) {
+                            incomingOffer = null
+                            manager.answerTakeover(paired, offer.offerId)
+                        }
+                    }
+
                     when {
                         current == null -> PairScreen(store = store, onPaired = { pairing = it })
+                        callState is CallState.Idle && activeOffer != null -> IncomingOfferScreen(
+                            onAccept = {
+                                val granted = ContextCompat.checkSelfPermission(
+                                    this@MainActivity, Manifest.permission.RECORD_AUDIO,
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (granted) {
+                                    incomingOffer = null
+                                    manager.answerTakeover(current, activeOffer.offerId)
+                                } else {
+                                    micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                                }
+                            },
+                            onDecline = {
+                                dismissedOffers += activeOffer.offerId
+                                incomingOffer = null
+                            },
+                        )
                         callState is CallState.Idle -> DialScreen(
                             pairing = current,
                             store = store,

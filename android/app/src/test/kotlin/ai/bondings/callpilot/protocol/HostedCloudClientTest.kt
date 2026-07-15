@@ -371,4 +371,49 @@ class HostedCloudClientTest {
         assertTrue(postBodies[1].contains("android-stable-key1"))
         assertEquals("jwt-token", result.token)
     }
+    @Test
+    fun `listInboundOffers 只解析 opaque offer 字段`() {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody("""{"offers":[{"offerId":"offer_abcdefghijkl","expiresAt":9999999999999}]}"""),
+        )
+
+        val offers = client.listInboundOffers()
+
+        assertEquals(1, offers.size)
+        assertEquals("offer_abcdefghijkl", offers[0].offerId)
+        assertEquals("/v1/inbound-offers", server.takeRequest().path)
+    }
+
+    @Test
+    fun `claimInboundOffer 成功返回入房凭证`() {
+        server.enqueue(
+            MockResponse().setResponseCode(202)
+                .setBody(
+                    """{"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl","roomName":"callpilot_x","url":"wss://cloud.livekit.example","token":"a.b.c","expiresAt":9999999999999}"""
+                ),
+        )
+
+        val session = client.claimInboundOffer("offer_abcdefghijkl")
+
+        assertEquals("claim_abcdefghijkl", session.sessionId)
+        assertEquals("wss://cloud.livekit.example", session.livekitUrl)
+        assertEquals("a.b.c", session.token)
+        val request = server.takeRequest()
+        assertEquals("/v1/inbound-offers/claim", request.path)
+        assertTrue(request.body.readUtf8().contains("\"offerId\":\"offer_abcdefghijkl\""))
+    }
+
+    @Test
+    fun `claimInboundOffer 输家收到 409 抛结构化错误`() {
+        server.enqueue(
+            MockResponse().setResponseCode(409)
+                .setBody("""{"error":{"code":"OFFER_UNAVAILABLE","message":"already claimed"}}"""),
+        )
+
+        val error = assertThrows(HostedCloudException::class.java) {
+            client.claimInboundOffer("offer_abcdefghijkl")
+        }
+        assertEquals("OFFER_UNAVAILABLE", error.errorCode)
+    }
 }

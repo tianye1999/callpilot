@@ -347,6 +347,62 @@ def test_scheduled_hangup_stops_current_session(monkeypatch):
     assert wait_until(lambda: not session.is_active), "延迟挂断未停掉本通会话"
 
 
+def test_detach_agent_invalidates_late_effects_without_hanging_up(monkeypatch):
+    modem = FakeModem()
+    service = make_service(modem)
+    session = service.session
+    agent = FakeAgent()
+    bridge = FakeAudioBridge()
+    transcripts: list[tuple[str, str]] = []
+
+    class RecordSpy:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict]] = []
+            self.downlink: list[bytes] = []
+
+        def log_event(self, event_type: str, **fields) -> None:
+            self.events.append((event_type, fields))
+
+        def write_downlink(self, pcm: bytes) -> None:
+            self.downlink.append(pcm)
+
+    record = RecordSpy()
+    session._active = True
+    session._session_generation = 4
+    session._hangup_delay_seconds = 0.01
+    session.current_caller = "13800000000"
+    audio_handler = session._make_agent_audio_handler(
+        agent,
+        bridge,
+        record,  # type: ignore[arg-type]
+    )
+    transcript_handler = session._make_transcript_handler(
+        record,  # type: ignore[arg-type]
+        transcripts,
+        agent,
+    )
+    tools = session._build_tools()
+
+    asyncio.run(session.detach_agent(agent, bridge))
+
+    audio_handler(b"\x01\x00" * 160)
+    transcript_handler("agent", "迟到转写")
+    hangup = tools.dispatch("hangup_call", {})
+    dtmf = tools.dispatch("send_dtmf", {"digits": "1"})
+    time.sleep(0.03)
+
+    assert agent.stopped
+    assert bridge.stopped
+    assert session.is_active
+    assert hangup["code"] == "STALE_AGENT_GENERATION"
+    assert dtmf["code"] == "STALE_AGENT_GENERATION"
+    assert session._outgoing_audio.empty()
+    assert transcripts == []
+    assert record.events == []
+    assert record.downlink == []
+    assert modem.calls == []
+
+
 def test_repeat_suppression_stuck_requests_winddown(monkeypatch, tmp_path):
     """连续复读抑制判卡死后，CallSession 走既有收尾路径说告别并挂断。"""
 

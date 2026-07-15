@@ -15,6 +15,12 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .cloud_credentials import CloudCredentialStore, EdgeCredential
+from .remote_dialer import IssuedLiveKitSession, RemoteDialerInvite
+from .takeover_coordinator import (
+    InboundTakeoverOfferRequest,
+    InboundTakeoverRevoke,
+    TakeoverResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +35,25 @@ class CloudSessionService(Protocol):
     def remote_dialer_status(self) -> dict[str, Any]: ...
 
     def start_cloud_remote_session(self, command: dict[str, Any]) -> tuple[bool, str | None]: ...
+
+    def next_inbound_takeover_offer(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverOfferRequest | None: ...
+
+    def next_inbound_takeover_revoke(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverRevoke | None: ...
+
+    def accept_inbound_takeover_claim(
+        self,
+        *,
+        offer_id: str,
+        call_id: str,
+        claim_id: str,
+        generation: int,
+        nonce: str,
+        issued: IssuedLiveKitSession,
+    ) -> TakeoverResult: ...
 
 
 @dataclass(frozen=True)
@@ -187,16 +212,43 @@ class CloudEdgeClient:
             )
 
     def handle_message(self, raw: str, send: Callable[[str], None]) -> None:
-        command_id = None
-        call_id = None
         try:
-            command = _parse_session_command(raw)
-            command_id = command["commandId"]
-            call_id = command["callId"]
-            accepted, error = self.service.start_cloud_remote_session(command)
+            command = _parse_cloud_command(raw)
         except ValueError:
             logger.warning("忽略格式不合法的云端控制消息")
             return
+
+        command_id = command["commandId"]
+        call_id = command["callId"]
+        offer_id: str | None = None
+        if command["type"] == "session.start":
+            accepted, error = self.service.start_cloud_remote_session(command)
+        else:
+            offer_id = command["offerId"]
+            session = command["session"]
+            issued = IssuedLiveKitSession(
+                invite=RemoteDialerInvite(
+                    session_id=session["sessionId"],
+                    url="",
+                    expires_at=time.time() + 600.0,
+                ),
+                room_name=session["roomName"],
+                browser_identity=session["browserIdentity"],
+                edge_identity=session["edgeIdentity"],
+                browser_token="",
+                edge_token=session["token"],
+                livekit_url=session["livekitUrl"],
+            )
+            result = self.service.accept_inbound_takeover_claim(
+                offer_id=offer_id,
+                call_id=call_id,
+                claim_id=command["claimId"],
+                generation=command["generation"],
+                nonce=command["nonce"],
+                issued=issued,
+            )
+            accepted = result.accepted
+            error = result.code.value if result.code is not None else None
         response: dict[str, Any] = {
             "v": 1,
             "type": "command.ack",
@@ -204,9 +256,41 @@ class CloudEdgeClient:
             "callId": call_id,
             "status": "accepted" if accepted else "rejected",
         }
+        if offer_id is not None:
+            response["offerId"] = offer_id
         if error:
             response["errorCode"] = error
         send(json.dumps(response, separators=(",", ":")))
+
+    def _drain_takeover_events(self, send: Callable[[str], None]) -> None:
+        while request := self.service.next_inbound_takeover_offer():
+            send(
+                json.dumps(
+                    {
+                        "v": 1,
+                        "type": "inbound.offer",
+                        "offerId": request.offer_id,
+                        "callId": request.call_id,
+                        "generation": request.generation,
+                        "nonce": request.nonce,
+                        "expiresAtUnixMs": round(request.expires_at * 1000),
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        while revoke := self.service.next_inbound_takeover_revoke():
+            send(
+                json.dumps(
+                    {
+                        "v": 1,
+                        "type": "inbound.offer.revoke",
+                        "offerId": revoke.offer_id,
+                        "callId": revoke.call_id,
+                        "reason": revoke.reason,
+                    },
+                    separators=(",", ":"),
+                )
+            )
 
     def _run(self) -> None:
         delay = 1.0
@@ -250,6 +334,7 @@ class CloudEdgeClient:
                 if now >= next_heartbeat:
                     websocket.send(self._heartbeat())
                     next_heartbeat = now + self._heartbeat_seconds
+                self._drain_takeover_events(websocket.send)
                 try:
                     message = websocket.recv(timeout=1.0)
                 except TimeoutError:
@@ -290,14 +375,32 @@ class CloudEdgeClient:
             self._last_error = value
 
 
-def _parse_session_command(raw: str) -> dict[str, Any]:
+def _parse_cloud_command(raw: str) -> dict[str, Any]:
     if not isinstance(raw, str) or not raw or len(raw.encode("utf-8")) > _MAX_JSON_BYTES:
         raise ValueError("invalid command")
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError("invalid command") from exc
-    if not isinstance(value, dict) or set(value) != {
+    if not isinstance(value, dict):
+        raise ValueError("invalid command")
+    command_type = value.get("type")
+    if command_type == "session.start":
+        return _validate_session_command(value)
+    if command_type == "inbound.claim":
+        return _validate_inbound_claim(value)
+    raise ValueError("invalid command")
+
+
+def _parse_session_command(raw: str) -> dict[str, Any]:
+    value = _parse_cloud_command(raw)
+    if value["type"] != "session.start":
+        raise ValueError("invalid command")
+    return value
+
+
+def _validate_session_command(value: dict[str, Any]) -> dict[str, Any]:
+    if set(value) != {
         "v", "type", "commandId", "callId", "expiresAt", "session"
     }:
         raise ValueError("invalid command")
@@ -310,7 +413,45 @@ def _parse_session_command(raw: str) -> dict[str, Any]:
     expires_at = _parse_timestamp(value.get("expiresAt"))
     if expires_at <= time.time() or expires_at > time.time() + 600:
         raise ValueError("invalid command")
-    session = value.get("session")
+    _validate_issued_session(value.get("session"))
+    value["expiresAtUnix"] = expires_at
+    return value
+
+
+def _validate_inbound_claim(value: dict[str, Any]) -> dict[str, Any]:
+    if set(value) != {
+        "v",
+        "type",
+        "commandId",
+        "offerId",
+        "callId",
+        "claimId",
+        "generation",
+        "nonce",
+        "session",
+    }:
+        raise ValueError("invalid command")
+    if value.get("v") != 1 or value.get("type") != "inbound.claim":
+        raise ValueError("invalid command")
+    identifiers = {
+        "commandId": "command",
+        "offerId": "offer",
+        "callId": "call",
+        "claimId": "claim",
+    }
+    if any(not _valid_id(value.get(key), prefix) for key, prefix in identifiers.items()):
+        raise ValueError("invalid command")
+    generation = value.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise ValueError("invalid command")
+    nonce = value.get("nonce")
+    if not isinstance(nonce, str) or not 16 <= len(nonce) <= 128:
+        raise ValueError("invalid command")
+    _validate_issued_session(value.get("session"))
+    return value
+
+
+def _validate_issued_session(session: Any) -> None:
     required = {
         "sessionId", "roomName", "browserIdentity", "edgeIdentity", "livekitUrl", "token"
     }
@@ -325,13 +466,18 @@ def _parse_session_command(raw: str) -> dict[str, Any]:
     if not _valid_id(session.get("edgeIdentity"), "edgepart"):
         raise ValueError("invalid command")
     livekit_url = session.get("livekitUrl")
-    if not isinstance(livekit_url, str) or urllib.parse.urlparse(livekit_url).scheme != "wss":
+    parsed_url = urllib.parse.urlparse(livekit_url) if isinstance(livekit_url, str) else None
+    if (
+        parsed_url is None
+        or parsed_url.scheme != "wss"
+        or not parsed_url.netloc
+        or parsed_url.username
+        or parsed_url.password
+    ):
         raise ValueError("invalid command")
     token = session.get("token")
     if not isinstance(token, str) or len(token) < 40 or len(token) > 8192:
         raise ValueError("invalid command")
-    value["expiresAtUnix"] = expires_at
-    return value
 
 
 def _validate_cloud_url(value: str) -> str:

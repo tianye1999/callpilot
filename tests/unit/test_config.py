@@ -655,6 +655,22 @@ def test_remote_web_dialer_defaults_off_and_masks_livekit_secrets(monkeypatch):
     assert rows["LIVEKIT_API_SECRET"]["value"] == "未设置"
 
 
+def test_inbound_takeover_defaults_off_and_example_stays_free_text(monkeypatch):
+    _unset(
+        monkeypatch,
+        "INBOUND_TAKEOVER_ENABLED",
+        "INBOUND_TAKEOVER_PREFERENCE",
+    )
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert get_bool("INBOUND_TAKEOVER_ENABLED") is False
+    assert get_str("INBOUND_TAKEOVER_PREFERENCE") == ""
+    assert "INBOUND_TAKEOVER_ENABLED=false" in example
+    assert "INBOUND_TAKEOVER_PREFERENCE=" in example
+
+
 def test_enabling_remote_web_dialer_requires_complete_secure_config(
     tmp_path, monkeypatch
 ):

@@ -27,7 +27,7 @@ import org.junit.Test
 
 class CallManagerTest {
 
-    private class FakeSession : RemoteSession {
+    private open class FakeSession : RemoteSession {
         val commands = mutableListOf<String>()
         var connected = false
         var disconnected = false
@@ -94,11 +94,15 @@ class CallManagerTest {
                 error("hosted provider should not be called")
             },
             idempotencyKeyProvider: () -> String = { "android-test-idempotency" },
+            takeoverClaimProvider: suspend (StoredPairing, String) -> HostedCallSession = { _, _ ->
+                error("takeover provider should not be called")
+            },
             inviteProvider: suspend (StoredPairing) -> Invite,
         ): CallManager = CallManager(
             sessionFactory = { session },
             inviteProvider = inviteProvider,
             hostedSessionProvider = hostedSessionProvider,
+            takeoverClaimProvider = takeoverClaimProvider,
             idempotencyKeyProvider = idempotencyKeyProvider,
             onForeground = { foreground += it },
             scope = scope,
@@ -410,6 +414,85 @@ class CallManagerTest {
             CallState.Failed("10000", "Line is busy", code = "LINE_BUSY"),
             manager.state.value,
         )
+        h.close()
+    }
+    // ---- #95 inbound takeover ----
+
+    private fun takeoverSession() = HostedCallSession(
+        sessionId = "claim_abcdefghijkl",
+        livekitUrl = "wss://lk.example.com",
+        token = "tok",
+        expiresAt = 9_999_999_999_999,
+    )
+
+    @Test
+    fun `answerTakeover happy path 不发 dial 且 connected 推进 InCall`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(
+            session,
+            takeoverClaimProvider = { _, offerId ->
+                assertEquals("offer_abcdefghijkl", offerId)
+                takeoverSession()
+            },
+        ) { error("invite path should not run") }
+        val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
+
+        manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
+        advanceUntilIdle()
+
+        assertTrue(session.connected)
+        assertTrue(manager.state.value is CallState.WaitingMedia)
+        assertTrue(session.commands.none { it.contains("\"dial\"") })
+
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("connected", null)))
+        advanceUntilIdle()
+        assertTrue(manager.state.value is CallState.InCall)
+        h.close()
+    }
+
+    @Test
+    fun `answerTakeover connect 期间 connected 到达不被覆盖回等待态`() = runTest {
+        val h = Harness(this)
+        val session = object : FakeSession() {
+            override suspend fun connect(livekitUrl: String, token: String) {
+                // 接管场景物理通话已在进行：connected 可能在 connect 内就绪。
+                emit(SessionEvent.Edge(Signaling.Event.Status("connected", null)))
+                super.connect(livekitUrl, token)
+            }
+        }
+        val manager = h.manager(
+            session,
+            takeoverClaimProvider = { _, _ -> takeoverSession() },
+        ) { error("invite path should not run") }
+        val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
+
+        manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
+        advanceUntilIdle()
+
+        assertTrue(manager.state.value is CallState.InCall)
+        h.close()
+    }
+
+    @Test
+    fun `answerTakeover claim 失败落结构化错误`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(
+            session,
+            takeoverClaimProvider = { _, _ ->
+                throw HostedCloudException(409, "OFFER_UNAVAILABLE", "already claimed")
+            },
+        ) { error("invite path should not run") }
+        val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
+
+        manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
+        advanceUntilIdle()
+
+        val state = manager.state.value
+        assertTrue(state is CallState.Failed)
+        assertEquals("OFFER_UNAVAILABLE", (state as CallState.Failed).code)
+        assertFalse(session.connected)
         h.close()
     }
 }

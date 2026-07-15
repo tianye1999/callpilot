@@ -9,8 +9,10 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -32,6 +34,8 @@ class HostedCloudClient(
         private val DEVICE_ID = Regex("^device_[A-Za-z0-9_-]{12,80}$")
         private val EDGE_ID = Regex("^edge_[A-Za-z0-9_-]{12,80}$")
         private val CALL_ID = Regex("^call_[A-Za-z0-9_-]{12,80}$")
+        private val OFFER_ID = Regex("^offer_[A-Za-z0-9_-]{12,80}$")
+        private val CLAIM_ID = Regex("^claim_[A-Za-z0-9_-]{12,80}$")
         private val IDEMPOTENCY_KEY = Regex("^[A-Za-z0-9._:-]{16,128}$")
     }
 
@@ -131,6 +135,49 @@ class HostedCloudClient(
             sleepMs(minOf(interval, remaining))
         }
         throw HostedCloudException(408, "SESSION_TIMEOUT", "等待云端通话会话超时")
+    }
+
+    /** #95 inbound takeover：轮询本 Edge 当前可接管的来电 offer（仅 opaque id）。 */
+    fun listInboundOffers(): List<InboundOffer> {
+        return request("GET", "v1/inbound-offers", null).use { response ->
+            val payload = parseOrThrow(response)
+            val items = payload["offers"]?.jsonArray ?: return emptyList()
+            items.mapNotNull { element ->
+                val obj = element.jsonObject
+                val offerId = obj["offerId"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                val expiresAt = obj["expiresAt"]?.jsonPrimitive?.longOrNull ?: return@mapNotNull null
+                if (!OFFER_ID.matches(offerId)) return@mapNotNull null
+                InboundOffer(offerId = offerId, expiresAt = expiresAt)
+            }
+        }
+    }
+
+    /** #95：claim 一个 offer，成功即拿到入房凭证（first-claim-wins，输家收 409）。 */
+    fun claimInboundOffer(offerId: String): HostedCallSession {
+        require(OFFER_ID.matches(offerId)) { "offer id 格式不合法" }
+        val body = buildJsonObject { put("offerId", offerId) }.toString()
+        return request("POST", "v1/inbound-offers/claim", body).use { response ->
+            val payload = parseOrThrow(response)
+            val claimId = payload["claimId"]?.jsonPrimitive?.contentOrNull
+            val echoedOfferId = payload["offerId"]?.jsonPrimitive?.contentOrNull
+            val url = payload["url"]?.jsonPrimitive?.contentOrNull
+            val token = payload["token"]?.jsonPrimitive?.contentOrNull
+            val expiresAt = payload["expiresAt"]?.jsonPrimitive?.longOrNull
+            if (claimId == null || url == null || token == null || expiresAt == null) {
+                throw HostedCloudException(response.code, "INVALID_RESPONSE", "接管响应字段不完整")
+            }
+            if (!CLAIM_ID.matches(claimId) || echoedOfferId != offerId) {
+                throw HostedCloudException(response.code, "INVALID_RESPONSE", "接管响应标识不匹配")
+            }
+            val session = HostedSessionPayload(livekitUrl = url, token = token, expiresAt = expiresAt)
+            validateSession(session)
+            HostedCallSession(
+                sessionId = claimId,
+                livekitUrl = session.livekitUrl,
+                token = session.token,
+                expiresAt = session.expiresAt,
+            )
+        }
     }
 
     fun unpair() {
@@ -296,6 +343,12 @@ data class HostedCallSession(
     override fun toString(): String =
         "HostedCallSession(sessionId=$sessionId, livekitUrl=$livekitUrl, token=***, expiresAt=$expiresAt)"
 }
+
+/** #95：一条可接管的来电 offer；云端只暴露 opaque id 与过期时间。 */
+data class InboundOffer(
+    val offerId: String,
+    val expiresAt: Long,
+)
 
 @Serializable
 private data class HostedCallResponse(

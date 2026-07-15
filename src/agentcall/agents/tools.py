@@ -95,6 +95,20 @@ QUERY_CODE_SPEC: dict[str, Any] = {
 }
 
 
+REQUEST_OWNER_TAKEOVER_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "request_owner_takeover",
+        "description": (
+            "请求把当前来电转给机主手机真人接听。仅当来电者明确要求找机主本人，"
+            "或对话符合系统提示中的机主接管偏好时调用一次；不要用参数复述偏好、"
+            "来电内容或模型推理。系统会负责垫话、等待和媒体切换。"
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+
 # 终结性工具：调用后会话即将结束，不应再让模型生成后续回复。
 # hangup_call 已要求「先说完告别再调用」，此时告别语已播出；若回传结果后再
 # 触发 response.create，模型会在挂断延迟里多说一句（如“电话已经挂断…”），
@@ -102,7 +116,9 @@ QUERY_CODE_SPEC: dict[str, Any] = {
 TERMINAL_TOOLS: frozenset[str] = frozenset({"hangup_call"})
 # 这类工具执行后会话仍继续，但应等待对端下一段音频，而不是立即让模型说话。
 # DTMF 后立刻口播会覆盖 IVR 的确认/下一层菜单，并触发半双工上行屏蔽。
-SILENT_AFTER_TOOLS: frozenset[str] = frozenset({"send_dtmf"})
+SILENT_AFTER_TOOLS: frozenset[str] = frozenset(
+    {"send_dtmf", "request_owner_takeover"}
+)
 _DTMF_LOG_MODES: frozenset[str] = frozenset(
     {"inband", "qvts", "both", "unknown"}
 )

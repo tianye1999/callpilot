@@ -42,6 +42,9 @@ export const edgeMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("command.ack"),
     commandId: opaqueId,
     callId: opaqueId,
+    // Present when acknowledging an inbound takeover claim command; routes the
+    // ack to inbound_offers instead of the outbound calls table.
+    offerId: opaqueId.optional(),
     status: z.enum(["accepted", "rejected"]),
     errorCode: z.string().regex(/^[A-Z][A-Z0-9_]{2,63}$/).optional()
   }).strict(),
@@ -50,6 +53,29 @@ export const edgeMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("call.status"),
     callId: opaqueId,
     status: z.enum(["media_ready", "dialing", "connected", "ended", "failed"])
+  }).strict(),
+  // Inbound takeover (#95): Edge offers an in-progress inbound call to paired
+  // devices. Deliberately carries no caller number, transcript or preference
+  // text — cloud only ever sees opaque ids and lifecycle state.
+  z.object({
+    v: z.literal(1),
+    type: z.literal("inbound.offer"),
+    offerId: opaqueId,
+    callId: opaqueId,
+    generation: z.number().int().min(0),
+    nonce: z.string().min(16).max(128),
+    expiresAtUnixMs: z.number().int().positive()
+  }).strict(),
+  z.object({
+    v: z.literal(1),
+    type: z.literal("inbound.offer.revoke"),
+    offerId: opaqueId,
+    callId: opaqueId,
+    reason: z.string().regex(/^[A-Z][A-Z0-9_]{2,63}$/)
   }).strict()
 ]);
+
+export const claimInboundOfferSchema = z.object({
+  offerId: opaqueId
+}).strict();
 

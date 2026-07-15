@@ -180,6 +180,20 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                "OpenAI Realtime", editable=False, hidden=True,
                requires_restart=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
+    ConfigSpec(
+        "INBOUND_TAKEOVER_ENABLED",
+        "来电转手机真人接管",
+        "bool",
+        "false",
+        requires_restart=True,
+    ),
+    ConfigSpec(
+        "INBOUND_TAKEOVER_PREFERENCE",
+        "来电真人接管偏好",
+        "str",
+        "",
+        requires_restart=True,
+    ),
     # 默认留空：让 prompts.agent_persona() 按 AGENT_LANGUAGE 回退到
     # 「AI 助理」/「AI assistant」，英文模式下不会硬塞中文人设。
     ConfigSpec("AGENT_PERSONA", "AI 人设称谓", "str", ""),

@@ -15,6 +15,12 @@ from agentcall.cloud_credentials import (
     EdgeCredential,
     parse_edge_credential,
 )
+from agentcall.takeover_coordinator import (
+    InboundTakeoverOfferRequest,
+    InboundTakeoverRevoke,
+    TakeoverRejection,
+    TakeoverResult,
+)
 
 
 class _Service:
@@ -22,6 +28,9 @@ class _Service:
 
     def __init__(self) -> None:
         self.commands: list[dict] = []
+        self.claims: list[dict] = []
+        self.offers: list[InboundTakeoverOfferRequest] = []
+        self.revokes: list[InboundTakeoverRevoke] = []
 
     def remote_dialer_status(self) -> dict:
         return {"active": False}
@@ -29,6 +38,20 @@ class _Service:
     def start_cloud_remote_session(self, command: dict) -> tuple[bool, str | None]:
         self.commands.append(command)
         return True, None
+
+    def next_inbound_takeover_offer(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverOfferRequest | None:
+        return self.offers.pop(0) if self.offers else None
+
+    def next_inbound_takeover_revoke(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverRevoke | None:
+        return self.revokes.pop(0) if self.revokes else None
+
+    def accept_inbound_takeover_claim(self, **fields) -> TakeoverResult:
+        self.claims.append(fields)
+        return TakeoverResult.success()
 
 
 class _Store:
@@ -57,6 +80,29 @@ def _command(**overrides) -> dict:
             "roomName": "callpilot_abcdefghijkl",
             "browserIdentity": "web_abcdefghijkl",
             "edgeIdentity": "edgepart_abcdefghijkl",
+            "livekitUrl": "wss://project.livekit.cloud",
+            "token": "x" * 80,
+        },
+    }
+    value.update(overrides)
+    return value
+
+
+def _takeover_claim(**overrides) -> dict:
+    value = {
+        "v": 1,
+        "type": "inbound.claim",
+        "commandId": "command_takeover_abcdefghijkl",
+        "offerId": "offer_takeover_abcdefghijkl",
+        "callId": "call_takeover_abcdefghijkl",
+        "claimId": "claim_takeover_abcdefghijkl",
+        "generation": 7,
+        "nonce": "takeover-nonce-abcdefghijkl",
+        "session": {
+            "sessionId": "session_takeover_abcdefghijkl",
+            "roomName": "callpilot_takeover_abcdefghijkl",
+            "browserIdentity": "web_takeover_abcdefghijkl",
+            "edgeIdentity": "edgepart_takeover_abcdefghijkl",
             "livekitUrl": "wss://project.livekit.cloud",
             "token": "x" * 80,
         },
@@ -151,6 +197,124 @@ def test_cloud_ack_preserves_stable_edge_preflight_error_code() -> None:
 
     assert sent[0]["status"] == "rejected"
     assert sent[0]["errorCode"] == "SIM_NOT_REGISTERED"
+
+
+def test_edge_sends_opaque_takeover_offer_then_revoke_with_frozen_schema() -> None:
+    service = _Service()
+    service.offers.append(
+        InboundTakeoverOfferRequest(
+            offer_id="offer_takeover_abcdefghijkl",
+            call_id="call_takeover_abcdefghijkl",
+            generation=7,
+            nonce="takeover-nonce-abcdefghijkl",
+            created_at=100.0,
+            expires_at=130.0,
+        )
+    )
+    service.revokes.append(
+        InboundTakeoverRevoke(
+            offer_id="offer_takeover_abcdefghijkl",
+            call_id="call_takeover_abcdefghijkl",
+            reason="CALL_ENDED",
+        )
+    )
+    client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
+    sent: list[dict] = []
+
+    client._drain_takeover_events(lambda raw: sent.append(json.loads(raw)))
+
+    assert sent == [
+        {
+            "v": 1,
+            "type": "inbound.offer",
+            "offerId": "offer_takeover_abcdefghijkl",
+            "callId": "call_takeover_abcdefghijkl",
+            "generation": 7,
+            "nonce": "takeover-nonce-abcdefghijkl",
+            "expiresAtUnixMs": 130000,
+        },
+        {
+            "v": 1,
+            "type": "inbound.offer.revoke",
+            "offerId": "offer_takeover_abcdefghijkl",
+            "callId": "call_takeover_abcdefghijkl",
+            "reason": "CALL_ENDED",
+        },
+    ]
+    assert "preference" not in repr(sent).lower()
+    assert "number" not in repr(sent).lower()
+
+
+def test_cloud_client_accepts_strict_inbound_claim_and_acks_offer() -> None:
+    service = _Service()
+    client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
+    sent: list[dict] = []
+
+    client.handle_message(
+        json.dumps(_takeover_claim()),
+        lambda value: sent.append(json.loads(value)),
+    )
+
+    assert len(service.claims) == 1
+    claim = service.claims[0]
+    assert claim["offer_id"] == "offer_takeover_abcdefghijkl"
+    assert claim["generation"] == 7
+    assert claim["nonce"] == "takeover-nonce-abcdefghijkl"
+    assert claim["issued"].browser_identity == "web_takeover_abcdefghijkl"
+    assert claim["issued"].browser_token == ""
+    assert sent == [
+        {
+            "v": 1,
+            "type": "command.ack",
+            "commandId": "command_takeover_abcdefghijkl",
+            "callId": "call_takeover_abcdefghijkl",
+            "offerId": "offer_takeover_abcdefghijkl",
+            "status": "accepted",
+        }
+    ]
+
+
+def test_inbound_claim_rejection_preserves_stable_fence_code() -> None:
+    class _RejectingService(_Service):
+        def accept_inbound_takeover_claim(self, **fields) -> TakeoverResult:
+            self.claims.append(fields)
+            return TakeoverResult.reject(TakeoverRejection.STALE_GENERATION)
+
+    service = _RejectingService()
+    client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
+    sent: list[dict] = []
+
+    client.handle_message(
+        json.dumps(_takeover_claim()),
+        lambda value: sent.append(json.loads(value)),
+    )
+
+    assert sent[0]["status"] == "rejected"
+    assert sent[0]["offerId"] == "offer_takeover_abcdefghijkl"
+    assert sent[0]["errorCode"] == "STALE_GENERATION"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"nonce": "short"},
+        {"generation": -1},
+        {"generation": True},
+        {"offerId": "call_wrong_prefix_abcdefghijkl"},
+        {"extra": "field"},
+    ],
+)
+def test_inbound_claim_parser_rejects_malformed_or_mutated_contract(mutation) -> None:
+    service = _Service()
+    client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
+    sent: list[str] = []
+    command = _takeover_claim()
+    command.update(mutation)
+
+    client.handle_message(json.dumps(command), sent.append)
+
+    assert service.claims == []
+    assert sent == []
 
 
 def test_heartbeat_tracks_live_modem_connection_state() -> None:

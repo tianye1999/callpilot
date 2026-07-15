@@ -49,6 +49,7 @@ class CallTools:
         schedule_hangup: Callable[[], None],
         is_sms_target_allowed: Callable[[str], bool] | None = None,
         send_dtmf: DtmfSender | None = None,
+        effect_guard: Callable[[], bool] | None = None,
     ) -> None:
         self._modem = modem
         self._hub = hub
@@ -60,6 +61,7 @@ class CallTools:
         self._is_sms_target_allowed = is_sms_target_allowed
         self._send_dtmf_impl = send_dtmf or self._send_dtmf_via_modem
         self._dtmf_fallback_mode = "unknown" if send_dtmf else "qvts"
+        self._effect_guard = effect_guard or (lambda: True)
 
     def register(self) -> ToolRegistry:
         registry = ToolRegistry()
@@ -85,8 +87,32 @@ class CallTools:
         if record is not None:
             record.log_event("tool_call", tool=tool, args=args, result=result)
 
+    def _stale_effect_result(
+        self, tool: str, args: dict
+    ) -> dict | None:
+        if self._effect_guard():
+            return None
+        result = {
+            "success": False,
+            "code": "STALE_AGENT_GENERATION",
+            "message": "会话媒体所有权已切换，忽略迟到的工具调用",
+        }
+        if tool == "send_dtmf":
+            digits = args.get("digits")
+            result.update(
+                {
+                    "count": len(digits.strip()) if isinstance(digits, str) else 0,
+                    "mode": "unknown",
+                }
+            )
+        logger.info("拒绝迟到的 Agent 工具调用: tool=%s", tool)
+        return result
+
     def _send_sms(self, args: dict) -> dict:
         """工具处理：Agent 在通话中请求发送短信。"""
+        stale = self._stale_effect_result("send_sms", args)
+        if stale is not None:
+            return stale
         number = (args.get("to") or "").strip() or (self._get_caller() or "").strip()
         content = (args.get("content") or "").strip()
         if not number:
@@ -169,6 +195,9 @@ class CallTools:
         实际是排定延迟挂断（CallSession 负责 Timer 与世代号），
         先让 Agent 把告别语播完，避免话没说完线路就断了。
         """
+        stale = self._stale_effect_result("hangup_call", args)
+        if stale is not None:
+            return stale
         self._schedule_hangup()
         result = {"success": True, "message": "好的，马上为您挂断电话"}
         self._audit_tool(
@@ -180,6 +209,9 @@ class CallTools:
 
     def _send_dtmf(self, args: dict) -> dict:
         """工具处理：Agent 请求发送 DTMF 按键（IVR 导航）。"""
+        stale = self._stale_effect_result("send_dtmf", args)
+        if stale is not None:
+            return stale
         digits = (args.get("digits") or "").strip()
         if not digits:
             return {
@@ -224,6 +256,9 @@ class CallTools:
 
     def _query_code(self, args: dict) -> dict:
         """工具处理：从最近收到的短信里查验证码。"""
+        stale = self._stale_effect_result("query_verification_code", args)
+        if stale is not None:
+            return stale
         code, text, sender = self._find_latest_code()
         if code:
             result = {

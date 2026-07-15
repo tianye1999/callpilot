@@ -38,6 +38,7 @@ def make_tools(
     on_hangup=None,
     sms_gate=None,
     send_dtmf=None,
+    effect_guard=None,
 ) -> tuple[CallTools, FakeModem, list]:
     modem = modem or FakeModem()
     hangups: list[bool] = []
@@ -49,6 +50,7 @@ def make_tools(
         schedule_hangup=on_hangup or (lambda: hangups.append(True)),
         is_sms_target_allowed=sms_gate,
         send_dtmf=send_dtmf,
+        effect_guard=effect_guard,
     )
     return tools, modem, hangups
 
@@ -345,3 +347,31 @@ def test_query_code_no_sms():
 def test_query_code_without_hub():
     tools, _, _ = make_tools(hub=None)
     assert tools._query_code({})["success"] is False
+
+
+def test_stale_agent_generation_rejects_every_tool_before_side_effect() -> None:
+    hub = make_hub()
+    hub.publish({"type": "sms_in", "sender": "95588", "text": "验证码 482913"})
+    record = SpyRecord()
+    tools, modem, hangups = make_tools(
+        hub=hub,
+        caller="13800000000",
+        record=record,
+        effect_guard=lambda: False,
+    )
+    registry = tools.register()
+
+    results = [
+        registry.dispatch("send_sms", {"content": "late"}),
+        registry.dispatch("hangup_call", {}),
+        registry.dispatch("send_dtmf", {"digits": "1"}),
+        registry.dispatch("query_verification_code", {}),
+    ]
+
+    assert all(result["success"] is False for result in results)
+    assert {result["code"] for result in results} == {"STALE_AGENT_GENERATION"}
+    assert results[2]["count"] == 1
+    assert results[2]["mode"] == "unknown"
+    assert modem.calls == []
+    assert hangups == []
+    assert record.events == []

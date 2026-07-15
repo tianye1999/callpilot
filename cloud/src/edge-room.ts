@@ -91,11 +91,36 @@ export class EdgeRoom extends DurableObject<Env> {
       return;
     }
     if (result.data.type === "command.ack") {
-      const status = result.data.status === "accepted" ? "ready" : "failed";
       const errorCode = result.data.status === "rejected" ? (result.data.errorCode ?? null) : null;
+      if (result.data.offerId) {
+        // Ack for an inbound takeover claim command (#95).
+        const offerStatus = result.data.status === "accepted" ? "edge_ready" : "failed";
+        await this.env.DB.prepare(
+          "UPDATE inbound_offers SET status = ?1, error_code = ?2, updated_at = ?3 WHERE offer_id = ?4 AND edge_id = ?5 AND status = 'claimed'"
+        ).bind(offerStatus, errorCode, now, result.data.offerId, attachment.edgeId).run();
+        return;
+      }
+      const status = result.data.status === "accepted" ? "ready" : "failed";
       await this.env.DB.prepare(
         "UPDATE calls SET status = ?1, error_code = ?2, updated_at = ?3 WHERE call_id = ?4 AND edge_id = ?5"
       ).bind(status, errorCode, now, result.data.callId, attachment.edgeId).run();
+      return;
+    }
+    if (result.data.type === "inbound.offer") {
+      // Offers are insert-once; a duplicate offerId from a reconnect replay is
+      // ignored rather than resurrecting a consumed offer.
+      await this.env.DB.prepare(
+        "INSERT OR IGNORE INTO inbound_offers(offer_id, edge_id, call_id, generation, nonce, status, created_at, expires_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'offered', ?6, ?7, ?6)"
+      ).bind(
+        result.data.offerId, attachment.edgeId, result.data.callId,
+        result.data.generation, result.data.nonce, now, result.data.expiresAtUnixMs
+      ).run();
+      return;
+    }
+    if (result.data.type === "inbound.offer.revoke") {
+      await this.env.DB.prepare(
+        "UPDATE inbound_offers SET status = 'revoked', error_code = ?1, updated_at = ?2 WHERE offer_id = ?3 AND edge_id = ?4 AND status IN ('offered', 'claimed', 'edge_ready')"
+      ).bind(result.data.reason, now, result.data.offerId, attachment.edgeId).run();
       return;
     }
     await this.env.DB.prepare(

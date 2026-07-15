@@ -7,16 +7,17 @@ import logging
 import math
 import os
 import re
+import secrets
 import threading
 import time
 from datetime import UTC, datetime
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Callable
 
 from . import config
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
-from .agents.tools import ToolRegistry
+from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
 from .audio_bridge import (
     MODEM_RATE,
     FfmpegAudioBridge,
@@ -65,6 +66,18 @@ from .result_verification import (
 from .sim_identity import SimIdentity
 from .sms_email_forwarder import SmsEmailForwarder
 from .summarizer import judge_wrap_up, summarize_call
+from .takeover_coordinator import (
+    ClaimFence,
+    InboundTakeoverCoordinator,
+    InboundTakeoverOfferRequest,
+    InboundTakeoverRevoke,
+    InboundTakeoverSession,
+    MediaOwner,
+    TakeoverOffer,
+    TakeoverRejection,
+    TakeoverResult,
+    TakeoverState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +97,24 @@ HANGUP_TOOL_DELAY_SECONDS = 4.5
 DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS = 3.0
 DTMF_RECENT_SEND_WINDOW_SECONDS = 5.0
 _EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
+_INBOUND_TAKEOVER_OFFER_TTL_SECONDS = 30.0
+
+
+class _CallSessionMediaRouter:
+    """Phase-B owner fence; Phase C attaches concrete bridge routing."""
+
+    def __init__(self) -> None:
+        self._owner = MediaOwner.AI
+        self._lock = threading.Lock()
+
+    @property
+    def owner(self) -> MediaOwner:
+        with self._lock:
+            return self._owner
+
+    def switch_owner(self, owner: MediaOwner) -> None:
+        with self._lock:
+            self._owner = owner
 
 
 class CallSession:
@@ -171,6 +202,14 @@ class CallSession:
         self._dtmf_ledger: DtmfActionLedger | None = None
         self._dtmf_judge: DtmfJudge | None = None
         self._dtmf_judge_started_at = 0.0
+        self._takeover_lock = threading.RLock()
+        self._takeover_coordinator: InboundTakeoverCoordinator | None = None
+        self._takeover_request: InboundTakeoverOfferRequest | None = None
+        self._takeover_offer_queue: Queue[InboundTakeoverOfferRequest] = Queue(
+            maxsize=1
+        )
+        self._takeover_revoke_queue: Queue[InboundTakeoverRevoke] = Queue(maxsize=1)
+        self._takeover_session_queue: Queue[InboundTakeoverSession] = Queue(maxsize=1)
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -259,6 +298,7 @@ class CallSession:
         number = self._outbound_number or self.current_caller
         record = self._begin_record(direction, number)
         self._record = record
+        self._initialize_takeover_context(direction)
         transcripts: list[tuple[str, str]] = []
 
         def mark(event_type: str, **fields) -> float:
@@ -351,7 +391,7 @@ class CallSession:
             agent.set_status_handler(
                 lambda text: self._publish({"type": "system", "text": text})
             )
-            tools = self._build_tools()
+            tools = self._build_tools(direction)
             with self._dtmf_lock:
                 self._active_tools = tools
             agent.set_tools(tools)
@@ -386,6 +426,7 @@ class CallSession:
         finally:
             # 先作废判官世代再 finish record，避免迟到结果在 meta 落盘后追加事件。
             self._stop_dtmf_judge()
+            self._end_takeover_context("CALL_ENDED")
             mark("ended", status=status)
             self._finalize_record(record, status, transcripts, direction, number)
 
@@ -426,7 +467,11 @@ class CallSession:
     ) -> Callable[[str, str], None]:
         """转写回调：累积到 transcripts（供摘要）、写通话记录、推送 UI。"""
 
+        generation = self._session_generation
+
         def on_transcript(role: str, text: str) -> None:
+            if not self._agent_effect_allowed(generation):
+                return
             transcripts.append((role, text))
             if record is not None:
                 record.log_event("transcript", role=role, text=text)
@@ -466,7 +511,11 @@ class CallSession:
         if self.hub is not None:
             self.hub.set_audio_rate(agent.output_rate)
 
+        generation = self._session_generation
+
         def on_agent_audio(pcm_agent: bytes) -> None:
+            if not self._agent_effect_allowed(generation):
+                return
             if pcm_agent and on_first_audio is not None:
                 on_first_audio()
             # 浏览器实时旁听下行 AI（Web Audio）：无监听端时零成本返回。kind=0=下行。
@@ -518,10 +567,15 @@ class CallSession:
         uplink_pre_stats = PcmFlowStats("agent_uplink_pre_gain")
         uplink_post_stats = PcmFlowStats("agent_uplink_post_gain")
         winddown_deadline: float | None = None
+        generation = self._session_generation
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
         while self._active and not agent.fatal:
-            self._drain_agent_audio(bridge)
+            agent_effects_allowed = self._agent_effect_allowed(generation)
+            if agent_effects_allowed:
+                self._drain_agent_audio(bridge)
+            else:
+                self._clear_outgoing_audio()
 
             now = time.monotonic()
             # ① 硬时限兜底
@@ -587,7 +641,7 @@ class CallSession:
                 # 本机监听对方声音（8k 旁路，入队即返回）。
                 if self.uplink_monitor is not None:
                     self.uplink_monitor.feed(pcm_8k)
-                if not suppress_uplink:
+                if not suppress_uplink and agent_effects_allowed:
                     pcm_agent = bridge.modem_to_agent(pcm_8k, agent.input_rate)
                     uplink_pre_stats.add(pcm_agent)
                     pcm_agent = apply_pcm_gain(pcm_agent, agent_uplink_gain)
@@ -730,8 +784,12 @@ class CallSession:
         except Exception as exc:  # noqa: BLE001
             logger.exception("通话摘要线程异常: %s", exc)
 
-    def _build_tools(self) -> ToolRegistry:
+    def _build_tools(self, direction: str | None = None) -> ToolRegistry:
         """构造本通会话的工具集（工具语义在 call_tools 模块）。"""
+        direction = direction or (
+            "outbound" if self._outbound_number is not None else "inbound"
+        )
+        generation = self._session_generation
         tools = CallTools(
             self.modem,
             hub=self.hub,
@@ -740,8 +798,15 @@ class CallSession:
             schedule_hangup=self._schedule_deferred_hangup,
             is_sms_target_allowed=self._sms_target_allowed,
             send_dtmf=self._send_dtmf_from_tool,
+            effect_guard=lambda: self._agent_effect_allowed(generation),
         )
-        return tools.register()
+        registry = tools.register()
+        if direction == "inbound" and config.get_bool("INBOUND_TAKEOVER_ENABLED"):
+            registry.register(
+                REQUEST_OWNER_TAKEOVER_SPEC,
+                lambda _args: self._request_owner_takeover(generation),
+            )
+        return registry
 
     def _start_dtmf_judge(
         self, record: CallRecord | None, *, session_t0: float
@@ -828,6 +893,12 @@ class CallSession:
         """会话系统提示词：文本构造在 prompts 模块（纯函数，可独测）。"""
         lang = agent_language()
         scenario = self._take_prompt_scenario() if direction == "outbound" else None
+        takeover_preference = (
+            config.get_str("INBOUND_TAKEOVER_PREFERENCE")
+            if direction == "inbound"
+            and config.get_bool("INBOUND_TAKEOVER_ENABLED")
+            else None
+        )
         return build_instructions(
             direction,
             owner_name(lang),
@@ -835,6 +906,7 @@ class CallSession:
             self._outbound_task(lang),
             lang,
             scenario=scenario,
+            takeover_preference=takeover_preference,
         )
 
     def _opening_instructions(self, direction: str) -> str:
@@ -1333,7 +1405,261 @@ class CallSession:
     async def _shutdown(self) -> None:
         self._active = False
 
-    async def _shutdown_agent(self, agent, bridge: AudioBridge | None) -> None:
+    def _agent_generation_current(self, generation: int) -> bool:
+        with self._hangup_lock:
+            return self._active and generation == self._session_generation
+
+    def _agent_effect_allowed(self, generation: int) -> bool:
+        if not self._agent_generation_current(generation):
+            return False
+        with self._takeover_lock:
+            coordinator = self._takeover_coordinator
+            return (
+                coordinator is None
+                or coordinator.state is TakeoverState.AI_ACTIVE
+            )
+
+    @property
+    def takeover_state(self) -> TakeoverState | None:
+        with self._takeover_lock:
+            coordinator = self._takeover_coordinator
+            return coordinator.state if coordinator is not None else None
+
+    @property
+    def takeover_fence(self):
+        with self._takeover_lock:
+            coordinator = self._takeover_coordinator
+            return coordinator.active_fence if coordinator is not None else None
+
+    def _initialize_takeover_context(self, direction: str) -> None:
+        with self._takeover_lock:
+            self._takeover_offer_queue = Queue(maxsize=1)
+            self._takeover_revoke_queue = Queue(maxsize=1)
+            self._takeover_session_queue = Queue(maxsize=1)
+            self._takeover_request = None
+            if direction != "inbound":
+                self._takeover_coordinator = None
+                return
+            router = _CallSessionMediaRouter()
+            self._takeover_coordinator = InboundTakeoverCoordinator(
+                call_id=f"call_{secrets.token_urlsafe(18)}",
+                generation=self._session_generation,
+                media_router=router,
+            )
+
+    def _request_owner_takeover(self, generation: int) -> dict:
+        if not config.get_bool("INBOUND_TAKEOVER_ENABLED"):
+            return {
+                "success": False,
+                "code": "TAKEOVER_DISABLED",
+                "message": "真人接管未启用",
+            }
+        if not self._agent_generation_current(generation):
+            return {
+                "success": False,
+                "code": "STALE_AGENT_GENERATION",
+                "message": "当前 Agent 会话已失效",
+            }
+        if self._outbound_number is not None:
+            return {
+                "success": False,
+                "code": "TAKEOVER_INBOUND_ONLY",
+                "message": "真人接管仅用于来电",
+            }
+
+        with self._takeover_lock:
+            coordinator = self._takeover_coordinator
+            if coordinator is None or coordinator.state is not TakeoverState.AI_ACTIVE:
+                return {
+                    "success": False,
+                    "code": "TAKEOVER_NOT_AI_ACTIVE",
+                    "message": "当前通话不允许重复请求真人接管",
+                }
+            result = coordinator.begin_takeover()
+            if not result.accepted:
+                return {
+                    "success": False,
+                    "code": str(result.code or TakeoverRejection.INVALID_STATE),
+                    "message": "当前通话状态不允许真人接管",
+                }
+            created_at = time.time()
+            request = InboundTakeoverOfferRequest(
+                offer_id=f"offer_{secrets.token_urlsafe(18)}",
+                nonce=secrets.token_urlsafe(24),
+                call_id=coordinator.call_id,
+                generation=coordinator.generation,
+                created_at=created_at,
+                expires_at=created_at + _INBOUND_TAKEOVER_OFFER_TTL_SECONDS,
+            )
+            self._takeover_request = request
+            try:
+                self._takeover_offer_queue.put_nowait(request)
+            except Full:
+                coordinator.rollback_precommit("offer_queue_full")
+                self._takeover_request = None
+                return {
+                    "success": False,
+                    "code": "TAKEOVER_QUEUE_FULL",
+                    "message": "真人接管请求队列繁忙",
+                }
+
+        self._clear_outgoing_audio()
+        record = self._record
+        if record is not None:
+            record.log_event(
+                "takeover_requested",
+                call_id=request.call_id,
+                generation=request.generation,
+                trigger="agent_tool",
+                preference_configured=bool(
+                    config.get_str("INBOUND_TAKEOVER_PREFERENCE").strip()
+                ),
+            )
+        self._publish(
+            {
+                "type": "inbound_takeover",
+                "status": "requested",
+                "call_id": request.call_id,
+                "generation": request.generation,
+            }
+        )
+        return {
+            "success": True,
+            "code": "TAKEOVER_REQUESTED",
+            "message": "真人接管请求已发出",
+        }
+
+    def next_takeover_offer(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverOfferRequest | None:
+        with self._takeover_lock:
+            queue = self._takeover_offer_queue
+        try:
+            return queue.get(timeout=timeout) if timeout > 0 else queue.get_nowait()
+        except Empty:
+            return None
+
+    def next_takeover_revoke(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverRevoke | None:
+        with self._takeover_lock:
+            queue = self._takeover_revoke_queue
+        try:
+            return queue.get(timeout=timeout) if timeout > 0 else queue.get_nowait()
+        except Empty:
+            return None
+
+    def provide_takeover_session(
+        self, claimed: InboundTakeoverSession
+    ) -> TakeoverResult:
+        if not config.get_bool("INBOUND_TAKEOVER_ENABLED"):
+            return TakeoverResult.reject(TakeoverRejection.TAKEOVER_DISABLED)
+        with self._takeover_lock:
+            coordinator = self._takeover_coordinator
+            request = self._takeover_request
+            if coordinator is None or request is None:
+                return TakeoverResult.reject(TakeoverRejection.INVALID_STATE)
+            offer = claimed.offer
+            fence = claimed.fence
+            if offer.call_id != request.call_id:
+                return TakeoverResult.reject(TakeoverRejection.STALE_CALL)
+            if offer.generation != request.generation:
+                return TakeoverResult.reject(TakeoverRejection.STALE_GENERATION)
+            if (
+                offer.offer_id != request.offer_id
+                or offer.nonce != request.nonce
+                or offer.expires_at != request.expires_at
+            ):
+                return TakeoverResult.reject(
+                    TakeoverRejection.OFFER_SCOPE_MISMATCH
+                )
+            if time.time() >= request.expires_at:
+                coordinator.rollback_precommit("offer_expired")
+                return TakeoverResult.reject(TakeoverRejection.OFFER_EXPIRED)
+            if coordinator.state is TakeoverState.TAKEOVER_PREPARING:
+                waiting = coordinator.wait_for_owner([offer])
+                if not waiting.accepted:
+                    return waiting
+            elif coordinator.state is not TakeoverState.WAITING_OWNER:
+                return TakeoverResult.reject(TakeoverRejection.INVALID_STATE)
+            result = coordinator.claim_offer(
+                offer_id=offer.offer_id,
+                nonce=offer.nonce,
+                claim_id=fence.claim_id,
+                device_id=fence.device_id,
+            )
+            if not result.accepted or result.idempotent:
+                return result
+            try:
+                self._takeover_session_queue.put_nowait(claimed)
+            except Full:
+                return TakeoverResult.reject(TakeoverRejection.CLAIM_CONFLICT)
+            return result
+
+    def accept_takeover_claim(
+        self,
+        *,
+        offer_id: str,
+        call_id: str,
+        claim_id: str,
+        generation: int,
+        nonce: str,
+        issued: IssuedLiveKitSession,
+    ) -> TakeoverResult:
+        """Bind an untrusted cloud claim to the Edge-local offer lifetime."""
+
+        with self._takeover_lock:
+            request = self._takeover_request
+            if request is None:
+                return TakeoverResult.reject(TakeoverRejection.INVALID_STATE)
+            expires_at = request.expires_at
+        device_id = issued.browser_identity
+        claimed = InboundTakeoverSession(
+            offer=TakeoverOffer(
+                offer_id=offer_id,
+                nonce=nonce,
+                call_id=call_id,
+                generation=generation,
+                target_device_id=device_id,
+                expires_at=expires_at,
+            ),
+            fence=ClaimFence(
+                call_id=call_id,
+                generation=generation,
+                claim_id=claim_id,
+                device_id=device_id,
+            ),
+            issued=issued,
+        )
+        return self.provide_takeover_session(claimed)
+
+    def take_takeover_session(self) -> InboundTakeoverSession | None:
+        with self._takeover_lock:
+            queue = self._takeover_session_queue
+        try:
+            return queue.get_nowait()
+        except Empty:
+            return None
+
+    def _end_takeover_context(self, reason: str) -> None:
+        with self._takeover_lock:
+            coordinator = self._takeover_coordinator
+            request = self._takeover_request
+            if coordinator is None:
+                return
+            coordinator.end_call(reason.lower())
+            if request is not None:
+                revoke = InboundTakeoverRevoke(
+                    offer_id=request.offer_id,
+                    call_id=request.call_id,
+                    reason=reason,
+                )
+                try:
+                    self._takeover_revoke_queue.put_nowait(revoke)
+                except Full:
+                    pass
+
+    async def _stop_agent_resources(self, agent, bridge: AudioBridge | None) -> None:
         if agent is not None:
             try:
                 await agent.stop()
@@ -1344,6 +1670,25 @@ class CallSession:
                 bridge.stop()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("关闭音频桥出错: %s", exc)
+
+    async def detach_agent(self, agent, bridge: AudioBridge | None) -> None:
+        """Detach AI resources without ending the physical modem call."""
+
+        # Invalidate first. Callbacks already in flight then fail their generation
+        # check before they can write PCM, send DTMF/SMS, or schedule a hangup.
+        with self._hangup_lock:
+            self._session_generation += 1
+            self._cancel_hangup_timer()
+        with self._dtmf_lock:
+            self._cancel_spoken_dtmf_followups_locked()
+            self._active_tools = None
+        self._stop_dtmf_judge()
+        self._clear_outgoing_audio()
+        await self._stop_agent_resources(agent, bridge)
+        logger.info("Agent 已从物理通话分离（modem 与 QPCMV 保持）")
+
+    async def _shutdown_agent(self, agent, bridge: AudioBridge | None) -> None:
+        await self._stop_agent_resources(agent, bridge)
         # 会话结束（含异常/端口冲突）时确保挂断物理通话，避免线路悬空。
         try:
             self.modem.hangup()
@@ -1784,6 +2129,43 @@ class CallAgentService:
         if worker is not None:
             payload.update(worker.coordinator.status())
         return payload
+
+    def next_inbound_takeover_offer(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverOfferRequest | None:
+        return self.session.next_takeover_offer(timeout)
+
+    def next_inbound_takeover_revoke(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverRevoke | None:
+        return self.session.next_takeover_revoke(timeout)
+
+    def provide_inbound_takeover_session(
+        self, claimed: InboundTakeoverSession
+    ) -> TakeoverResult:
+        return self.session.provide_takeover_session(claimed)
+
+    def accept_inbound_takeover_claim(
+        self,
+        *,
+        offer_id: str,
+        call_id: str,
+        claim_id: str,
+        generation: int,
+        nonce: str,
+        issued: IssuedLiveKitSession,
+    ) -> TakeoverResult:
+        return self.session.accept_takeover_claim(
+            offer_id=offer_id,
+            call_id=call_id,
+            claim_id=claim_id,
+            generation=generation,
+            nonce=nonce,
+            issued=issued,
+        )
+
+    def take_inbound_takeover_session(self) -> InboundTakeoverSession | None:
+        return self.session.take_takeover_session()
 
     def cancel_remote_dialer(self) -> tuple[bool, str | None]:
         with self._remote_setup_lock:

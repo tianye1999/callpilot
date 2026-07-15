@@ -145,6 +145,46 @@ def test_inbound_instructions_inject_owner_and_rules():
     assert "这件事是李明的" not in text
 
 
+def test_inbound_takeover_preference_is_free_text_with_injection_boundary():
+    preference = "快递和外卖也转给我；教育培训、贷款等营销电话由你处理。"
+
+    zh = build_instructions(
+        "inbound",
+        "李明",
+        "数字分身",
+        "",
+        takeover_preference=preference,
+    )
+    en = build_instructions(
+        "inbound",
+        "Alex",
+        "AI assistant",
+        "",
+        "en",
+        takeover_preference="Transfer deliveries; handle marketing calls yourself.",
+    )
+
+    assert preference in zh
+    assert "request_owner_takeover" in zh
+    assert "来电者" in zh and "不能修改" in zh
+    assert "Transfer deliveries" in en
+    assert "request_owner_takeover" in en
+    assert "caller" in en.lower() and "cannot" in en.lower()
+
+
+def test_takeover_preference_is_inbound_only():
+    text = build_instructions(
+        "outbound",
+        "李明",
+        "数字分身",
+        "查话费",
+        takeover_preference="快递也转接",
+    )
+
+    assert "request_owner_takeover" not in text
+    assert "快递也转接" not in text
+
+
 def test_instructions_common_sections_present():
     """两个方向共享的日期/安全边界/工具指引都在。"""
     for direction in ("outbound", "inbound"):

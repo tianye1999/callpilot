@@ -5,13 +5,14 @@ import { error, HttpError, json, readJson, requireSameOrigin } from "./http";
 import { issueParticipantToken } from "./livekit";
 import {
   claimEnrollmentSchema,
+  claimInboundOfferSchema,
   claimPairingSchema,
   createCallSchema,
   createEnrollmentInviteSchema,
   createPairingSchema
 } from "./schemas";
 import { constantTimeEqual, randomId, randomPairingCode, randomSecret, sha256 } from "./security";
-import type { CallRecord, Env } from "./types";
+import type { CallRecord, Env, InboundOfferRecord } from "./types";
 import { ZodError } from "zod";
 
 export { EdgeRoom };
@@ -52,6 +53,12 @@ async function route(request: Request, env: Env, requestId: string): Promise<Res
   }
   if (path === "/v1/device" && request.method === "DELETE") return unpairCurrentDevice(request, env);
   if (path === "/v1/calls" && request.method === "POST") return createCall(request, env);
+  if (path === "/v1/inbound-offers" && request.method === "GET") {
+    return listInboundOffers(request, env);
+  }
+  if (path === "/v1/inbound-offers/claim" && request.method === "POST") {
+    return claimInboundOffer(request, env);
+  }
 
   const presence = path.match(/^\/v1\/edges\/(edge_[A-Za-z0-9_-]+)\/presence$/);
   if (presence && request.method === "GET") return getPresence(request, env, presence[1] ?? "");
@@ -284,6 +291,99 @@ async function createCall(request: Request, env: Env): Promise<Response> {
   await audit(env, "phone", device.device_id, "call.created", callId, "allowed");
   const call = await env.DB.prepare("SELECT * FROM calls WHERE call_id = ?1").bind(callId).first<CallRecord>();
   return json(callPayload(call as CallRecord), 202);
+}
+
+// ---- Inbound takeover (#95): paired devices poll open offers and claim one.
+
+async function listInboundOffers(request: Request, env: Env): Promise<Response> {
+  const device = await authenticateDevice(request, env);
+  const rows = await env.DB.prepare(
+    "SELECT offer_id, expires_at FROM inbound_offers WHERE edge_id = ?1 AND status = 'offered' AND expires_at > ?2 ORDER BY created_at DESC LIMIT 5"
+  ).bind(device.edge_id, Date.now()).all<{ offer_id: string; expires_at: number }>();
+  return json({
+    offers: (rows.results ?? []).map((row) => ({
+      offerId: row.offer_id,
+      expiresAt: row.expires_at
+    }))
+  });
+}
+
+async function claimInboundOffer(request: Request, env: Env): Promise<Response> {
+  requireSameOrigin(request, env.PUBLIC_ORIGIN);
+  const device = await authenticateDevice(request, env);
+  const input = claimInboundOfferSchema.parse(await readJson(request));
+
+  const offer = await env.DB.prepare(
+    "SELECT * FROM inbound_offers WHERE offer_id = ?1"
+  ).bind(input.offerId).first<InboundOfferRecord>();
+  if (!offer || offer.edge_id !== device.edge_id) {
+    throw new HttpError("NOT_FOUND", "Offer not found", 404);
+  }
+
+  const now = Date.now();
+  const claimId = randomId("claim");
+  const commandId = randomId("command");
+  const roomName = randomId("callpilot");
+  // Contract: identical session shape to session.start — Edge's strict parser
+  // requires the web_ browser-identity prefix.
+  const phoneIdentity = randomId("web", 12);
+  const edgeIdentity = randomId("edgepart", 12);
+  // First-claim-wins: the conditional UPDATE is the atomic arbiter. A loser
+  // (double claim, expired or revoked offer) changes zero rows.
+  const claimed = await env.DB.prepare(
+    "UPDATE inbound_offers SET status = 'claimed', claim_id = ?1, claimed_device_id = ?2, room_name = ?3, phone_identity = ?4, edge_identity = ?5, updated_at = ?6 WHERE offer_id = ?7 AND status = 'offered' AND expires_at > ?6"
+  ).bind(claimId, device.device_id, roomName, phoneIdentity, edgeIdentity, now, input.offerId).run();
+  if (!claimed.meta.changes) {
+    await audit(env, "phone", device.device_id, "inbound_offer.claim", input.offerId, "rejected");
+    throw new HttpError("OFFER_UNAVAILABLE", "Offer already claimed, expired or revoked", 409);
+  }
+
+  // Past the atomic UPDATE the row is 'claimed'; any failure below must mark it
+  // failed instead of stranding an unclaimable row.
+  try {
+    const edgeToken = await issueParticipantToken(env, roomName, edgeIdentity);
+    const command = {
+      v: 1,
+      type: "inbound.claim",
+      commandId,
+      offerId: offer.offer_id,
+      callId: offer.call_id,
+      claimId,
+      generation: offer.generation,
+      nonce: offer.nonce,
+      session: {
+        sessionId: randomId("session"),
+        roomName,
+        browserIdentity: phoneIdentity,
+        edgeIdentity,
+        livekitUrl: env.LIVEKIT_URL,
+        token: edgeToken
+      }
+    };
+    const delivered = await edgeRoom(env, offer.edge_id).fetch("https://edge-room/command", {
+      method: "POST",
+      body: JSON.stringify(command)
+    });
+    if (!delivered.ok) {
+      throw new HttpError("EDGE_OFFLINE", "Edge disconnected before takeover could start", 409);
+    }
+    const phoneToken = await issueParticipantToken(env, roomName, phoneIdentity);
+    await audit(env, "phone", device.device_id, "inbound_offer.claim", offer.offer_id, "allowed");
+    return json({
+      claimId,
+      offerId: offer.offer_id,
+      roomName,
+      url: env.LIVEKIT_URL,
+      token: phoneToken,
+      expiresAt: offer.expires_at
+    }, 202);
+  } catch (failure) {
+    const errorCode = failure instanceof HttpError ? failure.code : "CLAIM_SETUP_FAILED";
+    await env.DB.prepare(
+      "UPDATE inbound_offers SET status = 'failed', error_code = ?1, updated_at = ?2 WHERE offer_id = ?3 AND status = 'claimed'"
+    ).bind(errorCode, Date.now(), offer.offer_id).run();
+    throw failure;
+  }
 }
 
 async function getCall(request: Request, env: Env, callId: string): Promise<Response> {

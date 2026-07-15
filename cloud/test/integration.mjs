@@ -188,6 +188,92 @@ try {
   assert.equal(rejected.status, "failed");
   assert.equal(rejected.errorCode, "SIM_NOT_REGISTERED");
 
+  // ---- Inbound takeover offers (#95) ----
+  // D1 local persists across runs and offers are insert-once by design, so the
+  // ids must be unique per run or a previous run's row swallows the INSERT.
+  const runTag = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const offerId = `offer_${runTag}a001`;
+  socket.send(JSON.stringify({
+    v: 1,
+    type: "inbound.offer",
+    offerId,
+    callId: `call_${runTag}c001`,
+    generation: 3,
+    nonce: "integration-nonce-0001",
+    expiresAtUnixMs: Date.now() + 60_000
+  }));
+  const offers = await eventuallyOffers(
+    cookie,
+    (payload) => payload.offers.length === 1 && payload.offers[0].offerId === offerId,
+    "offer did not appear",
+  );
+  // Privacy: polling exposes only opaque offer ids — never nonce or call id.
+  assert.equal(JSON.stringify(offers).includes("nonce"), false);
+  assert.equal(JSON.stringify(offers).includes(`call_${runTag}`), false);
+
+  const claimCommandPromise = nextMessage(socket);
+  const claim = await post("/v1/inbound-offers/claim", { offerId }, {
+    Cookie: cookie,
+    Origin: origin
+  }, 202);
+  assert.match(claim.claimId, /^claim_/);
+  assert.match(claim.token, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+  const claimCommand = await claimCommandPromise;
+  assert.equal(claimCommand.type, "inbound.claim");
+  assert.equal(claimCommand.offerId, offerId);
+  assert.equal(claimCommand.claimId, claim.claimId);
+  assert.equal(claimCommand.generation, 3);
+  assert.equal(claimCommand.nonce, "integration-nonce-0001");
+  assert.match(claimCommand.session.browserIdentity, /^web_/);
+  assert.match(claimCommand.session.token, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+
+  // First-claim-wins: the second claim must lose deterministically.
+  const doubleClaim = await fetch(`${base}/v1/inbound-offers/claim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie, Origin: origin },
+    body: JSON.stringify({ offerId })
+  });
+  assert.equal(doubleClaim.status, 409);
+
+  socket.send(JSON.stringify({
+    v: 1,
+    type: "command.ack",
+    commandId: claimCommand.commandId,
+    callId: claimCommand.callId,
+    offerId,
+    status: "accepted"
+  }));
+  await delay(100);
+
+  // Revoke path: a second offer withdrawn by the Edge disappears from polling.
+  const offerId2 = `offer_${runTag}a002`;
+  socket.send(JSON.stringify({
+    v: 1,
+    type: "inbound.offer",
+    offerId: offerId2,
+    callId: `call_${runTag}c002`,
+    generation: 4,
+    nonce: "integration-nonce-0002",
+    expiresAtUnixMs: Date.now() + 60_000
+  }));
+  await eventuallyOffers(
+    cookie,
+    (payload) => payload.offers.some((o) => o.offerId === offerId2),
+    "second offer did not appear",
+  );
+  socket.send(JSON.stringify({
+    v: 1,
+    type: "inbound.offer.revoke",
+    offerId: offerId2,
+    callId: `call_${runTag}c002`,
+    reason: "CALL_ENDED"
+  }));
+  await eventuallyOffers(
+    cookie,
+    (payload) => payload.offers.length === 0,
+    "revoked offer still listed",
+  );
+
   const revoke = await fetch(`${base}/v1/devices/${paired.device.deviceId}`, {
     method: "DELETE",
     headers: edgeHeaders("DELETE", `/v1/devices/${paired.device.deviceId}`, enrollment)
@@ -203,6 +289,19 @@ try {
   throw error;
 } finally {
   await stopWorker(worker);
+}
+
+async function eventuallyOffers(cookie, predicate, label) {
+  const deadline = Date.now() + 2_000;
+  let last;
+  while (Date.now() < deadline) {
+    const response = await fetch(`${base}/v1/inbound-offers`, { headers: { Cookie: cookie } });
+    assert.equal(response.status, 200);
+    last = await response.json();
+    if (predicate(last)) return last;
+    await delay(100);
+  }
+  throw new Error(`${label}: ${JSON.stringify(last)}`);
 }
 
 async function waitForHealth() {

@@ -44,6 +44,24 @@ export interface CallRecord {
   updated_at: number;
 }
 
+export interface InboundOfferRecord {
+  offer_id: string;
+  edge_id: string;
+  call_id: string;
+  generation: number;
+  nonce: string;
+  status: string;
+  claim_id: string | null;
+  claimed_device_id: string | null;
+  room_name: string | null;
+  phone_identity: string | null;
+  edge_identity: string | null;
+  error_code: string | null;
+  created_at: number;
+  expires_at: number;
+  updated_at: number;
+}
+
 export interface EdgePresence {
   connected: boolean;
   lastSeenAt?: number;
