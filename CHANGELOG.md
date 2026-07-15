@@ -4,6 +4,47 @@ All notable changes to CallPilot are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break).
 
+## [Unreleased]
+
+### Added
+
+- **Inbound call triage & owner takeover (#95)**: an incoming call is answered
+  by the AI, judged by a dedicated triage judge (marketing / personal /
+  needs-owner, with strict fencing and a two-pass confirmation before any
+  reject), and either politely rejected and hung up, or **handed over live to
+  the paired Android phone** — the phone rings, the owner answers, and the
+  call audio switches from the AI to the phone without dropping the physical
+  line. Owner preferences are free-text, fed only to the judge, and caller
+  speech can never modify them. Verified end-to-end on real hardware
+  (both scripted scenes passed 2026-07-15).
+- **Unified dial guard (#85/#93)**: modem/SIM state is now truthful and
+  transition-driven; dialing while the modem is offline or the SIM is
+  unregistered fails in ~0.15s with a stable error code instead of a 45s
+  timeout, on desktop, cloud and Android alike. Cross-carrier hotline
+  mis-dials are blocked; ordinary numbers are never affected.
+- **Bill-amount verification (#86)**: for opted-in carrier-billing calls the
+  official carrier SMS replaces the model's transcription in the summary, so
+  a misheard amount can no longer survive; without an SMS the summary is
+  structurally marked unverified.
+- Auxiliary text chains (summary / wrap-up judge / DTMF judge / triage judge)
+  now follow AGENT_PROVIDER: OpenAI by default, Qwen preserved as a switchable
+  path.
+
+### Fixed
+
+- **ffmpeg modem-write thread deadlock (#82)**: a stalled playback process is
+  now detected within ~250ms and restarted; the PCM buffer is bounded (60s)
+  so normal realtime TTS bursts are never truncated.
+- Android takeover-media 20s timeout with automatic reset (stale sessions no
+  longer block later offers); takeover now publishes `connected` to the app.
+
+### Security
+
+- Hosted PWA CSP tightened to the exact LiveKit host (no bare `wss:` /
+  wildcard) and the legacy pairing-free invite fragment entry removed (#54);
+  live on beta.
+- `main` branch protection enabled (PR checks required; no force-push).
+
 ## [0.6.0] — 2026-07-12
 
 First build that ships the hosted remote control plane, so an ordinary user can
