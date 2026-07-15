@@ -25,6 +25,7 @@ class FakeEndpoint:
         self.closed = False
         self.connected = False
         self.browser_chunks = [b"mobile-to-caller"]
+        self.events: list[dict] = []
 
     async def connect(self) -> None:
         self.connected = True
@@ -44,7 +45,7 @@ class FakeEndpoint:
         pass
 
     async def send_event(self, event: dict) -> None:
-        pass
+        self.events.append(event)
 
 
 def _service() -> CallAgentService:
@@ -122,6 +123,7 @@ def test_handoff_stops_old_writer_and_pumps_mobile_then_single_finalizer(monkeyp
     assert new_bridge.started
     assert new_bridge.downlink == [b"mobile-to-caller"]
     assert endpoint.connected and endpoint.closed
+    assert endpoint.events == [{"type": "status", "status": "connected"}]
     assert session.takeover_state is TakeoverState.MOBILE_ACTIVE
     assert session.modem.calls == []
 
@@ -174,6 +176,31 @@ def test_handoff_start_failure_restarts_old_bridge_and_rolls_back(monkeypatch) -
     assert old_bridge.stopped and old_bridge.started
     assert session.takeover_state is TakeoverState.AI_ACTIVE
     assert endpoint.closed
+
+
+def test_takeover_connected_snapshot_repeats_until_call_stops() -> None:
+    service = _service()
+    session = service.session
+    endpoint = FakeEndpoint(session)
+    session._active = True
+    session.modem.connected_flag.set()
+
+    async def run() -> None:
+        task = asyncio.create_task(
+            session._takeover_connected_snapshot_loop(endpoint, interval=0.001)
+        )
+        while len(endpoint.events) < 2:
+            await asyncio.sleep(0.001)
+        session._active = False
+        await asyncio.wait_for(task, timeout=0.1)
+
+    asyncio.run(run())
+
+    assert len(endpoint.events) >= 2
+    assert all(
+        event == {"type": "status", "status": "connected"}
+        for event in endpoint.events
+    )
 
 
 def test_postcommit_media_loss_expires_to_notice_then_hangup(monkeypatch) -> None:

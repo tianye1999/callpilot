@@ -782,7 +782,17 @@ class CallSession:
             await self.detach_agent(agent, None)
             if record is not None:
                 record.log_event("takeover_committed", generation=generation)
-            return await self._pump_mobile_media(endpoint, new_bridge, record, claimed)
+            await self._send_takeover_connected(endpoint)
+            status_task = asyncio.create_task(
+                self._takeover_connected_snapshot_loop(endpoint)
+            )
+            try:
+                return await self._pump_mobile_media(
+                    endpoint, new_bridge, record, claimed
+                )
+            finally:
+                status_task.cancel()
+                await asyncio.gather(status_task, return_exceptions=True)
         except Exception as exc:  # noqa: BLE001
             if committed:
                 logger.warning("接管后媒体泵失败: error_type=%s", type(exc).__name__)
@@ -808,6 +818,23 @@ class CallSession:
         finally:
             if endpoint is not None:
                 await endpoint.close()
+
+    @staticmethod
+    async def _send_takeover_connected(endpoint: RemoteMediaEndpoint) -> None:
+        try:
+            await endpoint.send_event({"type": "status", "status": "connected"})
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("接管 connected 状态发送失败: %s", type(exc).__name__)
+
+    async def _takeover_connected_snapshot_loop(
+        self, endpoint: RemoteMediaEndpoint, interval: float = 1.0
+    ) -> None:
+        try:
+            while self._active and self.modem.is_call_connected():
+                await asyncio.sleep(interval)
+                await self._send_takeover_connected(endpoint)
+        except asyncio.CancelledError:
+            pass
 
     async def _pump_mobile_media(
         self,
