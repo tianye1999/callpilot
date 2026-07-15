@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 @testable import CallPilot
 
+@MainActor
 final class HostedCloudClientTests: XCTestCase {
     override func tearDown() {
         MockURLProtocol.requestHandler = nil
@@ -14,7 +15,7 @@ final class HostedCloudClientTests: XCTestCase {
             XCTAssertEqual(request.url?.path, "/v1/pairing-sessions/claim")
             XCTAssertEqual(request.httpMethod, "POST")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Origin"), "https://cloud.example.test")
-            let body = try XCTUnwrap(request.httpBody)
+            let body = try Self.requestBody(request)
             let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
             XCTAssertEqual(json["displayName"], "iPhone")
             return Self.response(
@@ -103,11 +104,36 @@ final class HostedCloudClientTests: XCTestCase {
         XCTAssertEqual(offers, [InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9_999_999_999_999)])
     }
 
+    func testListInboundOffersAcceptsZeroAndOneButRejectsBooleanTimestamps() async throws {
+        // Foundation bridges JSON 0/1 and false/true through NSNumber. The
+        // protocol accepts only integer timestamps, never JSON booleans.
+        let client = try makeClient { request in
+            Self.response(
+                for: request,
+                json: """
+                {"offers":[
+                  {"offerId":"offer_aaaaaaaaaaaa","expiresAt":0},
+                  {"offerId":"offer_bbbbbbbbbbbb","expiresAt":1},
+                  {"offerId":"offer_cccccccccccc","expiresAt":false},
+                  {"offerId":"offer_dddddddddddd","expiresAt":true}
+                ]}
+                """
+            )
+        }
+
+        let offers = try await client.listInboundOffers()
+
+        XCTAssertEqual(offers, [
+            InboundOffer(offerId: "offer_aaaaaaaaaaaa", expiresAt: 0),
+            InboundOffer(offerId: "offer_bbbbbbbbbbbb", expiresAt: 1),
+        ])
+    }
+
     func testClaimInboundOfferReturnsValidatedSession() async throws {
         // Android parity: HostedCloudClientTest.`claimInboundOffer 成功返回入房凭证`.
         let client = try makeClient(clockMilliseconds: { 1_000 }) { request in
             XCTAssertEqual(request.url?.path, "/v1/inbound-offers/claim")
-            let body = try XCTUnwrap(request.httpBody)
+            let body = try Self.requestBody(request)
             let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
             XCTAssertEqual(json["offerId"], "offer_abcdefghijkl")
             return Self.response(
@@ -184,7 +210,7 @@ final class HostedCloudClientTests: XCTestCase {
             case 1:
                 XCTAssertEqual(request.httpMethod, "POST")
                 XCTAssertEqual(request.url?.path, "/v1/calls")
-                let body = try XCTUnwrap(request.httpBody)
+                let body = try Self.requestBody(request)
                 let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
                 XCTAssertEqual(fields["edgeId"], "edge_abcdefghijkl")
                 XCTAssertEqual(fields["idempotencyKey"], "ios-test-key-1234")
@@ -341,7 +367,7 @@ final class HostedCloudClientTests: XCTestCase {
         let client = try makeClient { request in
             requestCount += 1
             if request.httpMethod == "POST" {
-                postBodies.append(try XCTUnwrap(request.httpBody))
+                postBodies.append(try Self.requestBody(request))
                 if postBodies.count == 1 { throw URLError(.networkConnectionLost) }
                 return Self.response(
                     for: request,
@@ -408,7 +434,24 @@ final class HostedCloudClientTests: XCTestCase {
         )
     }
 
-    private static func response(
+    nonisolated private static func requestBody(_ request: URLRequest) throws -> Data {
+        if let body = request.httpBody { return body }
+        let stream = try XCTUnwrap(request.httpBodyStream)
+        stream.open()
+        defer { stream.close() }
+
+        var body = Data()
+        var buffer = [UInt8](repeating: 0, count: 1_024)
+        while true {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            if count < 0 { throw try XCTUnwrap(stream.streamError) }
+            if count == 0 { break }
+            body.append(buffer, count: count)
+        }
+        return body
+    }
+
+    nonisolated private static func response(
         for request: URLRequest,
         status: Int = 200,
         headers: [String: String] = [:],
@@ -423,7 +466,7 @@ final class HostedCloudClientTests: XCTestCase {
         return (response, Data(json.utf8))
     }
 
-    private static func callJSON(status: String, session: String? = nil) -> String {
+    nonisolated private static func callJSON(status: String, session: String? = nil) -> String {
         let sessionField = session.map { #", "session":\#($0)"# } ?? ""
         return """
         {"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"\(status)","createdAt":1,"expiresAt":9999\(sessionField)}

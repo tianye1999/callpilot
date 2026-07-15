@@ -25,15 +25,29 @@ struct CallView: View {
                 }
             }
 
-            HStack(spacing: 40) {
+            HStack(spacing: 28) {
                 Button { showKeypad.toggle() } label: {
                     Image(systemName: "circle.grid.3x3.fill").font(.title2)
+                        .frame(width: 48, height: 48)
                 }
+                .accessibilityLabel(showKeypad ? "隐藏键盘" : "显示键盘")
+
+                Button {
+                    model.setSpeakerphone(!model.speakerphoneEnabled)
+                } label: {
+                    Image(systemName: model.speakerphoneEnabled ? "speaker.wave.2.fill" : "speaker.fill")
+                        .font(.title2)
+                        .frame(width: 48, height: 48)
+                        .foregroundStyle(model.speakerphoneEnabled ? .blue : .primary)
+                }
+                .accessibilityLabel(model.speakerphoneEnabled ? "关闭扬声器" : "打开扬声器")
+
                 Button { model.hangup() } label: {
                     Image(systemName: "phone.down.fill").font(.title)
                         .frame(width: 72, height: 72)
                         .background(.red, in: Circle()).foregroundStyle(.white)
                 }
+                .accessibilityLabel("挂断")
             }
             Spacer()
         }

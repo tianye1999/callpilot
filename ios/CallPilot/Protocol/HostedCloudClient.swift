@@ -1,7 +1,9 @@
 import Foundation
+import CoreFoundation
 
-/// Hosted `/v1` 适配器(对齐 Android `HostedCloudClient.kt`)。方法为 async,
-/// 调用方负责并发上下文。仅依赖 Foundation。
+/// Hosted `/v1` 适配器(对齐 Android `HostedCloudClient.kt`)。凭证与请求状态
+/// 统一由 MainActor 隔离;仅依赖 Foundation/CoreFoundation。
+@MainActor
 final class HostedCloudClient {
     private let base: URL
     private let origin: String
@@ -11,12 +13,12 @@ final class HostedCloudClient {
     var credential: DeviceCredential?
 
     private static let deviceCookieName = "__Host-callpilot-device"
-    private static let deviceIdRE = /^device_[A-Za-z0-9_-]{12,80}$/
-    private static let edgeIdRE = /^edge_[A-Za-z0-9_-]{12,80}$/
-    private static let callIdRE = /^call_[A-Za-z0-9_-]{12,80}$/
-    private static let offerIdRE = /^offer_[A-Za-z0-9_-]{12,80}$/
-    private static let claimIdRE = /^claim_[A-Za-z0-9_-]{12,80}$/
-    private static let idempotencyKeyRE = /^[A-Za-z0-9._:-]{16,128}$/
+    private static var deviceIdRE: Regex<Substring> { /^device_[A-Za-z0-9_-]{12,80}$/ }
+    private static var edgeIdRE: Regex<Substring> { /^edge_[A-Za-z0-9_-]{12,80}$/ }
+    private static var callIdRE: Regex<Substring> { /^call_[A-Za-z0-9_-]{12,80}$/ }
+    private static var offerIdRE: Regex<Substring> { /^offer_[A-Za-z0-9_-]{12,80}$/ }
+    private static var claimIdRE: Regex<Substring> { /^claim_[A-Za-z0-9_-]{12,80}$/ }
+    private static var idempotencyKeyRE: Regex<Substring> { /^[A-Za-z0-9._:-]{16,128}$/ }
 
     init(
         baseURL: String,
@@ -337,7 +339,8 @@ final class HostedCloudClient {
     }
 
     private static func jsonInt64(_ value: Any?) -> Int64? {
-        guard !(value is Bool), let number = value as? NSNumber else { return nil }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
         let integer = number.int64Value
         guard number.doubleValue.isFinite,
               number.doubleValue == Double(integer) else { return nil }

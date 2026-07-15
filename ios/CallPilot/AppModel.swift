@@ -11,6 +11,7 @@ final class AppModel: ObservableObject {
     @Published var incomingOffer: InboundOffer?
     @Published var lineStatusLabel = "线路状态获取中…"
     @Published var lineReady = false
+    @Published private(set) var speakerphoneEnabled = false
 
     private let store = CredentialStore()
     private var client: HostedCloudClient?
@@ -101,10 +102,10 @@ final class AppModel: ObservableObject {
         guard let c = client, let p = pairing, !callState.isActive else { return }
         let attempt = beginCallAttempt(with: .preparing(label: number))
         // createSession → LiveKit 媒体 → 号码经 Dongle SIM ATD(dial 在 media_ready 后发)。
-        // 具体媒体建立由 CallMediaSession 承担,占位待 LiveKit 接线。
+        // 具体媒体建立与 data-topic 控制由 CallMediaSession 承担。
         _ = apply(.waitingMedia(label: number), for: attempt)
         media = CallMediaSession(onState: { [weak self] st in
-            Task { @MainActor in self?.apply(st, for: attempt) }
+            _ = self?.apply(st, for: attempt)
         })
         await media?.startOutbound(client: c, edgeId: p.edgeId, number: number)
     }
@@ -118,7 +119,7 @@ final class AppModel: ObservableObject {
         let waitingState = CallState.waitingMedia(label: label)
         let attempt = beginCallAttempt(with: waitingState)
         media = CallMediaSession(onState: { [weak self] st in
-            Task { @MainActor in self?.apply(st, for: attempt) }
+            _ = self?.apply(st, for: attempt)
         })
         // 20s 媒体超时:对齐 Android——接管失败不复位会永久 WaitingMedia 挡后续 offer。
         let timeoutTask = Task { [weak self] in
@@ -134,7 +135,7 @@ final class AppModel: ObservableObject {
                 code: "TAKEOVER_MEDIA_TIMEOUT"
             )
             guard self.apply(failedState, for: attempt, from: waitingState) else { return }
-            self.media?.stop()
+            await self.media?.stop()
             do {
                 try await Task.sleep(for: .seconds(2))
             } catch {
@@ -146,15 +147,24 @@ final class AppModel: ObservableObject {
     }
 
     func hangup() {
-        media?.hangup()
+        let activeMedia = media
+        Task { await activeMedia?.hangup() }
     }
 
     func sendDTMF(_ digit: String) {
-        media?.sendDTMF(digit)
+        let activeMedia = media
+        Task { await activeMedia?.sendDTMF(digit) }
+    }
+
+    func setSpeakerphone(_ enabled: Bool) {
+        guard callState.isActive else { return }
+        speakerphoneEnabled = enabled
+        media?.setSpeakerphone(enabled)
     }
 
     private func beginCallAttempt(with initialState: CallState) -> CallAttempt {
         let attempt = callAttempts.begin(with: initialState)
+        speakerphoneEnabled = false
         callState = initialState
         return attempt
     }
@@ -171,6 +181,7 @@ final class AppModel: ObservableObject {
             for: attempt
         ) else { return false }
         callState = nextState
+        if !nextState.isActive { speakerphoneEnabled = false }
         return true
     }
 }

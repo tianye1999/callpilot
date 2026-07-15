@@ -19,9 +19,9 @@ enum EdgeCallEvent: Equatable {
 /// Pure JSON codec for reliable LiveKit data packets. The media layer owns
 /// transport; this type owns only the Edge wire schema.
 enum CallSignaling {
-    private static let numberRE = /^\+?[0-9*#]{1,32}$/
-    private static let dtmfRE = /^[0-9*#]{1,16}$/
-    private static let idempotencyRE = /^[A-Za-z0-9_-]{8,64}$/
+    private static var numberRE: Regex<Substring> { /^\+?[0-9*#]{1,32}$/ }
+    private static var dtmfRE: Regex<Substring> { /^[0-9*#]{1,16}$/ }
+    private static var idempotencyRE: Regex<Substring> { /^[A-Za-z0-9_-]{8,64}$/ }
 
     static func encodeDial(number: String, idempotencyKey: String) throws -> Data {
         guard number.wholeMatch(of: numberRE) != nil else {
