@@ -122,14 +122,14 @@ class KeyValidationResult:
 
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- Agent ----
-    ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "openai",
+    ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "qwen",
                choices=("qwen", "doubao", "openai", "local"), requires_restart=True,
                choice_labels={"doubao": "doubao (experimental)",
                               "local": "local (三段式，音频不出本机)"}),
     ConfigSpec("DASHSCOPE_API_KEY", "DashScope API Key", "str", "",
                secret=True, requires_restart=True),
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
-               "qwen3.5-omni-flash-realtime", requires_restart=True),
+               "qwen3.5-omni-plus-realtime", requires_restart=True),
     # 精选常用音色做下拉;完整 55 种(含方言/多语言)见官网试听页,列表外音色
     # 可直接在 .env 填 QWEN_VOICE(get_str 读环境变量,不受 choices 限制)。
     ConfigSpec("QWEN_VOICE", "Qwen 音色", "select", "Raymond",

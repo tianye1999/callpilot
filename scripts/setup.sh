@@ -94,7 +94,7 @@ fi
 
 echo ""
 info "Setup complete. Next steps:"
-echo "  1. Edit .env — default OpenAI: set OPENAI_API_KEY; to use Qwen, set AGENT_PROVIDER=qwen and DASHSCOPE_API_KEY"
+echo "  1. Edit .env — default Qwen: set DASHSCOPE_API_KEY; to use OpenAI, set AGENT_PROVIDER=openai and OPENAI_API_KEY"
 if [ "$OS" = "Darwin" ]; then
     echo "  2. Plug in the EC20, then start the USB bridge:  .venv/bin/python scripts/ec20_usb_pty.py --map 2:/tmp/ec20-at"
 else

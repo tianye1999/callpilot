@@ -144,10 +144,10 @@ def test_default_provider_and_text_models_match_env_example(monkeypatch):
         encoding="utf-8"
     )
 
-    assert get_str("AGENT_PROVIDER") == "openai"
+    assert get_str("AGENT_PROVIDER") == "qwen"
     assert get_str("SUMMARY_MODEL") == ""
     assert get_str("DTMF_JUDGE_MODEL") == ""
-    assert re.search(r"^AGENT_PROVIDER=openai$", example, re.MULTILINE)
+    assert re.search(r"^AGENT_PROVIDER=qwen$", example, re.MULTILINE)
     assert re.search(r"^SUMMARY_MODEL=$", example, re.MULTILINE)
     assert re.search(r"^DTMF_JUDGE_MODEL=$", example, re.MULTILINE)
 
