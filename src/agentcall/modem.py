@@ -6,12 +6,13 @@ import logging
 import re
 import threading
 import time
+from queue import Queue
 from typing import Callable
 
 import serial
 
 from . import config, platforms, port_detect
-from .sim_identity import UNKNOWN_SIM, SimIdentity, identify
+from .sim_identity import UNKNOWN_SIM, SimIdentity, identify, with_registration
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,8 @@ CLCC_PATTERN = re.compile(
 )
 QPCMV_PATTERN = re.compile(r"\+QPCMV:\s*(\d+),(\d+)")
 CMTI_PATTERN = re.compile(r'\+CMTI:\s*"([^"]*)",\s*(\d+)')
+CREG_PATTERN = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?\d+(?=\s|$)")
+QSIMSTAT_PATTERN = re.compile(r"\+QSIMSTAT:\s*(\d+)\s*,\s*(\d+)")
 
 # GSM 03.38 默认字符表（基础表，用于 7-bit 短信解码）
 GSM7_BASIC = (
@@ -177,6 +180,15 @@ class Eg25Modem:
         # 所有获取都遵循 _serial_lock -> _reconnect_lock，禁止反向锁序。
         self._reconnect_lock = threading.Lock()
         self._reconnect_generation = 0
+        self._reconnect_in_progress = False
+        self._reconnect_complete = threading.Event()
+        self._reconnect_complete.set()
+        self._connection_state_lock = threading.Lock()
+        self._connection_online = False
+        self._connection_disconnected_at: float | None = None
+        self._on_connection_state: Callable[[bool], None] | None = None
+        self._connection_callback_queue: Queue[bool | None] = Queue()
+        self._connection_callback_thread: threading.Thread | None = None
         # 初始化序列进行中：此时 _send 失败不自触发重连（交给 _reconnect 的重试循环），
         # 避免同线程重入 _reconnect 造成死锁。
         self._opening = False
@@ -185,6 +197,13 @@ class Eg25Modem:
         self._on_hangup: Callable[[], None] | None = None
         self._on_sms: Callable[[str | None, str, str], None] | None = None
         self._on_call_connected: Callable[[str | None], None] | None = None
+        self._on_sim_identity: Callable[[SimIdentity], None] | None = None
+        self._sim_state_lock = threading.Lock()
+        self._last_notified_sim_identity = UNKNOWN_SIM
+        self._sim_refresh_lock = threading.Lock()
+        self._sim_refresh_thread: threading.Thread | None = None
+        self._sim_refresh_requested_generation: int | None = None
+        self._sim_refresh_generation = 0
         self._buffer = ""
         self._processing_response_cmti = False
         self._last_caller: str | None = None
@@ -207,6 +226,8 @@ class Eg25Modem:
 
     def connect(self) -> None:
         self._open_serial()
+        self._emit_connection_state(True)
+        self._emit_current_sim_identity()
         logger.info("模组已连接: %s", self._active_port)
 
     def send_command(self, command: str) -> str:
@@ -221,7 +242,12 @@ class Eg25Modem:
     _SIM_READ_RETRIES = 3
     _SIM_READ_RETRY_DELAY = 1.0
 
-    def refresh_sim_identity(self) -> None:
+    def refresh_sim_identity(
+        self,
+        *,
+        notify: bool = True,
+        expected_generation: int | None = None,
+    ) -> None:
         """读 CIMI/CREG 刷新 SIM 身份缓存(#88);AT 逻辑失败降级为 UNKNOWN_SIM,
         传输层故障上抛。connect/重连(``_open_serial``,已持串口锁)自动调用,
         换卡经拔插重连天然刷新;也可被上层主动调用重刷。
@@ -237,7 +263,7 @@ class Eg25Modem:
             except (serial.SerialException, OSError):
                 # 传输层故障必须上抛给 _open_serial 的退避循环——不能吞成"识别失败"
                 # 而让重连误判成功(codex #88 review BLOCK-3)。
-                self._sim_identity = UNKNOWN_SIM
+                self._set_sim_identity(UNKNOWN_SIM, notify=notify)
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning("SIM CIMI 读取异常: %s", type(exc).__name__)
@@ -249,11 +275,16 @@ class Eg25Modem:
         try:
             creg_raw = self._send("AT+CREG?")
         except (serial.SerialException, OSError):
-            self._sim_identity = UNKNOWN_SIM
+            self._set_sim_identity(UNKNOWN_SIM, notify=notify)
             raise
         except Exception:  # noqa: BLE001
             creg_raw = ""
-        self._sim_identity = identify(imsi_raw, creg_raw)
+        if (
+            expected_generation is not None
+            and expected_generation != self._sim_refresh_generation
+        ):
+            return
+        self._set_sim_identity(identify(imsi_raw, creg_raw), notify=notify)
         sim = self._sim_identity
         if sim.present:
             logger.info(
@@ -267,6 +298,25 @@ class Eg25Modem:
     def sim_identity(self) -> SimIdentity:
         """最近一次连接/重连时读到的 SIM 身份(缓存,不触发 AT)。"""
         return self._sim_identity
+
+    def _set_sim_identity(self, identity: SimIdentity, *, notify: bool = True) -> None:
+        callback: Callable[[SimIdentity], None] | None = None
+        with self._sim_state_lock:
+            previous = self._sim_identity
+            self._sim_identity = identity
+            if notify and (
+                identity != previous or identity != self._last_notified_sim_identity
+            ):
+                self._last_notified_sim_identity = identity
+                callback = self._on_sim_identity
+        if callback is not None:
+            try:
+                callback(identity)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SIM 状态回调异常: error_type=%s", type(exc).__name__)
+
+    def _emit_current_sim_identity(self) -> None:
+        self._set_sim_identity(self._sim_identity)
 
     def _resolve_port(self) -> str:
         """把 auto 哨兵解析为实际串口；每次打开都重扫（Windows 重插后 COM 号会变）。
@@ -299,7 +349,9 @@ class Eg25Modem:
                 self._send("ATE0")
                 self._send("AT+CLIP=1")
                 self._init_sms()
-                self.refresh_sim_identity()
+                self._send("AT+QSIMSTAT=1")
+                self._send("AT+CREG=1")
+                self.refresh_sim_identity(notify=False)
             finally:
                 self._opening = False
 
@@ -312,29 +364,61 @@ class Eg25Modem:
         带指数退避重试，直到成功或服务停止。
         """
         observed_generation = self._reconnect_generation
+        owner = False
         with self._serial_lock:
-            # 等串口锁期间若别的线程已完成重连，本次无需重复关闭新连接。
             if observed_generation != self._reconnect_generation:
                 return
             with self._reconnect_lock:
-                try:
-                    if self._ser and self._ser.is_open:
-                        self._ser.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                self._ser = None
-                self._buffer = ""
-                delay = 1.0
-                while self._running and not self._closed:
+                if observed_generation != self._reconnect_generation:
+                    return
+                if not self._reconnect_in_progress:
+                    self._reconnect_in_progress = True
+                    self._reconnect_complete.clear()
+                    with self._sim_refresh_lock:
+                        self._sim_refresh_generation += 1
+                        self._sim_refresh_requested_generation = None
                     try:
-                        self._open_serial()
+                        if self._ser and self._ser.is_open:
+                            self._ser.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._ser = None
+                    self._buffer = ""
+                    owner = True
+
+        if not owner:
+            while self._running and not self._closed:
+                if self._reconnect_complete.wait(timeout=0.2):
+                    return
+            return
+
+        self._emit_connection_state(False)
+        delay = 1.0
+        try:
+            while self._running and not self._closed:
+                try:
+                    self._open_serial()
+                    with self._serial_lock:
                         self._reconnect_generation += 1
-                        logger.info("串口已重连: %s", self._active_port)
-                        return
-                    except (serial.SerialException, OSError) as exc:
-                        logger.warning("串口重连失败，%.0fs 后重试: %s", delay, exc)
-                        time.sleep(delay)
-                        delay = min(delay * 2, 10.0)
+                    self._emit_connection_state(True)
+                    self._emit_current_sim_identity()
+                    logger.info("串口已重连: %s", self._active_port)
+                    return
+                except (serial.SerialException, OSError) as exc:
+                    with self._serial_lock:
+                        try:
+                            if self._ser and self._ser.is_open:
+                                self._ser.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        self._ser = None
+                    logger.warning("串口重连失败，%.0fs 后重试: %s", delay, exc)
+                    time.sleep(delay)
+                    delay = min(delay * 2, 10.0)
+        finally:
+            with self._reconnect_lock:
+                self._reconnect_in_progress = False
+                self._reconnect_complete.set()
 
     def _init_sms(self) -> None:
         """开启短信文本模式并让模组主动上报新短信 (+CMTI)。"""
@@ -449,6 +533,57 @@ class Eg25Modem:
     def on_call_connected(self, callback: Callable[[str | None], None]) -> None:
         self._on_call_connected = callback
 
+    def on_connection_state(self, callback: Callable[[bool], None]) -> None:
+        """Register for initialized serial transport transitions."""
+        self._on_connection_state = callback
+        if self._connection_callback_thread is None:
+            self._connection_callback_thread = threading.Thread(
+                target=self._connection_callback_loop,
+                name="modem-state-callback",
+                daemon=True,
+            )
+            self._connection_callback_thread.start()
+
+    def on_sim_identity(self, callback: Callable[[SimIdentity], None]) -> None:
+        """Register for privacy-safe cached SIM identity transitions."""
+        self._on_sim_identity = callback
+
+    def _emit_connection_state(self, online: bool) -> None:
+        recovery_seconds: float | None = None
+        now = time.time()
+        with self._connection_state_lock:
+            if online == self._connection_online:
+                return
+            self._connection_online = online
+            if online:
+                if self._connection_disconnected_at is not None:
+                    recovery_seconds = max(0.0, now - self._connection_disconnected_at)
+                self._connection_disconnected_at = None
+            else:
+                self._connection_disconnected_at = now
+        if online:
+            if recovery_seconds is None:
+                logger.info("模组传输已就绪")
+            else:
+                logger.info("模组传输已恢复: outage_seconds=%.3f", recovery_seconds)
+        else:
+            logger.warning("模组传输已断开: disconnected_at=%.3f", now)
+        if self._on_connection_state is not None:
+            self._connection_callback_queue.put(online)
+
+    def _connection_callback_loop(self) -> None:
+        while True:
+            online = self._connection_callback_queue.get()
+            if online is None:
+                return
+            callback = self._on_connection_state
+            if callback is None:
+                continue
+            try:
+                callback(online)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("模组连接状态回调异常: error_type=%s", type(exc).__name__)
+
     def start_listener(self) -> None:
         if self._closed:
             return
@@ -535,6 +670,11 @@ class Eg25Modem:
 
     def close(self) -> None:
         self._closed = True  # 终态：阻止后续 start_listener/_reconnect 复活
+        with self._sim_refresh_lock:
+            self._sim_refresh_generation += 1
+            self._sim_refresh_requested_generation = None
+        self._reconnect_complete.set()
+        self._connection_callback_queue.put(None)
         self.stop_listener()
         if self._ser and self._ser.is_open:
             self._ser.close()
@@ -692,6 +832,7 @@ class Eg25Modem:
 
     def _process_buffer(self) -> None:
         self._scan_qpcmv(self._buffer)
+        self._process_sim_urcs()
         while True:
             clip = CLIP_PATTERN.search(self._buffer)
             if clip:
@@ -722,6 +863,72 @@ class Eg25Modem:
             if len(self._buffer) > 4096:
                 self._buffer = self._buffer[-1024:]
             break
+
+    def _process_sim_urcs(self) -> None:
+        """Consume SIM/registration URCs without doing serial I/O on the reader."""
+        while True:
+            creg = CREG_PATTERN.search(self._buffer)
+            qsim = QSIMSTAT_PATTERN.search(self._buffer)
+            matches = [match for match in (creg, qsim) if match is not None]
+            if not matches:
+                return
+            match = min(matches, key=lambda item: item.start())
+            self._buffer = self._buffer[:match.start()] + self._buffer[match.end():]
+            if match.re is CREG_PATTERN:
+                self._set_sim_identity(with_registration(self._sim_identity, match.group(0)))
+                continue
+
+            enabled, inserted = match.group(1), match.group(2)
+            if enabled != "1":
+                continue
+            if inserted == "0":
+                with self._sim_refresh_lock:
+                    self._sim_refresh_generation += 1
+                    self._sim_refresh_requested_generation = None
+                self._set_sim_identity(UNKNOWN_SIM)
+            elif inserted in {"1", "2"}:
+                self._schedule_sim_identity_refresh()
+
+    _SIM_REFRESH_DEBOUNCE_SECONDS = 0.3
+
+    def _schedule_sim_identity_refresh(self) -> None:
+        with self._sim_refresh_lock:
+            self._sim_refresh_requested_generation = self._sim_refresh_generation
+            worker = self._sim_refresh_thread
+            if worker is not None and worker.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._sim_identity_refresh_worker,
+                name="sim-identity-refresh",
+                daemon=True,
+            )
+            self._sim_refresh_thread = worker
+            worker.start()
+
+    def _sim_identity_refresh_worker(self) -> None:
+        try:
+            while True:
+                time.sleep(self._SIM_REFRESH_DEBOUNCE_SECONDS)
+                with self._sim_refresh_lock:
+                    generation = self._sim_refresh_requested_generation
+                    self._sim_refresh_requested_generation = None
+                    if generation is None:
+                        self._sim_refresh_thread = None
+                        return
+                if self._closed:
+                    return
+                if generation != self._sim_refresh_generation:
+                    continue
+                self.refresh_sim_identity(expected_generation=generation)
+                with self._sim_refresh_lock:
+                    if self._sim_refresh_requested_generation is None:
+                        return
+        except (serial.SerialException, OSError) as exc:
+            logger.warning("SIM 热插拔刷新失败: error_type=%s", type(exc).__name__)
+        finally:
+            with self._sim_refresh_lock:
+                if self._sim_refresh_thread is threading.current_thread():
+                    self._sim_refresh_thread = None
 
     # 通话在线期间 CLCC 轮询连续异常达到该阈值（×2s ≈ 60s），判定串口
     # 已无法恢复、通话必然丢失，放弃等待并收尾会话（覆盖桥永久死亡场景）。

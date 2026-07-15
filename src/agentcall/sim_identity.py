@@ -14,7 +14,7 @@ AT 交互与缓存在 modem 层(Eg25Modem.refresh_sim_identity)。
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 # 中国大陆四大运营商 PLMN(MCC=460 + MNC)。来源:公开号段分配(ITU/工信部),
 # 与 ~/.claude skill callpilot-sim-check、issue #72/#88 一致。
@@ -40,7 +40,7 @@ _SERVICE_NUMBERS: dict[str, str] = {
 }
 
 _IMSI_RE = re.compile(r"\b(\d{14,15})\b")
-_CREG_RE = re.compile(r"\+CREG:\s*\d+\s*,\s*(\d+)")
+_CREG_RE = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?(\d+)(?:\s|$)")
 
 # CREG <stat> 语义(3GPP TS 27.007):1=已注册(本地),5=已注册(漫游)。
 _REGISTERED_STATS = {"1", "5"}
@@ -116,3 +116,9 @@ def identify(imsi_raw: str, creg_raw: str = "") -> SimIdentity:
         registered=registered,
         reg_status=reg_status,
     )
+
+
+def with_registration(identity: SimIdentity, creg_raw: str) -> SimIdentity:
+    """Return ``identity`` with only its cached CREG state updated."""
+    registered, reg_status = parse_creg(creg_raw)
+    return replace(identity, registered=registered, reg_status=reg_status)

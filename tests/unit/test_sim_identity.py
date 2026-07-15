@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import threading
+
 from agentcall.sim_identity import (
     UNKNOWN_SIM,
     identify,
     parse_creg,
     parse_imsi,
+    with_registration,
 )
 
 # ---- parse_imsi ----
@@ -33,6 +36,8 @@ def test_parse_imsi_error_and_garbage_rejected():
 def test_parse_creg_registered_states():
     assert parse_creg("+CREG: 0,1\r\nOK") == (True, "已注册")
     assert parse_creg("+CREG: 0,5\r\nOK") == (True, "已注册(漫游)")
+    assert parse_creg("+CREG: 1\r\n") == (True, "已注册")
+    assert parse_creg("+CREG: 5\r\n") == (True, "已注册(漫游)")
 
 
 def test_parse_creg_searching_and_denied():
@@ -44,6 +49,19 @@ def test_parse_creg_searching_and_denied():
 def test_parse_creg_malformed():
     assert parse_creg("") == (False, "未知")
     assert parse_creg("ERROR") == (False, "未知")
+
+
+def test_with_registration_preserves_sim_identity_fields():
+    sim = identify("460000123456789\r\nOK", "+CREG: 0,1")
+
+    updated = with_registration(sim, "+CREG: 2")
+
+    assert updated.present is True
+    assert updated.plmn == sim.plmn
+    assert updated.carrier == sim.carrier
+    assert updated.service_number == sim.service_number
+    assert updated.registered is False
+    assert updated.reg_status == "搜网中"
 
 
 # ---- identify:四大运营商映射(全 PLMN 表逐条锁死)----
@@ -166,3 +184,121 @@ def test_modem_default_identity_before_connect():
     from agentcall.sim_identity import UNKNOWN_SIM
 
     assert Eg25Modem("unused").sim_identity == UNKNOWN_SIM
+
+
+def test_creg_urc_updates_registration_without_losing_carrier():
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("unused")
+    modem._sim_identity = identify("460000123456789\r\nOK", "+CREG: 0,1")
+    events = []
+    modem.on_sim_identity(events.append)
+
+    modem._buffer = "\r\n+CREG: 2\r\n"
+    modem._process_buffer()
+    modem._buffer += "\r\n+CREG: 2\r\n"
+    modem._process_buffer()
+
+    assert modem.sim_identity.carrier == "中国移动"
+    assert modem.sim_identity.service_number == "10086"
+    assert modem.sim_identity.reg_status == "搜网中"
+    assert len(events) == 1
+
+
+def test_qsimstat_removal_is_immediate_and_does_not_refresh_inline(monkeypatch):
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("unused")
+    modem._sim_identity = identify("460000123456789\r\nOK", "+CREG: 0,1")
+    calls: list[str] = []
+    events = []
+    monkeypatch.setattr(modem, "_send", lambda command: calls.append(command) or "OK")
+    modem.on_sim_identity(events.append)
+
+    modem._buffer = "\r\n+QSIMSTAT: 1,0\r\n"
+    modem._process_buffer()
+
+    assert modem.sim_identity == UNKNOWN_SIM
+    assert events == [UNKNOWN_SIM]
+    assert calls == []
+
+
+def test_qsimstat_insertion_debounces_refresh_on_background_worker(monkeypatch):
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("unused")
+    modem._SIM_REFRESH_DEBOUNCE_SECONDS = 0.01
+    calls: list[tuple[str, str]] = []
+
+    def send(command: str) -> str:
+        calls.append((command, threading.current_thread().name))
+        if command == "AT+CIMI":
+            return "460000123456789\r\nOK"
+        if command == "AT+CREG?":
+            return "+CREG: 0,1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", send)
+    modem._buffer = "\r\n+QSIMSTAT: 1,1\r\n+QSIMSTAT: 1,2\r\n"
+    modem._process_buffer()
+    worker = modem._sim_refresh_thread
+    assert worker is not None
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert [command for command, _thread in calls].count("AT+CIMI") == 1
+    assert all(thread != threading.current_thread().name for _, thread in calls)
+    assert modem.sim_identity.carrier == "中国移动"
+
+
+def test_qsimstat_remove_then_insert_during_debounce_keeps_latest_refresh(monkeypatch):
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("unused")
+    modem._SIM_REFRESH_DEBOUNCE_SECONDS = 0.03
+
+    def send(command: str) -> str:
+        if command == "AT+CIMI":
+            return "460000123456789\r\nOK"
+        if command == "AT+CREG?":
+            return "+CREG: 0,1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", send)
+    modem._buffer = "\r\n+QSIMSTAT: 1,1\r\n"
+    modem._process_buffer()
+    modem._buffer = "\r\n+QSIMSTAT: 1,0\r\n+QSIMSTAT: 1,1\r\n"
+    modem._process_buffer()
+    worker = modem._sim_refresh_thread
+    assert worker is not None
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert modem.sim_identity.carrier == "中国移动"
+
+
+def test_open_serial_enables_sim_and_registration_urcs_before_identity_refresh(monkeypatch):
+    from agentcall import modem as modem_mod
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("unused")
+    commands: list[str] = []
+    monkeypatch.setattr(modem_mod.serial, "Serial", lambda **_kwargs: object())
+    monkeypatch.setattr(modem_mod.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(modem, "_drain", lambda: None)
+
+    def send(command: str) -> str:
+        commands.append(command)
+        if command == "AT+CIMI":
+            return "460000123456789\r\nOK"
+        if command == "AT+CREG?":
+            return "+CREG: 0,1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", send)
+    monkeypatch.setattr(modem, "_init_sms", lambda: None)
+
+    modem._open_serial()
+
+    assert commands.index("AT+QSIMSTAT=1") < commands.index("AT+CIMI")
+    assert commands.index("AT+CREG=1") < commands.index("AT+CIMI")

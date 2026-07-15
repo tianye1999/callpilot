@@ -1710,9 +1710,15 @@ function setModem(connected) {
   $("modemDot").classList.toggle("on", connected);
   $("modemState").textContent = t(connected ? "modem_on" : "modem_off");
 }
+let metaRefreshTimer = null;
+function scheduleMetaRefresh() {
+  clearTimeout(metaRefreshTimer);
+  metaRefreshTimer = setTimeout(() => { void loadMeta(); }, 200);
+}
 function handleEvent(ev) {
-  if (ev.type === "modem_status") {
-    setModem(!!ev.connected);
+  if (ev.type === "modem_status" || ev.type === "sim_status") {
+    if (ev.type === "modem_status") setModem(!!ev.connected);
+    scheduleMetaRefresh();
   } else if (ev.type === "call") {
     setCall(ev.status, ev.caller);
     if (ev.status === "ended") setTimeout(() => { loadHistory(); loadRecent(); }, 1200);

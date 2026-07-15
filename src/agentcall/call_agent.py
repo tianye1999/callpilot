@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+from datetime import UTC, datetime
 from queue import Empty, Queue
 from typing import Callable
 
@@ -55,6 +56,7 @@ from .remote_dialer import (
     RemoteWebDialerCoordinator,
     issue_livekit_session,
 )
+from .sim_identity import SimIdentity
 from .sms_email_forwarder import SmsEmailForwarder
 from .summarizer import judge_wrap_up, summarize_call
 
@@ -1339,6 +1341,9 @@ class CallAgentService:
         # supervisor 反复重连直到成功（首次连上后由 modem 读循环自愈接管）。
         # 注入 modem（测试/直连）视为已就绪；自建的由 supervisor 连上后置 True。
         self.modem_connected = modem is not None
+        self._modem_state_lock = threading.Lock()
+        self._modem_disconnected_monotonic: float | None = None
+        self._modem_disconnected_at: str | None = None
         self._service_running = False
         self._supervisor_thread: threading.Thread | None = None
         self.sms_email_forwarder = (
@@ -1476,9 +1481,21 @@ class CallAgentService:
             except Exception as exc:  # noqa: BLE001 - 转发失败不能中断模组监听。
                 logger.warning("短信邮件转发入队失败: error_type=%s", type(exc).__name__)
 
+        def on_connection_state(connected: bool) -> None:
+            self._set_modem_connected(connected)
+
+        def on_sim_identity(identity: SimIdentity) -> None:
+            self._publish({"type": "sim_status", **identity.as_dict()})
+
         self.modem.on_ring(on_ring)
         self.modem.on_hangup(on_hangup)
         self.modem.on_sms(on_sms)
+        connection_registrar = getattr(self.modem, "on_connection_state", None)
+        if callable(connection_registrar):
+            connection_registrar(on_connection_state)
+        sim_registrar = getattr(self.modem, "on_sim_identity", None)
+        if callable(sim_registrar):
+            sim_registrar(on_sim_identity)
 
     def dial(
         self,
@@ -1692,6 +1709,7 @@ class CallAgentService:
             "configured": not missing,
             "missing": missing,
             "active": bool(worker and worker.is_running),
+            "modem_online": self.modem_connected,
         }
         if worker is not None:
             payload.update(worker.coordinator.status())
@@ -1878,15 +1896,36 @@ class CallAgentService:
 
     def _set_modem_connected(self, connected: bool, error: str | None = None) -> None:
         """更新模组连接状态并广播给 UI（仅状态翻转时发事件，避免重连期刷屏）。"""
-        if connected == self.modem_connected:
-            return
-        self.modem_connected = connected
-        event = {"type": "modem_status", "connected": connected}
-        if error:
-            event["error"] = error
+        with self._modem_state_lock:
+            if connected == self.modem_connected:
+                return
+            self.modem_connected = connected
+            event: dict = {"type": "modem_status", "connected": connected}
+            if connected:
+                if self._modem_disconnected_monotonic is not None:
+                    event["recovery_seconds"] = round(
+                        max(0.0, time.monotonic() - self._modem_disconnected_monotonic), 3
+                    )
+                if self._modem_disconnected_at is not None:
+                    event["disconnected_at"] = self._modem_disconnected_at
+                self._modem_disconnected_monotonic = None
+                self._modem_disconnected_at = None
+            else:
+                self._modem_disconnected_monotonic = time.monotonic()
+                self._modem_disconnected_at = datetime.now(UTC).isoformat()
+                event["disconnected_at"] = self._modem_disconnected_at
+            if error:
+                event["error"] = error
         self._publish(event)
         if connected:
+            if "recovery_seconds" in event:
+                logger.info(
+                    "模组连接已恢复: recovery_seconds=%.3f",
+                    event["recovery_seconds"],
+                )
             self._publish({"type": "system", "text": "服务已启动，等待来电"})
+        else:
+            logger.warning("模组连接已断开: disconnected_at=%s", event["disconnected_at"])
 
     def stop_service(self) -> None:
         """停止 supervisor 与当前会话，关闭模组（供退出时调用）。"""

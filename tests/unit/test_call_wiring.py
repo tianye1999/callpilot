@@ -1264,6 +1264,38 @@ def test_modem_status_not_spammed_on_repeated_failure():
     assert len(events) == 1 and events[0]["connected"] is True
 
 
+def test_modem_callbacks_drive_truthful_status_and_privacy_safe_sim_events():
+    from agentcall.sim_identity import identify
+
+    hub = make_hub()
+    modem = FakeModem()
+    callbacks: dict[str, object] = {}
+    modem.on_connection_state = (  # type: ignore[attr-defined]
+        lambda callback: callbacks.__setitem__("connection", callback)
+    )
+    modem.on_sim_identity = (  # type: ignore[attr-defined]
+        lambda callback: callbacks.__setitem__("sim", callback)
+    )
+    service = make_service(modem, hub=hub)
+
+    on_connection = callbacks["connection"]
+    on_sim = callbacks["sim"]
+    on_connection(False)  # type: ignore[operator]
+    on_connection(False)  # type: ignore[operator]
+    assert service.remote_dialer_status()["modem_online"] is False
+    on_connection(True)  # type: ignore[operator]
+    on_sim(identify("460000123456789\r\nOK", "+CREG: 1"))  # type: ignore[operator]
+
+    statuses = [event for event in hub.history() if event.get("type") == "modem_status"]
+    assert [event["connected"] for event in statuses] == [False, True]
+    assert "disconnected_at" in statuses[0]
+    assert statuses[1]["recovery_seconds"] >= 0
+    sim_event = next(event for event in hub.history() if event.get("type") == "sim_status")
+    assert sim_event["carrier"] == "中国移动"
+    assert sim_event["service_number"] == "10086"
+    assert "460000123456789" not in str(sim_event)
+
+
 def test_dial_rejected_when_modem_not_connected(monkeypatch):
     """模组未连接时拨打必须立即拒绝，而不是假装"已发起呼叫"。"""
     from agentcall.call_agent import CallAgentService

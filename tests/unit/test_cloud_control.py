@@ -133,6 +133,15 @@ def test_cloud_client_accepts_only_complete_unexpired_session_commands() -> None
     assert len(sent) == 1
 
 
+def test_heartbeat_tracks_live_modem_connection_state() -> None:
+    service = _Service()
+    client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
+
+    assert json.loads(client._heartbeat())["status"]["modemOnline"] is True
+    service.modem_connected = False
+    assert json.loads(client._heartbeat())["status"]["modemOnline"] is False
+
+
 def test_cloud_api_never_includes_bearer_in_url_or_error(monkeypatch) -> None:
     captured = []
     credential = EdgeCredential(

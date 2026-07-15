@@ -86,6 +86,15 @@ def test_websocket_reconnect_clears_stale_call_and_recording_state():
     assert 'setCall("idle", "");' in text
 
 
+def test_modem_and_sim_events_debounce_metadata_refresh():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert "function scheduleMetaRefresh()" in text
+    assert 'ev.type === "modem_status" || ev.type === "sim_status"' in text
+    assert "clearTimeout(metaRefreshTimer)" in text
+    assert "metaRefreshTimer = setTimeout(() => { void loadMeta(); }" in text
+
+
 def test_dashboard_listener_recovers_suspended_web_audio():
     """WebKit 打断 AudioContext 后，旁听要恢复而不是保持“旁听中”但静音。"""
     text = INDEX.read_text(encoding="utf-8")

@@ -396,6 +396,79 @@ def test_reconnect_state_machine_retries_and_replaces_serial(monkeypatch):
     assert delays == [1.0, 2.0]
 
 
+def test_reconnect_emits_transition_only_callbacks_outside_modem_locks(monkeypatch):
+    modem = make_modem()
+    modem._ser = FakeSerial()
+    modem._running = True
+    modem._connection_online = True
+    attempts = 0
+    transitions: list[bool] = []
+    online_seen = threading.Event()
+
+    def on_state(online: bool) -> None:
+        assert not modem._serial_lock._is_owned()  # type: ignore[attr-defined]
+        assert not modem._reconnect_lock.locked()
+        transitions.append(online)
+        if online:
+            online_seen.set()
+
+    def flaky_open() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise serial.SerialException("bridge not ready")
+        modem._ser = FakeSerial()
+
+    modem.on_connection_state(on_state)
+    monkeypatch.setattr(modem, "_open_serial", flaky_open)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda _seconds: None)
+
+    modem._reconnect()
+    modem._running = False
+
+    assert online_seen.wait(timeout=1)
+    assert transitions == [False, True]
+    assert attempts == 3
+
+
+def test_stale_concurrent_reconnect_does_not_flap_connection_state(monkeypatch):
+    modem = make_modem()
+    modem._ser = FakeSerial()
+    modem._running = True
+    modem._connection_online = True
+    transitions: list[bool] = []
+    online_seen = threading.Event()
+    entered_open = threading.Event()
+    release_open = threading.Event()
+
+    def reopen() -> None:
+        entered_open.set()
+        assert release_open.wait(timeout=2)
+        modem._ser = FakeSerial()
+
+    def on_state(online: bool) -> None:
+        transitions.append(online)
+        if online:
+            online_seen.set()
+
+    modem.on_connection_state(on_state)
+    monkeypatch.setattr(modem, "_open_serial", reopen)
+
+    first = threading.Thread(target=modem._reconnect, daemon=True)
+    second = threading.Thread(target=modem._reconnect, daemon=True)
+    first.start()
+    assert entered_open.wait(timeout=1)
+    second.start()
+    release_open.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+    modem._running = False
+
+    assert not first.is_alive() and not second.is_alive()
+    assert online_seen.wait(timeout=1)
+    assert transitions == [False, True]
+
+
 def test_hangup_commands_not_interleaved_by_concurrent_send():
     """hangup 持锁期间，并发线程的 _send（如 CLCC 轮询）不得插进 ATH 与 AT+QPCMV=0 之间。"""
     modem = make_modem()
