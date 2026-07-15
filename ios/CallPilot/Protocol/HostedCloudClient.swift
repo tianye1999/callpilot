@@ -7,19 +7,25 @@ final class HostedCloudClient {
     private let origin: String
     private let urlSession: URLSession
     private let clockMilliseconds: () -> Int64
+    private let sleepMilliseconds: (UInt64) async throws -> Void
     var credential: DeviceCredential?
 
     private static let deviceCookieName = "__Host-callpilot-device"
     private static let deviceIdRE = /^device_[A-Za-z0-9_-]{12,80}$/
     private static let edgeIdRE = /^edge_[A-Za-z0-9_-]{12,80}$/
+    private static let callIdRE = /^call_[A-Za-z0-9_-]{12,80}$/
     private static let offerIdRE = /^offer_[A-Za-z0-9_-]{12,80}$/
     private static let claimIdRE = /^claim_[A-Za-z0-9_-]{12,80}$/
+    private static let idempotencyKeyRE = /^[A-Za-z0-9._:-]{16,128}$/
 
     init(
         baseURL: String,
         urlSession: URLSession = .shared,
         clockMilliseconds: @escaping () -> Int64 = {
             Int64(Date().timeIntervalSince1970 * 1_000)
+        },
+        sleepMilliseconds: @escaping (UInt64) async throws -> Void = { delay in
+            try await Task.sleep(nanoseconds: delay * 1_000_000)
         }
     ) throws {
         guard let url = URL(string: baseURL), let scheme = url.scheme, let host = url.host else {
@@ -31,6 +37,7 @@ final class HostedCloudClient {
         self.origin = originStr
         self.urlSession = urlSession
         self.clockMilliseconds = clockMilliseconds
+        self.sleepMilliseconds = sleepMilliseconds
     }
 
     // MARK: - 配对
@@ -68,6 +75,62 @@ final class HostedCloudClient {
         return HostedDeviceStatus(connected: connected, modemOnline: modemOnline)
     }
 
+    // MARK: - 外呼会话
+
+    /// 创建云端会话并轮询到 Edge 签发 LiveKit 凭证。号码不进入云 API，
+    /// 必须等房间的 media_ready 事件后再经 data topic 发给 Edge。
+    func createSession(
+        edgeId: String,
+        idempotencyKey: String = "ios-\(UUID().uuidString)"
+    ) async throws -> HostedCallSession {
+        guard edgeId.wholeMatch(of: Self.edgeIdRE) != nil else {
+            throw HostedCloudError(statusCode: 0, code: "BAD_EDGE_ID", message: "云配对缺少有效的 Edge ID")
+        }
+        guard idempotencyKey.wholeMatch(of: Self.idempotencyKeyRE) != nil else {
+            throw HostedCloudError(
+                statusCode: 0,
+                code: "BAD_IDEMPOTENCY_KEY",
+                message: "idempotency key 格式不合法"
+            )
+        }
+
+        let body = try JSONSerialization.data(withJSONObject: [
+            "edgeId": edgeId,
+            "idempotencyKey": idempotencyKey,
+        ])
+        let created = try await createCallWithRetry(body: body, expectedEdgeId: edgeId)
+        try throwIfTerminal(created)
+
+        let pollingStartedAt = clockMilliseconds()
+        while clockMilliseconds() < created.expiresAt {
+            let (payload, response) = try await request("GET", "v1/calls/\(created.callId)")
+            let call = try decodeCall(payload, statusCode: response.statusCode)
+            try validateCall(
+                call,
+                expectedCallId: created.callId,
+                expectedEdgeId: edgeId,
+                statusCode: response.statusCode
+            )
+            try throwIfTerminal(call)
+            if let session = call.session {
+                try validateSession(session, statusCode: response.statusCode)
+                return HostedCallSession(
+                    sessionId: call.callId,
+                    livekitURL: session.livekitURL,
+                    token: session.token,
+                    expiresAt: session.expiresAt
+                )
+            }
+
+            let now = clockMilliseconds()
+            let remaining = created.expiresAt - now
+            if remaining <= 0 { break }
+            let interval: Int64 = now - pollingStartedAt < 3_000 ? 250 : 1_000
+            try await sleepMilliseconds(UInt64(min(interval, remaining)))
+        }
+        throw HostedCloudError(statusCode: 408, code: "SESSION_TIMEOUT", message: "等待云端通话会话超时")
+    }
+
     // MARK: - 来电接管(#95)
 
     /// 轮询本 Edge 当前可接管的 offer(仅 opaque id)。
@@ -77,7 +140,7 @@ final class HostedCloudClient {
         return items.compactMap { item in
             guard let offerId = item["offerId"] as? String,
                   offerId.wholeMatch(of: Self.offerIdRE) != nil,
-                  let expiresAt = (item["expiresAt"] as? NSNumber)?.int64Value else { return nil }
+                  let expiresAt = Self.jsonInt64(item["expiresAt"]) else { return nil }
             return InboundOffer(offerId: offerId, expiresAt: expiresAt)
         }
     }
@@ -94,19 +157,18 @@ final class HostedCloudClient {
               let echoed = payload["offerId"] as? String, echoed == offerId,
               let url = payload["url"] as? String,
               let token = payload["token"] as? String,
-              let expiresAt = (payload["expiresAt"] as? NSNumber)?.int64Value else {
+              let expiresAt = Self.jsonInt64(payload["expiresAt"]) else {
             throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE",
                                    message: "接管响应字段不完整或标识不匹配")
         }
-        guard let livekitURL = URL(string: url),
-              livekitURL.scheme == "wss",
-              livekitURL.host != nil,
-              !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              expiresAt > clockMilliseconds() else {
-            throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE",
-                                   message: "接管响应会话连接信息不合法")
-        }
-        return HostedCallSession(sessionId: claimId, livekitURL: url, token: token, expiresAt: expiresAt)
+        let session = HostedSessionPayload(livekitURL: url, token: token, expiresAt: expiresAt)
+        try validateSession(session, statusCode: response.statusCode)
+        return HostedCallSession(
+            sessionId: claimId,
+            livekitURL: session.livekitURL,
+            token: session.token,
+            expiresAt: session.expiresAt
+        )
     }
 
     // MARK: - 内部
@@ -140,6 +202,146 @@ final class HostedCloudClient {
             )
         }
         return (obj, http)
+    }
+
+    private struct HostedSessionPayload {
+        let livekitURL: String
+        let token: String
+        let expiresAt: Int64
+    }
+
+    private struct HostedCallPayload {
+        let callId: String
+        let edgeId: String
+        let status: String
+        let createdAt: Int64
+        let expiresAt: Int64
+        let errorCode: String?
+        let session: HostedSessionPayload?
+    }
+
+    private func createCallWithRetry(
+        body: Data,
+        expectedEdgeId: String
+    ) async throws -> HostedCallPayload {
+        for attempt in 0..<2 {
+            do {
+                let (payload, response) = try await request("POST", "v1/calls", body: body)
+                let call = try decodeCall(payload, statusCode: response.statusCode)
+                try validateCall(
+                    call,
+                    expectedCallId: nil,
+                    expectedEdgeId: expectedEdgeId,
+                    statusCode: response.statusCode
+                )
+                return call
+            } catch is URLError where attempt == 0 {
+                continue
+            }
+        }
+        throw HostedCloudError(statusCode: 0, code: "TRANSPORT_ERROR", message: "云控制面请求失败")
+    }
+
+    private func decodeCall(
+        _ payload: [String: Any],
+        statusCode: Int
+    ) throws -> HostedCallPayload {
+        guard let callId = payload["callId"] as? String,
+              let edgeId = payload["edgeId"] as? String,
+              let status = payload["status"] as? String,
+              let createdAt = Self.jsonInt64(payload["createdAt"]),
+              let expiresAt = Self.jsonInt64(payload["expiresAt"]) else {
+            throw HostedCloudError(
+                statusCode: statusCode,
+                code: "INVALID_RESPONSE",
+                message: "云端呼叫响应字段不完整"
+            )
+        }
+
+        var session: HostedSessionPayload?
+        if let value = payload["session"] {
+            guard status == "ready",
+                  let fields = value as? [String: Any],
+                  let livekitURL = fields["livekitUrl"] as? String,
+                  let token = fields["token"] as? String,
+                  let sessionExpiresAt = Self.jsonInt64(fields["expiresAt"]) else {
+                throw HostedCloudError(
+                    statusCode: statusCode,
+                    code: "INVALID_RESPONSE",
+                    message: "云端呼叫会话字段不完整"
+                )
+            }
+            session = HostedSessionPayload(
+                livekitURL: livekitURL,
+                token: token,
+                expiresAt: sessionExpiresAt
+            )
+        }
+
+        return HostedCallPayload(
+            callId: callId,
+            edgeId: edgeId,
+            status: status,
+            createdAt: createdAt,
+            expiresAt: expiresAt,
+            errorCode: payload["errorCode"] as? String,
+            session: session
+        )
+    }
+
+    private func validateCall(
+        _ call: HostedCallPayload,
+        expectedCallId: String?,
+        expectedEdgeId: String,
+        statusCode: Int
+    ) throws {
+        let allowedStatuses = ["pending", "ready", "failed", "ended"]
+        guard call.callId.wholeMatch(of: Self.callIdRE) != nil,
+              call.edgeId == expectedEdgeId,
+              expectedCallId == nil || call.callId == expectedCallId,
+              allowedStatuses.contains(call.status),
+              call.createdAt <= call.expiresAt,
+              call.session == nil || call.status == "ready" else {
+            throw HostedCloudError(
+                statusCode: statusCode,
+                code: "INVALID_RESPONSE",
+                message: "云端呼叫响应内容不合法"
+            )
+        }
+    }
+
+    private func validateSession(
+        _ session: HostedSessionPayload,
+        statusCode: Int
+    ) throws {
+        guard let url = URL(string: session.livekitURL),
+              url.scheme == "wss",
+              url.host != nil,
+              !session.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              session.expiresAt > clockMilliseconds() else {
+            throw HostedCloudError(
+                statusCode: statusCode,
+                code: "INVALID_RESPONSE",
+                message: "云端会话连接信息不合法"
+            )
+        }
+    }
+
+    private func throwIfTerminal(_ call: HostedCallPayload) throws {
+        guard call.status == "failed" || call.status == "ended" else { return }
+        throw HostedCloudError(
+            statusCode: 200,
+            code: call.errorCode ?? "CALL_FAILED",
+            message: "云端呼叫创建失败"
+        )
+    }
+
+    private static func jsonInt64(_ value: Any?) -> Int64? {
+        guard !(value is Bool), let number = value as? NSNumber else { return nil }
+        let integer = number.int64Value
+        guard number.doubleValue.isFinite,
+              number.doubleValue == Double(integer) else { return nil }
+        return integer
     }
 
     private static func credentialFromSetCookie(_ response: HTTPURLResponse) -> DeviceCredential? {

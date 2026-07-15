@@ -175,6 +175,224 @@ final class HostedCloudClientTests: XCTestCase {
         }
     }
 
+    func testCreateSessionPostsThenPollsUntilReady() async throws {
+        // Android parity: HostedCloudClientTest.`createSession 创建呼叫并轮询到 ready`.
+        var requestCount = 0
+        let client = try makeClient { request in
+            requestCount += 1
+            switch requestCount {
+            case 1:
+                XCTAssertEqual(request.httpMethod, "POST")
+                XCTAssertEqual(request.url?.path, "/v1/calls")
+                let body = try XCTUnwrap(request.httpBody)
+                let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+                XCTAssertEqual(fields["edgeId"], "edge_abcdefghijkl")
+                XCTAssertEqual(fields["idempotencyKey"], "ios-test-key-1234")
+                return Self.response(
+                    for: request,
+                    status: 202,
+                    json: Self.callJSON(status: "pending")
+                )
+            case 2:
+                XCTAssertEqual(request.httpMethod, "GET")
+                XCTAssertEqual(request.url?.path, "/v1/calls/call_abcdefghijkl")
+                return Self.response(for: request, json: Self.callJSON(status: "pending"))
+            default:
+                XCTAssertEqual(request.url?.path, "/v1/calls/call_abcdefghijkl")
+                return Self.response(
+                    for: request,
+                    json: Self.callJSON(
+                        status: "ready",
+                        session: #"{"livekitUrl":"wss://lk.example.com","token":"jwt-token","expiresAt":9999}"#
+                    )
+                )
+            }
+        }
+
+        let session = try await client.createSession(
+            edgeId: "edge_abcdefghijkl",
+            idempotencyKey: "ios-test-key-1234"
+        )
+
+        XCTAssertEqual(requestCount, 3)
+        XCTAssertEqual(session.sessionId, "call_abcdefghijkl")
+        XCTAssertEqual(session.livekitURL, "wss://lk.example.com")
+        XCTAssertEqual(session.token, "jwt-token")
+    }
+
+    func testCreateSessionPreservesStablePreflightError() async throws {
+        // Android parity: HostedCloudClientTest.`结构化 API 错误按 code 暴露`.
+        let client = try makeClient { request in
+            Self.response(
+                for: request,
+                status: 409,
+                json: #"{"error":{"code":"MODEM_OFFLINE","message":"Modem is offline"}}"#
+            )
+        }
+
+        do {
+            _ = try await client.createSession(
+                edgeId: "edge_abcdefghijkl",
+                idempotencyKey: "ios-test-key-1234"
+            )
+            XCTFail("Expected preflight rejection")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.statusCode, 409)
+            XCTAssertEqual(error.code, "MODEM_OFFLINE")
+            XCTAssertEqual(error.message, "Modem is offline")
+        }
+    }
+
+    func testCreateSessionRejectsMismatchedPollIdentity() async throws {
+        // Android parity: HostedCloudClientTest.`轮询响应的 callId 或 edgeId 不匹配时拒绝会话`.
+        var requestCount = 0
+        let client = try makeClient { request in
+            requestCount += 1
+            if requestCount == 1 {
+                return Self.response(
+                    for: request,
+                    status: 202,
+                    json: Self.callJSON(status: "pending")
+                )
+            }
+            return Self.response(
+                for: request,
+                json: """
+                {"callId":"call_otherresponse","edgeId":"edge_abcdefghijkl","status":"ready","createdAt":1,"expiresAt":9999,"session":{"livekitUrl":"wss://lk.example.com","token":"jwt-token","expiresAt":9999}}
+                """
+            )
+        }
+
+        do {
+            _ = try await client.createSession(
+                edgeId: "edge_abcdefghijkl",
+                idempotencyKey: "ios-test-key-1234"
+            )
+            XCTFail("Expected mismatched call identity to fail closed")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "INVALID_RESPONSE")
+        }
+    }
+
+    func testCreateSessionRejectsInvalidReadyCredentials() async throws {
+        // Android parity: HostedCloudClientTest.`ready 会话必须提供 wss 地址和非空 token`.
+        var requestCount = 0
+        let client = try makeClient { request in
+            requestCount += 1
+            if requestCount == 1 {
+                return Self.response(
+                    for: request,
+                    status: 202,
+                    json: Self.callJSON(status: "pending")
+                )
+            }
+            return Self.response(
+                for: request,
+                json: Self.callJSON(
+                    status: "ready",
+                    session: #"{"livekitUrl":"https://lk.example.com","token":"","expiresAt":9999}"#
+                )
+            )
+        }
+
+        do {
+            _ = try await client.createSession(
+                edgeId: "edge_abcdefghijkl",
+                idempotencyKey: "ios-test-key-1234"
+            )
+            XCTFail("Expected invalid room credentials to fail closed")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "INVALID_RESPONSE")
+        }
+    }
+
+    func testCreateSessionUsesPollErrorCodeForTerminalFailure() async throws {
+        // Android parity: HostedCloudClientTest.`failed 呼叫停止轮询` with D1 errorCode preservation.
+        var requestCount = 0
+        let client = try makeClient { request in
+            requestCount += 1
+            let status = requestCount == 1 ? "pending" : "failed"
+            let error = status == "failed" ? #", "errorCode":"SIM_NOT_READY""# : ""
+            return Self.response(
+                for: request,
+                status: requestCount == 1 ? 202 : 200,
+                json: """
+                {"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"\(status)","createdAt":1,"expiresAt":9999\(error)}
+                """
+            )
+        }
+
+        do {
+            _ = try await client.createSession(
+                edgeId: "edge_abcdefghijkl",
+                idempotencyKey: "ios-test-key-1234"
+            )
+            XCTFail("Expected terminal call failure")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "SIM_NOT_READY")
+            XCTAssertEqual(requestCount, 2)
+        }
+    }
+
+    func testCreateSessionRetriesPostOnceWithIdenticalIdempotencyBody() async throws {
+        // Android parity: HostedCloudClientTest.`POST 传输失败只用同一 idempotencyKey 重试一次`.
+        var requestCount = 0
+        var postBodies: [Data] = []
+        let client = try makeClient { request in
+            requestCount += 1
+            if request.httpMethod == "POST" {
+                postBodies.append(try XCTUnwrap(request.httpBody))
+                if postBodies.count == 1 { throw URLError(.networkConnectionLost) }
+                return Self.response(
+                    for: request,
+                    status: 202,
+                    json: Self.callJSON(status: "pending")
+                )
+            }
+            return Self.response(
+                for: request,
+                json: Self.callJSON(
+                    status: "ready",
+                    session: #"{"livekitUrl":"wss://lk.example.com","token":"jwt-token","expiresAt":9999}"#
+                )
+            )
+        }
+
+        let session = try await client.createSession(
+            edgeId: "edge_abcdefghijkl",
+            idempotencyKey: "ios-stable-key-123"
+        )
+
+        XCTAssertEqual(requestCount, 3)
+        XCTAssertEqual(postBodies.count, 2)
+        XCTAssertEqual(postBodies[0], postBodies[1])
+        XCTAssertEqual(session.token, "jwt-token")
+    }
+
+    func testCreateSessionStopsAtServerDeadline() async throws {
+        // Android parity: HostedCloudClientTest.`轮询到服务端 deadline 返回超时`.
+        var requestCount = 0
+        let client = try makeClient(clockMilliseconds: { 10_000 }) { request in
+            requestCount += 1
+            return Self.response(
+                for: request,
+                status: 202,
+                json: Self.callJSON(status: "pending")
+            )
+        }
+
+        do {
+            _ = try await client.createSession(
+                edgeId: "edge_abcdefghijkl",
+                idempotencyKey: "ios-test-key-1234"
+            )
+            XCTFail("Expected deadline timeout")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "SESSION_TIMEOUT")
+            XCTAssertEqual(requestCount, 1)
+        }
+    }
+
     private func makeClient(
         clockMilliseconds: @escaping () -> Int64 = { 1_000 },
         handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
@@ -185,7 +403,8 @@ final class HostedCloudClientTests: XCTestCase {
         return try HostedCloudClient(
             baseURL: "https://cloud.example.test/",
             urlSession: URLSession(configuration: configuration),
-            clockMilliseconds: clockMilliseconds
+            clockMilliseconds: clockMilliseconds,
+            sleepMilliseconds: { _ in }
         )
     }
 
@@ -202,6 +421,13 @@ final class HostedCloudClientTests: XCTestCase {
             headerFields: headers
         )!
         return (response, Data(json.utf8))
+    }
+
+    private static func callJSON(status: String, session: String? = nil) -> String {
+        let sessionField = session.map { #", "session":\#($0)"# } ?? ""
+        return """
+        {"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"\(status)","createdAt":1,"expiresAt":9999\(sessionField)}
+        """
     }
 }
 

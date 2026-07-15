@@ -15,6 +15,10 @@ import Foundation
 final class CallMediaSession {
     private let onState: (CallState) -> Void
     private var connectedHandler: (() -> Void)?
+    private(set) var preparedSession: HostedCallSession?
+    private(set) var pendingDialPacket: Data?
+    private var activeLabel: String?
+    private var isStopped = false
 
     init(onState: @escaping (CallState) -> Void) {
         self.onState = onState
@@ -22,43 +26,138 @@ final class CallMediaSession {
 
     /// US-2 外呼:createSession(HTTP)→ 连房间发麦 → media_ready 后 Edge 侧 ATD。
     func startOutbound(client: HostedCloudClient, edgeId: String, number: String) async {
-        // TODO(LiveKit): client.createSession(edgeId:) → Room.connect(url, token)
-        //   → 发布麦克风轨 → 消费 status 事件(media_ready/dialing/connected/ended)。
-        // 当前骨架:标记等待媒体,待 SDK 接线。
-        onState(.waitingMedia(label: number))
+        isStopped = false
+        activeLabel = number
+        connectedHandler = nil
+        preparedSession = nil
+        pendingDialPacket = nil
+        do {
+            // Validate before allocating a cloud room. The packet stays pending
+            // until Edge reports media_ready, then the LiveKit layer publishes it once.
+            let dialPacket = try CallSignaling.encodeDial(
+                number: number,
+                idempotencyKey: UUID().uuidString
+            )
+            let session = try await client.createSession(edgeId: edgeId)
+            guard !isStopped else { return }
+            preparedSession = session
+            pendingDialPacket = dialPacket
+            onState(.waitingMedia(label: number))
+            // TODO(LiveKit): Room.connect(session.livekitURL, session.token)
+            //   → publish microphone → consume callpilot.status data packets.
+        } catch let error as HostedCloudError {
+            guard !isStopped else { return }
+            isStopped = true
+            connectedHandler = nil
+            onState(.failed(label: number, reason: error.message, code: error.code))
+        } catch {
+            guard !isStopped else { return }
+            isStopped = true
+            connectedHandler = nil
+            onState(.failed(label: number, reason: error.localizedDescription, code: nil))
+        }
     }
 
     /// US-1 接管:claimInboundOffer(HTTP)→ 入房(不发 dial)→ 等 Edge status=connected。
     func startTakeover(client: HostedCloudClient, offerId: String, onConnected: @escaping () -> Void) async {
-        connectedHandler = onConnected
+        isStopped = false
+        activeLabel = "来电接管"
+        preparedSession = nil
+        pendingDialPacket = nil
+        installConnectedHandler(onConnected)
         do {
             let session = try await client.claimInboundOffer(offerId: offerId)
-            _ = session  // TODO(LiveKit): Room.connect(session.livekitURL, session.token) → 等 connected
+            guard !isStopped else { return }
+            preparedSession = session
+            // TODO(LiveKit): Room.connect(session.livekitURL, session.token) → 等 connected
             onState(.waitingMedia(label: "来电接管"))
         } catch let e as HostedCloudError {
+            guard !isStopped else { return }
+            isStopped = true
+            connectedHandler = nil
             onState(.failed(label: "来电接管", reason: e.message, code: e.code))
         } catch {
+            guard !isStopped else { return }
+            isStopped = true
+            connectedHandler = nil
             onState(.failed(label: "来电接管", reason: error.localizedDescription, code: nil))
         }
     }
 
     /// Edge status=connected 到达时调用(取消超时 + 推进 inCall)。
     func handleConnected(label: String) {
+        guard !isStopped else { return }
         connectedHandler?()
         connectedHandler = nil
         onState(.inCall(label: label))
     }
 
-    func sendDTMF(_ digit: String) {
-        // TODO(LiveKit): 经 data-topic 发 {type:dtmf,digits:digit}(对齐 Android sendDtmf)。
+    /// Entry point for future LiveKit data-topic delivery. Parsing and state
+    /// reduction are complete here; only the Room callback wiring is pending.
+    @discardableResult
+    func handleEdgePayload(_ data: Data, label: String) -> CallStatusAction? {
+        guard !isStopped else { return nil }
+        activeLabel = label
+        guard let event = CallSignaling.decodeEvent(data) else { return nil }
+        let action = CallStatusReducer.reduce(event, label: label)
+        switch action {
+        case .mediaReady, .ignored:
+            break
+        case let .state(state):
+            if case .inCall = state {
+                handleConnected(label: label)
+            } else {
+                if !state.isActive {
+                    isStopped = true
+                    connectedHandler = nil
+                    preparedSession = nil
+                    pendingDialPacket = nil
+                }
+                onState(state)
+            }
+        }
+        return action
     }
 
-    func hangup() {
-        // TODO(LiveKit): 经 data-topic 发 hangup + Room.disconnect()。
-        onState(.ended(label: "通话", reason: "local_hangup"))
+    /// Atomically consumes the deferred dial command. Repeated media_ready
+    /// events therefore cannot redial the same physical line.
+    func takePendingDialPacket() -> Data? {
+        defer { pendingDialPacket = nil }
+        return pendingDialPacket
+    }
+
+    func installConnectedHandler(_ handler: @escaping () -> Void) {
+        connectedHandler = handler
+    }
+
+    @discardableResult
+    func sendDTMF(_ digit: String) -> Data? {
+        guard !isStopped else { return nil }
+        guard let packet = try? CallSignaling.encodeDTMF(digit) else { return nil }
+        // TODO(LiveKit): publish packet reliably on CallPilotTopic.control.
+        return packet
+    }
+
+    @discardableResult
+    func hangup() -> Data {
+        let packet = CallSignaling.encodeHangup()
+        guard !isStopped else { return packet }
+        let label = activeLabel ?? "通话"
+        isStopped = true
+        connectedHandler = nil
+        preparedSession = nil
+        pendingDialPacket = nil
+        // TODO(LiveKit): publish packet reliably on CallPilotTopic.control, then disconnect.
+        onState(.ended(label: label, reason: "local_hangup"))
+        return packet
     }
 
     func stop() {
-        // TODO(LiveKit): Room.disconnect() + 清理。
+        isStopped = true
+        connectedHandler = nil
+        preparedSession = nil
+        pendingDialPacket = nil
+        activeLabel = nil
+        // TODO(LiveKit): Room.disconnect().
     }
 }
