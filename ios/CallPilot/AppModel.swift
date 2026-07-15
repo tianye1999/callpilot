@@ -16,6 +16,7 @@ final class AppModel: ObservableObject {
     private var client: HostedCloudClient?
     private var dismissedOffers = Set<String>()
     private var media: CallMediaSession?
+    private var callAttempts = CallAttemptStateMachine()
 
     // 接管媒体超时(对齐 Android takeoverMediaTimeoutMs;真机实证:失败会话不复位会挡后续 offer)。
     private let takeoverMediaTimeout: Duration = .seconds(20)
@@ -98,12 +99,12 @@ final class AppModel: ObservableObject {
 
     func startCall(number: String) async {
         guard let c = client, let p = pairing, !callState.isActive else { return }
-        callState = .preparing(label: number)
+        let attempt = beginCallAttempt(with: .preparing(label: number))
         // createSession → LiveKit 媒体 → 号码经 Dongle SIM ATD(dial 在 media_ready 后发)。
         // 具体媒体建立由 CallMediaSession 承担,占位待 LiveKit 接线。
-        callState = .waitingMedia(label: number)
+        _ = apply(.waitingMedia(label: number), for: attempt)
         media = CallMediaSession(onState: { [weak self] st in
-            Task { @MainActor in self?.callState = st }
+            Task { @MainActor in self?.apply(st, for: attempt) }
         })
         await media?.startOutbound(client: c, edgeId: p.edgeId, number: number)
     }
@@ -114,18 +115,32 @@ final class AppModel: ObservableObject {
         guard let c = client, !callState.isActive else { return }
         incomingOffer = nil
         let label = "来电接管"
-        callState = .waitingMedia(label: label)
+        let waitingState = CallState.waitingMedia(label: label)
+        let attempt = beginCallAttempt(with: waitingState)
         media = CallMediaSession(onState: { [weak self] st in
-            Task { @MainActor in self?.callState = st }
+            Task { @MainActor in self?.apply(st, for: attempt) }
         })
         // 20s 媒体超时:对齐 Android——接管失败不复位会永久 WaitingMedia 挡后续 offer。
         let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: self?.takeoverMediaTimeout ?? .seconds(20))
-            guard let self, case .waitingMedia = self.callState else { return }
-            self.callState = .failed(label: label, reason: "接管媒体建立超时", code: "TAKEOVER_MEDIA_TIMEOUT")
+            do {
+                try await Task.sleep(for: self?.takeoverMediaTimeout ?? .seconds(20))
+            } catch {
+                return
+            }
+            guard let self else { return }
+            let failedState = CallState.failed(
+                label: label,
+                reason: "接管媒体建立超时",
+                code: "TAKEOVER_MEDIA_TIMEOUT"
+            )
+            guard self.apply(failedState, for: attempt, from: waitingState) else { return }
             self.media?.stop()
-            try? await Task.sleep(for: .seconds(2))
-            if case .failed = self.callState { self.callState = .idle }
+            do {
+                try await Task.sleep(for: .seconds(2))
+            } catch {
+                return
+            }
+            _ = self.apply(.idle, for: attempt, from: failedState)
         }
         await media?.startTakeover(client: c, offerId: offer.offerId, onConnected: { timeoutTask.cancel() })
     }
@@ -136,6 +151,27 @@ final class AppModel: ObservableObject {
 
     func sendDTMF(_ digit: String) {
         media?.sendDTMF(digit)
+    }
+
+    private func beginCallAttempt(with initialState: CallState) -> CallAttempt {
+        let attempt = callAttempts.begin(with: initialState)
+        callState = initialState
+        return attempt
+    }
+
+    @discardableResult
+    private func apply(
+        _ nextState: CallState,
+        for attempt: CallAttempt,
+        from expectedState: CallState? = nil
+    ) -> Bool {
+        guard callAttempts.transition(
+            from: expectedState,
+            to: nextState,
+            for: attempt
+        ) else { return false }
+        callState = nextState
+        return true
     }
 }
 

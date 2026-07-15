@@ -14,11 +14,18 @@ struct DeviceCredential: Equatable, Codable {
 }
 
 /// 一次外呼或来电接管的入房凭证。
-struct HostedCallSession: Equatable {
+struct HostedCallSession: Equatable, CustomStringConvertible, CustomDebugStringConvertible {
     let sessionId: String
     let livekitURL: String
     let token: String
     let expiresAt: Int64
+
+    /// Keep one-time room credentials out of logs and crash reports.
+    var description: String {
+        "HostedCallSession(sessionId: \(sessionId), livekitURL: \(livekitURL), token: ***, expiresAt: \(expiresAt))"
+    }
+
+    var debugDescription: String { description }
 }
 
 /// #95 一条可接管的来电 offer;云端只暴露 opaque id 与过期时间(无号码/转写)。

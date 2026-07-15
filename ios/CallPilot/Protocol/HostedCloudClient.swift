@@ -6,14 +6,22 @@ final class HostedCloudClient {
     private let base: URL
     private let origin: String
     private let urlSession: URLSession
+    private let clockMilliseconds: () -> Int64
     var credential: DeviceCredential?
 
     private static let deviceCookieName = "__Host-callpilot-device"
+    private static let deviceIdRE = /^device_[A-Za-z0-9_-]{12,80}$/
     private static let edgeIdRE = /^edge_[A-Za-z0-9_-]{12,80}$/
     private static let offerIdRE = /^offer_[A-Za-z0-9_-]{12,80}$/
     private static let claimIdRE = /^claim_[A-Za-z0-9_-]{12,80}$/
 
-    init(baseURL: String, urlSession: URLSession = .shared) throws {
+    init(
+        baseURL: String,
+        urlSession: URLSession = .shared,
+        clockMilliseconds: @escaping () -> Int64 = {
+            Int64(Date().timeIntervalSince1970 * 1_000)
+        }
+    ) throws {
         guard let url = URL(string: baseURL), let scheme = url.scheme, let host = url.host else {
             throw HostedCloudError(statusCode: 0, code: "BAD_BASE_URL", message: "无效的网关地址")
         }
@@ -22,6 +30,7 @@ final class HostedCloudClient {
         if let port = url.port { originStr += ":\(port)" }
         self.origin = originStr
         self.urlSession = urlSession
+        self.clockMilliseconds = clockMilliseconds
     }
 
     // MARK: - 配对
@@ -37,6 +46,9 @@ final class HostedCloudClient {
                                    message: "配对响应缺少设备 Cookie")
         }
         guard let device = payload["device"] as? [String: Any],
+              let deviceId = device["deviceId"] as? String,
+              deviceId.wholeMatch(of: Self.deviceIdRE) != nil,
+              deviceId == cred.deviceId,
               let edgeId = device["edgeId"] as? String,
               edgeId.wholeMatch(of: Self.edgeIdRE) != nil else {
             throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE",
@@ -50,8 +62,9 @@ final class HostedCloudClient {
 
     func deviceStatus() async throws -> HostedDeviceStatus {
         let (payload, _) = try await request("GET", "v1/device")
-        let connected = payload["connected"] as? Bool ?? false
-        let modemOnline = payload["modemOnline"] as? Bool ?? false
+        let edge = payload["edge"] as? [String: Any]
+        let connected = edge?["connected"] as? Bool ?? false
+        let modemOnline = edge?["modemOnline"] as? Bool ?? false
         return HostedDeviceStatus(connected: connected, modemOnline: modemOnline)
     }
 
@@ -84,6 +97,14 @@ final class HostedCloudClient {
               let expiresAt = (payload["expiresAt"] as? NSNumber)?.int64Value else {
             throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE",
                                    message: "接管响应字段不完整或标识不匹配")
+        }
+        guard let livekitURL = URL(string: url),
+              livekitURL.scheme == "wss",
+              livekitURL.host != nil,
+              !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              expiresAt > clockMilliseconds() else {
+            throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE",
+                                   message: "接管响应会话连接信息不合法")
         }
         return HostedCallSession(sessionId: claimId, livekitURL: url, token: token, expiresAt: expiresAt)
     }

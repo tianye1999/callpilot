@@ -19,3 +19,44 @@ enum CallState: Equatable {
         }
     }
 }
+
+/// Identifies one logical call attempt. Async completions must present the
+/// token issued when that attempt began before they may mutate UI state.
+struct CallAttempt: Equatable, Sendable {
+    fileprivate let generation: UInt64
+}
+
+/// Pure state owner used to fence late timeout/network completions from an
+/// older call attempt. AppModel wiring is intentionally separate from the
+/// state contract so this logic can be exhaustively unit tested.
+struct CallAttemptStateMachine {
+    private(set) var state: CallState = .idle
+    private(set) var generation: UInt64 = 0
+
+    mutating func begin(with initialState: CallState) -> CallAttempt {
+        generation &+= 1
+        state = initialState
+        return CallAttempt(generation: generation)
+    }
+
+    func isCurrent(_ attempt: CallAttempt) -> Bool {
+        attempt.generation == generation
+    }
+
+    @discardableResult
+    mutating func transition(
+        from expectedState: CallState? = nil,
+        to nextState: CallState,
+        for attempt: CallAttempt
+    ) -> Bool {
+        guard isCurrent(attempt) else { return false }
+        if let expectedState, state != expectedState { return false }
+        state = nextState
+        return true
+    }
+
+    mutating func invalidate(to nextState: CallState = .idle) {
+        generation &+= 1
+        state = nextState
+    }
+}

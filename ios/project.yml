@@ -36,3 +36,15 @@ targets:
         INFOPLIST_FILE: CallPilot/Info.plist
         TARGETED_DEVICE_FAMILY: "1"  # iPhone
         CODE_SIGN_STYLE: Automatic
+
+  CallPilotTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: CallPilotTests
+    dependencies:
+      - target: CallPilot
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot.tests
+        GENERATE_INFOPLIST_FILE: "YES"
