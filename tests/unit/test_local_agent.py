@@ -203,8 +203,13 @@ def test_llm_failures_mark_fatal():
     agent, _pipeline, _seen = _make_agent(replies)
     asyncio.run(agent.start(lambda pcm: None))
     try:
-        for _ in range(3):
+        # Wait for each turn to finish before sending the next one. Otherwise the
+        # brain worker may merge queued utterances and exercise only one failure.
+        for expected_failures in range(1, 4):
             asyncio.run(agent.send_audio(b"hello"))
+            assert _wait_until(
+                lambda expected=expected_failures: agent._llm_failures == expected
+            )
         assert _wait_until(lambda: agent.fatal)
     finally:
         asyncio.run(agent.stop())
