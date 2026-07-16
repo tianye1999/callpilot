@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "record": {
+    "callId": "call_fixture_remote_0001",
+    "revision": "revision_call_remote_0001",
+    "direction": "OUTBOUND",
+    "address": "+15550100103",
+    "startedAt": 1784160000000,
+    "endedAt": 1784160060000,
+    "durationMs": 60000,
+    "status": "COMPLETED",
+    "answered": true,
+    "source": "REMOTE_HANDSET",
+    "summaryState": "UNAVAILABLE",
+    "summaryPreview": null,
+    "hasTranscript": false,
+    "triageOutcome": null
+  },
+  "summary": null,
+  "timelineRevision": "revision_timeline_empty_0001"
+}

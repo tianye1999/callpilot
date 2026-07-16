@@ -1,0 +1,46 @@
+{
+  "v": 1,
+  "items": [
+    {
+      "timelineItemId": "item_fixture_transcript_0001",
+      "occurredAt": 1784161010000,
+      "type": "TRANSCRIPT",
+      "role": "AGENT",
+      "text": "Hello. Who are you calling for?"
+    },
+    {
+      "timelineItemId": "item_fixture_transcript_0002",
+      "occurredAt": 1784161015000,
+      "type": "TRANSCRIPT",
+      "role": "CALLER",
+      "text": "This is a synthetic request to speak with the owner."
+    },
+    {
+      "timelineItemId": "item_fixture_triage_0001",
+      "occurredAt": 1784161020000,
+      "type": "TRIAGE",
+      "category": "NEEDS_OWNER",
+      "action": "TRANSFER",
+      "confidence": 0.94,
+      "reasonCode": "OWNER_REQUESTED"
+    },
+    {
+      "timelineItemId": "item_fixture_takeover_0001",
+      "occurredAt": 1784161040000,
+      "type": "TAKEOVER",
+      "state": "COMMITTED",
+      "reasonCode": null
+    },
+    {
+      "timelineItemId": "item_fixture_result_0001",
+      "occurredAt": 1784161120000,
+      "type": "RESULT",
+      "status": "COMPLETED",
+      "summary": "The owner completed the synthetic call."
+    }
+  ],
+  "nextCursor": null,
+  "hasMore": false,
+  "collectionRevision": "revision_timeline_agent_0001",
+  "oldestAvailableAt": 1784161010000
+}

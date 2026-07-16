@@ -1,0 +1,39 @@
+{
+  "v": 1,
+  "items": [
+    {
+      "messageId": "msg_fixture_outbound_0001",
+      "revision": "revision_message_out_0001",
+      "direction": "OUTBOUND",
+      "address": "+15550100101",
+      "text": "Synthetic status request.",
+      "occurredAt": 1784160300000,
+      "recordedAt": 1784160300000,
+      "status": "SENT"
+    },
+    {
+      "messageId": "msg_fixture_fragment_0002",
+      "revision": "revision_message_frag_0002",
+      "direction": "INBOUND",
+      "address": "+15550100101",
+      "text": "Synthetic notice fragment B.",
+      "occurredAt": 1784160200000,
+      "recordedAt": 1784160202000,
+      "status": "RECEIVED"
+    },
+    {
+      "messageId": "msg_fixture_fragment_0001",
+      "revision": "revision_message_frag_0001",
+      "direction": "INBOUND",
+      "address": "+15550100101",
+      "text": "Synthetic notice fragment A.",
+      "occurredAt": 1784160200000,
+      "recordedAt": 1784160201000,
+      "status": "RECEIVED"
+    }
+  ],
+  "nextCursor": "cursor_messages_fixture_0001",
+  "hasMore": true,
+  "collectionRevision": "revision_messages_fixture_0001",
+  "oldestAvailableAt": 1784100000000
+}

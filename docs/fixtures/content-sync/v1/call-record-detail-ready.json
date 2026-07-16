@@ -1,0 +1,31 @@
+{
+  "v": 1,
+  "record": {
+    "callId": "call_fixture_pending_0001",
+    "revision": "revision_call_pending_0002",
+    "direction": "OUTBOUND",
+    "address": "+15550100104",
+    "startedAt": 1784162000000,
+    "endedAt": 1784162065000,
+    "durationMs": 65000,
+    "status": "COMPLETED",
+    "answered": true,
+    "source": "AGENT",
+    "summaryState": "READY",
+    "summaryPreview": "Synthetic balance inquiry completed with verified evidence.",
+    "hasTranscript": true,
+    "triageOutcome": null
+  },
+  "summary": {
+    "ok": true,
+    "text": "Synthetic balance inquiry completed with verified evidence.",
+    "callerIdentity": "Demo service",
+    "intent": "Account balance inquiry",
+    "urgency": "NORMAL",
+    "callbackNeeded": false,
+    "errorCode": null,
+    "resultSource": "CARRIER_MESSAGE",
+    "resultVerification": "VERIFIED"
+  },
+  "timelineRevision": "revision_timeline_pending_0002"
+}

@@ -1,0 +1,26 @@
+{
+  "v": 1,
+  "type": "data.response",
+  "requestId": "request_fixture_0001",
+  "resource": "messages.list",
+  "status": "ok",
+  "body": {
+    "v": 1,
+    "items": [
+      {
+        "messageId": "msg_fixture_inbound_0001",
+        "revision": "revision_message_in_0001",
+        "direction": "INBOUND",
+        "address": "+15550100101",
+        "text": "Synthetic reply with verification value redacted.",
+        "occurredAt": 1784160001000,
+        "recordedAt": 1784160002000,
+        "status": "RECEIVED"
+      }
+    ],
+    "nextCursor": null,
+    "hasMore": false,
+    "collectionRevision": "revision_messages_fixture_0001",
+    "oldestAvailableAt": 1784160001000
+  }
+}

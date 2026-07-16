@@ -1,0 +1,41 @@
+{
+  "v": 1,
+  "items": [
+    {
+      "callId": "call_fixture_agent_0001",
+      "revision": "revision_call_agent_0002",
+      "direction": "INBOUND",
+      "address": "+15550100102",
+      "startedAt": 1784161000000,
+      "endedAt": 1784161120000,
+      "durationMs": 120000,
+      "status": "COMPLETED",
+      "answered": true,
+      "source": "AGENT",
+      "summaryState": "READY",
+      "summaryPreview": "Synthetic caller requested the owner and was transferred.",
+      "hasTranscript": true,
+      "triageOutcome": "TRANSFERRED"
+    },
+    {
+      "callId": "call_fixture_remote_0001",
+      "revision": "revision_call_remote_0001",
+      "direction": "OUTBOUND",
+      "address": "+15550100103",
+      "startedAt": 1784160000000,
+      "endedAt": 1784160060000,
+      "durationMs": 60000,
+      "status": "COMPLETED",
+      "answered": true,
+      "source": "REMOTE_HANDSET",
+      "summaryState": "UNAVAILABLE",
+      "summaryPreview": null,
+      "hasTranscript": false,
+      "triageOutcome": null
+    }
+  ],
+  "nextCursor": null,
+  "hasMore": false,
+  "collectionRevision": "revision_calls_fixture_0002",
+  "oldestAvailableAt": 1784160000000
+}

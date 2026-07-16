@@ -4,6 +4,11 @@ Issue #42 defines the Beta contract between the hosted control plane, Edge, and
 remote handset. JSON requests and WebSocket messages are limited to 16 KiB.
 Unknown fields may be ignored; unknown message types are rejected.
 
+Issue #99 adds a separately gated, read-only content relay. Its DTO, cursor,
+privacy, sizing and `data.request`/`data.response` contract is defined in
+[`content-sync-protocol.md`](content-sync-protocol.md). That document is the SSOT
+for content reads; this file remains the SSOT for enrollment, pairing and calls.
+
 ## Authentication
 
 - Edge HTTP/WSS: `Authorization: Bearer <edge_id>.<secret>`.
@@ -58,8 +63,16 @@ POST /v1/pairing-sessions/claim
 DELETE /v1/devices/{deviceId}
 POST /v1/calls
 GET  /v1/calls/{callId}
+GET  /v1/messages
+GET  /v1/call-records
+GET  /v1/call-records/{callId}
+GET  /v1/call-records/{callId}/timeline
 ```
 
 Calls are asynchronous. `POST /v1/calls` returns `202` while the command is sent
 to Edge. After Edge accepts it, `GET /v1/calls/{callId}` returns a fresh,
 short-lived handset LiveKit credential. Tokens are never persisted.
+
+The four content endpoints are asynchronous only inside the control plane: each
+HTTP request waits for one short-lived Edge relay response. They do not create a
+D1 content record and do not expose the Edge's local `/api/history` or `/ws`.

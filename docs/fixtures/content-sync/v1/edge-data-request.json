@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "type": "data.request",
+  "requestId": "request_fixture_0001",
+  "deviceId": "device_fixture_0001",
+  "resource": "messages.list",
+  "params": {
+    "limit": 25,
+    "cursor": null
+  },
+  "issuedAtUnixMs": 1784160000000,
+  "expiresAtUnixMs": 1784160005000
+}

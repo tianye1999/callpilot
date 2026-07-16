@@ -1,0 +1,126 @@
+[
+  {
+    "scenario": "invalid_limit",
+    "httpStatus": 400,
+    "body": {
+      "error": {
+        "code": "INVALID_REQUEST",
+        "message": "The request fields are invalid",
+        "requestId": "request_fixture_error_0000"
+      }
+    }
+  },
+  {
+    "scenario": "cursor_bound_to_another_resource",
+    "httpStatus": 400,
+    "body": {
+      "error": {
+        "code": "CURSOR_INVALID",
+        "message": "The cursor is not valid for this resource",
+        "requestId": "request_fixture_error_0001"
+      }
+    }
+  },
+  {
+    "scenario": "device_credential_is_revoked",
+    "httpStatus": 401,
+    "body": {
+      "error": {
+        "code": "UNAUTHORIZED",
+        "message": "Device credential is invalid",
+        "requestId": "request_fixture_error_0007"
+      }
+    }
+  },
+  {
+    "scenario": "device_lacks_content_capability",
+    "httpStatus": 403,
+    "body": {
+      "error": {
+        "code": "FORBIDDEN",
+        "message": "The device cannot read this resource",
+        "requestId": "request_fixture_error_0002"
+      }
+    }
+  },
+  {
+    "scenario": "call_record_does_not_exist",
+    "httpStatus": 404,
+    "body": {
+      "error": {
+        "code": "NOT_FOUND",
+        "message": "Call record was not found",
+        "requestId": "request_fixture_error_0008"
+      }
+    }
+  },
+  {
+    "scenario": "device_read_rate_exceeded",
+    "httpStatus": 429,
+    "headers": {
+      "Retry-After": "30"
+    },
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "Too many content requests",
+        "requestId": "request_fixture_error_0009"
+      }
+    }
+  },
+  {
+    "scenario": "edge_content_gate_is_off",
+    "httpStatus": 403,
+    "body": {
+      "error": {
+        "code": "FEATURE_DISABLED",
+        "message": "Content sync is disabled",
+        "requestId": "request_fixture_error_0003"
+      }
+    }
+  },
+  {
+    "scenario": "edge_is_offline",
+    "httpStatus": 503,
+    "body": {
+      "error": {
+        "code": "EDGE_OFFLINE",
+        "message": "Edge is offline",
+        "requestId": "request_fixture_error_0004"
+      }
+    }
+  },
+  {
+    "scenario": "edge_response_timed_out",
+    "httpStatus": 504,
+    "body": {
+      "error": {
+        "code": "TIMEOUT",
+        "message": "Edge did not respond in time",
+        "requestId": "request_fixture_error_0005"
+      }
+    }
+  },
+  {
+    "scenario": "single_item_exceeds_v1_limit",
+    "httpStatus": 413,
+    "body": {
+      "error": {
+        "code": "PAYLOAD_TOO_LARGE",
+        "message": "The content item exceeds the protocol limit",
+        "requestId": "request_fixture_error_0006"
+      }
+    }
+  },
+  {
+    "scenario": "unexpected_server_failure",
+    "httpStatus": 500,
+    "body": {
+      "error": {
+        "code": "INTERNAL_ERROR",
+        "message": "The request could not be completed",
+        "requestId": "request_fixture_error_0010"
+      }
+    }
+  }
+]
