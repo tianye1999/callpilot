@@ -7,6 +7,7 @@ import base64
 import contextlib
 import inspect
 import json
+import struct
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -727,10 +728,70 @@ def test_livekit_modem_audio_queue_is_bounded_to_latest_frames() -> None:
     assert endpoint._modem_audio.get_nowait() == b"\x03\x00" * 160
 
 
+def test_livekit_downlink_gain_applies_before_capture_and_clamps_without_wrap(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        monkeypatch.setenv("REMOTE_DOWNLINK_GAIN", "16.0")
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud",
+            api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32",
+            public_url="https://dial.callpilot.example/",
+        )
+        endpoint = LiveKitRemoteMediaEndpoint(
+            issued,
+            rtc_module=_fake_rtc_module(),
+        )
+        await endpoint.connect()
+        try:
+            samples = (500, -500, 30000, -30000) * 40
+            endpoint.push_modem_audio(struct.pack("<160h", *samples))
+            source = _FakeLiveKitAudioSource.instances[-1]
+            await _wait_for(lambda: len(source.frames) == 1)
+
+            captured = struct.unpack("<160h", source.frames[0].kwargs["data"])
+            assert captured[:4] == (8000, -8000, 32767, -32768)
+        finally:
+            await endpoint.close()
+
+    asyncio.run(run())
+
+
+def test_livekit_downlink_gain_is_read_for_each_endpoint(monkeypatch) -> None:
+    async def capture_with_gain(raw_gain: str) -> int:
+        monkeypatch.setenv("REMOTE_DOWNLINK_GAIN", raw_gain)
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud",
+            api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32",
+            public_url="https://dial.callpilot.example/",
+        )
+        endpoint = LiveKitRemoteMediaEndpoint(
+            issued,
+            rtc_module=_fake_rtc_module(),
+        )
+        await endpoint.connect()
+        try:
+            endpoint.push_modem_audio(struct.pack("<160h", *((100,) * 160)))
+            source = _FakeLiveKitAudioSource.instances[-1]
+            await _wait_for(lambda: len(source.frames) == 1)
+            return struct.unpack("<h", source.frames[0].kwargs["data"][:2])[0]
+        finally:
+            await endpoint.close()
+
+    async def run() -> None:
+        assert await capture_with_gain("2.0") == 200
+        assert await capture_with_gain("4.0") == 400
+
+    asyncio.run(run())
+
+
 def test_livekit_modem_publish_stats_cover_peak_queue_and_empty_reset(
     caplog, monkeypatch
 ) -> None:
     async def run() -> None:
+        monkeypatch.setenv("REMOTE_DOWNLINK_GAIN", "16.0")
         issued = issue_livekit_session(
             livekit_url="wss://example.livekit.cloud",
             api_key="test-key",
@@ -749,12 +810,13 @@ def test_livekit_modem_publish_stats_cover_peak_queue_and_empty_reset(
         with caplog.at_level("INFO", logger="agentcall.pcm_stats"):
             await endpoint.connect()
             try:
-                endpoint.push_modem_audio(b"\xff\x7f" * 160)
+                endpoint.push_modem_audio(b"\xf4\x01" * 160)
                 await _wait_for(
                     lambda: any(
                         "downlink1_lk_publish" in record.getMessage()
-                        and "frames=1 bytes=320 peak=32767" in record.getMessage()
+                        and "frames=1 bytes=320 peak=8000" in record.getMessage()
                         and "queued=0" in record.getMessage()
+                        and "gain=16.0" in record.getMessage()
                         for record in caplog.records
                     )
                 )

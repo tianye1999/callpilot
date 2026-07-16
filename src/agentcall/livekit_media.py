@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from typing import Any
 
+from . import config
+from .audio_bridge import apply_pcm_gain
 from .pcm_stats import PcmFlowStats
 from .remote_dialer import (
     REMOTE_AUDIO_RATE,
@@ -85,6 +88,13 @@ class LiveKitRemoteMediaEndpoint:
         self._browser_connected = False
         self._media_ready = False
         self._closed = False
+        self._downlink_gain = config.get_float("REMOTE_DOWNLINK_GAIN")
+        if not math.isfinite(self._downlink_gain) or self._downlink_gain <= 0:
+            logger.warning(
+                "REMOTE_DOWNLINK_GAIN=%r 非法，当前通话回落为 16.0",
+                self._downlink_gain,
+            )
+            self._downlink_gain = 16.0
         # 上行第一段观测：浏览器（手机）→ LiveKit → Edge 的入站帧统计。
         # 打点由 take_browser_audio（remote pump 每 10ms 调）驱动，
         # 因此 LiveKit 一帧未推时也会按期打出 frames=0。
@@ -323,14 +333,15 @@ class LiveKitRemoteMediaEndpoint:
         try:
             while True:
                 pcm = await self._modem_audio.get()
+                amplified = apply_pcm_gain(pcm, self._downlink_gain)
                 frame = rtc.AudioFrame(
-                    data=pcm,
+                    data=amplified,
                     sample_rate=REMOTE_AUDIO_RATE,
                     num_channels=1,
-                    samples_per_channel=len(pcm) // 2,
+                    samples_per_channel=len(amplified) // 2,
                 )
                 await source.capture_frame(frame)
-                self._modem_publish_stats.add(pcm)
+                self._modem_publish_stats.add(amplified)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -343,6 +354,7 @@ class LiveKitRemoteMediaEndpoint:
                 await asyncio.sleep(_AUDIO_STATS_IDLE_TICK_SECONDS)
                 self._modem_publish_stats.maybe_log(
                     queued=self._modem_audio.qsize(),
+                    gain=self._downlink_gain,
                 )
         except asyncio.CancelledError:
             raise

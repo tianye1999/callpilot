@@ -254,6 +254,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("MODEM_TX_GAIN", "上行发送增益", "float", "1.0"),
     # 对方语音送 AI 模型前的独立增益；每通开始读取，录音/监听仍保留各自路径。
     ConfigSpec("AGENT_UPLINK_GAIN", "AI 输入增益（对方语音）", "float", "1.0"),
+    # 模组语音送远程手机前的独立增益；每个 LiveKit 会话创建时读取，支持热更新。
+    ConfigSpec("REMOTE_DOWNLINK_GAIN", "远程手机下行增益", "float", "16.0"),
     # ---- 通话行为 ----
     ConfigSpec("HALF_DUPLEX_HANGOVER_SECONDS", "半双工挂尾时长（秒）", "float", "0.5"),
     ConfigSpec("HANGUP_TOOL_DELAY_SECONDS", "挂断工具延迟（秒）", "float", "4.5"),

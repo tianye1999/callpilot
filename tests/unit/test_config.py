@@ -81,6 +81,18 @@ def test_agent_uplink_gain_default_and_env_example(monkeypatch):
     assert re.search(r"^AGENT_UPLINK_GAIN=1\.0$", example, re.MULTILINE)
 
 
+def test_remote_downlink_gain_default_and_env_example(monkeypatch):
+    """#97 UX-A2:远程手机下行增益可热更新且默认完成真机标定。"""
+    _unset(monkeypatch, "REMOTE_DOWNLINK_GAIN")
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert get_float("REMOTE_DOWNLINK_GAIN") == pytest.approx(16.0)
+    assert get_spec("REMOTE_DOWNLINK_GAIN").requires_restart is False
+    assert re.search(r"^REMOTE_DOWNLINK_GAIN=16\.0$", example, re.MULTILINE)
+
+
 def test_get_bool_truthy_values(monkeypatch):
     for raw in ("true", "TRUE", "1", "yes", "Yes"):
         monkeypatch.setenv("RECORDING_ENABLED", raw)
