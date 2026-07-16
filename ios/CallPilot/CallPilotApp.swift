@@ -16,13 +16,18 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if model.pairing == nil {
+            switch RootPresentation.resolve(
+                isPaired: model.pairing != nil,
+                callState: model.callState,
+                incomingOffer: model.incomingOffer
+            ) {
+            case .pairing:
                 PairView(model: model)
-            } else if model.callState.isCallPresented {
+            case .call:
                 CallView(model: model)
-            } else if let offer = model.incomingOffer {
+            case .incomingOffer(let offer):
                 IncomingOfferView(model: model, offer: offer)
-            } else {
+            case .main:
                 DialView(model: model)
             }
         }
