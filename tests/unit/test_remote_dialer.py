@@ -727,6 +727,63 @@ def test_livekit_modem_audio_queue_is_bounded_to_latest_frames() -> None:
     assert endpoint._modem_audio.get_nowait() == b"\x03\x00" * 160
 
 
+def test_livekit_modem_publish_stats_cover_peak_queue_and_empty_reset(
+    caplog, monkeypatch
+) -> None:
+    async def run() -> None:
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud",
+            api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32",
+            public_url="https://dial.callpilot.example/",
+        )
+        endpoint = LiveKitRemoteMediaEndpoint(
+            issued,
+            rtc_module=_fake_rtc_module(),
+        )
+        endpoint._modem_publish_stats.interval_seconds = 0.05
+        monkeypatch.setattr(
+            "agentcall.livekit_media._AUDIO_STATS_IDLE_TICK_SECONDS", 0.005
+        )
+
+        with caplog.at_level("INFO", logger="agentcall.pcm_stats"):
+            await endpoint.connect()
+            try:
+                endpoint.push_modem_audio(b"\xff\x7f" * 160)
+                await _wait_for(
+                    lambda: any(
+                        "downlink1_lk_publish" in record.getMessage()
+                        and "frames=1 bytes=320 peak=32767" in record.getMessage()
+                        and "queued=0" in record.getMessage()
+                        for record in caplog.records
+                    )
+                )
+                flow_log = "\n".join(
+                    record.getMessage()
+                    for record in caplog.records
+                    if "downlink1_lk_publish" in record.getMessage()
+                )
+                assert issued.edge_token not in flow_log
+                assert issued.livekit_url not in flow_log
+                assert issued.browser_identity not in flow_log
+                assert "10086" not in flow_log
+
+                caplog.clear()
+                await _wait_for(
+                    lambda: any(
+                        "downlink1_lk_publish" in record.getMessage()
+                        and "frames=0 bytes=0 peak=0" in record.getMessage()
+                        and "queued=0" in record.getMessage()
+                        for record in caplog.records
+                    )
+                )
+            finally:
+                await endpoint.close()
+                assert endpoint._modem_stats_task is None
+
+    asyncio.run(run())
+
+
 def test_livekit_endpoint_filters_identity_and_topic_and_tracks_media_state() -> None:
     async def run() -> None:
         issued = issue_livekit_session(

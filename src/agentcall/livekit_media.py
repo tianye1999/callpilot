@@ -21,6 +21,7 @@ _PCM_FRAME_MS = 20
 _PCM_FRAME_BYTES = REMOTE_AUDIO_RATE * 2 * _PCM_FRAME_MS // 1000
 _MAX_CONTROL_BYTES = 4096
 _MAX_COMMANDS = 32
+_AUDIO_STATS_IDLE_TICK_SECONDS = 0.5
 
 
 def _decode_control_payload(payload: bytes) -> dict[str, Any] | None:
@@ -79,6 +80,7 @@ class LiveKitRemoteMediaEndpoint:
         self._audio_stream: Any = None
         self._browser_audio_task: asyncio.Task[None] | None = None
         self._publisher_task: asyncio.Task[None] | None = None
+        self._modem_stats_task: asyncio.Task[None] | None = None
         self._stream_close_tasks: set[asyncio.Task[None]] = set()
         self._browser_connected = False
         self._media_ready = False
@@ -87,6 +89,9 @@ class LiveKitRemoteMediaEndpoint:
         # 打点由 take_browser_audio（remote pump 每 10ms 调）驱动，
         # 因此 LiveKit 一帧未推时也会按期打出 frames=0。
         self._browser_in_stats = PcmFlowStats("uplink1_lk_in")
+        # 下行发布观测：模组 → Edge 队列 → LiveKit AudioSource。只统计成功
+        # capture 的帧数/字节/峰值与瞬时队列深度，不记录 PCM 内容。
+        self._modem_publish_stats = PcmFlowStats("downlink1_lk_publish")
 
     @property
     def media_ready(self) -> bool:
@@ -196,6 +201,7 @@ class LiveKitRemoteMediaEndpoint:
         options.source = rtc.TrackSource.SOURCE_MICROPHONE
         await room.local_participant.publish_track(track, options)
         self._publisher_task = asyncio.create_task(self._publish_modem_audio())
+        self._modem_stats_task = asyncio.create_task(self._log_modem_publish_stats())
 
         participant = room.remote_participants.get(self._issued.browser_identity)
         if participant is not None:
@@ -209,7 +215,11 @@ class LiveKitRemoteMediaEndpoint:
         self._cancel_browser_audio_task()
         tasks = [
             task
-            for task in (browser_audio_task, self._publisher_task)
+            for task in (
+                browser_audio_task,
+                self._publisher_task,
+                self._modem_stats_task,
+            )
             if task is not None
         ]
         for task in tasks:
@@ -218,6 +228,7 @@ class LiveKitRemoteMediaEndpoint:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._browser_audio_task = None
         self._publisher_task = None
+        self._modem_stats_task = None
 
         if self._audio_stream is not None:
             try:
@@ -319,11 +330,22 @@ class LiveKitRemoteMediaEndpoint:
                     samples_per_channel=len(pcm) // 2,
                 )
                 await source.capture_frame(frame)
+                self._modem_publish_stats.add(pcm)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("发布 LiveKit 模组音频失败: %s", type(exc).__name__)
             self._media_ready = False
+
+    async def _log_modem_publish_stats(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(_AUDIO_STATS_IDLE_TICK_SECONDS)
+                self._modem_publish_stats.maybe_log(
+                    queued=self._modem_audio.qsize(),
+                )
+        except asyncio.CancelledError:
+            raise
 
     def _cancel_browser_audio_task(self) -> None:
         task = self._browser_audio_task
