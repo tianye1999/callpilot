@@ -7,6 +7,10 @@ export interface Env {
   LIVEKIT_API_SECRET: string;
   LIVEKIT_URL: string;
   PUBLIC_ORIGIN: string;
+  CONTENT_READ_ENABLED?: string;
+  CONTENT_RELAY_TIMEOUT_MS?: string;
+  CONTENT_READ_DEVICE_LIMIT?: string;
+  CONTENT_READ_EDGE_LIMIT?: string;
 }
 
 export interface EdgeRecord {

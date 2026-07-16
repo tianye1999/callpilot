@@ -1,5 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 
+import {
+  CONTENT_WIRE_LIMIT_BYTES,
+  dataRequestSchema,
+  isBeforeRelayDeadline,
+  serializedByteLength,
+  type ContentResource,
+  type DataResponse
+} from "./content-sync";
 import { edgeMessageSchema } from "./schemas";
 import type { EdgePresence, Env } from "./types";
 
@@ -7,7 +15,17 @@ interface SocketAttachment {
   edgeId: string;
 }
 
+interface PendingRelay {
+  resource: ContentResource;
+  deadline: number;
+  socket: WebSocket;
+  timeout: ReturnType<typeof setTimeout>;
+  resolve: (response: Response) => void;
+}
+
 export class EdgeRoom extends DurableObject<Env> {
+  private readonly pendingRelays = new Map<string, PendingRelay>();
+
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -18,6 +36,7 @@ export class EdgeRoom extends DurableObject<Env> {
     if (url.pathname === "/connect") return this.acceptConnection(request);
     if (url.pathname === "/presence" && request.method === "GET") return this.presence();
     if (url.pathname === "/command" && request.method === "POST") return this.sendCommand(request);
+    if (url.pathname === "/content-relay" && request.method === "POST") return this.relayContent(request);
     return new Response("Not found", { status: 404 });
   }
 
@@ -28,7 +47,10 @@ export class EdgeRoom extends DurableObject<Env> {
     const edgeId = request.headers.get("X-CallPilot-Edge-Id") ?? "";
     if (!/^edge_[A-Za-z0-9_-]{12,80}$/.test(edgeId)) return new Response("Forbidden", { status: 403 });
 
-    for (const existing of this.ctx.getWebSockets("edge")) existing.close(4001, "Replaced by a newer connection");
+    for (const existing of this.ctx.getWebSockets("edge")) {
+      this.failRelaysForSocket(existing, "EDGE_OFFLINE", 503);
+      existing.close(4001, "Replaced by a newer connection");
+    }
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -51,13 +73,68 @@ export class EdgeRoom extends DurableObject<Env> {
     const sockets = this.ctx.getWebSockets("edge").filter((socket) => socket.readyState === WebSocket.OPEN);
     if (sockets.length !== 1) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
     const text = await request.text();
-    if (text.length > 16 * 1024) return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
+    if (serializedByteLength(text) > CONTENT_WIRE_LIMIT_BYTES) {
+      return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
+    }
     sockets[0]?.send(text);
     return Response.json({ accepted: true }, { status: 202 });
   }
 
+  private async relayContent(request: Request): Promise<Response> {
+    const text = await request.text();
+    if (serializedByteLength(text) > CONTENT_WIRE_LIMIT_BYTES) {
+      return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return Response.json({ error: "INVALID_REQUEST" }, { status: 400 });
+    }
+    const result = dataRequestSchema.safeParse(parsed);
+    if (!result.success || result.data.expiresAtUnixMs <= Date.now()) {
+      return Response.json({ error: "INVALID_REQUEST" }, { status: 400 });
+    }
+    if (this.pendingRelays.has(result.data.requestId)) {
+      return Response.json({ error: "INVALID_REQUEST" }, { status: 400 });
+    }
+    const sockets = this.ctx.getWebSockets("edge").filter((socket) => socket.readyState === WebSocket.OPEN);
+    if (sockets.length !== 1) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
+    const socket = sockets[0] as WebSocket;
+
+    return new Promise<Response>((resolve) => {
+      const requestId = result.data.requestId;
+      const timeout = setTimeout(() => {
+        const pending = this.pendingRelays.get(requestId);
+        if (!pending) return;
+        this.pendingRelays.delete(requestId);
+        pending.resolve(Response.json({ error: "TIMEOUT" }, { status: 504 }));
+      }, Math.max(1, result.data.expiresAtUnixMs - Date.now()));
+      this.pendingRelays.set(requestId, {
+        resource: result.data.resource,
+        deadline: result.data.expiresAtUnixMs,
+        socket,
+        timeout,
+        resolve
+      });
+      try {
+        socket.send(text);
+      } catch {
+        clearTimeout(timeout);
+        this.pendingRelays.delete(requestId);
+        resolve(Response.json({ error: "EDGE_OFFLINE" }, { status: 503 }));
+      }
+    });
+  }
+
   override async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
-    if (typeof message !== "string" || message.length > 16 * 1024) {
+    if (typeof message !== "string") {
+      this.failRelaysForSocket(ws, "EDGE_OFFLINE", 503);
+      ws.close(1003, "Text JSON required");
+      return;
+    }
+    if (serializedByteLength(message) > CONTENT_WIRE_LIMIT_BYTES) {
+      this.failRelaysForSocket(ws, "PAYLOAD_TOO_LARGE", 413);
       ws.close(1009, "Invalid message");
       return;
     }
@@ -71,6 +148,10 @@ export class EdgeRoom extends DurableObject<Env> {
     const result = edgeMessageSchema.safeParse(parsed);
     if (!result.success) {
       ws.send(JSON.stringify({ v: 1, type: "error", code: "INVALID_MESSAGE" }));
+      return;
+    }
+    if (result.data.type === "data.response") {
+      this.acceptRelayResponse(ws, result.data);
       return;
     }
     const attachment = ws.deserializeAttachment() as SocketAttachment;
@@ -129,6 +210,7 @@ export class EdgeRoom extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    this.failRelaysForSocket(ws, "EDGE_OFFLINE", 503);
     const attachment = ws.deserializeAttachment() as SocketAttachment | null;
     await this.ctx.storage.put<EdgePresence>("presence", {
       ...(await this.ctx.storage.get<EdgePresence>("presence")),
@@ -143,6 +225,29 @@ export class EdgeRoom extends DurableObject<Env> {
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
+    this.failRelaysForSocket(ws, "EDGE_OFFLINE", 503);
     ws.close(1011, "WebSocket error");
+  }
+
+  private acceptRelayResponse(ws: WebSocket, response: DataResponse): void {
+    const pending = this.pendingRelays.get(response.requestId);
+    if (
+      !pending
+      || pending.socket !== ws
+      || pending.resource !== response.resource
+      || !isBeforeRelayDeadline(pending.deadline, Date.now())
+    ) return;
+    clearTimeout(pending.timeout);
+    this.pendingRelays.delete(response.requestId);
+    pending.resolve(Response.json(response));
+  }
+
+  private failRelaysForSocket(ws: WebSocket, code: string, status: number): void {
+    for (const [requestId, pending] of this.pendingRelays) {
+      if (pending.socket !== ws) continue;
+      clearTimeout(pending.timeout);
+      this.pendingRelays.delete(requestId);
+      pending.resolve(Response.json({ error: code }, { status }));
+    }
   }
 }

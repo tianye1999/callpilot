@@ -13,8 +13,14 @@ export function json(data: unknown, status = 200, headers?: HeadersInit): Respon
   return new Response(JSON.stringify(data), { status, headers: merged });
 }
 
-export function error(code: string, message: string, status: number, requestId: string): Response {
-  return json({ error: { code, message, requestId } }, status);
+export function error(
+  code: string,
+  message: string,
+  status: number,
+  requestId: string,
+  headers?: HeadersInit
+): Response {
+  return json({ error: { code, message, requestId } }, status, headers);
 }
 
 export async function readJson(request: Request): Promise<unknown> {
@@ -40,7 +46,8 @@ export class HttpError extends Error {
   constructor(
     public readonly code: string,
     message: string,
-    public readonly status: number
+    public readonly status: number,
+    public readonly headers?: HeadersInit
   ) {
     super(message);
   }

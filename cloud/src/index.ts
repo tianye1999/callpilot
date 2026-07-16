@@ -1,4 +1,20 @@
 import { authenticateDevice, authenticateEdge } from "./auth";
+import {
+  contentReadEnabled,
+  contentRelayTimeoutMs,
+  enforceContentRateLimit
+} from "./content-access";
+import {
+  CONTENT_CAPABILITIES,
+  CONTENT_WIRE_LIMIT_BYTES,
+  contentCursorSchema,
+  dataResponseSchema,
+  responseMatchesRequest,
+  serializedByteLength,
+  type ContentErrorCode,
+  type ContentResource,
+  type DataRequest
+} from "./content-sync";
 import { liveKitConnectSources } from "./csp";
 import { EdgeRoom } from "./edge-room";
 import { error, HttpError, json, readJson, requireSameOrigin } from "./http";
@@ -12,7 +28,7 @@ import {
   createPairingSchema
 } from "./schemas";
 import { constantTimeEqual, randomId, randomPairingCode, randomSecret, sha256 } from "./security";
-import type { CallRecord, Env, InboundOfferRecord } from "./types";
+import type { CallRecord, DeviceRecord, Env, InboundOfferRecord } from "./types";
 import { ZodError } from "zod";
 
 export { EdgeRoom };
@@ -21,11 +37,17 @@ const COOKIE_MAX_AGE = 180 * 24 * 60 * 60;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const requestId = randomId("req", 12);
+    const path = new URL(request.url).pathname;
+    const requestId = randomId(
+      path.startsWith("/v1/messages") || path.startsWith("/v1/call-records") ? "request" : "req",
+      12
+    );
     try {
       return await route(request, env, requestId);
     } catch (caught) {
-      if (caught instanceof HttpError) return error(caught.code, caught.message, caught.status, requestId);
+      if (caught instanceof HttpError) {
+        return error(caught.code, caught.message, caught.status, requestId, caught.headers);
+      }
       if (caught instanceof ZodError) return error("VALIDATION_ERROR", "Request fields are invalid", 400, requestId);
       console.error(JSON.stringify({ requestId, errorType: caught instanceof Error ? caught.name : "unknown" }));
       return error("INTERNAL_ERROR", "The request could not be completed", 500, requestId);
@@ -58,6 +80,26 @@ async function route(request: Request, env: Env, requestId: string): Promise<Res
   }
   if (path === "/v1/inbound-offers/claim" && request.method === "POST") {
     return claimInboundOffer(request, env);
+  }
+  if (path === "/v1/messages" && request.method === "GET") {
+    return relayContentRead(request, env, "messages.list", undefined);
+  }
+  if (path === "/v1/call-records" && request.method === "GET") {
+    return relayContentRead(request, env, "call_records.list", undefined);
+  }
+
+  const timeline = path.match(
+    /^\/v1\/call-records\/(call_[A-Za-z0-9_-]{12,80})\/timeline$/
+  );
+  if (timeline && request.method === "GET") {
+    return relayContentRead(request, env, "call_timeline.list", timeline[1]);
+  }
+  const callRecord = path.match(/^\/v1\/call-records\/(call_[A-Za-z0-9_-]{12,80})$/);
+  if (callRecord && request.method === "GET") {
+    return relayContentRead(request, env, "call_records.get", callRecord[1]);
+  }
+  if (path.startsWith("/v1/call-records/") && request.method === "GET") {
+    throw new HttpError("INVALID_REQUEST", "The request fields are invalid", 400);
   }
 
   const presence = path.match(/^\/v1\/edges\/(edge_[A-Za-z0-9_-]+)\/presence$/);
@@ -180,6 +222,7 @@ async function getDevice(request: Request, env: Env): Promise<Response> {
     return json({
       ok: true,
       paired: true,
+      capabilities: await contentCapabilities(env, device.edge_id),
       device: { deviceId: device.device_id, edgeId: device.edge_id, displayName: device.display_name },
       edge: await response.json()
     });
@@ -401,6 +444,164 @@ async function getCall(request: Request, env: Env, callId: string): Promise<Resp
     };
   }
   return json(payload);
+}
+
+async function relayContentRead(
+  request: Request,
+  env: Env,
+  resource: ContentResource,
+  callId: string | undefined
+): Promise<Response> {
+  const device = await authenticateDevice(request, env);
+  await requireContentCapability(env, device, resource);
+  if (!contentReadEnabled(env.CONTENT_READ_ENABLED)) {
+    throw new HttpError("FEATURE_DISABLED", "Content sync is disabled", 403);
+  }
+  await enforceContentRateLimit(env, device);
+
+  const params = contentParams(new URL(request.url), resource, callId);
+  const now = Date.now();
+  const relayRequest: DataRequest = {
+    v: 1,
+    type: "data.request",
+    requestId: randomId("request", 12),
+    deviceId: device.device_id,
+    resource,
+    params,
+    issuedAtUnixMs: now,
+    expiresAtUnixMs: now + contentRelayTimeoutMs(env)
+  } as DataRequest;
+  const wire = JSON.stringify(relayRequest);
+  if (serializedByteLength(wire) > CONTENT_WIRE_LIMIT_BYTES) {
+    throw new HttpError("PAYLOAD_TOO_LARGE", "The request exceeds the protocol limit", 413);
+  }
+
+  const relayed = await edgeRoom(env, device.edge_id).fetch("https://edge-room/content-relay", {
+    method: "POST",
+    body: wire
+  });
+  if (!relayed.ok) {
+    const internal = await safeInternalRelayError(relayed);
+    throw contentHttpError(internal);
+  }
+  const rawResponse = await relayed.text();
+  if (serializedByteLength(rawResponse) > CONTENT_WIRE_LIMIT_BYTES) {
+    throw new HttpError("PAYLOAD_TOO_LARGE", "The content item exceeds the protocol limit", 413);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawResponse);
+  } catch {
+    throw new HttpError("INTERNAL_ERROR", "The request could not be completed", 500);
+  }
+  const response = dataResponseSchema.safeParse(parsed);
+  if (!response.success || !responseMatchesRequest(response.data, relayRequest)) {
+    throw new HttpError("INTERNAL_ERROR", "The request could not be completed", 500);
+  }
+
+  // The credential may have been revoked or moved out of the allowlist while
+  // Edge was reading. Never return even an accepted body without a fresh check.
+  const currentDevice = await authenticateDevice(request, env);
+  if (currentDevice.device_id !== device.device_id || currentDevice.edge_id !== device.edge_id) {
+    throw new HttpError("UNAUTHORIZED", "Credential is missing, invalid, or revoked", 401);
+  }
+  await requireContentCapability(env, currentDevice, resource);
+  if (!contentReadEnabled(env.CONTENT_READ_ENABLED)) {
+    throw new HttpError("FEATURE_DISABLED", "Content sync is disabled", 403);
+  }
+
+  if (response.data.status === "error") throw contentHttpError(response.data.error.code);
+  await audit(env, "phone", device.device_id, "content.read", resource, "allowed");
+  return json(response.data.body);
+}
+
+function contentParams(
+  url: URL,
+  resource: ContentResource,
+  callId: string | undefined
+): DataRequest["params"] {
+  const allowed = resource === "call_records.get" ? new Set<string>() : new Set(["limit", "cursor"]);
+  for (const key of url.searchParams.keys()) {
+    if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+      throw new HttpError("INVALID_REQUEST", "The request fields are invalid", 400);
+    }
+  }
+  if (resource === "call_records.get") {
+    if (!callId) throw new HttpError("INVALID_REQUEST", "The request fields are invalid", 400);
+    return { callId };
+  }
+  const defaultLimit = resource === "call_timeline.list" ? 50 : 25;
+  const rawLimit = url.searchParams.get("limit");
+  const limit = rawLimit === null ? defaultLimit : Number(rawLimit);
+  if (rawLimit !== null && !/^\d+$/.test(rawLimit)) {
+    throw new HttpError("INVALID_REQUEST", "The request fields are invalid", 400);
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new HttpError("INVALID_REQUEST", "The request fields are invalid", 400);
+  }
+  const rawCursor = url.searchParams.get("cursor");
+  const cursor = rawCursor === null ? null : rawCursor;
+  if (cursor !== null && !contentCursorSchema.safeParse(cursor).success) {
+    throw new HttpError("CURSOR_INVALID", "The cursor is not valid for this resource", 400);
+  }
+  if (resource === "call_timeline.list") {
+    if (!callId) throw new HttpError("INVALID_REQUEST", "The request fields are invalid", 400);
+    return { callId, limit, cursor };
+  }
+  return { limit, cursor };
+}
+
+async function contentCapabilities(env: Env, edgeId: string): Promise<string[]> {
+  const granted = await env.DB.prepare(
+    "SELECT allowlist.edge_id FROM content_read_edges AS allowlist JOIN edges ON edges.edge_id = allowlist.edge_id WHERE allowlist.edge_id = ?1 AND edges.revoked_at IS NULL"
+  ).bind(edgeId).first<{ edge_id: string }>();
+  return granted ? [...CONTENT_CAPABILITIES] : [];
+}
+
+async function requireContentCapability(
+  env: Env,
+  device: DeviceRecord,
+  resource: ContentResource
+): Promise<void> {
+  const required = resource === "messages.list" ? "messages:read" : "call_records:read";
+  if (!(await contentCapabilities(env, device.edge_id)).includes(required)) {
+    throw new HttpError("FORBIDDEN", "The device cannot read this resource", 403);
+  }
+}
+
+async function safeInternalRelayError(response: Response): Promise<ContentErrorCode> {
+  try {
+    const payload = await response.json<{ error?: unknown }>();
+    const parsed = typeof payload.error === "string" ? payload.error : "INTERNAL_ERROR";
+    return isContentErrorCode(parsed) ? parsed : "INTERNAL_ERROR";
+  } catch {
+    return "INTERNAL_ERROR";
+  }
+}
+
+function isContentErrorCode(code: string): code is ContentErrorCode {
+  return [
+    "INVALID_REQUEST", "CURSOR_INVALID", "FORBIDDEN", "FEATURE_DISABLED", "NOT_FOUND",
+    "RATE_LIMITED", "PAYLOAD_TOO_LARGE", "EDGE_OFFLINE", "TIMEOUT", "INTERNAL_ERROR"
+  ].includes(code);
+}
+
+function contentHttpError(code: ContentErrorCode): HttpError {
+  const mapping: Record<ContentErrorCode, [number, string]> = {
+    INVALID_REQUEST: [400, "The request fields are invalid"],
+    CURSOR_INVALID: [400, "The cursor is not valid for this resource"],
+    FORBIDDEN: [403, "The device cannot read this resource"],
+    FEATURE_DISABLED: [403, "Content sync is disabled"],
+    NOT_FOUND: [404, "Call record was not found"],
+    RATE_LIMITED: [429, "Too many content requests"],
+    PAYLOAD_TOO_LARGE: [413, "The content item exceeds the protocol limit"],
+    EDGE_OFFLINE: [503, "Edge is offline"],
+    TIMEOUT: [504, "Edge did not respond in time"],
+    INTERNAL_ERROR: [500, "The request could not be completed"]
+  };
+  const [status, message] = mapping[code];
+  const headers = code === "RATE_LIMITED" ? { "Retry-After": "30" } : undefined;
+  return new HttpError(code, message, status, headers);
 }
 
 async function authenticateActorForEdge(

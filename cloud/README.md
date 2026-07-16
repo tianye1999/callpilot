@@ -2,8 +2,10 @@
 
 Company-hosted control plane for issue #42. It serves the fixed Web Dialer,
 registers Edge devices, pairs phones, routes one live Edge WebSocket through a
-Durable Object, and signs room-scoped LiveKit credentials. It does not store or
-relay call audio, SMS bodies, transcripts, or recordings.
+Durable Object, and signs room-scoped LiveKit credentials. When the #99 content
+gate and closed-Beta allowlist are both enabled, it can relay one bounded SMS or
+normalized call-history response in memory. It never stores those bodies,
+transcripts, summaries, recordings, or audio in D1 or Durable Object storage.
 
 ## Local verification
 
@@ -55,6 +57,24 @@ curl --fail-with-body -X POST https://api-beta.bondings.ai/v1/admin/enrollment-i
 
 The code is shown once and expires after one use. Edge credentials and device
 private keys are stored by the desktop app in Keychain/Credential Manager.
+
+## Closed-Beta content-read rollout
+
+Content reads default off. Apply migrations first, add only an owner-approved
+Edge to the server-managed allowlist, and then set the Worker flag:
+
+```bash
+npx wrangler d1 execute callpilot-cloud-beta --remote \
+  --command "INSERT INTO content_read_edges(edge_id, created_at) VALUES ('edge_REPLACE_WITH_OPAQUE_ID', CAST(strftime('%s','now') AS INTEGER) * 1000)"
+npx wrangler secret put CONTENT_READ_ENABLED
+```
+
+Enter the exact value `true` for the flag. Missing values and every other spelling
+fail closed. Removing the allowlist row revokes both `messages:read` and
+`call_records:read` for all devices paired to that Edge. The Edge independently
+requires `REMOTE_CONTENT_READ_ENABLED=true`; either gate being off blocks reads.
+Worker invocation observability remains explicitly disabled because request URLs
+carry opaque cursors that must not enter durable platform logs or traces.
 
 ## Rollback
 

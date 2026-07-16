@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { dataResponseSchema } from "./content-sync";
+
 const opaqueId = z.string().regex(/^[a-z]+_[A-Za-z0-9_-]{12,80}$/);
 
 export const createEnrollmentInviteSchema = z.object({
@@ -26,7 +28,7 @@ export const createCallSchema = z.object({
   idempotencyKey: z.string().min(16).max(128).regex(/^[A-Za-z0-9._:-]+$/)
 }).strict();
 
-export const edgeMessageSchema = z.discriminatedUnion("type", [
+export const edgeMessageSchema = z.union([
   z.object({
     v: z.literal(1),
     type: z.literal("heartbeat"),
@@ -72,10 +74,10 @@ export const edgeMessageSchema = z.discriminatedUnion("type", [
     offerId: opaqueId,
     callId: opaqueId,
     reason: z.string().regex(/^[A-Z][A-Z0-9_]{2,63}$/)
-  }).strict()
+  }).strict(),
+  dataResponseSchema
 ]);
 
 export const claimInboundOfferSchema = z.object({
   offerId: opaqueId
 }).strict();
-
