@@ -12,7 +12,7 @@ struct CallRecordsView: View {
                 recordList
             }
         }
-        .navigationTitle("记录")
+        .navigationTitle(L10n.text("tab.records"))
         .task { await model.refresh() }
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
@@ -49,7 +49,11 @@ struct CallRecordsView: View {
                     } label: {
                         HStack {
                             Spacer()
-                            if model.isLoadingMore { ProgressView() } else { Text("加载更多") }
+                            if model.isLoadingMore {
+                                ProgressView()
+                            } else {
+                                Text(L10n.text("common.load_more"))
+                            }
                             Spacer()
                         }
                     }
@@ -67,17 +71,17 @@ struct CallRecordsView: View {
     private var emptyState: some View {
         switch model.syncStatus {
         case .idle, .loading:
-            ProgressView("正在同步通话记录…")
+            ProgressView(L10n.text("calls.loading"))
         case .live:
-            ContentUnavailableView("暂无通话记录", systemImage: "clock")
+            ContentUnavailableView(L10n.text("calls.empty"), systemImage: "clock")
                 .refreshable { await model.refresh() }
         case .stale, .offline:
             ContentUnavailableView {
-                Label("无法载入通话记录", systemImage: "wifi.slash")
+                Label(L10n.text("calls.load_failed"), systemImage: "wifi.slash")
             } description: {
                 Text(model.errorMessage ?? CallHistoryCopy.unavailable)
             } actions: {
-                Button("重试") { Task { await model.refresh() } }
+                Button(L10n.text("common.retry")) { Task { await model.refresh() } }
             }
         }
     }
@@ -106,10 +110,10 @@ struct CallRecordsView: View {
 
     private var statusText: String {
         switch model.syncStatus {
-        case .live: "已同步"
-        case .stale: "离线缓存，内容可能不是最新"
+        case .live: L10n.text("common.synced")
+        case .stale: L10n.text("common.stale_cache")
         case .offline: model.errorMessage ?? CallHistoryCopy.edgeOffline
-        case .idle, .loading: "正在同步"
+        case .idle, .loading: L10n.text("common.syncing")
         }
     }
 
@@ -161,7 +165,9 @@ private struct CallRecordRow: View {
         .accessibilityElement(children: .combine)
     }
 
-    private var addressLabel: String { record.address ?? "未知号码" }
+    private var addressLabel: String {
+        record.address ?? L10n.text("calls.unknown_address")
+    }
 
     private var startedAtLabel: String {
         Date(timeIntervalSince1970: TimeInterval(record.startedAt) / 1_000)
@@ -173,33 +179,23 @@ private struct CallRecordRow: View {
     }
 
     private var statusLabel: String {
-        switch record.status {
-        case .completed: "已完成"
-        case .notConnected: "未接通"
-        case .failed: "失败"
-        default: "状态未知"
-        }
+        CallRecordCopy.status(record.status)
     }
 
     private var durationLabel: String? {
         guard let durationMs = record.durationMs else { return nil }
-        let seconds = durationMs / 1_000
-        return seconds >= 60 ? "\(seconds / 60)分\(seconds % 60)秒" : "\(seconds)秒"
+        return CallRecordCopy.duration(durationMs)
     }
 
     private var sourceLabel: String? {
-        switch record.source {
-        case .agent: "AI 接听"
-        case .remoteHandset: "手机通话"
-        case .unknown: nil
-        }
+        CallRecordCopy.source(record.source)
     }
 
     private var summaryLabel: String? {
         switch record.summaryState {
-        case .pending: "AI 摘要生成中"
-        case .ready: record.summaryPreview ?? "查看 AI 摘要"
-        case .failed: "AI 摘要生成失败"
+        case .pending: L10n.text("calls.summary.pending_preview")
+        case .ready: record.summaryPreview ?? L10n.text("calls.summary.ready_preview")
+        case .failed: L10n.text("calls.summary.failed_preview")
         case .unavailable: nil
         }
     }
@@ -220,17 +216,19 @@ private struct CallRecordDetailView: View {
                 detailList(detail: detail, state: state)
             } else if let state = model.detail(for: callId), state.syncStatus == .offline {
                 ContentUnavailableView {
-                    Label("无法载入通话详情", systemImage: "wifi.slash")
+                    Label(L10n.text("calls.detail.load_failed"), systemImage: "wifi.slash")
                 } description: {
                     Text(state.errorMessage ?? CallHistoryCopy.unavailable)
                 } actions: {
-                    Button("重试") { Task { await model.refreshDetail(callId: callId) } }
+                    Button(L10n.text("common.retry")) {
+                        Task { await model.refreshDetail(callId: callId) }
+                    }
                 }
             } else {
-                ProgressView("正在载入通话详情…")
+                ProgressView(L10n.text("calls.detail.loading"))
             }
         }
-        .navigationTitle("通话详情")
+        .navigationTitle(L10n.text("calls.detail.title"))
         .navigationBarTitleDisplayMode(.inline)
         .task(id: callId) { await model.refreshDetail(callId: callId) }
         .onChange(of: scenePhase) { _, phase in
@@ -244,7 +242,7 @@ private struct CallRecordDetailView: View {
             if state.syncStatus == .stale || state.errorMessage != nil {
                 Section {
                     Label(
-                        state.errorMessage ?? "离线缓存，内容可能不是最新",
+                        state.errorMessage ?? L10n.text("common.stale_cache"),
                         systemImage: state.syncStatus == .stale ? "clock.badge.exclamationmark" : "exclamationmark.triangle"
                     )
                     .font(.subheadline)
@@ -256,21 +254,23 @@ private struct CallRecordDetailView: View {
             summarySection(detail: detail)
 
             if state.isNormalNoAIContent {
-                Section("AI 对话") {
-                    Label("这通电话没有 AI 对话内容", systemImage: "person.wave.2")
+                Section(L10n.text("calls.ai.section")) {
+                    Label(L10n.text("calls.ai.no_content"), systemImage: "person.wave.2")
                         .foregroundStyle(.secondary)
                 }
             } else if !state.visibleTimeline.isEmpty {
-                Section("通话过程") {
+                Section(L10n.text("calls.timeline.section")) {
                     ForEach(state.visibleTimeline) { item in
                         TimelineRow(item: item)
                     }
                 }
             } else if state.syncStatus == .loading {
-                Section("通话过程") { ProgressView("正在载入…") }
+                Section(L10n.text("calls.timeline.section")) {
+                    ProgressView(L10n.text("calls.timeline.loading"))
+                }
             } else {
-                Section("通话过程") {
-                    Text("暂无可显示的对话内容")
+                Section(L10n.text("calls.timeline.section")) {
+                    Text(L10n.text("calls.timeline.empty"))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -282,7 +282,11 @@ private struct CallRecordDetailView: View {
                     } label: {
                         HStack {
                             Spacer()
-                            if state.isLoadingMore { ProgressView() } else { Text("加载更多内容") }
+                            if state.isLoadingMore {
+                                ProgressView()
+                            } else {
+                                Text(L10n.text("calls.timeline.load_more"))
+                            }
                             Spacer()
                         }
                     }
@@ -299,37 +303,40 @@ private struct CallRecordDetailView: View {
         case .hidden:
             EmptyView()
         case .pending:
-            Section("AI 摘要") {
+            Section(L10n.text("calls.summary.section")) {
                 HStack(spacing: 10) {
                     ProgressView()
-                    Text("摘要生成中")
+                    Text(L10n.text("calls.summary.loading"))
                         .foregroundStyle(.secondary)
                 }
             }
         case .ready(let summary):
-            Section("AI 摘要") {
+            Section(L10n.text("calls.summary.section")) {
                 if let text = summary?.text, !text.isEmpty {
                     Text(text).textSelection(.enabled)
                 }
                 if let caller = summary?.callerIdentity, !caller.isEmpty {
-                    LabeledContent("来电人", value: caller)
+                    LabeledContent(L10n.text("calls.summary.caller"), value: caller)
                 }
                 if let intent = summary?.intent, !intent.isEmpty {
-                    LabeledContent("来意", value: intent)
+                    LabeledContent(L10n.text("calls.summary.intent"), value: intent)
                 }
                 if let urgency = summary?.urgency, !urgency.isEmpty {
-                    LabeledContent("紧急程度", value: urgency)
+                    LabeledContent(L10n.text("calls.summary.urgency"), value: urgency)
                 }
                 if let callback = summary?.callbackNeeded {
-                    LabeledContent("需要回电", value: callback ? "是" : "否")
+                    LabeledContent(
+                        L10n.text("calls.summary.callback"),
+                        value: callback ? L10n.text("common.yes") : L10n.text("common.no")
+                    )
                 }
             }
         case .failed(let summary):
-            Section("AI 摘要") {
-                Label("摘要生成失败", systemImage: "exclamationmark.triangle")
+            Section(L10n.text("calls.summary.section")) {
+                Label(L10n.text("calls.summary.failed"), systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
                 if let code = summary?.errorCode, !code.isEmpty {
-                    Text("错误代码：\(code)")
+                    Text(L10n.format("calls.summary.error_code", code))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -343,39 +350,33 @@ private struct CallMetadataSection: View {
     let record: CallRecordItem
 
     var body: some View {
-        Section("通话") {
-            LabeledContent(record.direction == .inbound ? "来电" : "去电", value: record.address ?? "未知号码")
-            LabeledContent("开始时间", value: dateLabel(record.startedAt))
+        Section(L10n.text("calls.metadata.section")) {
+            LabeledContent(
+                record.direction == .inbound
+                    ? L10n.text("calls.direction.inbound")
+                    : L10n.text("calls.direction.outbound"),
+                value: record.address ?? L10n.text("calls.unknown_address")
+            )
+            LabeledContent(L10n.text("calls.metadata.started_at"), value: dateLabel(record.startedAt))
             if let endedAt = record.endedAt {
-                LabeledContent("结束时间", value: dateLabel(endedAt))
+                LabeledContent(L10n.text("calls.metadata.ended_at"), value: dateLabel(endedAt))
             }
             if let durationMs = record.durationMs {
-                LabeledContent("通话时长", value: durationLabel(durationMs))
+                LabeledContent(L10n.text("calls.metadata.duration"), value: durationLabel(durationMs))
             }
-            LabeledContent("结果", value: statusLabel)
+            LabeledContent(L10n.text("calls.metadata.result"), value: statusLabel)
             if let triageLabel {
-                LabeledContent("分诊结果", value: triageLabel)
+                LabeledContent(L10n.text("calls.metadata.triage"), value: triageLabel)
             }
         }
     }
 
     private var statusLabel: String {
-        switch record.status {
-        case .completed: "已完成"
-        case .notConnected: "未接通"
-        case .failed: "失败"
-        default: "状态未知"
-        }
+        CallRecordCopy.status(record.status)
     }
 
     private var triageLabel: String? {
-        switch record.triageOutcome {
-        case .aiHandled: "AI 已处理"
-        case .rejected: "已礼貌拒绝"
-        case .transferred: "已转接本人"
-        case .unknown: "结果未知"
-        case nil: nil
-        }
+        CallRecordCopy.triageOutcome(record.triageOutcome)
     }
 
     private func dateLabel(_ milliseconds: Int64) -> String {
@@ -384,8 +385,7 @@ private struct CallMetadataSection: View {
     }
 
     private func durationLabel(_ milliseconds: Int64) -> String {
-        let seconds = milliseconds / 1_000
-        return seconds >= 60 ? "\(seconds / 60)分\(seconds % 60)秒" : "\(seconds)秒"
+        CallRecordCopy.duration(milliseconds)
     }
 }
 
@@ -418,10 +418,13 @@ private struct TimelineRow: View {
 
     private var title: String {
         switch item {
-        case .transcript(let value): value.role == .caller ? "对方" : "AI"
-        case .result: "通话结果"
-        case .triage: "智能分诊"
-        case .takeover: "转接状态"
+        case .transcript(let value):
+            value.role == .caller
+                ? L10n.text("calls.timeline.caller")
+                : L10n.text("calls.timeline.ai")
+        case .result: L10n.text("calls.timeline.result")
+        case .triage: L10n.text("calls.timeline.triage")
+        case .takeover: L10n.text("calls.timeline.takeover")
         case .unknown: ""
         }
     }
@@ -430,8 +433,9 @@ private struct TimelineRow: View {
         switch item {
         case .transcript(let value): value.text
         case .result(let value): value.summary ?? statusLabel(value.status)
-        case .triage(let value): "\(categoryLabel(value.category)) · \(actionLabel(value.action))"
-        case .takeover(let value): takeoverLabel(value.state)
+        case .triage(let value):
+            "\(CallRecordCopy.category(value.category)) · \(CallRecordCopy.action(value.action))"
+        case .takeover(let value): CallRecordCopy.takeover(value.state)
         case .unknown: nil
         }
     }
@@ -462,38 +466,70 @@ private struct TimelineRow: View {
     }
 
     private func statusLabel(_ status: CallRecordStatus) -> String {
+        CallRecordCopy.status(status)
+    }
+}
+
+private enum CallRecordCopy {
+    static func status(_ status: CallRecordStatus) -> String {
         switch status {
-        case .completed: "已完成"
-        case .notConnected: "未接通"
-        case .failed: "失败"
-        default: "状态未知"
+        case .completed: L10n.text("calls.status.completed")
+        case .notConnected: L10n.text("calls.status.not_connected")
+        case .failed: L10n.text("calls.status.failed")
+        default: L10n.text("calls.status.unknown")
         }
     }
 
-    private func categoryLabel(_ category: TriageCategory) -> String {
+    static func duration(_ milliseconds: Int64) -> String {
+        let seconds = milliseconds / 1_000
+        if seconds >= 60 {
+            return L10n.format("calls.duration.minutes_seconds", seconds / 60, seconds % 60)
+        }
+        return L10n.format("calls.duration.seconds", seconds)
+    }
+
+    static func source(_ source: CallSource) -> String? {
+        switch source {
+        case .agent: L10n.text("calls.source.agent")
+        case .remoteHandset: L10n.text("calls.source.remote_handset")
+        case .unknown: nil
+        }
+    }
+
+    static func triageOutcome(_ outcome: CallTriageOutcome?) -> String? {
+        switch outcome {
+        case .aiHandled: L10n.text("calls.triage_outcome.ai_handled")
+        case .rejected: L10n.text("calls.triage_outcome.rejected")
+        case .transferred: L10n.text("calls.triage_outcome.transferred")
+        case .unknown: L10n.text("calls.triage_outcome.unknown")
+        case nil: nil
+        }
+    }
+
+    static func category(_ category: TriageCategory) -> String {
         switch category {
-        case .marketing: "营销来电"
-        case .personal: "个人来电"
-        case .needsOwner: "需要本人处理"
-        case .unknown: "类型未知"
+        case .marketing: L10n.text("calls.triage_category.marketing")
+        case .personal: L10n.text("calls.triage_category.personal")
+        case .needsOwner: L10n.text("calls.triage_category.needs_owner")
+        case .unknown: L10n.text("calls.triage_category.unknown")
         }
     }
 
-    private func actionLabel(_ action: TriageAction) -> String {
+    static func action(_ action: TriageAction) -> String {
         switch action {
-        case .clarify: "继续确认"
-        case .continueAI: "AI 继续处理"
-        case .reject: "已拒绝"
-        case .transfer: "已转接"
+        case .clarify: L10n.text("calls.triage_action.clarify")
+        case .continueAI: L10n.text("calls.triage_action.continue_ai")
+        case .reject: L10n.text("calls.triage_action.reject")
+        case .transfer: L10n.text("calls.triage_action.transfer")
         }
     }
 
-    private func takeoverLabel(_ state: TakeoverState) -> String {
+    static func takeover(_ state: TakeoverState) -> String {
         switch state {
-        case .requested: "正在请求转接"
-        case .committed: "已由本人接听"
-        case .ownerHangup: "本人已挂断"
-        case .failed: "转接失败"
+        case .requested: L10n.text("calls.takeover.requested")
+        case .committed: L10n.text("calls.takeover.committed")
+        case .ownerHangup: L10n.text("calls.takeover.owner_hangup")
+        case .failed: L10n.text("calls.takeover.failed")
         }
     }
 }

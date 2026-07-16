@@ -41,6 +41,33 @@ final class CallHistoryModelTests: XCTestCase {
         XCTAssertEqual(model.records[0].summaryState, .ready)
     }
 
+    func testAuthorizationFailureClearsCachedContentAndNotifiesLifecycle() async throws {
+        let page = try fixture(CallRecordsPage.self, "call-records-page.json")
+        let store = InMemoryCallHistoryCacheStore(snapshot: CallHistoryCacheSnapshot(
+            deviceId: "device_abcdefghijkl",
+            records: page.items,
+            collectionRevision: page.collectionRevision,
+            details: [:],
+            savedAt: 1_000
+        ))
+        let client = FakeCallRecordContentClient(listResults: [
+            .failure(HostedCloudError(statusCode: 401, code: "UNAUTHORIZED", message: "revoked")),
+        ])
+        var didRevoke = false
+        let model = CallHistoryModel(
+            client: client,
+            store: store,
+            deviceId: "device_abcdefghijkl",
+            onUnauthorized: { didRevoke = true }
+        )
+
+        await model.refresh()
+
+        XCTAssertTrue(model.records.isEmpty)
+        XCTAssertNil(store.snapshot)
+        XCTAssertTrue(didRevoke)
+    }
+
     func testDetailMovesFromPendingToReadyWithoutLosingTimeline() async throws {
         let pending = try fixture(CallRecordDetail.self, "call-record-detail-pending.json")
         let ready = try fixture(CallRecordDetail.self, "call-record-detail-ready.json")
@@ -218,6 +245,25 @@ final class CallHistoryModelTests: XCTestCase {
         XCTAssertTrue(model.records.isEmpty)
         XCTAssertNil(model.detail(for: detail.record.callId))
         XCTAssertNil(store.snapshot)
+    }
+
+    func testSettingsCanLoadProtectedCacheWithoutStartingNetworkRefresh() throws {
+        let page = try fixture(CallRecordsPage.self, "call-records-page.json")
+        let store = InMemoryCallHistoryCacheStore(snapshot: CallHistoryCacheSnapshot(
+            deviceId: "device_abcdefghijkl",
+            records: page.items,
+            collectionRevision: page.collectionRevision,
+            details: [:],
+            savedAt: 1_000
+        ))
+        let client = FakeCallRecordContentClient()
+        let model = CallHistoryModel(client: client, store: store, deviceId: "device_abcdefghijkl")
+
+        model.loadCachedContent()
+
+        XCTAssertEqual(model.records, page.items)
+        XCTAssertEqual(model.syncStatus, .stale)
+        XCTAssertTrue(client.listResults.isEmpty)
     }
 
     private func fixture<T: Decodable>(_ type: T.Type, _ name: String) throws -> T {

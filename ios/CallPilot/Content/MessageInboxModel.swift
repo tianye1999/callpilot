@@ -10,11 +10,11 @@ enum MessageSyncStatus: Equatable {
 }
 
 enum MessageInboxCopy {
-    static let payloadTooLarge = "这条短信内容过大，暂时无法在 App 中显示。请在电脑端查看。"
-    static let unavailable = "暂时无法更新短信，请稍后重试。"
-    static let edgeOffline = "电脑端暂时离线，无法更新短信。"
-    static let featureDisabled = "短信同步尚未启用。"
-    static let unauthorized = "设备授权已失效，请重新配对。"
+    static var payloadTooLarge: String { L10n.text("messages.error.payload_too_large") }
+    static var unavailable: String { L10n.text("messages.error.unavailable") }
+    static var edgeOffline: String { L10n.text("messages.error.edge_offline") }
+    static var featureDisabled: String { L10n.text("messages.error.feature_disabled") }
+    static var unauthorized: String { L10n.text("content.error.unauthorized") }
 }
 
 @MainActor
@@ -34,6 +34,7 @@ final class MessageInboxModel: ObservableObject {
     private let store: MessageCacheStoring
     private let deviceId: String
     private let clockMilliseconds: () -> Int64
+    private let onUnauthorized: @MainActor () -> Void
     private var watermark: MessageWatermark?
     private var nextCursor: String?
     private var didLoadCache = false
@@ -48,12 +49,14 @@ final class MessageInboxModel: ObservableObject {
         deviceId: String,
         clockMilliseconds: @escaping () -> Int64 = {
             Int64(Date().timeIntervalSince1970 * 1_000)
-        }
+        },
+        onUnauthorized: @escaping @MainActor () -> Void = {}
     ) {
         self.client = client
         self.store = store
         self.deviceId = deviceId
         self.clockMilliseconds = clockMilliseconds
+        self.onUnauthorized = onUnauthorized
     }
 
     func refresh() async {
@@ -79,6 +82,10 @@ final class MessageInboxModel: ObservableObject {
             guard requestGeneration == generation else { return }
             handle(error)
         }
+    }
+
+    func loadCachedContent() {
+        loadCacheIfNeeded()
     }
 
     func loadMore() async {
@@ -183,6 +190,7 @@ final class MessageInboxModel: ObservableObject {
             errorCode = "UNAUTHORIZED"
             errorMessage = MessageInboxCopy.unauthorized
             syncStatus = .offline
+            onUnauthorized()
             return
         case "PAYLOAD_TOO_LARGE":
             errorMessage = MessageInboxCopy.payloadTooLarge

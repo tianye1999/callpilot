@@ -98,13 +98,20 @@ final class MessageInboxModelTests: XCTestCase {
         let client = FakeMessageContentClient(results: [
             .failure(HostedCloudError(statusCode: 401, code: "UNAUTHORIZED", message: "revoked")),
         ])
-        let model = MessageInboxModel(client: client, store: store, deviceId: "device_abcdefghijkl")
+        var didRevoke = false
+        let model = MessageInboxModel(
+            client: client,
+            store: store,
+            deviceId: "device_abcdefghijkl",
+            onUnauthorized: { didRevoke = true }
+        )
 
         await model.refresh()
 
         XCTAssertTrue(model.messages.isEmpty)
         XCTAssertNil(store.snapshot)
         XCTAssertEqual(store.clearCount, 1)
+        XCTAssertTrue(didRevoke)
     }
 
     func testLoadMoreAppendsWithoutDuplicatingExistingMessages() async throws {
@@ -239,6 +246,25 @@ final class MessageInboxModelTests: XCTestCase {
         XCTAssertTrue(model.messages.isEmpty)
         XCTAssertNil(store.snapshot)
         XCTAssertEqual(model.syncStatus, .idle)
+    }
+
+    func testSettingsCanLoadProtectedCacheWithoutStartingNetworkRefresh() throws {
+        let page = try fixturePage()
+        let store = InMemoryMessageCacheStore(snapshot: MessageCacheSnapshot(
+            deviceId: "device_abcdefghijkl",
+            messages: page.items,
+            watermark: nil,
+            collectionRevision: page.collectionRevision,
+            savedAt: 1_000
+        ))
+        let client = FakeMessageContentClient(results: [])
+        let model = MessageInboxModel(client: client, store: store, deviceId: "device_abcdefghijkl")
+
+        model.loadCachedContent()
+
+        XCTAssertEqual(model.messages, page.items)
+        XCTAssertEqual(model.syncStatus, .stale)
+        XCTAssertTrue(client.requests.isEmpty)
     }
 
     private func fixturePage() throws -> MessagePage {

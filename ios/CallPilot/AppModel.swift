@@ -9,11 +9,14 @@ final class AppModel: ObservableObject {
     @Published var pairing: StoredPairing?
     @Published var callState: CallState = .idle
     @Published var incomingOffer: InboundOffer?
-    @Published var lineStatusLabel = "线路状态获取中…"
+    @Published var lineStatusLabel = L10n.text("line.status.checking")
     @Published var lineReady = false
     @Published private(set) var speakerphoneEnabled = false
     @Published private(set) var messageInbox: MessageInboxModel?
     @Published private(set) var callHistory: CallHistoryModel?
+    @Published private(set) var deviceStatus: HostedDeviceStatus?
+    @Published private(set) var deviceStatusSync: DeviceStatusSyncState = .idle
+    @Published private(set) var deviceStatusRefreshing = false
 
     private let store = CredentialStore()
     private var client: HostedCloudClient?
@@ -22,6 +25,7 @@ final class AppModel: ObservableObject {
     private var callAttempts = CallAttemptStateMachine()
     private let messageStore = FileMessageCacheStore()
     private let callHistoryStore = FileCallHistoryCacheStore()
+    private var deviceStatusMachine = DeviceStatusStateMachine()
 
     // 接管媒体超时(对齐 Android takeoverMediaTimeoutMs;真机实证:失败会话不复位会挡后续 offer)。
     private let takeoverMediaTimeout: Duration = .seconds(20)
@@ -34,6 +38,7 @@ final class AppModel: ObservableObject {
     }
 
     private func rebuildClient() {
+        resetDeviceStatus()
         guard let p = pairing else {
             client = nil
             messageInbox = nil
@@ -45,12 +50,14 @@ final class AppModel: ObservableObject {
             messageInbox = MessageInboxModel(
                 client: client,
                 store: messageStore,
-                deviceId: p.credential.deviceId
+                deviceId: p.credential.deviceId,
+                onUnauthorized: { [weak self] in self?.unpair() }
             )
             callHistory = CallHistoryModel(
                 client: client,
                 store: callHistoryStore,
-                deviceId: p.credential.deviceId
+                deviceId: p.credential.deviceId,
+                onUnauthorized: { [weak self] in self?.unpair() }
             )
         } else {
             messageInbox = nil
@@ -87,6 +94,19 @@ final class AppModel: ObservableObject {
         messageInbox = nil
         callHistory = nil
         incomingOffer = nil
+        resetDeviceStatus()
+    }
+
+    func clearLocalContent() {
+        messageInbox?.clearLocalData()
+        callHistory?.clearLocalData()
+        try? messageStore.clear()
+        try? callHistoryStore.clear()
+    }
+
+    func loadCachedContentForSettings() {
+        messageInbox?.loadCachedContent()
+        callHistory?.loadCachedContent()
     }
 
     // MARK: - 轮询(前台版:offer + 线路状态)
@@ -108,15 +128,37 @@ final class AppModel: ObservableObject {
                 } else {
                     incomingOffer = nil
                 }
-                if tick % 5 == 0, let status = try? await c.deviceStatus() {
-                    lineReady = status.lineReady
-                    lineStatusLabel = status.lineReady ? "远程拨号已就绪"
-                        : (!status.connected ? "电脑端离线" : "SIM 线路离线")
-                }
+                if tick % 5 == 0 { await refreshDeviceStatus() }
             }
             tick += 1
             try? await Task.sleep(for: offerPollInterval)
         }
+    }
+
+    func refreshDeviceStatus() async {
+        guard !deviceStatusRefreshing, let currentClient = client else { return }
+        let refresh = deviceStatusMachine.beginRefresh()
+        publishDeviceStatus()
+        deviceStatusRefreshing = true
+        defer { deviceStatusRefreshing = false }
+        do {
+            let status = try await currentClient.deviceStatus()
+            guard currentClient === client,
+                  deviceStatusMachine.succeed(status, for: refresh) else { return }
+        } catch {
+            guard currentClient === client else { return }
+            if error is CancellationError
+                || (error as? URLError)?.code == .cancelled
+                || Task.isCancelled {
+                guard deviceStatusMachine.cancel(for: refresh) else { return }
+            } else if (error as? HostedCloudError)?.code == "UNAUTHORIZED" {
+                unpair()
+                return
+            } else {
+                guard deviceStatusMachine.fail(for: refresh) else { return }
+            }
+        }
+        publishDeviceStatus()
     }
 
     func dismissOffer(_ offer: InboundOffer) {
@@ -196,6 +238,30 @@ final class AppModel: ObservableObject {
         speakerphoneEnabled = false
         callState = initialState
         return attempt
+    }
+
+    private func resetDeviceStatus() {
+        deviceStatusMachine.reset()
+        deviceStatusRefreshing = false
+        publishDeviceStatus()
+    }
+
+    private func publishDeviceStatus() {
+        deviceStatus = deviceStatusMachine.status
+        deviceStatusSync = deviceStatusMachine.syncStatus
+        lineReady = deviceStatusSync == .live && (deviceStatus?.lineReady ?? false)
+        switch deviceStatusSync {
+        case .idle, .loading:
+            lineStatusLabel = L10n.text("line.status.checking")
+        case .live:
+            lineStatusLabel = deviceStatus?.lineReady == true
+                ? L10n.text("line.status.ready")
+                : (deviceStatus?.connected == false
+                    ? L10n.text("line.status.edge_offline")
+                    : L10n.text("line.status.sim_offline"))
+        case .stale, .offline:
+            lineStatusLabel = L10n.text("line.status.unavailable")
+        }
     }
 
     @discardableResult

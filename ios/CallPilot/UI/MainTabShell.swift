@@ -21,39 +21,45 @@ struct MainTabShell: View {
         TabView(selection: $selectedTab) {
             NavigationStack(path: $dialPath) {
                 DialView(model: model)
-                    .navigationTitle("拨号")
+                    .navigationTitle(L10n.text("tab.dial"))
             }
-            .tabItem { Label("拨号", systemImage: "phone") }
+            .tabItem { Label(L10n.text("tab.dial"), systemImage: "phone") }
             .tag(MainTab.dial)
 
             NavigationStack(path: $recordsPath) {
                 if let history = model.callHistory {
                     CallRecordsView(model: history)
                 } else {
-                    ContentUnavailableView("无法载入通话记录", systemImage: "clock.badge.exclamationmark")
-                        .navigationTitle("记录")
+                    ContentUnavailableView(
+                        L10n.text("calls.load_failed"),
+                        systemImage: "clock.badge.exclamationmark"
+                    )
+                    .navigationTitle(L10n.text("tab.records"))
                 }
             }
-            .tabItem { Label("记录", systemImage: "clock") }
+            .tabItem { Label(L10n.text("tab.records"), systemImage: "clock") }
             .tag(MainTab.records)
 
             NavigationStack(path: $messagesPath) {
                 if let inbox = model.messageInbox {
                     MessagesView(model: inbox)
                 } else {
-                    ContentUnavailableView("无法载入短信", systemImage: "message.badge.filled.fill")
-                        .navigationTitle("短信")
+                    ContentUnavailableView(
+                        L10n.text("messages.load_failed"),
+                        systemImage: "message.badge.filled.fill"
+                    )
+                    .navigationTitle(L10n.text("tab.messages"))
                 }
             }
-            .tabItem { Label("短信", systemImage: "message") }
+            .tabItem { Label(L10n.text("tab.messages"), systemImage: "message") }
             .badge(model.messageInbox?.unreadCount ?? 0)
             .tag(MainTab.messages)
 
             NavigationStack(path: $settingsPath) {
                 SettingsView(model: model)
-                    .navigationTitle("设置")
+                    .navigationTitle(L10n.text("tab.settings"))
             }
-            .tabItem { Label("设置", systemImage: "gearshape") }
+            .tabItem { Label(L10n.text("tab.settings"), systemImage: "gearshape") }
             .tag(MainTab.settings)
         }
     }

@@ -12,7 +12,7 @@ struct MessagesView: View {
                 messageList
             }
         }
-        .navigationTitle("短信")
+        .navigationTitle(L10n.text("tab.messages"))
         .task {
             await model.refresh()
             await markDisplayedAfterRender()
@@ -71,7 +71,7 @@ struct MessagesView: View {
                             if model.isLoadingMore {
                                 ProgressView()
                             } else {
-                                Text("加载更多")
+                                Text(L10n.text("common.load_more"))
                             }
                             Spacer()
                         }
@@ -93,17 +93,17 @@ struct MessagesView: View {
     private var emptyState: some View {
         switch model.syncStatus {
         case .idle, .loading:
-            ProgressView("正在同步短信…")
+            ProgressView(L10n.text("messages.loading"))
         case .live:
-            ContentUnavailableView("暂无短信", systemImage: "message")
+            ContentUnavailableView(L10n.text("messages.empty"), systemImage: "message")
                 .refreshable { await model.refresh() }
         case .stale, .offline:
             ContentUnavailableView {
-                Label("无法载入短信", systemImage: "wifi.slash")
+                Label(L10n.text("messages.load_failed"), systemImage: "wifi.slash")
             } description: {
                 Text(model.errorMessage ?? MessageInboxCopy.unavailable)
             } actions: {
-                Button("重试") { Task { await model.refresh() } }
+                Button(L10n.text("common.retry")) { Task { await model.refresh() } }
             }
         }
     }
@@ -132,10 +132,10 @@ struct MessagesView: View {
 
     private var statusText: String {
         switch model.syncStatus {
-        case .live: "已同步"
-        case .stale: "离线缓存，内容可能不是最新"
+        case .live: L10n.text("common.synced")
+        case .stale: L10n.text("common.stale_cache")
         case .offline: model.errorMessage ?? MessageInboxCopy.edgeOffline
-        case .idle, .loading: "正在同步"
+        case .idle, .loading: L10n.text("common.syncing")
         }
     }
 
@@ -188,7 +188,11 @@ private struct MessageRow: View {
                     .font(.body)
                     .foregroundStyle(.primary)
                     .lineLimit(2)
-                Text(message.direction == .inbound ? "收到" : deliveryLabel)
+                Text(
+                    message.direction == .inbound
+                        ? L10n.text("messages.status.received_short")
+                        : deliveryLabel
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -204,10 +208,10 @@ private struct MessageRow: View {
 
     private var deliveryLabel: String {
         switch message.status {
-        case .sent: "已发送"
-        case .failed: "发送失败"
-        case .error: "发送异常"
-        case .received: "收到"
+        case .sent: L10n.text("messages.status.sent")
+        case .failed: L10n.text("messages.status.failed")
+        case .error: L10n.text("messages.status.error")
+        case .received: L10n.text("messages.status.received_short")
         }
     }
 }
@@ -217,18 +221,23 @@ private struct MessageDetailView: View {
 
     var body: some View {
         List {
-            Section("联系人") {
-                LabeledContent(message.direction == .inbound ? "发件人" : "收件人", value: message.address)
-                LabeledContent("时间", value: messageDate)
-                LabeledContent("状态", value: statusLabel)
+            Section(L10n.text("messages.detail.contact_section")) {
+                LabeledContent(
+                    message.direction == .inbound
+                        ? L10n.text("messages.detail.sender")
+                        : L10n.text("messages.detail.recipient"),
+                    value: message.address
+                )
+                LabeledContent(L10n.text("messages.detail.time"), value: messageDate)
+                LabeledContent(L10n.text("messages.detail.status"), value: statusLabel)
             }
-            Section("内容") {
+            Section(L10n.text("messages.detail.content_section")) {
                 Text(message.text)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .navigationTitle("短信详情")
+        .navigationTitle(L10n.text("messages.detail.title"))
         .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -239,10 +248,10 @@ private struct MessageDetailView: View {
 
     private var statusLabel: String {
         switch message.status {
-        case .received: "已收到"
-        case .sent: "已发送"
-        case .failed: "发送失败"
-        case .error: "发送异常"
+        case .received: L10n.text("messages.status.received")
+        case .sent: L10n.text("messages.status.sent")
+        case .failed: L10n.text("messages.status.failed")
+        case .error: L10n.text("messages.status.error")
         }
     }
 }

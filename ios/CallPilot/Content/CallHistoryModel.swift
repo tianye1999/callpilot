@@ -10,11 +10,11 @@ enum CallHistorySyncStatus: Equatable {
 }
 
 enum CallHistoryCopy {
-    static let payloadTooLarge = "这条通话记录内容过大，暂时无法在 App 中显示。请在电脑端查看。"
-    static let unavailable = "暂时无法更新通话记录，请稍后重试。"
-    static let edgeOffline = "电脑端暂时离线，无法更新通话记录。"
-    static let featureDisabled = "通话记录同步尚未启用。"
-    static let unauthorized = "设备授权已失效，请重新配对。"
+    static var payloadTooLarge: String { L10n.text("calls.error.payload_too_large") }
+    static var unavailable: String { L10n.text("calls.error.unavailable") }
+    static var edgeOffline: String { L10n.text("calls.error.edge_offline") }
+    static var featureDisabled: String { L10n.text("calls.error.feature_disabled") }
+    static var unauthorized: String { L10n.text("content.error.unauthorized") }
 }
 
 enum CallSummaryPresentation: Equatable {
@@ -76,6 +76,7 @@ final class CallHistoryModel: ObservableObject {
     private let store: CallHistoryCacheStoring
     private let deviceId: String
     private let clockMilliseconds: () -> Int64
+    private let onUnauthorized: @MainActor () -> Void
     private var nextCursor: String?
     private var didLoadCache = false
     private var generation = 0
@@ -89,15 +90,21 @@ final class CallHistoryModel: ObservableObject {
         deviceId: String,
         clockMilliseconds: @escaping () -> Int64 = {
             Int64(Date().timeIntervalSince1970 * 1_000)
-        }
+        },
+        onUnauthorized: @escaping @MainActor () -> Void = {}
     ) {
         self.client = client
         self.store = store
         self.deviceId = deviceId
         self.clockMilliseconds = clockMilliseconds
+        self.onUnauthorized = onUnauthorized
     }
 
     func detail(for callId: String) -> CallDetailState? { details[callId] }
+
+    func loadCachedContent() {
+        loadCacheIfNeeded()
+    }
 
     func refresh() async {
         guard !isRefreshing, !isLoadingMore else { return }
@@ -286,6 +293,7 @@ final class CallHistoryModel: ObservableObject {
             errorCode = "UNAUTHORIZED"
             errorMessage = CallHistoryCopy.unauthorized
             syncStatus = .offline
+            onUnauthorized()
             return
         }
         errorCode = hosted?.code
@@ -300,6 +308,7 @@ final class CallHistoryModel: ObservableObject {
             errorCode = "UNAUTHORIZED"
             errorMessage = CallHistoryCopy.unauthorized
             syncStatus = .offline
+            onUnauthorized()
             return
         }
         var state = details[callId] ?? Self.emptyDetailState
@@ -346,6 +355,8 @@ final class CallHistoryModel: ObservableObject {
         errorCode: nil, errorMessage: nil, isLoadingMore: false
     )
     private static let invalidResponseError = HostedCloudError(
-        statusCode: 200, code: "INVALID_RESPONSE", message: "通话记录标识不匹配"
+        statusCode: 200,
+        code: "INVALID_RESPONSE",
+        message: L10n.text("calls.error.identity_mismatch")
     )
 }
