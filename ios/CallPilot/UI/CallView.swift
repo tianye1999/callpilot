@@ -12,42 +12,51 @@ struct CallView: View {
         VStack(spacing: 20) {
             Spacer()
             Text(statusText).font(.title2).bold()
-            Text("正在通过远端 SIM 通话").font(.footnote).foregroundStyle(.secondary)
+            if !model.callState.isTerminal {
+                Text("正在通过远端 SIM 通话").font(.footnote).foregroundStyle(.secondary)
+            }
             Spacer()
 
-            if showKeypad {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 14) {
-                    ForEach(keys, id: \.self) { k in
-                        Button(k) { model.sendDTMF(k) }
-                            .font(.title).frame(width: 66, height: 66)
-                            .background(Color.gray.opacity(0.12), in: Circle())
+            if model.callState.isTerminal {
+                Button("返回拨号") {
+                    model.dismissCallResult()
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                if showKeypad {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 14) {
+                        ForEach(keys, id: \.self) { k in
+                            Button(k) { model.sendDTMF(k) }
+                                .font(.title).frame(width: 66, height: 66)
+                                .background(Color.gray.opacity(0.12), in: Circle())
+                        }
                     }
                 }
-            }
 
-            HStack(spacing: 28) {
-                Button { showKeypad.toggle() } label: {
-                    Image(systemName: "circle.grid.3x3.fill").font(.title2)
-                        .frame(width: 48, height: 48)
-                }
-                .accessibilityLabel(showKeypad ? "隐藏键盘" : "显示键盘")
+                HStack(spacing: 28) {
+                    Button { showKeypad.toggle() } label: {
+                        Image(systemName: "circle.grid.3x3.fill").font(.title2)
+                            .frame(width: 48, height: 48)
+                    }
+                    .accessibilityLabel(showKeypad ? "隐藏键盘" : "显示键盘")
 
-                Button {
-                    model.setSpeakerphone(!model.speakerphoneEnabled)
-                } label: {
-                    Image(systemName: model.speakerphoneEnabled ? "speaker.wave.2.fill" : "speaker.fill")
-                        .font(.title2)
-                        .frame(width: 48, height: 48)
-                        .foregroundStyle(model.speakerphoneEnabled ? .blue : .primary)
-                }
-                .accessibilityLabel(model.speakerphoneEnabled ? "关闭扬声器" : "打开扬声器")
+                    Button {
+                        model.setSpeakerphone(!model.speakerphoneEnabled)
+                    } label: {
+                        Image(systemName: model.speakerphoneEnabled ? "speaker.wave.2.fill" : "speaker.fill")
+                            .font(.title2)
+                            .frame(width: 48, height: 48)
+                            .foregroundStyle(model.speakerphoneEnabled ? .blue : .primary)
+                    }
+                    .accessibilityLabel(model.speakerphoneEnabled ? "关闭扬声器" : "打开扬声器")
 
-                Button { model.hangup() } label: {
-                    Image(systemName: "phone.down.fill").font(.title)
-                        .frame(width: 72, height: 72)
-                        .background(.red, in: Circle()).foregroundStyle(.white)
+                    Button { model.hangup() } label: {
+                        Image(systemName: "phone.down.fill").font(.title)
+                            .frame(width: 72, height: 72)
+                            .background(.red, in: Circle()).foregroundStyle(.white)
+                    }
+                    .accessibilityLabel("挂断")
                 }
-                .accessibilityLabel("挂断")
             }
             Spacer()
         }

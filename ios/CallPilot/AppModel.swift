@@ -68,7 +68,7 @@ final class AppModel: ObservableObject {
         var tick = 0
         while !Task.isCancelled {
             if let c = client {
-                if !callState.isActive {
+                if callState == .idle {
                     if let offer = try? await c.listInboundOffers().first(where: {
                         !dismissedOffers.contains($0.offerId)
                             && $0.expiresAt > Int64(Date().timeIntervalSince1970 * 1000)
@@ -99,7 +99,7 @@ final class AppModel: ObservableObject {
     // MARK: - 外呼(US-2)
 
     func startCall(number: String) async {
-        guard let c = client, let p = pairing, !callState.isActive else { return }
+        guard let c = client, let p = pairing, callState == .idle else { return }
         let attempt = beginCallAttempt(with: .preparing(label: number))
         // createSession → LiveKit 媒体 → 号码经 Dongle SIM ATD(dial 在 media_ready 后发)。
         // 具体媒体建立与 data-topic 控制由 CallMediaSession 承担。
@@ -113,7 +113,7 @@ final class AppModel: ObservableObject {
     // MARK: - 来电接管(US-1 App 侧,前台版)
 
     func answerTakeover(_ offer: InboundOffer) async {
-        guard let c = client, !callState.isActive else { return }
+        guard let c = client, callState == .idle else { return }
         incomingOffer = nil
         let label = "来电接管"
         let waitingState = CallState.waitingMedia(label: label)
@@ -121,7 +121,7 @@ final class AppModel: ObservableObject {
         media = CallMediaSession(onState: { [weak self] st in
             _ = self?.apply(st, for: attempt)
         })
-        // 20s 媒体超时:对齐 Android——接管失败不复位会永久 WaitingMedia 挡后续 offer。
+        // 20s 媒体超时:失败结果保持可见，等待用户显式返回拨号页。
         let timeoutTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: self?.takeoverMediaTimeout ?? .seconds(20))
@@ -136,14 +136,15 @@ final class AppModel: ObservableObject {
             )
             guard self.apply(failedState, for: attempt, from: waitingState) else { return }
             await self.media?.stop()
-            do {
-                try await Task.sleep(for: .seconds(2))
-            } catch {
-                return
-            }
-            _ = self.apply(.idle, for: attempt, from: failedState)
         }
         await media?.startTakeover(client: c, offerId: offer.offerId, onConnected: { timeoutTask.cancel() })
+    }
+
+    func dismissCallResult() {
+        guard callAttempts.resetTerminal() else { return }
+        callState = .idle
+        media = nil
+        speakerphoneEnabled = false
     }
 
     func hangup() {

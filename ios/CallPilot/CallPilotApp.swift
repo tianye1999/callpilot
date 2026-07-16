@@ -18,10 +18,10 @@ struct RootView: View {
         Group {
             if model.pairing == nil {
                 PairView(model: model)
-            } else if let offer = model.incomingOffer, !model.callState.isActive {
-                IncomingOfferView(model: model, offer: offer)
-            } else if model.callState.isActive {
+            } else if model.callState.isCallPresented {
                 CallView(model: model)
+            } else if let offer = model.incomingOffer {
+                IncomingOfferView(model: model, offer: offer)
             } else {
                 DialView(model: model)
             }

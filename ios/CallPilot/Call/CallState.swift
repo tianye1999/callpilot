@@ -18,6 +18,19 @@ enum CallState: Equatable {
         default: return true
         }
     }
+
+    var isTerminal: Bool {
+        switch self {
+        case .ended, .failed: return true
+        default: return false
+        }
+    }
+
+    /// Keeps the call surface visible through terminal states until the user
+    /// explicitly acknowledges the result.
+    var isCallPresented: Bool {
+        self != .idle
+    }
 }
 
 /// Identifies one logical call attempt. Async completions must present the
@@ -58,5 +71,12 @@ struct CallAttemptStateMachine {
     mutating func invalidate(to nextState: CallState = .idle) {
         generation &+= 1
         state = nextState
+    }
+
+    @discardableResult
+    mutating func resetTerminal() -> Bool {
+        guard state.isTerminal else { return false }
+        invalidate()
+        return true
     }
 }
