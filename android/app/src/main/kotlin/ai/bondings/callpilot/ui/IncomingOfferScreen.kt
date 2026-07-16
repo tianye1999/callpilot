@@ -27,6 +27,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 
+internal data class IncomingOfferActionColors(val container: Color, val content: Color)
+
+internal object IncomingOfferColors {
+    val reject = IncomingOfferActionColors(container = Color(0xFFB3261E), content = Color.White)
+    val accept = IncomingOfferActionColors(container = Color(0xFF1B873B), content = Color.White)
+}
+
 /**
  * #95 inbound takeover：AI 请求把进行中的来电转给机主。
  * 前台全屏卡：铃声 + 振动 + 接听/拒绝。仅在 App 前台且空闲时展示（MVP 边界）。
@@ -77,12 +84,18 @@ fun IncomingOfferScreen(
             Button(
                 onClick = onDecline,
                 modifier = Modifier.weight(1f).height(64.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB3261E)),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = IncomingOfferColors.reject.container,
+                    contentColor = IncomingOfferColors.reject.content,
+                ),
             ) { Text("拒绝", style = MaterialTheme.typography.titleMedium) }
             Button(
                 onClick = onAccept,
                 modifier = Modifier.weight(1f).height(64.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B873B)),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = IncomingOfferColors.accept.container,
+                    contentColor = IncomingOfferColors.accept.content,
+                ),
             ) { Text("接听", style = MaterialTheme.typography.titleMedium) }
         }
         Spacer(Modifier.height(18.dp))
