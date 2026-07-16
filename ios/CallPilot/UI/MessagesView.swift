@@ -154,15 +154,16 @@ struct MessagesView: View {
     }
 }
 
-private struct MessageRow: View {
+struct MessageRow: View {
     let message: SMSMessage
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
             Image(systemName: message.direction == .inbound ? "arrow.down.left.circle.fill" : "arrow.up.right.circle.fill")
-                .font(.title2)
+                .font(.system(size: 22))
                 .foregroundStyle(message.direction == .inbound ? Color.green : Color.blue)
+                .frame(width: 30)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 if dynamicTypeSize.isAccessibilitySize {

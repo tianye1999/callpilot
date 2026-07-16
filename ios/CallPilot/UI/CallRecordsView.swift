@@ -126,14 +126,14 @@ struct CallRecordsView: View {
     }
 }
 
-private struct CallRecordRow: View {
+struct CallRecordRow: View {
     let record: CallRecordItem
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
             Image(systemName: record.direction == .inbound ? "phone.arrow.down.left.fill" : "phone.arrow.up.right.fill")
-                .font(.title2)
+                .font(.system(size: 22))
                 .foregroundStyle(record.direction == .inbound ? Color.green : Color.blue)
                 .frame(width: 30)
                 .accessibilityHidden(true)
