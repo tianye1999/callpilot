@@ -21,6 +21,7 @@ from agentcall import config, number_profiles
 from agentcall.call_agent import CallAgentService
 from agentcall.cloud_control import CloudControlApi, CloudEdgeClient
 from agentcall.cloud_credentials import CloudCredentialStore
+from agentcall.content_sync import ContentSyncRepository
 from agentcall.events import EventHub
 from agentcall.remote_pairing import RemotePairingStore
 from agentcall.web.remote_gateway import build_remote_gateway
@@ -59,7 +60,7 @@ def _restart_after_cleanup() -> None:
     os.execv(sys.executable, argv)
 
 
-def _create_cloud_components(service):
+def _create_cloud_components(service, hub: EventHub | None = None):
     """Build the optional cloud subsystem without risking core app startup."""
 
     try:
@@ -67,7 +68,21 @@ def _create_cloud_components(service):
         api = CloudControlApi(
             config.get_str("REMOTE_CLOUD_URL"), sign=store.sign
         )
-        client = CloudEdgeClient(config.get_str("REMOTE_CLOUD_URL"), service, store)
+        call_logger = getattr(service, "call_logger", None)
+        repository = (
+            ContentSyncRepository(hub, call_logger)
+            if hub is not None and call_logger is not None
+            else None
+        )
+        client = CloudEdgeClient(
+            config.get_str("REMOTE_CLOUD_URL"),
+            service,
+            store,
+            content_repository=repository,
+            content_read_enabled=lambda: config.get_bool(
+                "REMOTE_CONTENT_READ_ENABLED"
+            ),
+        )
         client.start()
         return api, store, client
     except (RuntimeError, ValueError) as exc:
@@ -239,7 +254,7 @@ def main() -> None:
     # 需重启配置的自愈重启：/api/restart 置位该事件 → 停 loop → 清理后重启。
     restart_event = threading.Event()
     if cloud_enabled:
-        cloud_api, cloud_store, cloud_client = _create_cloud_components(service)
+        cloud_api, cloud_store, cloud_client = _create_cloud_components(service, hub)
 
     app = build_app(
         hub,

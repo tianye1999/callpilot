@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .cloud_credentials import CloudCredentialStore, EdgeCredential
+from .content_sync import ContentSyncError
 from .remote_dialer import IssuedLiveKitSession, RemoteDialerInvite
 from .takeover_coordinator import (
     InboundTakeoverOfferRequest,
@@ -54,6 +56,10 @@ class CloudSessionService(Protocol):
         nonce: str,
         issued: IssuedLiveKitSession,
     ) -> TakeoverResult: ...
+
+
+class CloudContentRepository(Protocol):
+    def read(self, resource: str, params: dict[str, Any]) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -169,12 +175,17 @@ class CloudEdgeClient:
         *,
         connect: Callable[..., Any] | None = None,
         heartbeat_seconds: float = 15.0,
+        content_repository: CloudContentRepository | None = None,
+        content_read_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self.base_url = _validate_cloud_url(base_url)
         self.service = service
         self.credential_store = credential_store
         self._connect = connect
         self._heartbeat_seconds = max(5.0, heartbeat_seconds)
+        self._content_repository = content_repository
+        self._content_read_enabled = content_read_enabled or (lambda: False)
+        self._seen_data_requests: dict[str, int] = {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._connected = False
@@ -216,6 +227,10 @@ class CloudEdgeClient:
             command = _parse_cloud_command(raw)
         except ValueError:
             logger.warning("忽略格式不合法的云端控制消息")
+            return
+
+        if command["type"] == "data.request":
+            self._handle_data_request(command, send)
             return
 
         command_id = command["commandId"]
@@ -261,6 +276,102 @@ class CloudEdgeClient:
         if error:
             response["errorCode"] = error
         send(json.dumps(response, separators=(",", ":")))
+
+    def _handle_data_request(
+        self, command: dict[str, Any], send: Callable[[str], None]
+    ) -> None:
+        now_ms = round(time.time() * 1000)
+        self._prune_seen_data_requests(now_ms)
+        request_id = command["requestId"]
+        resource = command["resource"]
+        if request_id in self._seen_data_requests:
+            self._send_data_error(send, request_id, resource, "INVALID_REQUEST")
+            return
+        if len(self._seen_data_requests) >= 2_048:
+            self._seen_data_requests.pop(next(iter(self._seen_data_requests)))
+        self._seen_data_requests[request_id] = command["expiresAtUnixMs"]
+
+        repository = self._content_repository
+        if repository is None or not self._content_read_enabled():
+            self._send_data_error(send, request_id, resource, "FEATURE_DISABLED")
+            return
+        try:
+            params = dict(command["params"])
+            while True:
+                body = repository.read(resource, params)
+                response = {
+                    "v": 1,
+                    "type": "data.response",
+                    "requestId": request_id,
+                    "resource": resource,
+                    "status": "ok",
+                    "body": body,
+                }
+                wire = _compact_json(response)
+                if len(wire.encode("utf-8")) <= _MAX_JSON_BYTES:
+                    send(wire)
+                    return
+                items = body.get("items")
+                limit = params.get("limit")
+                if (
+                    not isinstance(items, list)
+                    or len(items) <= 1
+                    or isinstance(limit, bool)
+                    or not isinstance(limit, int)
+                    or limit <= 1
+                ):
+                    self._send_data_error(
+                        send, request_id, resource, "PAYLOAD_TOO_LARGE"
+                    )
+                    return
+                params["limit"] = max(
+                    1,
+                    min(limit - 1, len(items) - 1, limit // 2),
+                )
+        except ContentSyncError as exc:
+            code = (
+                exc.code
+                if exc.code
+                in {
+                    "INVALID_REQUEST",
+                    "CURSOR_INVALID",
+                    "FEATURE_DISABLED",
+                    "NOT_FOUND",
+                    "PAYLOAD_TOO_LARGE",
+                }
+                else "INTERNAL_ERROR"
+            )
+            self._send_data_error(send, request_id, resource, code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "内容同步读取失败: error_type=%s", type(exc).__name__
+            )
+            self._send_data_error(send, request_id, resource, "INTERNAL_ERROR")
+
+    def _prune_seen_data_requests(self, now_ms: int) -> None:
+        for request_id, expires_at in list(self._seen_data_requests.items()):
+            if expires_at <= now_ms:
+                self._seen_data_requests.pop(request_id, None)
+
+    @staticmethod
+    def _send_data_error(
+        send: Callable[[str], None],
+        request_id: str,
+        resource: str,
+        code: str,
+    ) -> None:
+        send(
+            _compact_json(
+                {
+                    "v": 1,
+                    "type": "data.response",
+                    "requestId": request_id,
+                    "resource": resource,
+                    "status": "error",
+                    "error": {"code": code},
+                }
+            )
+        )
 
     def _drain_takeover_events(self, send: Callable[[str], None]) -> None:
         while request := self.service.next_inbound_takeover_offer():
@@ -389,6 +500,8 @@ def _parse_cloud_command(raw: str) -> dict[str, Any]:
         return _validate_session_command(value)
     if command_type == "inbound.claim":
         return _validate_inbound_claim(value)
+    if command_type == "data.request":
+        return _validate_data_request(value)
     raise ValueError("invalid command")
 
 
@@ -451,6 +564,77 @@ def _validate_inbound_claim(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _validate_data_request(value: dict[str, Any]) -> dict[str, Any]:
+    if set(value) != {
+        "v",
+        "type",
+        "requestId",
+        "deviceId",
+        "resource",
+        "params",
+        "issuedAtUnixMs",
+        "expiresAtUnixMs",
+    }:
+        raise ValueError("invalid command")
+    if value.get("v") != 1 or value.get("type") != "data.request":
+        raise ValueError("invalid command")
+    if not _valid_id(value.get("requestId"), "request") or not _valid_id(
+        value.get("deviceId"), "device"
+    ):
+        raise ValueError("invalid command")
+    resource = value.get("resource")
+    if resource not in {
+        "messages.list",
+        "call_records.list",
+        "call_records.get",
+        "call_timeline.list",
+    }:
+        raise ValueError("invalid command")
+    issued_at = value.get("issuedAtUnixMs")
+    expires_at = value.get("expiresAtUnixMs")
+    if (
+        isinstance(issued_at, bool)
+        or not isinstance(issued_at, int)
+        or issued_at < 0
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+        or expires_at <= issued_at
+        or expires_at - issued_at > 10_000
+        or expires_at <= round(time.time() * 1000)
+    ):
+        raise ValueError("invalid command")
+    params = value.get("params")
+    if not isinstance(params, dict):
+        raise ValueError("invalid command")
+    if resource in {"messages.list", "call_records.list"}:
+        if set(params) != {"limit", "cursor"}:
+            raise ValueError("invalid command")
+        _validate_data_list_params(params)
+    elif resource == "call_records.get":
+        if set(params) != {"callId"} or not _valid_id(params.get("callId"), "call"):
+            raise ValueError("invalid command")
+    else:
+        if set(params) != {"callId", "limit", "cursor"} or not _valid_id(
+            params.get("callId"), "call"
+        ):
+            raise ValueError("invalid command")
+        _validate_data_list_params(params)
+    return value
+
+
+def _validate_data_list_params(params: dict[str, Any]) -> None:
+    limit = params.get("limit")
+    cursor = params.get("cursor")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("invalid command")
+    if cursor is not None and (
+        not isinstance(cursor, str)
+        or not 8 <= len(cursor) <= 2_048
+        or re.fullmatch(r"cursor_[A-Za-z0-9_-]+", cursor) is None
+    ):
+        raise ValueError("invalid command")
+
+
 def _validate_issued_session(session: Any) -> None:
     required = {
         "sessionId", "roomName", "browserIdentity", "edgeIdentity", "livekitUrl", "token"
@@ -501,9 +685,11 @@ def _websocket_url(base_url: str) -> str:
 
 
 def _valid_id(value: Any, prefix: str) -> bool:
-    import re
-
     return isinstance(value, str) and re.fullmatch(rf"{prefix}_[A-Za-z0-9_-]{{12,80}}", value) is not None
+
+
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _parse_timestamp(value: Any) -> float:

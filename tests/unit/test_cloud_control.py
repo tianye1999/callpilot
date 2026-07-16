@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.error
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +17,7 @@ from agentcall.cloud_credentials import (
     EdgeCredential,
     parse_edge_credential,
 )
+from agentcall.content_sync import ContentSyncError
 from agentcall.takeover_coordinator import (
     InboundTakeoverOfferRequest,
     InboundTakeoverRevoke,
@@ -65,6 +68,26 @@ class _Store:
         return "proof"
 
 
+class _ContentRepository:
+    def __init__(self, body: dict | None = None, error: str | None = None) -> None:
+        self.body = body or {
+            "v": 1,
+            "items": [],
+            "nextCursor": None,
+            "hasMore": False,
+            "collectionRevision": "revision_content_abcdefghijkl",
+            "oldestAvailableAt": None,
+        }
+        self.error = error
+        self.reads: list[tuple[str, dict]] = []
+
+    def read(self, resource: str, params: dict) -> dict:
+        self.reads.append((resource, dict(params)))
+        if self.error:
+            raise ContentSyncError(self.error)
+        return self.body
+
+
 def _command(**overrides) -> dict:
     expires = datetime.fromtimestamp(time.time() + 300, UTC).isoformat().replace(
         "+00:00", "Z"
@@ -109,6 +132,36 @@ def _takeover_claim(**overrides) -> dict:
     }
     value.update(overrides)
     return value
+
+
+def _data_request(**overrides) -> dict:
+    now = round(time.time() * 1000)
+    value = {
+        "v": 1,
+        "type": "data.request",
+        "requestId": "request_content_abcdefghijkl",
+        "deviceId": "device_content_abcdefghijkl",
+        "resource": "messages.list",
+        "params": {"limit": 25, "cursor": None},
+        "issuedAtUnixMs": now,
+        "expiresAtUnixMs": now + 5_000,
+    }
+    value.update(overrides)
+    return value
+
+
+def _content_client(
+    repository: _ContentRepository,
+    *,
+    enabled: bool = True,
+) -> CloudEdgeClient:
+    return CloudEdgeClient(
+        "https://api.bondings.ai",
+        _Service(),
+        _Store(),
+        content_repository=repository,
+        content_read_enabled=lambda: enabled,
+    )
 
 
 def test_edge_credential_parser_rejects_malformed_values() -> None:
@@ -292,6 +345,198 @@ def test_inbound_claim_rejection_preserves_stable_fence_code() -> None:
     assert sent[0]["status"] == "rejected"
     assert sent[0]["offerId"] == "offer_takeover_abcdefghijkl"
     assert sent[0]["errorCode"] == "STALE_GENERATION"
+
+
+def test_content_request_reads_repository_and_returns_correlated_response() -> None:
+    repository = _ContentRepository()
+    client = _content_client(repository)
+    sent: list[dict] = []
+
+    client.handle_message(
+        json.dumps(_data_request()),
+        lambda raw: sent.append(json.loads(raw)),
+    )
+
+    assert repository.reads == [("messages.list", {"limit": 25, "cursor": None})]
+    assert sent == [
+        {
+            "v": 1,
+            "type": "data.response",
+            "requestId": "request_content_abcdefghijkl",
+            "resource": "messages.list",
+            "status": "ok",
+            "body": repository.body,
+        }
+    ]
+
+
+def test_content_relay_preserves_shared_v1_fixture_contract() -> None:
+    fixture_dir = (
+        Path(__file__).resolve().parents[2] / "docs/fixtures/content-sync/v1"
+    )
+    request = json.loads((fixture_dir / "edge-data-request.json").read_text())
+    repository = _ContentRepository(
+        body=json.loads((fixture_dir / "messages-page.json").read_text())
+    )
+    now = round(time.time() * 1000)
+    request.update(issuedAtUnixMs=now, expiresAtUnixMs=now + 5_000)
+    sent: list[str] = []
+
+    _content_client(repository).handle_message(json.dumps(request), sent.append)
+
+    response = json.loads(sent[0])
+    assert response["requestId"] == request["requestId"]
+    assert response["resource"] == request["resource"]
+    assert response["body"] == repository.body
+    assert len(sent[0].encode("utf-8")) <= 16 * 1024
+
+
+def test_content_request_double_gate_fails_before_repository_read() -> None:
+    repository = _ContentRepository()
+    sent: list[dict] = []
+
+    _content_client(repository, enabled=False).handle_message(
+        json.dumps(_data_request()),
+        lambda raw: sent.append(json.loads(raw)),
+    )
+
+    assert repository.reads == []
+    assert sent[0]["status"] == "error"
+    assert sent[0]["error"] == {"code": "FEATURE_DISABLED"}
+
+
+def test_content_request_replay_and_expiry_never_read_content() -> None:
+    repository = _ContentRepository()
+    client = _content_client(repository)
+    sent: list[dict] = []
+    request = _data_request()
+
+    client.handle_message(json.dumps(request), lambda raw: sent.append(json.loads(raw)))
+    client.handle_message(json.dumps(request), lambda raw: sent.append(json.loads(raw)))
+    expired = _data_request(
+        requestId="request_expired_abcdefghijkl",
+        issuedAtUnixMs=1_000,
+        expiresAtUnixMs=2_000,
+    )
+    client.handle_message(json.dumps(expired), lambda raw: sent.append(json.loads(raw)))
+
+    assert len(repository.reads) == 1
+    assert sent[1]["error"] == {"code": "INVALID_REQUEST"}
+    assert all(item["requestId"] != "request_expired_abcdefghijkl" for item in sent)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "params"),
+    [
+        ({"resource": "filesystem.read"}, None),
+        ({"params": {"limit": True, "cursor": None}}, None),
+        ({"params": {"limit": 25, "cursor": "not-a-cursor"}}, None),
+        ({"expiresAtUnixMs": 0}, None),
+        ({}, {"extra": "field"}),
+    ],
+)
+def test_malformed_content_request_is_rejected_before_repository_read(
+    mutation, params
+) -> None:
+    repository = _ContentRepository()
+    sent: list[str] = []
+    request = _data_request(**mutation)
+    if params:
+        request.update(params)
+
+    _content_client(repository).handle_message(json.dumps(request), sent.append)
+
+    assert repository.reads == []
+    assert sent == []
+
+
+def test_content_request_ttl_over_ten_seconds_is_rejected_before_read() -> None:
+    repository = _ContentRepository()
+    sent: list[str] = []
+    request = _data_request()
+    request["expiresAtUnixMs"] = request["issuedAtUnixMs"] + 10_001
+
+    _content_client(repository).handle_message(json.dumps(request), sent.append)
+
+    assert repository.reads == []
+    assert sent == []
+
+
+def test_content_repository_error_maps_to_stable_content_response() -> None:
+    repository = _ContentRepository(error="CURSOR_INVALID")
+    sent: list[dict] = []
+
+    _content_client(repository).handle_message(
+        json.dumps(_data_request()),
+        lambda raw: sent.append(json.loads(raw)),
+    )
+
+    assert sent[0]["status"] == "error"
+    assert sent[0]["error"] == {"code": "CURSOR_INVALID"}
+
+
+def test_content_page_reduces_limit_until_full_envelope_fits() -> None:
+    class _AdaptiveRepository(_ContentRepository):
+        def read(self, resource: str, params: dict) -> dict:
+            self.reads.append((resource, dict(params)))
+            limit = params["limit"]
+            return {
+                "v": 1,
+                "items": [
+                    {
+                        "messageId": f"msg_{index:012d}",
+                        "revision": f"revision_{index:012d}",
+                        "direction": "INBOUND",
+                        "address": "+15550100101",
+                        "text": "x" * 9_000,
+                        "occurredAt": index,
+                        "recordedAt": index,
+                        "status": "RECEIVED",
+                    }
+                    for index in range(limit)
+                ],
+                "nextCursor": "cursor_content_abcdefghijkl" if limit == 1 else None,
+                "hasMore": limit == 1,
+                "collectionRevision": "revision_content_abcdefghijkl",
+                "oldestAvailableAt": 0,
+            }
+
+    repository = _AdaptiveRepository()
+    sent_raw: list[str] = []
+    request = _data_request(params={"limit": 2, "cursor": None})
+
+    _content_client(repository).handle_message(json.dumps(request), sent_raw.append)
+
+    assert [params["limit"] for _, params in repository.reads] == [2, 1]
+    assert len(sent_raw[0].encode("utf-8")) <= 16 * 1024
+    response = json.loads(sent_raw[0])
+    assert len(response["body"]["items"]) == 1
+    assert response["body"]["hasMore"] is True
+
+
+def test_content_single_item_oversize_is_413_code_without_body_log(
+    caplog,
+) -> None:
+    body = {
+        "v": 1,
+        "items": [{"text": "private sentinel " + "界" * 6_000}],
+        "nextCursor": None,
+        "hasMore": False,
+        "collectionRevision": "revision_content_abcdefghijkl",
+        "oldestAvailableAt": 0,
+    }
+    repository = _ContentRepository(body=body)
+    sent: list[dict] = []
+
+    with caplog.at_level(logging.WARNING):
+        _content_client(repository).handle_message(
+            json.dumps(_data_request(params={"limit": 1, "cursor": None})),
+            lambda raw: sent.append(json.loads(raw)),
+        )
+
+    assert sent[0]["status"] == "error"
+    assert sent[0]["error"] == {"code": "PAYLOAD_TOO_LARGE"}
+    assert "private sentinel" not in caplog.text
 
 
 @pytest.mark.parametrize(

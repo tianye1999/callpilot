@@ -641,10 +641,12 @@ def test_remote_web_dialer_defaults_off_and_masks_livekit_secrets(monkeypatch):
     _unset(
         monkeypatch,
         "REMOTE_WEB_DIALER_ENABLED",
+        "REMOTE_CONTENT_READ_ENABLED",
         "LIVEKIT_API_KEY",
         "LIVEKIT_API_SECRET",
     )
     assert get_bool("REMOTE_WEB_DIALER_ENABLED") is False
+    assert get_bool("REMOTE_CONTENT_READ_ENABLED") is False
     assert get_str("REMOTE_DTMF_MODE") == "qvts"
     assert get_int("REMOTE_GATEWAY_PORT") == 47445
     assert get_int("REMOTE_MAX_PAIRED_DEVICES") == 5

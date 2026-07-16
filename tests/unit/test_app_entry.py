@@ -101,3 +101,61 @@ def test_invalid_optional_cloud_url_does_not_crash_core_app(monkeypatch, caplog)
 
     assert (api, store, client) == (None, None, None)
     assert "已禁用远程云功能" in caplog.text
+
+
+def test_cloud_components_wire_content_repository_behind_edge_gate(monkeypatch):
+    hub = object()
+    call_logger = object()
+    service = type("Service", (), {"call_logger": call_logger})()
+    repository = object()
+    captured = {}
+
+    class FakeStore:
+        @staticmethod
+        def sign(_message):
+            return "signature"
+
+    class FakeClient:
+        def __init__(self, base_url, actual_service, store, **kwargs):
+            captured.update(
+                base_url=base_url,
+                service=actual_service,
+                store=store,
+                **kwargs,
+            )
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(app, "CloudCredentialStore", FakeStore)
+    monkeypatch.setattr(app, "CloudControlApi", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app, "CloudEdgeClient", FakeClient)
+    monkeypatch.setattr(
+        app,
+        "ContentSyncRepository",
+        lambda actual_hub, actual_logger: (
+            repository
+            if (actual_hub, actual_logger) == (hub, call_logger)
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        app.config,
+        "get_str",
+        lambda key: "https://api-beta.bondings.ai"
+        if key == "REMOTE_CLOUD_URL"
+        else "",
+    )
+    monkeypatch.setattr(
+        app.config,
+        "get_bool",
+        lambda key: key == "REMOTE_CONTENT_READ_ENABLED",
+    )
+
+    _api, _store, client = app._create_cloud_components(service, hub)
+
+    assert client.started is True
+    assert captured["service"] is service
+    assert captured["content_repository"] is repository
+    assert captured["content_read_enabled"]() is True

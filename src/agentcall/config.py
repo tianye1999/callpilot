@@ -340,6 +340,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                requires_restart=True),
     ConfigSpec("REMOTE_CLOUD_ENABLED", "使用 CallPilot 云控制面", "bool", "false",
                requires_restart=True),
+    ConfigSpec("REMOTE_CONTENT_READ_ENABLED", "允许已授权手机读取短信与通话记录",
+               "bool", "false", requires_restart=True),
     ConfigSpec("REMOTE_CLOUD_URL", "CallPilot 云控制面地址", "str",
                "https://api-beta.bondings.ai", requires_restart=True),
     ConfigSpec("REMOTE_CLOUD_DIALER_URL", "CallPilot 手机拨号地址", "str",
