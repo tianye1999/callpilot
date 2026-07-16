@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.call
 
+import ai.bondings.callpilot.R
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -42,7 +43,7 @@ class CallService : Service() {
         return builder
             .setContentTitle("CallPilot 通话中")
             .setContentText("正在通过远端 SIM 通话")
-            .setSmallIcon(android.R.drawable.stat_sys_phone_call)
+            .setSmallIcon(R.drawable.ic_callpilot_notification)
             .setOngoing(true)
             .build()
     }

@@ -25,7 +25,14 @@
 	<string>用于在通过远端 SIM 的通话中传输您的语音。</string>
 	<!-- 前台版无后台推送;Phase 2 才加 voip 后台模式 + PushKit -->
 	<key>UILaunchScreen</key>
-	<dict/>
+	<dict>
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+		<key>UIImageName</key>
+		<string>LaunchMark</string>
+		<key>UIImageRespectsSafeAreaInsets</key>
+		<true/>
+	</dict>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
