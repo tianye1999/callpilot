@@ -13,6 +13,7 @@ final class AppModel: ObservableObject {
     @Published var lineReady = false
     @Published private(set) var speakerphoneEnabled = false
     @Published private(set) var messageInbox: MessageInboxModel?
+    @Published private(set) var callHistory: CallHistoryModel?
 
     private let store = CredentialStore()
     private var client: HostedCloudClient?
@@ -20,6 +21,7 @@ final class AppModel: ObservableObject {
     private var media: CallMediaSession?
     private var callAttempts = CallAttemptStateMachine()
     private let messageStore = FileMessageCacheStore()
+    private let callHistoryStore = FileCallHistoryCacheStore()
 
     // 接管媒体超时(对齐 Android takeoverMediaTimeoutMs;真机实证:失败会话不复位会挡后续 offer)。
     private let takeoverMediaTimeout: Duration = .seconds(20)
@@ -35,6 +37,7 @@ final class AppModel: ObservableObject {
         guard let p = pairing else {
             client = nil
             messageInbox = nil
+            callHistory = nil
             return
         }
         client = try? HostedCloudClient(baseURL: p.gatewayURL).also { $0.credential = p.credential }
@@ -44,8 +47,14 @@ final class AppModel: ObservableObject {
                 store: messageStore,
                 deviceId: p.credential.deviceId
             )
+            callHistory = CallHistoryModel(
+                client: client,
+                store: callHistoryStore,
+                deviceId: p.credential.deviceId
+            )
         } else {
             messageInbox = nil
+            callHistory = nil
         }
     }
 
@@ -71,10 +80,12 @@ final class AppModel: ObservableObject {
 
     func unpair() {
         messageInbox?.clearLocalData()
+        callHistory?.clearLocalData()
         store.clear()
         pairing = nil
         client = nil
         messageInbox = nil
+        callHistory = nil
         incomingOffer = nil
     }
 

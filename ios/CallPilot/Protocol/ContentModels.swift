@@ -91,7 +91,6 @@ struct MessagePage: Codable, Equatable {
     let collectionRevision: String
     let oldestAvailableAt: Int64?
 
-    private static var cursorRE: Regex<Substring> { /^cursor_[A-Za-z0-9_-]{12,80}$/ }
     private static var revisionRE: Regex<Substring> { /^revision_[A-Za-z0-9_-]{12,80}$/ }
 
     init(
@@ -123,7 +122,7 @@ struct MessagePage: Codable, Equatable {
               items.count <= 100,
               Set(items.map(\.messageId)).count == items.count,
               hasMore == (nextCursor != nil),
-              nextCursor == nil || nextCursor?.wholeMatch(of: Self.cursorRE) != nil,
+              ContentWireValidation.validCursor(nextCursor),
               collectionRevision.wholeMatch(of: Self.revisionRE) != nil,
               oldestAvailableAt == nil || oldestAvailableAt! >= 0 else {
             throw DecodingError.dataCorruptedError(

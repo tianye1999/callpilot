@@ -27,8 +27,12 @@ struct MainTabShell: View {
             .tag(MainTab.dial)
 
             NavigationStack(path: $recordsPath) {
-                ContentUnavailableView("暂无通话记录", systemImage: "clock.arrow.circlepath")
-                    .navigationTitle("记录")
+                if let history = model.callHistory {
+                    CallRecordsView(model: history)
+                } else {
+                    ContentUnavailableView("无法载入通话记录", systemImage: "clock.badge.exclamationmark")
+                        .navigationTitle("记录")
+                }
             }
             .tabItem { Label("记录", systemImage: "clock") }
             .tag(MainTab.records)

@@ -4,7 +4,7 @@ import CoreFoundation
 /// Hosted `/v1` 适配器(对齐 Android `HostedCloudClient.kt`)。凭证与请求状态
 /// 统一由 MainActor 隔离;仅依赖 Foundation/CoreFoundation。
 @MainActor
-final class HostedCloudClient: MessageContentClient {
+final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     private let base: URL
     private let origin: String
     private let urlSession: URLSession
@@ -19,7 +19,6 @@ final class HostedCloudClient: MessageContentClient {
     private static var offerIdRE: Regex<Substring> { /^offer_[A-Za-z0-9_-]{12,80}$/ }
     private static var claimIdRE: Regex<Substring> { /^claim_[A-Za-z0-9_-]{12,80}$/ }
     private static var idempotencyKeyRE: Regex<Substring> { /^[A-Za-z0-9._:-]{16,128}$/ }
-    private static var cursorRE: Regex<Substring> { /^cursor_[A-Za-z0-9_-]{12,80}$/ }
 
     init(
         baseURL: String,
@@ -178,7 +177,7 @@ final class HostedCloudClient: MessageContentClient {
 
     func listMessages(limit: Int = 25, cursor: String? = nil) async throws -> MessagePage {
         guard (1...100).contains(limit),
-              cursor == nil || cursor?.wholeMatch(of: Self.cursorRE) != nil else {
+              ContentWireValidation.validCursor(cursor) else {
             throw HostedCloudError(
                 statusCode: 0,
                 code: "INVALID_REQUEST",
@@ -187,23 +186,70 @@ final class HostedCloudClient: MessageContentClient {
         }
         var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
         if let cursor { queryItems.append(URLQueryItem(name: "cursor", value: cursor)) }
-        let (data, response) = try await contentRequest("v1/messages", queryItems: queryItems)
-        guard data.count <= 16_384 else {
+        return try await decodeContent(
+            MessagePage.self,
+            path: "v1/messages",
+            queryItems: queryItems,
+            responseName: "短信"
+        )
+    }
+
+    func listCallRecords(limit: Int = 25, cursor: String? = nil) async throws -> CallRecordsPage {
+        guard (1...100).contains(limit), ContentWireValidation.validCursor(cursor) else {
             throw HostedCloudError(
-                statusCode: response.statusCode,
-                code: "INVALID_RESPONSE",
-                message: "短信响应超过协议上限"
+                statusCode: 0,
+                code: "INVALID_REQUEST",
+                message: "通话记录分页参数不合法"
             )
         }
-        do {
-            return try JSONDecoder().decode(MessagePage.self, from: data)
-        } catch {
+        var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if let cursor { queryItems.append(URLQueryItem(name: "cursor", value: cursor)) }
+        return try await decodeContent(
+            CallRecordsPage.self,
+            path: "v1/call-records",
+            queryItems: queryItems,
+            responseName: "通话记录"
+        )
+    }
+
+    func getCallRecord(callId: String) async throws -> CallRecordDetail {
+        guard callId.wholeMatch(of: Self.callIdRE) != nil else {
             throw HostedCloudError(
-                statusCode: response.statusCode,
-                code: "INVALID_RESPONSE",
-                message: "短信响应不符合内容同步协议"
+                statusCode: 0,
+                code: "INVALID_REQUEST",
+                message: "通话记录标识不合法"
             )
         }
+        return try await decodeContent(
+            CallRecordDetail.self,
+            path: "v1/call-records/\(callId)",
+            queryItems: [],
+            responseName: "通话详情"
+        )
+    }
+
+    func listCallTimeline(
+        callId: String,
+        limit: Int = 50,
+        cursor: String? = nil
+    ) async throws -> CallTimelinePage {
+        guard callId.wholeMatch(of: Self.callIdRE) != nil,
+              (1...100).contains(limit),
+              ContentWireValidation.validCursor(cursor) else {
+            throw HostedCloudError(
+                statusCode: 0,
+                code: "INVALID_REQUEST",
+                message: "通话时间线分页参数不合法"
+            )
+        }
+        var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if let cursor { queryItems.append(URLQueryItem(name: "cursor", value: cursor)) }
+        return try await decodeContent(
+            CallTimelinePage.self,
+            path: "v1/call-records/\(callId)/timeline",
+            queryItems: queryItems,
+            responseName: "通话时间线"
+        )
     }
 
     // MARK: - 内部
@@ -236,7 +282,7 @@ final class HostedCloudClient: MessageContentClient {
         guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
             throw HostedCloudError(statusCode: 0, code: "BAD_BASE_URL", message: "无效的网关地址")
         }
-        components.queryItems = queryItems
+        if !queryItems.isEmpty { components.queryItems = queryItems }
         guard let url = components.url else {
             throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "分页参数不合法")
         }
@@ -249,6 +295,31 @@ final class HostedCloudClient: MessageContentClient {
             req.setValue("\(Self.deviceCookieName)=\(cred.cookieValue)", forHTTPHeaderField: "Cookie")
         }
         return try await perform(req)
+    }
+
+    private func decodeContent<T: Decodable>(
+        _ type: T.Type,
+        path: String,
+        queryItems: [URLQueryItem],
+        responseName: String
+    ) async throws -> T {
+        let (data, response) = try await contentRequest(path, queryItems: queryItems)
+        guard data.count <= 16_384 else {
+            throw HostedCloudError(
+                statusCode: response.statusCode,
+                code: "INVALID_RESPONSE",
+                message: "\(responseName)响应超过协议上限"
+            )
+        }
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            throw HostedCloudError(
+                statusCode: response.statusCode,
+                code: "INVALID_RESPONSE",
+                message: "\(responseName)响应不符合内容同步协议"
+            )
+        }
     }
 
     private func perform(_ req: URLRequest) async throws -> (Data, HTTPURLResponse) {

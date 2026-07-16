@@ -502,6 +502,75 @@ final class HostedCloudClientTests: XCTestCase {
         }
     }
 
+    func testCallRecordEndpointsConsumeFrozenFixtures() async throws {
+        let list = try ContentTestFixtures.data(named: "call-records-page.json")
+        let detail = try ContentTestFixtures.data(named: "call-record-detail-ready.json")
+        let timeline = try ContentTestFixtures.data(named: "call-timeline-page.json")
+        var requestCount = 0
+        let client = try makeClient { request in
+            requestCount += 1
+            switch requestCount {
+            case 1:
+                XCTAssertEqual(request.url?.path, "/v1/call-records")
+                XCTAssertEqual(request.url?.query, "limit=25")
+                return Self.dataResponse(for: request, data: list)
+            case 2:
+                XCTAssertEqual(request.url?.path, "/v1/call-records/call_fixture_pending_0001")
+                XCTAssertNil(request.url?.query)
+                return Self.dataResponse(for: request, data: detail)
+            default:
+                XCTAssertEqual(request.url?.path, "/v1/call-records/call_fixture_agent_0001/timeline")
+                XCTAssertEqual(request.url?.query, "limit=50&cursor=cursor_fixture_timeline_0001")
+                return Self.dataResponse(for: request, data: timeline)
+            }
+        }
+
+        let page = try await client.listCallRecords(limit: 25, cursor: nil)
+        let call = try await client.getCallRecord(callId: "call_fixture_pending_0001")
+        let events = try await client.listCallTimeline(
+            callId: "call_fixture_agent_0001",
+            limit: 50,
+            cursor: "cursor_fixture_timeline_0001"
+        )
+
+        XCTAssertEqual(page.items.count, 2)
+        XCTAssertEqual(call.record.summaryState, .ready)
+        XCTAssertEqual(events.items.count, 5)
+    }
+
+    func testCallRecordEndpointsRejectInvalidInputsBeforeNetwork() async throws {
+        var requestCount = 0
+        let client = try makeClient { request in
+            requestCount += 1
+            return Self.response(for: request, json: "{}")
+        }
+
+        do {
+            _ = try await client.getCallRecord(callId: "../meta.json")
+            XCTFail("Expected invalid call id")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "INVALID_REQUEST")
+        }
+        do {
+            _ = try await client.listCallTimeline(callId: "call_fixture_agent_0001", limit: 0, cursor: nil)
+            XCTFail("Expected invalid timeline limit")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "INVALID_REQUEST")
+        }
+        XCTAssertEqual(requestCount, 0)
+    }
+
+    func testContentCursorAcceptsOpaqueValueLongerThanEightyCharacters() async throws {
+        let fixture = try ContentTestFixtures.data(named: "call-records-page.json")
+        let cursor = "cursor_" + String(repeating: "a", count: 256)
+        let client = try makeClient { request in
+            XCTAssertEqual(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.last?.value, cursor)
+            return Self.dataResponse(for: request, data: fixture)
+        }
+
+        _ = try await client.listCallRecords(limit: 25, cursor: cursor)
+    }
+
     private func makeClient(
         clockMilliseconds: @escaping () -> Int64 = { 1_000 },
         handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
@@ -547,6 +616,19 @@ final class HostedCloudClientTests: XCTestCase {
             headerFields: headers
         )!
         return (response, Data(json.utf8))
+    }
+
+    nonisolated private static func dataResponse(
+        for request: URLRequest,
+        data: Data
+    ) -> (HTTPURLResponse, Data) {
+        (
+            HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["Cache-Control": "no-store"]
+            )!,
+            data
+        )
     }
 
     nonisolated private static func callJSON(status: String, session: String? = nil) -> String {
