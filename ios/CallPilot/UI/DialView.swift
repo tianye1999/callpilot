@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 拨号页(对齐 Android DialScreen)。线路状态卡 + 12 键盘 + 拨号键。
+/// 拨号页(对齐 Android DialScreen)。12 键盘 + 拨号键。
 struct DialView: View {
     @ObservedObject var model: AppModel
     @State private var number = ""
@@ -9,13 +9,6 @@ struct DialView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            HStack {
-                Circle().fill(model.lineReady ? .green : .gray).frame(width: 10, height: 10)
-                Text(model.lineStatusLabel).font(.subheadline)
-                Spacer()
-                Button("解绑") { model.unpair() }.font(.footnote)
-            }
-
             Text(number.isEmpty ? " " : number)
                 .font(.system(size: 34, weight: .medium, design: .rounded))
                 .frame(maxWidth: .infinity, minHeight: 56)

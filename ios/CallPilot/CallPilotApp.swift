@@ -9,28 +9,46 @@ struct CallPilotApp: App {
     }
 }
 
-/// 导航:未配对 → 配对页;已配对空闲 → 拨号页(含来电接管卡);通话生命周期内 → 通话页。
-/// 对齐 Android MainActivity 的 when 分支。
+/// 根展示层:未配对时显示配对页;配对后保持主 Tab 壳常驻,通话与来电作为顶层覆盖。
 struct RootView: View {
     @StateObject private var model = AppModel()
 
     var body: some View {
+        let presentation = RootPresentation.resolve(
+            isPaired: model.pairing != nil,
+            callState: model.callState,
+            incomingOffer: model.incomingOffer
+        )
+
         Group {
-            switch RootPresentation.resolve(
-                isPaired: model.pairing != nil,
-                callState: model.callState,
-                incomingOffer: model.incomingOffer
-            ) {
-            case .pairing:
+            if presentation == .pairing {
                 PairView(model: model)
-            case .call:
-                CallView(model: model)
-            case .incomingOffer(let offer):
-                IncomingOfferView(model: model, offer: offer)
-            case .main:
-                DialView(model: model)
+            } else {
+                ZStack {
+                    MainTabShell(model: model)
+                        .allowsHitTesting(presentation == .main)
+                        .accessibilityHidden(presentation != .main)
+
+                    switch presentation {
+                    case .call:
+                        fullScreenOverlay { CallView(model: model) }
+                    case .incomingOffer(let offer):
+                        fullScreenOverlay { IncomingOfferView(model: model, offer: offer) }
+                    case .pairing, .main:
+                        EmptyView()
+                    }
+                }
             }
         }
         .task { await model.startOfferPolling() }
+    }
+
+    private func fullScreenOverlay<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        ZStack {
+            Color(uiColor: .systemBackground).ignoresSafeArea()
+            content()
+        }
     }
 }
