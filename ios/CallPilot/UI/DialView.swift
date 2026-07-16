@@ -23,7 +23,11 @@ struct DialView: View {
                 }
             }
 
-            HStack(spacing: 30) {
+            // 对齐 Apple 电话:拨打键恒居中列,删除键在右列出现/消失(占位隐藏),不挤动拨打键。
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 18) {
+                Color.clear.frame(width: 74, height: 74)
+                    .accessibilityHidden(true)
+
                 Button {
                     Task { await model.startCall(number: number) }
                 } label: {
@@ -33,12 +37,15 @@ struct DialView: View {
                         .foregroundStyle(.white)
                 }
                 .disabled(!model.lineReady || number.isEmpty)
+                .accessibilityLabel("拨打")
 
-                if !number.isEmpty {
-                    Button { number.removeLast() } label: {
-                        Image(systemName: "delete.left").font(.title2)
-                    }
+                Button { number.removeLast() } label: {
+                    Image(systemName: "delete.left").font(.title2)
+                        .frame(width: 74, height: 74)
                 }
+                .opacity(number.isEmpty ? 0 : 1)
+                .disabled(number.isEmpty)
+                .accessibilityLabel("删除")
             }
             Spacer()
         }
