@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from fakes import FakeModem
 
 from agentcall.call_agent import CallAgentService
@@ -121,7 +123,9 @@ def test_tool_request_is_opaque_bounded_and_double_gated(monkeypatch) -> None:
     assert request.generation == 7
     assert request.expires_at > request.created_at
     serialized = repr(request)
-    assert "138" not in serialized
+    # 裸 "138" 子串会撞时间戳浮点(如 …384.391…),CI flaky 实锤;
+    # 改为带数字边界的完整手机号模式:任何独立 11 位号都不得进 repr。
+    assert re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", serialized) is None
     assert "快递" not in serialized
     assert service.session.takeover_state is TakeoverState.TAKEOVER_PREPARING
 
