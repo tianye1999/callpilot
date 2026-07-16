@@ -71,6 +71,10 @@ def test_full_lifecycle_produces_all_artifacts(tmp_path):
     assert meta["number"] == "10000"
     assert meta["status"] == "completed"
     assert meta["answered"] is False
+    assert re.fullmatch(r"call_[A-Za-z0-9_-]{12,80}", meta["public_id"])
+    assert meta["public_id"] == record.public_id
+    assert meta["content_updated_at"] >= meta["started_at"]
+    assert meta["summary_state"] == "FAILED"
     assert meta["ended_at"] >= meta["started_at"]
     assert meta["duration"] == pytest.approx(meta["ended_at"] - meta["started_at"], abs=0.01)
 
@@ -162,6 +166,42 @@ def test_finish_is_idempotent(tmp_path):
     record.log_event("post_hangup", note="补记")
     events = read_events(record.path)
     assert events[-1]["type"] == "post_hangup"
+
+
+def test_late_summary_advances_content_updated_at_without_changing_public_id(
+    tmp_path, monkeypatch
+):
+    timestamps = iter([100.0, 110.0, 120.0, 130.0, 140.0])
+    monkeypatch.setattr("agentcall.call_log.time.time", lambda: next(timestamps))
+    record = CallLogger(tmp_path).begin_call("inbound", "13800000000")
+    record.finish("completed")
+    before = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
+
+    record.set_summary({"ok": True, "summary": "ready"})
+    after = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
+
+    assert after["public_id"] == before["public_id"]
+    assert after["content_updated_at"] > before["content_updated_at"]
+    assert before["summary_state"] == "UNAVAILABLE"
+    assert after["summary_state"] == "READY"
+    assert after["events"] == before["events"]
+
+
+def test_mark_summary_pending_is_explicit_and_advances_content_timestamp(
+    tmp_path, monkeypatch
+):
+    timestamps = iter([100.0, 101.0, 102.0, 103.0])
+    monkeypatch.setattr("agentcall.call_log.time.time", lambda: next(timestamps))
+    record = CallLogger(tmp_path).begin_call("inbound", "10086")
+    record.finish("completed")
+    before = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
+
+    record.mark_summary_pending()
+    after = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
+
+    assert before["summary_state"] == "UNAVAILABLE"
+    assert after["summary_state"] == "PENDING"
+    assert after["content_updated_at"] > before["content_updated_at"]
 
 
 # ---- list_calls ----

@@ -962,9 +962,16 @@ class CallSession:
                 name="call-summary",
             )
             self._summary_thread = thread
+            record.mark_summary_pending()
             thread.start()
         except Exception as exc:  # noqa: BLE001
             logger.warning("启动通话摘要线程失败: %s", exc)
+            try:
+                record.set_summary(
+                    {"ok": False, "summary": "", "error": "summary_worker_start_failed"}
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("记录摘要启动失败状态时发生异常")
 
     def _summarize_worker(
         self,
@@ -1010,13 +1017,19 @@ class CallSession:
                     evidence,
                     lang=agent_language(),
                 )
+            record.set_summary(result)
             if result.get("ok"):
-                record.set_summary(result)
                 self._publish({"type": "call_summary", "call_id": record.id, **result})
             else:
                 logger.warning("通话摘要生成失败: %s", result.get("error"))
         except Exception as exc:  # noqa: BLE001
             logger.exception("通话摘要线程异常: %s", exc)
+            try:
+                record.set_summary(
+                    {"ok": False, "summary": "", "error": "summary_worker_error"}
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("记录摘要线程失败状态时发生异常")
 
     def _build_tools(self, direction: str | None = None) -> ToolRegistry:
         """构造本通会话的工具集（工具语义在 call_tools 模块）。"""

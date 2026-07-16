@@ -30,7 +30,7 @@ def test_parse_verdict_is_strict_and_rejects_duplicate_fields():
     verdict = parse_triage_verdict(_response())
     assert verdict.action == "transfer"
     assert verdict.call_generation == 7
-    assert "category" not in verdict.public_fields()
+    assert verdict.public_fields()["category"] == "personal"
 
     with pytest.raises(TriageJudgeError, match="invalid_schema"):
         parse_triage_verdict(_response(extra="leak"))

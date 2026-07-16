@@ -74,9 +74,51 @@ def test_sms_events_persisted_and_reloaded(tmp_path):
 
     data = json.loads(store.read_text(encoding="utf-8"))
     assert [e["type"] for e in data] == ["sms_in"]
+    assert data[0]["message_id"].startswith("msg_")
 
     reloaded = EventHub(make_loop(), store_path=store)
     assert [e["type"] for e in reloaded.history()] == ["sms_in"]
+    assert reloaded.history()[0]["message_id"] == data[0]["message_id"]
+
+
+def test_legacy_sms_ids_are_deterministic_persisted_and_keep_duplicates_distinct(
+    tmp_path,
+):
+    store = tmp_path / "messages.json"
+    duplicate = {
+        "type": "sms_out",
+        "number": "10086",
+        "text": "same stored fragment",
+        "status": "sent",
+        "ts": 10.0,
+    }
+    store.write_text(json.dumps([duplicate, duplicate]), encoding="utf-8")
+
+    first = EventHub(make_loop(), store_path=store)
+    migrated = json.loads(store.read_text(encoding="utf-8"))
+    first_ids = [event["message_id"] for event in migrated]
+
+    assert len(set(first_ids)) == 2
+    assert all(message_id.startswith("msg_") for message_id in first_ids)
+    assert [event["message_id"] for event in first.history()] == first_ids
+
+    second = EventHub(make_loop(), store_path=store)
+    assert [event["message_id"] for event in second.history()] == first_ids
+
+
+def test_legacy_sms_migration_assigns_ids_before_history_retention_window(tmp_path):
+    store = tmp_path / "messages.json"
+    legacy = [
+        {"type": "sms_out", "number": "10086", "text": f"item {i}", "ts": i}
+        for i in range(4)
+    ]
+    store.write_text(json.dumps(legacy), encoding="utf-8")
+
+    EventHub(make_loop(), history_limit=2, store_path=store)
+    migrated = json.loads(store.read_text(encoding="utf-8"))
+
+    assert len(migrated) == 4
+    assert len({event["message_id"] for event in migrated}) == 4
 
 
 def test_persist_write_does_not_hold_history_lock(tmp_path, monkeypatch):

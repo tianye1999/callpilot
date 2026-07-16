@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -79,15 +80,20 @@ class CallRecord:
         number: str | None,
         recording_enabled: bool = False,
         source: str | None = None,
+        public_id: str | None = None,
     ) -> None:
         self.id = id
+        self.public_id = public_id or f"call_{secrets.token_urlsafe(18)}"
         self.path = path
         self.direction = direction
         self.number = number
         self.source = source
         self.recording_enabled = recording_enabled
         self.started_at = time.time()
+        self._content_updated_at = self.started_at
+        self._summary_state = "UNAVAILABLE"
         self._lock = threading.Lock()
+        self._disk_lock = threading.Lock()
         self._event_lines: list[str] = []
         # 录音缓冲用 chunk list（append 引用 O(1)），不用 bytearray——
         # 长通话时 extend 会在锁内触发大 buffer 扩容拷贝，造成音频抖动。
@@ -143,14 +149,32 @@ class CallRecord:
 
     def set_summary(self, summary: dict) -> None:
         """写 summary.json 并记一条 summary 事件。"""
-        try:
-            (self.path / "summary.json").write_text(
-                json.dumps(summary, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            logger.warning("写入 %s/summary.json 失败: %s", self.id, exc)
-        self.log_event("summary", summary=summary)
+        with self._disk_lock:
+            try:
+                (self.path / "summary.json").write_text(
+                    json.dumps(summary, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.warning("写入 %s/summary.json 失败: %s", self.id, exc)
+            self.log_event("summary", summary=summary)
+            with self._lock:
+                self._content_updated_at = time.time()
+                content_updated_at = self._content_updated_at
+                self._summary_state = (
+                    "READY" if summary.get("ok") is True else "FAILED"
+                )
+                summary_state = self._summary_state
+            self._update_content_meta(content_updated_at, summary_state)
+
+    def mark_summary_pending(self) -> None:
+        """Persist that a summary worker was actually scheduled for this call."""
+        with self._disk_lock:
+            with self._lock:
+                self._summary_state = "PENDING"
+                self._content_updated_at = time.time()
+                content_updated_at = self._content_updated_at
+            self._update_content_meta(content_updated_at, "PENDING")
 
     def finish(self, status: str) -> None:
         """结束通话：flush 录音为 wav、写 events.jsonl 与 meta.json。幂等。"""
@@ -173,36 +197,68 @@ class CallRecord:
             self._uplink = []
             self._downlink = []
 
-        # 磁盘 IO 全部在锁外完成。
+        # 磁盘 IO 全部在热路径锁外完成；disk_lock 与迟到摘要更新串行化。
+        with self._disk_lock:
+            try:
+                self.path.mkdir(parents=True, exist_ok=True)
+                (self.path / "events.jsonl").write_text(
+                    "\n".join(event_lines) + "\n", encoding="utf-8"
+                )
+                if self.recording_enabled:
+                    _write_wav(self.path / "uplink.wav", uplink)
+                    _write_wav(self.path / "downlink.wav", downlink)
+                with self._lock:
+                    self._content_updated_at = max(
+                        self._content_updated_at, ended_at
+                    )
+                    content_updated_at = self._content_updated_at
+                meta = {
+                    "id": self.id,
+                    "public_id": self.public_id,
+                    "content_updated_at": content_updated_at,
+                    "summary_state": self._summary_state,
+                    "direction": self.direction,
+                    "number": self.number,
+                    "started_at": self.started_at,
+                    "ended_at": ended_at,
+                    "duration": round(ended_at - self.started_at, 3),
+                    "status": status,
+                    "answered": answered,
+                    "events": len(event_lines),
+                    "recording_enabled": self.recording_enabled,
+                    "uplink_bytes": len(uplink),
+                    "downlink_bytes": len(downlink),
+                }
+                if self.source:
+                    meta["source"] = self.source
+                (self.path / "meta.json").write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            except OSError as exc:
+                logger.error("落盘通话记录 %s 失败: %s", self.id, exc)
+
+    def _update_content_meta(
+        self, content_updated_at: float, summary_state: str
+    ) -> None:
+        meta_path = self.path / "meta.json"
         try:
-            self.path.mkdir(parents=True, exist_ok=True)
-            (self.path / "events.jsonl").write_text(
-                "\n".join(event_lines) + "\n", encoding="utf-8"
-            )
-            if self.recording_enabled:
-                _write_wav(self.path / "uplink.wav", uplink)
-                _write_wav(self.path / "downlink.wav", downlink)
-            meta = {
-                "id": self.id,
-                "direction": self.direction,
-                "number": self.number,
-                "started_at": self.started_at,
-                "ended_at": ended_at,
-                "duration": round(ended_at - self.started_at, 3),
-                "status": status,
-                "answered": answered,
-                "events": len(event_lines),
-                "recording_enabled": self.recording_enabled,
-                "uplink_bytes": len(uplink),
-                "downlink_bytes": len(downlink),
-            }
-            if self.source:
-                meta["source"] = self.source
-            (self.path / "meta.json").write_text(
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if not isinstance(meta, dict):
+            return
+        meta["public_id"] = self.public_id
+        meta["content_updated_at"] = content_updated_at
+        meta["summary_state"] = summary_state
+        temp_path = meta_path.with_suffix(".json.tmp")
+        try:
+            temp_path.write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+            temp_path.replace(meta_path)
         except OSError as exc:
-            logger.error("落盘通话记录 %s 失败: %s", self.id, exc)
+            logger.warning("更新 %s/meta.json 失败: %s", self.id, exc)
+            temp_path.unlink(missing_ok=True)
 
 
 class CallLogger:

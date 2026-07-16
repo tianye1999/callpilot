@@ -474,6 +474,8 @@ def test_summary_thread_writes_summary_and_publishes(tmp_path, monkeypatch):
     call_dir = sole_call_dir(base)
     summary = json.loads((call_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["caller_identity"] == "快递员"
+    meta = json.loads((call_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["summary_state"] == "READY"
 
     summary_events = [e for e in hub.history() if e.get("type") == "call_summary"]
     assert len(summary_events) == 1
@@ -492,6 +494,8 @@ def test_summary_skipped_when_disabled(tmp_path, monkeypatch):
         monkeypatch, CallLogger(base), agent=TalkativeCallerAgent()
     )
     assert service.session._summary_thread is None
+    meta = json.loads((sole_call_dir(base) / "meta.json").read_text(encoding="utf-8"))
+    assert meta["summary_state"] == "UNAVAILABLE"
 
 
 def test_summary_skipped_without_user_speech(tmp_path, monkeypatch):
@@ -500,8 +504,65 @@ def test_summary_skipped_without_user_speech(tmp_path, monkeypatch):
         "agentcall.call_agent.summarize_call",
         lambda *a, **kw: pytest.fail("对方没说话时不应调用 summarize_call"),
     )
-    service, *_ = run_inbound_call(monkeypatch, CallLogger(tmp_path / "rec"))
+    base = tmp_path / "rec"
+    service, *_ = run_inbound_call(monkeypatch, CallLogger(base))
     assert service.session._summary_thread is None  # FakeAgent 只有 agent 转写
+    meta = json.loads((sole_call_dir(base) / "meta.json").read_text(encoding="utf-8"))
+    assert meta["summary_state"] == "UNAVAILABLE"
+
+
+def test_summary_failure_is_terminal_not_permanently_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUMMARY_ENABLED", "true")
+    monkeypatch.setattr(
+        "agentcall.call_agent.summarize_call",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "summary": "",
+            "error": "model_timeout",
+        },
+    )
+    service = make_service(FakeModem(), call_logger=CallLogger(tmp_path / "rec"))
+    record = service.session._begin_record("inbound", "13800000000")
+    assert record is not None
+    record.finish("completed")
+
+    service.session._maybe_summarize(
+        record,
+        [("user", "hello")],
+        "inbound",
+        "13800000000",
+    )
+    assert service.session._summary_thread is not None
+    service.session._summary_thread.join(timeout=1.0)
+
+    meta = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
+    summary = json.loads((record.path / "summary.json").read_text(encoding="utf-8"))
+    assert meta["summary_state"] == "FAILED"
+    assert summary["ok"] is False
+
+
+def test_summary_thread_start_failure_is_terminal(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUMMARY_ENABLED", "true")
+    service = make_service(FakeModem(), call_logger=CallLogger(tmp_path / "rec"))
+    record = service.session._begin_record("inbound", "13800000000")
+    assert record is not None
+    record.finish("completed")
+    monkeypatch.setattr(
+        "agentcall.call_agent.threading.Thread.start",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("cannot start")),
+    )
+
+    service.session._maybe_summarize(
+        record,
+        [("user", "hello")],
+        "inbound",
+        "13800000000",
+    )
+
+    meta = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
+    summary = json.loads((record.path / "summary.json").read_text(encoding="utf-8"))
+    assert meta["summary_state"] == "FAILED"
+    assert summary["error"] == "summary_worker_start_failed"
 
 
 def test_carrier_sms_profile_replaces_misheard_summary_with_official_result(

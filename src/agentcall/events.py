@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import os
+import re
+import secrets
+import tempfile
 import threading
 import time
 from collections import deque
@@ -17,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 # 需要持久化到磁盘的事件类型（短信收发记录）。
 _PERSISTED_TYPES = {"sms_in", "sms_out"}
+_MESSAGE_ID_RE = re.compile(r"^msg_[A-Za-z0-9_-]{12,80}$")
+_LEGACY_MESSAGE_ID_NAMESPACE = b"callpilot-content-sync-message-v1\0"
 
 
 class EventHub:
@@ -156,6 +164,10 @@ class EventHub:
         避免补收 SIM 已存短信 / +CMTI 重复上报时重复转发。
         """
         event.setdefault("ts", time.time())
+        if event.get("type") in _PERSISTED_TYPES and not _valid_message_id(
+            event.get("message_id")
+        ):
+            event["message_id"] = f"msg_{secrets.token_urlsafe(18)}"
         # 收件短信去重：指纹已见过则直接丢弃（不入库、不广播、返回 False）。
         with self._condition:
             if event.get("type") == "sms_in":
@@ -204,34 +216,73 @@ class EventHub:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("读取短信历史失败: %s", exc)
             return
-        if isinstance(data, list):
-            for event in data:
-                if isinstance(event, dict):
-                    self._repair_sms_event(event)
-                    self._history.append(event)
-                    # 预填去重指纹：重启后补收 SIM 已存短信时，已持久化过的不再重复入库。
-                    if event.get("type") == "sms_in":
-                        self._seen_sms.add(self._sms_fingerprint(event))
+        if not isinstance(data, list):
+            return
+        changed = False
+        occurrences: dict[str, int] = {}
+        for event in data:
+            if not isinstance(event, dict):
+                continue
+            changed = self._repair_sms_event(event) or changed
+            if event.get("type") in _PERSISTED_TYPES:
+                canonical = _canonical_legacy_sms(event)
+                ordinal = occurrences.get(canonical, 0)
+                occurrences[canonical] = ordinal + 1
+                if not _valid_message_id(event.get("message_id")):
+                    event["message_id"] = _legacy_message_id(canonical, ordinal)
+                    changed = True
+            self._history.append(event)
+            # 预填去重指纹：重启后补收 SIM 已存短信时，已持久化过的不再重复入库。
+            if event.get("type") == "sms_in":
+                self._seen_sms.add(self._sms_fingerprint(event))
+        if changed:
+            self._persist_migration(data)
 
     @staticmethod
-    def _repair_sms_event(event: dict[str, Any]) -> None:
+    def _repair_sms_event(event: dict[str, Any]) -> bool:
         """修正历史里遗留的未解码 PDU 短信（sender 为空且正文是 PDU 十六进制）。"""
         if event.get("type") != "sms_in" or event.get("sender"):
-            return
+            return False
         text = event.get("text")
         if not isinstance(text, str):
-            return
+            return False
         try:
             from .modem import _looks_like_pdu, parse_sms_pdu
         except Exception:  # noqa: BLE001
-            return
+            return False
         if not _looks_like_pdu(text):
-            return
+            return False
         parsed = parse_sms_pdu(text)
         if parsed is not None:
             sender, _timestamp, body = parsed
             event["sender"] = sender
             event["text"] = body
+            return True
+        return False
+
+    def _persist_migration(self, events: list[Any]) -> None:
+        """Atomically persist one-time legacy repairs before serving content sync."""
+        assert self._store_path is not None
+        with self._persist_lock:
+            try:
+                self._store_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = json.dumps(events, ensure_ascii=False, indent=2)
+                fd, raw_path = tempfile.mkstemp(
+                    prefix=f".{self._store_path.name}.",
+                    suffix=".tmp",
+                    dir=self._store_path.parent,
+                )
+                temp_path = Path(raw_path)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        handle.write(payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temp_path, self._store_path)
+                finally:
+                    temp_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("迁移短信历史失败: %s", exc)
 
     def _persist(self) -> None:
         assert self._store_path is not None
@@ -248,3 +299,29 @@ class EventHub:
                 )
             except OSError as exc:
                 logger.warning("写入短信历史失败: %s", exc)
+
+
+def _valid_message_id(value: Any) -> bool:
+    return isinstance(value, str) and _MESSAGE_ID_RE.fullmatch(value) is not None
+
+
+def _canonical_legacy_sms(event: dict[str, Any]) -> str:
+    public_input = {key: value for key, value in event.items() if key != "message_id"}
+    return json.dumps(
+        public_input,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _legacy_message_id(canonical: str, ordinal: int) -> str:
+    digest = hashlib.sha256(
+        _LEGACY_MESSAGE_ID_NAMESPACE
+        + canonical.encode("utf-8")
+        + b"\0"
+        + str(ordinal).encode("ascii")
+    ).digest()
+    opaque = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return f"msg_{opaque}"

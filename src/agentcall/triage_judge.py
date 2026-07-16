@@ -64,6 +64,7 @@ class TriageVerdict:
 
     def public_fields(self) -> dict[str, str | float | int]:
         return {
+            "category": self.category,
             "action": self.action,
             "confidence": self.confidence,
             "reason_code": self.reason_code,

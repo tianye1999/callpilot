@@ -186,6 +186,10 @@ Requires `call_records:read`. Items are newest first.
 | `hasTranscript` | boolean | Timeline has at least one public transcript item |
 | `triageOutcome` | `AI_HANDLED \| REJECTED \| TRANSFERRED \| UNKNOWN` or null | Inbound normalized result |
 
+`PENDING` means an Edge summary worker was actually scheduled and has not reached
+a terminal result. Calls for which summary generation is disabled or ineligible
+(for example, no caller transcript) are `UNAVAILABLE`, not permanently pending.
+
 Internal paths, byte counts, recording flags and raw source/event values are not
 public fields. Version 1 exposes no recording capability.
 
