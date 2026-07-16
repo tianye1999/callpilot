@@ -419,6 +419,89 @@ final class HostedCloudClientTests: XCTestCase {
         }
     }
 
+    func testListMessagesConsumesFrozenFixtureWithOpaqueCursor() async throws {
+        let fixture = try ContentTestFixtures.data(named: "messages-page.json")
+        let client = try makeClient { request in
+            XCTAssertEqual(request.url?.path, "/v1/messages")
+            let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
+            XCTAssertEqual(components.queryItems, [
+                URLQueryItem(name: "limit", value: "25"),
+                URLQueryItem(name: "cursor", value: "cursor_messages_fixture_0001"),
+            ])
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Cache-Control"), "no-store")
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["Cache-Control": "no-store"]
+                )!,
+                fixture
+            )
+        }
+        client.credential = DeviceCredential(deviceId: "device_abcdefghijkl", secret: "secret-value")
+
+        let page = try await client.listMessages(limit: 25, cursor: "cursor_messages_fixture_0001")
+
+        XCTAssertEqual(page.items.count, 3)
+        XCTAssertEqual(page.nextCursor, "cursor_messages_fixture_0001")
+    }
+
+    func testListMessagesRejectsInvalidLimitOrCursorBeforeNetwork() async throws {
+        var requests = 0
+        let client = try makeClient { request in
+            requests += 1
+            return Self.response(for: request, json: "{}")
+        }
+
+        for (limit, cursor) in [(0, nil), (101, nil), (25, "not-a-cursor")] {
+            do {
+                _ = try await client.listMessages(limit: limit, cursor: cursor)
+                XCTFail("Expected invalid pagination input")
+            } catch let error as HostedCloudError {
+                XCTAssertEqual(error.code, "INVALID_REQUEST")
+            }
+        }
+        XCTAssertEqual(requests, 0)
+    }
+
+    func testListMessagesPreservesPayloadTooLargeCode() async throws {
+        let client = try makeClient { request in
+            Self.response(
+                for: request,
+                status: 413,
+                json: #"{"error":{"code":"PAYLOAD_TOO_LARGE","message":"oversized"}}"#
+            )
+        }
+
+        do {
+            _ = try await client.listMessages(limit: 25, cursor: nil)
+            XCTFail("Expected oversized item failure")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.statusCode, 413)
+            XCTAssertEqual(error.code, "PAYLOAD_TOO_LARGE")
+        }
+    }
+
+    func testListMessagesRejectsSuccessfulResponseAboveProtocolLimit() async throws {
+        let oversized = Data(repeating: UInt8(ascii: " "), count: 16_385)
+        let client = try makeClient { request in
+            (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["Cache-Control": "no-store"]
+                )!,
+                oversized
+            )
+        }
+
+        do {
+            _ = try await client.listMessages(limit: 25, cursor: nil)
+            XCTFail("Expected oversized successful response to fail closed")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "INVALID_RESPONSE")
+        }
+    }
+
     private func makeClient(
         clockMilliseconds: @escaping () -> Int64 = { 1_000 },
         handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)

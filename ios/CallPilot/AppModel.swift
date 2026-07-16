@@ -12,12 +12,14 @@ final class AppModel: ObservableObject {
     @Published var lineStatusLabel = "线路状态获取中…"
     @Published var lineReady = false
     @Published private(set) var speakerphoneEnabled = false
+    @Published private(set) var messageInbox: MessageInboxModel?
 
     private let store = CredentialStore()
     private var client: HostedCloudClient?
     private var dismissedOffers = Set<String>()
     private var media: CallMediaSession?
     private var callAttempts = CallAttemptStateMachine()
+    private let messageStore = FileMessageCacheStore()
 
     // 接管媒体超时(对齐 Android takeoverMediaTimeoutMs;真机实证:失败会话不复位会挡后续 offer)。
     private let takeoverMediaTimeout: Duration = .seconds(20)
@@ -30,8 +32,21 @@ final class AppModel: ObservableObject {
     }
 
     private func rebuildClient() {
-        guard let p = pairing else { client = nil; return }
+        guard let p = pairing else {
+            client = nil
+            messageInbox = nil
+            return
+        }
         client = try? HostedCloudClient(baseURL: p.gatewayURL).also { $0.credential = p.credential }
+        if let client {
+            messageInbox = MessageInboxModel(
+                client: client,
+                store: messageStore,
+                deviceId: p.credential.deviceId
+            )
+        } else {
+            messageInbox = nil
+        }
     }
 
     // MARK: - 配对
@@ -55,9 +70,11 @@ final class AppModel: ObservableObject {
     }
 
     func unpair() {
+        messageInbox?.clearLocalData()
         store.clear()
         pairing = nil
         client = nil
+        messageInbox = nil
         incomingOffer = nil
     }
 

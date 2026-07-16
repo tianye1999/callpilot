@@ -34,10 +34,15 @@ struct MainTabShell: View {
             .tag(MainTab.records)
 
             NavigationStack(path: $messagesPath) {
-                ContentUnavailableView("暂无短信", systemImage: "message")
-                    .navigationTitle("短信")
+                if let inbox = model.messageInbox {
+                    MessagesView(model: inbox)
+                } else {
+                    ContentUnavailableView("无法载入短信", systemImage: "message.badge.filled.fill")
+                        .navigationTitle("短信")
+                }
             }
             .tabItem { Label("短信", systemImage: "message") }
+            .badge(model.messageInbox?.unreadCount ?? 0)
             .tag(MainTab.messages)
 
             NavigationStack(path: $settingsPath) {

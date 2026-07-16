@@ -4,7 +4,7 @@ import CoreFoundation
 /// Hosted `/v1` 适配器(对齐 Android `HostedCloudClient.kt`)。凭证与请求状态
 /// 统一由 MainActor 隔离;仅依赖 Foundation/CoreFoundation。
 @MainActor
-final class HostedCloudClient {
+final class HostedCloudClient: MessageContentClient {
     private let base: URL
     private let origin: String
     private let urlSession: URLSession
@@ -19,6 +19,7 @@ final class HostedCloudClient {
     private static var offerIdRE: Regex<Substring> { /^offer_[A-Za-z0-9_-]{12,80}$/ }
     private static var claimIdRE: Regex<Substring> { /^claim_[A-Za-z0-9_-]{12,80}$/ }
     private static var idempotencyKeyRE: Regex<Substring> { /^[A-Za-z0-9._:-]{16,128}$/ }
+    private static var cursorRE: Regex<Substring> { /^cursor_[A-Za-z0-9_-]{12,80}$/ }
 
     init(
         baseURL: String,
@@ -173,6 +174,38 @@ final class HostedCloudClient {
         )
     }
 
+    // MARK: - 只读内容同步(#99)
+
+    func listMessages(limit: Int = 25, cursor: String? = nil) async throws -> MessagePage {
+        guard (1...100).contains(limit),
+              cursor == nil || cursor?.wholeMatch(of: Self.cursorRE) != nil else {
+            throw HostedCloudError(
+                statusCode: 0,
+                code: "INVALID_REQUEST",
+                message: "短信分页参数不合法"
+            )
+        }
+        var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if let cursor { queryItems.append(URLQueryItem(name: "cursor", value: cursor)) }
+        let (data, response) = try await contentRequest("v1/messages", queryItems: queryItems)
+        guard data.count <= 16_384 else {
+            throw HostedCloudError(
+                statusCode: response.statusCode,
+                code: "INVALID_RESPONSE",
+                message: "短信响应超过协议上限"
+            )
+        }
+        do {
+            return try JSONDecoder().decode(MessagePage.self, from: data)
+        } catch {
+            throw HostedCloudError(
+                statusCode: response.statusCode,
+                code: "INVALID_RESPONSE",
+                message: "短信响应不符合内容同步协议"
+            )
+        }
+    }
+
     // MARK: - 内部
 
     private func request(
@@ -190,6 +223,35 @@ final class HostedCloudClient {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = body
         }
+        let (data, http) = try await perform(req)
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        return (obj, http)
+    }
+
+    private func contentRequest(
+        _ path: String,
+        queryItems: [URLQueryItem]
+    ) async throws -> (Data, HTTPURLResponse) {
+        let endpoint = base.appendingPathComponent(path)
+        guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
+            throw HostedCloudError(statusCode: 0, code: "BAD_BASE_URL", message: "无效的网关地址")
+        }
+        components.queryItems = queryItems
+        guard let url = components.url else {
+            throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "分页参数不合法")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue(origin, forHTTPHeaderField: "Origin")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        if let cred = credential {
+            req.setValue("\(Self.deviceCookieName)=\(cred.cookieValue)", forHTTPHeaderField: "Cookie")
+        }
+        return try await perform(req)
+    }
+
+    private func perform(_ req: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let (data, response) = try await urlSession.data(for: req)
         guard let http = response as? HTTPURLResponse else {
             throw HostedCloudError(statusCode: 0, code: "NO_HTTP_RESPONSE", message: "无 HTTP 响应")
@@ -203,7 +265,7 @@ final class HostedCloudClient {
                 message: (err?["message"] as? String) ?? "云控制面请求失败(HTTP \(http.statusCode))"
             )
         }
-        return (obj, http)
+        return (data, http)
     }
 
     private struct HostedSessionPayload {
