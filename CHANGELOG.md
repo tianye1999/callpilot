@@ -8,6 +8,12 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
 
 ### Added
 
+- **Mobile inbox and call history (#99)**: the paired iOS and Android apps now
+  expose read-only SMS and call records (timeline, transcript and summary
+  lifecycle), with bounded encrypted local caches, incremental pagination,
+  bilingual UI and fail-closed cache erasure after device revocation. Content
+  remains sourced from the Edge through the transient hosted relay rather than
+  being retained by the Worker.
 - **iOS system incoming-call surface (#96)**: opaque PushKit wake-ups now report
   owner-takeover offers through CallKit, with encrypted APNs token storage,
   duplicate/expiry fencing, and CallKit-owned LiveKit audio activation. Delivery
@@ -39,6 +45,11 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
 
 ### Fixed
 
+- **iOS VoIP wake reliability (#96/#102)**: PushKit now reports incoming calls
+  synchronously on its main-queue callback before returning, preventing iOS
+  from terminating the app for an unhandled VoIP push. App Store exports now
+  carry the provisioning-profile-derived production APNs entitlement; the
+  locked-screen CallKit flow was verified on a physical iPhone.
 - **ffmpeg modem-write thread deadlock (#82)**: a stalled playback process is
   now detected within ~250ms and restarted; the PCM buffer is bounded (60s)
   so normal realtime TTS bursts are never truncated.
