@@ -1,6 +1,7 @@
 package ai.bondings.callpilot.protocol
 
 import java.io.IOException
+import kotlinx.coroutines.test.runTest
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -415,5 +416,56 @@ class HostedCloudClientTest {
             client.claimInboundOffer("offer_abcdefghijkl")
         }
         assertEquals("OFFER_UNAVAILABLE", error.errorCode)
+    }
+
+    @Test
+    fun `listMessages consumes shared fixture with opaque cursor and no-store`() = runTest {
+        client.credential = DeviceCredential("device_abcdefghijkl", "secret-value")
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .addHeader("Cache-Control", "no-store")
+                .setBody(ContentTestFixtures.text("messages-page.json")),
+        )
+
+        val page = client.listMessages(25, "cursor_messages_fixture_0001")
+
+        assertEquals(3, page.items.size)
+        val request = server.takeRequest()
+        assertEquals("/v1/messages?limit=25&cursor=cursor_messages_fixture_0001", request.path)
+        assertEquals("no-store", request.getHeader("Cache-Control"))
+        assertTrue(request.getHeader("Cookie")!!.startsWith("__Host-callpilot-device="))
+    }
+
+    @Test
+    fun `listMessages rejects bad pagination before network and preserves stable error`() = runTest {
+        assertThrows(HostedCloudException::class.java) {
+            kotlinx.coroutines.runBlocking { client.listMessages(0, null) }
+        }
+        assertThrows(HostedCloudException::class.java) {
+            kotlinx.coroutines.runBlocking { client.listMessages(25, "not-a-cursor") }
+        }
+        assertEquals(0, server.requestCount)
+
+        server.enqueue(
+            MockResponse().setResponseCode(413)
+                .setBody("""{"error":{"code":"PAYLOAD_TOO_LARGE","message":"oversized"}}"""),
+        )
+        val error = assertThrows(HostedCloudException::class.java) {
+            kotlinx.coroutines.runBlocking { client.listMessages(25, null) }
+        }
+        assertEquals("PAYLOAD_TOO_LARGE", error.errorCode)
+    }
+
+    @Test
+    fun `listMessages rejects successful body above protocol limit`() = runTest {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody(Buffer().write(ByteArray(16_385) { ' '.code.toByte() })),
+        )
+
+        val error = assertThrows(HostedCloudException::class.java) {
+            kotlinx.coroutines.runBlocking { client.listMessages(25, null) }
+        }
+        assertEquals("INVALID_RESPONSE", error.errorCode)
     }
 }

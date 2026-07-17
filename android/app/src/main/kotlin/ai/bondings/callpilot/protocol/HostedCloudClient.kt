@@ -3,6 +3,8 @@ package ai.bondings.callpilot.protocol
 import java.io.IOException
 import java.net.URI
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -28,7 +30,7 @@ class HostedCloudClient(
     private val client: OkHttpClient = OkHttpClient(),
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val sleepMs: (Long) -> Unit = Thread::sleep,
-) {
+) : MessageContentClient {
     companion object {
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
         private val DEVICE_ID = Regex("^device_[A-Za-z0-9_-]{12,80}$")
@@ -37,6 +39,7 @@ class HostedCloudClient(
         private val OFFER_ID = Regex("^offer_[A-Za-z0-9_-]{12,80}$")
         private val CLAIM_ID = Regex("^claim_[A-Za-z0-9_-]{12,80}$")
         private val IDEMPOTENCY_KEY = Regex("^[A-Za-z0-9._:-]{16,128}$")
+        private const val CONTENT_RESPONSE_MAX_BYTES = 16_384
     }
 
     private val base: HttpUrl = baseUrl.toHttpUrl().also {
@@ -180,6 +183,38 @@ class HostedCloudClient(
         }
     }
 
+    override suspend fun listMessages(limit: Int, cursor: String?): MessagePage {
+        if (limit !in 1..100 || !ContentWireValidation.validCursor(cursor)) {
+            throw HostedCloudException(0, "INVALID_REQUEST", "短信分页参数不合法")
+        }
+        return withContext(Dispatchers.IO) {
+            val query = buildList {
+                add("limit" to limit.toString())
+                cursor?.let { add("cursor" to it) }
+            }
+            request("GET", "v1/messages", null, query).use { response ->
+                val bytes = response.body?.bytes() ?: ByteArray(0)
+                val payload = parseOrThrow(response, bytes)
+                if (bytes.size > CONTENT_RESPONSE_MAX_BYTES) {
+                    throw HostedCloudException(
+                        response.code,
+                        "INVALID_RESPONSE",
+                        "短信响应超过协议上限",
+                    )
+                }
+                try {
+                    MessagePage.decode(json, payload.toString())
+                } catch (_: ContentContractException) {
+                    throw HostedCloudException(
+                        response.code,
+                        "INVALID_RESPONSE",
+                        "短信响应不符合内容同步协议",
+                    )
+                }
+            }
+        }
+    }
+
     fun unpair() {
         request("DELETE", "v1/device", null).use { response ->
             parseOrThrow(response)
@@ -187,9 +222,17 @@ class HostedCloudClient(
         }
     }
 
-    private fun request(method: String, path: String, jsonBody: String?): Response {
+    private fun request(
+        method: String,
+        path: String,
+        jsonBody: String?,
+        query: List<Pair<String, String>> = emptyList(),
+    ): Response {
+        val url = base.newBuilder().addPathSegments(path).apply {
+            query.forEach { (name, value) -> addQueryParameter(name, value) }
+        }.build()
         val builder = Request.Builder()
-            .url(base.newBuilder().addPathSegments(path).build())
+            .url(url)
             .header("Origin", origin)
             .header("Accept", "application/json")
             .header("Cache-Control", "no-store")
@@ -206,7 +249,11 @@ class HostedCloudClient(
     }
 
     private fun parseOrThrow(response: Response): JsonObject {
-        val text = response.body?.string().orEmpty()
+        return parseOrThrow(response, response.body?.bytes() ?: ByteArray(0))
+    }
+
+    private fun parseOrThrow(response: Response, bytes: ByteArray): JsonObject {
+        val text = bytes.toString(Charsets.UTF_8)
         val payload = try {
             json.parseToJsonElement(text).jsonObject
         } catch (_: Exception) {
@@ -306,6 +353,7 @@ class HostedCloudClient(
         if (separator <= 0 || separator == value.lastIndex) return null
         return DeviceCredential(value.substring(0, separator), value.substring(separator + 1))
     }
+
 }
 
 @Serializable

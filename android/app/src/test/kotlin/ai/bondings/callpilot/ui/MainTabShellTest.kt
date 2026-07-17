@@ -15,4 +15,10 @@ class MainTabShellTest {
             MainTab.entries.map(MainTab::route),
         )
     }
+
+    @Test
+    fun `detail destination keeps its parent tab selected`() {
+        assertEquals(true, isMainTabSelected(MainTab.Messages, "messages/detail/{messageId}"))
+        assertEquals(false, isMainTabSelected(MainTab.Records, "messages/detail/{messageId}"))
+    }
 }
