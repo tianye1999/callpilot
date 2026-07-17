@@ -44,6 +44,7 @@
     <tr><td>Call recording</td><td>Your Edge computer</td><td>Recording is off by default. When enabled, the default local retention period is 30 days</td></tr>
     <tr><td>Mobile content cache</td><td>Your iPhone or Android device</td><td>Protected locally and cleared when you unpair, clear content, or authorization is revoked. iOS cache files are excluded from iCloud backup; Android stores encrypted content whose key is not exportable from Android Keystore</td></tr>
     <tr><td>Device and routing metadata</td><td>Our Cloudflare-based control plane</td><td>Device identifiers, credential hashes, online state, opaque call/session state, and security audit events are retained as needed to operate and secure the beta service</td></tr>
+    <tr><td>iOS VoIP notification token</td><td>Encrypted in our control plane and used with Apple Push Notification service</td><td>Retained while the device remains paired; deleted when the device unpairs, is revoked, or Apple reports the token invalid</td></tr>
     <tr><td>Media and requested content in transit</td><td>Cloud relay and LiveKit media infrastructure</td><td>Processed only to complete the live request; content is not written to our content database or application logs</td></tr>
   </table>
 
@@ -55,6 +56,7 @@
   <ul>
     <li>The mobile app uses the microphone only while you place, answer, or take over a call.</li>
     <li>AI calls use the model provider configured on your Edge, such as OpenAI or Alibaba Cloud Model Studio. Audio or text sent to that provider is governed by your account and the provider's terms.</li>
+    <li>On iOS, Apple Push Notification service receives an opaque incoming-call notification containing no caller identity, phone number, message, transcript, or audio.</li>
     <li>We do not use advertising SDKs, sell personal data, build advertising profiles, or track you across apps and websites.</li>
     <li>CallPilot does not request your contacts or location.</li>
   </ul>
@@ -93,6 +95,7 @@
       <li>录音默认关闭;启用后只保存在 Edge,默认保留 30 天。</li>
       <li>手机缓存受系统数据保护;解除配对、清除内容或授权撤销时删除。iOS 缓存文件排除 iCloud 备份;Android 内容以 Android Keystore 中不可导出的密钥加密。</li>
       <li>云端保留运行与安全所需的设备标识、凭证哈希、在线状态、不透明会话状态与审计元数据,不保存内容正文。</li>
+      <li>iOS VoIP 推送令牌加密保存在控制面,仅用于通过 Apple 推送服务唤醒系统来电界面;解除配对、撤销设备或 Apple 判定令牌失效时删除。</li>
     </ul>
 
     <h2>3. 云中转边界</h2>
@@ -102,6 +105,7 @@
     <ul>
       <li>手机 App 只在你拨打、接听或接管通话时使用麦克风。</li>
       <li>AI 通话使用你在 Edge 配置的模型服务商,例如 OpenAI 或阿里云百炼;发送给服务商的音频或文本受你的账号及服务商条款约束。</li>
+      <li>iOS 的 Apple 推送服务只接收不透明来电通知,不包含来电人身份、电话号码、短信、转写或音频。</li>
       <li>我们不接入广告 SDK,不出售个人数据,不跨 App 跟踪,不请求通讯录或位置权限。</li>
     </ul>
 
