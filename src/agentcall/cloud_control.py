@@ -34,7 +34,7 @@ _USER_AGENT = "CallPilot-Edge/1"
 class CloudSessionService(Protocol):
     modem_connected: bool
 
-    def remote_dialer_status(self) -> dict[str, Any]: ...
+    def line_busy(self) -> bool: ...
 
     def start_cloud_remote_session(self, command: dict[str, Any]) -> tuple[bool, str | None]: ...
 
@@ -465,14 +465,13 @@ class CloudEdgeClient:
         return headers
 
     def _heartbeat(self) -> str:
-        status = self.service.remote_dialer_status()
         payload = {
             "v": 1,
             "type": "heartbeat",
             "occurredAt": _utc_now(),
             "status": {
                 "modemOnline": bool(self.service.modem_connected),
-                "lineBusy": bool(status.get("active")),
+                "lineBusy": self.service.line_busy(),
             },
         }
         return json.dumps(payload, separators=(",", ":"))

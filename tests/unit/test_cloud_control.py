@@ -38,6 +38,9 @@ class _Service:
     def remote_dialer_status(self) -> dict:
         return {"active": False}
 
+    def line_busy(self) -> bool:
+        return bool(self.remote_dialer_status().get("active"))
+
     def start_cloud_remote_session(self, command: dict) -> tuple[bool, str | None]:
         self.commands.append(command)
         return True, None
@@ -569,6 +572,18 @@ def test_heartbeat_tracks_live_modem_connection_state() -> None:
     assert json.loads(client._heartbeat())["status"]["modemOnline"] is True
     service.modem_connected = False
     assert json.loads(client._heartbeat())["status"]["modemOnline"] is False
+
+
+def test_heartbeat_reports_local_agent_call_as_line_busy() -> None:
+    class _LocallyBusyService(_Service):
+        def line_busy(self) -> bool:
+            return True
+
+    service = _LocallyBusyService()
+    assert service.remote_dialer_status()["active"] is False
+    client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
+
+    assert json.loads(client._heartbeat())["status"]["lineBusy"] is True
 
 
 def test_cloud_api_never_includes_bearer_in_url_or_error(monkeypatch) -> None:

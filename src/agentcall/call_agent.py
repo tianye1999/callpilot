@@ -171,6 +171,7 @@ class CallSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._active = False
+        self._active_lock = threading.Lock()
         self._outgoing_audio: Queue[bytes] = Queue()
         self._record: CallRecord | None = None
         self._summary_thread: threading.Thread | None = None
@@ -242,7 +243,12 @@ class CallSession:
 
     @property
     def is_active(self) -> bool:
-        return self._active
+        with self._active_lock:
+            return self._active
+
+    def _set_active(self, value: bool) -> None:
+        with self._active_lock:
+            self._active = value
 
     def start(
         self,
@@ -251,7 +257,7 @@ class CallSession:
         preset_hint: str | None = None,
         preset_id: str | None = None,
     ) -> None:
-        if self._active:
+        if self.is_active:
             logger.warning("已有通话进行中，忽略新的呼叫请求")
             return
         self._outbound_number = outbound_number
@@ -280,13 +286,13 @@ class CallSession:
         with self._hangup_lock:
             self._cancel_hangup_timer()
             self._session_generation += 1
-            self._active = True
+            self._set_active(True)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         with self._dtmf_lock:
-            self._active = False
+            self._set_active(False)
             self._cancel_spoken_dtmf_followups_locked()
         self._stop_dtmf_judge()
         self._stop_triage_judge()
@@ -302,7 +308,7 @@ class CallSession:
             logger.exception("通话处理异常: %s", exc)
         finally:
             with self._dtmf_lock:
-                self._active = False
+                self._set_active(False)
                 self._cancel_spoken_dtmf_followups_locked()
                 self._active_tools = None
             self._stop_dtmf_judge()
@@ -645,7 +651,7 @@ class CallSession:
         generation = self._session_generation
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
-        while self._active and not agent.fatal:
+        while self.is_active and not agent.fatal:
             triage_action = await self._consume_triage_results(
                 agent, bridge, generation
             )
@@ -1838,18 +1844,18 @@ class CallSession:
 
     async def _wait_connected(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
-        while self._active and time.monotonic() < deadline:
+        while self.is_active and time.monotonic() < deadline:
             if self.modem.is_call_connected():
                 return True
             await asyncio.sleep(0.2)
         return False
 
     async def _shutdown(self) -> None:
-        self._active = False
+        self._set_active(False)
 
     def _agent_generation_current(self, generation: int) -> bool:
         with self._hangup_lock:
-            return self._active and generation == self._session_generation
+            return self.is_active and generation == self._session_generation
 
     def _agent_effect_allowed(self, generation: int) -> bool:
         if not self._agent_generation_current(generation):
@@ -2628,6 +2634,16 @@ class CallAgentService:
         if worker is not None:
             payload.update(worker.coordinator.status())
         return payload
+
+    def line_busy(self) -> bool:
+        """Return a synchronized snapshot of every owner that can occupy the line."""
+        with self._remote_setup_lock:
+            worker = self._remote_worker
+            remote_session_active = bool(worker and worker.is_running)
+        with self._ring_lock:
+            local_session_active = self.session.is_active
+            remote_call_active = self._remote_call_owner is not None
+        return remote_session_active or local_session_active or remote_call_active
 
     def next_inbound_takeover_offer(
         self, timeout: float = 0.0

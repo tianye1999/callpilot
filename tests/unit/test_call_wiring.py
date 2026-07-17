@@ -1533,6 +1533,22 @@ def test_modem_callbacks_drive_truthful_status_and_privacy_safe_sim_events():
     assert "460000123456789" not in str(sim_event)
 
 
+def test_line_busy_aggregates_local_agent_and_remote_worker_state():
+    modem = FakeModem()
+    service = make_service(modem)
+
+    assert service.line_busy() is False
+    service.session._active = True
+    assert service.line_busy() is True
+    service.session._active = False
+
+    class RunningWorker:
+        is_running = True
+
+    service._remote_worker = RunningWorker()  # type: ignore[assignment]
+    assert service.line_busy() is True
+
+
 def test_dial_rejected_when_modem_not_connected(monkeypatch):
     """模组未连接时拨打必须立即拒绝，而不是假装"已发起呼叫"。"""
     from agentcall.call_agent import CallAgentService
