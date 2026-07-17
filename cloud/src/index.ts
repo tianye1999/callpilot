@@ -20,6 +20,11 @@ import { EdgeRoom } from "./edge-room";
 import { error, HttpError, json, readJson, requireSameOrigin } from "./http";
 import { issueParticipantToken } from "./livekit";
 import {
+  appReviewPairingEnabled,
+  PairingPolicyError,
+  validatePairingPolicy
+} from "./pairing-policy";
+import {
   claimEnrollmentSchema,
   claimInboundOfferSchema,
   claimPairingSchema,
@@ -171,6 +176,21 @@ async function createPairing(request: Request, env: Env, edgeId: string): Promis
   const edge = await authenticateEdge(request, env);
   if (edge.edge_id !== edgeId) throw new HttpError("FORBIDDEN", "Edge does not own this resource", 403);
   const input = createPairingSchema.parse(await readJson(request));
+  try {
+    validatePairingPolicy(
+      input.purpose,
+      input.ttlSeconds,
+      appReviewPairingEnabled(env.APP_REVIEW_PAIRING_ENABLED)
+    );
+  } catch (caught) {
+    if (caught instanceof PairingPolicyError && caught.code === "FEATURE_DISABLED") {
+      throw new HttpError("FEATURE_DISABLED", "App Review pairing is disabled", 403);
+    }
+    if (caught instanceof PairingPolicyError) {
+      throw new HttpError("VALIDATION_ERROR", "Pairing lifetime is invalid", 400);
+    }
+    throw caught;
+  }
   const active = await env.DB.prepare(
     "SELECT COUNT(*) AS count FROM devices WHERE edge_id = ?1 AND revoked_at IS NULL"
   ).bind(edgeId).first<{ count: number }>();
@@ -180,8 +200,15 @@ async function createPairing(request: Request, env: Env, edgeId: string): Promis
   const code = randomPairingCode();
   const now = Date.now();
   await env.DB.prepare(
-    "INSERT INTO pairing_sessions(pairing_id, edge_id, code_hash, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5)"
-  ).bind(pairingId, edgeId, await sha256(normalizePairingCode(code)), now + input.ttlSeconds * 1000, now).run();
+    "INSERT INTO pairing_sessions(pairing_id, edge_id, code_hash, expires_at, created_at, purpose) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+  ).bind(
+    pairingId,
+    edgeId,
+    await sha256(normalizePairingCode(code)),
+    now + input.ttlSeconds * 1000,
+    now,
+    input.purpose
+  ).run();
   return json({ pairingId, code, expiresAt: now + input.ttlSeconds * 1000 }, 201);
 }
 
@@ -192,8 +219,12 @@ async function claimPairing(request: Request, env: Env): Promise<Response> {
   const now = Date.now();
   const codeHash = await sha256(normalizePairingCode(input.code));
   const pairing = await env.DB.prepare(
-    "UPDATE pairing_sessions SET claimed_at = ?1 WHERE code_hash = ?2 AND claimed_at IS NULL AND expires_at > ?1 RETURNING pairing_id, edge_id"
-  ).bind(now, codeHash).first<{ pairing_id: string; edge_id: string }>();
+    "UPDATE pairing_sessions SET claimed_at = ?1 WHERE code_hash = ?2 AND claimed_at IS NULL AND expires_at > ?1 AND (purpose = 'standard' OR (purpose = 'app_review' AND ?3 = 1)) RETURNING pairing_id, edge_id"
+  ).bind(
+    now,
+    codeHash,
+    appReviewPairingEnabled(env.APP_REVIEW_PAIRING_ENABLED) ? 1 : 0
+  ).first<{ pairing_id: string; edge_id: string }>();
   if (!pairing) throw new HttpError("INVALID_PAIRING", "Pairing code is invalid or expired", 401);
 
   const active = await env.DB.prepare(

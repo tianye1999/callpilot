@@ -619,6 +619,84 @@ def test_cloud_api_never_includes_bearer_in_url_or_error(monkeypatch) -> None:
     assert request.headers["User-agent"] == "CallPilot-Edge/1"
 
 
+def test_cloud_api_preserves_standard_pairing_wire_contract(monkeypatch) -> None:
+    captured = []
+    credential = EdgeCredential(
+        "edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40
+    )
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b'{"pairingId":"pairing_abcdefghijkl","code":"ABCD-EFGH"}'
+
+    def fake_urlopen(request, timeout):
+        captured.append((request, timeout))
+        return _Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    CloudControlApi(
+        "https://api.bondings.ai", sign=lambda _message: "proof"
+    ).create_pairing(credential)
+
+    request, _timeout = captured[0]
+    assert json.loads(request.data) == {"ttlSeconds": 300}
+
+
+def test_cloud_api_creates_bounded_app_review_pairing(monkeypatch) -> None:
+    captured = []
+    credential = EdgeCredential(
+        "edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40
+    )
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b'{"pairingId":"pairing_abcdefghijkl","code":"ABCD-EFGH"}'
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda request, timeout: captured.append((request, timeout)) or _Response(),
+    )
+    api = CloudControlApi(
+        "https://api.bondings.ai", sign=lambda _message: "proof"
+    )
+
+    api.create_pairing(
+        credential,
+        ttl_seconds=7 * 24 * 60 * 60,
+        purpose="app_review",
+    )
+
+    request, _timeout = captured[0]
+    assert json.loads(request.data) == {
+        "ttlSeconds": 604800,
+        "purpose": "app_review",
+    }
+    with pytest.raises(ValueError, match="ttl_seconds"):
+        api.create_pairing(
+            credential,
+            ttl_seconds=604801,
+            purpose="app_review",
+        )
+    with pytest.raises(ValueError, match="ttl_seconds"):
+        api.create_pairing(credential, ttl_seconds=300.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ttl_seconds"):
+        api.create_pairing(credential, ttl_seconds=True)
+    with pytest.raises(ValueError, match="purpose"):
+        api.create_pairing(credential, purpose="unexpected")
+
+
 def test_cloud_websocket_uses_product_user_agent() -> None:
     credential = EdgeCredential(
         "edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40

@@ -34,25 +34,8 @@ const migration = spawnSync(
 );
 if (migration.status !== 0) throw new Error(migration.stderr || migration.stdout);
 
-const worker = spawn(
-  wrangler,
-  [
-    "dev", "--local", "--ip", "127.0.0.1", "--port", String(port),
-    "--var", `ADMIN_TOKEN:${adminToken}`,
-    "--var", "LIVEKIT_API_KEY:integration-key",
-    "--var", `LIVEKIT_API_SECRET:${livekitSecret}`,
-    "--var", "LIVEKIT_URL:wss://integration.livekit.cloud",
-    "--var", "CONTENT_READ_ENABLED:true",
-    "--var", "CONTENT_RELAY_TIMEOUT_MS:500",
-    "--var", "CONTENT_READ_DEVICE_LIMIT:100",
-    "--var", "CONTENT_READ_EDGE_LIMIT:200"
-  ],
-  { cwd: cloudDir, stdio: ["ignore", "pipe", "pipe"] }
-);
-
 let workerOutput = "";
-worker.stdout.on("data", (chunk) => { workerOutput += chunk; });
-worker.stderr.on("data", (chunk) => { workerOutput += chunk; });
+let worker = startWorker(false);
 
 try {
   await waitForHealth();
@@ -97,6 +80,81 @@ try {
     })
   });
   assert.equal(reusedEnrollment.status, 401);
+
+  const disabledReviewPairing = await fetch(
+    `${base}/v1/edges/${enrollment.edgeId}/pairing-sessions`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...edgeHeaders("POST", `/v1/edges/${enrollment.edgeId}/pairing-sessions`, enrollment)
+      },
+      body: JSON.stringify({ ttlSeconds: 3_600, purpose: "app_review" })
+    }
+  );
+  assert.equal(disabledReviewPairing.status, 403);
+  assert.equal((await disabledReviewPairing.json()).error.code, "FEATURE_DISABLED");
+
+  worker = await restartWorker(worker, true);
+
+  const revocableReviewPairing = await post(
+    `/v1/edges/${enrollment.edgeId}/pairing-sessions`,
+    { ttlSeconds: 3_600, purpose: "app_review" },
+    edgeHeaders("POST", `/v1/edges/${enrollment.edgeId}/pairing-sessions`, enrollment)
+  );
+  worker = await restartWorker(worker, false);
+  const disabledReviewClaim = await fetch(`${base}/v1/pairing-sessions/claim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: origin, "CF-Connecting-IP": clientIp },
+    body: JSON.stringify({ code: revocableReviewPairing.code, displayName: "Disabled Review" })
+  });
+  assert.equal(disabledReviewClaim.status, 401);
+  assert.equal((await disabledReviewClaim.json()).error.code, "INVALID_PAIRING");
+
+  worker = await restartWorker(worker, true);
+
+  const overlongStandardPairing = await fetch(
+    `${base}/v1/edges/${enrollment.edgeId}/pairing-sessions`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...edgeHeaders("POST", `/v1/edges/${enrollment.edgeId}/pairing-sessions`, enrollment)
+      },
+      body: JSON.stringify({ ttlSeconds: 601 })
+    }
+  );
+  assert.equal(overlongStandardPairing.status, 400);
+  assert.equal((await overlongStandardPairing.json()).error.code, "VALIDATION_ERROR");
+
+  const reviewPairingStartedAt = Date.now();
+  const reviewPairing = await post(
+    `/v1/edges/${enrollment.edgeId}/pairing-sessions`,
+    { ttlSeconds: 604_800, purpose: "app_review" },
+    edgeHeaders("POST", `/v1/edges/${enrollment.edgeId}/pairing-sessions`, enrollment)
+  );
+  assert.match(reviewPairing.code, /^[23456789A-HJ-NP-Z]{4}-[23456789A-HJ-NP-Z]{4}$/);
+  assert.ok(reviewPairing.expiresAt >= reviewPairingStartedAt + 604_800_000);
+  assert.ok(reviewPairing.expiresAt <= Date.now() + 604_800_000);
+
+  const reviewPairResponse = await fetch(`${base}/v1/pairing-sessions/claim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: origin, "CF-Connecting-IP": clientIp },
+    body: JSON.stringify({ code: reviewPairing.code, displayName: "Review Phone" })
+  });
+  assert.equal(reviewPairResponse.status, 201);
+  const reviewPaired = await reviewPairResponse.json();
+  const reusedReviewPairing = await fetch(`${base}/v1/pairing-sessions/claim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: origin, "CF-Connecting-IP": clientIp },
+    body: JSON.stringify({ code: reviewPairing.code, displayName: "Review Replay" })
+  });
+  assert.equal(reusedReviewPairing.status, 401);
+  const revokeReviewDevice = await fetch(`${base}/v1/devices/${reviewPaired.device.deviceId}`, {
+    method: "DELETE",
+    headers: edgeHeaders("DELETE", `/v1/devices/${reviewPaired.device.deviceId}`, enrollment)
+  });
+  assert.equal(revokeReviewDevice.status, 200);
 
   const pairing = await post(`/v1/edges/${enrollment.edgeId}/pairing-sessions`, { ttlSeconds: 300 }, {
     ...edgeHeaders("POST", `/v1/edges/${enrollment.edgeId}/pairing-sessions`, enrollment)
@@ -741,4 +799,33 @@ async function stopWorker(process) {
     process.kill("SIGKILL");
     await closed;
   }
+}
+
+function startWorker(reviewPairingEnabled) {
+  const child = spawn(
+    wrangler,
+    [
+      "dev", "--local", "--ip", "127.0.0.1", "--port", String(port),
+      "--var", `ADMIN_TOKEN:${adminToken}`,
+      "--var", "LIVEKIT_API_KEY:integration-key",
+      "--var", `LIVEKIT_API_SECRET:${livekitSecret}`,
+      "--var", "LIVEKIT_URL:wss://integration.livekit.cloud",
+      "--var", "CONTENT_READ_ENABLED:true",
+      "--var", "CONTENT_RELAY_TIMEOUT_MS:500",
+      "--var", "CONTENT_READ_DEVICE_LIMIT:100",
+      "--var", "CONTENT_READ_EDGE_LIMIT:200",
+      "--var", `APP_REVIEW_PAIRING_ENABLED:${reviewPairingEnabled}`
+    ],
+    { cwd: cloudDir, stdio: ["ignore", "pipe", "pipe"] }
+  );
+  child.stdout.on("data", (chunk) => { workerOutput += chunk; });
+  child.stderr.on("data", (chunk) => { workerOutput += chunk; });
+  return child;
+}
+
+async function restartWorker(current, reviewPairingEnabled) {
+  await stopWorker(current);
+  const replacement = startWorker(reviewPairingEnabled);
+  await waitForHealth();
+  return replacement;
 }

@@ -90,11 +90,27 @@ class CloudControlApi:
             {"code": code, "displayName": display_name, "publicKey": public_key},
         )
 
-    def create_pairing(self, credential: EdgeCredential) -> dict[str, Any]:
+    def create_pairing(
+        self,
+        credential: EdgeCredential,
+        *,
+        ttl_seconds: int = 300,
+        purpose: str = "standard",
+    ) -> dict[str, Any]:
+        if purpose not in {"standard", "app_review"}:
+            raise ValueError("purpose must be standard or app_review")
+        max_seconds = 600 if purpose == "standard" else 7 * 24 * 60 * 60
+        if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool):
+            raise ValueError("ttl_seconds must be an integer")
+        if not 60 <= ttl_seconds <= max_seconds:
+            raise ValueError("ttl_seconds is outside the allowed range")
+        payload: dict[str, Any] = {"ttlSeconds": ttl_seconds}
+        if purpose == "app_review":
+            payload["purpose"] = purpose
         return self._request(
             "POST",
             f"/v1/edges/{credential.edge_id}/pairing-sessions",
-            {"ttlSeconds": 300},
+            payload,
             credential=credential,
         )
 

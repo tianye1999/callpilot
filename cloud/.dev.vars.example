@@ -2,3 +2,4 @@ ADMIN_TOKEN=replace-with-a-random-admin-token
 LIVEKIT_API_KEY=replace-with-livekit-api-key
 LIVEKIT_API_SECRET=replace-with-livekit-api-secret
 CONTENT_READ_ENABLED=false
+APP_REVIEW_PAIRING_ENABLED=false

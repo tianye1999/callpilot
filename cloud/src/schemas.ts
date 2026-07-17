@@ -15,7 +15,8 @@ export const claimEnrollmentSchema = z.object({
 }).strict();
 
 export const createPairingSchema = z.object({
-  ttlSeconds: z.number().int().min(60).max(600).default(300)
+  ttlSeconds: z.number().int().min(60).max(604800).default(300),
+  purpose: z.enum(["standard", "app_review"]).default("standard")
 }).strict();
 
 export const claimPairingSchema = z.object({

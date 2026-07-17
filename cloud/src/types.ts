@@ -11,6 +11,7 @@ export interface Env {
   CONTENT_RELAY_TIMEOUT_MS?: string;
   CONTENT_READ_DEVICE_LIMIT?: string;
   CONTENT_READ_EDGE_LIMIT?: string;
+  APP_REVIEW_PAIRING_ENABLED?: string;
 }
 
 export interface EdgeRecord {

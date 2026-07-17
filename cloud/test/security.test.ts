@@ -10,7 +10,12 @@ import {
   randomSecret,
   sha256
 } from "../src/security";
-import { claimPairingSchema, createCallSchema, edgeMessageSchema } from "../src/schemas";
+import {
+  claimPairingSchema,
+  createCallSchema,
+  createPairingSchema,
+  edgeMessageSchema
+} from "../src/schemas";
 
 describe("credential helpers", () => {
   it("creates opaque identifiers and secrets without punctuation separators", () => {
@@ -50,6 +55,22 @@ describe("protocol schema", () => {
   it("normalizes only syntax at the pairing boundary", () => {
     expect(claimPairingSchema.safeParse({ code: "ABCD-EFGH", displayName: "Phone" }).success).toBe(true);
     expect(claimPairingSchema.safeParse({ code: "0000-0000", displayName: "Phone" }).success).toBe(false);
+  });
+
+  it("keeps pairing purpose explicit while preserving the legacy default", () => {
+    expect(createPairingSchema.parse({ ttlSeconds: 300 })).toEqual({
+      ttlSeconds: 300,
+      purpose: "standard"
+    });
+    expect(createPairingSchema.safeParse({
+      ttlSeconds: 604_800,
+      purpose: "app_review"
+    }).success).toBe(true);
+    expect(createPairingSchema.safeParse({
+      ttlSeconds: 604_801,
+      purpose: "app_review"
+    }).success).toBe(false);
+    expect(createPairingSchema.safeParse({ ttlSeconds: 300, purpose: "other" }).success).toBe(false);
   });
 
   it("allows documented edge messages and rejects arbitrary message types", () => {
