@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CallPilot — 你的 SIM,随身携带,AI 代劳</title>
+<meta name="description" content="CallPilot 把插在电脑上的实体 SIM 变成随身可用的智能电话:手机远程拨打接听,AI 代接来电、代打客服,通话与短信尽在掌握。">
+<style>
+  :root { --blue:#2E5CE6; --cyan:#39D2E8; --ink:#16181d; --muted:#5b6472; --bg:#fbfbfe; --card:#ffffff; --line:#e6e9f2; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#eceef3; --muted:#9aa3b2; --bg:#0e0f14; --card:#171922; --line:#262a36; }
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); line-height:1.7; }
+  .wrap { max-width:960px; margin:0 auto; padding:0 24px; }
+  header { padding:22px 0; display:flex; align-items:center; justify-content:space-between; }
+  .brand { display:flex; align-items:center; gap:10px; font-weight:700; font-size:18px; }
+  .brand-mark { width:34px; height:34px; border-radius:8px; background:var(--blue); position:relative; }
+  .brand-mark::after { content:"📞"; position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:17px; filter:grayscale(1) brightness(10); }
+  nav a { color:var(--muted); text-decoration:none; font-size:14px; margin-left:20px; }
+  nav a:hover { color:var(--blue); }
+  .hero { padding:72px 0 56px; text-align:center; }
+  .hero h1 { font-size:clamp(30px,5vw,44px); line-height:1.25; letter-spacing:-0.5px; }
+  .hero h1 em { font-style:normal; background:linear-gradient(90deg,var(--blue),var(--cyan)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .hero p { color:var(--muted); font-size:17px; max-width:640px; margin:18px auto 0; }
+  .cta { margin-top:32px; display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+  .btn { display:inline-block; padding:11px 22px; border-radius:10px; font-size:15px; text-decoration:none; }
+  .btn-primary { background:var(--blue); color:#fff; }
+  .btn-ghost { border:1px solid var(--line); color:var(--ink); background:var(--card); }
+  .beta-tag { display:inline-block; margin-top:14px; font-size:12.5px; color:var(--muted); border:1px solid var(--line); border-radius:99px; padding:3px 12px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; padding:40px 0 8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:22px; }
+  .card .icon { font-size:22px; }
+  .card h3 { font-size:16.5px; margin:10px 0 6px; }
+  .card p { font-size:14.5px; color:var(--muted); }
+  .how { padding:48px 0 16px; }
+  .how h2, .dl h2 { font-size:24px; text-align:center; margin-bottom:8px; }
+  .how .sub, .dl .sub { text-align:center; color:var(--muted); font-size:15px; margin-bottom:28px; }
+  .steps { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
+  .step { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; }
+  .step b { color:var(--blue); font-size:13px; letter-spacing:1px; }
+  .step h4 { font-size:15.5px; margin:6px 0 4px; }
+  .step p { font-size:14px; color:var(--muted); }
+  .dl { padding:48px 0; }
+  .dl-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:14px; }
+  .dl-item { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; text-align:center; }
+  .dl-item h4 { font-size:15.5px; }
+  .dl-item .state { font-size:13px; color:var(--muted); margin-top:4px; }
+  .dl-item .state.live { color:#23A55A; }
+  footer { border-top:1px solid var(--line); padding:28px 0 48px; margin-top:40px; font-size:13.5px; color:var(--muted); display:flex; flex-wrap:wrap; gap:18px; justify-content:space-between; }
+  footer a { color:var(--muted); text-decoration:none; margin-right:16px; }
+  footer a:hover { color:var(--blue); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand"><span class="brand-mark"></span>CallPilot</div>
+    <nav>
+      <a href="#features">功能</a>
+      <a href="#how">工作原理</a>
+      <a href="#download">下载</a>
+      <a href="./support.html">支持</a>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <h1>你的 SIM,随身携带<br><em>AI 替你接打电话</em></h1>
+    <p>把插在电脑上的实体 SIM 卡,变成手机上随时可用的智能电话线路。人在外面,卡在家里;来电有 AI 先接,客服电话 AI 代打,通话与短信一屏掌握。</p>
+    <div class="cta">
+      <a class="btn btn-primary" href="#download">加入内测</a>
+      <a class="btn btn-ghost" href="https://github.com/tianye1999/callpilot">GitHub</a>
+    </div>
+    <span class="beta-tag">Beta 内测中 · iOS / Android / macOS</span>
+  </section>
+
+  <section class="grid" id="features">
+    <div class="card"><div class="icon">📱</div><h3>远程拨打与接听</h3><p>手机 App 经加密通道使用家中 SIM 拨打、接听,如同 SIM 就在手机里。副卡、物联卡、保号卡的最佳伴侣。</p></div>
+    <div class="card"><div class="icon">🤖</div><h3>AI 来电管家</h3><p>来电先由 AI 接听、智能分诊:重要来电一键转接真人接管,骚扰推销自动应付,每通都有摘要与完整对话记录。</p></div>
+    <div class="card"><div class="icon">📞</div><h3>AI 代打电话</h3><p>查话费、订座、催快递——给 AI 一句话任务,它替你拨号、按键盘、跟客服周旋,结果回报给你。</p></div>
+    <div class="card"><div class="icon">💬</div><h3>短信与通话记录同步</h3><p>验证码短信、通话历史与 AI 对话详情实时同步到手机,云端零存储,数据只在你自己的设备上。</p></div>
+    <div class="card"><div class="icon">🔒</div><h3>隐私优先架构</h3><p>录音、转写、短信正文全部存放在你自己的电脑上;云服务只做瞬时转发,不落库、不记日志、不做画像。</p></div>
+    <div class="card"><div class="icon">🌐</div><h3>双语与无障碍</h3><p>界面跟随系统中英文;大字号与读屏深度适配,细节对齐系统原生电话体验。</p></div>
+  </section>
+
+  <section class="how" id="how">
+    <h2>工作原理</h2>
+    <p class="sub">三个部件,一条加密链路</p>
+    <div class="steps">
+      <div class="step"><b>STEP 1</b><h4>电脑端 Edge</h4><p>把 4G 通信模组(内含你的 SIM)插上电脑,运行 CallPilot 桌面端——它是你的私人电话基站与数据保管者。</p></div>
+      <div class="step"><b>STEP 2</b><h4>扫码配对</h4><p>手机 App 输入配对码,与你的 Edge 建立专属加密绑定。凭证存于系统安全区,可随时撤销。</p></div>
+      <div class="step"><b>STEP 3</b><h4>随处使用</h4><p>拨号、接听、看短信、翻记录——媒体经端到端实时通道传输,内容云端零存储。</p></div>
+    </div>
+  </section>
+
+  <section class="dl" id="download">
+    <h2>获取 CallPilot</h2>
+    <p class="sub">Beta 内测阶段,逐步开放</p>
+    <div class="dl-row">
+      <div class="dl-item"><h4> iOS</h4><div class="state">TestFlight 内测 · 即将开放申请</div></div>
+      <div class="dl-item"><h4>🤖 Android</h4><div class="state">APK 内测包 · 即将开放</div></div>
+      <div class="dl-item"><h4>💻 macOS(Edge 桌面端)</h4><div class="state live">v0.6.0 已发布 · GitHub Releases</div></div>
+      <div class="dl-item"><h4>🪟 Windows</h4><div class="state">实验性 · 规划中</div></div>
+    </div>
+  </section>
+
+  <footer>
+    <div>© 2026 Azores Labs · CallPilot Beta</div>
+    <div>
+      <a href="./privacy.html">隐私政策</a>
+      <a href="./terms.html">用户协议</a>
+      <a href="./support.html">支持与反馈</a>
+      <a href="https://github.com/tianye1999/callpilot">GitHub</a>
+    </div>
+  </footer>
+</div>
+</body>
+</html>

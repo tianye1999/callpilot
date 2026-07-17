@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>支持与反馈 · CallPilot</title>
+<style>
+  :root { --blue:#2E5CE6; --ink:#16181d; --muted:#5b6472; --bg:#fbfbfe; --card:#ffffff; --line:#e6e9f2; }
+  @media (prefers-color-scheme: dark) { :root { --ink:#eceef3; --muted:#9aa3b2; --bg:#121319; --card:#1a1c24; --line:#2a2e3a; } }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); line-height:1.75; }
+  .wrap { max-width:760px; margin:0 auto; padding:48px 24px 96px; }
+  nav a { color:var(--blue); text-decoration:none; font-size:14px; }
+  h1 { font-size:28px; margin:24px 0 4px; }
+  .meta { color:var(--muted); font-size:14px; margin-bottom:28px; }
+  h2 { font-size:19px; margin:32px 0 10px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin:12px 0; }
+  .card h3 { font-size:15.5px; margin-bottom:6px; }
+  .card p { font-size:14.5px; color:var(--muted); }
+  a.mail { color:var(--blue); text-decoration:none; font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav><a href="./index.html">← CallPilot 首页</a></nav>
+  <h1>支持与反馈</h1>
+  <p class="meta">Beta 内测期间,我们会认真读每一封邮件。</p>
+
+  <h2>联系我们</h2>
+  <div class="card">
+    <h3>📮 support@bondings.ai</h3>
+    <p>问题反馈、功能建议、内测申请、隐私与安全事项,均可来信。请附上 App 版本号(设置页可见)与问题发生的大致时间,便于我们排查。</p>
+  </div>
+  <div class="card">
+    <h3>🐙 GitHub Issues</h3>
+    <p>开发者可直接在 <a class="mail" href="https://github.com/tianye1999/callpilot/issues">github.com/tianye1999/callpilot/issues</a> 提交问题报告。</p>
+  </div>
+
+  <h2>常见问题</h2>
+  <div class="card"><h3>手机上短信/记录显示"无法更新"?</h3><p>先确认电脑端 CallPilot 正在运行且显示"线路就绪";再确认手机网络正常后下拉刷新。内容同步为逐设备授权能力,若显示"尚未启用"请联系我们。</p></div>
+  <div class="card"><h3>拨号提示线路离线?</h3><p>检查电脑端通信模组是否插好(掉电重插后需等待约 30 秒重新注册网络)、电脑端应用是否在运行。</p></div>
+  <div class="card"><h3>对方声音小或听不清?</h3><p>0.7.0 起已内置下行增益修正。若仍偏小,请在通话中切换听筒/扬声器对比后反馈给我们。</p></div>
+  <div class="card"><h3>SIM 卡收到"语音功能被限制"短信?</h3><p>这是运营商风控(对高频呼出敏感)。请按运营商短信指引完成实人认证即可恢复;建议避免短时间内高频拨打同一号码。</p></div>
+  <div class="card"><h3>如何彻底删除我的数据?</h3><p>手机端:设置 → 清除本机内容 / 解除配对(自动抹除)。电脑端:数据均在本地目录,可在应用内删除记录或直接删除数据文件。云端本就不存储你的内容。</p></div>
+
+  <h2>安全问题报告</h2>
+  <div class="card"><p>若你发现安全漏洞,请<strong>不要公开披露</strong>,发送细节至 <a class="mail" href="mailto:support@bondings.ai">support@bondings.ai</a>(标题注明 SECURITY)。我们承诺 48 小时内响应。</p></div>
+</div>
+</body>
+</html>

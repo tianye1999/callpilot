@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>隐私政策 · CallPilot</title>
+<style>
+  :root { --blue:#2E5CE6; --ink:#16181d; --muted:#5b6472; --bg:#fbfbfe; --card:#ffffff; --line:#e6e9f2; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#eceef3; --muted:#9aa3b2; --bg:#121319; --card:#1a1c24; --line:#2a2e3a; }
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); line-height:1.75; }
+  .wrap { max-width:760px; margin:0 auto; padding:48px 24px 96px; }
+  nav a { color:var(--blue); text-decoration:none; font-size:14px; }
+  h1 { font-size:28px; margin:24px 0 4px; }
+  .meta { color:var(--muted); font-size:14px; margin-bottom:32px; }
+  h2 { font-size:19px; margin:36px 0 12px; padding-top:12px; border-top:1px solid var(--line); }
+  p, li { color:var(--ink); font-size:15.5px; }
+  ul { padding-left:1.4em; margin:8px 0; }
+  .note { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--blue); border-radius:8px; padding:14px 16px; margin:16px 0; font-size:14.5px; }
+  .muted { color:var(--muted); }
+  table { width:100%; border-collapse:collapse; margin:12px 0; font-size:14.5px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav><a href="./index.html">← CallPilot 首页</a></nav>
+  <h1>隐私政策</h1>
+  <p class="meta">生效日期:2026-07-17 · 适用于 CallPilot 移动应用(iOS/Android)、桌面端与配套云服务(Beta)</p>
+
+  <div class="note">
+    <strong>一句话摘要:</strong>你的通话音频、短信正文与 AI 对话记录保存在<strong>你自己的电脑(Edge)上</strong>。云服务只做配对、指令转发与内容的<strong>瞬时中转</strong>,不存储上述内容。
+  </div>
+
+  <h2>1. 我们是谁</h2>
+  <p>CallPilot 由 Azores Labs(下称"我们")开发,是一款把你的实体 SIM 通话能力(经连接在你电脑上的通信模组)桥接到手机 App 的个人通信工具,并提供 AI 代接/代拨能力。</p>
+
+  <h2>2. 数据在哪里、存多久</h2>
+  <table>
+    <tr><th>数据</th><th>存放位置</th><th>说明</th></tr>
+    <tr><td>通话录音、AI 对话转写、通话摘要</td><td><strong>仅你的电脑(Edge)本地</strong></td><td>默认保留 30 天,可在设置中更改或删除;不上传云端存储</td></tr>
+    <tr><td>短信正文</td><td><strong>仅你的电脑(Edge)本地</strong></td><td>保留最近记录;不上传云端存储</td></tr>
+    <tr><td>手机 App 内容缓存</td><td>你的手机本地</td><td>受系统数据保护(iOS Data Protection / Android 加密存储),不进 iCloud/云备份;解除配对即抹除</td></tr>
+    <tr><td>配对与设备凭证、设备在线状态、审计元数据</td><td>云服务(Cloudflare)</td><td>仅为路由与安全所需的最小元数据;审计记录不含任何内容正文</td></tr>
+    <tr><td>通话/短信内容经云中转</td><td><strong>不存储</strong></td><td>见第 3 条"瞬时中转"</td></tr>
+  </table>
+
+  <h2>3. 云服务的"瞬时中转"承诺与边界</h2>
+  <p>当你在手机上查看短信、通话记录或进行远程通话时,内容需经我们的云服务在你的手机与你的电脑之间转发。我们承诺:</p>
+  <ul>
+    <li>内容<strong>不写入</strong>云端数据库、对象存储、缓存、日志或监控指标;</li>
+    <li>请求完成或超时后,内容即被丢弃;</li>
+    <li>设备授权被撤销后,进行中的请求结果也不会再投递。</li>
+  </ul>
+  <div class="note muted"><strong>如实说明:</strong>当前版本尚未实现内容级端到端加密。转发过程中,内容以 TLS 加密传输,并会在云服务进程内存中<strong>短暂以明文形式处理</strong>。若你对此敏感,可暂不启用内容同步功能(其为服务端逐设备授权的可选能力)。</div>
+
+  <h2>4. 我们收集哪些信息</h2>
+  <ul>
+    <li><strong>麦克风</strong>:仅在你发起或接管通话时采集,用于将你的语音传输至通话对方;不用于其他目的。</li>
+    <li><strong>通话与短信内容</strong>:由你的电脑上的模组产生,按第 2 条存放于你本地。</li>
+    <li><strong>账户与设备信息</strong>:配对码、设备标识、Edge 标识等技术性标识,用于建立与保护你的设备间连接。</li>
+    <li>我们<strong>不</strong>收集通讯录、位置信息,不做广告追踪,不向第三方出售任何数据。</li>
+  </ul>
+
+  <h2>5. AI 功能披露</h2>
+  <ul>
+    <li>CallPilot 的 AI 可代你接听或拨打电话。AI 生成的语音属于<strong>合成内容</strong>。</li>
+    <li>你应遵守所在地区关于自动拨号、通话录音与 AI 合成内容的法律法规(包括录音须告知对方、AI 合成内容标识等要求;中国大陆用户请注意《人工智能生成合成内容标识办法》等规定)。</li>
+    <li>AI 对话内容会调用你自行配置的大模型服务(如阿里云通义等)。该部分数据处理同时受你与相应模型服务商之间协议的约束。</li>
+  </ul>
+
+  <h2>6. 通话录音合规提醒</h2>
+  <p>录音功能默认仅存储于你的电脑本地,但<strong>是否合法录音取决于你所在司法辖区</strong>(部分地区要求通话双方同意)。你是录音行为的责任主体,请在使用前了解并遵守当地法律。</p>
+
+  <h2>7. 你的控制权</h2>
+  <ul>
+    <li>手机 App:设置中可随时<strong>清除本机缓存</strong>或<strong>解除配对</strong>(自动抹除手机上的全部内容缓存);</li>
+    <li>电脑端:可删除任意或全部通话记录/短信数据,可关闭录音、摘要等功能;</li>
+    <li>设备被撤销授权后,将立即失去内容访问能力。</li>
+  </ul>
+
+  <h2>8. 数据安全</h2>
+  <p>设备凭证以密文存储(iOS Keychain / Android EncryptedSharedPreferences);云通道全程 TLS;内容同步为服务端逐设备显式授权 + 双端功能开关,默认关闭;云端对读取行为仅记录不含正文的审计元数据。</p>
+
+  <h2>9. 未成年人</h2>
+  <p>本产品面向成年人,不面向 16 岁以下未成年人提供服务。</p>
+
+  <h2>10. 政策变更与联系我们</h2>
+  <p>政策更新将在本页发布并更新生效日期。任何隐私相关问题,请联系:<strong>support@bondings.ai</strong></p>
+  <p class="muted" style="margin-top:24px;font-size:13px">Beta 阶段说明:本产品处于测试阶段,功能与本政策可能随版本演进调整;重大变更会显著提示。</p>
+</div>
+</body>
+</html>
