@@ -9,9 +9,10 @@ import ai.bondings.callpilot.protocol.InboundOffer
 import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.ui.CallPilotTheme
 import ai.bondings.callpilot.ui.CallScreen
-import ai.bondings.callpilot.ui.DialScreen
 import ai.bondings.callpilot.ui.IncomingOfferScreen
+import ai.bondings.callpilot.ui.MainTabShell
 import ai.bondings.callpilot.ui.PairScreen
+import ai.bondings.callpilot.ui.RootPresentation
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
@@ -20,10 +21,13 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -31,6 +35,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.hideFromAccessibility
+import androidx.compose.ui.semantics.semantics
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
@@ -40,7 +47,7 @@ import kotlinx.coroutines.withContext
 
 private const val OFFER_POLL_INTERVAL_MS = 3_000L
 
-/** 导航：未配对 → 配对页；已配对空闲 → 拨号页（含来电接管卡）；通话生命周期内 → 通话页。 */
+/** Root host: the paired tab shell remains mounted while call/offer UI overlays it. */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,14 +69,11 @@ class MainActivity : ComponentActivity() {
                     val current = pairing
 
                     // #95：hosted 配对且前台空闲时轮询可接管的来电 offer（MVP=前台在线）。
-                    if (current != null && current.protocol == PairingProtocol.HOSTED) {
-                        // 复用单个 client：每轮 new HostedCloudClient 会泄漏 OkHttp 连接池。
-                        val offerClient = remember(current) {
-                            HostedCloudClient(current.gatewayUrl).also {
+                    LaunchedEffect(current) {
+                        if (current != null && current.protocol == PairingProtocol.HOSTED) {
+                            val offerClient = HostedCloudClient(current.gatewayUrl).also {
                                 it.credential = current.credential
                             }
-                        }
-                        LaunchedEffect(current) {
                             lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                                 while (true) {
                                     if (manager.state.value is CallState.Idle) {
@@ -88,6 +92,8 @@ class MainActivity : ComponentActivity() {
                                     delay(OFFER_POLL_INTERVAL_MS)
                                 }
                             }
+                        } else {
+                            incomingOffer = null
                         }
                     }
 
@@ -103,35 +109,87 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    when {
-                        current == null -> PairScreen(store = store, onPaired = { pairing = it })
-                        callState is CallState.Idle && activeOffer != null -> IncomingOfferScreen(
-                            onAccept = {
-                                val granted = ContextCompat.checkSelfPermission(
-                                    this@MainActivity, Manifest.permission.RECORD_AUDIO,
-                                ) == PackageManager.PERMISSION_GRANTED
-                                if (granted) {
+                    val presentation = RootPresentation.resolve(
+                        isPaired = current != null,
+                        callState = callState,
+                        incomingOffer = activeOffer,
+                    )
+                    if (presentation == RootPresentation.Pairing) {
+                        PairScreen(store = store, onPaired = { pairing = it })
+                    } else if (current != null) {
+                        val overlayVisible = presentation != RootPresentation.Main
+                        Box(Modifier.fillMaxSize()) {
+                            MainTabShell(
+                                pairing = current,
+                                store = store,
+                                manager = manager,
+                                onUnpaired = {
                                     incomingOffer = null
-                                    manager.answerTakeover(current, activeOffer.offerId)
-                                } else {
-                                    micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                                    pairing = null
+                                },
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .then(
+                                        if (overlayVisible) {
+                                            Modifier
+                                                .pointerInput(Unit) {
+                                                    awaitPointerEventScope {
+                                                        while (true) {
+                                                            awaitPointerEvent().changes.forEach { it.consume() }
+                                                        }
+                                                    }
+                                                }
+                                                .semantics { hideFromAccessibility() }
+                                        } else {
+                                            Modifier
+                                        },
+                                    ),
+                            )
+
+                            when (presentation) {
+                                RootPresentation.Call -> FullScreenOverlay {
+                                    CallScreen(state = callState, manager = manager)
                                 }
-                            },
-                            onDecline = {
-                                dismissedOffers += activeOffer.offerId
-                                incomingOffer = null
-                            },
-                        )
-                        callState is CallState.Idle -> DialScreen(
-                            pairing = current,
-                            store = store,
-                            manager = manager,
-                            onUnpaired = { pairing = null },
-                        )
-                        else -> CallScreen(state = callState, manager = manager)
+                                is RootPresentation.IncomingOffer -> FullScreenOverlay {
+                                    IncomingOfferScreen(
+                                        onAccept = {
+                                            val granted = ContextCompat.checkSelfPermission(
+                                                this@MainActivity,
+                                                Manifest.permission.RECORD_AUDIO,
+                                            ) == PackageManager.PERMISSION_GRANTED
+                                            if (granted) {
+                                                incomingOffer = null
+                                                manager.answerTakeover(
+                                                    current,
+                                                    presentation.offer.offerId,
+                                                )
+                                            } else {
+                                                micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                                            }
+                                        },
+                                        onDecline = {
+                                            dismissedOffers += presentation.offer.offerId
+                                            incomingOffer = null
+                                        },
+                                    )
+                                }
+                                RootPresentation.Main, RootPresentation.Pairing -> Unit
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FullScreenOverlay(content: @Composable () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+        content()
     }
 }
