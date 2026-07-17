@@ -10,6 +10,7 @@ final class AppModel: ObservableObject {
     @Published var callState: CallState = .idle
     @Published var incomingOffer: InboundOffer?
     @Published var lineStatusLabel = L10n.text("line.status.checking")
+    @Published var pairingError: String?
     @Published var lineReady = false
     @Published private(set) var speakerphoneEnabled = false
     @Published private(set) var messageInbox: MessageInboxModel?
@@ -68,6 +69,7 @@ final class AppModel: ObservableObject {
     // MARK: - 配对
 
     func pair(code: String, gatewayURL: String, displayName: String) async {
+        pairingError = nil
         do {
             let c = try HostedCloudClient(baseURL: gatewayURL)
             let result = try await c.claimPairing(code: code, displayName: displayName)
@@ -79,9 +81,9 @@ final class AppModel: ObservableObject {
             pairing = stored
             rebuildClient()
         } catch let e as HostedCloudError {
-            lineStatusLabel = "配对失败:\(e.message)"
+            pairingError = PairingErrorCopy.message(code: e.code)
         } catch {
-            lineStatusLabel = "配对失败:\(error.localizedDescription)"
+            pairingError = PairingErrorCopy.message(code: "TRANSPORT_ERROR")
         }
     }
 
@@ -185,7 +187,7 @@ final class AppModel: ObservableObject {
     func answerTakeover(_ offer: InboundOffer) async {
         guard let c = client, callState == .idle else { return }
         incomingOffer = nil
-        let label = "来电接管"
+        let label = L10n.text("call.takeover.label")
         let waitingState = CallState.waitingMedia(label: label)
         let attempt = beginCallAttempt(with: waitingState)
         media = CallMediaSession(onState: { [weak self] st in
@@ -201,7 +203,7 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             let failedState = CallState.failed(
                 label: label,
-                reason: "接管媒体建立超时",
+                reason: L10n.text("call.takeover.timeout"),
                 code: "TAKEOVER_MEDIA_TIMEOUT"
             )
             guard self.apply(failedState, for: attempt, from: waitingState) else { return }

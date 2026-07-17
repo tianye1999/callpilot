@@ -20,6 +20,55 @@
 
 "content.error.unauthorized" = "设备授权已失效，请重新配对。";
 
+"pair.title" = "配对 CallPilot";
+"pair.subtitle" = "输入电脑端 CallPilot 生成的配对码。";
+"pair.code_placeholder" = "配对码（如 ABCD-EFGH）";
+"pair.gateway_placeholder" = "网关地址";
+"pair.device_name_placeholder" = "设备名";
+"pair.action" = "配对";
+"pair.action.busy" = "正在配对…";
+"pair.error.invalid_code" = "配对码无效或已过期，请在电脑端重新生成。";
+"pair.error.device_limit" = "已达到配对设备上限，请先在电脑端撤销一台旧设备。";
+"pair.error.rate_limited" = "配对尝试过于频繁，请稍后再试。";
+"pair.error.bad_gateway" = "请输入有效的 HTTPS 网关地址。";
+"pair.error.unavailable" = "暂时无法配对，请重试。";
+
+"dial.accessibility.call" = "拨打";
+"dial.accessibility.delete" = "删除一位";
+
+"incoming.title" = "来电转接";
+"incoming.description" = "AI 正在处理一通需要你本人接听的来电。接听后将在这台 iPhone 上继续通话。";
+"incoming.decline" = "拒绝";
+"incoming.answer" = "接听";
+"incoming.decline_footer" = "拒绝后，AI 会继续处理这通电话。";
+
+"call.remote_sim_notice" = "正在通过远端 SIM 通话";
+"call.return_to_dialer" = "返回拨号";
+"call.keypad.show" = "显示键盘";
+"call.keypad.hide" = "隐藏键盘";
+"call.speaker.enable" = "打开扬声器";
+"call.speaker.disable" = "关闭扬声器";
+"call.hangup" = "挂断";
+"call.takeover.label" = "来电转接";
+"call.takeover.timeout" = "来电转接媒体建立超时";
+"call.state.preparing" = "%@ · 准备中";
+"call.state.waiting_media" = "%@ · 正在建立音频";
+"call.state.dialing" = "%@ · 正在拨号";
+"call.state.in_call" = "%@ · 通话中";
+"call.state.ended" = "%@ · 通话已结束";
+"call.state.failed" = "%@ · %@";
+"call.state.idle" = "空闲";
+"call.error.edge_offline" = "电脑端已离线。";
+"call.error.modem_offline" = "通信模组已离线，请检查 USB 连接。";
+"call.error.sim_not_ready" = "SIM 卡尚未就绪。";
+"call.error.sim_not_registered" = "SIM 卡尚未注册到移动网络。";
+"call.error.service_number_mismatch" = "当前 SIM 与该运营商客服号码不匹配。";
+"call.error.line_busy" = "远程线路正在使用中。";
+"call.error.rate_limited" = "已达到拨号限额，请稍后再试。";
+"call.error.timeout" = "连接超时。";
+"call.error.offer_unavailable" = "这次来电转接已失效。";
+"call.error.generic" = "未能完成这通电话。";
+
 "messages.loading" = "正在同步短信…";
 "messages.empty" = "暂无短信";
 "messages.load_failed" = "无法载入短信";
@@ -138,6 +187,9 @@
 "settings.privacy.section" = "隐私";
 "settings.privacy.relay" = "短信和通话内容仅在请求时经云端瞬时转发，不写入云端内容存储。当前版本尚未端到端加密，云端处理期间会短暂接触明文。";
 "settings.privacy.local" = "本机缓存受 iOS 数据保护。解除配对、检测到授权撤销或手动清除时，会删除本机短信、通话详情和未读进度。";
+"settings.legal.privacy_policy" = "隐私政策";
+"settings.legal.terms" = "用户协议";
+"settings.legal.support" = "帮助与支持";
 "settings.unpair.action" = "解除配对";
 "settings.unpair.confirm_title" = "解除与电脑端的配对？";
 "settings.unpair.confirm_message" = "解除后将清除本机内容，需要重新输入配对码才能使用远程线路。";

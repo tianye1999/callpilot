@@ -37,7 +37,7 @@ struct DialView: View {
                         .foregroundStyle(.white)
                 }
                 .disabled(!model.lineReady || number.isEmpty)
-                .accessibilityLabel("拨打")
+                .accessibilityLabel(L10n.text("dial.accessibility.call"))
 
                 Button { number.removeLast() } label: {
                     Image(systemName: "delete.left").font(.title2)
@@ -45,7 +45,7 @@ struct DialView: View {
                 }
                 .opacity(number.isEmpty ? 0 : 1)
                 .disabled(number.isEmpty)
-                .accessibilityLabel("删除")
+                .accessibilityLabel(L10n.text("dial.accessibility.delete"))
             }
             Spacer()
         }

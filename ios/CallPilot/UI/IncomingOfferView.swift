@@ -11,8 +11,8 @@ struct IncomingOfferView: View {
             Spacer()
             Image(systemName: "phone.arrow.up.right.fill")
                 .font(.system(size: 56)).foregroundStyle(.green)
-            Text("来电转接请求").font(.largeTitle).bold()
-            Text("AI 正在接听一通来电,判断需要你本人处理。\n接听后通话将转到这台手机。")
+            Text(L10n.text("incoming.title")).font(.largeTitle).bold()
+            Text(L10n.text("incoming.description"))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
             Spacer()
@@ -20,7 +20,7 @@ struct IncomingOfferView: View {
                 Button {
                     model.dismissOffer(offer)
                 } label: {
-                    Label("拒绝", systemImage: "phone.down.fill")
+                    Label(L10n.text("incoming.decline"), systemImage: "phone.down.fill")
                         .frame(maxWidth: .infinity, minHeight: 60)
                 }
                 .buttonStyle(.borderedProminent).tint(.red)
@@ -28,12 +28,12 @@ struct IncomingOfferView: View {
                 Button {
                     Task { await model.answerTakeover(offer) }
                 } label: {
-                    Label("接听", systemImage: "phone.fill")
+                    Label(L10n.text("incoming.answer"), systemImage: "phone.fill")
                         .frame(maxWidth: .infinity, minHeight: 60)
                 }
                 .buttonStyle(.borderedProminent).tint(.green)
             }
-            Text("拒绝后 AI 会继续处理这通电话。")
+            Text(L10n.text("incoming.decline_footer"))
                 .font(.footnote).foregroundStyle(.secondary)
         }
         .padding(28)

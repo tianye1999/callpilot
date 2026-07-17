@@ -1,2 +1,2 @@
-"NSCameraUsageDescription" = "Camera access supports optional video calling. CallPilot asks before using the camera.";
+"NSCameraUsageDescription" = "CallPilot does not use camera capture in this version. The bundled communication framework includes camera support.";
 "NSMicrophoneUsageDescription" = "CallPilot uses the microphone to transmit your voice during calls through your remote SIM.";

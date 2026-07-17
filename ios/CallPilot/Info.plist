@@ -26,7 +26,7 @@
 	<true/>
 	<!-- LiveKit links camera APIs for optional video media; current app remains audio-first. -->
 	<key>NSCameraUsageDescription</key>
-	<string>Camera access supports optional video calling. CallPilot asks before using the camera.</string>
+	<string>CallPilot does not use camera capture in this version. The bundled communication framework includes camera support.</string>
 	<!-- 麦克风:远程通话经 LiveKit 采集本机麦克风(对齐 Android RECORD_AUDIO) -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>CallPilot uses the microphone to transmit your voice during calls through your remote SIM.</string>

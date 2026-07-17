@@ -11,21 +11,21 @@ struct PairView: View {
 
     var body: some View {
         VStack(spacing: 20) {
-            Text("配对 CallPilot")
+            Text(L10n.text("pair.title"))
                 .font(.largeTitle).bold()
-            Text("在电脑端 CallPilot 生成配对码后输入。")
+            Text(L10n.text("pair.subtitle"))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
-            TextField("配对码(如 ABCD-EFGH)", text: $code)
+            TextField(L10n.text("pair.code_placeholder"), text: $code)
                 .textFieldStyle(.roundedBorder)
                 .textInputAutocapitalization(.characters)
                 .autocorrectionDisabled()
-            TextField("网关地址", text: $gateway)
+            TextField(L10n.text("pair.gateway_placeholder"), text: $gateway)
                 .textFieldStyle(.roundedBorder)
                 .keyboardType(.URL)
                 .autocorrectionDisabled()
-            TextField("设备名", text: $displayName)
+            TextField(L10n.text("pair.device_name_placeholder"), text: $displayName)
                 .textFieldStyle(.roundedBorder)
 
             Button {
@@ -34,15 +34,22 @@ struct PairView: View {
                                         gatewayURL: gateway, displayName: displayName)
                     busy = false }
             } label: {
-                Text(busy ? "配对中…" : "配对").frame(maxWidth: .infinity)
+                Text(L10n.text(busy ? "pair.action.busy" : "pair.action"))
+                    .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .disabled(busy || code.isEmpty)
 
-            if !model.lineStatusLabel.hasPrefix("线路") {
-                Text(model.lineStatusLabel).font(.footnote).foregroundStyle(.red)
+            if let error = model.pairingError {
+                Text(error).font(.footnote).foregroundStyle(.red)
             }
             Spacer()
+            HStack(spacing: 20) {
+                Link(L10n.text("settings.legal.privacy_policy"), destination: AppLinks.privacyPolicy)
+                Link(L10n.text("settings.legal.terms"), destination: AppLinks.terms)
+                Link(L10n.text("settings.legal.support"), destination: AppLinks.support)
+            }
+            .font(.footnote)
         }
         .padding(28)
     }

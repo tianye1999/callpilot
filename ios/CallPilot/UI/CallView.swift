@@ -13,12 +13,14 @@ struct CallView: View {
             Spacer()
             Text(statusText).font(.title2).bold()
             if !model.callState.isTerminal {
-                Text("正在通过远端 SIM 通话").font(.footnote).foregroundStyle(.secondary)
+                Text(L10n.text("call.remote_sim_notice"))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
             Spacer()
 
             if model.callState.isTerminal {
-                Button("返回拨号") {
+                Button(L10n.text("call.return_to_dialer")) {
                     model.dismissCallResult()
                 }
                 .buttonStyle(.borderedProminent)
@@ -38,7 +40,9 @@ struct CallView: View {
                         Image(systemName: "circle.grid.3x3.fill").font(.title2)
                             .frame(width: 48, height: 48)
                     }
-                    .accessibilityLabel(showKeypad ? "隐藏键盘" : "显示键盘")
+                    .accessibilityLabel(
+                        L10n.text(showKeypad ? "call.keypad.hide" : "call.keypad.show")
+                    )
 
                     Button {
                         model.setSpeakerphone(!model.speakerphoneEnabled)
@@ -48,14 +52,20 @@ struct CallView: View {
                             .frame(width: 48, height: 48)
                             .foregroundStyle(model.speakerphoneEnabled ? .blue : .primary)
                     }
-                    .accessibilityLabel(model.speakerphoneEnabled ? "关闭扬声器" : "打开扬声器")
+                    .accessibilityLabel(
+                        L10n.text(
+                            model.speakerphoneEnabled
+                                ? "call.speaker.disable"
+                                : "call.speaker.enable"
+                        )
+                    )
 
                     Button { model.hangup() } label: {
                         Image(systemName: "phone.down.fill").font(.title)
                             .frame(width: 72, height: 72)
                             .background(.red, in: Circle()).foregroundStyle(.white)
                     }
-                    .accessibilityLabel("挂断")
+                    .accessibilityLabel(L10n.text("call.hangup"))
                 }
             }
             Spacer()
@@ -65,13 +75,14 @@ struct CallView: View {
 
     private var statusText: String {
         switch model.callState {
-        case .preparing(let l): return "\(l) · 准备中"
-        case .waitingMedia(let l): return "\(l) · 建立媒体中"
-        case .dialing(let n): return "\(n) · 拨号中"
-        case .inCall(let l): return "\(l) · 通话中"
-        case .ended(let l, let r): return "\(l) · 已结束(\(r))"
-        case .failed(let l, let r, _): return "\(l) · 失败:\(r)"
-        case .idle: return "空闲"
+        case .preparing(let label): return L10n.format("call.state.preparing", label)
+        case .waitingMedia(let label): return L10n.format("call.state.waiting_media", label)
+        case .dialing(let number): return L10n.format("call.state.dialing", number)
+        case .inCall(let label): return L10n.format("call.state.in_call", label)
+        case .ended(let label, _): return L10n.format("call.state.ended", label)
+        case .failed(let label, _, let code):
+            return L10n.format("call.state.failed", label, CallFailureCopy.message(code: code))
+        case .idle: return L10n.text("call.state.idle")
         }
     }
 }

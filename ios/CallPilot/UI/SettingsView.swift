@@ -54,6 +54,24 @@ struct SettingsView: View {
             Section(L10n.text("settings.privacy.section")) {
                 Text(L10n.text("settings.privacy.relay"))
                 Text(L10n.text("settings.privacy.local"))
+                Link(destination: AppLinks.privacyPolicy) {
+                    Label(
+                        L10n.text("settings.legal.privacy_policy"),
+                        systemImage: "hand.raised"
+                    )
+                }
+                Link(destination: AppLinks.terms) {
+                    Label(
+                        L10n.text("settings.legal.terms"),
+                        systemImage: "doc.text"
+                    )
+                }
+                Link(destination: AppLinks.support) {
+                    Label(
+                        L10n.text("settings.legal.support"),
+                        systemImage: "questionmark.circle"
+                    )
+                }
             }
 
             Section {
