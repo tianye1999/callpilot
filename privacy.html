@@ -1,96 +1,124 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>隐私政策 · CallPilot</title>
+<title>Privacy Policy · CallPilot</title>
+<meta name="description" content="CallPilot privacy policy in English and Simplified Chinese.">
 <style>
-  :root { --blue:#2E5CE6; --ink:#16181d; --muted:#5b6472; --bg:#fbfbfe; --card:#ffffff; --line:#e6e9f2; }
-  @media (prefers-color-scheme: dark) {
-    :root { --ink:#eceef3; --muted:#9aa3b2; --bg:#121319; --card:#1a1c24; --line:#2a2e3a; }
-  }
-  * { box-sizing:border-box; margin:0; padding:0; }
-  body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); line-height:1.75; }
-  .wrap { max-width:760px; margin:0 auto; padding:48px 24px 96px; }
-  nav a { color:var(--blue); text-decoration:none; font-size:14px; }
-  h1 { font-size:28px; margin:24px 0 4px; }
-  .meta { color:var(--muted); font-size:14px; margin-bottom:32px; }
-  h2 { font-size:19px; margin:36px 0 12px; padding-top:12px; border-top:1px solid var(--line); }
-  p, li { color:var(--ink); font-size:15.5px; }
-  ul { padding-left:1.4em; margin:8px 0; }
-  .note { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--blue); border-radius:8px; padding:14px 16px; margin:16px 0; font-size:14.5px; }
-  .muted { color:var(--muted); }
-  table { width:100%; border-collapse:collapse; margin:12px 0; font-size:14.5px; }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th { color:var(--muted); font-weight:600; }
+  :root { --blue:#2E5CE6; --ink:#16181d; --muted:#5b6472; --bg:#fbfbfe; --card:#fff; --line:#e6e9f2; }
+  @media (prefers-color-scheme:dark) { :root { --ink:#eceef3; --muted:#a5adba; --bg:#121319; --card:#1a1c24; --line:#2a2e3a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; background:var(--bg); color:var(--ink); line-height:1.7; }
+  main { max-width:800px; margin:0 auto; padding:40px 24px 96px; }
+  nav { display:flex; justify-content:space-between; gap:20px; font-size:14px; }
+  a { color:var(--blue); text-decoration:none; }
+  h1 { font-size:30px; line-height:1.25; margin:28px 0 4px; }
+  h2 { font-size:19px; margin:34px 0 10px; padding-top:10px; border-top:1px solid var(--line); }
+  p, li, td, th { font-size:15px; }
+  ul { padding-left:1.35em; }
+  .meta, .muted { color:var(--muted); }
+  .meta { margin:0 0 28px; font-size:14px; }
+  .notice { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--blue); border-radius:8px; padding:14px 16px; margin:18px 0; }
+  table { width:100%; border-collapse:collapse; margin:14px 0; }
+  th, td { text-align:left; vertical-align:top; padding:9px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); }
+  .translation { margin-top:80px; scroll-margin-top:20px; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <nav><a href="./index.html">← CallPilot 首页</a></nav>
-  <h1>隐私政策</h1>
-  <p class="meta">生效日期:2026-07-17 · 适用于 CallPilot 移动应用(iOS/Android)、桌面端与配套云服务(Beta)</p>
+<main id="top">
+  <nav><a href="./index.html">CallPilot home</a><a href="#zh">中文版本</a></nav>
+  <h1>Privacy Policy</h1>
+  <p class="meta">Effective July 17, 2026 · CallPilot mobile apps, Edge desktop software, and supporting cloud services</p>
 
-  <div class="note">
-    <strong>一句话摘要:</strong>你的通话音频、短信正文与 AI 对话记录保存在<strong>你自己的电脑(Edge)上</strong>。云服务只做配对、指令转发与内容的<strong>瞬时中转</strong>,不存储上述内容。
-  </div>
+  <div class="notice"><strong>Summary.</strong> CallPilot keeps SMS content, call history, AI transcripts, summaries, and optional recordings on the computer running your Edge. Our control plane routes requests and media but does not retain message bodies, transcripts, recordings, or call audio.</div>
 
-  <h2>1. 我们是谁</h2>
-  <p>CallPilot 由 Azores Labs(下称"我们")开发,是一款把你的实体 SIM 通话能力(经连接在你电脑上的通信模组)桥接到手机 App 的个人通信工具,并提供 AI 代接/代拨能力。</p>
+  <h2>1. Who operates CallPilot</h2>
+  <p>CallPilot is developed by Azores Labs ("we" or "us"). It connects a SIM card in a supported modem attached to your computer with the CallPilot mobile app and optional AI calling features. Questions can be sent to <a href="mailto:support@bondings.ai">support@bondings.ai</a>.</p>
 
-  <h2>2. 数据在哪里、存多久</h2>
+  <h2>2. Data and storage locations</h2>
   <table>
-    <tr><th>数据</th><th>存放位置</th><th>说明</th></tr>
-    <tr><td>通话录音、AI 对话转写、通话摘要</td><td><strong>仅你的电脑(Edge)本地</strong></td><td>默认保留 30 天,可在设置中更改或删除;不上传云端存储</td></tr>
-    <tr><td>短信正文</td><td><strong>仅你的电脑(Edge)本地</strong></td><td>保留最近记录;不上传云端存储</td></tr>
-    <tr><td>手机 App 内容缓存</td><td>你的手机本地</td><td>受系统数据保护(iOS Data Protection / Android 加密存储),不进 iCloud/云备份;解除配对即抹除</td></tr>
-    <tr><td>配对与设备凭证、设备在线状态、审计元数据</td><td>云服务(Cloudflare)</td><td>仅为路由与安全所需的最小元数据;审计记录不含任何内容正文</td></tr>
-    <tr><td>通话/短信内容经云中转</td><td><strong>不存储</strong></td><td>见第 3 条"瞬时中转"</td></tr>
+    <tr><th>Data</th><th>Where it is handled</th><th>Retention</th></tr>
+    <tr><td>SMS, call history, AI transcript, summary</td><td>Your Edge computer</td><td>Until you delete it or the configured local retention policy removes it</td></tr>
+    <tr><td>Call recording</td><td>Your Edge computer</td><td>Recording is off by default. When enabled, the default local retention period is 30 days</td></tr>
+    <tr><td>Mobile content cache</td><td>Your iPhone or Android device</td><td>Protected locally and cleared when you unpair, clear content, or authorization is revoked. iOS cache files are excluded from iCloud backup; Android stores encrypted content whose key is not exportable from Android Keystore</td></tr>
+    <tr><td>Device and routing metadata</td><td>Our Cloudflare-based control plane</td><td>Device identifiers, credential hashes, online state, opaque call/session state, and security audit events are retained as needed to operate and secure the beta service</td></tr>
+    <tr><td>Media and requested content in transit</td><td>Cloud relay and LiveKit media infrastructure</td><td>Processed only to complete the live request; content is not written to our content database or application logs</td></tr>
   </table>
 
-  <h2>3. 云服务的"瞬时中转"承诺与边界</h2>
-  <p>当你在手机上查看短信、通话记录或进行远程通话时,内容需经我们的云服务在你的手机与你的电脑之间转发。我们承诺:</p>
-  <ul>
-    <li>内容<strong>不写入</strong>云端数据库、对象存储、缓存、日志或监控指标;</li>
-    <li>请求完成或超时后,内容即被丢弃;</li>
-    <li>设备授权被撤销后,进行中的请求结果也不会再投递。</li>
-  </ul>
-  <div class="note muted"><strong>如实说明:</strong>当前版本尚未实现内容级端到端加密。转发过程中,内容以 TLS 加密传输,并会在云服务进程内存中<strong>短暂以明文形式处理</strong>。若你对此敏感,可暂不启用内容同步功能(其为服务端逐设备授权的可选能力)。</div>
+  <h2>3. Cloud relay boundary</h2>
+  <p>When the app displays an SMS or call record, the requested content travels from your Edge through our control plane to your phone over TLS. It is held in memory only while servicing that request and is discarded on completion, timeout, or authorization failure. The current content relay is not end-to-end encrypted at the application layer, so the relay process can briefly access plaintext while forwarding it.</p>
+  <p>Live voice is routed through LiveKit infrastructure. We do not enable cloud recording or egress for ordinary CallPilot calls. Infrastructure providers may process network information such as IP address and connection diagnostics to deliver and secure their services.</p>
 
-  <h2>4. 我们收集哪些信息</h2>
+  <h2>4. Microphone, AI, and third parties</h2>
   <ul>
-    <li><strong>麦克风</strong>:仅在你发起或接管通话时采集,用于将你的语音传输至通话对方;不用于其他目的。</li>
-    <li><strong>通话与短信内容</strong>:由你的电脑上的模组产生,按第 2 条存放于你本地。</li>
-    <li><strong>账户与设备信息</strong>:配对码、设备标识、Edge 标识等技术性标识,用于建立与保护你的设备间连接。</li>
-    <li>我们<strong>不</strong>收集通讯录、位置信息,不做广告追踪,不向第三方出售任何数据。</li>
+    <li>The mobile app uses the microphone only while you place, answer, or take over a call.</li>
+    <li>AI calls use the model provider configured on your Edge, such as OpenAI or Alibaba Cloud Model Studio. Audio or text sent to that provider is governed by your account and the provider's terms.</li>
+    <li>We do not use advertising SDKs, sell personal data, build advertising profiles, or track you across apps and websites.</li>
+    <li>CallPilot does not request your contacts or location.</li>
   </ul>
 
-  <h2>5. AI 功能披露</h2>
+  <h2>5. Recording and AI disclosure</h2>
+  <p>Recording is disabled by default. Laws governing call recording, automated calling, and synthetic voices vary by location. You are responsible for obtaining any required consent and for providing required disclosure that a participant is an AI. CallPilot is not an emergency calling service.</p>
+
+  <h2>6. Your choices</h2>
   <ul>
-    <li>CallPilot 的 AI 可代你接听或拨打电话。AI 生成的语音属于<strong>合成内容</strong>。</li>
-    <li>你应遵守所在地区关于自动拨号、通话录音与 AI 合成内容的法律法规(包括录音须告知对方、AI 合成内容标识等要求;中国大陆用户请注意《人工智能生成合成内容标识办法》等规定)。</li>
-    <li>AI 对话内容会调用你自行配置的大模型服务(如阿里云通义等)。该部分数据处理同时受你与相应模型服务商之间协议的约束。</li>
+    <li>Clear cached messages and call details from Settings on the mobile device.</li>
+    <li>Unpair a phone, which revokes its access and clears its protected local content cache.</li>
+    <li>Revoke a lost device from the Edge. An offline device cannot be remotely erased; it clears protected content after reconnecting and receiving the revocation.</li>
+    <li>Delete local call records from the Edge and disable recording or content synchronization.</li>
+    <li>Request deletion of cloud device and audit metadata by contacting support.</li>
   </ul>
 
-  <h2>6. 通话录音合规提醒</h2>
-  <p>录音功能默认仅存储于你的电脑本地,但<strong>是否合法录音取决于你所在司法辖区</strong>(部分地区要求通话双方同意)。你是录音行为的责任主体,请在使用前了解并遵守当地法律。</p>
+  <h2>7. Security and children</h2>
+  <p>Credentials are stored in iOS Keychain or Android Keystore-backed encrypted storage. Connections use TLS, content access is separately authorized, and credentials can be revoked. No system is perfectly secure. CallPilot is intended for adults and is not directed to children under 16.</p>
 
-  <h2>7. 你的控制权</h2>
-  <ul>
-    <li>手机 App:设置中可随时<strong>清除本机缓存</strong>或<strong>解除配对</strong>(自动抹除手机上的全部内容缓存);</li>
-    <li>电脑端:可删除任意或全部通话记录/短信数据,可关闭录音、摘要等功能;</li>
-    <li>设备被撤销授权后,将立即失去内容访问能力。</li>
-  </ul>
+  <h2>8. Changes</h2>
+  <p>We will update this page and its effective date when our practices change. Material changes will be communicated in the app or release notes where appropriate.</p>
 
-  <h2>8. 数据安全</h2>
-  <p>设备凭证以密文存储(iOS Keychain / Android EncryptedSharedPreferences);云通道全程 TLS;内容同步为服务端逐设备显式授权 + 双端功能开关,默认关闭;云端对读取行为仅记录不含正文的审计元数据。</p>
+  <section id="zh" class="translation" lang="zh-CN">
+    <nav><a href="./index.html">CallPilot 首页</a><a href="#top">English</a></nav>
+    <h1>隐私政策</h1>
+    <p class="meta">生效日期:2026 年 7 月 17 日 · 适用于 CallPilot 移动 App、Edge 桌面端及配套云服务</p>
 
-  <h2>9. 未成年人</h2>
-  <p>本产品面向成年人,不面向 16 岁以下未成年人提供服务。</p>
+    <div class="notice"><strong>摘要:</strong>短信正文、通话记录、AI 转写与摘要、可选录音保存在运行 Edge 的电脑上。云控制面负责路由请求和媒体,不留存短信正文、转写、录音或通话音频。</div>
 
-  <h2>10. 政策变更与联系我们</h2>
-  <p>政策更新将在本页发布并更新生效日期。任何隐私相关问题,请联系:<strong>support@bondings.ai</strong></p>
-  <p class="muted" style="margin-top:24px;font-size:13px">Beta 阶段说明:本产品处于测试阶段,功能与本政策可能随版本演进调整;重大变更会显著提示。</p>
-</div>
+    <h2>1. 运营主体</h2>
+    <p>CallPilot 由 Azores Labs 开发。产品把连接在电脑通信模组中的 SIM 与手机 App、可选 AI 通话能力连接起来。隐私问题请联系 <a href="mailto:support@bondings.ai">support@bondings.ai</a>。</p>
+
+    <h2>2. 数据与存储位置</h2>
+    <ul>
+      <li>短信、通话记录、AI 转写与摘要保存在你的 Edge 电脑上,直至你删除或本地保留策略清理。</li>
+      <li>录音默认关闭;启用后只保存在 Edge,默认保留 30 天。</li>
+      <li>手机缓存受系统数据保护;解除配对、清除内容或授权撤销时删除。iOS 缓存文件排除 iCloud 备份;Android 内容以 Android Keystore 中不可导出的密钥加密。</li>
+      <li>云端保留运行与安全所需的设备标识、凭证哈希、在线状态、不透明会话状态与审计元数据,不保存内容正文。</li>
+    </ul>
+
+    <h2>3. 云中转边界</h2>
+    <p>手机读取短信或通话记录时,内容经 TLS 从 Edge 通过控制面转发,只在完成请求所需的时间内存于内存,完成、超时或鉴权失败即丢弃。当前内容链路尚未实现应用层端到端加密,中转进程在转发时会短暂接触明文。实时语音经 LiveKit 基础设施路由,普通通话不启用云录制。</p>
+
+    <h2>4. 麦克风、AI 与第三方</h2>
+    <ul>
+      <li>手机 App 只在你拨打、接听或接管通话时使用麦克风。</li>
+      <li>AI 通话使用你在 Edge 配置的模型服务商,例如 OpenAI 或阿里云百炼;发送给服务商的音频或文本受你的账号及服务商条款约束。</li>
+      <li>我们不接入广告 SDK,不出售个人数据,不跨 App 跟踪,不请求通讯录或位置权限。</li>
+    </ul>
+
+    <h2>5. 录音与 AI 披露</h2>
+    <p>录音默认关闭。不同地区对通话录音、自动拨号与合成语音有不同规定;你负责取得必要同意并依法披露 AI 身份。CallPilot 不能用于紧急呼叫。</p>
+
+    <h2>6. 你的选择</h2>
+    <ul>
+      <li>在手机设置中清除短信和通话详情缓存或解除配对。</li>
+      <li>在 Edge 撤销遗失设备。离线设备无法远程抹除,再次联网并收到授权失效后才会清除受保护缓存。</li>
+      <li>在 Edge 删除本地通话记录,关闭录音或内容同步。</li>
+      <li>联系支持请求删除云端设备与审计元数据。</li>
+    </ul>
+
+    <h2>7. 安全、未成年人及变更</h2>
+    <p>凭证存放在 iOS Keychain 或 Android Keystore 支持的加密存储中;连接使用 TLS,内容读取需独立授权,凭证可撤销。本产品面向成年人,不面向 16 岁以下未成年人。实践发生变化时,我们会更新本页及生效日期。</p>
+  </section>
+</main>
 </body>
 </html>

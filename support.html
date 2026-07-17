@@ -1,50 +1,77 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>支持与反馈 · CallPilot</title>
+<title>Support · CallPilot</title>
+<meta name="description" content="CallPilot support, troubleshooting, and security contact.">
 <style>
-  :root { --blue:#2E5CE6; --ink:#16181d; --muted:#5b6472; --bg:#fbfbfe; --card:#ffffff; --line:#e6e9f2; }
-  @media (prefers-color-scheme: dark) { :root { --ink:#eceef3; --muted:#9aa3b2; --bg:#121319; --card:#1a1c24; --line:#2a2e3a; } }
-  * { box-sizing:border-box; margin:0; padding:0; }
-  body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); line-height:1.75; }
-  .wrap { max-width:760px; margin:0 auto; padding:48px 24px 96px; }
-  nav a { color:var(--blue); text-decoration:none; font-size:14px; }
-  h1 { font-size:28px; margin:24px 0 4px; }
-  .meta { color:var(--muted); font-size:14px; margin-bottom:28px; }
-  h2 { font-size:19px; margin:32px 0 10px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin:12px 0; }
-  .card h3 { font-size:15.5px; margin-bottom:6px; }
-  .card p { font-size:14.5px; color:var(--muted); }
-  a.mail { color:var(--blue); text-decoration:none; font-weight:600; }
+  :root { --blue:#2E5CE6; --ink:#16181d; --muted:#5b6472; --bg:#fbfbfe; --card:#fff; --line:#e6e9f2; }
+  @media (prefers-color-scheme:dark) { :root { --ink:#eceef3; --muted:#a5adba; --bg:#121319; --card:#1a1c24; --line:#2a2e3a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; background:var(--bg); color:var(--ink); line-height:1.65; }
+  main { max-width:800px; margin:0 auto; padding:40px 24px 96px; }
+  nav { display:flex; justify-content:space-between; gap:20px; font-size:14px; }
+  a { color:var(--blue); text-decoration:none; }
+  h1 { font-size:30px; line-height:1.25; margin:28px 0 4px; }
+  h2 { font-size:20px; margin:34px 0 12px; }
+  .meta { color:var(--muted); margin:0 0 24px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:17px 19px; margin:12px 0; }
+  .card h3 { font-size:16px; margin:0 0 6px; }
+  .card p { color:var(--muted); font-size:14.5px; margin:0; }
+  .translation { margin-top:80px; padding-top:20px; border-top:1px solid var(--line); scroll-margin-top:20px; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <nav><a href="./index.html">← CallPilot 首页</a></nav>
-  <h1>支持与反馈</h1>
-  <p class="meta">Beta 内测期间,我们会认真读每一封邮件。</p>
+<main id="top">
+  <nav><a href="./index.html">CallPilot home</a><a href="#zh">中文版本</a></nav>
+  <h1>Support</h1>
+  <p class="meta">Help with setup, calls, messages, privacy, and beta access.</p>
 
-  <h2>联系我们</h2>
+  <h2>Contact</h2>
   <div class="card">
-    <h3>📮 support@bondings.ai</h3>
-    <p>问题反馈、功能建议、内测申请、隐私与安全事项,均可来信。请附上 App 版本号(设置页可见)与问题发生的大致时间,便于我们排查。</p>
+    <h3><a href="mailto:support@bondings.ai">support@bondings.ai</a></h3>
+    <p>Include the CallPilot version, your phone model and OS version, the approximate time of the problem, and any stable error code shown by the app. Never email API keys, Edge credentials, pairing codes, SMS contents, or call recordings.</p>
   </div>
   <div class="card">
-    <h3>🐙 GitHub Issues</h3>
-    <p>开发者可直接在 <a class="mail" href="https://github.com/tianye1999/callpilot/issues">github.com/tianye1999/callpilot/issues</a> 提交问题报告。</p>
+    <h3><a href="https://github.com/tianye1999/callpilot/issues">Public issue tracker</a></h3>
+    <p>Use GitHub for reproducible software defects that contain no private call, message, credential, or account information.</p>
   </div>
 
-  <h2>常见问题</h2>
-  <div class="card"><h3>手机上短信/记录显示"无法更新"?</h3><p>先确认电脑端 CallPilot 正在运行且显示"线路就绪";再确认手机网络正常后下拉刷新。内容同步为逐设备授权能力,若显示"尚未启用"请联系我们。</p></div>
-  <div class="card"><h3>拨号提示线路离线?</h3><p>检查电脑端通信模组是否插好(掉电重插后需等待约 30 秒重新注册网络)、电脑端应用是否在运行。</p></div>
-  <div class="card"><h3>对方声音小或听不清?</h3><p>0.7.0 起已内置下行增益修正。若仍偏小,请在通话中切换听筒/扬声器对比后反馈给我们。</p></div>
-  <div class="card"><h3>SIM 卡收到"语音功能被限制"短信?</h3><p>这是运营商风控(对高频呼出敏感)。请按运营商短信指引完成实人认证即可恢复;建议避免短时间内高频拨打同一号码。</p></div>
-  <div class="card"><h3>如何彻底删除我的数据?</h3><p>手机端:设置 → 清除本机内容 / 解除配对(自动抹除)。电脑端:数据均在本地目录,可在应用内删除记录或直接删除数据文件。云端本就不存储你的内容。</p></div>
+  <h2>Common questions</h2>
+  <div class="card"><h3>Why does the app ask for a pairing code?</h3><p>CallPilot does not use a shared account password. Generate a short-lived code from your own Edge computer, enter it once on the phone, and keep the Edge online. The code expires and cannot be reused.</p></div>
+  <div class="card"><h3>Messages or call records will not refresh</h3><p>Confirm the Edge is running, the modem is online, and the phone has network access. Pull to refresh. If authorization was revoked, pair again with a new code. Content access may be disabled separately from calling.</p></div>
+  <div class="card"><h3>A call says the line is offline or busy</h3><p>Reconnect the USB modem, wait for mobile network registration, and end any active AI or mobile call before trying again. CallPilot cannot place emergency calls.</p></div>
+  <div class="card"><h3>The other party or I cannot hear audio</h3><p>Check microphone permission, raise call volume, and compare receiver and speaker output. Keep the app in the foreground for the current beta incoming-call flow.</p></div>
+  <div class="card"><h3>The carrier restricted my SIM</h3><p>Follow the carrier's identity-verification instructions. Avoid repeated rapid test calls. CallPilot does not bypass carrier limits or anti-fraud controls.</p></div>
+  <div class="card"><h3>How do I remove local content?</h3><p>Use Settings to clear mobile content or unpair. Delete call records from the Edge. If a phone is lost, revoke it from the Edge; an offline phone clears protected content after it reconnects and receives the revocation.</p></div>
 
-  <h2>安全问题报告</h2>
-  <div class="card"><p>若你发现安全漏洞,请<strong>不要公开披露</strong>,发送细节至 <a class="mail" href="mailto:support@bondings.ai">support@bondings.ai</a>(标题注明 SECURITY)。我们承诺 48 小时内响应。</p></div>
-</div>
+  <h2>Security reports</h2>
+  <div class="card"><p>Email <a href="mailto:support@bondings.ai?subject=SECURITY%3A%20CallPilot">support@bondings.ai</a> with the subject beginning <strong>SECURITY</strong>. Do not disclose an unpatched vulnerability publicly. We aim to acknowledge complete reports within 48 hours.</p></div>
+
+  <p class="meta"><a href="./privacy.html">Privacy Policy</a> · <a href="./terms.html">Terms of Use</a></p>
+
+  <section id="zh" class="translation" lang="zh-CN">
+    <nav><a href="./index.html">CallPilot 首页</a><a href="#top">English</a></nav>
+    <h1>支持与反馈</h1>
+    <p class="meta">安装配置、通话、短信、隐私与内测支持。</p>
+
+    <h2>联系我们</h2>
+    <div class="card"><h3><a href="mailto:support@bondings.ai">support@bondings.ai</a></h3><p>请附 CallPilot 版本、手机型号与系统版本、问题发生的大致时间以及 App 显示的稳定错误码。不要通过邮件发送 API key、Edge 凭证、配对码、短信正文或通话录音。</p></div>
+    <div class="card"><h3><a href="https://github.com/tianye1999/callpilot/issues">公开问题追踪</a></h3><p>仅提交不含私人通话、短信、凭证或账号信息的可复现软件缺陷。</p></div>
+
+    <h2>常见问题</h2>
+    <div class="card"><h3>为什么需要配对码?</h3><p>CallPilot 不使用共享账号密码。请从自己的 Edge 电脑生成短期配对码,在手机输入一次并保持 Edge 在线。配对码会过期且不能重复使用。</p></div>
+    <div class="card"><h3>短信或通话记录无法刷新</h3><p>确认 Edge 正在运行、模组在线且手机网络正常,然后下拉刷新。授权已撤销时需要重新配对;内容读取也可能与通话能力分开关闭。</p></div>
+    <div class="card"><h3>拨号提示线路离线或占用</h3><p>重新连接 USB 模组,等待移动网络注册,并结束正在进行的 AI 或手机通话。CallPilot 不支持紧急呼叫。</p></div>
+    <div class="card"><h3>通话没有声音或音量小</h3><p>检查麦克风权限并提高通话音量,对比听筒与扬声器。当前 Beta 的来电接管需要 App 保持前台。</p></div>
+    <div class="card"><h3>SIM 被运营商限制</h3><p>请按运营商指引完成身份核验,避免短时间反复测试拨号。CallPilot 不绕过运营商限制或反诈风控。</p></div>
+    <div class="card"><h3>如何删除本地内容?</h3><p>在设置中清除手机内容或解除配对,并在 Edge 删除通话记录。手机遗失时从 Edge 撤销;离线手机再次联网并收到授权失效后才会清除受保护缓存。</p></div>
+
+    <h2>安全问题</h2>
+    <div class="card"><p>请发送邮件到 <a href="mailto:support@bondings.ai?subject=SECURITY%3A%20CallPilot">support@bondings.ai</a>,标题以 <strong>SECURITY</strong> 开头。修复前不要公开披露漏洞;完整报告会争取在 48 小时内确认。</p></div>
+    <p class="meta"><a href="./privacy.html#zh">隐私政策</a> · <a href="./terms.html#zh">用户协议</a></p>
+  </section>
+</main>
 </body>
 </html>
