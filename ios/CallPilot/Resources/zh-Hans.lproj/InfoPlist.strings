@@ -1,0 +1,2 @@
+"NSCameraUsageDescription" = "用于在您选择视频通话时传输画面。CallPilot 会在使用摄像头前征得您的许可。";
+"NSMicrophoneUsageDescription" = "用于在通过远端 SIM 的通话中传输您的语音。";

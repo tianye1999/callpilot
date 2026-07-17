@@ -3,6 +3,41 @@ import XCTest
 @testable import CallPilot
 
 final class LocalizationTests: XCTestCase {
+    func testCallMediaPrivacyPurposeStringsCoverCameraAndMicrophoneInBothLanguages() throws {
+        let root = repositoryRoot
+        let infoURL = root.appendingPathComponent("ios/CallPilot/Info.plist")
+        let info = try XCTUnwrap(
+            PropertyListSerialization.propertyList(
+                from: Data(contentsOf: infoURL),
+                options: [],
+                format: nil
+            ) as? [String: Any]
+        )
+
+        for key in ["NSCameraUsageDescription", "NSMicrophoneUsageDescription"] {
+            let fallback = try XCTUnwrap(info[key] as? String, "Missing Info.plist key \(key)")
+            XCTAssertFalse(fallback.isEmpty, "Empty Info.plist value for \(key)")
+
+            for language in ["zh-Hans", "en"] {
+                let url = root.appendingPathComponent(
+                    "ios/CallPilot/Resources/\(language).lproj/InfoPlist.strings"
+                )
+                let localized = try XCTUnwrap(
+                    PropertyListSerialization.propertyList(
+                        from: Data(contentsOf: url),
+                        options: [],
+                        format: nil
+                    ) as? [String: String]
+                )
+                let value = try XCTUnwrap(
+                    localized[key],
+                    "Missing \(language) purpose string for \(key)"
+                )
+                XCTAssertFalse(value.isEmpty, "Empty \(language) purpose string for \(key)")
+            }
+        }
+    }
+
     func testM3ThroughM6StringsHaveChineseAndEnglishCatalogValues() throws {
         let root = repositoryRoot
         let referencedKeys = try localizationKeys(in: localizationSourceURLs(root: root))

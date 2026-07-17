@@ -24,9 +24,12 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- LiveKit links camera APIs for optional video media; current app remains audio-first. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Camera access supports optional video calling. CallPilot asks before using the camera.</string>
 	<!-- 麦克风:远程通话经 LiveKit 采集本机麦克风(对齐 Android RECORD_AUDIO) -->
 	<key>NSMicrophoneUsageDescription</key>
-	<string>用于在通过远端 SIM 的通话中传输您的语音。</string>
+	<string>CallPilot uses the microphone to transmit your voice during calls through your remote SIM.</string>
 	<!-- 前台版无后台推送;Phase 2 才加 voip 后台模式 + PushKit -->
 	<key>UILaunchScreen</key>
 	<dict>
