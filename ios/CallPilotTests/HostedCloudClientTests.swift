@@ -134,7 +134,9 @@ final class HostedCloudClientTests: XCTestCase {
     }
 
     func testVoipTokenRegistrationUsesAuthenticatedMutationAndStableWireFields() async throws {
-        let token = String(repeating: "ab", count: 32)
+        // APNs says device-token length is variable; a non-32-byte token must
+        // remain valid as long as it is bounded, even-length hexadecimal.
+        let token = String(repeating: "ab", count: 40)
         var requestCount = 0
         let client = try makeClient { request in
             requestCount += 1

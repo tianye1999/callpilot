@@ -80,12 +80,24 @@ describe("protocol schema", () => {
       environment: "production"
     }).success).toBe(true);
     expect(registerVoipTokenSchema.safeParse({
+      token: "cd".repeat(40),
+      environment: "sandbox"
+    }).success).toBe(true);
+    expect(registerVoipTokenSchema.safeParse({
       token: "not-a-token",
       environment: "production"
     }).success).toBe(false);
     expect(registerVoipTokenSchema.safeParse({
       token: "ab".repeat(32),
       environment: "other"
+    }).success).toBe(false);
+    expect(registerVoipTokenSchema.safeParse({
+      token: "a".repeat(63),
+      environment: "sandbox"
+    }).success).toBe(false);
+    expect(registerVoipTokenSchema.safeParse({
+      token: "ab".repeat(257),
+      environment: "sandbox"
     }).success).toBe(false);
   });
 

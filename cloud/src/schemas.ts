@@ -84,6 +84,8 @@ export const claimInboundOfferSchema = z.object({
 }).strict();
 
 export const registerVoipTokenSchema = z.object({
-  token: z.string().regex(/^[A-Fa-f0-9]{64}$/),
+  // Apple explicitly treats device-token length as variable. Keep the wire
+  // value even-length hex while bounding it to 32...256 bytes.
+  token: z.string().regex(/^(?:[A-Fa-f0-9]{2}){32,256}$/),
   environment: z.enum(["sandbox", "production"])
 }).strict();

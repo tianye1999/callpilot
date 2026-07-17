@@ -80,7 +80,9 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     // MARK: - PushKit token
 
     func registerVoipToken(_ token: String, environment: ApnsEnvironment) async throws {
-        guard token.wholeMatch(of: /^[A-Fa-f0-9]{64}$/) != nil else {
+        // APNs device-token size is not a stable API contract. Validate an
+        // even-length, bounded byte string rather than hard-coding 32 bytes.
+        guard token.wholeMatch(of: /^(?:[A-Fa-f0-9]{2}){32,256}$/) != nil else {
             throw HostedCloudError(
                 statusCode: 0,
                 code: "BAD_PUSH_TOKEN",
