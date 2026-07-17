@@ -91,7 +91,7 @@ final class HostedCloudClientTests: XCTestCase {
                 for: request,
                 json: """
                 {"offers":[
-                  {"offerId":"offer_abcdefghijkl","expiresAt":9999999999999},
+                  {"offerId":"offer_abcdefghijkl","callUUID":"12345678-1234-4abc-8def-1234567890ab","expiresAt":9999999999999},
                   {"offerId":"not-an-offer","expiresAt":9999999999999},
                   {"offerId":"offer_missingexpiry"}
                 ]}
@@ -101,7 +101,11 @@ final class HostedCloudClientTests: XCTestCase {
 
         let offers = try await client.listInboundOffers()
 
-        XCTAssertEqual(offers, [InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9_999_999_999_999)])
+        XCTAssertEqual(offers, [InboundOffer(
+            offerId: "offer_abcdefghijkl",
+            callUUID: UUID(uuidString: "12345678-1234-4abc-8def-1234567890ab"),
+            expiresAt: 9_999_999_999_999
+        )])
     }
 
     func testListInboundOffersAcceptsZeroAndOneButRejectsBooleanTimestamps() async throws {
@@ -124,9 +128,42 @@ final class HostedCloudClientTests: XCTestCase {
         let offers = try await client.listInboundOffers()
 
         XCTAssertEqual(offers, [
-            InboundOffer(offerId: "offer_aaaaaaaaaaaa", expiresAt: 0),
-            InboundOffer(offerId: "offer_bbbbbbbbbbbb", expiresAt: 1),
+            InboundOffer(offerId: "offer_aaaaaaaaaaaa", callUUID: nil, expiresAt: 0),
+            InboundOffer(offerId: "offer_bbbbbbbbbbbb", callUUID: nil, expiresAt: 1),
         ])
+    }
+
+    func testVoipTokenRegistrationUsesAuthenticatedMutationAndStableWireFields() async throws {
+        let token = String(repeating: "ab", count: 32)
+        var requestCount = 0
+        let client = try makeClient { request in
+            requestCount += 1
+            XCTAssertEqual(request.url?.path, "/v1/device/push-token")
+            XCTAssertEqual(
+                request.value(forHTTPHeaderField: "Cookie"),
+                "__Host-callpilot-device=device_abcdefghijkl.secret-value"
+            )
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Origin"), "https://cloud.example.test")
+            if request.httpMethod == "PUT" {
+                let body = try Self.requestBody(request)
+                let fields = try XCTUnwrap(
+                    JSONSerialization.jsonObject(with: body) as? [String: String]
+                )
+                XCTAssertEqual(fields, ["token": token, "environment": "production"])
+                return Self.response(for: request, json: #"{"registered":true}"#)
+            }
+            XCTAssertEqual(request.httpMethod, "DELETE")
+            return Self.response(for: request, json: #"{"registered":false}"#)
+        }
+        client.credential = DeviceCredential(
+            deviceId: "device_abcdefghijkl",
+            secret: "secret-value"
+        )
+
+        try await client.registerVoipToken(token, environment: .production)
+        try await client.unregisterVoipToken()
+
+        XCTAssertEqual(requestCount, 2)
     }
 
     func testClaimInboundOfferReturnsValidatedSession() async throws {

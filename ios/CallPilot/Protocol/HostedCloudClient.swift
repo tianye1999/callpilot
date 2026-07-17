@@ -77,6 +77,27 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         return HostedDeviceStatus(connected: connected, modemOnline: modemOnline)
     }
 
+    // MARK: - PushKit token
+
+    func registerVoipToken(_ token: String, environment: ApnsEnvironment) async throws {
+        guard token.wholeMatch(of: /^[A-Fa-f0-9]{64}$/) != nil else {
+            throw HostedCloudError(
+                statusCode: 0,
+                code: "BAD_PUSH_TOKEN",
+                message: "VoIP push token is invalid"
+            )
+        }
+        let body = try JSONSerialization.data(withJSONObject: [
+            "token": token.lowercased(),
+            "environment": environment.rawValue,
+        ])
+        _ = try await request("PUT", "v1/device/push-token", body: body)
+    }
+
+    func unregisterVoipToken() async throws {
+        _ = try await request("DELETE", "v1/device/push-token")
+    }
+
     // MARK: - 外呼会话
 
     /// 创建云端会话并轮询到 Edge 签发 LiveKit 凭证。号码不进入云 API，
@@ -143,7 +164,8 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
             guard let offerId = item["offerId"] as? String,
                   offerId.wholeMatch(of: Self.offerIdRE) != nil,
                   let expiresAt = Self.jsonInt64(item["expiresAt"]) else { return nil }
-            return InboundOffer(offerId: offerId, expiresAt: expiresAt)
+            let callUUID = (item["callUUID"] as? String).flatMap(UUID.init(uuidString:))
+            return InboundOffer(offerId: offerId, callUUID: callUUID, expiresAt: expiresAt)
         }
     }
 

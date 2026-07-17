@@ -4,6 +4,7 @@ import XCTest
 final class RootPresentationTests: XCTestCase {
     private let offer = InboundOffer(
         offerId: "offer_abcdefghijkl",
+        callUUID: nil,
         expiresAt: 9_999
     )
 

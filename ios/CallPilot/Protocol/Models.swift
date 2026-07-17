@@ -28,10 +28,22 @@ struct HostedCallSession: Equatable, CustomStringConvertible, CustomDebugStringC
     var debugDescription: String { description }
 }
 
-/// #95 一条可接管的来电 offer;云端只暴露 opaque id 与过期时间(无号码/转写)。
+/// #95 一条可接管的来电 offer;云端只暴露 opaque id、CallKit UUID 与过期时间。
 struct InboundOffer: Equatable {
     let offerId: String
+    let callUUID: UUID?
     let expiresAt: Int64
+
+    init(offerId: String, callUUID: UUID? = nil, expiresAt: Int64) {
+        self.offerId = offerId
+        self.callUUID = callUUID
+        self.expiresAt = expiresAt
+    }
+}
+
+enum ApnsEnvironment: String, Equatable {
+    case sandbox
+    case production
 }
 
 /// 线路就绪状态(hosted `/api/device`)。
