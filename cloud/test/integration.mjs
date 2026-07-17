@@ -556,6 +556,69 @@ try {
   const afterRevoke = await fetch(`${base}/api/device`, { headers: { Cookie: cookie } });
   assert.deepEqual(await afterRevoke.json(), { ok: true, paired: false });
 
+  const revokedContentRead = await fetch(`${base}/v1/messages`, {
+    headers: { Cookie: cookie }
+  });
+  assert.equal(revokedContentRead.status, 401);
+  assert.equal((await revokedContentRead.json()).error.code, "UNAUTHORIZED");
+
+  // Losing a phone must not strand the owner's Edge. The Edge creates a fresh
+  // pairing session, a replacement phone receives a different credential, and
+  // the Edge-level content grant remains effective. The revoked credential stays
+  // invalid throughout and is never revived by the replacement pairing.
+  const recoveryPairing = await post(
+    `/v1/edges/${enrollment.edgeId}/pairing-sessions`,
+    { ttlSeconds: 300 },
+    edgeHeaders(
+      "POST",
+      `/v1/edges/${enrollment.edgeId}/pairing-sessions`,
+      enrollment
+    )
+  );
+  assert.match(recoveryPairing.code, /^[23456789A-HJ-NP-Z]{4}-[23456789A-HJ-NP-Z]{4}$/);
+
+  const recoveryPairResponse = await fetch(`${base}/v1/pairing-sessions/claim`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Origin: origin,
+      "CF-Connecting-IP": clientIp
+    },
+    body: JSON.stringify({ code: recoveryPairing.code, displayName: "Replacement Phone" })
+  });
+  assert.equal(recoveryPairResponse.status, 201);
+  const recoveryCookie = recoveryPairResponse.headers.get("set-cookie")?.split(";", 1)[0];
+  assert.ok(recoveryCookie?.startsWith("__Host-callpilot-device="));
+  const recoveryPaired = await recoveryPairResponse.json();
+  assert.notEqual(recoveryPaired.device.deviceId, paired.device.deviceId);
+
+  const recoveredDevice = await fetch(`${base}/v1/device`, {
+    headers: { Cookie: recoveryCookie }
+  });
+  assert.equal(recoveredDevice.status, 200);
+  const recoveredDeviceBody = await recoveredDevice.json();
+  assert.equal(recoveredDeviceBody.paired, true);
+  assert.equal(recoveredDeviceBody.device.edgeId, enrollment.edgeId);
+  assert.deepEqual(recoveredDeviceBody.capabilities, [
+    "messages:read", "call_records:read"
+  ]);
+
+  const recoveredMessages = await contentRead(
+    socket,
+    recoveryCookie,
+    "/v1/messages",
+    "messages.list",
+    messages,
+    { limit: 25, cursor: null }
+  );
+  assert.deepEqual(recoveredMessages, messages);
+
+  const stillRevoked = await fetch(`${base}/v1/messages`, {
+    headers: { Cookie: cookie }
+  });
+  assert.equal(stillRevoked.status, 401);
+  assert.equal((await stillRevoked.json()).error.code, "UNAUTHORIZED");
+
   // Application output and every local D1 row remain free of relayed content.
   // Audit rows hold only opaque actor ids plus the closed resource discriminator.
   assert.doesNotMatch(workerOutput, /Synthetic notice fragment|verification value redacted/);
