@@ -6,6 +6,8 @@ local.properties
 # 签名材料绝不入库
 *.keystore
 *.jks
+keystore.properties
+signing/
 # IDE
 .idea/
 *.iml
