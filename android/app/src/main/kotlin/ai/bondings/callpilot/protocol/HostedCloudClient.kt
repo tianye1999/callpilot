@@ -30,7 +30,7 @@ class HostedCloudClient(
     private val client: OkHttpClient = OkHttpClient(),
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val sleepMs: (Long) -> Unit = Thread::sleep,
-) : MessageContentClient {
+) : MessageContentClient, CallRecordContentClient {
     companion object {
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
         private val DEVICE_ID = Regex("^device_[A-Za-z0-9_-]{12,80}$")
@@ -193,24 +193,48 @@ class HostedCloudClient(
                 cursor?.let { add("cursor" to it) }
             }
             request("GET", "v1/messages", null, query).use { response ->
-                val bytes = response.body?.bytes() ?: ByteArray(0)
-                val payload = parseOrThrow(response, bytes)
-                if (bytes.size > CONTENT_RESPONSE_MAX_BYTES) {
-                    throw HostedCloudException(
-                        response.code,
-                        "INVALID_RESPONSE",
-                        "短信响应超过协议上限",
-                    )
-                }
-                try {
-                    MessagePage.decode(json, payload.toString())
-                } catch (_: ContentContractException) {
-                    throw HostedCloudException(
-                        response.code,
-                        "INVALID_RESPONSE",
-                        "短信响应不符合内容同步协议",
-                    )
-                }
+                decodeContent(response, "短信") { MessagePage.decode(json, it) }
+            }
+        }
+    }
+
+    override suspend fun listCallRecords(limit: Int, cursor: String?): CallRecordsPage {
+        validateContentPage(limit, cursor, "通话记录")
+        return withContext(Dispatchers.IO) {
+            request("GET", "v1/call-records", null, pageQuery(limit, cursor)).use { response ->
+                decodeContent(response, "通话记录") { CallRecordsPage.decode(json, it) }
+            }
+        }
+    }
+
+    override suspend fun getCallRecord(callId: String): CallRecordDetail {
+        if (!ContentWireValidation.validCallId(callId)) {
+            throw HostedCloudException(0, "INVALID_REQUEST", "通话记录标识不合法")
+        }
+        return withContext(Dispatchers.IO) {
+            request("GET", "v1/call-records/$callId", null).use { response ->
+                decodeContent(response, "通话详情") { CallRecordDetail.decode(json, it) }
+            }
+        }
+    }
+
+    override suspend fun listCallTimeline(
+        callId: String,
+        limit: Int,
+        cursor: String?,
+    ): CallTimelinePage {
+        if (!ContentWireValidation.validCallId(callId)) {
+            throw HostedCloudException(0, "INVALID_REQUEST", "通话记录标识不合法")
+        }
+        validateContentPage(limit, cursor, "通话时间线")
+        return withContext(Dispatchers.IO) {
+            request(
+                "GET",
+                "v1/call-records/$callId/timeline",
+                null,
+                pageQuery(limit, cursor),
+            ).use { response ->
+                decodeContent(response, "通话时间线") { CallTimelinePage.decode(json, it) }
             }
         }
     }
@@ -246,6 +270,42 @@ class HostedCloudClient(
             else -> error("不支持的方法 $method")
         }
         return client.newCall(builder.build()).execute()
+    }
+
+    private fun pageQuery(limit: Int, cursor: String?): List<Pair<String, String>> = buildList {
+        add("limit" to limit.toString())
+        cursor?.let { add("cursor" to it) }
+    }
+
+    private fun validateContentPage(limit: Int, cursor: String?, resourceName: String) {
+        if (limit !in 1..100 || !ContentWireValidation.validCursor(cursor)) {
+            throw HostedCloudException(0, "INVALID_REQUEST", "$resourceName 分页参数不合法")
+        }
+    }
+
+    private fun <T> decodeContent(
+        response: Response,
+        responseName: String,
+        decode: (String) -> T,
+    ): T {
+        val bytes = response.body?.bytes() ?: ByteArray(0)
+        if (bytes.size > CONTENT_RESPONSE_MAX_BYTES) {
+            throw HostedCloudException(
+                response.code,
+                "INVALID_RESPONSE",
+                "$responseName 响应超过协议上限",
+            )
+        }
+        val payload = parseOrThrow(response, bytes)
+        return try {
+            decode(payload.toString())
+        } catch (_: ContentContractException) {
+            throw HostedCloudException(
+                response.code,
+                "INVALID_RESPONSE",
+                "$responseName 响应不符合内容同步协议",
+            )
+        }
     }
 
     private fun parseOrThrow(response: Response): JsonObject {

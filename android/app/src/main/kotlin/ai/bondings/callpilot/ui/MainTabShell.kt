@@ -1,6 +1,8 @@
 package ai.bondings.callpilot.ui
 
 import ai.bondings.callpilot.call.CallManager
+import ai.bondings.callpilot.content.CallHistoryCacheStore
+import ai.bondings.callpilot.content.CallHistoryModel
 import ai.bondings.callpilot.content.MessageCacheStore
 import ai.bondings.callpilot.content.MessageInboxState
 import ai.bondings.callpilot.content.MessageInboxModel
@@ -65,11 +67,13 @@ fun MainTabShell(
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route ?: MainTab.Dial.route
-    val messageModel = remember(pairing) {
-        if (pairing.protocol == PairingProtocol.HOSTED) {
-            val client = HostedCloudClient(pairing.gatewayUrl).also {
-                it.credential = pairing.credential
-            }
+    val hostedClient = remember(pairing) {
+        if (pairing.protocol == PairingProtocol.HOSTED) HostedCloudClient(pairing.gatewayUrl).also {
+            it.credential = pairing.credential
+        } else null
+    }
+    val messageModel = remember(pairing, hostedClient) {
+        hostedClient?.let { client ->
             MessageInboxModel(
                 client = client,
                 store = MessageCacheStore(ProtectedJsonStore.messages(context)),
@@ -79,14 +83,28 @@ fun MainTabShell(
                     onUnpaired()
                 },
             )
-        } else {
-            null
+        }
+    }
+    val callHistoryModel = remember(pairing, hostedClient) {
+        hostedClient?.let { client ->
+            CallHistoryModel(
+                client = client,
+                store = CallHistoryCacheStore(ProtectedJsonStore.callHistory(context)),
+                deviceId = pairing.credential.deviceId,
+                onUnauthorized = {
+                    store.clear()
+                    onUnpaired()
+                },
+            )
         }
     }
     val emptyMessageState = remember { MutableStateFlow(MessageInboxState()) }
     val messageState by (messageModel?.state ?: emptyMessageState).collectAsState()
     LaunchedEffect(messageModel) {
         messageModel?.loadCachedContent()
+    }
+    LaunchedEffect(callHistoryModel) {
+        callHistoryModel?.loadCachedContent()
     }
 
     Scaffold(
@@ -139,7 +157,14 @@ fun MainTabShell(
                 )
             }
             composable(MainTab.Records.route) {
-                PendingContentScreen("通话记录", "完整记录将在下一批接入")
+                CallRecordsScreen(callHistoryModel, navController)
+            }
+            composable("records/detail/{callId}") { entry ->
+                CallRecordDetailScreen(
+                    callId = entry.arguments?.getString("callId").orEmpty(),
+                    model = callHistoryModel,
+                    onBack = { navController.popBackStack() },
+                )
             }
             composable(MainTab.Messages.route) {
                 MessagesScreen(messageModel, navController)

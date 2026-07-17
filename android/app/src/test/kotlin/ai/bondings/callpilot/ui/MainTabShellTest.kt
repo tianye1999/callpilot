@@ -20,5 +20,7 @@ class MainTabShellTest {
     fun `detail destination keeps its parent tab selected`() {
         assertEquals(true, isMainTabSelected(MainTab.Messages, "messages/detail/{messageId}"))
         assertEquals(false, isMainTabSelected(MainTab.Records, "messages/detail/{messageId}"))
+        assertEquals(true, isMainTabSelected(MainTab.Records, "records/detail/{callId}"))
+        assertEquals(false, isMainTabSelected(MainTab.Messages, "records/detail/{callId}"))
     }
 }

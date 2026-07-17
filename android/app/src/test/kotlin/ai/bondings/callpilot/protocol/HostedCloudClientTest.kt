@@ -468,4 +468,47 @@ class HostedCloudClientTest {
         }
         assertEquals("INVALID_RESPONSE", error.errorCode)
     }
+
+    @Test
+    fun `call content endpoints preserve paths cursors and shared fixtures`() = runTest {
+        client.credential = DeviceCredential("device_abcdefghijkl", "secret-value")
+        server.enqueue(MockResponse().setResponseCode(200).setBody(ContentTestFixtures.text("call-records-page.json")))
+        server.enqueue(MockResponse().setResponseCode(200).setBody(ContentTestFixtures.text("call-record-detail-ready.json")))
+        server.enqueue(MockResponse().setResponseCode(200).setBody(ContentTestFixtures.text("call-timeline-page.json")))
+
+        val page = client.listCallRecords(25, "cursor_calls_fixture_0001")
+        val callId = "call_fixture_pending_0001"
+        val detail = client.getCallRecord(callId)
+        val timeline = client.listCallTimeline(callId, 50, "cursor_timeline_fixture_0001")
+
+        assertEquals(2, page.items.size)
+        assertEquals(callId, detail.record.callId)
+        assertEquals(5, timeline.items.size)
+        assertEquals("/v1/call-records?limit=25&cursor=cursor_calls_fixture_0001", server.takeRequest().path)
+        assertEquals("/v1/call-records/$callId", server.takeRequest().path)
+        assertEquals(
+            "/v1/call-records/$callId/timeline?limit=50&cursor=cursor_timeline_fixture_0001",
+            server.takeRequest().path,
+        )
+    }
+
+    @Test
+    fun `call content rejects invalid identity before network and preserves stable oversized error`() = runTest {
+        assertThrows(HostedCloudException::class.java) {
+            kotlinx.coroutines.runBlocking { client.getCallRecord("local-directory-name") }
+        }
+        assertThrows(HostedCloudException::class.java) {
+            kotlinx.coroutines.runBlocking { client.listCallTimeline("call_fixture_pending_0001", 0, null) }
+        }
+        assertEquals(0, server.requestCount)
+
+        server.enqueue(
+            MockResponse().setResponseCode(413)
+                .setBody("""{"error":{"code":"PAYLOAD_TOO_LARGE","message":"oversized"}}"""),
+        )
+        val error = assertThrows(HostedCloudException::class.java) {
+            kotlinx.coroutines.runBlocking { client.listCallRecords(25, null) }
+        }
+        assertEquals("PAYLOAD_TOO_LARGE", error.errorCode)
+    }
 }

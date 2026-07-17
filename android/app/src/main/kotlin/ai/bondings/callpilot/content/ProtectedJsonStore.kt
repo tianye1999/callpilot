@@ -72,6 +72,14 @@ class ProtectedJsonStore(
                 AndroidKeystoreContentCipher("callpilot-content-v1"),
             )
         }
+
+        fun callHistory(context: Context): ProtectedJsonStore {
+            val directory = File(context.noBackupFilesDir, "CallPilot")
+            return ProtectedJsonStore(
+                File(directory, "call-history-v1.bin"),
+                AndroidKeystoreContentCipher("callpilot-call-history-v1"),
+            )
+        }
     }
 }
 

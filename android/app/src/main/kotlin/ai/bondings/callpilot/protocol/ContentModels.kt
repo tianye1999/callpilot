@@ -69,7 +69,10 @@ interface MessageContentClient {
 object ContentWireValidation {
     private val CURSOR = Regex("^cursor_[A-Za-z0-9_-]+$")
     private val MESSAGE_ID = Regex("^msg_[A-Za-z0-9_-]{12,80}$")
+    private val CALL_ID = Regex("^call_[A-Za-z0-9_-]{12,80}$")
+    private val TIMELINE_ITEM_ID = Regex("^item_[A-Za-z0-9_-]{12,80}$")
     private val REVISION = Regex("^revision_[A-Za-z0-9_-]{12,80}$")
+    private val PRODUCT_CODE = Regex("^[A-Z][A-Z0-9_]{2,63}$")
 
     fun validCursor(value: String?): Boolean =
         value == null || (value.length <= 2_048 && CURSOR.matches(value))
@@ -77,6 +80,12 @@ object ContentWireValidation {
     fun validRevision(value: String): Boolean = REVISION.matches(value)
 
     fun validMessageId(value: String): Boolean = MESSAGE_ID.matches(value)
+
+    fun validCallId(value: String): Boolean = CALL_ID.matches(value)
+
+    fun validTimelineItemId(value: String): Boolean = TIMELINE_ITEM_ID.matches(value)
+
+    fun validProductCode(value: String): Boolean = PRODUCT_CODE.matches(value)
 }
 
 class ContentContractException(cause: Throwable? = null) : Exception("Invalid content-sync payload", cause)
