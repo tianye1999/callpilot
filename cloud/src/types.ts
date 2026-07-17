@@ -12,6 +12,12 @@ export interface Env {
   CONTENT_READ_DEVICE_LIMIT?: string;
   CONTENT_READ_EDGE_LIMIT?: string;
   APP_REVIEW_PAIRING_ENABLED?: string;
+  VOIP_PUSH_ENABLED?: string;
+  APNS_TEAM_ID?: string;
+  APNS_KEY_ID?: string;
+  APNS_PRIVATE_KEY?: string;
+  APNS_BUNDLE_ID?: string;
+  PUSH_TOKEN_ENCRYPTION_KEY?: string;
 }
 
 export interface EdgeRecord {
@@ -65,6 +71,7 @@ export interface InboundOfferRecord {
   created_at: number;
   expires_at: number;
   updated_at: number;
+  call_uuid: string | null;
 }
 
 export interface EdgePresence {

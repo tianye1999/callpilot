@@ -10,6 +10,7 @@ import {
 } from "./content-sync";
 import { edgeMessageSchema } from "./schemas";
 import type { EdgePresence, Env } from "./types";
+import { dispatchInboundOfferPushes } from "./voip-push";
 
 interface SocketAttachment {
   edgeId: string;
@@ -190,12 +191,22 @@ export class EdgeRoom extends DurableObject<Env> {
     if (result.data.type === "inbound.offer") {
       // Offers are insert-once; a duplicate offerId from a reconnect replay is
       // ignored rather than resurrecting a consumed offer.
-      await this.env.DB.prepare(
-        "INSERT OR IGNORE INTO inbound_offers(offer_id, edge_id, call_id, generation, nonce, status, created_at, expires_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'offered', ?6, ?7, ?6)"
+      const callUUID = crypto.randomUUID();
+      const inserted = await this.env.DB.prepare(
+        "INSERT OR IGNORE INTO inbound_offers(offer_id, edge_id, call_id, generation, nonce, status, created_at, expires_at, updated_at, call_uuid) VALUES (?1, ?2, ?3, ?4, ?5, 'offered', ?6, ?7, ?6, ?8)"
       ).bind(
         result.data.offerId, attachment.edgeId, result.data.callId,
-        result.data.generation, result.data.nonce, now, result.data.expiresAtUnixMs
+        result.data.generation, result.data.nonce, now, result.data.expiresAtUnixMs,
+        callUUID
       ).run();
+      if (inserted.meta.changes) {
+        this.ctx.waitUntil(dispatchInboundOfferPushes(this.env, {
+          edgeId: attachment.edgeId,
+          offerId: result.data.offerId,
+          callUUID,
+          expiresAtUnixMs: result.data.expiresAtUnixMs
+        }).catch(() => undefined));
+      }
       return;
     }
     if (result.data.type === "inbound.offer.revoke") {

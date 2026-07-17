@@ -14,6 +14,7 @@ const base = `http://127.0.0.1:${port}`;
 const origin = process.env.CALLPILOT_PUBLIC_ORIGIN ?? "https://dial-beta.bondings.ai";
 const adminToken = "integration-admin-token-with-at-least-32-characters";
 const livekitSecret = "integration-livekit-secret-with-at-least-32-characters";
+const pushEncryptionKey = Buffer.alloc(32, 7).toString("base64url");
 const clientIp = `198.51.100.${Math.floor(Math.random() * 200) + 1}`;
 const edgeKeys = generateKeyPairSync("ed25519");
 const publicDer = edgeKeys.publicKey.export({ format: "der", type: "spki" });
@@ -171,6 +172,50 @@ try {
   assert.ok(cookie?.startsWith("__Host-callpilot-device="));
   const paired = await pairResponse.json();
 
+  const pushToken = "ab".repeat(32);
+  const disabledPushRegistration = await fetch(`${base}/v1/device/push-token`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: cookie,
+      Origin: origin
+    },
+    body: JSON.stringify({ token: pushToken, environment: "sandbox" })
+  });
+  assert.equal(disabledPushRegistration.status, 403);
+  assert.equal((await disabledPushRegistration.json()).error.code, "FEATURE_DISABLED");
+
+  worker = await restartWorker(worker, true, true);
+  const pushRegistration = await fetch(`${base}/v1/device/push-token`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: cookie,
+      Origin: origin
+    },
+    body: JSON.stringify({ token: pushToken, environment: "sandbox" })
+  });
+  assert.equal(pushRegistration.status, 200);
+  assert.deepEqual(await pushRegistration.json(), { registered: true });
+  const storedPushTokens = d1Rows(
+    `SELECT token_ciphertext, token_nonce, environment FROM device_push_tokens WHERE device_id = '${paired.device.deviceId}'`
+  );
+  assert.equal(storedPushTokens.length, 1);
+  assert.equal(storedPushTokens[0].environment, "sandbox");
+  assert.notEqual(storedPushTokens[0].token_ciphertext, pushToken);
+  assert.equal(JSON.stringify(storedPushTokens).includes(pushToken), false);
+
+  const pushRemoval = await fetch(`${base}/v1/device/push-token`, {
+    method: "DELETE",
+    headers: { Cookie: cookie, Origin: origin }
+  });
+  assert.equal(pushRemoval.status, 200);
+  assert.deepEqual(await pushRemoval.json(), { registered: false });
+  assert.equal(d1Rows(
+    `SELECT device_id FROM device_push_tokens WHERE device_id = '${paired.device.deviceId}'`
+  ).length, 0);
+  worker = await restartWorker(worker, true);
+
   // Pairing alone grants no content capability. The closed-Beta allowlist is
   // server-managed D1 authorization metadata, not a phone-controlled field.
   const deniedBeforeGrant = await fetch(`${base}/v1/messages`, { headers: { Cookie: cookie } });
@@ -293,6 +338,7 @@ try {
     (payload) => payload.offers.length === 1 && payload.offers[0].offerId === offerId,
     "offer did not appear",
   );
+  assert.match(offers.offers[0].callUUID, /^[0-9a-f-]{36}$/);
   // Privacy: polling exposes only opaque offer ids — never nonce or call id.
   assert.equal(JSON.stringify(offers).includes("nonce"), false);
   assert.equal(JSON.stringify(offers).includes(`call_${runTag}`), false);
@@ -801,7 +847,7 @@ async function stopWorker(process) {
   }
 }
 
-function startWorker(reviewPairingEnabled) {
+function startWorker(reviewPairingEnabled, voipPushEnabled = false) {
   const child = spawn(
     wrangler,
     [
@@ -814,7 +860,9 @@ function startWorker(reviewPairingEnabled) {
       "--var", "CONTENT_RELAY_TIMEOUT_MS:500",
       "--var", "CONTENT_READ_DEVICE_LIMIT:100",
       "--var", "CONTENT_READ_EDGE_LIMIT:200",
-      "--var", `APP_REVIEW_PAIRING_ENABLED:${reviewPairingEnabled}`
+      "--var", `APP_REVIEW_PAIRING_ENABLED:${reviewPairingEnabled}`,
+      "--var", `VOIP_PUSH_ENABLED:${voipPushEnabled}`,
+      "--var", `PUSH_TOKEN_ENCRYPTION_KEY:${pushEncryptionKey}`
     ],
     { cwd: cloudDir, stdio: ["ignore", "pipe", "pipe"] }
   );
@@ -823,9 +871,20 @@ function startWorker(reviewPairingEnabled) {
   return child;
 }
 
-async function restartWorker(current, reviewPairingEnabled) {
+async function restartWorker(current, reviewPairingEnabled, voipPushEnabled = false) {
   await stopWorker(current);
-  const replacement = startWorker(reviewPairingEnabled);
+  const replacement = startWorker(reviewPairingEnabled, voipPushEnabled);
   await waitForHealth();
   return replacement;
+}
+
+function d1Rows(command) {
+  const result = spawnSync(
+    wrangler,
+    ["d1", "execute", "DB", "--local", "--json", "--command", command],
+    { cwd: cloudDir, encoding: "utf8" }
+  );
+  if (result.status !== 0) throw new Error(result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  return payload[0]?.results ?? [];
 }

@@ -14,7 +14,8 @@ import {
   claimPairingSchema,
   createCallSchema,
   createPairingSchema,
-  edgeMessageSchema
+  edgeMessageSchema,
+  registerVoipTokenSchema
 } from "../src/schemas";
 
 describe("credential helpers", () => {
@@ -71,6 +72,21 @@ describe("protocol schema", () => {
       purpose: "app_review"
     }).success).toBe(false);
     expect(createPairingSchema.safeParse({ ttlSeconds: 300, purpose: "other" }).success).toBe(false);
+  });
+
+  it("accepts only bounded hexadecimal VoIP tokens and a known APNs environment", () => {
+    expect(registerVoipTokenSchema.safeParse({
+      token: "ab".repeat(32),
+      environment: "production"
+    }).success).toBe(true);
+    expect(registerVoipTokenSchema.safeParse({
+      token: "not-a-token",
+      environment: "production"
+    }).success).toBe(false);
+    expect(registerVoipTokenSchema.safeParse({
+      token: "ab".repeat(32),
+      environment: "other"
+    }).success).toBe(false);
   });
 
   it("allows documented edge messages and rejects arbitrary message types", () => {

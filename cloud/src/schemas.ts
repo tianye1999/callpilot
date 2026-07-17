@@ -82,3 +82,8 @@ export const edgeMessageSchema = z.union([
 export const claimInboundOfferSchema = z.object({
   offerId: opaqueId
 }).strict();
+
+export const registerVoipTokenSchema = z.object({
+  token: z.string().regex(/^[A-Fa-f0-9]{64}$/),
+  environment: z.enum(["sandbox", "production"])
+}).strict();

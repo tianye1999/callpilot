@@ -76,6 +76,28 @@ requires `REMOTE_CONTENT_READ_ENABLED=true`; either gate being off blocks reads.
 Worker invocation observability remains explicitly disabled because request URLs
 carry opaque cursors that must not enter durable platform logs or traces.
 
+## Closed-Beta iOS incoming-call rollout
+
+VoIP push delivery defaults off. Apply the D1 migrations and deploy the Worker
+before setting any APNs secret. The feature requires six Worker settings:
+
+```bash
+npx wrangler secret put APNS_TEAM_ID
+npx wrangler secret put APNS_KEY_ID
+npx wrangler secret put APNS_PRIVATE_KEY
+npx wrangler secret put APNS_BUNDLE_ID
+npx wrangler secret put PUSH_TOKEN_ENCRYPTION_KEY
+npx wrangler secret put VOIP_PUSH_ENABLED
+```
+
+`PUSH_TOKEN_ENCRYPTION_KEY` is a base64url-encoded 32-byte random key. Enter the
+exact value `true` for `VOIP_PUSH_ENABLED`; missing values and all other spellings
+fail closed. Keep the flag off until the signed iOS build has the VoIP entitlement
+and the dedicated reviewer Edge is isolated from owner data and toll-risk calls.
+Turning the flag off stops new registration and delivery. Authenticated token
+removal, device unpairing, and Edge-side device revocation still delete stored
+tokens while delivery is disabled.
+
 ## Rollback
 
 The hosted mode is independently gated by `REMOTE_CLOUD_ENABLED=false`. Turning

@@ -30,10 +30,16 @@ import {
   claimPairingSchema,
   createCallSchema,
   createEnrollmentInviteSchema,
-  createPairingSchema
+  createPairingSchema,
+  registerVoipTokenSchema
 } from "./schemas";
 import { constantTimeEqual, randomId, randomPairingCode, randomSecret, sha256 } from "./security";
 import type { CallRecord, DeviceRecord, Env, InboundOfferRecord } from "./types";
+import {
+  decodeEncryptionKey,
+  encryptPushToken,
+  voipPushEnabled
+} from "./voip-push";
 import { ZodError } from "zod";
 
 export { EdgeRoom };
@@ -79,6 +85,12 @@ async function route(request: Request, env: Env, requestId: string): Promise<Res
     return getDevice(request, env);
   }
   if (path === "/v1/device" && request.method === "DELETE") return unpairCurrentDevice(request, env);
+  if (path === "/v1/device/push-token" && request.method === "PUT") {
+    return registerVoipToken(request, env);
+  }
+  if (path === "/v1/device/push-token" && request.method === "DELETE") {
+    return unregisterVoipToken(request, env);
+  }
   if (path === "/v1/calls" && request.method === "POST") return createCall(request, env);
   if (path === "/v1/inbound-offers" && request.method === "GET") {
     return listInboundOffers(request, env);
@@ -277,6 +289,8 @@ async function unpairCurrentDevice(request: Request, env: Env): Promise<Response
   const device = await authenticateDevice(request, env);
   await env.DB.prepare("UPDATE devices SET revoked_at = ?1 WHERE device_id = ?2 AND revoked_at IS NULL")
     .bind(Date.now(), device.device_id).run();
+  await env.DB.prepare("DELETE FROM device_push_tokens WHERE device_id = ?1")
+    .bind(device.device_id).run();
   await audit(env, "phone", device.device_id, "device.unpaired", device.edge_id, "allowed");
   return json(
     { paired: false },
@@ -292,8 +306,46 @@ async function revokeDevice(request: Request, env: Env, deviceId: string): Promi
     "UPDATE devices SET revoked_at = ?1 WHERE device_id = ?2 AND edge_id = ?3 AND revoked_at IS NULL"
   ).bind(now, deviceId, edge.edge_id).run();
   if (!result.meta.changes) throw new HttpError("NOT_FOUND", "Device not found", 404);
+  await env.DB.prepare("DELETE FROM device_push_tokens WHERE device_id = ?1")
+    .bind(deviceId).run();
   await audit(env, "edge", edge.edge_id, "device.revoked", deviceId, "allowed");
   return json({ revoked: true });
+}
+
+async function registerVoipToken(request: Request, env: Env): Promise<Response> {
+  requireSameOrigin(request, env.PUBLIC_ORIGIN);
+  const device = await authenticateDevice(request, env);
+  if (!voipPushEnabled(env.VOIP_PUSH_ENABLED)) {
+    throw new HttpError("FEATURE_DISABLED", "VoIP push is disabled", 403);
+  }
+  if (!env.PUSH_TOKEN_ENCRYPTION_KEY) {
+    throw new HttpError("FEATURE_UNAVAILABLE", "VoIP push is unavailable", 503);
+  }
+  const input = registerVoipTokenSchema.parse(await readJson(request));
+  const encrypted = await encryptPushToken(
+    input.token,
+    decodeEncryptionKey(env.PUSH_TOKEN_ENCRYPTION_KEY)
+  );
+  await env.DB.prepare(
+    "INSERT INTO device_push_tokens(device_id, token_ciphertext, token_nonce, environment, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(device_id) DO UPDATE SET token_ciphertext = excluded.token_ciphertext, token_nonce = excluded.token_nonce, environment = excluded.environment, updated_at = excluded.updated_at"
+  ).bind(
+    device.device_id,
+    encrypted.ciphertext,
+    encrypted.nonce,
+    input.environment,
+    Date.now()
+  ).run();
+  await audit(env, "phone", device.device_id, "voip_token.registered", device.edge_id, "allowed");
+  return json({ registered: true });
+}
+
+async function unregisterVoipToken(request: Request, env: Env): Promise<Response> {
+  requireSameOrigin(request, env.PUBLIC_ORIGIN);
+  const device = await authenticateDevice(request, env);
+  await env.DB.prepare("DELETE FROM device_push_tokens WHERE device_id = ?1")
+    .bind(device.device_id).run();
+  await audit(env, "phone", device.device_id, "voip_token.unregistered", device.edge_id, "allowed");
+  return json({ registered: false });
 }
 
 async function createCall(request: Request, env: Env): Promise<Response> {
@@ -372,11 +424,16 @@ async function createCall(request: Request, env: Env): Promise<Response> {
 async function listInboundOffers(request: Request, env: Env): Promise<Response> {
   const device = await authenticateDevice(request, env);
   const rows = await env.DB.prepare(
-    "SELECT offer_id, expires_at FROM inbound_offers WHERE edge_id = ?1 AND status = 'offered' AND expires_at > ?2 ORDER BY created_at DESC LIMIT 5"
-  ).bind(device.edge_id, Date.now()).all<{ offer_id: string; expires_at: number }>();
+    "SELECT offer_id, call_uuid, expires_at FROM inbound_offers WHERE edge_id = ?1 AND status = 'offered' AND expires_at > ?2 ORDER BY created_at DESC LIMIT 5"
+  ).bind(device.edge_id, Date.now()).all<{
+    offer_id: string;
+    call_uuid: string | null;
+    expires_at: number;
+  }>();
   return json({
     offers: (rows.results ?? []).map((row) => ({
       offerId: row.offer_id,
+      ...(row.call_uuid ? { callUUID: row.call_uuid } : {}),
       expiresAt: row.expires_at
     }))
   });
