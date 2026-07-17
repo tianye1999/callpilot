@@ -244,7 +244,10 @@ extension CallKitCoordinator: PKPushRegistryDelegate {
             return
         }
         let completionBox = PushCompletion(completion)
-        Task { @MainActor [weak self] in
+        // The registry is created on the main queue. Report to CallKit before
+        // returning from this callback; an asynchronous actor hop makes iOS
+        // classify the VoIP push as unhandled and terminate the app.
+        MainActor.assumeIsolated { [weak self] in
             guard let self else {
                 completionBox.call()
                 return

@@ -37,11 +37,6 @@ targets:
         CODE_SIGN_ENTITLEMENTS: CallPilot/CallPilot.entitlements
         TARGETED_DEVICE_FAMILY: "1"  # iPhone
         CODE_SIGN_STYLE: Automatic
-      configs:
-        Debug:
-          APS_ENVIRONMENT: development
-        Release:
-          APS_ENVIRONMENT: production
 
   CallPilotTests:
     type: bundle.unit-test
