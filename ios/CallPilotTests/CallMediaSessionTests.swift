@@ -175,12 +175,13 @@ final class CallMediaSessionTests: XCTestCase {
             transportFactory: { transport }
         )
 
-        await media.startTakeover(
+        let joined = await media.startTakeover(
             client: client,
             offerId: "offer_abcdefghijkl",
             onConnected: { connectedCount += 1 }
         )
 
+        XCTAssertTrue(joined)
         XCTAssertEqual(states, [.waitingMedia(label: "来电接管"), .inCall(label: "来电接管")])
         XCTAssertEqual(connectedCount, 1)
         XCTAssertFalse(transport.operations.contains { operation in

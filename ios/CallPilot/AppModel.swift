@@ -27,6 +27,7 @@ final class AppModel: ObservableObject {
     private let messageStore = FileMessageCacheStore()
     private let callHistoryStore = FileCallHistoryCacheStore()
     private var deviceStatusMachine = DeviceStatusStateMachine()
+    private let callKit = CallKitCoordinator()
 
     // 接管媒体超时(对齐 Android takeoverMediaTimeoutMs;真机实证:失败会话不复位会挡后续 offer)。
     private let takeoverMediaTimeout: Duration = .seconds(20)
@@ -36,6 +37,9 @@ final class AppModel: ObservableObject {
     init() {
         pairing = store.load()
         rebuildClient()
+        callKit.delegate = self
+        callKit.start()
+        registerCurrentVoipToken()
     }
 
     private func rebuildClient() {
@@ -60,6 +64,7 @@ final class AppModel: ObservableObject {
                 deviceId: p.credential.deviceId,
                 onUnauthorized: { [weak self] in self?.unpair() }
             )
+            registerCurrentVoipToken()
         } else {
             messageInbox = nil
             callHistory = nil
@@ -88,6 +93,8 @@ final class AppModel: ObservableObject {
     }
 
     func unpair() {
+        let pairedClient = client
+        Task { try? await pairedClient?.unregisterVoipToken() }
         messageInbox?.clearLocalData()
         callHistory?.clearLocalData()
         store.clear()
@@ -118,16 +125,24 @@ final class AppModel: ObservableObject {
         var tick = 0
         while !Task.isCancelled {
             if let c = client {
-                if callState == .idle {
-                    if let offer = try? await c.listInboundOffers().first(where: {
+                if let offers = try? await c.listInboundOffers() {
+                    callKit.reconcile(
+                        openOffers: offers,
+                        nowUnixMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                    )
+                    if callState == .idle, let offer = offers.first(where: {
                         !dismissedOffers.contains($0.offerId)
                             && $0.expiresAt > Int64(Date().timeIntervalSince1970 * 1000)
                     }) {
                         incomingOffer = offer
-                    } else {
+                    } else if callState == .idle {
                         incomingOffer = nil
                     }
-                } else {
+                } else if let offer = incomingOffer,
+                          offer.expiresAt <= Int64(Date().timeIntervalSince1970 * 1_000) {
+                    incomingOffer = nil
+                }
+                if callState != .idle {
                     incomingOffer = nil
                 }
                 if tick % 5 == 0 { await refreshDeviceStatus() }
@@ -166,12 +181,14 @@ final class AppModel: ObservableObject {
     func dismissOffer(_ offer: InboundOffer) {
         dismissedOffers.insert(offer.offerId)
         incomingOffer = nil
+        Task { _ = await callKit.requestEndIfManaged(offer) }
     }
 
     // MARK: - 外呼(US-2)
 
     func startCall(number: String) async {
         guard let c = client, let p = pairing, callState == .idle else { return }
+        CallKitAudioSessionBridge.prepareForStandaloneCall()
         let attempt = beginCallAttempt(with: .preparing(label: number))
         // createSession → LiveKit 媒体 → 号码经 Dongle SIM ATD(dial 在 media_ready 后发)。
         // 具体媒体建立与 data-topic 控制由 CallMediaSession 承担。
@@ -185,6 +202,13 @@ final class AppModel: ObservableObject {
     // MARK: - 来电接管(US-1 App 侧,前台版)
 
     func answerTakeover(_ offer: InboundOffer) async {
+        incomingOffer = nil
+        if await callKit.requestAnswerIfManaged(offer) { return }
+        CallKitAudioSessionBridge.prepareForStandaloneCall()
+        await performTakeover(offer)
+    }
+
+    private func performTakeover(_ offer: InboundOffer) async {
         guard let c = client, callState == .idle else { return }
         incomingOffer = nil
         let label = L10n.text("call.takeover.label")
@@ -209,7 +233,11 @@ final class AppModel: ObservableObject {
             guard self.apply(failedState, for: attempt, from: waitingState) else { return }
             await self.media?.stop()
         }
-        await media?.startTakeover(client: c, offerId: offer.offerId, onConnected: { timeoutTask.cancel() })
+        let joined = await media?.startTakeover(client: c, offerId: offer.offerId, onConnected: { [weak self] in
+            timeoutTask.cancel()
+            self?.callKit.markConnected(offerId: offer.offerId)
+        }) ?? false
+        if joined { callKit.markMediaJoined(offerId: offer.offerId) }
     }
 
     func dismissCallResult() {
@@ -221,7 +249,11 @@ final class AppModel: ObservableObject {
 
     func hangup() {
         let activeMedia = media
-        Task { await activeMedia?.hangup() }
+        Task { [weak self] in
+            guard let self else { return }
+            if await self.callKit.requestEndActiveIfManaged() { return }
+            await activeMedia?.hangup()
+        }
     }
 
     func sendDTMF(_ digit: String) {
@@ -279,7 +311,60 @@ final class AppModel: ObservableObject {
         ) else { return false }
         callState = nextState
         if !nextState.isActive { speakerphoneEnabled = false }
+        switch nextState {
+        case .failed:
+            callKit.finishActiveCall(reason: .failed)
+        case .ended:
+            callKit.finishActiveCall(reason: .remoteEnded)
+        case .idle, .preparing, .waitingMedia, .dialing, .inCall:
+            break
+        }
         return true
+    }
+
+    private func registerCurrentVoipToken() {
+        guard let client, let token = callKit.currentToken else { return }
+        Task { try? await client.registerVoipToken(token.value, environment: token.environment) }
+    }
+}
+
+extension AppModel: CallKitCoordinatorDelegate {
+    var callKitCanAcceptIncomingCall: Bool {
+        pairing != nil && client != nil && callState == .idle
+    }
+
+    func callKitDidUpdateToken(_ token: String, environment: ApnsEnvironment) {
+        guard let client else { return }
+        Task { try? await client.registerVoipToken(token, environment: environment) }
+    }
+
+    func callKitDidInvalidateToken() {
+        guard let client else { return }
+        Task { try? await client.unregisterVoipToken() }
+    }
+
+    func callKitDidReceiveOffer(_ offer: InboundOffer) {
+        guard callKitCanAcceptIncomingCall,
+              !dismissedOffers.contains(offer.offerId) else { return }
+        incomingOffer = offer
+    }
+
+    func callKitDidRequestAnswer(_ offer: InboundOffer) {
+        guard callKitCanAcceptIncomingCall else {
+            callKit.finishActiveCall(reason: .failed)
+            return
+        }
+        Task { await performTakeover(offer) }
+    }
+
+    func callKitDidRequestDecline(_ offer: InboundOffer) {
+        dismissedOffers.insert(offer.offerId)
+        if incomingOffer?.offerId == offer.offerId { incomingOffer = nil }
+    }
+
+    func callKitDidRequestHangup() {
+        let activeMedia = media
+        Task { await activeMedia?.hangup() }
     }
 }
 

@@ -11,7 +11,7 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     MARKETING_VERSION: "0.7.0"
-    CURRENT_PROJECT_VERSION: "3"
+    CURRENT_PROJECT_VERSION: "4"
     # 开源友好:不硬编码 Team。本地 `export DEVELOPMENT_TEAM=<你的 Apple Team ID>`
     # (见 Xcode > Settings > Accounts),或在 Xcode 的 Signing 面板选择。
     DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
@@ -34,8 +34,14 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot
         GENERATE_INFOPLIST_FILE: "NO"
         INFOPLIST_FILE: CallPilot/Info.plist
+        CODE_SIGN_ENTITLEMENTS: CallPilot/CallPilot.entitlements
         TARGETED_DEVICE_FAMILY: "1"  # iPhone
         CODE_SIGN_STYLE: Automatic
+      configs:
+        Debug:
+          APS_ENVIRONMENT: development
+        Release:
+          APS_ENVIRONMENT: production
 
   CallPilotTests:
     type: bundle.unit-test

@@ -193,3 +193,4 @@
 "settings.unpair.action" = "解除配对";
 "settings.unpair.confirm_title" = "解除与电脑端的配对？";
 "settings.unpair.confirm_message" = "解除后将清除本机内容，需要重新输入配对码才能使用远程线路。";
+"callkit.incoming.name" = "AI 来电转接";

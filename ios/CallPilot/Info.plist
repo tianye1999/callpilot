@@ -30,7 +30,10 @@
 	<!-- 麦克风:远程通话经 LiveKit 采集本机麦克风(对齐 Android RECORD_AUDIO) -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>CallPilot uses the microphone to transmit your voice during calls through your remote SIM.</string>
-	<!-- 前台版无后台推送;Phase 2 才加 voip 后台模式 + PushKit -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>voip</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>

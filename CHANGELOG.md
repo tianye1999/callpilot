@@ -8,6 +8,10 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
 
 ### Added
 
+- **iOS system incoming-call surface (#96)**: opaque PushKit wake-ups now report
+  owner-takeover offers through CallKit, with encrypted APNs token storage,
+  duplicate/expiry fencing, and CallKit-owned LiveKit audio activation. Delivery
+  remains fail-closed behind the hosted `VOIP_PUSH_ENABLED` rollout gate.
 - **Inbound call triage & owner takeover (#95)**: an incoming call is answered
   by the AI, judged by a dedicated triage judge (marketing / personal /
   needs-owner, with strict fencing and a two-pass confirmation before any

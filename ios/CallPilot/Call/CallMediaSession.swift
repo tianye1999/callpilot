@@ -71,17 +71,18 @@ final class CallMediaSession {
 
     /// US-1 takeover: claim the offer and join its room. The physical call is
     /// already active, so this path never sends dial.
+    @discardableResult
     func startTakeover(
         client: HostedCloudClient,
         offerId: String,
         onConnected: @escaping () -> Void
-    ) async {
+    ) async -> Bool {
         let label = "来电接管"
         let attempt = beginAttempt(label: label)
         installConnectedHandler(onConnected)
         do {
             let session = try await client.claimInboundOffer(offerId: offerId)
-            guard isCurrent(attempt) else { return }
+            guard isCurrent(attempt) else { return false }
 
             preparedSession = session
             let activeTransport = installTransport(for: attempt)
@@ -93,8 +94,9 @@ final class CallMediaSession {
             try await activeTransport.connect(url: session.livekitURL, token: session.token)
             guard isCurrent(attempt) else {
                 await activeTransport.disconnect()
-                return
+                return false
             }
+            return true
         } catch let error as HostedCloudError {
             await failSetup(
                 attempt: attempt,
@@ -102,6 +104,7 @@ final class CallMediaSession {
                 reason: error.message,
                 code: error.code
             )
+            return false
         } catch {
             await failSetup(
                 attempt: attempt,
@@ -109,6 +112,7 @@ final class CallMediaSession {
                 reason: error.localizedDescription,
                 code: nil
             )
+            return false
         }
     }
 

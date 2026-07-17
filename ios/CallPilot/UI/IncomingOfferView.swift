@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// 来电接管请求全屏卡(对齐 Android IncomingOfferScreen)。
-/// 前台版:App 前台时展示;锁屏/系统来电 UI 属 Phase 2(CallKit)。
+/// 前台展示与系统 CallKit 来电界面共享同一 offer 状态。
 struct IncomingOfferView: View {
     @ObservedObject var model: AppModel
     let offer: InboundOffer

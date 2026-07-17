@@ -203,6 +203,7 @@ final class LocalizationTests: XCTestCase {
     private func localizationSourceURLs(root: URL) -> [URL] {
         [
             "ios/CallPilot/AppModel.swift",
+            "ios/CallPilot/Call/CallKitCoordinator.swift",
             "ios/CallPilot/UI/PairView.swift",
             "ios/CallPilot/UI/DialView.swift",
             "ios/CallPilot/UI/IncomingOfferView.swift",
