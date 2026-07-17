@@ -13,20 +13,11 @@ import kotlinx.coroutines.withContext
 
 enum class MessageSyncStatus { IDLE, LOADING, LIVE, STALE, OFFLINE }
 
-object MessageCopy {
-    const val PAYLOAD_TOO_LARGE = "这条短信过长，当前版本暂时无法显示"
-    const val UNAVAILABLE = "暂时无法载入短信"
-    const val EDGE_OFFLINE = "电脑端离线，正在显示本机缓存"
-    const val FEATURE_DISABLED = "短信同步尚未启用"
-    const val UNAUTHORIZED = "设备授权已失效，请重新配对"
-}
-
 data class MessageInboxState(
     val messages: List<SMSMessage> = emptyList(),
     val syncStatus: MessageSyncStatus = MessageSyncStatus.IDLE,
     val unreadCount: Int = 0,
     val errorCode: String? = null,
-    val errorMessage: String? = null,
     val isRefreshing: Boolean = false,
     val isLoadingMore: Boolean = false,
     val collectionRevision: String? = null,
@@ -67,7 +58,6 @@ class MessageInboxModel(
                 syncStatus = MessageSyncStatus.LIVE,
                 unreadCount = unreadCount(merged),
                 errorCode = null,
-                errorMessage = null,
                 collectionRevision = page.collectionRevision,
                 hasMore = nextCursor != null,
             )
@@ -109,7 +99,6 @@ class MessageInboxModel(
                 syncStatus = MessageSyncStatus.LIVE,
                 unreadCount = unreadCount(bounded),
                 errorCode = null,
-                errorMessage = null,
                 collectionRevision = page.collectionRevision,
                 hasMore = nextCursor != null,
             )
@@ -189,21 +178,13 @@ class MessageInboxModel(
             mutableState.value = state.value.copy(
                 syncStatus = MessageSyncStatus.OFFLINE,
                 errorCode = code,
-                errorMessage = MessageCopy.UNAUTHORIZED,
             )
             onUnauthorized()
             return
         }
-        val message = when (code) {
-            "PAYLOAD_TOO_LARGE" -> MessageCopy.PAYLOAD_TOO_LARGE
-            "EDGE_OFFLINE", "TIMEOUT" -> MessageCopy.EDGE_OFFLINE
-            "FEATURE_DISABLED", "FORBIDDEN" -> MessageCopy.FEATURE_DISABLED
-            else -> MessageCopy.UNAVAILABLE
-        }
         mutableState.value = state.value.copy(
             syncStatus = if (state.value.messages.isEmpty()) MessageSyncStatus.OFFLINE else MessageSyncStatus.STALE,
             errorCode = code,
-            errorMessage = message,
         )
     }
 

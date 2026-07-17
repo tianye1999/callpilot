@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.ui
 
+import ai.bondings.callpilot.R
 import ai.bondings.callpilot.content.MessageInboxModel
 import ai.bondings.callpilot.content.MessageSyncStatus
 import ai.bondings.callpilot.protocol.MessageDeliveryStatus
@@ -43,6 +44,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
@@ -65,8 +67,8 @@ fun MessagesScreen(
 ) {
     if (model == null) {
         Column(Modifier.fillMaxSize()) {
-            PageTitle("短信")
-            UnsupportedContentScreen("当前连接模式暂不支持短信同步", Modifier.weight(1f))
+            PageTitle(stringResource(R.string.messages_title))
+            UnsupportedContentScreen(stringResource(R.string.messages_unsupported), Modifier.weight(1f))
         }
         return
     }
@@ -99,7 +101,7 @@ fun MessagesScreen(
     }
 
     Column(Modifier.fillMaxSize()) {
-        PageTitle("短信")
+        PageTitle(stringResource(R.string.messages_title))
         PullToRefreshBox(
             isRefreshing = state.isRefreshing,
             onRefresh = {
@@ -113,11 +115,11 @@ fun MessagesScreen(
         ) {
             when {
             state.messages.isNotEmpty() -> LazyColumn(Modifier.fillMaxSize()) {
-                item { SyncStatusRow(state.syncStatus, state.errorMessage, state.isRefreshing) }
-                state.errorMessage?.let { message ->
+                item { SyncStatusRow(state.syncStatus, state.errorCode, state.isRefreshing) }
+                state.errorCode?.let { code ->
                     item {
                         ListItem(
-                            headlineContent = { Text(message) },
+                            headlineContent = { Text(messageErrorText(code)) },
                             leadingContent = {
                                 Icon(Icons.Filled.Warning, contentDescription = null, tint = Color(0xFFD97706))
                             },
@@ -145,20 +147,20 @@ fun MessagesScreen(
                                 modifier = Modifier.heightIn(min = 48.dp),
                             ) {
                                 if (state.isLoadingMore) CircularProgressIndicator(Modifier.size(24.dp))
-                                else Text("加载更多")
+                                else Text(stringResource(R.string.common_load_more))
                             }
                         }
                     }
                 }
             }
             state.syncStatus in setOf(MessageSyncStatus.IDLE, MessageSyncStatus.LOADING) ->
-                CenteredStatus(progress = true, title = "正在载入短信", detail = null)
+                CenteredStatus(progress = true, title = stringResource(R.string.messages_loading), detail = null)
             state.syncStatus == MessageSyncStatus.LIVE ->
-                CenteredStatus(progress = false, title = "暂无短信", detail = null)
+                CenteredStatus(progress = false, title = stringResource(R.string.messages_empty), detail = null)
             else -> CenteredStatus(
                 progress = false,
-                title = "短信载入失败",
-                detail = state.errorMessage,
+                title = stringResource(R.string.messages_load_failed),
+                detail = messageErrorText(state.errorCode),
                 action = { scope.launch { model.refresh() } },
             )
             }
@@ -173,12 +175,12 @@ fun MessageDetailScreen(
     onBack: () -> Unit,
 ) {
     if (model == null) {
-        UnsupportedContentScreen("短信内容不可用")
+        UnsupportedContentScreen(stringResource(R.string.messages_detail_unavailable))
         return
     }
     val state by model.state.collectAsState()
     val message = state.messages.firstOrNull { it.messageId == messageId }
-        ?: return UnsupportedContentScreen("短信内容不可用")
+        ?: return UnsupportedContentScreen(stringResource(R.string.messages_detail_unavailable))
     Column(Modifier.fillMaxSize()) {
         Row(
             modifier = Modifier
@@ -187,10 +189,10 @@ fun MessageDetailScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.common_back))
             }
             Text(
-                "短信详情",
+                stringResource(R.string.messages_detail_title),
                 style = MaterialTheme.typography.headlineSmall,
                 modifier = Modifier.padding(start = 4.dp),
             )
@@ -198,11 +200,15 @@ fun MessageDetailScreen(
         LazyColumn(Modifier.weight(1f)) {
             item {
                 DetailField(
-                    if (message.direction == MessageDirection.INBOUND) "发件人" else "收件人",
+                    if (message.direction == MessageDirection.INBOUND) {
+                        stringResource(R.string.messages_detail_sender)
+                    } else {
+                        stringResource(R.string.messages_detail_recipient)
+                    },
                     message.address,
                 )
-                DetailField("时间", formatMessageTime(message.occurredAt))
-                DetailField("状态", deliveryLabel(message))
+                DetailField(stringResource(R.string.messages_detail_time), formatMessageTime(message.occurredAt))
+                DetailField(stringResource(R.string.messages_detail_status), deliveryLabel(message))
                 HorizontalDivider()
                 SelectionContainer {
                     Text(
@@ -221,11 +227,12 @@ fun MessageDetailScreen(
 @Composable
 private fun MessageRow(message: SMSMessage, onClick: () -> Unit) {
     val largeText = LocalConfiguration.current.fontScale >= 1.5f
+    val localizedDelivery = deliveryLabel(message)
     ListItem(
         modifier = Modifier
             .heightIn(min = 64.dp)
             .clickable(onClick = onClick)
-            .semantics { stateDescription = deliveryLabel(message) },
+            .semantics { stateDescription = localizedDelivery },
         headlineContent = {
             if (largeText) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -242,7 +249,7 @@ private fun MessageRow(message: SMSMessage, onClick: () -> Unit) {
         supportingContent = {
             Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text(message.text, maxLines = 2, style = MaterialTheme.typography.bodyMedium)
-                Text(deliveryLabel(message), style = MaterialTheme.typography.labelSmall)
+                Text(localizedDelivery, style = MaterialTheme.typography.labelSmall)
             }
         },
         leadingContent = {
@@ -256,12 +263,12 @@ private fun MessageRow(message: SMSMessage, onClick: () -> Unit) {
 }
 
 @Composable
-private fun SyncStatusRow(status: MessageSyncStatus, error: String?, refreshing: Boolean) {
+private fun SyncStatusRow(status: MessageSyncStatus, errorCode: String?, refreshing: Boolean) {
     val text = when (status) {
-        MessageSyncStatus.LIVE -> "已同步"
-        MessageSyncStatus.STALE -> "正在显示本机缓存"
-        MessageSyncStatus.OFFLINE -> error ?: "电脑端离线"
-        MessageSyncStatus.IDLE, MessageSyncStatus.LOADING -> "正在同步"
+        MessageSyncStatus.LIVE -> stringResource(R.string.common_synced)
+        MessageSyncStatus.STALE -> stringResource(R.string.common_stale_cache)
+        MessageSyncStatus.OFFLINE -> messageErrorText(errorCode)
+        MessageSyncStatus.IDLE, MessageSyncStatus.LOADING -> stringResource(R.string.common_syncing)
     }
     ListItem(
         headlineContent = { Text(text) },
@@ -286,7 +293,11 @@ private fun CenteredStatus(
         if (progress) CircularProgressIndicator()
         Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 12.dp))
         detail?.let { Text(it, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 8.dp)) }
-        action?.let { OutlinedButton(onClick = it, modifier = Modifier.padding(top = 16.dp)) { Text("重试") } }
+        action?.let {
+            OutlinedButton(onClick = it, modifier = Modifier.padding(top = 16.dp)) {
+                Text(stringResource(R.string.common_retry))
+            }
+        }
     }
 }
 
@@ -314,11 +325,21 @@ internal fun UnsupportedContentScreen(message: String, modifier: Modifier = Modi
     }
 }
 
+@Composable
 private fun deliveryLabel(message: SMSMessage): String = when (message.status) {
-    MessageDeliveryStatus.RECEIVED -> "已接收"
-    MessageDeliveryStatus.SENT -> "已发送"
-    MessageDeliveryStatus.FAILED -> "发送失败"
-    MessageDeliveryStatus.ERROR -> "发送异常"
+    MessageDeliveryStatus.RECEIVED -> stringResource(R.string.messages_status_received)
+    MessageDeliveryStatus.SENT -> stringResource(R.string.messages_status_sent)
+    MessageDeliveryStatus.FAILED -> stringResource(R.string.messages_status_failed)
+    MessageDeliveryStatus.ERROR -> stringResource(R.string.messages_status_error)
+}
+
+@Composable
+private fun messageErrorText(code: String?): String = when (code) {
+    "PAYLOAD_TOO_LARGE" -> stringResource(R.string.messages_error_payload_too_large)
+    "EDGE_OFFLINE", "TIMEOUT" -> stringResource(R.string.messages_error_edge_offline)
+    "FEATURE_DISABLED", "FORBIDDEN" -> stringResource(R.string.messages_error_feature_disabled)
+    "UNAUTHORIZED" -> stringResource(R.string.content_error_unauthorized)
+    else -> stringResource(R.string.messages_error_unavailable)
 }
 
 private fun formatMessageTime(epochMs: Long): String =

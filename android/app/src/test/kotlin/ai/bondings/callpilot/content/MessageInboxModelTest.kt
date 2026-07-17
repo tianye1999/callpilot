@@ -59,7 +59,7 @@ class MessageInboxModelTest {
         model.markLatestDisplayed()
 
         assertEquals(MessageSyncStatus.STALE, model.state.value.syncStatus)
-        assertEquals(MessageCopy.PAYLOAD_TOO_LARGE, model.state.value.errorMessage)
+        assertEquals("PAYLOAD_TOO_LARGE", model.state.value.errorCode)
         assertEquals(2, model.state.value.unreadCount)
         assertEquals(watermark, store.snapshot?.watermark)
     }

@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.ui
 
+import ai.bondings.callpilot.R
 import ai.bondings.callpilot.content.CallDetailState
 import ai.bondings.callpilot.content.CallHistoryModel
 import ai.bondings.callpilot.content.CallHistorySyncStatus
@@ -55,6 +56,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
@@ -76,8 +78,8 @@ fun CallRecordsScreen(
 ) {
     if (model == null) {
         Column(Modifier.fillMaxSize()) {
-            CallPageTitle("通话记录")
-            UnsupportedContentScreen("当前连接模式暂不支持通话记录同步", Modifier.weight(1f))
+            CallPageTitle(stringResource(R.string.calls_title))
+            UnsupportedContentScreen(stringResource(R.string.calls_unsupported), Modifier.weight(1f))
         }
         return
     }
@@ -95,7 +97,7 @@ fun CallRecordsScreen(
     }
 
     Column(Modifier.fillMaxSize()) {
-        CallPageTitle("通话记录")
+        CallPageTitle(stringResource(R.string.calls_title))
         PullToRefreshBox(
             isRefreshing = state.isRefreshing,
             onRefresh = { scope.launch { model.refresh() } },
@@ -103,9 +105,9 @@ fun CallRecordsScreen(
         ) {
             when {
                 state.records.isNotEmpty() -> LazyColumn(Modifier.fillMaxSize()) {
-                    item { CallSyncStatusRow(state.syncStatus, state.errorMessage, state.isRefreshing) }
-                    state.errorMessage?.let { error ->
-                        item { CallErrorRow(error) }
+                    item { CallSyncStatusRow(state.syncStatus, state.errorCode, state.isRefreshing) }
+                    state.errorCode?.let { code ->
+                        item { CallErrorRow(callErrorText(code)) }
                     }
                     items(state.records, key = CallRecordItem::callId) { record ->
                         CallRecordRow(record) {
@@ -115,17 +117,21 @@ fun CallRecordsScreen(
                     }
                     if (state.hasMore) {
                         item {
-                            LoadMoreButton(state.isLoadingMore, "加载更多") {
+                            LoadMoreButton(state.isLoadingMore, stringResource(R.string.common_load_more)) {
                                 scope.launch { model.loadMore() }
                             }
                         }
                     }
                 }
                 state.syncStatus in setOf(CallHistorySyncStatus.IDLE, CallHistorySyncStatus.LOADING) ->
-                    CallCenteredStatus(true, "正在载入通话记录", null)
+                    CallCenteredStatus(true, stringResource(R.string.calls_loading), null)
                 state.syncStatus == CallHistorySyncStatus.LIVE ->
-                    CallCenteredStatus(false, "暂无通话记录", null)
-                else -> CallCenteredStatus(false, "通话记录载入失败", state.errorMessage) {
+                    CallCenteredStatus(false, stringResource(R.string.calls_empty), null)
+                else -> CallCenteredStatus(
+                    false,
+                    stringResource(R.string.calls_load_failed),
+                    callErrorText(state.errorCode),
+                ) {
                     scope.launch { model.refresh() }
                 }
             }
@@ -140,7 +146,7 @@ fun CallRecordDetailScreen(
     onBack: () -> Unit,
 ) {
     if (model == null) {
-        UnsupportedContentScreen("通话详情不可用")
+        UnsupportedContentScreen(stringResource(R.string.calls_detail_load_failed))
         return
     }
     val state by model.state.collectAsState()
@@ -163,10 +169,10 @@ fun CallRecordDetailScreen(
             detailState?.detail != null -> CallDetailContent(detailState, model, callId)
             detailState?.syncStatus == CallHistorySyncStatus.OFFLINE -> CallCenteredStatus(
                 false,
-                "通话详情载入失败",
-                detailState.errorMessage,
+                stringResource(R.string.calls_detail_load_failed),
+                callErrorText(detailState.errorCode),
             ) { scope.launch { model.refreshDetail(callId) } }
-            else -> CallCenteredStatus(true, "正在载入通话详情", null)
+            else -> CallCenteredStatus(true, stringResource(R.string.calls_detail_loading), null)
         }
     }
 }
@@ -176,37 +182,45 @@ private fun CallDetailContent(state: CallDetailState, model: CallHistoryModel, c
     val detail = requireNotNull(state.detail)
     val scope = rememberCoroutineScope()
     LazyColumn(Modifier.fillMaxSize()) {
-        if (state.syncStatus == CallHistorySyncStatus.STALE || state.errorMessage != null) {
-            item { CallErrorRow(state.errorMessage ?: "正在显示本机缓存") }
+        if (state.syncStatus == CallHistorySyncStatus.STALE || state.errorCode != null) {
+            item {
+                CallErrorRow(
+                    state.errorCode?.let { callErrorText(it) }
+                        ?: stringResource(R.string.common_stale_cache),
+                )
+            }
         }
         item { CallMetadata(detail.record) }
         item { CallSummarySection(state) }
         when {
             state.isNormalNoAIContent -> item {
-                SectionLabel("AI 内容")
+                SectionLabel(stringResource(R.string.calls_ai_section))
                 ListItem(
-                    headlineContent = { Text("这通电话由手机端完成，没有 AI 对话或摘要") },
+                    headlineContent = { Text(stringResource(R.string.calls_ai_no_content)) },
                     leadingContent = { Icon(Icons.Filled.Person, contentDescription = null) },
                 )
             }
             state.visibleTimeline.isNotEmpty() -> {
-                item { SectionLabel("对话与事件") }
+                item { SectionLabel(stringResource(R.string.calls_timeline_section)) }
                 items(state.visibleTimeline, key = CallTimelineItem::timelineItemId) { item ->
                     TimelineRow(item)
                     HorizontalDivider(Modifier.padding(start = 56.dp))
                 }
             }
             state.syncStatus == CallHistorySyncStatus.LOADING -> item {
-                ListItem(headlineContent = { Text("正在载入对话") }, leadingContent = { CircularProgressIndicator(Modifier.size(24.dp)) })
+                ListItem(
+                    headlineContent = { Text(stringResource(R.string.calls_timeline_loading)) },
+                    leadingContent = { CircularProgressIndicator(Modifier.size(24.dp)) },
+                )
             }
             else -> item {
-                SectionLabel("对话与事件")
-                ListItem(headlineContent = { Text("没有可显示的 AI 对话") })
+                SectionLabel(stringResource(R.string.calls_timeline_section))
+                ListItem(headlineContent = { Text(stringResource(R.string.calls_timeline_empty)) })
             }
         }
         if (state.hasMoreTimeline) {
             item {
-                LoadMoreButton(state.isLoadingMore, "加载更多对话") {
+                LoadMoreButton(state.isLoadingMore, stringResource(R.string.calls_timeline_load_more)) {
                     scope.launch { model.loadMoreTimeline(callId) }
                 }
             }
@@ -217,28 +231,32 @@ private fun CallDetailContent(state: CallDetailState, model: CallHistoryModel, c
 @Composable
 private fun CallRecordRow(record: CallRecordItem, onClick: () -> Unit) {
     val largeText = LocalConfiguration.current.fontScale >= 1.5f
+    val address = record.address ?: stringResource(R.string.calls_unknown_address)
+    val localizedStatus = statusLabel(record.status)
+    val metadata = recordMetadata(record)
+    val summary = summaryPreview(record)
     ListItem(
         modifier = Modifier
             .heightIn(min = 72.dp)
             .clickable(onClick = onClick)
-            .semantics { stateDescription = statusLabel(record.status) },
+            .semantics { stateDescription = localizedStatus },
         headlineContent = {
             if (largeText) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(record.address ?: "未知号码", style = MaterialTheme.typography.titleMedium)
+                    Text(address, style = MaterialTheme.typography.titleMedium)
                     Text(formatCallTime(record.startedAt), style = MaterialTheme.typography.labelSmall)
                 }
             } else {
                 Row(verticalAlignment = Alignment.Top) {
-                    Text(record.address ?: "未知号码", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                    Text(address, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
                     Text(formatCallTime(record.startedAt), style = MaterialTheme.typography.labelSmall)
                 }
             }
         },
         supportingContent = {
             Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(recordMetadata(record), style = MaterialTheme.typography.bodySmall)
-                summaryPreview(record)?.let {
+                Text(metadata, style = MaterialTheme.typography.bodySmall)
+                summary?.let {
                     Text(
                         it,
                         maxLines = 2,
@@ -260,13 +278,26 @@ private fun CallRecordRow(record: CallRecordItem, onClick: () -> Unit) {
 
 @Composable
 private fun CallMetadata(record: CallRecordItem) {
-    SectionLabel("通话信息")
-    CallDetailField(if (record.direction == CallDirection.INBOUND) "来电" else "外呼", record.address ?: "未知号码")
-    CallDetailField("开始时间", formatCallTime(record.startedAt))
-    record.endedAt?.let { CallDetailField("结束时间", formatCallTime(it)) }
-    record.durationMs?.let { CallDetailField("通话时长", durationLabel(it)) }
-    CallDetailField("结果", statusLabel(record.status))
-    triageOutcomeLabel(record.triageOutcome)?.let { CallDetailField("分诊结果", it) }
+    SectionLabel(stringResource(R.string.calls_metadata_section))
+    CallDetailField(
+        if (record.direction == CallDirection.INBOUND) {
+            stringResource(R.string.calls_direction_inbound)
+        } else {
+            stringResource(R.string.calls_direction_outbound)
+        },
+        record.address ?: stringResource(R.string.calls_unknown_address),
+    )
+    CallDetailField(stringResource(R.string.calls_metadata_started_at), formatCallTime(record.startedAt))
+    record.endedAt?.let {
+        CallDetailField(stringResource(R.string.calls_metadata_ended_at), formatCallTime(it))
+    }
+    record.durationMs?.let {
+        CallDetailField(stringResource(R.string.calls_metadata_duration), durationLabel(it))
+    }
+    CallDetailField(stringResource(R.string.calls_metadata_result), statusLabel(record.status))
+    triageOutcomeLabel(record.triageOutcome)?.let {
+        CallDetailField(stringResource(R.string.calls_metadata_triage), it)
+    }
 }
 
 @Composable
@@ -275,28 +306,39 @@ private fun CallSummarySection(state: CallDetailState) {
     when (state.summaryPresentation) {
         CallSummaryPresentation.HIDDEN -> Unit
         CallSummaryPresentation.PENDING -> {
-            SectionLabel("通话摘要")
+            SectionLabel(stringResource(R.string.calls_summary_section))
             ListItem(
-                headlineContent = { Text("摘要生成中") },
+                headlineContent = { Text(stringResource(R.string.calls_summary_loading)) },
                 leadingContent = { CircularProgressIndicator(Modifier.size(24.dp)) },
             )
         }
         CallSummaryPresentation.READY -> {
-            SectionLabel("通话摘要")
+            SectionLabel(stringResource(R.string.calls_summary_section))
             summary?.text?.takeIf(String::isNotBlank)?.let { value ->
                 SelectionContainer { Text(value, Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) }
             }
-            summary?.callerIdentity?.takeIf(String::isNotBlank)?.let { CallDetailField("来电人", it) }
-            summary?.intent?.takeIf(String::isNotBlank)?.let { CallDetailField("来意", it) }
-            summary?.urgency?.takeIf(String::isNotBlank)?.let { CallDetailField("紧急程度", it) }
-            summary?.callbackNeeded?.let { CallDetailField("需要回电", if (it) "是" else "否") }
+            summary?.callerIdentity?.takeIf(String::isNotBlank)?.let {
+                CallDetailField(stringResource(R.string.calls_summary_caller), it)
+            }
+            summary?.intent?.takeIf(String::isNotBlank)?.let {
+                CallDetailField(stringResource(R.string.calls_summary_intent), it)
+            }
+            summary?.urgency?.takeIf(String::isNotBlank)?.let {
+                CallDetailField(stringResource(R.string.calls_summary_urgency), it)
+            }
+            summary?.callbackNeeded?.let {
+                CallDetailField(
+                    stringResource(R.string.calls_summary_callback),
+                    stringResource(if (it) R.string.common_yes else R.string.common_no),
+                )
+            }
         }
         CallSummaryPresentation.FAILED -> {
-            SectionLabel("通话摘要")
+            SectionLabel(stringResource(R.string.calls_summary_section))
             ListItem(
-                headlineContent = { Text("摘要生成失败") },
+                headlineContent = { Text(stringResource(R.string.calls_summary_failed)) },
                 supportingContent = summary?.errorCode?.takeIf(String::isNotBlank)?.let { code ->
-                    { SelectionContainer { Text("错误代码：$code") } }
+                    { SelectionContainer { Text(stringResource(R.string.calls_summary_error_code, code)) } }
                 },
                 leadingContent = { Icon(Icons.Filled.Warning, contentDescription = null, tint = Color(0xFFD97706)) },
             )
@@ -306,21 +348,29 @@ private fun CallSummarySection(state: CallDetailState) {
 
 @Composable
 private fun TimelineRow(item: CallTimelineItem) {
+    val resultStatus = item.recordStatus?.let { statusLabel(it) }
+    val triageCategory = item.triageCategory?.let { triageCategoryLabel(it) }
+    val triageAction = item.triageAction?.let { triageActionLabel(it) }
+    val takeoverState = item.takeoverState?.let { takeoverStateLabel(it) }
     val title = when (item.kind) {
-        CallTimelineKind.TRANSCRIPT -> if (item.timelineRole == TimelineRole.CALLER) "对方" else "AI"
-        CallTimelineKind.RESULT -> "通话结果"
-        CallTimelineKind.TRIAGE -> "智能分诊"
-        CallTimelineKind.TAKEOVER -> "真人接管"
+        CallTimelineKind.TRANSCRIPT -> if (item.timelineRole == TimelineRole.CALLER) {
+            stringResource(R.string.calls_timeline_caller)
+        } else {
+            stringResource(R.string.calls_timeline_ai)
+        }
+        CallTimelineKind.RESULT -> stringResource(R.string.calls_timeline_result)
+        CallTimelineKind.TRIAGE -> stringResource(R.string.calls_timeline_triage)
+        CallTimelineKind.TAKEOVER -> stringResource(R.string.calls_timeline_takeover)
         CallTimelineKind.UNKNOWN -> return
     }
     val detail = when (item.kind) {
         CallTimelineKind.TRANSCRIPT -> item.text
-        CallTimelineKind.RESULT -> item.summary ?: item.recordStatus?.let(::statusLabel)
+        CallTimelineKind.RESULT -> item.summary ?: resultStatus
         CallTimelineKind.TRIAGE -> listOfNotNull(
-            item.triageCategory?.let(::triageCategoryLabel),
-            item.triageAction?.let(::triageActionLabel),
+            triageCategory,
+            triageAction,
         ).joinToString(" · ")
-        CallTimelineKind.TAKEOVER -> item.takeoverState?.let(::takeoverStateLabel)
+        CallTimelineKind.TAKEOVER -> takeoverState
         CallTimelineKind.UNKNOWN -> null
     }
     ListItem(
@@ -344,19 +394,23 @@ private fun CallDetailTitle(onBack: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         IconButton(onClick = onBack) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.common_back))
         }
-        Text("通话详情", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(start = 4.dp))
+        Text(
+            stringResource(R.string.calls_detail_title),
+            style = MaterialTheme.typography.headlineSmall,
+            modifier = Modifier.padding(start = 4.dp),
+        )
     }
 }
 
 @Composable
-private fun CallSyncStatusRow(status: CallHistorySyncStatus, error: String?, refreshing: Boolean) {
+private fun CallSyncStatusRow(status: CallHistorySyncStatus, errorCode: String?, refreshing: Boolean) {
     val text = when (status) {
-        CallHistorySyncStatus.LIVE -> "已同步"
-        CallHistorySyncStatus.STALE -> "正在显示本机缓存"
-        CallHistorySyncStatus.OFFLINE -> error ?: "电脑端离线"
-        CallHistorySyncStatus.IDLE, CallHistorySyncStatus.LOADING -> "正在同步"
+        CallHistorySyncStatus.LIVE -> stringResource(R.string.common_synced)
+        CallHistorySyncStatus.STALE -> stringResource(R.string.common_stale_cache)
+        CallHistorySyncStatus.OFFLINE -> callErrorText(errorCode)
+        CallHistorySyncStatus.IDLE, CallHistorySyncStatus.LOADING -> stringResource(R.string.common_syncing)
     }
     ListItem(
         headlineContent = { Text(text) },
@@ -395,7 +449,11 @@ private fun CallCenteredStatus(progress: Boolean, title: String, detail: String?
         if (progress) CircularProgressIndicator()
         Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 12.dp))
         detail?.let { Text(it, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 8.dp)) }
-        action?.let { OutlinedButton(it, Modifier.padding(top = 16.dp)) { Text("重试") } }
+        action?.let {
+            OutlinedButton(it, Modifier.padding(top = 16.dp)) {
+                Text(stringResource(R.string.common_retry))
+            }
+        }
     }
 }
 
@@ -422,64 +480,85 @@ private fun CallPageTitle(text: String) {
     Text(text, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp))
 }
 
-private fun recordMetadata(record: CallRecordItem): String = listOfNotNull(
-    statusLabel(record.status),
-    record.durationMs?.let(::durationLabel),
-    sourceLabel(record.source),
-).joinToString(" · ")
+@Composable
+private fun recordMetadata(record: CallRecordItem): String {
+    val duration = record.durationMs?.let { durationLabel(it) }
+    return listOfNotNull(statusLabel(record.status), duration, sourceLabel(record.source)).joinToString(" · ")
+}
 
+@Composable
 private fun summaryPreview(record: CallRecordItem): String? = when (record.summaryState) {
-    CallSummaryState.PENDING -> "摘要生成中"
-    CallSummaryState.READY -> record.summaryPreview ?: "摘要已生成"
-    CallSummaryState.FAILED -> "摘要生成失败"
+    CallSummaryState.PENDING -> stringResource(R.string.calls_summary_pending_preview)
+    CallSummaryState.READY -> record.summaryPreview ?: stringResource(R.string.calls_summary_ready_preview)
+    CallSummaryState.FAILED -> stringResource(R.string.calls_summary_failed_preview)
     CallSummaryState.UNAVAILABLE -> null
 }
 
+@Composable
 private fun statusLabel(status: CallRecordStatus): String = when (status) {
-    CallRecordStatus.COMPLETED -> "已完成"
-    CallRecordStatus.NOT_CONNECTED -> "未接通"
-    CallRecordStatus.FAILED -> "失败"
-    else -> "未知状态"
+    CallRecordStatus.COMPLETED -> stringResource(R.string.calls_status_completed)
+    CallRecordStatus.NOT_CONNECTED -> stringResource(R.string.calls_status_not_connected)
+    CallRecordStatus.FAILED -> stringResource(R.string.calls_status_failed)
+    else -> stringResource(R.string.calls_status_unknown)
 }
 
+@Composable
 private fun sourceLabel(source: CallSource): String? = when (source) {
-    CallSource.AGENT -> "AI 通话"
-    CallSource.REMOTE_HANDSET -> "手机通话"
+    CallSource.AGENT -> stringResource(R.string.calls_source_agent)
+    CallSource.REMOTE_HANDSET -> stringResource(R.string.calls_source_remote_handset)
     CallSource.UNKNOWN -> null
 }
 
+@Composable
 private fun triageOutcomeLabel(outcome: CallTriageOutcome?): String? = when (outcome) {
-    CallTriageOutcome.AI_HANDLED -> "AI 已处理"
-    CallTriageOutcome.REJECTED -> "已礼貌拒绝"
-    CallTriageOutcome.TRANSFERRED -> "已转接本人"
-    CallTriageOutcome.UNKNOWN -> "未知"
+    CallTriageOutcome.AI_HANDLED -> stringResource(R.string.calls_triage_outcome_ai_handled)
+    CallTriageOutcome.REJECTED -> stringResource(R.string.calls_triage_outcome_rejected)
+    CallTriageOutcome.TRANSFERRED -> stringResource(R.string.calls_triage_outcome_transferred)
+    CallTriageOutcome.UNKNOWN -> stringResource(R.string.calls_triage_outcome_unknown)
     null -> null
 }
 
+@Composable
 private fun triageCategoryLabel(value: TriageCategory): String = when (value) {
-    TriageCategory.MARKETING -> "营销"
-    TriageCategory.PERSONAL -> "个人事务"
-    TriageCategory.NEEDS_OWNER -> "需要本人"
-    TriageCategory.UNKNOWN -> "未知"
+    TriageCategory.MARKETING -> stringResource(R.string.calls_triage_category_marketing)
+    TriageCategory.PERSONAL -> stringResource(R.string.calls_triage_category_personal)
+    TriageCategory.NEEDS_OWNER -> stringResource(R.string.calls_triage_category_needs_owner)
+    TriageCategory.UNKNOWN -> stringResource(R.string.calls_triage_category_unknown)
 }
 
+@Composable
 private fun triageActionLabel(value: TriageAction): String = when (value) {
-    TriageAction.CLARIFY -> "继续确认"
-    TriageAction.CONTINUE_AI -> "AI 继续处理"
-    TriageAction.REJECT -> "礼貌拒绝"
-    TriageAction.TRANSFER -> "转接本人"
+    TriageAction.CLARIFY -> stringResource(R.string.calls_triage_action_clarify)
+    TriageAction.CONTINUE_AI -> stringResource(R.string.calls_triage_action_continue_ai)
+    TriageAction.REJECT -> stringResource(R.string.calls_triage_action_reject)
+    TriageAction.TRANSFER -> stringResource(R.string.calls_triage_action_transfer)
 }
 
+@Composable
 private fun takeoverStateLabel(value: TakeoverState): String = when (value) {
-    TakeoverState.REQUESTED -> "已请求接管"
-    TakeoverState.COMMITTED -> "已由本人接管"
-    TakeoverState.OWNER_HANGUP -> "本人已挂断"
-    TakeoverState.FAILED -> "接管失败"
+    TakeoverState.REQUESTED -> stringResource(R.string.calls_takeover_requested)
+    TakeoverState.COMMITTED -> stringResource(R.string.calls_takeover_committed)
+    TakeoverState.OWNER_HANGUP -> stringResource(R.string.calls_takeover_owner_hangup)
+    TakeoverState.FAILED -> stringResource(R.string.calls_takeover_failed)
 }
 
+@Composable
 private fun durationLabel(milliseconds: Long): String {
     val seconds = milliseconds / 1_000
-    return if (seconds >= 60) "${seconds / 60} 分 ${seconds % 60} 秒" else "$seconds 秒"
+    return if (seconds >= 60) {
+        stringResource(R.string.calls_duration_minutes_seconds, seconds / 60, seconds % 60)
+    } else {
+        stringResource(R.string.calls_duration_seconds, seconds)
+    }
+}
+
+@Composable
+private fun callErrorText(code: String?): String = when (code) {
+    "PAYLOAD_TOO_LARGE" -> stringResource(R.string.calls_error_payload_too_large)
+    "EDGE_OFFLINE", "TIMEOUT" -> stringResource(R.string.calls_error_edge_offline)
+    "FEATURE_DISABLED", "FORBIDDEN" -> stringResource(R.string.calls_error_feature_disabled)
+    "UNAUTHORIZED" -> stringResource(R.string.content_error_unauthorized)
+    else -> stringResource(R.string.calls_error_unavailable)
 }
 
 private fun formatCallTime(epochMs: Long): String =

@@ -1,7 +1,6 @@
 package ai.bondings.callpilot.ui
 
 import ai.bondings.callpilot.call.CallManager
-import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.DeviceStatus
 import ai.bondings.callpilot.protocol.GatewayClient
@@ -33,13 +32,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -68,9 +65,7 @@ internal fun isDialEnabled(number: String, lineReady: Boolean?): Boolean =
 @Composable
 fun DialScreen(
     pairing: StoredPairing,
-    store: CredentialStore,
     manager: CallManager,
-    onUnpaired: () -> Unit,
 ) {
     val context = LocalContext.current
     var lineReady by remember(pairing) { mutableStateOf<Boolean?>(null) }
@@ -78,7 +73,6 @@ fun DialScreen(
     var lineStatusError by remember(pairing) { mutableStateOf<String?>(null) }
     var number by remember { mutableStateOf("") }
     var message by remember { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
 
     val micPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -182,32 +176,6 @@ fun DialScreen(
         ) {
             Text("CallPilot", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.weight(1f))
-            TextButton(
-                onClick = {
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            when (pairing.protocol) {
-                                PairingProtocol.TUNNEL -> GatewayClient(pairing.gatewayUrl)
-                                    .also { it.credential = pairing.credential }
-                                    .unpair()
-                                PairingProtocol.HOSTED -> HostedCloudClient(pairing.gatewayUrl)
-                                    .also { it.credential = pairing.credential }
-                                    .unpair()
-                            }
-                        } catch (_: Exception) {
-                            // 网关不可达时也允许本地解除
-                        }
-                        store.clear()
-                        onUnpaired()
-                    }
-                },
-            ) {
-                Text(
-                    "解除配对",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-            }
         }
 
         Spacer(Modifier.height(8.dp))

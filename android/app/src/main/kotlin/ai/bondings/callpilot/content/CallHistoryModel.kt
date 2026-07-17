@@ -20,14 +20,6 @@ enum class CallHistorySyncStatus { IDLE, LOADING, LIVE, STALE, OFFLINE }
 
 enum class CallSummaryPresentation { HIDDEN, PENDING, READY, FAILED }
 
-object CallHistoryCopy {
-    const val PAYLOAD_TOO_LARGE = "这条通话内容过长，当前版本暂时无法显示"
-    const val UNAVAILABLE = "暂时无法载入通话记录"
-    const val EDGE_OFFLINE = "电脑端离线，正在显示本机缓存"
-    const val FEATURE_DISABLED = "通话记录同步尚未启用"
-    const val UNAUTHORIZED = "设备授权已失效，请重新配对"
-}
-
 data class CallDetailState(
     val detail: CallRecordDetail? = null,
     val timeline: List<CallTimelineItem> = emptyList(),
@@ -35,7 +27,6 @@ data class CallDetailState(
     val timelineCollectionRevision: String? = null,
     val syncStatus: CallHistorySyncStatus = CallHistorySyncStatus.IDLE,
     val errorCode: String? = null,
-    val errorMessage: String? = null,
     val isLoadingMore: Boolean = false,
 ) {
     val hasMoreTimeline: Boolean get() = nextTimelineCursor != null
@@ -57,7 +48,6 @@ data class CallHistoryState(
     val records: List<CallRecordItem> = emptyList(),
     val syncStatus: CallHistorySyncStatus = CallHistorySyncStatus.IDLE,
     val errorCode: String? = null,
-    val errorMessage: String? = null,
     val isRefreshing: Boolean = false,
     val isLoadingMore: Boolean = false,
     val collectionRevision: String? = null,
@@ -100,7 +90,6 @@ class CallHistoryModel(
                 records = records,
                 syncStatus = CallHistorySyncStatus.LIVE,
                 errorCode = null,
-                errorMessage = null,
                 collectionRevision = page.collectionRevision,
                 hasMore = nextCursor != null,
             )
@@ -141,7 +130,6 @@ class CallHistoryModel(
                 records = bounded,
                 syncStatus = CallHistorySyncStatus.LIVE,
                 errorCode = null,
-                errorMessage = null,
                 collectionRevision = page.collectionRevision,
                 hasMore = nextCursor != null,
             )
@@ -168,10 +156,10 @@ class CallHistoryModel(
             val detail = client.getCallRecord(callId)
             if (requestGeneration != generation.get()) return
             if (detail.record.callId != callId) {
-                throw HostedCloudException(200, "INVALID_RESPONSE", "通话详情标识不匹配")
+                throw HostedCloudException(200, "INVALID_RESPONSE", "Call record identifier mismatch")
             }
             updateDetail(callId) {
-                it.copy(detail = detail, errorCode = null, errorMessage = null)
+                it.copy(detail = detail, errorCode = null)
             }
             replaceListRecord(detail.record)
             saveCache()
@@ -185,7 +173,6 @@ class CallHistoryModel(
                     timelineCollectionRevision = timeline.collectionRevision,
                     syncStatus = CallHistorySyncStatus.LIVE,
                     errorCode = null,
-                    errorMessage = null,
                 )
             }
             saveCache()
@@ -225,7 +212,6 @@ class CallHistoryModel(
                     timelineCollectionRevision = page.collectionRevision,
                     syncStatus = CallHistorySyncStatus.LIVE,
                     errorCode = null,
-                    errorMessage = null,
                 )
             }
             saveCache()
@@ -295,7 +281,6 @@ class CallHistoryModel(
             mutableState.value = state.value.copy(
                 syncStatus = CallHistorySyncStatus.OFFLINE,
                 errorCode = code,
-                errorMessage = CallHistoryCopy.UNAUTHORIZED,
             )
             onUnauthorized()
             return
@@ -303,7 +288,6 @@ class CallHistoryModel(
         mutableState.value = state.value.copy(
             syncStatus = if (state.value.records.isEmpty()) CallHistorySyncStatus.OFFLINE else CallHistorySyncStatus.STALE,
             errorCode = code,
-            errorMessage = errorCopy(code),
         )
     }
 
@@ -317,17 +301,8 @@ class CallHistoryModel(
             it.copy(
                 syncStatus = if (it.detail == null) CallHistorySyncStatus.OFFLINE else CallHistorySyncStatus.STALE,
                 errorCode = code,
-                errorMessage = errorCopy(code),
             )
         }
-    }
-
-    private fun errorCopy(code: String?): String = when (code) {
-        "PAYLOAD_TOO_LARGE" -> CallHistoryCopy.PAYLOAD_TOO_LARGE
-        "EDGE_OFFLINE", "TIMEOUT" -> CallHistoryCopy.EDGE_OFFLINE
-        "FEATURE_DISABLED", "FORBIDDEN" -> CallHistoryCopy.FEATURE_DISABLED
-        "UNAUTHORIZED" -> CallHistoryCopy.UNAUTHORIZED
-        else -> CallHistoryCopy.UNAVAILABLE
     }
 
     private fun updateDetail(callId: String, transform: (CallDetailState) -> CallDetailState) {

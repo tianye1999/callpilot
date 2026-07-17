@@ -18,6 +18,14 @@ interface ContentCipher {
     fun decrypt(ciphertext: ByteArray, aad: ByteArray): ByteArray
 }
 
+internal fun clearAllBestEffort(
+    clearMessages: () -> Unit,
+    clearCallHistory: () -> Unit,
+) {
+    runCatching(clearMessages)
+    runCatching(clearCallHistory)
+}
+
 /** Encrypted, device-bound, no-backup content file with atomic replacement. */
 class ProtectedJsonStore(
     private val file: File,
@@ -78,6 +86,13 @@ class ProtectedJsonStore(
             return ProtectedJsonStore(
                 File(directory, "call-history-v1.bin"),
                 AndroidKeystoreContentCipher("callpilot-call-history-v1"),
+            )
+        }
+
+        fun clearAll(context: Context) {
+            clearAllBestEffort(
+                clearMessages = { messages(context).clear() },
+                clearCallHistory = { callHistory(context).clear() },
             )
         }
     }

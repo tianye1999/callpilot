@@ -13,6 +13,23 @@ import org.junit.Test
 
 class ProtectedJsonStoreTest {
     @Test
+    fun `clearing all stores still attempts the second store when the first fails`() {
+        var firstAttempts = 0
+        var secondAttempts = 0
+
+        clearAllBestEffort(
+            {
+                firstAttempts += 1
+                error("synthetic delete failure")
+            },
+            { secondAttempts += 1 },
+        )
+
+        assertTrue(firstAttempts == 1)
+        assertTrue(secondAttempts == 1)
+    }
+
+    @Test
     fun `ciphertext hides content and round trips only for the same device`() {
         val directory = Files.createTempDirectory("callpilot-content-test").toFile()
         try {
