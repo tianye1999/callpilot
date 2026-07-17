@@ -1612,3 +1612,63 @@ def test_outbound_auto_winddown_hangs_up(monkeypatch):
     assert service.session._thread is not None
     service.session._thread.join(timeout=6)
     assert ("hangup", ()) in modem.calls
+
+
+def test_inbound_hard_deadline_finalizes_when_all_hangup_signals_are_lost(
+    tmp_path, monkeypatch
+):
+    """Session-owned deadline is the last guard when URCs and CLCC polling both die."""
+    monkeypatch.setenv("INBOUND_MAX_SECONDS", "1")
+    modem = FakeModem()
+    bridges: list[FakeAudioBridge] = []
+    agents: list[FakeAgent] = []
+
+    def new_bridge(**kwargs):
+        bridge = FakeAudioBridge()
+        bridges.append(bridge)
+        return bridge
+
+    def new_agent(provider):
+        agent = FakeAgent()
+        agents.append(agent)
+        return agent
+
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", new_bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", new_agent)
+    base = tmp_path / "rec"
+    service = make_service(modem, call_logger=CallLogger(base))
+
+    # The modem remains convinced the call is connected and never delivers a
+    # hangup callback. FakeModem has no CLCC worker, matching a dead poller.
+    modem.connected_flag.set()
+    modem.trigger_ring("+15550100008")
+    try:
+        assert wait_until(lambda: not service.session.is_active, timeout=4)
+    finally:
+        if service.session.is_active:
+            service.session.stop()
+        if service.session._thread is not None:
+            service.session._thread.join(timeout=5)
+
+    assert bridges[0].stopped is True
+    assert agents[0].stopped is True
+    assert modem.call_names().count("hangup") == 1
+    first_events = [
+        json.loads(line)
+        for line in (sorted(base.iterdir())[0] / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    first_types = [event["type"] for event in first_events]
+    assert first_types.count("inbound_hard_deadline") == 1
+    assert first_types.count("ended") == 1
+    assert first_types.count("call_finished") == 1
+
+    # Finalization releases the session rather than poisoning the next call.
+    modem.connected_flag.set()
+    modem.trigger_ring("+15550100009")
+    assert wait_until(lambda: len(bridges) == 2 and bridges[1].started)
+    service.session.stop()
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+    assert not service.session._thread.is_alive()

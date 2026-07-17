@@ -500,6 +500,24 @@ def test_manual_response_control_defaults(monkeypatch):
     assert get_int("MANUAL_RESPONSE_MAX_WAIT_MS") == 8000
 
 
+def test_inbound_hard_deadline_default_matches_example(monkeypatch):
+    _unset(monkeypatch, "INBOUND_MAX_SECONDS")
+    example = (Path(__file__).parents[2] / ".env.example").read_text(encoding="utf-8")
+
+    assert get_int("INBOUND_MAX_SECONDS") == 1800
+    assert re.search(r"^INBOUND_MAX_SECONDS=1800$", example, re.MULTILINE)
+
+
+def test_inbound_hard_deadline_cannot_be_disabled(tmp_path, monkeypatch):
+    _unset(monkeypatch, "INBOUND_MAX_SECONDS")
+
+    with pytest.raises(ValueError, match="INBOUND_MAX_SECONDS"):
+        update_env_file(
+            {"INBOUND_MAX_SECONDS": "0"},
+            env_path=tmp_path / ".env",
+        )
+
+
 # ---- update_env_file ----
 
 

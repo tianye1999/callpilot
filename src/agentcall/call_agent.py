@@ -607,9 +607,22 @@ class CallSession:
         last_play_at = 0.0
         loop_started = time.monotonic()
         # 外呼硬时限：LLM 收尾裁判失灵/漏判时的最后防线（到点道别挂断）。
-        max_seconds = (
+        outbound_max_seconds = (
             float(config.get_int("OUTBOUND_MAX_SECONDS")) if self._outbound_number else 0.0
         )
+        inbound_max_seconds = (
+            float(config.get_int("INBOUND_MAX_SECONDS"))
+            if self._outbound_number is None
+            else 0.0
+        )
+        if self._outbound_number is None and inbound_max_seconds <= 0:
+            inbound_max_seconds = float(
+                config.get_spec("INBOUND_MAX_SECONDS").default
+            )
+            logger.warning(
+                "INBOUND_MAX_SECONDS 必须大于 0，当前通话回落为 %.0fs",
+                inbound_max_seconds,
+            )
         # 收尾裁判（仅外呼）：接通后先给 grace 让通话进正题，之后每 interval 让文本模型
         # 看对话判「继续/收尾」——理解任意措辞（治打转/太早撤），不靠关键词枚举。
         judge_enabled = self._outbound_number is not None
@@ -653,13 +666,32 @@ class CallSession:
                 self._clear_outgoing_audio()
 
             now = time.monotonic()
-            # ① 硬时限兜底
+            # 来电的 NO CARRIER 与 CLCC 轮询可能同时停活；会话自己持有最终时限，
+            # 确保 Agent/bridge/CallRecord 最终仍走统一 finally 收尾。
             if (
-                max_seconds > 0
-                and winddown_deadline is None
-                and (now - loop_started) > max_seconds
+                inbound_max_seconds > 0
+                and (now - loop_started) >= inbound_max_seconds
             ):
-                logger.warning("外呼超过 %.0fs 仍在进行，自动道别收尾", max_seconds)
+                logger.warning(
+                    "来电超过 %.0fs 仍未收到挂断信号，触发会话级兜底收尾",
+                    inbound_max_seconds,
+                )
+                if record is not None:
+                    record.log_event(
+                        "inbound_hard_deadline",
+                        max_seconds=inbound_max_seconds,
+                    )
+                break
+            # ① 外呼硬时限兜底
+            if (
+                outbound_max_seconds > 0
+                and winddown_deadline is None
+                and (now - loop_started) > outbound_max_seconds
+            ):
+                logger.warning(
+                    "外呼超过 %.0fs 仍在进行，自动道别收尾",
+                    outbound_max_seconds,
+                )
                 try:
                     await agent.say(self._winddown_instructions())
                 except Exception as exc:  # noqa: BLE001

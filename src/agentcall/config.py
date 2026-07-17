@@ -268,6 +268,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 外呼硬时限（秒）：LLM 收尾裁判失灵/漏判时的最后防线，到点自动道别挂断；
     # 0 = 不限制。（正常收尾由 summarizer.judge_wrap_up 提前判定。）
     ConfigSpec("OUTBOUND_MAX_SECONDS", "外呼最长时长（秒）", "int", "150"),
+    # 来电缺失 NO CARRIER 且 CLCC 轮询也停活时的会话级最后防线。
+    ConfigSpec("INBOUND_MAX_SECONDS", "来电最长时长（秒）", "int", "1800"),
     ConfigSpec("WRAP_UP_JUDGE_GRACE_SECONDS", "收尾裁判首次等待（秒）", "float", "20.0",
                editable=False, hidden=True),
     ConfigSpec("WRAP_UP_JUDGE_INTERVAL_SECONDS", "收尾裁判间隔（秒）", "float", "15.0",
@@ -607,6 +609,7 @@ def read_panel_values() -> list[dict]:
 _NUMERIC_RANGES: dict[str, tuple[float, float, bool]] = {
     "DTMF_TONE_MS": (0, 2000, True),          # >0 且 ≤2000ms
     "DTMF_TONE_AMPLITUDE": (0.0, 1.0, True),  # (0, 1]
+    "INBOUND_MAX_SECONDS": (0, 86400, True),   # >0 且 ≤24h
 }
 
 
