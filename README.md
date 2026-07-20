@@ -1,23 +1,41 @@
 # CallPilot
 
+### Your phone calls — answered and made by AI, on *your* SIM and hardware.
+
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
-[![Platform: macOS | Windows (beta)](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20(beta)-000000.svg?logo=apple&logoColor=white)](#hardware--platform-support)
-[![Status: Mac Beta](https://img.shields.io/badge/Status-Mac_Beta-orange.svg)](docs/roadmap.md)
+[![Latest release](https://img.shields.io/github/v/release/tianye1999/callpilot?color=orange&label=release)](https://github.com/tianye1999/callpilot/releases/latest)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
+[![中文 README](https://img.shields.io/badge/docs-中文-red.svg)](#中文)
 
-**Your calls, handled by AI.** An open-source AI phone agent that runs on a
-Quectel EC20/EG25 4G modem: it auto-answers incoming calls and talks to the
-caller with a realtime voice AI, places outbound calls, sends/receives SMS,
-navigates IVR menus (DTMF), and records + summarizes every call — all on your
-own hardware and API keys.
+CallPilot turns a **~$20 4G modem into a realtime AI phone agent**. It answers your
+incoming calls and *talks* to the caller with a live voice model, dials out, sends and
+reads SMS, works through IVR menus (DTMF), and records + summarizes every call.
 
-> **Status: Mac Beta (v0.6.0).** Runs on macOS with a Quectel EC20 today.
-> Developers can run from source; regular users install the signed, notarized
-> macOS DMG from the latest GitHub Release. As of 0.6.0 an optional hosted cloud
-> control plane lets you pair a phone and dial through the modem remotely with a
-> pairing code — no self-hosted tunnel needed. See [Roadmap](docs/roadmap.md).
+Unlike cloud call-screening apps, **everything runs on hardware you own** — your SIM,
+your API keys, your recordings and messages stay on your machine.
 
-[English](#english) · [中文](#中文)
+<p align="center">
+  <img src="docs/screenshots/dashboard-dial.png" alt="CallPilot — start an AI-handled call" width="480">
+  <br>
+  <em>Start an AI-handled call: pick a preset task, type a number, describe the goal — the AI dials and talks for you.</em>
+</p>
+
+**Why CallPilot is different**
+
+- ☎️ **Real cellular calls, not VoIP** — driven by hardware AT events (`RING → ATA`) on a Quectel EC20/EG25 modem, not screen automation or a SIP trunk.
+- 🔒 **Privacy-first & self-hosted** — call/SMS content lives on your machine (the *Edge*); the optional cloud relays in transit only and **stores nothing**.
+- 🧠 **Bring your own brain** — realtime speech-to-speech via **Qwen Omni / OpenAI Realtime / Doubao**, or a fully **on-device** VAD→STT→LLM→TTS pipeline where audio never leaves your Mac.
+- 🖥️📱 **A full stack, not a script** — a signed macOS desktop app, native **iOS & Android** remote handsets, and a Cloudflare control plane to pair and dial from anywhere.
+
+| Platform | Status |
+|---|---|
+| macOS desktop (signed & notarized DMG) | ✅ **Beta — [download v0.6.0](https://github.com/tianye1999/callpilot/releases/latest)** |
+| Cloud control plane (pair + dial remotely) | ✅ Beta |
+| Windows desktop | 🧪 code-complete, **awaiting hardware reports** |
+| iOS remote handset | 🚧 TestFlight internal (0.7.0 in dev) |
+| Android remote handset | 🚧 release-signed, real-device verification in progress (0.7.0 in dev) |
+
+**[▶ Quick start](#developer-path-macos-from-source)** · **[🛒 Get the hardware (~$20)](#get-the-hardware)** · **[🗺 Roadmap](docs/roadmap.md)** · **[🇨🇳 中文](#中文)**
 
 ---
 
@@ -332,10 +350,36 @@ License: [Apache-2.0](LICENSE).
 
 ## 中文
 
-> **状态：Mac Beta（v0.6.0）。** 今天可在装有 Quectel EC20 的 macOS 上运行。开发者可从
-> 源码运行；普通用户从最新 GitHub Release 安装已签名公证的 macOS DMG。0.6.0 起提供可选的
-> hosted 云控制面，用配对码即可让手机远程通过模组拨号，无需自建 tunnel。见
-> [路线图](docs/roadmap.md)。
+### 你的电话——由 AI 接听和拨打，跑在*你自己*的 SIM 卡和硬件上。
+
+CallPilot 把一个 **~¥150 的 4G 模组变成实时 AI 电话 agent**：它接听来电并*用实时语音模型和对方对话*，外呼、收发短信、按 IVR 菜单键（DTMF），每通电话录音 + 摘要。
+
+和云端挡电话服务不同，**一切都跑在你拥有的硬件上**——你的 SIM、你的 API Key，通话录音和短信都留在你自己机器上。
+
+<p align="center">
+  <img src="docs/screenshots/dashboard-dial.png" alt="CallPilot 拨号界面" width="480">
+  <br>
+  <em>发起一通 AI 代打电话：选预设任务、填号码、描述目标——AI 替你拨打并对话。</em>
+</p>
+
+**CallPilot 有何不同**
+
+- ☎️ **真实蜂窝通话，不是 VoIP** —— 由 Quectel EC20/EG25 模组的硬件 AT 事件（`RING → ATA`）驱动，不是屏幕自动化或 SIP 中继。
+- 🔒 **隐私优先、可自托管** —— 通话/短信内容留在你的机器（*Edge*）；可选云端只做传输中转，**不存储任何内容**。
+- 🧠 **自带大脑** —— 实时端到端语音走 **Qwen Omni / OpenAI Realtime / 豆包**，或完全**本地**的 VAD→STT→LLM→TTS 流水线，音频不出本机。
+- 🖥️📱 **完整栈，不是脚本** —— 签名公证的 macOS 桌面 App、原生 **iOS & Android** 远程手柄、可远程配对拨号的 Cloudflare 控制面。
+
+| 平台 | 状态 |
+|---|---|
+| macOS 桌面（签名公证 DMG） | ✅ **Beta —— [下载 v0.6.0](https://github.com/tianye1999/callpilot/releases/latest)** |
+| 云控制面（远程配对 + 拨号） | ✅ Beta |
+| Windows 桌面 | 🧪 代码完备，**待硬件反馈** |
+| iOS 远程手柄 | 🚧 TestFlight 内测（0.7.0 开发中） |
+| Android 远程手柄 | 🚧 已 release 签名，真机验收进行中（0.7.0 开发中） |
+
+**[▶ 快速开始](#开发者路径macos-源码运行)** · **[🛒 准备硬件（~¥150）](#硬件准备)** · **[🗺 路线图](docs/roadmap.md)** · **[🇬🇧 English](#english)**
+
+---
 
 ### 这是什么
 
