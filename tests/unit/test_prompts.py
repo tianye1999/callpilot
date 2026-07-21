@@ -6,6 +6,7 @@ from agentcall.prompts import (
     DEFAULT_OUTBOUND_TASK,
     agent_persona,
     build_instructions,
+    openai_vibe_line,
     opening_instructions,
     owner_name,
 )
@@ -24,6 +25,25 @@ def test_owner_and_persona_defaults(monkeypatch):
     monkeypatch.delenv("AGENT_PERSONA", raising=False)
     assert owner_name() == "机主"
     assert agent_persona() == "AI 助理"
+
+
+# ---- OpenAI 说话 Vibe（仅 OpenAI 链路）----
+
+def test_openai_vibe_line_empty_returns_blank(monkeypatch):
+    monkeypatch.setenv("OPENAI_VIBE", "  ")
+    assert openai_vibe_line() == ""
+
+
+def test_openai_vibe_line_zh_and_en(monkeypatch):
+    monkeypatch.setenv("OPENAI_VIBE", "calm")
+    assert openai_vibe_line("zh") == "机主希望的说话风格补充：calm。"
+    assert openai_vibe_line("en") == "Additional speaking style: calm."
+
+
+def test_openai_vibe_line_defaults_to_agent_language(monkeypatch):
+    monkeypatch.setenv("OPENAI_VIBE", "cheerful")
+    monkeypatch.setenv("AGENT_LANGUAGE", "en")
+    assert openai_vibe_line() == "Additional speaking style: cheerful."
 
 
 # ---- 系统提示词 ----

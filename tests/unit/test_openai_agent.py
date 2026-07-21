@@ -189,6 +189,45 @@ def test_session_instructions_override_default(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_openai_vibe_appends_to_session_instructions(monkeypatch):
+    """OPENAI_VIBE 非空时，其风格补充追加在会话 instructions 末尾（VOICE_STYLE 之后）。"""
+    monkeypatch.setenv("AGENT_LANGUAGE", "zh")
+    monkeypatch.setenv("OPENAI_VIBE", "cheerful")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    agent.set_session_instructions("外呼任务：确认预约")
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            session = instances[0].sent[0]["session"]
+            assert session["instructions"] == (
+                "外呼任务：确认预约\n机主希望的说话风格补充：cheerful。"
+            )
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_openai_vibe_empty_leaves_instructions_unchanged(monkeypatch):
+    """OPENAI_VIBE 为空(默认)时不追加，instructions 与传入保持一致。"""
+    monkeypatch.setenv("OPENAI_VIBE", "")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    agent.set_session_instructions("外呼任务：确认预约")
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            session = instances[0].sent[0]["session"]
+            assert session["instructions"] == "外呼任务：确认预约"
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
 def test_manual_response_control_sets_create_response_false_and_debounces(monkeypatch):
     monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
     monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "25")
