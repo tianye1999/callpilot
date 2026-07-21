@@ -79,39 +79,65 @@ def _write_wav_stereo(path: Path, interleaved: bytes) -> None:
         wf.writeframes(interleaved[:aligned])
 
 
+# 合成时把对方(上行)自适应放大到可闻：原始上行是窄带低电平（实测比 AI 低约一个
+# 数量级），不放大会被 AI 完全盖过。按 99.5 分位峰值归一到目标电平，并设增益上限，
+# 避免把极静通话的底噪放得过大；原始 uplink.wav 不受影响。
+_MIX_CALLER_TARGET_PEAK = 18000.0  # 目标峰值(int16，约 -5dBFS)
+_MIX_CALLER_MAX_GAIN = 40.0
+
+
+def _boost_caller(up: Any) -> Any:
+    """把对方(上行) int16 数组自适应放大到可闻，限幅防削顶；极静则原样返回。"""
+    if up.size == 0:
+        return up
+    ref = float(np.percentile(np.abs(up.astype(np.int32)), 99.5))
+    if ref < 1.0:
+        return up
+    gain = min(_MIX_CALLER_TARGET_PEAK / ref, _MIX_CALLER_MAX_GAIN)
+    if gain <= 1.0:
+        return up
+    boosted = np.clip(up.astype(np.float32) * gain, -32768.0, 32767.0)
+    return boosted.astype("<i2")
+
+
 def _build_stereo_mix(
     uplink: bytes, downlink_chunks: list[tuple[int, bytes]]
 ) -> bytes:
-    """把连续的上行(对方)与按上行字节位置打点的下行(AI)对齐成立体声交错 PCM。
+    """把上行(对方)与按上行位置打点的下行(AI)对齐成立体声交错 PCM。
 
-    以上行字节数为共同时间轴：每个 AI 分块放到它录制时的上行位置，空档补静音。
-    左声道 = AI(下行)，右声道 = 对方(上行)。两路都为空时返回 b""（不生成文件）。
+    左=AI(下行)，右=对方(上行)。以上行字节数为共同时间轴，但 OpenAI 会把整轮 AI
+    音频**以突发写入**（远快于实时播放），因此不能简单按打点位置覆盖——同一轮的
+    分块打点几乎相同，覆盖会只剩最后一小段。做法：AI 分块首尾相接铺开，静音间隔后
+    按上行位置重新锚定，即 ``start = max(游标, 上行位置)``。对方声道自适应放大到可闻。
+    两路皆空返回 b""（不生成文件）。
     """
     up = np.frombuffer(
         uplink[: len(uplink) - (len(uplink) % SAMPLE_WIDTH)], dtype="<i2"
     )
     placed: list[tuple[int, Any]] = []
-    ai_end = 0
+    cursor = 0  # AI 左声道写游标（样本）：保证突发分块首尾相接、不互相覆盖
     for pos_bytes, pcm in downlink_chunks:
         chunk = np.frombuffer(
             pcm[: len(pcm) - (len(pcm) % SAMPLE_WIDTH)], dtype="<i2"
         )
-        off = max(0, pos_bytes // SAMPLE_WIDTH)
-        placed.append((off, chunk))
-        ai_end = max(ai_end, off + len(chunk))
-    n = max(len(up), ai_end)
+        if chunk.size == 0:
+            continue
+        start = max(cursor, max(0, pos_bytes // SAMPLE_WIDTH))
+        placed.append((start, chunk))
+        cursor = start + len(chunk)
+    n = max(len(up), cursor)
     if n == 0:
         return b""
     left = np.zeros(n, dtype="<i2")
-    for off, chunk in placed:
-        end = min(n, off + len(chunk))
-        if end > off:
-            left[off:end] = chunk[: end - off]
+    for start, chunk in placed:
+        end = min(n, start + len(chunk))
+        if end > start:
+            left[start:end] = chunk[: end - start]
     right = np.zeros(n, dtype="<i2")
-    right[: len(up)] = up
+    right[: len(up)] = _boost_caller(up)
     stereo = np.empty(n * 2, dtype="<i2")
     stereo[0::2] = left   # 左 = AI 下行
-    stereo[1::2] = right  # 右 = 对方上行
+    stereo[1::2] = right  # 右 = 对方上行（已放大）
     return stereo.tobytes()
 
 
