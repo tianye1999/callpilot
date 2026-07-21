@@ -45,6 +45,21 @@ def agent_language() -> str:
     return normalize_lang(config.get_str("AGENT_LANGUAGE"))
 
 
+def openai_vibe_line(lang: str | None = None) -> str:
+    """OpenAI-only 说话 Vibe：追加在 ``VOICE_STYLE`` 之后的一行风格补充。
+
+    读取 config ``OPENAI_VIBE``；为空则返回空串（不追加）。仅由 openai_agent 在
+    装配 OpenAI 会话 instructions 时调用，qwen/doubao/local 链路不受影响。``lang``
+    缺省按 ``AGENT_LANGUAGE``。
+    """
+    vibe = config.get_str("OPENAI_VIBE").strip()
+    if not vibe:
+        return ""
+    if (lang or agent_language()) == "en":
+        return f"Additional speaking style: {vibe}."
+    return f"机主希望的说话风格补充：{vibe}。"
+
+
 def owner_name(lang: str = "zh") -> str:
     """机主称谓；OWNER_NAME 未设置时用当前语言的中性称谓。"""
     return config.get_str("OWNER_NAME").strip() or _OWNER_FALLBACK[normalize_lang(lang)]

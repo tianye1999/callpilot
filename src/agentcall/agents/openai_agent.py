@@ -23,7 +23,7 @@ from typing import Any, Callable
 import websockets
 
 from .. import config
-from ..prompts import agent_language, repeat_nudge_instructions
+from ..prompts import agent_language, openai_vibe_line, repeat_nudge_instructions
 from ..repeat_suppression import ResponseAudioGate
 from .base import VoiceAgent
 from .tools import SILENT_AFTER_TOOLS, TERMINAL_TOOLS
@@ -196,6 +196,10 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._manual_response_enabled = config.get_bool("MANUAL_RESPONSE_CONTROL")
         self._reset_manual_response_state()
         self._instructions = self._session_instructions or _default_instructions()
+        # OpenAI-only 说话 Vibe：追加在 VOICE_STYLE（已并入上面的 instructions）之后。
+        vibe_line = openai_vibe_line()
+        if vibe_line:
+            self._instructions = f"{self._instructions.rstrip()}\n{vibe_line}"
         await self._connect()
         self._recv_task = asyncio.create_task(self._recv_loop())
 

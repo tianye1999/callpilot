@@ -172,6 +172,14 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                choices=("alloy", "ash", "ballad", "coral", "echo",
                         "sage", "shimmer", "verse", "marin", "cedar"),
                help="https://openai.fm"),
+    # OpenAI 说话 Vibe（仅 OpenAI 链路）：选中后其风格描述追加在 VOICE_STYLE
+    # 之后一并注入会话 instructions（见 prompts.openai_vibe_line 与 openai_agent）。
+    # 空 = 不追加，行为与旧版一致；qwen 链路不受影响。参考 https://openai.fm 的 VIBE。
+    ConfigSpec("OPENAI_VIBE", "OpenAI 说话 Vibe", "select", "",
+               choices=("", "calm", "cheerful", "professional",
+                        "warm", "energetic"),
+               choice_labels={"": "（默认·不追加）"},
+               help="https://openai.fm"),
     # 端点覆写（可选）：留空即直连 api.openai.com；仅在用反代/Azure OpenAI，
     # 或所在网络无法直连 OpenAI 时才需要填。
     ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",
