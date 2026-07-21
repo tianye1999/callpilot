@@ -2,7 +2,7 @@
 # AGP 8.10 推荐上限），此处钉 compileSdk≤36 兼容的成熟组合；LiveKit/网络栈为实查最新稳定。
 [versions]
 agp = "8.10.1"
-kotlin = "2.2.0"
+kotlin = "2.4.0"
 coreKtx = "1.16.0"
 lifecycleRuntimeKtx = "2.9.0"
 activityCompose = "1.10.1"
