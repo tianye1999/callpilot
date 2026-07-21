@@ -8,6 +8,7 @@ import threading
 import time
 import wave
 
+import numpy as np
 import pytest
 
 from agentcall.call_log import CallLogger
@@ -86,6 +87,68 @@ def test_full_lifecycle_produces_all_artifacts(tmp_path):
 
     summary = json.loads((record.path / "summary.json").read_text(encoding="utf-8"))
     assert summary == {"text": "对方确认了订单"}
+
+
+# ---- 合成对话录音 mixed.wav（立体声 左=AI / 右=对方，按时间轴对齐）----
+
+
+def _read_stereo(path):
+    with wave.open(str(path), "rb") as wf:
+        assert wf.getnchannels() == 2
+        assert wf.getframerate() == 8000
+        assert wf.getsampwidth() == 2
+        data = np.frombuffer(wf.readframes(wf.getnframes()), dtype="<i2")
+    return data.reshape(-1, 2)  # 列0=左(AI), 列1=右(对方)
+
+
+def test_mixed_recording_aligns_ai_to_uplink_timeline(tmp_path):
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call("outbound", "10000")
+
+    # 对方(上行)连续录制：先 100 样本静音；此时 AI 说话 50 样本；再 100 样本对方声音。
+    record.write_uplink(b"\x00\x00" * 100)   # uplink_bytes -> 200（= 样本100）
+    record.write_downlink(b"\x22\x22" * 50)  # 打点在上行样本 100 处
+    record.write_uplink(b"\x11\x11" * 100)   # 对方继续说
+    record.finish("completed")
+
+    stereo = _read_stereo(record.path / "mixed.wav")
+    assert stereo.shape[0] == 200  # n = max(上行200, AI结束150)
+    left, right = stereo[:, 0], stereo[:, 1]
+    # 右声道 = 对方上行：前100静音，后100为 0x1111
+    assert np.all(right[:100] == 0)
+    assert np.all(right[100:200] == 0x1111)
+    # 左声道 = AI：仅落在样本 [100,150) 处，其余静音（证明按时间轴对齐，非从头拼接）
+    assert np.all(left[:100] == 0)
+    assert np.all(left[100:150] == 0x2222)
+    assert np.all(left[150:200] == 0)
+
+
+def test_mixed_recording_downlink_only_ai_left_silence_right(tmp_path):
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call("outbound", "10000")
+    record.write_downlink(b"\x22\x22" * 30)  # 只有 AI 说话，对方无上行
+    record.finish("completed")
+
+    stereo = _read_stereo(record.path / "mixed.wav")
+    assert stereo.shape[0] == 30
+    assert np.all(stereo[:, 0] == 0x2222)  # 左 = AI
+    assert np.all(stereo[:, 1] == 0)       # 右 = 对方静音
+
+
+def test_mixed_recording_skipped_when_no_pcm(tmp_path):
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call("outbound", "10000")
+    record.finish("completed")  # 录音开但无音频
+    assert not (record.path / "mixed.wav").exists()
+
+
+def test_mixed_recording_absent_when_recording_disabled(tmp_path):
+    clog = CallLogger(tmp_path, recording_enabled=False)
+    record = clog.begin_call("outbound", "10000")
+    record.write_uplink(b"\x11\x11" * 100)
+    record.write_downlink(b"\x22\x22" * 50)
+    record.finish("completed")
+    assert not (record.path / "mixed.wav").exists()
 
 
 def test_begin_call_rejects_bad_direction_and_handles_none_number(tmp_path):
