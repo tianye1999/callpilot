@@ -7,6 +7,7 @@
         meta.json       # 通话元数据（方向/号码/起止时间/状态/事件数/时长）
         uplink.wav      # 上行录音（用户→远端），8kHz 16bit mono
         downlink.wav    # 下行录音（远端→用户），8kHz 16bit mono
+        mixed.wav       # 合成对话录音：立体声（左=AI下行 / 右=对方上行），按时间轴对齐
         summary.json    # Agent 生成的通话摘要（可选）
 
 性能约定：``log_event`` / ``write_uplink`` / ``write_downlink`` 会被音频主循环
@@ -34,6 +35,8 @@ import wave
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from . import config
 
@@ -63,6 +66,79 @@ def _write_wav(path: Path, pcm: bytes) -> None:
         wf.setsampwidth(SAMPLE_WIDTH)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(pcm[:aligned])
+
+
+def _write_wav_stereo(path: Path, interleaved: bytes) -> None:
+    """写立体声 8kHz 16bit WAV（L/R 交错的 PCM）。"""
+    frame = SAMPLE_WIDTH * 2
+    aligned = len(interleaved) - (len(interleaved) % frame)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(interleaved[:aligned])
+
+
+# 合成时把对方(上行)自适应放大到可闻：原始上行是窄带低电平（实测比 AI 低约一个
+# 数量级），不放大会被 AI 完全盖过。按 99.5 分位峰值归一到目标电平，并设增益上限，
+# 避免把极静通话的底噪放得过大；原始 uplink.wav 不受影响。
+_MIX_CALLER_TARGET_PEAK = 18000.0  # 目标峰值(int16，约 -5dBFS)
+_MIX_CALLER_MAX_GAIN = 40.0
+
+
+def _boost_caller(up: Any) -> Any:
+    """把对方(上行) int16 数组自适应放大到可闻，限幅防削顶；极静则原样返回。"""
+    if up.size == 0:
+        return up
+    ref = float(np.percentile(np.abs(up.astype(np.int32)), 99.5))
+    if ref < 1.0:
+        return up
+    gain = min(_MIX_CALLER_TARGET_PEAK / ref, _MIX_CALLER_MAX_GAIN)
+    if gain <= 1.0:
+        return up
+    boosted = np.clip(up.astype(np.float32) * gain, -32768.0, 32767.0)
+    return boosted.astype("<i2")
+
+
+def _build_stereo_mix(
+    uplink: bytes, downlink_chunks: list[tuple[int, bytes]]
+) -> bytes:
+    """把上行(对方)与按上行位置打点的下行(AI)对齐成立体声交错 PCM。
+
+    左=AI(下行)，右=对方(上行)。以上行字节数为共同时间轴，但 OpenAI 会把整轮 AI
+    音频**以突发写入**（远快于实时播放），因此不能简单按打点位置覆盖——同一轮的
+    分块打点几乎相同，覆盖会只剩最后一小段。做法：AI 分块首尾相接铺开，静音间隔后
+    按上行位置重新锚定，即 ``start = max(游标, 上行位置)``。对方声道自适应放大到可闻。
+    两路皆空返回 b""（不生成文件）。
+    """
+    up = np.frombuffer(
+        uplink[: len(uplink) - (len(uplink) % SAMPLE_WIDTH)], dtype="<i2"
+    )
+    placed: list[tuple[int, Any]] = []
+    cursor = 0  # AI 左声道写游标（样本）：保证突发分块首尾相接、不互相覆盖
+    for pos_bytes, pcm in downlink_chunks:
+        chunk = np.frombuffer(
+            pcm[: len(pcm) - (len(pcm) % SAMPLE_WIDTH)], dtype="<i2"
+        )
+        if chunk.size == 0:
+            continue
+        start = max(cursor, max(0, pos_bytes // SAMPLE_WIDTH))
+        placed.append((start, chunk))
+        cursor = start + len(chunk)
+    n = max(len(up), cursor)
+    if n == 0:
+        return b""
+    left = np.zeros(n, dtype="<i2")
+    for start, chunk in placed:
+        end = min(n, start + len(chunk))
+        if end > start:
+            left[start:end] = chunk[: end - start]
+    right = np.zeros(n, dtype="<i2")
+    right[: len(up)] = _boost_caller(up)
+    stereo = np.empty(n * 2, dtype="<i2")
+    stereo[0::2] = left   # 左 = AI 下行
+    stereo[1::2] = right  # 右 = 对方上行（已放大）
+    return stereo.tobytes()
 
 
 class CallRecord:
@@ -98,7 +174,8 @@ class CallRecord:
         # 录音缓冲用 chunk list（append 引用 O(1)），不用 bytearray——
         # 长通话时 extend 会在锁内触发大 buffer 扩容拷贝，造成音频抖动。
         self._uplink: list[bytes] = []
-        self._downlink: list[bytes] = []
+        self._uplink_bytes = 0  # 上行累计字节数：作为下行(AI)分块的时间轴锚点
+        self._downlink: list[tuple[int, bytes]] = []  # (上行位置, AI PCM)
         self._answered = False
         self._finished = False
 
@@ -136,6 +213,7 @@ class CallRecord:
         with self._lock:
             if not self._finished:
                 self._uplink.append(pcm8k)
+                self._uplink_bytes += len(pcm8k)
 
     def write_downlink(self, pcm8k: bytes) -> None:
         """追加下行 PCM（8kHz 16bit mono）；录音关闭时 no-op。"""
@@ -143,7 +221,8 @@ class CallRecord:
             return
         with self._lock:
             if not self._finished:
-                self._downlink.append(pcm8k)
+                # 打上"此刻上行已累计字节数"作为时间轴位置，供合成对齐。
+                self._downlink.append((self._uplink_bytes, pcm8k))
 
     # ---- 低频路径：允许磁盘 IO ----
 
@@ -192,9 +271,11 @@ class CallRecord:
             event_lines = self._event_lines
             self._event_lines = []
             uplink = b"".join(self._uplink)
-            downlink = b"".join(self._downlink)
+            downlink_chunks = self._downlink
+            downlink = b"".join(pcm for _, pcm in downlink_chunks)
             answered = self._answered
             self._uplink = []
+            self._uplink_bytes = 0
             self._downlink = []
 
         # 磁盘 IO 全部在热路径锁外完成；disk_lock 与迟到摘要更新串行化。
@@ -207,6 +288,9 @@ class CallRecord:
                 if self.recording_enabled:
                     _write_wav(self.path / "uplink.wav", uplink)
                     _write_wav(self.path / "downlink.wav", downlink)
+                    mixed = _build_stereo_mix(uplink, downlink_chunks)
+                    if mixed:
+                        _write_wav_stereo(self.path / "mixed.wav", mixed)
                 with self._lock:
                     self._content_updated_at = max(
                         self._content_updated_at, ended_at

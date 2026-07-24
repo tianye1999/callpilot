@@ -1271,7 +1271,7 @@ const I18N = {
     hist_delete: "Delete", hist_delete_title: "Delete this call record?",
     hist_delete_msg: "This call's timeline and recordings will be deleted.",
     hist_deleted: "Deleted", hist_delete_fail: "Delete failed: ",
-    rec_ai: "AI voice", rec_peer: "Caller",
+    rec_ai: "AI voice", rec_peer: "Caller", rec_conversation: "Conversation recording",
     dir_in: "Inbound", dir_out: "Outbound",
     stc_completed: "Completed", stc_failed: "Failed", stc_not_connected: "No answer",
     unknown_number: "Unknown",
@@ -1441,7 +1441,7 @@ const I18N = {
     hist_delete: "删除", hist_delete_title: "删除这条通话记录？",
     hist_delete_msg: "这条通话的事件和录音会被删除。",
     hist_deleted: "已删除", hist_delete_fail: "删除失败：",
-    rec_ai: "AI 下行", rec_peer: "对方上行",
+    rec_ai: "AI 下行", rec_peer: "对方上行", rec_conversation: "通话录音",
     dir_in: "呼入", dir_out: "呼出",
     stc_completed: "已完成", stc_failed: "异常", stc_not_connected: "未接通",
     unknown_number: "未知号码",
@@ -2444,21 +2444,20 @@ function evDetail(ev) {
   return "";
 }
 function buildRecPlayers(id) {
-  // 录音播放器：走浏览器 <audio>（Chrome→系统音频），绕开本机 PortAudio/ffmpeg 播放问题。
+  // 单条合成对话录音（立体声 左=AI / 右=对方）。走浏览器 <audio>（Chrome→系统音频），
+  // 绕开本机 PortAudio/ffmpeg 播放问题。
   const box = el("div", "rec-audio");
   box.addEventListener("click", (event) => event.stopPropagation());
-  for (const [track, label] of [["downlink", t("rec_ai")], ["uplink", t("rec_peer")]]) {
-    const row = el("div", "rec-row");
-    row.addEventListener("click", (event) => event.stopPropagation());
-    row.appendChild(el("span", "rec-label", label));
-    const a = document.createElement("audio");
-    a.controls = true;
-    a.preload = "none";
-    a.src = `/api/history/${encodeURIComponent(id)}/audio/${track}`;
-    a.addEventListener("click", (event) => event.stopPropagation());
-    row.appendChild(a);
-    box.appendChild(row);
-  }
+  const row = el("div", "rec-row");
+  row.addEventListener("click", (event) => event.stopPropagation());
+  row.appendChild(el("span", "rec-label", t("rec_conversation")));
+  const a = document.createElement("audio");
+  a.controls = true;
+  a.preload = "none";
+  a.src = `/api/history/${encodeURIComponent(id)}/audio/mixed`;
+  a.addEventListener("click", (event) => event.stopPropagation());
+  row.appendChild(a);
+  box.appendChild(row);
   return box;
 }
 async function loadTimeline(tl, id) {

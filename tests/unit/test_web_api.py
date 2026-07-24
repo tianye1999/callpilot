@@ -728,6 +728,26 @@ def test_history_audio_serves_recorded_wav(tmp_path):
     assert len(api(app, fn)) > 44  # WAV 头 + 采样数据
 
 
+def test_history_audio_serves_mixed_wav(tmp_path):
+    """合成对话录音(mixed)必须可回放：track=mixed 返回 WAV（回归：曾因未加入白名单被 400）。"""
+    call_logger = CallLogger(base_dir=tmp_path / "calls", recording_enabled=True)
+    rec = call_logger.begin_call("outbound", "10086")
+    rec.write_uplink(b"\x02\x00" * 200)
+    rec.write_downlink(b"\x01\x00" * 200)
+    rec.finish("completed")
+    app = make_app(FakeService(call_logger=call_logger))
+
+    async def fn(client):
+        resp = await client.get(f"/api/history/{rec.id}/audio/mixed")
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "audio/wav"
+        body = await resp.read()
+        assert body[:4] == b"RIFF"  # WAV 头
+        return body
+
+    assert len(api(app, fn)) > 44
+
+
 def test_history_audio_uplink_amplified(tmp_path, monkeypatch):
     """上行回放前放大到可闻：原始极轻的样本经路由后峰值明显变大。"""
     monkeypatch.setenv("MONITOR_UPLINK_GAIN", "10")

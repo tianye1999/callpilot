@@ -950,11 +950,12 @@ async def _history_events(request: web.Request) -> web.Response:
     return web.json_response(events)
 
 
-_AUDIO_TRACKS = {"uplink", "downlink"}
+_AUDIO_TRACKS = {"uplink", "downlink", "mixed"}
 
 
 async def _history_audio(request: web.Request) -> web.StreamResponse:
-    """播放某通录音：downlink=AI 下行，uplink=对方上行（WAV，供浏览器 <audio> 播放）。
+    """播放某通录音（WAV，供浏览器 <audio> 播放）。
+    track：mixed=合成对话(立体声 左=AI/右=对方)、downlink=AI 下行、uplink=对方上行。
 
     浏览器播放走 Chrome→系统音频，绕开本机 PortAudio/ffmpeg 播放通道的已知问题，
     是听 AI 到底说了什么最稳的途径（配合实时转写）。
@@ -966,7 +967,7 @@ async def _history_audio(request: web.Request) -> web.StreamResponse:
         return web.json_response({"ok": False, "error": "非法的通话 ID"}, status=400)
     if track not in _AUDIO_TRACKS:
         return web.json_response(
-            {"ok": False, "error": "track 只能是 downlink/uplink"}, status=400
+            {"ok": False, "error": "track 只能是 downlink/uplink/mixed"}, status=400
         )
     wav_path = Path(service.call_logger.base_dir) / call_id / f"{track}.wav"
     if not wav_path.is_file():
