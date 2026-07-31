@@ -111,6 +111,12 @@ v0.4.0 adds several call-quality controls for outbound work:
 macOS has **no native serial port** for Quectel vendor interfaces, so a
 USB→PTY bridge (`scripts/ec20_usb_pty.py`) exposes `/tmp/ec20-at`.
 
+The bridge looks for `2c7c:0125` (EC20/EG25) by default. Another libusb-reachable
+vendor-serial module can be targeted with `--vid`/`--pid` (hex), e.g. a SIMCom
+SIM7600: `--vid 1e0e --pid 9001`. Use `--list`/`--probe` to find its AT interface.
+This only moves bulk-endpoint bytes — the rest of the call chain is still tuned
+for the EC20, so a non-Quectel module is not a supported end-to-end configuration.
+
 ### Get the hardware
 
 You need a **Quectel EC20 or EG25** 4G modem (this build is verified against
@@ -432,6 +438,11 @@ v0.4.0 增加了几项面向外呼质量的控制：
 
 macOS 没有 Quectel 厂商串口的原生设备，需先跑 USB→PTY 桥（`scripts/ec20_usb_pty.py`）
 暴露出 `/tmp/ec20-at`。
+
+桥默认找 `2c7c:0125`（EC20/EG25）；其他 libusb 可达的厂商串口模组用 `--vid`/`--pid`
+指定（十六进制），例如 SIMCom SIM7600：`--vid 1e0e --pid 9001`，AT 口序号可用
+`--list`/`--probe` 探测。桥只搬运 bulk 端点字节，通话链路其余部分仍按 EC20 调校，
+非 Quectel 模组不属于端到端支持的配置。
 
 ### 硬件准备
 

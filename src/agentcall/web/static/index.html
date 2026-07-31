@@ -407,6 +407,18 @@
     font-size: 11px; line-height: 1.45; overflow-wrap: anywhere;
   }
   .tag-restart { font-size: 10px; color: var(--warn); margin-left: 6px; }
+  /* SIM PIN 解锁横幅:卡锁着时通话链路全不可用,置于主页顶部而非设置里 */
+  .sim-lock { display: none; margin-bottom: 12px; padding: 12px 14px; border-radius: 12px;
+    background: var(--warn-dim); border: 1px solid rgba(255,214,10,.32); }
+  .sim-lock.show { display: block; }
+  .sim-lock-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    font-size: 13px; font-weight: 700; color: var(--warn); }
+  .sim-lock-attempts { font-size: 11px; font-weight: 600; color: var(--muted); }
+  .sim-lock-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .sim-lock-row input { flex: 0 1 140px; font-family: var(--mono); letter-spacing: 3px; }
+  .sim-lock-msg { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .sim-lock-msg.err { color: var(--err); }
+  .sim-lock-msg.ok { color: var(--ok); }
   .cfg-row input[type=text], .cfg-row input[type=password], .cfg-row input[type=number], .cfg-row select {
     width: 200px; background: var(--well); border: 1px solid var(--border);
     color: var(--text); border-radius: 9px; padding: 7px 10px; font-size: 13px; font-family: var(--mono);
@@ -785,6 +797,18 @@
     <!-- 电话（主页，poc 双卡） -->
     <div class="panel-page active" id="page-phone">
       <div class="wrap">
+        <div class="sim-lock" id="simLock">
+          <div class="sim-lock-head">
+            <span data-i18n="sim_lock_title"></span>
+            <span class="sim-lock-attempts" id="simLockAttempts"></span>
+          </div>
+          <div class="sim-lock-row">
+            <input id="simPin" type="password" inputmode="numeric" autocomplete="off"
+                   maxlength="8" data-i18n-ph="sim_lock_ph" />
+            <button class="btn sm primary" id="simUnlockBtn" data-i18n="sim_lock_unlock"></button>
+          </div>
+          <div class="sim-lock-msg" id="simLockMsg"></div>
+        </div>
         <section class="card">
           <div class="home-grid">
             <div class="dial-col">
@@ -1296,6 +1320,15 @@ const I18N = {
     setup_finish: "Finish", setup_steps: ["Hardware", "API Key", "Personalize", "Recording", "Self-test", "Done"],
     setup_hw_title: "Hardware check", setup_hw_hint: "Plug in the EC20/EG25 module and keep the AT port connected. This check does not block setup.",
     setup_usb: "USB module", setup_at: "AT port", setup_port: "Port", setup_sim: "SIM",
+    sim_lock_title: "SIM is locked — PIN required",
+    sim_lock_ph: "SIM PIN",
+    sim_lock_unlock: "Unlock",
+    sim_lock_attempts: (n) => `${n} attempt(s) left`,
+    sim_lock_attempts_unknown: "attempts left: unknown",
+    sim_lock_puk: "SIM is PUK-locked. Unlock it in a phone — CallPilot will not send a PIN.",
+    sim_lock_working: "Unlocking…",
+    sim_lock_ok: "SIM unlocked.",
+    sim_lock_badpin: "A SIM PIN is 4-8 digits.",
     setup_hw_ok: "Hardware looks ready.", setup_hw_wait: "Hardware is not fully ready yet. You can continue and retry after plugging it in.",
     setup_key_title: "Provider API key", setup_key_hint: "Qwen and OpenAI keys are validated online before saving. The key is never echoed back.",
     setup_qwen_key_help: {
@@ -1466,6 +1499,15 @@ const I18N = {
     setup_finish: "完成", setup_steps: ["硬件", "API Key", "个性化", "通话录音", "自测", "完成"],
     setup_hw_title: "硬件检测", setup_hw_hint: "请插入 EC20/EG25 模组并保持 AT 口连接。本检测不阻塞后续配置。",
     setup_usb: "USB 模组", setup_at: "AT 口", setup_port: "端口", setup_sim: "SIM 卡",
+    sim_lock_title: "SIM 卡已锁定，需要 PIN 码",
+    sim_lock_ph: "SIM PIN",
+    sim_lock_unlock: "解锁",
+    sim_lock_attempts: (n) => `剩余 ${n} 次尝试`,
+    sim_lock_attempts_unknown: "剩余次数未知",
+    sim_lock_puk: "SIM 已被 PUK 锁定，请在手机上解锁；CallPilot 不会下发 PIN。",
+    sim_lock_working: "解锁中…",
+    sim_lock_ok: "SIM 已解锁。",
+    sim_lock_badpin: "PIN 应为 4-8 位数字。",
     setup_hw_ok: "硬件状态看起来已就绪。", setup_hw_wait: "硬件暂未完全就绪。你可以继续配置，插好后再重试。",
     setup_key_title: "Provider API Key", setup_key_hint: "Qwen 与 OpenAI 会先在线校验再保存；Key 不会被回显。",
     setup_qwen_key_help: {
@@ -1765,12 +1807,70 @@ async function loadMeta() {
     $("provider").textContent = m.provider || "-";
     $("portSub").textContent = t("modem_prefix") + (m.port || "-");
     renderSetupHardware();
+    renderSimLock();
     syncRecordingUi();
     if (m.setup_required && !$("setupWizard").classList.contains("show")) {
       showSetupWizard(false, m);
     }
   } catch (e) { console.warn("[meta] 加载运行信息失败", e); }
 }
+
+/* ========= SIM PIN 解锁：卡锁着时 CIMI/COPS 全 ERROR，通话链路整条不可用 ========= */
+function renderSimLock() {
+  const box = $("simLock");
+  if (!box) return;
+  const sim = (lastMeta || {}).sim || {};
+  box.classList.toggle("show", !!sim.locked);
+  if (!sim.locked) return;
+
+  const n = sim.pin_attempts;
+  $("simLockAttempts").textContent =
+    typeof n === "number" && n >= 0 ? t("sim_lock_attempts")(n) : t("sim_lock_attempts_unknown");
+
+  // PUK 锁不是输 PIN 能解的，收起输入框免得用户白试。
+  const puk = (sim.lock_state || "").indexOf("PUK") >= 0;
+  $("simPin").style.display = puk ? "none" : "";
+  $("simUnlockBtn").style.display = puk ? "none" : "";
+  if (puk) simLockMsg(t("sim_lock_puk"), "err");
+}
+
+function simLockMsg(text, kind) {
+  const node = $("simLockMsg");
+  node.className = "sim-lock-msg" + (kind ? " " + kind : "");
+  node.textContent = text || "";
+}
+
+async function unlockSim() {
+  const input = $("simPin");
+  const pin = (input.value || "").trim();
+  if (!/^\d{4,8}$/.test(pin)) { simLockMsg(t("sim_lock_badpin"), "err"); return; }
+
+  const btn = $("simUnlockBtn");
+  btn.disabled = true;
+  simLockMsg(t("sim_lock_working"), "");
+  try {
+    const r = await fetch("/api/sim/unlock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) { simLockMsg(data.error || ("HTTP " + r.status), "err"); return; }
+    simLockMsg(t("sim_lock_ok"), "ok");
+    if (lastMeta) lastMeta.sim = data.sim;
+    renderSetupHardware();
+    renderSimLock();
+  } catch (e) {
+    simLockMsg(String(e), "err");
+  } finally {
+    // PIN 明文不在页面里留存，成功失败都清空。
+    input.value = "";
+    btn.disabled = false;
+  }
+}
+
+$("simUnlockBtn").addEventListener("click", unlockSim);
+$("simPin").addEventListener("keydown", (e) => { if (e.key === "Enter") unlockSim(); });
 
 /* ========= 实时旁听：Web Audio 播放下行 PCM（走浏览器→系统音频，绕开 native）========= */
 // 下行(AI)与上行(对方)各一条播放时间线，按帧首字节的方向标记分流，两路同时出声。
@@ -2784,7 +2884,7 @@ function renderSetupHardware() {
   const sim = meta.sim || {};
   const simText = sim.present
     ? `${sim.carrier} · ${sim.reg_status}` + (sim.service_number ? ` · 客服 ${sim.service_number}` : "")
-    : "-";
+    : sim.locked ? t("sim_lock_title") : "-";
   for (const [label, value] of [
     [t("setup_usb"), statusWord(!!hw.usb_online)],
     [t("setup_at"), statusWord(!!hw.modem_connected)],

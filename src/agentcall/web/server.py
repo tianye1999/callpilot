@@ -81,42 +81,61 @@ def _pyusb_backend():
     return usb.backend.libusb1.get_backend(find_library=find_library)
 
 
-def _detect_quectel_usb_pyusb() -> bool:
+def modem_usb_vid() -> int:
+    """安装向导扫描用的模组 USB 厂商号;配置非法时退回 Quectel 默认值。
+
+    非 Quectel 模组(如 SIMCom SIM7600)只有配对了 VID,向导才不会一直报
+    「硬件尚未就绪」——模组能用但检测按厂商号写死是历史遗留。
+    """
+    raw = (config.get_str("MODEM_USB_VID") or "").strip()
+    try:
+        vid = int(raw, 16)
+    except ValueError:
+        logger.warning("MODEM_USB_VID 不是合法十六进制(%r),回退 Quectel 默认值", raw)
+        return QUECTEL_VID
+    if not 0 <= vid <= 0xFFFF:
+        logger.warning("MODEM_USB_VID 超出 16 位范围(%r),回退 Quectel 默认值", raw)
+        return QUECTEL_VID
+    return vid
+
+
+def _detect_quectel_usb_pyusb(vid: int) -> bool:
     try:
         import usb.core
     except Exception as exc:  # noqa: BLE001
-        logger.debug("PyUSB unavailable for Quectel scan: %s", exc)
+        logger.debug("PyUSB unavailable for modem scan: %s", exc)
         return False
     try:
         return any(
             True
             for _dev in usb.core.find(
                 find_all=True,
-                idVendor=QUECTEL_VID,
+                idVendor=vid,
                 backend=_pyusb_backend(),
             )
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("PyUSB Quectel scan failed: %s", exc)
+        logger.debug("PyUSB modem scan failed: %s", exc)
         return False
 
 
-def _usb_tree_has_quectel(node) -> bool:
+def _usb_tree_has_quectel(node, vid: int) -> bool:
+    hex_vid = f"0x{vid:04x}"
     if isinstance(node, dict):
         for key, value in node.items():
             if key == "vendor_id":
-                if isinstance(value, int) and value == QUECTEL_VID:
+                if isinstance(value, int) and value == vid:
                     return True
-                if isinstance(value, str) and "0x2c7c" in value.lower():
+                if isinstance(value, str) and hex_vid in value.lower():
                     return True
-            if _usb_tree_has_quectel(value):
+            if _usb_tree_has_quectel(value, vid):
                 return True
     elif isinstance(node, list):
-        return any(_usb_tree_has_quectel(item) for item in node)
+        return any(_usb_tree_has_quectel(item, vid) for item in node)
     return False
 
 
-def _detect_quectel_usb_system_profiler() -> bool:
+def _detect_quectel_usb_system_profiler(vid: int) -> bool:
     try:
         result = subprocess.run(
             ["system_profiler", "SPUSBDataType", "-json"],
@@ -136,19 +155,23 @@ def _detect_quectel_usb_system_profiler() -> bool:
     except json.JSONDecodeError as exc:
         logger.debug("system_profiler Quectel scan JSON invalid: %s", exc)
         return False
-    return _usb_tree_has_quectel(data)
+    return _usb_tree_has_quectel(data, vid)
 
 
 def detect_quectel_usb_online() -> bool:
-    """Best-effort EC20/EG25 USB VID presence check for the setup wizard."""
+    """Best-effort modem USB VID presence check for the setup wizard.
+
+    扫描的 VID 来自 ``MODEM_USB_VID``(默认 Quectel 2c7c)。
+    """
+    vid = modem_usb_vid()
     if platforms.IS_MACOS:
-        if _detect_quectel_usb_pyusb():
+        if _detect_quectel_usb_pyusb(vid):
             return True
-        return _detect_quectel_usb_system_profiler()
+        return _detect_quectel_usb_system_profiler(vid)
     try:
-        return any(getattr(port, "vid", None) == QUECTEL_VID for port in list_ports.comports())
+        return any(getattr(port, "vid", None) == vid for port in list_ports.comports())
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Quectel USB scan failed: %s", exc)
+        logger.debug("Modem USB scan failed: %s", exc)
         return False
 
 
@@ -263,6 +286,7 @@ def build_app(
     app.router.add_post("/api/call/dial", _dial)
     app.router.add_post("/api/call/hangup", _hangup)
     app.router.add_post("/api/call/dtmf", _dtmf)
+    app.router.add_post("/api/sim/unlock", _sim_unlock)
     app.router.add_get("/api/remote_dialer/status", _remote_dialer_status)
     app.router.add_post("/api/remote_dialer/invite", _remote_dialer_invite)
     app.router.add_post("/api/remote_dialer/cancel", _remote_dialer_cancel)
@@ -537,6 +561,31 @@ async def _dtmf(request: web.Request) -> web.Response:
     if not ok and err == "当前没有进行中的通话":
         return web.json_response({"ok": False, "error": err}, status=409)
     return web.json_response({"ok": bool(ok)})
+
+
+async def _sim_unlock(request: web.Request) -> web.Response:
+    """用用户输入的 PIN 解锁 SIM。
+
+    PIN 只在本进程内转发给模组:不落日志、不落配置、不进 SSE/WS 事件。
+    """
+    service = require_service(request)
+    modem = getattr(service, "modem", None)
+    if modem is None or not getattr(service, "modem_connected", False):
+        return web.json_response({"ok": False, "error": "模组未连接"}, status=409)
+
+    data = await read_json(request)
+    pin = str(data.get("pin") or "")
+
+    loop = asyncio.get_running_loop()
+    try:
+        sim = await loop.run_in_executor(None, modem.unlock_sim, pin)
+    except ValueError as exc:
+        # 校验失败/次数不足属用户可修正的输入问题,回 400 带原因。
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except Exception:  # noqa: BLE001
+        logger.exception("SIM 解锁失败")
+        return web.json_response({"ok": False, "error": "模组通信失败"}, status=502)
+    return web.json_response({"ok": True, "sim": sim.as_dict()})
 
 
 async def _remote_dialer_status(request: web.Request) -> web.Response:

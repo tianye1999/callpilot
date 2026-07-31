@@ -8,6 +8,29 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
 
 ### Added
 
+- **`MODEM_USB_VID` for the setup wizard's hardware check**: the "USB module"
+  probe matched the Quectel VID (`2c7c`) unconditionally, so a working
+  non-Quectel module still reported "hardware is not fully ready yet". The
+  scanned VID is now configurable (hex, default `2c7c`) across all three probe
+  paths — PyUSB, `system_profiler`, and the non-macOS serial scan — and falls
+  back to the default with a warning if misconfigured. Set it to match
+  `scripts/ec20_usb_pty.py --vid` (e.g. `1e0e` for SIMCom SIM7600).
+- **SIM PIN unlock from the web UI**: a PIN-locked SIM used to surface only as
+  "SIM 识别失败(未插卡/未就绪)" — `AT+CIMI`/`AT+COPS?` fail identically whether the
+  card is missing or locked, leaving no way to act. The modem layer now reads
+  `AT+CPIN?`/`AT+SPIC` into the SIM identity (`lock_state`, `lock_status`,
+  `pin_attempts`, `locked`), the phone page shows an unlock banner with the
+  remaining-attempt count, and `POST /api/sim/unlock` forwards the PIN to
+  `Eg25Modem.unlock_sim()`. The PIN is never logged, persisted, or echoed back.
+  Unlocking is refused below 2 remaining attempts, and for PUK-locked cards, so a
+  mistyped PIN in the browser cannot push the card into a PUK lock.
+- **USB→PTY bridge `--vid`/`--pid` overrides**: `scripts/ec20_usb_pty.py` still
+  defaults to the Quectel EC20/EG25 (`2c7c:0125`), but can now be pointed at any
+  other libusb-reachable vendor-serial module (e.g. SIMCom SIM7600 with
+  `--vid 1e0e --pid 9001`). The bridge only moves bulk-endpoint bytes; the rest of
+  the call chain remains EC20-tuned, so non-Quectel modules are not a supported
+  end-to-end configuration.
+
 - **Mobile inbox and call history (#99)**: the paired iOS and Android apps now
   expose read-only SMS and call records (timeline, transcript and summary
   lifecycle), with bounded encrypted local caches, incremental pagination,

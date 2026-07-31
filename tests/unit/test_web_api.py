@@ -17,6 +17,7 @@ from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from agentcall import config, platforms
 from agentcall.call_log import CallLogger
 from agentcall.remote_pairing import RemotePairingStore
+from agentcall.sim_identity import identify, with_lock_state
 from agentcall.web import server
 from agentcall.web.server import _history_audio, _history_delete, _history_events, build_app
 
@@ -276,8 +277,8 @@ def test_setup_test_sms_allows_manual_rerun_after_setup_done(monkeypatch):
 
 def test_quectel_usb_detection_on_macos_uses_usb_scan(monkeypatch):
     monkeypatch.setattr(platforms, "IS_MACOS", True)
-    monkeypatch.setattr(server, "_detect_quectel_usb_pyusb", lambda: True)
-    monkeypatch.setattr(server, "_detect_quectel_usb_system_profiler", lambda: False)
+    monkeypatch.setattr(server, "_detect_quectel_usb_pyusb", lambda vid: True)
+    monkeypatch.setattr(server, "_detect_quectel_usb_system_profiler", lambda vid: False)
     monkeypatch.setattr(
         server.list_ports,
         "comports",
@@ -289,8 +290,8 @@ def test_quectel_usb_detection_on_macos_uses_usb_scan(monkeypatch):
 
 def test_quectel_usb_detection_on_macos_falls_back_to_system_profiler(monkeypatch):
     monkeypatch.setattr(platforms, "IS_MACOS", True)
-    monkeypatch.setattr(server, "_detect_quectel_usb_pyusb", lambda: False)
-    monkeypatch.setattr(server, "_detect_quectel_usb_system_profiler", lambda: True)
+    monkeypatch.setattr(server, "_detect_quectel_usb_pyusb", lambda vid: False)
+    monkeypatch.setattr(server, "_detect_quectel_usb_system_profiler", lambda vid: True)
 
     assert server.detect_quectel_usb_online() is True
 
@@ -298,7 +299,7 @@ def test_quectel_usb_detection_on_macos_falls_back_to_system_profiler(monkeypatc
 def test_quectel_usb_detection_on_non_macos_keeps_serial_scan(monkeypatch):
     monkeypatch.setattr(platforms, "IS_MACOS", False)
 
-    def fail_pyusb():
+    def fail_pyusb(vid):
         raise AssertionError("non-mac path must not use pyusb")
 
     monkeypatch.setattr(server, "_detect_quectel_usb_pyusb", fail_pyusb)
@@ -1595,3 +1596,142 @@ def test_meta_exposes_unknown_sim_block():
 
     sim = api(app, fn)["sim"]
     assert sim["present"] is False and sim["carrier"] == "未知"
+
+
+# ---- /api/sim/unlock ----
+
+
+class _UnlockModemStub:
+    """modem 替身:只提供 SIM 解锁路径用到的接口。"""
+
+    def __init__(self, result=None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.pins: list[str] = []
+
+    def unlock_sim(self, pin: str):
+        self.pins.append(pin)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def _unlock_app(modem_stub, *, connected: bool = True):
+    service = FakeService()
+    service.modem = modem_stub
+    service.modem_connected = connected
+    return make_app(service), service
+
+
+def test_sim_unlock_forwards_pin_and_returns_identity():
+    unlocked = with_lock_state(
+        identify("460000123456789\r\nOK", "+CREG: 0,1\r\nOK"), "+CPIN: READY\r\nOK"
+    )
+    modem = _UnlockModemStub(result=unlocked)
+    app, _ = _unlock_app(modem)
+
+    async def fn(client):
+        resp = await client.post("/api/sim/unlock", json={"pin": "1234"})
+        return resp.status, await resp.json()
+
+    status, body = api(app, fn)
+    assert status == 200 and body["ok"] is True
+    assert body["sim"]["locked"] is False
+    assert body["sim"]["carrier"] == "中国移动"
+    assert modem.pins == ["1234"]
+
+
+def test_sim_unlock_rejects_bad_pin_with_reason():
+    modem = _UnlockModemStub(error=ValueError("PIN 应为 4-8 位数字"))
+    app, _ = _unlock_app(modem)
+
+    async def fn(client):
+        resp = await client.post("/api/sim/unlock", json={"pin": "12"})
+        return resp.status, await resp.json()
+
+    status, body = api(app, fn)
+    assert status == 400
+    assert body == {"ok": False, "error": "PIN 应为 4-8 位数字"}
+
+
+def test_sim_unlock_requires_connected_modem():
+    """模组没连上时不该假装在解锁——回 409 而不是 500。"""
+    app, _ = _unlock_app(_UnlockModemStub(), connected=False)
+
+    async def fn(client):
+        resp = await client.post("/api/sim/unlock", json={"pin": "1234"})
+        return resp.status, await resp.json()
+
+    status, body = api(app, fn)
+    assert status == 409 and body["ok"] is False
+
+
+def test_sim_unlock_modem_failure_is_502_without_leaking_pin(caplog):
+    modem = _UnlockModemStub(error=RuntimeError("serial exploded 4321"))
+    app, _ = _unlock_app(modem)
+
+    async def fn(client):
+        resp = await client.post("/api/sim/unlock", json={"pin": "4321"})
+        return resp.status, await resp.json()
+
+    with caplog.at_level("ERROR"):
+        status, body = api(app, fn)
+    assert status == 502 and body["error"] == "模组通信失败"
+    # PIN 明文绝不出现在响应或日志里
+    assert "4321" not in json.dumps(body)
+    assert not any("4321" in r.getMessage() for r in caplog.records)
+
+
+# ---- MODEM_USB_VID:非 Quectel 模组的向导检测 ----
+
+
+def test_modem_usb_vid_defaults_to_quectel(monkeypatch):
+    monkeypatch.delenv("MODEM_USB_VID", raising=False)
+    assert server.modem_usb_vid() == server.QUECTEL_VID
+
+
+def test_modem_usb_vid_reads_hex_config(monkeypatch):
+    monkeypatch.setenv("MODEM_USB_VID", "1e0e")
+    assert server.modem_usb_vid() == 0x1E0E
+    monkeypatch.setenv("MODEM_USB_VID", "0X1E0E")
+    assert server.modem_usb_vid() == 0x1E0E
+
+
+def test_modem_usb_vid_falls_back_on_garbage(monkeypatch, caplog):
+    """配置写错不能让向导硬件检测直接炸——回退默认值并告警。"""
+    for bad in ("zzzz", "", "10000"):
+        monkeypatch.setenv("MODEM_USB_VID", bad)
+        with caplog.at_level("WARNING"):
+            assert server.modem_usb_vid() == server.QUECTEL_VID
+
+
+def test_usb_detection_uses_configured_vid_on_macos(monkeypatch):
+    """SIM7600(1e0e)插着时向导应报「已就绪」,而不是按 Quectel VID 报未插。"""
+    monkeypatch.setattr(platforms, "IS_MACOS", True)
+    monkeypatch.setenv("MODEM_USB_VID", "1e0e")
+    seen: list[int] = []
+    monkeypatch.setattr(
+        server, "_detect_quectel_usb_pyusb", lambda vid: (seen.append(vid), vid == 0x1E0E)[1]
+    )
+    assert server.detect_quectel_usb_online() is True
+    assert seen == [0x1E0E]
+
+
+def test_usb_detection_uses_configured_vid_on_non_macos(monkeypatch):
+    monkeypatch.setattr(platforms, "IS_MACOS", False)
+    monkeypatch.setenv("MODEM_USB_VID", "1e0e")
+    monkeypatch.setattr(
+        server.list_ports, "comports", lambda: [SimpleNamespace(vid=0x1E0E)]
+    )
+    assert server.detect_quectel_usb_online() is True
+    # 配回 Quectel 后同一台设备就不该再被认作模组
+    monkeypatch.setenv("MODEM_USB_VID", "2c7c")
+    assert server.detect_quectel_usb_online() is False
+
+
+def test_system_profiler_tree_matches_configured_vid():
+    tree = {"SPUSBDataType": [{"_items": [{"vendor_id": "0x1e0e  (SimTech)"}]}]}
+    assert server._usb_tree_has_quectel(tree, 0x1E0E) is True
+    assert server._usb_tree_has_quectel(tree, server.QUECTEL_VID) is False
+    # 整数形式的 vendor_id 同样要认
+    assert server._usb_tree_has_quectel({"vendor_id": 0x1E0E}, 0x1E0E) is True

@@ -250,6 +250,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", platforms.default_modem_port(),
                requires_restart=True),
     ConfigSpec("MODEM_BAUD", "串口波特率", "int", "115200", requires_restart=True),
+    # 安装向导的「USB 模组已插入」检测按此 VID 扫描(十六进制)。默认 Quectel;
+    # 换其他厂商串口模组(如 SIMCom SIM7600 = 1e0e)时改这里,否则模组明明能用
+    # 却一直显示「硬件尚未就绪」。与 scripts/ec20_usb_pty.py --vid 取值一致。
+    ConfigSpec("MODEM_USB_VID", "模组 USB 厂商号(hex)", "str", "2c7c"),
     ConfigSpec("MODEM_AUDIO_MODE", "模组音频模式", "select", platforms.default_audio_mode(),
                choices=("uac_ffmpeg", "uac", "nmea"), requires_restart=True),
     ConfigSpec("MODEM_AUDIO_KEYWORD", "UAC 声卡匹配关键字", "str", "Interface",

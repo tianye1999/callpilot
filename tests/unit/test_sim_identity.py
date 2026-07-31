@@ -7,8 +7,11 @@ import threading
 from agentcall.sim_identity import (
     UNKNOWN_SIM,
     identify,
+    parse_cpin,
     parse_creg,
     parse_imsi,
+    parse_pin_attempts,
+    with_lock_state,
     with_registration,
 )
 
@@ -302,3 +305,181 @@ def test_open_serial_enables_sim_and_registration_urcs_before_identity_refresh(m
 
     assert commands.index("AT+QSIMSTAT=1") < commands.index("AT+CIMI")
     assert commands.index("AT+CREG=1") < commands.index("AT+CIMI")
+
+
+# ---- parse_cpin / parse_pin_attempts / with_lock_state ----
+
+def test_parse_cpin_reads_lock_codes():
+    assert parse_cpin("+CPIN: READY\r\n\r\nOK") == "READY"
+    assert parse_cpin("+CPIN: SIM PIN\r\n\r\nOK") == "SIM PIN"
+    assert parse_cpin("+CPIN: SIM PUK\r\n\r\nOK") == "SIM PUK"
+    # 小写/多空格来自不同厂商固件,归一化为大写单空格
+    assert parse_cpin("+cpin:  sim   pin\r\nOK") == "SIM PIN"
+
+
+def test_parse_cpin_unknown_when_absent():
+    # 未插卡时模组只回 ERROR,没有 +CPIN 行——必须是"未知"而不是"锁着"
+    assert parse_cpin("+CME ERROR: 10") == ""
+    assert parse_cpin("ERROR") == ""
+    assert parse_cpin("") == ""
+
+
+def test_parse_pin_attempts_reads_first_field():
+    assert parse_pin_attempts("+SPIC: 3,10,1,10\r\nOK") == 3
+    assert parse_pin_attempts("+SPIC: 0,10,0,10\r\nOK") == 0
+
+
+def test_parse_pin_attempts_unknown_when_unsupported():
+    # Quectel 不支持 +SPIC,返回 -1(未知)而不是 0(会被误判成"已锁死")
+    assert parse_pin_attempts("ERROR") == -1
+    assert parse_pin_attempts("") == -1
+
+
+def test_with_lock_state_marks_locked_sim():
+    sim = with_lock_state(UNKNOWN_SIM, "+CPIN: SIM PIN\r\nOK", "+SPIC: 3,10,1,10\r\nOK")
+    assert sim.locked is True
+    assert sim.lock_state == "SIM PIN"
+    assert sim.lock_status == "等待 PIN"
+    assert sim.pin_attempts == 3
+
+
+def test_with_lock_state_ready_is_not_locked():
+    sim = with_lock_state(UNKNOWN_SIM, "+CPIN: READY\r\nOK", "ERROR")
+    assert sim.locked is False
+    assert sim.lock_status == "已解锁"
+    assert sim.pin_attempts == -1
+
+
+def test_unknown_lock_state_is_not_reported_as_locked():
+    # 读不到 CPIN 不等于锁着——否则未插卡会被误报成"需要 PIN"
+    assert with_lock_state(UNKNOWN_SIM, "ERROR").locked is False
+    assert UNKNOWN_SIM.locked is False
+
+
+def test_as_dict_exposes_locked_for_frontend():
+    sim = with_lock_state(UNKNOWN_SIM, "+CPIN: SIM PIN\r\nOK", "+SPIC: 2,10,1,10\r\nOK")
+    data = sim.as_dict()
+    assert data["locked"] is True
+    assert data["pin_attempts"] == 2
+    # 完整 IMSI 绝不出网
+    assert "imsi" not in data
+
+
+def test_identify_defaults_keep_lock_fields_unknown():
+    # 既有调用方(#88)不传锁状态时字段应为"未知",不影响原有语义
+    sim = identify("460110123456789\r\nOK", "+CREG: 0,1\r\nOK")
+    assert sim.lock_state == ""
+    assert sim.locked is False
+    assert sim.pin_attempts == -1
+
+
+# ---- modem 层接线:锁卡识别与 unlock_sim ----
+
+import pytest  # noqa: E402
+
+
+def test_modem_refresh_flags_locked_sim(monkeypatch, caplog):
+    """锁卡时 CIMI 必 ERROR:不能报成"未插卡",要报成"等待 PIN"。"""
+    modem = _make_modem(monkeypatch, {
+        "AT+CPIN?": "+CPIN: SIM PIN\r\nOK",
+        "AT+SPIC": "+SPIC: 3,10,1,10\r\nOK",
+        "AT+CIMI": "ERROR",
+        "AT+CREG?": "+CREG: 0,2\r\nOK",
+    })
+    with caplog.at_level("WARNING"):
+        modem.refresh_sim_identity()
+    sim = modem.sim_identity
+    assert sim.locked is True and sim.pin_attempts == 3
+    assert any("已锁定" in r.getMessage() for r in caplog.records)
+
+
+def test_modem_refresh_skips_cimi_retries_when_locked(monkeypatch):
+    """锁卡时重试 CIMI 三轮纯属白等,应直接跳过。"""
+    calls: list[str] = []
+    modem = _make_modem(monkeypatch, {})
+    monkeypatch.setattr(modem, "_send", lambda cmd: (calls.append(cmd), {
+        "AT+CPIN?": "+CPIN: SIM PIN\r\nOK",
+        "AT+SPIC": "+SPIC: 3,10,1,10\r\nOK",
+    }.get(cmd, "ERROR"))[1])
+    modem.refresh_sim_identity()
+    assert calls.count("AT+CIMI") == 0
+
+
+def test_modem_unlock_sends_pin_and_refreshes(monkeypatch):
+    state = {"locked": True}
+
+    def fake_send(cmd: str) -> str:
+        if cmd == "AT+CPIN?":
+            return "+CPIN: SIM PIN\r\nOK" if state["locked"] else "+CPIN: READY\r\nOK"
+        if cmd == "AT+SPIC":
+            return "+SPIC: 3,10,1,10\r\nOK"
+        if cmd == 'AT+CPIN="1234"':
+            state["locked"] = False
+            return "OK"
+        if cmd == "AT+CIMI":
+            return "ERROR" if state["locked"] else "460000123456789\r\nOK"
+        if cmd == "AT+CREG?":
+            return "+CREG: 0,1\r\nOK"
+        return "OK"
+
+    modem = _make_modem(monkeypatch, {})
+    monkeypatch.setattr(modem, "_send", fake_send)
+    sim = modem.unlock_sim("1234")
+    assert sim.locked is False
+    assert sim.carrier == "中国移动" and sim.service_number == "10086"
+
+
+def test_modem_unlock_rejects_malformed_pin_without_sending(monkeypatch):
+    """格式不对的 PIN 绝不下发——不能白白消耗模组的尝试次数。"""
+    calls: list[str] = []
+    modem = _make_modem(monkeypatch, {})
+    monkeypatch.setattr(modem, "_send", lambda cmd: (calls.append(cmd), "OK")[1])
+    for bad in ("", "12", "123456789", "12ab", "  "):
+        with pytest.raises(ValueError):
+            modem.unlock_sim(bad)
+    assert not any(c.startswith('AT+CPIN="') for c in calls)
+
+
+def test_modem_unlock_refuses_when_attempts_nearly_exhausted(monkeypatch):
+    """剩 1 次时拒绝下发:再错一次就是 PUK 锁死,代价远大于让用户拿手机解卡。"""
+    calls: list[str] = []
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPIN?":
+            return "+CPIN: SIM PIN\r\nOK"
+        if cmd == "AT+SPIC":
+            return "+SPIC: 1,10,1,10\r\nOK"
+        return "OK"
+
+    modem = _make_modem(monkeypatch, {})
+    monkeypatch.setattr(modem, "_send", fake_send)
+    with pytest.raises(ValueError, match="仅剩 1 次"):
+        modem.unlock_sim("1234")
+    assert not any(c.startswith('AT+CPIN="') for c in calls)
+
+
+def test_modem_unlock_refuses_puk_locked_card(monkeypatch):
+    modem = _make_modem(monkeypatch, {
+        "AT+CPIN?": "+CPIN: SIM PUK\r\nOK",
+        "AT+SPIC": "+SPIC: 0,10,1,10\r\nOK",
+    })
+    with pytest.raises(ValueError, match="PUK"):
+        modem.unlock_sim("1234")
+
+
+def test_modem_unlock_wrong_pin_raises_without_leaking_pin(monkeypatch):
+    def fake_send(cmd: str) -> str:
+        if cmd == "AT+CPIN?":
+            return "+CPIN: SIM PIN\r\nOK"
+        if cmd == "AT+SPIC":
+            return "+SPIC: 3,10,1,10\r\nOK"
+        if cmd.startswith('AT+CPIN="'):
+            return "+CME ERROR: incorrect password"
+        return "ERROR"
+
+    modem = _make_modem(monkeypatch, {})
+    monkeypatch.setattr(modem, "_send", fake_send)
+    with pytest.raises(ValueError) as excinfo:
+        modem.unlock_sim("9999")
+    assert "9999" not in str(excinfo.value)   # PIN 明文不进异常消息

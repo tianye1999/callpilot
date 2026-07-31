@@ -41,6 +41,23 @@ _SERVICE_NUMBERS: dict[str, str] = {
 
 _IMSI_RE = re.compile(r"\b(\d{14,15})\b")
 _CREG_RE = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?(\d+)(?:\s|$)")
+_CPIN_RE = re.compile(r"\+CPIN:\s*([A-Z0-9 ]+?)\s*(?:\r|\n|$)", re.IGNORECASE)
+# SIMCom +SPIC: <pin1>,<puk1>,<pin2>,<puk2> — 首字段是 PIN1 剩余次数。
+_SPIC_RE = re.compile(r"\+SPIC:\s*(\d+)")
+
+# CPIN <code>(3GPP TS 27.007):READY=无需密码;其余为等待某种密码。
+LOCK_READY = "READY"
+LOCK_PIN = "SIM PIN"
+LOCK_PUK = "SIM PUK"
+LOCK_UNKNOWN = ""
+
+_LOCK_LABELS = {
+    LOCK_READY: "已解锁",
+    LOCK_PIN: "等待 PIN",
+    LOCK_PUK: "已锁死(需 PUK)",
+    "SIM PIN2": "等待 PIN2",
+    "SIM PUK2": "等待 PUK2",
+}
 
 # CREG <stat> 语义(3GPP TS 27.007):1=已注册(本地),5=已注册(漫游)。
 _REGISTERED_STATS = {"1", "5"}
@@ -64,9 +81,21 @@ class SimIdentity:
     service_number: str      # 该运营商免费客服号;未识别为 ""
     registered: bool         # CS 域已注册(CREG 1/5)
     reg_status: str          # 注册状态人话(已注册/搜网中/…)
+    # PIN 锁状态:锁卡时 CIMI/COPS 全 ERROR,不区分「没插卡」与「卡锁着」
+    # 会让用户对着"SIM 识别失败"无从下手。
+    lock_state: str = LOCK_UNKNOWN   # CPIN 原文(READY / SIM PIN / SIM PUK);未知为 ""
+    lock_status: str = "未知"        # 锁状态人话
+    pin_attempts: int = -1           # 剩余 PIN1 尝试次数;未知为 -1
+
+    @property
+    def locked(self) -> bool:
+        """卡是否正等待密码。锁状态未知时不算锁——避免读不到 CPIN 就误报锁卡。"""
+        return self.lock_state not in (LOCK_UNKNOWN, LOCK_READY)
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data["locked"] = self.locked  # property 不进 asdict,显式补上供前端用
+        return data
 
 
 UNKNOWN_SIM = SimIdentity(
@@ -122,3 +151,35 @@ def with_registration(identity: SimIdentity, creg_raw: str) -> SimIdentity:
     """Return ``identity`` with only its cached CREG state updated."""
     registered, reg_status = parse_creg(creg_raw)
     return replace(identity, registered=registered, reg_status=reg_status)
+
+
+def parse_cpin(raw: str) -> str:
+    """从 AT+CPIN? 原始响应提取锁状态码(大写原文);读不到返回 ""。
+
+    响应形如 ``+CPIN: SIM PIN\\r\\n\\r\\nOK``;ERROR/+CME ERROR(未插卡)无 +CPIN 行,
+    此时返回 "" 表示未知,由调用方按「读不到 ≠ 锁着」处理。
+    """
+    m = _CPIN_RE.search(raw or "")
+    return " ".join(m.group(1).upper().split()) if m else LOCK_UNKNOWN
+
+
+def parse_pin_attempts(raw: str) -> int:
+    """从 AT+SPIC(SIMCom)原始响应提取剩余 PIN1 次数;读不到返回 -1。
+
+    Quectel 无此指令(返回 ERROR),识别不到即 -1,上层按「未知」处理而不是当成 0。
+    """
+    m = _SPIC_RE.search(raw or "")
+    return int(m.group(1)) if m else -1
+
+
+def with_lock_state(
+    identity: SimIdentity, cpin_raw: str, spic_raw: str = ""
+) -> SimIdentity:
+    """Return ``identity`` with its CPIN lock state / PIN attempt count updated."""
+    lock_state = parse_cpin(cpin_raw)
+    return replace(
+        identity,
+        lock_state=lock_state,
+        lock_status=_LOCK_LABELS.get(lock_state, "未知" if not lock_state else lock_state),
+        pin_attempts=parse_pin_attempts(spic_raw),
+    )

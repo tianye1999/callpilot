@@ -12,7 +12,17 @@ from typing import Callable
 import serial
 
 from . import config, platforms, port_detect
-from .sim_identity import UNKNOWN_SIM, SimIdentity, identify, with_registration
+from .sim_identity import (
+    LOCK_PIN,
+    LOCK_READY,
+    LOCK_UNKNOWN,
+    UNKNOWN_SIM,
+    SimIdentity,
+    identify,
+    parse_cpin,
+    with_lock_state,
+    with_registration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -256,8 +266,13 @@ class Eg25Modem:
         (需 +QSIMSTAT / +CREG=1 URC,列入 #88 follow-up)。CIMI 上电延迟已由
         本方法内短重试覆盖。
         """
+        # 先读锁状态:卡锁着时 CIMI 必然 ERROR,重试三轮纯属白等,且会把
+        # 「卡锁着」误报成「未插卡」。
+        cpin_raw, spic_raw = self._read_lock_state()
+        locked = parse_cpin(cpin_raw) not in (LOCK_UNKNOWN, LOCK_READY)
+
         imsi_raw = ""
-        for attempt in range(self._SIM_READ_RETRIES):
+        for attempt in range(0 if locked else self._SIM_READ_RETRIES):
             try:
                 imsi_raw = self._send("AT+CIMI")
             except (serial.SerialException, OSError):
@@ -284,15 +299,85 @@ class Eg25Modem:
             and expected_generation != self._sim_refresh_generation
         ):
             return
-        self._set_sim_identity(identify(imsi_raw, creg_raw), notify=notify)
+        self._set_sim_identity(
+            with_lock_state(identify(imsi_raw, creg_raw), cpin_raw, spic_raw),
+            notify=notify,
+        )
         sim = self._sim_identity
         if sim.present:
             logger.info(
                 "SIM 识别: %s (PLMN %s) → 免费客服 %s | 网络: %s",
                 sim.carrier, sim.plmn, sim.service_number or "?", sim.reg_status,
             )
+        elif sim.locked:
+            logger.warning(
+                "SIM 已锁定(%s),等待用户输入 PIN;剩余尝试: %s",
+                sim.lock_status,
+                sim.pin_attempts if sim.pin_attempts >= 0 else "未知",
+            )
         else:
             logger.warning("SIM 识别失败(未插卡/未就绪): %s", sim.reg_status)
+
+    def _read_lock_state(self) -> tuple[str, str]:
+        """读 (CPIN, SPIC) 原始响应;任一失败降级为 "",由解析层当「未知」处理。
+
+        传输层故障不在这里上抛:锁状态只是诊断信息,真正的连接健康判定仍由
+        后续 CIMI/CREG 的异常路径负责。
+        """
+        raws: list[str] = []
+        for cmd in ("AT+CPIN?", "AT+SPIC"):
+            try:
+                raws.append(self._send(cmd))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("%s 读取失败: %s", cmd, type(exc).__name__)
+                raws.append("")
+        return raws[0], raws[1]
+
+    # 低于此剩余次数拒绝下发 PIN:输错到 0 会把卡打进 PUK 锁(再错 10 次永久报废),
+    # 而 Web 端一次误点的代价远大于「让用户拿手机解一次卡」。
+    MIN_PIN_ATTEMPTS_TO_TRY = 2
+
+    def unlock_sim(self, pin: str) -> SimIdentity:
+        """用 ``pin`` 解锁 SIM,成功后重刷身份缓存并返回最新 SimIdentity。
+
+        安全边界:只接受 4-8 位数字;剩余次数已知且低于
+        ``MIN_PIN_ATTEMPTS_TO_TRY`` 时拒绝下发(见常量注释)。两种拒绝都抛
+        ``ValueError``,不消耗模组的任何一次尝试。
+        """
+        pin = (pin or "").strip()
+        if not pin.isdigit() or not 4 <= len(pin) <= 8:
+            raise ValueError("PIN 应为 4-8 位数字")
+
+        cpin_raw, spic_raw = self._read_lock_state()
+        state = parse_cpin(cpin_raw)
+        if state == LOCK_READY:
+            self.refresh_sim_identity()
+            return self._sim_identity
+        if state != LOCK_PIN:
+            raise ValueError(
+                f"当前 SIM 状态为 {state or '未知'},不接受 PIN"
+                + ("(需用 PUK 解锁)" if "PUK" in state else "")
+            )
+
+        remaining = with_lock_state(UNKNOWN_SIM, cpin_raw, spic_raw).pin_attempts
+        if 0 <= remaining < self.MIN_PIN_ATTEMPTS_TO_TRY:
+            raise ValueError(
+                f"仅剩 {remaining} 次尝试机会,已拒绝下发 PIN——"
+                "请在手机上解锁该卡或使用 PUK,避免误输导致 PUK 锁死"
+            )
+
+        # PIN 明文只在这一行存在;不进日志、不进异常消息、不进 SIM 身份缓存。
+        response = self._send(f'AT+CPIN="{pin}"')
+        if "ERROR" in response.upper():
+            self.refresh_sim_identity()
+            raise ValueError("PIN 校验失败,请核对后重试")
+
+        # 解锁后卡要重新上电注册,CIMI 会短暂 ERROR;沿用既有重试节奏等一拍。
+        time.sleep(self._SIM_READ_RETRY_DELAY)
+        self.refresh_sim_identity()
+        if self._sim_identity.locked:
+            raise ValueError("PIN 校验失败,请核对后重试")
+        return self._sim_identity
 
     @property
     def sim_identity(self) -> SimIdentity:

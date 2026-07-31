@@ -31,6 +31,11 @@ logger = logging.getLogger("ec20_usb_pty")
 VID = 0x2C7C
 PID = 0x0125
 
+# 其他 libusb 可达的厂商串口模组（如 SIMCom SIM7600 = 1e0e:9001）用 --vid/--pid 指向；
+# 桥只搬运 bulk 端点字节，与 AT 方言无关，但上层通话链路仍按 EC20 调校。
+DEFAULT_VID = VID
+DEFAULT_PID = PID
+
 LOCK_PATH = Path("/tmp/ec20-usb-pty.lock")
 
 
@@ -113,9 +118,9 @@ class BridgeHandle:
             path.unlink()
 
 
-def find_device() -> usb.core.Device:
+def find_device(vid: int = DEFAULT_VID, pid: int = DEFAULT_PID) -> usb.core.Device:
     try:
-        dev = usb.core.find(idVendor=VID, idProduct=PID, backend=libusb_backend())
+        dev = usb.core.find(idVendor=vid, idProduct=pid, backend=libusb_backend())
     except usb.core.NoBackendError:
         # pyusb 是纯 Python 包，真正的 USB 访问依赖系统 libusb；
         # 干净的 Mac 上没有它，裸 traceback 会劝退第一次跑桥的用户。
@@ -125,7 +130,7 @@ def find_device() -> usb.core.Device:
             "               sudo apt install libusb-1.0-0   (Debian/Ubuntu)"
         ) from None
     if dev is None:
-        raise RuntimeError("未找到 Quectel EC20/EG25 USB 设备 (2c7c:0125)")
+        raise RuntimeError(f"未找到 USB 设备 ({vid:04x}:{pid:04x})")
     return dev
 
 
@@ -295,15 +300,31 @@ def parse_map(value: str) -> tuple[int, str]:
     return iface, link
 
 
-def wait_for_device(stop: threading.Event, poll_seconds: float = 2.0) -> usb.core.Device | None:
-    """阻塞等待 EC20 出现（模组重插场景）；stop 置位时返回 None。"""
+def parse_usb_id(value: str) -> int:
+    """解析 --vid/--pid：一律按十六进制读（`1e0e` 与 `0x1e0e` 等价）。"""
+    try:
+        number = int(value, 16)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"USB ID 应为十六进制，例如 1e0e；收到 {value!r}") from exc
+    if not 0 <= number <= 0xFFFF:
+        raise argparse.ArgumentTypeError(f"USB ID 超出 16 位范围: {value!r}")
+    return number
+
+
+def wait_for_device(
+    stop: threading.Event,
+    poll_seconds: float = 2.0,
+    vid: int = DEFAULT_VID,
+    pid: int = DEFAULT_PID,
+) -> usb.core.Device | None:
+    """阻塞等待模组出现（重插场景）；stop 置位时返回 None。"""
     announced = False
     while not stop.is_set():
         try:
-            return find_device()
+            return find_device(vid, pid)
         except RuntimeError:
             if not announced:
-                logger.warning("未检测到 EC20 (2c7c:0125)，等待设备接入…")
+                logger.warning("未检测到模组 (%04x:%04x)，等待设备接入…", vid, pid)
                 announced = True
             stop.wait(poll_seconds)
     return None
@@ -360,6 +381,14 @@ def main() -> int:
         help="桥断开（设备拔出）后直接退出，不等待重插自动重连",
     )
     parser.add_argument("--log-file", help="同时把日志写入指定文件")
+    parser.add_argument(
+        "--vid", type=parse_usb_id, default=DEFAULT_VID, metavar="HEX",
+        help=f"USB Vendor ID，十六进制（默认 {DEFAULT_VID:04x} = Quectel）",
+    )
+    parser.add_argument(
+        "--pid", type=parse_usb_id, default=DEFAULT_PID, metavar="HEX",
+        help=f"USB Product ID，十六进制（默认 {DEFAULT_PID:04x} = EC20/EG25）",
+    )
     args = parser.parse_args()
 
     handlers: list[logging.Handler] = [logging.StreamHandler()]
@@ -374,7 +403,7 @@ def main() -> int:
     _lock = acquire_instance_lock()  # noqa: F841  # 持有到进程退出
 
     if args.list or args.probe:
-        dev = find_device()
+        dev = find_device(args.vid, args.pid)
         ports = discover_ports(dev)
         if args.list:
             for port in ports.values():
@@ -409,7 +438,7 @@ def main() -> int:
     fail_threshold = int(os.environ.get("EC20_BRIDGE_FAIL_THRESHOLD", "6"))
     backoff = 1.0
     while not stop.is_set():
-        dev = wait_for_device(stop)
+        dev = wait_for_device(stop, vid=args.vid, pid=args.pid)
         if dev is None:
             break
         started_at = time.monotonic()
