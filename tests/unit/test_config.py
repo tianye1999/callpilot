@@ -193,7 +193,7 @@ def test_modem_defaults_follow_platforms(monkeypatch):
     assert get_str("MODEM_PORT") == platforms.default_modem_port()
     assert get_str("MODEM_AUDIO_MODE") == platforms.default_audio_mode()
     # 音频模式的三个可选值不因平台默认变化而缩水
-    assert get_spec("MODEM_AUDIO_MODE").choices == ("uac_ffmpeg", "uac", "nmea")
+    assert get_spec("MODEM_AUDIO_MODE").choices == ("uac_ffmpeg", "uac", "nmea", "simcom_pcm")
 
 
 def test_runtime_paths_default_to_project_cwd_or_env_override(tmp_path, monkeypatch):
@@ -995,3 +995,12 @@ def test_dtmf_tone_numeric_ranges_rejected_on_write(tmp_path):
     assert set(updated) == {"DTMF_TONE_MS", "DTMF_TONE_AMPLITUDE"}
     os.environ.pop("DTMF_TONE_MS", None)
     os.environ.pop("DTMF_TONE_AMPLITUDE", None)
+
+
+def test_audio_mode_choices_include_simcom_pcm():
+    """simcom_pcm 必须在注册表 choices 内，否则设置面板写回会被校验拒绝。"""
+    spec = get_spec("MODEM_AUDIO_MODE")
+    assert "simcom_pcm" in spec.choices
+    # 既有模式一个都不能丢
+    assert {"uac", "uac_ffmpeg", "nmea"} <= set(spec.choices)
+    assert spec.default in spec.choices

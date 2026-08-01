@@ -231,8 +231,13 @@ class Eg25Modem:
         self._clcc_absent_count = 0
         self._clcc_fail_count = 0
         # EC20 NMEA PCM 上行流控：默认允许发送，仅在收到 +QPCMV:0,0 时暂停。
+        # SIMCom 无对应 URC，流控事件恒为置位（连续流，靠串口写超时自然背压）。
         self._pcm_ready_event = threading.Event()
         self._pcm_ready_event.set()
+        # 最近一次 initialize_for_voice 的模式，决定 hangup 用哪种方言关通道。
+        self._audio_mode = ""
+        # 语音 PCM 通道是否确实开着（simcom_pcm 下音频桥的启动前置条件）。
+        self._voice_pcm_active = False
 
     def connect(self) -> None:
         self._open_serial()
@@ -589,8 +594,9 @@ class Eg25Modem:
         return entries
 
     def initialize_for_voice(self, audio_mode: str = "uac") -> None:
-        """启用 EG25 语音 PCM 通道。"""
+        """启用语音 PCM 通道；记住模式供 hangup 用对应方言关闭。"""
         selected = audio_mode.lower()
+        self._audio_mode = selected
         # uac_ffmpeg 只是宿主侧换 ffmpeg 实现，模组侧同 UAC（AT+QPCMV=1,2）。
         if selected in ("uac", "uac_ffmpeg"):
             self._send('AT+QCFG="USBCFG",0x2C7C,0x0125,1,1,1,1,1,1,1')
@@ -603,7 +609,78 @@ class Eg25Modem:
             self._send("AT+QPCMV=1,0")
             logger.info("NMEA PCM 语音通道已启用 (AT+QPCMV=1,0)")
             return
-        raise ValueError("audio_mode 只能是 uac、uac_ffmpeg（仅 macOS）或 nmea")
+        if selected == "simcom_pcm":
+            self._enable_simcom_pcm()
+            return
+        raise ValueError(
+            "audio_mode 只能是 uac、uac_ffmpeg（仅 macOS）、nmea 或 simcom_pcm"
+        )
+
+    # 接通后 CPCMREG 要等模组内部把语音通道建起来才受理，等待时间不固定：
+    # 真机实测成功点散布在接通后 1.3s / 4.9s / 8.0s，2.5s 的窗口会漏掉后两种
+    # （2026-08-01 有一通就是重试 5 次全 ERROR、整通无声）。按最慢观测值留足余量。
+    _SIMCOM_PCM_ENABLE_TIMEOUT = 12.0
+    _SIMCOM_PCM_RETRY_DELAY = 0.5
+
+    def _enable_simcom_pcm(self) -> None:
+        """SIMCom(SIM7600 系)：AT+CPCMREG=1 把 PCM 推到 USB 音频接口。
+
+        与 Quectel 的关键差异：``AT+CPCMREG=1`` **只在通话中有效**，无通话时
+        模组回 ERROR。因此两条路径区别对待：
+
+        - 无通话（服务启动时的 supervisor）：ERROR 是正常的，静默略过。
+        - 通话中：ERROR 是真故障。重试若干次仍失败就抛——绝不能让上层带着
+          「PCM 没开」去启动音频桥，那会往不出流的端点写数据，触发
+          ``[Errno 60] Operation timed out`` 并连带把 AT 口的桥一起拖死
+          （真机 2026-08-01 实测，通话中途模组直接掉线）。
+        """
+        in_call = self._call_connected_event.is_set()
+        if in_call:
+            # 显式声明 8k PCM，不赖模组默认值（+CPCMFRM: 0=8000Hz, 1=16000Hz）。
+            # 老固件无此指令，ERROR 无害，故 best-effort 不判成败。
+            try:
+                self._send("AT+CPCMFRM=0")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("AT+CPCMFRM=0 失败（可忽略）: %s", type(exc).__name__)
+
+        deadline = time.monotonic() + self._SIMCOM_PCM_ENABLE_TIMEOUT
+        attempts = 0
+        while True:
+            attempts += 1
+            if "OK" in self._send("AT+CPCMREG=1").upper():
+                self._voice_pcm_active = True
+                logger.info(
+                    "SIMCom PCM 语音通道已启用 (AT+CPCMREG=1，第 %d 次尝试)", attempts
+                )
+                return
+            # 无通话时只试一次：ERROR 是必然结果，重试纯属浪费启动时间。
+            if not in_call or time.monotonic() >= deadline:
+                break
+            time.sleep(self._SIMCOM_PCM_RETRY_DELAY)
+
+        self._voice_pcm_active = False
+        if not in_call:
+            logger.info("AT+CPCMREG=1 暂不可用（无通话时模组必回 ERROR），接通后再启用")
+            return
+        raise RuntimeError(
+            f"通话中启用 SIMCom PCM 失败：AT+CPCMREG=1 在 "
+            f"{self._SIMCOM_PCM_ENABLE_TIMEOUT:.0f}s 内重试 {attempts} 次仍非 OK；"
+            "不启动音频桥，避免向未出流的 USB 端点写入拖死 AT 链路"
+        )
+
+    @property
+    def voice_pcm_active(self) -> bool:
+        """语音 PCM 通道当前是否确实已启用（simcom_pcm 路径的唯一事实来源）。"""
+        return self._voice_pcm_active
+
+    def _disable_voice_pcm(self) -> None:
+        """按当前音频模式关闭语音通道；模式未知时按 Quectel 处理（历史默认）。"""
+        if self._audio_mode == "simcom_pcm":
+            self._send("AT+CPCMREG=0")
+        else:
+            self._send("AT+QPCMV=0")
+        # 通道已关：下一通必须重新启用，绝不能让上一通的 True 泄漏过来。
+        self._voice_pcm_active = False
 
     def on_ring(self, callback: Callable[[str | None], None]) -> None:
         self._on_ring = callback
@@ -745,7 +822,7 @@ class Eg25Modem:
         # 不等待，持锁调用无死锁风险。
         with self._serial_lock:
             self._send("ATH")
-            self._send("AT+QPCMV=0")
+            self._disable_voice_pcm()
             self._pcm_ready_event.set()
             self._call_connected_event.clear()
             self._connected_call_ids.clear()

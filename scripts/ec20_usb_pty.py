@@ -38,6 +38,15 @@ DEFAULT_PID = PID
 
 LOCK_PATH = Path("/tmp/ec20-usb-pty.lock")
 
+# 单次 USB 写超时不致命（PCM 实时流常见）；连续这么多次才判定链路已死。
+WRITE_TIMEOUT_TOLERANCE = 10
+
+# 单次 bulk 写的等待上限。实时 PCM 下宁可快速丢帧也不能阻塞：8kHz/16bit 单声道
+# 是 16000 B/s，按 512 字节一写约 31 次/秒，原来的 1000ms 意味着一次卡顿就吞掉
+# ~31 帧、连续 10 次就是 10 秒哑音（真机 2026-08-01 实测）。200ms 仍远大于正常
+# 写入耗时，只是不再把实时流拖死。
+WRITE_TIMEOUT_MS = 200
+
 
 def bundled_libusb_path() -> Path | None:
     """Return bundled libusb dylib path when running from the macOS app."""
@@ -264,6 +273,11 @@ def bridge_port(
                     return
 
     def pty_to_usb() -> None:
+        # 写超时容忍：PCM 实时流下模组 OUT 端点可能瞬时写满。丢一帧音频远好过
+        # 拆掉整座桥——真机 2026-08-01：一次 [Errno 60] 把 AT 口的桥一起带走，
+        # 通话当场中断、模组随后掉线。读路径本就 continue 掉超时，写路径此前
+        # 却是致命的，这里补齐对称性；连续超时到阈值才判定链路真的死了。
+        consecutive_timeouts = 0
         while not stop.is_set():
             try:
                 ready, _, _ = select.select([master_fd], [], [], 0.1)
@@ -277,7 +291,25 @@ def bridge_port(
                 return
             if data:
                 try:
-                    dev.write(port.bulk_out, data, timeout=1000)
+                    dev.write(port.bulk_out, data, timeout=WRITE_TIMEOUT_MS)
+                    consecutive_timeouts = 0
+                except usb.core.USBTimeoutError:
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= WRITE_TIMEOUT_TOLERANCE:
+                        if not stop.is_set():
+                            logger.error(
+                                "interface %d 连续 %d 次 USB 写超时，判定链路已死",
+                                port.interface, consecutive_timeouts,
+                            )
+                        stop.set()
+                        return
+                    # 首次用 warning 提示，后续降到 debug，避免长通话刷屏。
+                    log = logger.warning if consecutive_timeouts == 1 else logger.debug
+                    log(
+                        "interface %d USB 写超时，丢弃 %d 字节（第 %d/%d 次）",
+                        port.interface, len(data), consecutive_timeouts,
+                        WRITE_TIMEOUT_TOLERANCE,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     if not stop.is_set():
                         logger.error("interface %d USB write failed: %s", port.interface, exc)

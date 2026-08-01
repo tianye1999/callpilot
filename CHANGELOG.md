@@ -8,6 +8,62 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
 
 ### Added
 
+- **`simcom_pcm` audio mode — SIMCom (SIM7600 family) PCM over USB, downlink only**:
+  the SIM7600 exposes no UAC sound card (all six USB interfaces are
+  vendor-specific), so `uac`/`uac_ffmpeg` cannot work on it. The new mode enables
+  PCM with `AT+CPCMREG=1` and carries it over the module's USB audio interface,
+  bridged to a PTY and consumed by the existing `SerialPcmAudioBridge` — set
+  `MODEM_AUDIO_MODE=simcom_pcm` and point `MODEM_PCM_PORT` at the bridged PTY
+  (`ec20_usb_pty.py --map 4:/tmp/ec20-pcm`). Unlike Quectel's `AT+QPCMV`,
+  `AT+CPCMREG=1` is only accepted **during** a call and its latency varies
+  (measured 1.3s–8.0s after connect), so it is retried within a 12s window and
+  the audio bridge refuses to start unless it actually succeeded.
+
+  **Known limitation — uplink does not work; PCM over USB appears transmit-only
+  on this module.** Agent → far end is verified on hardware (sustained
+  16.3 kB/s, speech spectrum, audible on the remote handset). Far end → agent
+  returns broadband noise instead of speech, at every energy layer, including a
+  41 s call with continuous speech from the far end.
+
+  Eliminated by measurement, so nobody need repeat it — scoring is the
+  low/high band-energy ratio, which reads ~16.7 for the working downlink and
+  ~1.0 for noise:
+
+  - decode of the same bytes as 16-bit LE / 16-bit BE / µ-law / A-law → 1.1–1.9
+  - one-byte sample realignment → no improvement (and it *breaks* the known-good
+    downlink, confirming the test discriminates)
+  - stereo de-interleaving, both channels → ~1.06
+  - other USB endpoints: interfaces 0, 1 and 5 emit **zero bytes** during a call
+  - audio routing sweep on a live call — `AT+CSDVC` 1/2/3 and `AT+CMIC=7` → 0.89
+    to 1.17. These commands *do* take effect (noise rms moved 3 198 → 15 701),
+    they change the noise floor and never its content.
+
+  That last point is the informative one: the receive direction still follows the
+  module's analog codec, whose input is unconnected on this board, so the far end's
+  voice never enters the USB PCM stream.
+
+  **Why USB Audio Class is not a way out on this firmware** (checked against the
+  `LE20B05V03SIM7600M21-A` image, so nobody need repeat it):
+
+  - the firmware *does* implement UAC — `usb_audio.c`, `uac2_func` and a
+    `create usb2audio_play` thread are all present in `system.img`/`modem.img`
+  - `AT+CUSBAUDIO` exists and is real: `+CUSBAUDIO: (0-1)`, factory default `0`
+  - setting it to `1` is accepted and reads back, but it is **volatile** (lost on
+    `AT+CFUN=1,1`) and does not trigger USB re-enumeration on its own
+  - `AT+CUSBPIDSWITCH=9001,1,1` (same PID) is a no-op — no re-enumeration
+  - the firmware's PID→composite table contains exactly one entry with audio,
+    `0x9056 → DIAG_ADB_SER_RMNET_MS_AUDIO`, and the module **rejects**
+    `AT+CUSBPIDSWITCH=9056,1,1` with `ERROR`
+  - every PID the module *does* accept (`9000`-`9007`, `9011`, `9016`,
+    `9018`-`901B`, `9020`-`902B`, `9031`, `9041`, `4D38`, `9059`) maps to a
+    composite without an audio interface
+
+  So the hardware is capable and the code is in the firmware, but this build
+  exposes no switchable USB configuration that enumerates a UAC device. Reaching
+  it would need different module firmware — verify on Windows with SIMCom's own
+  tooling first, where recovery from a bad USB config is possible.
+
+  Quectel EC20/EG25 paths are untouched and unaffected.
 - **`MODEM_USB_VID` for the setup wizard's hardware check**: the "USB module"
   probe matched the Quectel VID (`2c7c`) unconditionally, so a working
   non-Quectel module still reported "hardware is not fully ready yet". The

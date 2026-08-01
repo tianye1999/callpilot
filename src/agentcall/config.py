@@ -255,10 +255,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 却一直显示「硬件尚未就绪」。与 scripts/ec20_usb_pty.py --vid 取值一致。
     ConfigSpec("MODEM_USB_VID", "模组 USB 厂商号(hex)", "str", "2c7c"),
     ConfigSpec("MODEM_AUDIO_MODE", "模组音频模式", "select", platforms.default_audio_mode(),
-               choices=("uac_ffmpeg", "uac", "nmea"), requires_restart=True),
+               choices=("uac_ffmpeg", "uac", "nmea", "simcom_pcm"), requires_restart=True),
     ConfigSpec("MODEM_AUDIO_KEYWORD", "UAC 声卡匹配关键字", "str", "Interface",
                requires_restart=True),
-    # nmea 音频模式专用的 PCM 数据串口；uac/uac_ffmpeg 模式留空即可。
+    # nmea / simcom_pcm 音频模式专用的 PCM 数据串口；uac/uac_ffmpeg 模式留空即可。
     ConfigSpec("MODEM_PCM_PORT", "模组 PCM 串口", "str", "",
                requires_restart=True),
     ConfigSpec("MODEM_PCM_BAUD", "PCM 串口波特率", "int", "921600",

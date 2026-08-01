@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import subprocess
 import threading
 import time
@@ -322,3 +323,164 @@ def test_ffmpeg_bridge_constructs_on_macos(monkeypatch):
 def test_create_audio_bridge_invalid_mode_mentions_macos_constraint():
     with pytest.raises(ValueError, match="仅 macOS"):
         create_audio_bridge("bogus", "Interface", None, 921600)
+
+
+# ---- simcom_pcm 模式：SIMCom(SIM7600 系)PCM over USB ----
+
+
+def test_create_audio_bridge_simcom_pcm_uses_serial_bridge():
+    """SIMCom PCM 与 NMEA 同为 8k/mono 裸流，复用同一条串口传输实现。"""
+    bridge = create_audio_bridge(
+        mode="simcom_pcm",
+        device_keyword="",
+        pcm_port="/tmp/ec20-pcm",
+        pcm_baudrate=921600,
+        tx_gain=2.0,
+    )
+    assert isinstance(bridge, audio_bridge.SerialPcmAudioBridge)
+    assert bridge.port == "/tmp/ec20-pcm"
+    assert bridge.tx_gain == 2.0
+
+
+def test_create_audio_bridge_simcom_pcm_requires_pcm_port():
+    """漏配 MODEM_PCM_PORT 时要明确报错，而不是开一条读不到数据的空桥。"""
+    with pytest.raises(RuntimeError, match="MODEM_PCM_PORT"):
+        create_audio_bridge(
+            mode="simcom_pcm",
+            device_keyword="",
+            pcm_port="",
+            pcm_baudrate=921600,
+        )
+
+
+def test_create_audio_bridge_rejects_unknown_mode_listing_simcom():
+    with pytest.raises(ValueError, match="simcom_pcm"):
+        create_audio_bridge(
+            mode="not_a_mode",
+            device_keyword="",
+            pcm_port="",
+            pcm_baudrate=921600,
+        )
+
+
+# ---- PCM 口是 PTY 时的波特率兜底（真机 2026-08-01：921600 直接炸掉整通电话）----
+
+
+def test_serial_pcm_bridge_falls_back_when_pty_rejects_baudrate(monkeypatch):
+    """macOS PTY 只接受 ≤230400；921600 抛 ENOTTY 时应降速重开而不是让通话失败。"""
+    attempts: list[int] = []
+
+    def fake_serial(port, baudrate, timeout, write_timeout):
+        attempts.append(baudrate)
+        if baudrate > audio_bridge.PTY_SAFE_BAUDRATE:
+            raise OSError(errno.ENOTTY, "Inappropriate ioctl for device")
+        return _FakeSerial()
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", fake_serial)
+    bridge = audio_bridge.SerialPcmAudioBridge("/tmp/ec20-pcm", 921600)
+    bridge.start()
+    try:
+        assert attempts == [921600, audio_bridge.PTY_SAFE_BAUDRATE]
+    finally:
+        bridge.stop()
+
+
+def test_serial_pcm_bridge_keeps_real_serial_errors(monkeypatch):
+    """真串口的其他 OSError 不能被吞成"降速重试"——那会掩盖接错口之类的问题。"""
+
+    def fake_serial(port, baudrate, timeout, write_timeout):
+        raise OSError(errno.ENOENT, "No such file or directory")
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", fake_serial)
+    with pytest.raises(OSError) as excinfo:
+        audio_bridge.SerialPcmAudioBridge("/tmp/nope", 921600).start()
+    assert excinfo.value.errno == errno.ENOENT
+
+
+def test_serial_pcm_bridge_does_not_retry_when_already_safe(monkeypatch):
+    """已经是安全波特率还报 ENOTTY，说明是别的问题，不该无意义重试。"""
+    attempts: list[int] = []
+
+    def fake_serial(port, baudrate, timeout, write_timeout):
+        attempts.append(baudrate)
+        raise OSError(errno.ENOTTY, "Inappropriate ioctl for device")
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", fake_serial)
+    with pytest.raises(OSError):
+        audio_bridge.SerialPcmAudioBridge("/tmp/ec20-pcm", 115200).start()
+    assert attempts == [115200]
+
+
+class _FakeSerial:
+    """最小 pyserial 替身：只满足 SerialPcmAudioBridge.start/stop 的调用面。"""
+
+    is_open = True
+
+    def reset_input_buffer(self): pass
+    def reset_output_buffer(self): pass
+    def close(self): self.is_open = False
+    def read(self, n): return b""
+    def write(self, data): return len(data)
+
+
+# ---- PTY 半采样对齐（真机 2026-08-01：接通 4.3s 后必现，整通电话炸掉）----
+
+
+class _ChunkSerial(_FakeSerial):
+    """按脚本给定的分片返回，模拟 PTY 在采样中间切断的 read()。"""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    def read(self, n):
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+def _bridge_with(chunks):
+    bridge = audio_bridge.SerialPcmAudioBridge("/tmp/ec20-pcm", 115200)
+    bridge._ser = _ChunkSerial(chunks)
+    return bridge
+
+
+def test_read_chunk_holds_back_odd_trailing_byte():
+    """奇数字节直接进 np.frombuffer(int16) 会抛 buffer size 错误。"""
+    bridge = _bridge_with([b"\x01\x02\x03"])          # 3 字节 = 1.5 个采样
+    out = bridge.read_modem_chunk()
+    assert len(out) % 2 == 0
+    assert out == b"\x01\x02"
+    assert bridge._rx_carry == b"\x03"
+
+
+def test_read_chunk_rejoins_carry_without_losing_bytes():
+    """落单字节必须拼回下一块：丢掉会让后续采样整体错位半字节，全流变噪音。"""
+    bridge = _bridge_with([b"\x01\x02\x03", b"\x04\x05\x06"])
+    first = bridge.read_modem_chunk()
+    second = bridge.read_modem_chunk()
+    # 6 字节原样保序流出，一个不丢一个不乱
+    assert first + second == b"\x01\x02\x03\x04\x05\x06"
+    assert len(second) % 2 == 0
+
+
+def test_read_chunk_output_always_parses_as_int16():
+    """对任意分片方式，输出都必须能被 numpy 当 int16 解析。"""
+    import numpy as np
+
+    bridge = _bridge_with([b"\x01", b"\x02\x03", b"\x04\x05\x06\x07", b"\x08"])
+    for _ in range(4):
+        chunk = bridge.read_modem_chunk()
+        np.frombuffer(chunk, dtype=np.int16)   # 不抛即通过
+
+
+def test_start_clears_stale_carry(monkeypatch):
+    """上一通剩的半个字节不能漏到下一通，否则新流从一开始就错位。"""
+    monkeypatch.setattr(
+        audio_bridge.serial, "Serial",
+        lambda port, baudrate, timeout, write_timeout: _FakeSerial(),
+    )
+    bridge = audio_bridge.SerialPcmAudioBridge("/tmp/ec20-pcm", 115200)
+    bridge._rx_carry = b"\x99"
+    bridge.start()
+    try:
+        assert bridge._rx_carry == b""
+    finally:
+        bridge.stop()

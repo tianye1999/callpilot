@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import re
@@ -19,6 +20,9 @@ from . import platforms
 from .pcm_stats import PcmFlowStats
 
 logger = logging.getLogger(__name__)
+
+# macOS PTY 只接受 ≤230400；PCM 走桥出的 PTY 时用它兜底(见 _open_serial)。
+PTY_SAFE_BAUDRATE = 115200
 
 MODEM_RATE = 8000
 MODEM_CHANNELS = 1
@@ -153,6 +157,8 @@ class SerialPcmAudioBridge:
         self._ready_check: "Callable[[], bool] | None" = None
         self._ser: serial.Serial | None = None
         self._tx_buffer = bytearray()
+        # 上次读剩的半个采样（PTY 会在采样中间切断，见 read_modem_chunk）。
+        self._rx_carry = b""
         self._tx_lock = threading.Lock()
         self._writer_thread: threading.Thread | None = None
         self._running = False
@@ -161,13 +167,39 @@ class SerialPcmAudioBridge:
         self._last_stats_at = 0.0
         self._write_timeouts = 0
 
+    def _open_serial(self) -> serial.Serial:
+        """打开 PCM 串口；PTY 拒绝高波特率时降到 PTY 安全值重开。
+
+        simcom_pcm 模式下 MODEM_PCM_PORT 指向的是 ec20_usb_pty 桥出来的 **PTY**，
+        不是真串口：macOS 的 PTY 只接受 ≤230400，用 EC20 NMEA 口的 921600 会抛
+        ENOTTY，整通电话在 bridge.start() 就炸掉（真机 2026-08-01 实测）。
+        PTY 上波特率本就无物理意义（没有实际串行时序），降速不影响吞吐。
+        """
+        try:
+            return serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=0.02,
+                write_timeout=0.2,
+            )
+        except OSError as exc:
+            if exc.errno != errno.ENOTTY or self.baudrate <= PTY_SAFE_BAUDRATE:
+                raise
+            logger.warning(
+                "PCM 口 %s 不接受 %s 波特率（PTY 上限 %s），降速重开；"
+                "PTY 无物理串行时序，不影响音频吞吐",
+                self.port, self.baudrate, PTY_SAFE_BAUDRATE,
+            )
+            return serial.Serial(
+                port=self.port,
+                baudrate=PTY_SAFE_BAUDRATE,
+                timeout=0.02,
+                write_timeout=0.2,
+            )
+
     def start(self) -> None:
-        self._ser = serial.Serial(
-            port=self.port,
-            baudrate=self.baudrate,
-            timeout=0.02,
-            write_timeout=0.2,
-        )
+        self._ser = self._open_serial()
+        self._rx_carry = b""
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
         self._running = True
@@ -194,9 +226,22 @@ class SerialPcmAudioBridge:
             self._tx_buffer.clear()
 
     def read_modem_chunk(self) -> bytes:
+        """读一块模组 PCM，保证 16-bit 采样对齐（偶数字节）。
+
+        pyserial 的 read() 返回的是「最多 N 字节」：PTY 上很容易在一个采样中间
+        切断，半个采样交给 np.frombuffer(dtype=int16) 会抛
+        "buffer size must be a multiple of element size" 并炸掉整通电话
+        （真机 2026-08-01 实测，接通 4.3s 后必现）。落单的那个字节留到下一次
+        拼回去——丢掉它会让后续所有采样错位半个字节，整条流变噪音。
+        """
         if not self._ser:
             return b""
-        return self._ser.read(NMEA_READ_SIZE)
+        data = self._rx_carry + self._ser.read(NMEA_READ_SIZE)
+        if len(data) % 2:
+            self._rx_carry = data[-1:]
+            return data[:-1]
+        self._rx_carry = b""
+        return data
 
     def pending_output_bytes(self) -> int:
         with self._tx_lock:
@@ -642,4 +687,15 @@ def create_audio_bridge(
         if not pcm_port:
             raise RuntimeError("NMEA PCM 模式需要配置 MODEM_PCM_PORT")
         return SerialPcmAudioBridge(pcm_port, pcm_baudrate, tx_gain=tx_gain)
-    raise ValueError("MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg（仅 macOS）或 nmea")
+    if selected == "simcom_pcm":
+        # SIMCom 的 PCM 也是 8k/mono/16bit 的裸流，只是走模组的 USB 音频接口
+        # （macOS 上由 ec20_usb_pty 桥成 PTY），传输层与 NMEA 模式同构。
+        if not pcm_port:
+            raise RuntimeError(
+                "simcom_pcm 模式需要配置 MODEM_PCM_PORT（指向桥出的 PCM PTY，"
+                "如 scripts/ec20_usb_pty.py --map 4:/tmp/ec20-pcm）"
+            )
+        return SerialPcmAudioBridge(pcm_port, pcm_baudrate, tx_gain=tx_gain)
+    raise ValueError(
+        "MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg（仅 macOS）、nmea 或 simcom_pcm"
+    )
