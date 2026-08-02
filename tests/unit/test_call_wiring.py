@@ -1688,3 +1688,54 @@ def test_inbound_hard_deadline_finalizes_when_all_hangup_signals_are_lost(
     assert service.session._thread is not None
     service.session._thread.join(timeout=5)
     assert not service.session._thread.is_alive()
+
+
+# ---- supervisor 掉线兜底（真机 2026-08-01：桥重启后服务永远停在未连接）----
+
+
+def test_supervisor_keeps_watching_after_first_connect(monkeypatch):
+    """首连成功后 supervisor 不能就此退出——否则之后掉线没有任何人管。
+
+    回归锁：原实现连上即 return，USB→PTY 桥一重启就必须手动重启整个服务。
+    """
+    monkeypatch.setattr("agentcall.call_agent.CallAgentService._SUPERVISOR_POLL_SECONDS", 0.05)
+    modem = FakeModem()
+    service = make_service(modem)
+    service.modem_connected = False
+    service.start()
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not service.modem_connected:
+        time.sleep(0.02)
+    assert service.modem_connected is True
+
+    # 模拟掉线且模组自身已放弃自救
+    modem.reconnect_in_progress = False
+    service.modem_connected = False
+    before = modem.call_names().count("connect")
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and modem.call_names().count("connect") <= before:
+        time.sleep(0.02)
+    service._service_running = False
+    assert modem.call_names().count("connect") > before, "掉线后 supervisor 应重跑连接序列"
+
+
+def test_supervisor_does_not_interfere_while_modem_self_recovers(monkeypatch):
+    """模组正在自行重连时不得插手——两边同时开串口会互相踩。"""
+    monkeypatch.setattr("agentcall.call_agent.CallAgentService._SUPERVISOR_POLL_SECONDS", 0.05)
+    modem = FakeModem()
+    service = make_service(modem)
+    service.modem_connected = False
+    service.start()
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not service.modem_connected:
+        time.sleep(0.02)
+    before = modem.call_names().count("connect")
+
+    modem.reconnect_in_progress = True      # 模组自救中
+    service.modem_connected = False
+    time.sleep(0.4)                          # 给它足够多个巡检周期
+    service._service_running = False
+    assert modem.call_names().count("connect") == before, "自救期间不该重跑连接序列"

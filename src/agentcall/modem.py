@@ -295,6 +295,17 @@ class Eg25Modem:
             logger.warning("SIM 识别失败(未插卡/未就绪): %s", sim.reg_status)
 
     @property
+    def reconnect_in_progress(self) -> bool:
+        """模组是否正在自行重连。
+
+        供上层 supervisor 区分「正在自救、别插手」与「已经放弃、需要重跑连接
+        序列」——``_reconnect`` 的循环条件是 ``_running``，监听线程一旦停掉
+        它就静默退出，此后没有任何人再尝试（真机 2026-08-01：桥重启后服务
+        一直停在未连接，必须手动重启进程）。
+        """
+        return self._reconnect_in_progress
+
+    @property
     def sim_identity(self) -> SimIdentity:
         """最近一次连接/重连时读到的 SIM 身份(缓存,不触发 AT)。"""
         return self._sim_identity

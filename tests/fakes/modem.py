@@ -11,6 +11,9 @@ from typing import Callable
 
 
 class FakeModem:
+    # 真 modem 上是只读 property；supervisor 用它区分「正在自救」与「已放弃」。
+    reconnect_in_progress = False
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple]] = []
         self.sms_should_succeed = True
