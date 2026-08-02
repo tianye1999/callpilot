@@ -193,7 +193,9 @@ def _call_qwen_sync(
 
     response = dashscope.Generation.call(
         model=model,
-        messages=messages,
+        # 存根要求 list[Message]，但 dashscope 运行时就是收 [{"role":…, "content":…}]
+        # 这样的普通 dict（官方示例亦然）。存根偏严，抑制到这一行为止。
+        messages=messages,  # type: ignore[arg-type]
         result_format="message",
         api_key=os.environ.get("DASHSCOPE_API_KEY"),
     )
