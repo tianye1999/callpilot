@@ -36,6 +36,13 @@ PID = 0x0125
 DEFAULT_VID = VID
 DEFAULT_PID = PID
 
+# 已知的厂商串口模组 VID：--vid 省略时按这张表扫描，插上即可认出。
+# 加新厂商只需在这里补一行，桥的搬运逻辑与 AT 方言无关。
+KNOWN_VENDORS = {
+    0x2C7C: "Quectel",
+    0x1E0E: "SIMCom",
+}
+
 LOCK_PATH = Path("/tmp/ec20-usb-pty.lock")
 
 # 单次 USB 写超时不致命（PCM 实时流常见）；连续这么多次才判定链路已死。
@@ -127,9 +134,10 @@ class BridgeHandle:
             path.unlink()
 
 
-def find_device(vid: int = DEFAULT_VID, pid: int = DEFAULT_PID) -> usb.core.Device:
+def find_all_devices(**criteria: int) -> list[usb.core.Device]:
+    """枚举匹配 ``criteria`` 的 USB 设备；libusb 缺失时给可操作的安装提示。"""
     try:
-        dev = usb.core.find(idVendor=vid, idProduct=pid, backend=libusb_backend())
+        return list(usb.core.find(find_all=True, backend=libusb_backend(), **criteria))
     except usb.core.NoBackendError:
         # pyusb 是纯 Python 包，真正的 USB 访问依赖系统 libusb；
         # 干净的 Mac 上没有它，裸 traceback 会劝退第一次跑桥的用户。
@@ -138,8 +146,79 @@ def find_device(vid: int = DEFAULT_VID, pid: int = DEFAULT_PID) -> usb.core.Devi
             "  Install it:  brew install libusb   (macOS)\n"
             "               sudo apt install libusb-1.0-0   (Debian/Ubuntu)"
         ) from None
-    if dev is None:
-        raise RuntimeError(f"未找到 USB 设备 ({vid:04x}:{pid:04x})")
+
+
+def describe_device(dev: usb.core.Device) -> str:
+    """``vid:pid (厂商 产品)``；字符串描述符读不到时退化成只有 ID。
+
+    读 manufacturer/product 要发控制传输，未授权或设备忙时会抛——描述只是
+    给人看的，绝不能因此让整个枚举失败。
+    """
+    parts: list[str] = []
+    for attr in ("manufacturer", "product"):
+        try:
+            value = getattr(dev, attr, None)
+        except Exception:  # noqa: BLE001  # 控制传输失败：权限/设备忙/无描述符
+            value = None
+        if not value:
+            continue
+        text = str(value).strip()
+        # SIM7600 的 manufacturer 与 product 是同一个字符串（都是
+        # "SimTech, Incorporated"），照原样拼会打印两遍。
+        if text and text.lower() not in (p.lower() for p in parts):
+            parts.append(text)
+    vendor = KNOWN_VENDORS.get(dev.idVendor)
+    if vendor and vendor.lower() not in " ".join(parts).lower():
+        parts.insert(0, vendor)
+    label = f"{dev.idVendor:04x}:{dev.idProduct:04x}"
+    return f"{label} ({' '.join(parts)})" if parts else label
+
+
+def _no_match_message(scope: str) -> str:
+    """没匹配上时把总线上的设备全列出来——用户的模组可能是未知 VID。"""
+    lines = [f"未找到 USB 设备（{scope}）"]
+    others = find_all_devices()
+    if others:
+        lines.append("当前 USB 总线上的设备：")
+        lines.extend(f"  {describe_device(dev)}" for dev in others)
+        lines.append("若你的模组在上面，用 --vid/--pid 指定它（十六进制）。")
+    else:
+        lines.append("USB 总线上没有任何设备——请确认模组已插好并已上电。")
+    return "\n".join(lines)
+
+
+def find_device(
+    vid: int | None = None, pid: int | None = None
+) -> usb.core.Device:
+    """定位模组：``vid`` 省略时扫 :data:`KNOWN_VENDORS`，``pid`` 省略时按 vid 枚举。
+
+    ``pid`` 可省是关键：SIMCom SIM7600 的 PID 随固件 composite 配置浮动
+    （9000-9007 / 9011 / 9016 / 9018-901b / 9020-902b …），写死一个值等于
+    要求用户先手工查一遍 ``system_profiler``。唯一匹配才返回，多个候选时
+    列出来让用户用 ``--pid`` 消歧——绝不替用户猜该桥哪个模组。
+    """
+    if vid is None:
+        candidates = [d for d in find_all_devices() if d.idVendor in KNOWN_VENDORS]
+        scope = "已知厂商 " + "/".join(
+            f"{v:04x} {name}" for v, name in KNOWN_VENDORS.items()
+        )
+    else:
+        candidates = find_all_devices(idVendor=vid)
+        scope = f"vid {vid:04x}"
+    if pid is not None:
+        candidates = [d for d in candidates if d.idProduct == pid]
+        scope += f" pid {pid:04x}"
+
+    if not candidates:
+        raise RuntimeError(_no_match_message(scope))
+    if len(candidates) > 1:
+        listing = "\n  ".join(describe_device(dev) for dev in candidates)
+        raise RuntimeError(
+            f"{scope} 匹配到 {len(candidates)} 个设备，无法确定桥哪一个；"
+            f"请用 --vid/--pid 指定：\n  {listing}"
+        )
+    dev = candidates[0]
+    logger.info("匹配到模组 %s", describe_device(dev))
     return dev
 
 
@@ -204,7 +283,13 @@ def probe_at(dev: usb.core.Device, port: UsbPort) -> bytes:
                 dev.read(port.bulk_in, port.max_packet, timeout=50)
             except Exception:
                 break
-        dev.write(port.bulk_out, b"AT\r", timeout=1000)
+        try:
+            dev.write(port.bulk_out, b"AT\r", timeout=1000)
+        except usb.core.USBError as exc:
+            # 非 AT 接口（DIAG/QMI/PCM…）常常直接拒收或写超时。这必须降级成
+            # 「这个接口不是 AT 口」，绝不能中止整轮探测——否则 interface 0 一超时
+            # 就再也走不到后面真正的 AT 口，用户永远探不出该 --map 哪个号。
+            raise RuntimeError(f"写入失败（大概不是 AT 口）: {exc}") from exc
         return read_response(dev, port, 1.5)
     finally:
         usb.util.release_interface(dev, port.interface)
@@ -346,17 +431,18 @@ def parse_usb_id(value: str) -> int:
 def wait_for_device(
     stop: threading.Event,
     poll_seconds: float = 2.0,
-    vid: int = DEFAULT_VID,
-    pid: int = DEFAULT_PID,
+    vid: int | None = None,
+    pid: int | None = None,
 ) -> usb.core.Device | None:
     """阻塞等待模组出现（重插场景）；stop 置位时返回 None。"""
     announced = False
     while not stop.is_set():
         try:
             return find_device(vid, pid)
-        except RuntimeError:
+        except RuntimeError as exc:
             if not announced:
-                logger.warning("未检测到模组 (%04x:%04x)，等待设备接入…", vid, pid)
+                # 首次带上 find_device 的完整诊断（含总线设备清单），之后不再刷屏。
+                logger.warning("未检测到模组，等待设备接入…\n%s", exc)
                 announced = True
             stop.wait(poll_seconds)
     return None
@@ -414,12 +500,14 @@ def main() -> int:
     )
     parser.add_argument("--log-file", help="同时把日志写入指定文件")
     parser.add_argument(
-        "--vid", type=parse_usb_id, default=DEFAULT_VID, metavar="HEX",
-        help=f"USB Vendor ID，十六进制（默认 {DEFAULT_VID:04x} = Quectel）",
+        "--vid", type=parse_usb_id, default=None, metavar="HEX",
+        help="USB Vendor ID，十六进制；省略时扫描已知厂商（"
+             + "/".join(f"{v:04x} {n}" for v, n in KNOWN_VENDORS.items()) + "）",
     )
     parser.add_argument(
-        "--pid", type=parse_usb_id, default=DEFAULT_PID, metavar="HEX",
-        help=f"USB Product ID，十六进制（默认 {DEFAULT_PID:04x} = EC20/EG25）",
+        "--pid", type=parse_usb_id, default=None, metavar="HEX",
+        help="USB Product ID，十六进制；省略时按 VID 枚举，"
+             "仅在同一 VID 匹配到多个设备时才需要指定",
     )
     args = parser.parse_args()
 
@@ -438,12 +526,18 @@ def main() -> int:
         dev = find_device(args.vid, args.pid)
         ports = discover_ports(dev)
         if args.list:
+            # 先打设备身份：--pid 可省之后，用户需要知道到底认到了哪一个，
+            # 且 --map 用的 interface 号只在这台设备上成立。
+            print(f"device {describe_device(dev)}")
             for port in ports.values():
                 print(
                     f"interface {port.interface}: "
                     f"in=0x{port.bulk_in:02x} out=0x{port.bulk_out:02x} max={port.max_packet}"
                 )
+            if not ports:
+                print("(未发现任何 bulk 接口——该设备可能不是厂商串口模组)")
             return 0
+        print(f"device {describe_device(dev)}")
         for port in ports.values():
             try:
                 response = probe_at(dev, port).decode("ascii", "ignore").replace("\r\n", " | ")
