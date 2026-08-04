@@ -137,10 +137,15 @@ coll = COLLECT(exe, a.binaries, a.datas, name="CallPilot")
 
 # .app BUNDLE 仅 macOS 有意义；其余平台产物即 COLLECT 目录
 if IS_MACOS:
+    # packaging/*.icns 在 .gitignore 里（图标是本地资产，不入库），所以新 clone
+    # 上这个文件本就不存在。缺图标不该让整个构建在最后一步 BUNDLE 崩掉——
+    # icon=None 时 PyInstaller 用默认图标，app 照样能跑。
+    _icon_path = project_root / "packaging" / "CallPilot.icns"
+    _icon = str(_icon_path) if _icon_path.is_file() else None
     app = BUNDLE(
         coll,
         name="CallPilot.app",
-        icon=str(project_root / "packaging" / "CallPilot.icns"),
+        icon=_icon,
         bundle_identifier="ai.bondings.callpilot",
         info_plist={
             "CFBundleDisplayName": "CallPilot",

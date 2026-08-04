@@ -99,8 +99,19 @@ def test_spec_is_valid_python():
 def test_spec_bundle_only_on_macos():
     text = SPEC.read_text(encoding="utf-8")
     assert "from agentcall.platforms import" in text, "平台判断应经 platforms 模块"
-    # BUNDLE(.app) 必须包在 IS_MACOS 分支里（缩进 4 空格），Windows 构建不执行
-    assert "if IS_MACOS:\n    app = BUNDLE(" in text
+    # BUNDLE(.app) 必须包在 IS_MACOS 分支里，Windows 构建不执行。
+    # 不按"紧邻 if IS_MACOS:"断言——分支内加语句（如图标存在性判断）是正常演进；
+    # 也不能只找第一个 if IS_MACOS:（spec 里另有一处按平台收 GUI 包）。
+    # 判据：从 BUNDLE 行往上找最近的零缩进语句，它必须就是 if IS_MACOS:。
+    lines = text.splitlines()
+    bundles = [i for i, line in enumerate(lines) if line == "    app = BUNDLE("]
+    assert len(bundles) == 1, f"BUNDLE 应只有一处（缩进 4 空格），实际 {len(bundles)}"
+    enclosing = next(
+        lines[i]
+        for i in range(bundles[0] - 1, -1, -1)
+        if lines[i].strip() and not lines[i].startswith((" ", "\t", "#"))
+    )
+    assert enclosing == "if IS_MACOS:", f"BUNDLE 的直接外层是 {enclosing!r}，不是 if IS_MACOS:"
 
 
 # ---- pwsh 语法检查（本机有 pwsh 才跑）----
