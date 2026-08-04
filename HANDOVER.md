@@ -15,7 +15,7 @@ CallPilot 原生只支持 Quectel EC20/EG25。本轮把它跑在 **SIMCom SIM760
 | 项 | 值 |
 |---|---|
 | 仓库 | `/Users/redtea/Downloads/code/callpilot` |
-| 分支 | `local/simcom-integration`（**未推送**；本提交后比 `origin/main` 多 21 个本地提交） |
+| 分支 | `local/simcom-integration`（**未推送**；本提交后比 `origin/main` 多 22 个本地提交） |
 | 基线 | `origin/main` = `c7b4546` |
 | 模组 | SIMCom SIM7600G，USB `1e0e:9001`，固件 `LE20B05SIM7600M21-A_250919` |
 | SIM | 中国电信，IMSI `46011…`，免费客服号 **10000** |
@@ -158,7 +158,7 @@ REST 面（`/v1/chat/completions`）的 **function calling 是正常的**，TTS
 
 ---
 
-## 4. 本地提交清单（本提交后 21 个，均未推送）
+## 4. 本地提交清单（本提交后 22 个，均未推送）
 
 上游未合并分支合入（前 4 个不是我写的）：
 
@@ -188,7 +188,8 @@ b5fdf25 fix(packaging): 缺 CallPilot.icns 不再让 macOS 构建在最后一步
 b16dbbe fix(bridge): 数据口链路判死不再连坐控制口
 394adab fix(simcom): harden usb pcm and call cleanup
 6399bc9 docs(simcom): record pcm probe findings
-（本提交）fix(simcom): verify cpcmreg state and stop per manual
+2af56fd fix(simcom): verify cpcmreg state and stop per manual
+（本提交）test(simcom): add receive-only audio capture probe
 ```
 
 新增配置项：`MODEM_USB_VID`、`MODEM_BRIDGE_MAPS`、`MINIMAX_API_KEY` /
@@ -290,6 +291,25 @@ Windows 有 SIMCom 官方驱动，我们是 libusb 从用户态直连 bulk 端�
 bridge 时 app 卡在“串口发送失败，尝试重连后重试”，20 秒以上未恢复，需再重启 app。
 因此人工恢复应按 bridge 先、app 后一起重启；生产代码当前靠“只关闭坏掉的 interface 4”
 避免把 AT 口一起重启。
+
+#### 19:18–19:24 纯接收抓音（10 次接通，仍未收到客服 PCM）
+
+为了避免 OUT 写超时在 2 秒内关闭数据口，新增 `scripts/simcom_receive_capture.py`：停掉
+app/bridge/tray 后独占 USB，只发 AT 控制命令，**绝不写 audio OUT**，每通保存独立 WAV。
+本轮所有测试都先确认 `AT+CLCC` 无历史通话，结束后执行 `AT+CHUP`、
+`AT+CPCMREG=0,1` 并再次确认 `AT+CLCC = OK`。
+
+- 3 通：提前 claim interface 4，各抓 12 秒，均为 0 bytes。
+- 3 通：按旧成功探针的时序，CPCMREG mode=1 后才 claim interface 4，各抓 12 秒，仍为 0 bytes。
+- 2 通：先 `dev.reset()` 清 macOS 可能残留的僵死端点，各抓 15 秒，仍为 0 bytes。
+- 1 通全接口扫描首次被 interface 0 不支持 CDC DTR（PIPE）中断，finally 已正常挂断。
+- 修正后再扫描 1 通：interface 0/1/4/5 各 4 秒全为 0 bytes；interface 3 只有 20 bytes
+  （5 B/s，控制碎片，不是应有的约 16000 B/s PCM）。
+
+因此这 10 次都没有得到可播放的客服录音；生成的 WAV 除 interface 3 那个 64B 文件外均
+只有 44B 文件头。**这不能证明 10000 没有播报，只能证明当前 USB composite 没把客服
+音频交给这些 bulk IN 端点。** 它也说明早先 interface 4 的 15999 B/s 成功结果不是当前
+可稳定复现的状态；继续判断客服内容前，必须先恢复 USB IN 流。
 
 注意：两次“同步写最长等 5 秒”的独占脚本运行时后来发现存在 active + held 历史呼叫，
 不是干净证据，不能拿来证明异步 URB 必然无效；上面 18:54 的 app 单通复现才是可信基线。
