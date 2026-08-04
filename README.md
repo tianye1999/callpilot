@@ -111,9 +111,12 @@ v0.4.0 adds several call-quality controls for outbound work:
 macOS has **no native serial port** for Quectel vendor interfaces, so a
 USB→PTY bridge (`scripts/ec20_usb_pty.py`) exposes `/tmp/ec20-at`.
 
-The bridge looks for `2c7c:0125` (EC20/EG25) by default. Another libusb-reachable
-vendor-serial module can be targeted with `--vid`/`--pid` (hex), e.g. a SIMCom
-SIM7600: `--vid 1e0e --pid 9001`. Use `--list`/`--probe` to find its AT interface.
+With no arguments the bridge scans the vendor IDs it knows (`2c7c` Quectel,
+`1e0e` SIMCom) and uses the single match, so `--list` alone identifies a plugged-in
+module and prints its bulk interfaces — no need to read the PID off
+`system_profiler` first. `--vid`/`--pid` (hex) narrow the search when the module's
+vendor is unknown or more than one is attached; if nothing matches, the error
+lists every device on the bus. Use `--probe` to find which interface answers AT.
 This only moves bulk-endpoint bytes — the rest of the call chain is still tuned
 for the EC20, so a non-Quectel module is not a supported end-to-end configuration.
 
@@ -439,9 +442,11 @@ v0.4.0 增加了几项面向外呼质量的控制：
 macOS 没有 Quectel 厂商串口的原生设备，需先跑 USB→PTY 桥（`scripts/ec20_usb_pty.py`）
 暴露出 `/tmp/ec20-at`。
 
-桥默认找 `2c7c:0125`（EC20/EG25）；其他 libusb 可达的厂商串口模组用 `--vid`/`--pid`
-指定（十六进制），例如 SIMCom SIM7600：`--vid 1e0e --pid 9001`，AT 口序号可用
-`--list`/`--probe` 探测。桥只搬运 bulk 端点字节，通话链路其余部分仍按 EC20 调校，
+不带参数时桥会扫描已知厂商 VID（`2c7c` Quectel、`1e0e` SIMCom）并使用唯一匹配项，
+所以插上模组直接 `--list` 就能认出设备并列出 bulk 接口，不必先去 `system_profiler`
+手抄 PID（SIM7600 的 PID 随固件 composite 配置浮动）。厂商未知或同时插了多个模组时，
+再用 `--vid`/`--pid`（十六进制）收窄；一个都没匹配上时，报错会列出总线上的全部设备。
+AT 口序号用 `--probe` 探测。桥只搬运 bulk 端点字节，通话链路其余部分仍按 EC20 调校，
 非 Quectel 模组不属于端到端支持的配置。
 
 ### 硬件准备
