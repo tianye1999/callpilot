@@ -8,6 +8,7 @@ import os
 from .. import config
 from .base import VoiceAgent
 from .doubao_agent import DoubaoVoiceAgent
+from .minimax_agent import MiniMaxVoiceAgent
 from .openai_agent import OpenAIVoiceAgent
 from .qwen_agent import QwenVoiceAgent
 
@@ -59,6 +60,25 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
             realtime_url=config.get_str("OPENAI_REALTIME_URL") or None,
         )
 
+    if selected == "minimax":
+        # 实测能力边界（见 minimax_agent 模块 docstring）：realtime 端点静默丢弃
+        # session.tools，AI 无法自行挂断/发短信/发 DTMF；且无服务端 VAD，断句由
+        # agent 内的能量 VAD 负责。选它之前要清楚这两条。
+        logger.warning(
+            "MiniMax provider 不支持工具调用：AI 无法自行挂断电话或发短信，"
+            "通话收尾依赖 OUTBOUND_MAX_SECONDS / INBOUND_MAX_SECONDS 硬时限；"
+            "需要完整工具能力请用 qwen 或 openai"
+        )
+        return MiniMaxVoiceAgent(
+            # API Key 属凭证不走注册表默认值：缺失即 KeyError fail-fast。
+            api_key=os.environ["MINIMAX_API_KEY"],
+            model=config.get_str("MINIMAX_REALTIME_MODEL"),
+            model_display_name=config.get_str("AGENT_MODEL_NAME_MINIMAX"),
+            voice=config.get_str("MINIMAX_VOICE"),
+            realtime_url=config.get_str("MINIMAX_REALTIME_URL") or None,
+        )
+
     raise ValueError(
-        f"不支持的 AGENT_PROVIDER: {selected}，请使用 qwen、doubao、openai 或 local"
+        f"不支持的 AGENT_PROVIDER: {selected}，"
+        "请使用 qwen、doubao、openai、minimax 或 local"
     )
