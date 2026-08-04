@@ -328,9 +328,29 @@ def _import_rumps():
     return rumps
 
 
+def _load_env() -> None:
+    """把 .env 读进 os.environ。
+
+    菜单栏进程也必须加载：它生成 launchd plist 的参数要读配置（如
+    MODEM_BRIDGE_MAPS 决定桥哪些 USB 接口）。此前只有 --service 分支在
+    app.py 里 load_dotenv，托盘进程拿到的全是注册表默认值，于是 SIMCom 模组
+    的 PCM 口永远不会被桥出来（打包版 simcom_pcm 音频起不来的根因）。
+    """
+    try:
+        from dotenv import load_dotenv
+
+        from agentcall import config
+
+        load_dotenv(config.env_file_path())
+    except Exception as exc:  # noqa: BLE001
+        # 读不到配置不该让菜单栏起不来；后果只是 plist 用默认值。
+        logger.warning("加载 .env 失败，launchd 参数将用默认值: %s", type(exc).__name__)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     _prepend_runtime_paths()
+    _load_env()
     if "--selftest" in sys.argv[1:]:
         # 打包后 import 自检（不起服务/不装 launchd）：验证关键模块真进了 bundle。
         import app

@@ -1053,3 +1053,35 @@ def test_model_name_keys_reference_registered_specs():
     """映射指向的每个 key 都得真在注册表里，否则 get_str 抛 KeyError。"""
     for provider, key in config.MODEL_NAME_KEYS.items():
         assert get_spec(key), f"{provider} 指向未注册的 {key}"
+
+
+def test_bridge_map_args_expands_config(monkeypatch):
+    """常驻桥的接口映射必须可配：写死 EC20 四口布局时 SIMCom 的 PCM 口无从加入。"""
+    from agentcall import macos_launchd
+
+    monkeypatch.setenv("MODEM_BRIDGE_MAPS", "2:/tmp/ec20-at,4:/tmp/ec20-pcm")
+    assert macos_launchd.bridge_map_args() == [
+        "--map", "2:/tmp/ec20-at", "--map", "4:/tmp/ec20-pcm",
+    ]
+
+
+def test_bridge_map_args_default_is_ec20_layout(monkeypatch):
+    from agentcall import macos_launchd
+
+    monkeypatch.delenv("MODEM_BRIDGE_MAPS", raising=False)
+    assert macos_launchd.bridge_map_args() == [
+        "--map", "2:/tmp/ec20-at",
+        "--map", "1:/tmp/ec20-nmea",
+        "--map", "3:/tmp/ec20-modem",
+    ]
+
+
+def test_bridge_map_args_skips_bad_entries(monkeypatch, caplog):
+    """一个笔误不该把常驻桥整个搞停——跳过并告警，其余照桥。"""
+    from agentcall import macos_launchd
+
+    monkeypatch.setenv("MODEM_BRIDGE_MAPS", "2:/tmp/ec20-at, ,x:/tmp/bad,3:,4:/tmp/pcm")
+    with caplog.at_level("WARNING"):
+        args = macos_launchd.bridge_map_args()
+    assert args == ["--map", "2:/tmp/ec20-at", "--map", "4:/tmp/pcm"]
+    assert any("已跳过" in r.getMessage() for r in caplog.records)

@@ -279,6 +279,14 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 换其他厂商串口模组(如 SIMCom SIM7600 = 1e0e)时改这里,否则模组明明能用
     # 却一直显示「硬件尚未就绪」。与 scripts/ec20_usb_pty.py --vid 取值一致。
     ConfigSpec("MODEM_USB_VID", "模组 USB 厂商号(hex)", "str", "2c7c"),
+    # 常驻桥（launchd）要把哪些 USB 接口桥成 PTY，逗号分隔的 IFACE:LINK。
+    # 默认是 Quectel EC20 四口布局；SIMCom 六口布局的 PCM 口（simcom_pcm 音频
+    # 模式必需）不在默认里，接口号也因模组而异——先跑 scripts/ec20_usb_pty.py
+    # --probe 实测，再把 MODEM_PCM_PORT 对应的那一条补进来，例如：
+    #   2:/tmp/ec20-at,4:/tmp/ec20-pcm
+    ConfigSpec("MODEM_BRIDGE_MAPS", "常驻桥接口映射", "str",
+               "2:/tmp/ec20-at,1:/tmp/ec20-nmea,3:/tmp/ec20-modem",
+               requires_restart=True),
     ConfigSpec("MODEM_AUDIO_MODE", "模组音频模式", "select", platforms.default_audio_mode(),
                choices=("uac_ffmpeg", "uac", "nmea", "simcom_pcm"), requires_restart=True),
     ConfigSpec("MODEM_AUDIO_KEYWORD", "UAC 声卡匹配关键字", "str", "Interface",

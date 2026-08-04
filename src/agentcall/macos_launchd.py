@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
+from . import config
+
 BRIDGE_LABEL = "com.agentcall.bridge"
 APP_LABEL = "com.agentcall.app"
 TRAY_LABEL = "com.agentcall.tray"
@@ -152,6 +154,29 @@ def _environment(layout: LaunchdLayout) -> dict[str, str]:
     return env
 
 
+def bridge_map_args() -> list[str]:
+    """把 ``MODEM_BRIDGE_MAPS`` 展开成 ``--map IFACE:LINK`` 参数列表。
+
+    此前这三条是写死的 Quectel EC20 四口布局，SIMCom 六口模组的 PCM 口
+    （``MODEM_AUDIO_MODE=simcom_pcm`` 必需）无从加入，打包版起不了音频。
+    非法条目跳过并告警，不让一个笔误把常驻桥整个搞停。
+    """
+    raw = config.get_str("MODEM_BRIDGE_MAPS")
+    args: list[str] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        iface, _, link = entry.partition(":")
+        if not iface.strip().isdigit() or not link.strip():
+            logger.warning("MODEM_BRIDGE_MAPS 条目非法，已跳过: %r", entry)
+            continue
+        args += ["--map", f"{iface.strip()}:{link.strip()}"]
+    if not args:
+        logger.warning("MODEM_BRIDGE_MAPS 未解析出任何映射，常驻桥将无接口可桥")
+    return args
+
+
 def build_plists(layout: LaunchdLayout) -> dict[str, dict]:
     common = {
         "KeepAlive": True,
@@ -169,12 +194,7 @@ def build_plists(layout: LaunchdLayout) -> dict[str, dict]:
             "-s",
             str(layout.executable),
             "--bridge",
-            "--map",
-            "2:/tmp/ec20-at",
-            "--map",
-            "1:/tmp/ec20-nmea",
-            "--map",
-            "3:/tmp/ec20-modem",
+            *bridge_map_args(),
             "--log-file",
             str(layout.log_dir / "ec20_usb_pty.log"),
         ],
