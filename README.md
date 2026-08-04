@@ -94,6 +94,17 @@ v0.4.0 adds several call-quality controls for outbound work:
   `gpt-realtime-2.1-mini` for lower call latency, with `gpt-realtime-2.1`,
   `gpt-realtime-2`, `gpt-realtime`, and `gpt-realtime-mini` still selectable in
   `.env` / Settings.
+- **MiniMax provider** (`AGENT_PROVIDER=minimax`): speaks the OpenAI Realtime
+  *beta* protocol at `wss://api.minimaxi.com/ws/v1/realtime`, bidirectional
+  pcm16 @ 24 kHz with built-in ASR. The key is configurable from Settings and
+  the first-run wizard (validated online). **Two hard limits, both measured on
+  the live endpoint:** it silently drops `session.tools`, so the AI cannot hang
+  up, send SMS, look up a verification code or dial DTMF on its own — calls end
+  on the `OUTBOUND_MAX_SECONDS` / `INBOUND_MAX_SECONDS` backstop; and it has no
+  server-side VAD, so turn-taking is done by a local energy VAD
+  (`MINIMAX_VAD_RMS_THRESHOLD` plus the `MANUAL_RESPONSE_*` windows). It also
+  emits no user-side transcription event, so summaries only see the agent side.
+  Pick Qwen or OpenAI when you need tools.
 
 ### Hardware & platform support
 
@@ -425,6 +436,14 @@ v0.4.0 增加了几项面向外呼质量的控制：
 - **OpenAI 模型选择**：OpenAI Realtime provider 默认使用 `gpt-realtime-2.1-mini`
   以优先降低电话链路延迟；仍可在 `.env` / 设置面板切换到 `gpt-realtime-2.1`、
   `gpt-realtime-2`、`gpt-realtime` 或 `gpt-realtime-mini`。
+- **MiniMax provider**（`AGENT_PROVIDER=minimax`）：端点
+  `wss://api.minimaxi.com/ws/v1/realtime` 说的是 OpenAI Realtime **beta** 协议，
+  双向 pcm16 @ 24kHz，自带 ASR。Key 可在设置面板与首启向导里填（带在线校验）。
+  **两条硬限制，均为真机实测**：该端点静默丢弃 `session.tools`，AI 无法自行挂断、
+  发短信、查验证码或发 DTMF —— 通话收尾只能靠 `OUTBOUND_MAX_SECONDS` /
+  `INBOUND_MAX_SECONDS` 兜底；且没有服务端 VAD，断句由本端能量 VAD 负责
+  （`MINIMAX_VAD_RMS_THRESHOLD` 配合 `MANUAL_RESPONSE_*` 两个窗口）。它也不发
+  用户侧转写事件，通话摘要只看得到 Agent 一侧。需要工具能力请用 Qwen 或 OpenAI。
 
 ### 硬件与平台支持
 

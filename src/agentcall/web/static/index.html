@@ -1121,6 +1121,7 @@
               <select id="setupProvider">
                 <option value="qwen">Qwen</option>
                 <option value="openai">OpenAI</option>
+                <option value="minimax">MiniMax (no tool calling)</option>
                 <option value="doubao">Doubao (experimental)</option>
               </select>
             </div>
@@ -1330,7 +1331,7 @@ const I18N = {
     sim_lock_ok: "SIM unlocked.",
     sim_lock_badpin: "A SIM PIN is 4-8 digits.",
     setup_hw_ok: "Hardware looks ready.", setup_hw_wait: "Hardware is not fully ready yet. You can continue and retry after plugging it in.",
-    setup_key_title: "Provider API key", setup_key_hint: "Qwen and OpenAI keys are validated online before saving. The key is never echoed back.",
+    setup_key_title: "Provider API key", setup_key_hint: "Qwen, OpenAI and MiniMax keys are validated online before saving. The key is never echoed back.",
     setup_qwen_key_help: {
       before: "Qwen / DashScope API Key can be created for free in ",
       link: "Alibaba Cloud Model Studio",
@@ -1340,6 +1341,7 @@ const I18N = {
     setup_validating: "Validating…", setup_key_valid: "Key is valid.", setup_key_invalid: "Key is invalid.",
     setup_key_network: "Network unavailable or provider timed out.", setup_key_unsupported: "Online validation is not available for this provider.",
     setup_key_saved: "Provider settings saved.", setup_doubao_note: "Doubao is experimental. App ID and Access Key will be saved without online validation.",
+    setup_minimax_note: "MiniMax realtime has no tool calling: the AI cannot hang up, send SMS or dial DTMF on its own. Calls end on the hard time limit. Use Qwen or OpenAI if you need tools.",
     setup_person_title: "Personalize", setup_person_hint: "These values shape how the assistant introduces itself and which language it uses in calls.",
     setup_owner: "Owner name", setup_persona: "AI persona title", setup_call_lang: "Call language", setup_voice: "Voice",
     setup_person_saved: "Personalization saved.",
@@ -1362,6 +1364,10 @@ const I18N = {
       AGENT_PROVIDER: "Agent provider", DASHSCOPE_API_KEY: "DashScope API key",
       QWEN_REALTIME_MODEL: "Qwen realtime model", QWEN_VOICE: "Qwen voice",
       OPENAI_API_KEY: "OpenAI API key",
+      MINIMAX_API_KEY: "MiniMax API key", MINIMAX_REALTIME_MODEL: "MiniMax realtime model",
+      MINIMAX_VOICE: "MiniMax voice", MINIMAX_REALTIME_URL: "MiniMax realtime endpoint override",
+      MINIMAX_VAD_RMS_THRESHOLD: "MiniMax turn-end energy threshold",
+      MINIMAX_RECONNECT_MAX: "MiniMax max reconnects",
       OPENAI_REALTIME_MODEL: "OpenAI realtime model", OPENAI_VOICE: "OpenAI voice", OPENAI_VIBE: "OpenAI vibe",
       OPENAI_REALTIME_URL: "OpenAI endpoint override", OPENAI_RECONNECT_MAX: "OpenAI max reconnects",
       AGENT_OUTBOUND_TASK: "Default outbound topic",
@@ -1509,7 +1515,7 @@ const I18N = {
     sim_lock_ok: "SIM 已解锁。",
     sim_lock_badpin: "PIN 应为 4-8 位数字。",
     setup_hw_ok: "硬件状态看起来已就绪。", setup_hw_wait: "硬件暂未完全就绪。你可以继续配置，插好后再重试。",
-    setup_key_title: "Provider API Key", setup_key_hint: "Qwen 与 OpenAI 会先在线校验再保存；Key 不会被回显。",
+    setup_key_title: "Provider API Key", setup_key_hint: "Qwen、OpenAI 与 MiniMax 会先在线校验再保存；Key 不会被回显。",
     setup_qwen_key_help: {
       before: "Qwen / DashScope API Key：前往",
       link: "阿里云百炼",
@@ -1519,6 +1525,7 @@ const I18N = {
     setup_validating: "正在校验…", setup_key_valid: "Key 有效。", setup_key_invalid: "Key 无效。",
     setup_key_network: "网络不通或 provider 超时。", setup_key_unsupported: "该 provider 暂不支持在线校验。",
     setup_key_saved: "Provider 设置已保存。", setup_doubao_note: "Doubao 仍为实验支持，将保存 App ID 和 Access Key，但不做在线校验。",
+    setup_minimax_note: "MiniMax realtime 不支持工具调用：AI 无法自行挂断电话、发短信或发 DTMF，通话只能等硬时限结束。需要工具能力请用 Qwen 或 OpenAI。",
     setup_person_title: "个性化", setup_person_hint: "这些信息会影响 AI 如何介绍自己，以及通话时使用的语言。",
     setup_owner: "机主姓名", setup_persona: "AI 人设称谓", setup_call_lang: "通话语言", setup_voice: "音色",
     setup_person_saved: "个性化设置已保存。",
@@ -2772,6 +2779,8 @@ let cfgDirty = false;  // 设置有未保存修改（离开页面时据此提示
 const CFG_SUGGEST = {
   OPENAI_VOICE: ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"],
   QWEN_VOICE: ["Cherry", "Serena", "Ethan", "Chelsie"],
+  MINIMAX_VOICE: ["female-shaonv", "female-yujie", "female-chengshu", "female-tianmei",
+                  "male-qn-qingse", "male-qn-jingying", "presenter_female", "presenter_male"],
 };
 let setupStep = 0;
 let setupValidated = false;
@@ -2779,8 +2788,15 @@ let setupRecordingConfirmed = false;
 let setupRecordingSaved = false;
 let recordingEnabled = false;
 const QWEN_API_KEY_URL = "https://bailian.console.aliyun.com/?tab=api#/api-key";
-const setupProviderKey = (provider) => provider === "openai" ? "OPENAI_API_KEY" : "DASHSCOPE_API_KEY";
-const setupVoiceKey = (provider) => provider === "openai" ? "OPENAI_VOICE" : "QWEN_VOICE";
+// provider -> 凭证 / 音色配置项。表驱动：新增 provider 只加一行，
+// 不再往三元表达式上继续叠。未列出的（如 local）回落 DashScope。
+const SETUP_PROVIDER_KEYS = {
+  openai: { key: "OPENAI_API_KEY", voice: "OPENAI_VOICE", label: "OpenAI API Key" },
+  minimax: { key: "MINIMAX_API_KEY", voice: "MINIMAX_VOICE", label: "MiniMax API Key" },
+};
+const setupProviderKey = (provider) => (SETUP_PROVIDER_KEYS[provider] || {}).key || "DASHSCOPE_API_KEY";
+const setupVoiceKey = (provider) => (SETUP_PROVIDER_KEYS[provider] || {}).voice || "QWEN_VOICE";
+const setupProviderKeyLabel = (provider) => (SETUP_PROVIDER_KEYS[provider] || {}).label || "DashScope API Key";
 const cfgVal = (key) => (cfgSpecs.find((c) => c.key === key) || {}).value || "";
 const recordingSpec = () => cfgSpecs.find((c) => c.key === "RECORDING_ENABLED") || {};
 function recordingDetailsText() {
@@ -2942,7 +2958,8 @@ function renderSetupProviderFields() {
   document.querySelectorAll(".setup-key-field").forEach((node) => { node.style.display = doubao ? "none" : ""; });
   $("setupValidateKey").style.display = doubao ? "none" : "";
   renderSetupQwenKeyHelp(provider);
-  $("setupApiKeyLabel").textContent = provider === "openai" ? "OpenAI API Key" : "DashScope API Key";
+  $("setupApiKeyLabel").textContent = setupProviderKeyLabel(provider);
+  if (provider === "minimax") setupStatus("setupKeyStatus", "", t("setup_minimax_note"));
   const key = setupVoiceKey(provider);
   const choices = CFG_SUGGEST[key] || [];
   const list = $("setupVoiceList");
