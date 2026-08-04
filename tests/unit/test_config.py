@@ -1027,3 +1027,29 @@ def test_audio_mode_choices_include_simcom_pcm():
     # 既有模式一个都不能丢
     assert {"uac", "uac_ffmpeg", "nmea"} <= set(spec.choices)
     assert spec.default in spec.choices
+
+
+def test_every_provider_choice_has_a_model_display_name():
+    """AGENT_PROVIDER 每个选项都必须在 MODEL_NAME_KEYS 里有项。
+
+    漏了不会报错，只会静默把别家的显示名报到 /api/meta——接入 minimax 时就
+    踩过：面板显示 provider=minimax 而 model=Qwen3.5-Omni。
+    """
+    missing = set(get_spec("AGENT_PROVIDER").choices) - set(config.MODEL_NAME_KEYS)
+    assert not missing, f"这些 provider 缺模型显示名映射: {sorted(missing)}"
+
+
+def test_model_display_name_per_provider(monkeypatch):
+    _unset(monkeypatch, "AGENT_MODEL_NAME", "AGENT_MODEL_NAME_OPENAI",
+           "AGENT_MODEL_NAME_MINIMAX", "AGENT_MODEL_NAME_DOUBAO")
+    assert config.model_display_name("minimax") == "MiniMax Realtime"
+    assert config.model_display_name("openai") == "OpenAI Realtime"
+    assert config.model_display_name("qwen") == "Qwen3.5-Omni"
+    # 未知 provider 回落 qwen，不抛
+    assert config.model_display_name("nope") == "Qwen3.5-Omni"
+
+
+def test_model_name_keys_reference_registered_specs():
+    """映射指向的每个 key 都得真在注册表里，否则 get_str 抛 KeyError。"""
+    for provider, key in config.MODEL_NAME_KEYS.items():
+        assert get_spec(key), f"{provider} 指向未注册的 {key}"

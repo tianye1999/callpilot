@@ -540,6 +540,26 @@ def setup_required() -> bool:
     return not get_bool("SETUP_DONE")
 
 
+# provider -> 模型显示名的注册表 key。放在这里而不是调用点：AGENT_PROVIDER 每加
+# 一个选项都要在这张表里有对应项，否则 /api/meta 会把别家的显示名报出去
+# （2026-08-04 接入 minimax 时就漏过一次，面板显示 provider=minimax /
+# model=Qwen3.5-Omni）。有防漏测试守着，见 test_config。
+MODEL_NAME_KEYS: dict[str, str] = {
+    "qwen": "AGENT_MODEL_NAME",
+    "doubao": "AGENT_MODEL_NAME_DOUBAO",
+    "openai": "AGENT_MODEL_NAME_OPENAI",
+    "minimax": "AGENT_MODEL_NAME_MINIMAX",
+    # 三段式的"模型"是本地 pipeline + 文本脑，沿用 qwen 显示名（LOCAL_LLM_MODEL
+    # 默认就是 qwen-plus）。
+    "local": "AGENT_MODEL_NAME",
+}
+
+
+def model_display_name(provider: str) -> str:
+    """provider 的模型显示名（/api/meta 与自我介绍用）；未知 provider 回落 qwen。"""
+    return get_str(MODEL_NAME_KEYS.get(provider, "AGENT_MODEL_NAME"))
+
+
 def runtime_meta(provider: str, model: str, port: str) -> dict:
     """Build /api/meta payload with non-fatal configuration readiness."""
     return {
@@ -956,6 +976,8 @@ __all__ = [
     "get_str",
     "log_dir",
     "read_panel_values",
+    "MODEL_NAME_KEYS",
+    "model_display_name",
     "runtime_meta",
     "setup_required",
     "update_env_file",

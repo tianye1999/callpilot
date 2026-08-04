@@ -212,15 +212,10 @@ def main() -> None:
         hub=hub,
     )
 
-    # provider -> 模型显示名的注册表 key（未知 provider 回落 qwen 显示名）。
-    model_name_keys = {
-        "qwen": "AGENT_MODEL_NAME",
-        "doubao": "AGENT_MODEL_NAME_DOUBAO",
-        "openai": "AGENT_MODEL_NAME_OPENAI",
-    }
     meta = config.runtime_meta(
         provider=provider,
-        model=config.get_str(model_name_keys.get(provider, "AGENT_MODEL_NAME")),
+        # provider -> 显示名的映射是 config.MODEL_NAME_KEYS（单一事实来源）。
+        model=config.model_display_name(provider),
         port=modem_port,
     )
 
