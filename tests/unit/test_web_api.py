@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
-from agentcall import config, platforms
+from agentcall import config, platforms, port_detect
 from agentcall.call_log import CallLogger
 from agentcall.remote_pairing import RemotePairingStore
 from agentcall.sim_identity import identify, with_lock_state
@@ -306,7 +306,7 @@ def test_quectel_usb_detection_on_non_macos_keeps_serial_scan(monkeypatch):
     monkeypatch.setattr(
         server.list_ports,
         "comports",
-        lambda: [SimpleNamespace(vid=server.QUECTEL_VID)],
+        lambda: [SimpleNamespace(vid=port_detect.QUECTEL_VID)],
     )
 
     assert server.detect_quectel_usb_online() is True
@@ -1683,26 +1683,8 @@ def test_sim_unlock_modem_failure_is_502_without_leaking_pin(caplog):
 
 
 # ---- MODEM_USB_VID:非 Quectel 模组的向导检测 ----
-
-
-def test_modem_usb_vid_defaults_to_quectel(monkeypatch):
-    monkeypatch.delenv("MODEM_USB_VID", raising=False)
-    assert server.modem_usb_vid() == server.QUECTEL_VID
-
-
-def test_modem_usb_vid_reads_hex_config(monkeypatch):
-    monkeypatch.setenv("MODEM_USB_VID", "1e0e")
-    assert server.modem_usb_vid() == 0x1E0E
-    monkeypatch.setenv("MODEM_USB_VID", "0X1E0E")
-    assert server.modem_usb_vid() == 0x1E0E
-
-
-def test_modem_usb_vid_falls_back_on_garbage(monkeypatch, caplog):
-    """配置写错不能让向导硬件检测直接炸——回退默认值并告警。"""
-    for bad in ("zzzz", "", "10000"):
-        monkeypatch.setenv("MODEM_USB_VID", bad)
-        with caplog.at_level("WARNING"):
-            assert server.modem_usb_vid() == server.QUECTEL_VID
+# modem_usb_vid() 本身的解析行为在 test_port_detect.py 测(那里是它的定义处);
+# 这里只测向导确实把它用上了。
 
 
 def test_usb_detection_uses_configured_vid_on_macos(monkeypatch):
@@ -1732,6 +1714,6 @@ def test_usb_detection_uses_configured_vid_on_non_macos(monkeypatch):
 def test_system_profiler_tree_matches_configured_vid():
     tree = {"SPUSBDataType": [{"_items": [{"vendor_id": "0x1e0e  (SimTech)"}]}]}
     assert server._usb_tree_has_quectel(tree, 0x1E0E) is True
-    assert server._usb_tree_has_quectel(tree, server.QUECTEL_VID) is False
+    assert server._usb_tree_has_quectel(tree, port_detect.QUECTEL_VID) is False
     # 整数形式的 vendor_id 同样要认
     assert server._usb_tree_has_quectel({"vendor_id": 0x1E0E}, 0x1E0E) is True

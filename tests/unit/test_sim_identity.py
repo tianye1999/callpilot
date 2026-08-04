@@ -307,6 +307,38 @@ def test_open_serial_enables_sim_and_registration_urcs_before_identity_refresh(m
     assert commands.index("AT+CREG=1") < commands.index("AT+CIMI")
 
 
+def test_open_serial_skips_quectel_private_urc_on_other_vendors(monkeypatch):
+    """QSIMSTAT 是 Quectel 私有：SIMCom 上必回 ERROR，只会往日志里塞假故障。
+
+    CREG=1 是 3GPP 标准命令，两家都吃，必须照发——否则 SIM/注册变化没人通知。
+    """
+    from agentcall import modem as modem_mod
+    from agentcall.modem import Eg25Modem
+
+    monkeypatch.setenv("MODEM_USB_VID", "1e0e")
+    modem = Eg25Modem("unused")
+    commands: list[str] = []
+    monkeypatch.setattr(modem_mod.serial, "Serial", lambda **_kwargs: object())
+    monkeypatch.setattr(modem_mod.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(modem, "_drain", lambda: None)
+
+    def send(command: str) -> str:
+        commands.append(command)
+        if command == "AT+CIMI":
+            return "460010123456789\r\nOK"
+        if command == "AT+CREG?":
+            return "+CREG: 0,1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", send)
+    monkeypatch.setattr(modem, "_init_sms", lambda: None)
+
+    modem._open_serial()
+
+    assert "AT+QSIMSTAT=1" not in commands
+    assert "AT+CREG=1" in commands
+
+
 # ---- parse_cpin / parse_pin_attempts / with_lock_state ----
 
 def test_parse_cpin_reads_lock_codes():

@@ -429,7 +429,11 @@ class Eg25Modem:
             return self.port
         detected = port_detect.detect_at_port()
         if detected is None:
-            raise serial.SerialException("MODEM_PORT=auto 未探测到 Quectel AT 串口")
+            raise serial.SerialException(
+                "MODEM_PORT=auto 未探测到模组 AT 串口"
+                f"（扫描 VID=0x{port_detect.modem_usb_vid():04X}，"
+                "非 Quectel 模组需设 MODEM_USB_VID）"
+            )
         return detected
 
     def _open_serial(self) -> None:
@@ -450,7 +454,13 @@ class Eg25Modem:
                 self._send("ATE0")
                 self._send("AT+CLIP=1")
                 self._init_sms()
-                self._send("AT+QSIMSTAT=1")
+                # QSIMSTAT（SIM 热插拔 URC）是 Quectel 私有，SIMCom 必回 ERROR。
+                # _send 不因 ERROR 抛异常所以无害，但每次连接都往日志里留一条像
+                # 故障的响应。按 MODEM_USB_VID 判厂商：它是项目里唯一的厂商声明
+                # 来源，且不必为此多发一条 AT+CGMI 往返。非 Quectel 上少了这个
+                # URC，SIM 变化仍由 CREG=1 与 refresh_sim_identity 兜底。
+                if port_detect.modem_usb_vid() == port_detect.QUECTEL_VID:
+                    self._send("AT+QSIMSTAT=1")
                 self._send("AT+CREG=1")
                 self.refresh_sim_identity(notify=False)
             finally:

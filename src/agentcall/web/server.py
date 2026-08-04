@@ -32,7 +32,7 @@ from ..number_profiles import (
     list_profiles,
     update_profile,
 )
-from ..port_detect import QUECTEL_VID
+from ..port_detect import modem_usb_vid
 from ..rate_limit import acquire_sms_send_slot
 
 logger = logging.getLogger(__name__)
@@ -79,24 +79,6 @@ def _pyusb_backend():
     except Exception:  # noqa: BLE001
         return None
     return usb.backend.libusb1.get_backend(find_library=find_library)
-
-
-def modem_usb_vid() -> int:
-    """安装向导扫描用的模组 USB 厂商号;配置非法时退回 Quectel 默认值。
-
-    非 Quectel 模组(如 SIMCom SIM7600)只有配对了 VID,向导才不会一直报
-    「硬件尚未就绪」——模组能用但检测按厂商号写死是历史遗留。
-    """
-    raw = (config.get_str("MODEM_USB_VID") or "").strip()
-    try:
-        vid = int(raw, 16)
-    except ValueError:
-        logger.warning("MODEM_USB_VID 不是合法十六进制(%r),回退 Quectel 默认值", raw)
-        return QUECTEL_VID
-    if not 0 <= vid <= 0xFFFF:
-        logger.warning("MODEM_USB_VID 超出 16 位范围(%r),回退 Quectel 默认值", raw)
-        return QUECTEL_VID
-    return vid
 
 
 def _detect_quectel_usb_pyusb(vid: int) -> bool:

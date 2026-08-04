@@ -169,3 +169,65 @@ def test_connect_fixed_port_skips_detection(fake_serial, monkeypatch):
     modem.connect()
     assert fake_serial.instances[0].port == "/dev/ttyUSB2"
     assert modem._active_port == "/dev/ttyUSB2"
+
+
+# ---- modem_usb_vid：桥 / 向导 / auto 扫描共用的单一事实来源 ----
+
+
+def test_modem_usb_vid_defaults_to_quectel(monkeypatch):
+    monkeypatch.delenv("MODEM_USB_VID", raising=False)
+    assert port_detect.modem_usb_vid() == QUECTEL_VID
+
+
+def test_modem_usb_vid_reads_hex_config(monkeypatch):
+    """一律按十六进制读，大小写与 0x 前缀等价。"""
+    monkeypatch.setenv("MODEM_USB_VID", "1e0e")
+    assert port_detect.modem_usb_vid() == 0x1E0E
+    monkeypatch.setenv("MODEM_USB_VID", "0X1E0E")
+    assert port_detect.modem_usb_vid() == 0x1E0E
+
+
+def test_modem_usb_vid_falls_back_on_garbage(monkeypatch, caplog):
+    """配置写错不能让模组检测直接炸——回退默认值并告警。"""
+    for bad in ("zzzz", "", "10000"):
+        monkeypatch.setenv("MODEM_USB_VID", bad)
+        with caplog.at_level("WARNING"):
+            assert port_detect.modem_usb_vid() == QUECTEL_VID
+
+
+# ---- 非 Quectel 厂商：认 AT 描述，但不按 Quectel 口序瞎猜 ----
+
+
+def test_detect_matches_configured_non_quectel_vid(monkeypatch):
+    """MODEM_USB_VID=1e0e 时应扫 SIMCom 的口，而不是继续只认 Quectel。"""
+    monkeypatch.setenv("MODEM_USB_VID", "1e0e")
+    _patch_comports(monkeypatch, [
+        FakePortInfo("COM3", "Quectel USB AT Port", QUECTEL_VID),
+        FakePortInfo("COM7", "SimTech HS-USB AT Port 9001", 0x1E0E),
+    ])
+    assert detect_at_port() == "COM7"
+
+
+def test_detect_refuses_index_fallback_for_non_quectel(monkeypatch):
+    """SIM7600 是六口布局，按 Quectel 第 3 口惯例猜会把 DM/NMEA 当 AT 口用。
+
+    那种错法的表现是所有 AT 指令静默超时，比直接报「探测不到」难查得多，
+    所以描述不含 AT 时宁可返回 None。
+    """
+    monkeypatch.setenv("MODEM_USB_VID", "1e0e")
+    _patch_comports(monkeypatch, [
+        FakePortInfo(f"COM{i}", "SimTech HS-USB Port", 0x1E0E) for i in range(3, 9)
+    ])
+    assert detect_at_port() is None
+
+
+def test_detect_keeps_quectel_index_fallback(monkeypatch):
+    """Quectel 的四口惯例回退不受影响（回归保护）。"""
+    monkeypatch.setenv("MODEM_USB_VID", "2c7c")
+    _patch_comports(monkeypatch, [
+        FakePortInfo("COM3", "Quectel USB Port", QUECTEL_VID),
+        FakePortInfo("COM4", "Quectel USB Port", QUECTEL_VID),
+        FakePortInfo("COM5", "Quectel USB Port", QUECTEL_VID),
+        FakePortInfo("COM6", "Quectel USB Port", QUECTEL_VID),
+    ])
+    assert detect_at_port() == "COM5"
