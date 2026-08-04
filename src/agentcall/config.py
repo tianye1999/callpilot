@@ -123,8 +123,10 @@ class KeyValidationResult:
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- Agent ----
     ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "qwen",
-               choices=("qwen", "doubao", "openai", "local"), requires_restart=True,
+               choices=("qwen", "doubao", "openai", "minimax", "local"),
+               requires_restart=True,
                choice_labels={"doubao": "doubao (experimental)",
+                              "minimax": "minimax (无工具调用，仅纯对话)",
                               "local": "local (三段式，音频不出本机)"}),
     ConfigSpec("DASHSCOPE_API_KEY", "DashScope API Key", "str", "",
                secret=True, requires_restart=True),
@@ -186,6 +188,29 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                requires_restart=True),
     ConfigSpec("AGENT_MODEL_NAME_OPENAI", "OpenAI 模型显示名", "str",
                "OpenAI Realtime", editable=False, hidden=True,
+               requires_restart=True),
+    # MiniMax Realtime（OpenAI Realtime beta 协议兼容，实测 2026-08-04）。
+    # 重要能力缺口：该端点静默丢弃 session.tools（session.updated 回显里无
+    # tools 字段，四种写法均无 function call 事件），所以 AI 无法自行挂断/
+    # 发短信/发 DTMF——详见 agents/minimax_agent 模块 docstring。
+    ConfigSpec("MINIMAX_API_KEY", "MiniMax API Key", "str", "",
+               secret=True, requires_restart=True),
+    # realtime 端点当前只提供 abab6.5s-chat；?model= 查询参数被服务端忽略，
+    # 此项仅用于显示与将来端点支持选模型时切换。
+    ConfigSpec("MINIMAX_REALTIME_MODEL", "MiniMax 实时模型", "str",
+               "abab6.5s-chat", requires_restart=True),
+    # 精选常用音色做下拉；列表外音色可直接在 .env 填（get_str 读环境变量，
+    # 不受 choices 限制），同 QWEN_VOICE 的处理。
+    ConfigSpec("MINIMAX_VOICE", "MiniMax 音色", "select", "female-shaonv",
+               choices=("female-shaonv", "female-yujie", "female-chengshu",
+                        "female-tianmei", "male-qn-qingse", "male-qn-jingying",
+                        "male-qn-badao", "presenter_female", "presenter_male")),
+    # 端点覆写（可选）：留空即用国内区 api.minimaxi.com。注意国际站
+    # api.minimax.io 与国内区 key 不通用（实测国内 key 在国际站回 401）。
+    ConfigSpec("MINIMAX_REALTIME_URL", "MiniMax Realtime 端点覆写", "str", "",
+               requires_restart=True),
+    ConfigSpec("AGENT_MODEL_NAME_MINIMAX", "MiniMax 模型显示名", "str",
+               "MiniMax Realtime", editable=False, hidden=True,
                requires_restart=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
     ConfigSpec(
@@ -351,6 +376,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("QWEN_PREWARM", "Qwen 连接预热", "bool", "true"),
     ConfigSpec("QWEN_RECONNECT_MAX", "Qwen 最大重连次数", "int", "2"),
     ConfigSpec("OPENAI_RECONNECT_MAX", "OpenAI 最大重连次数", "int", "2"),
+    ConfigSpec("MINIMAX_RECONNECT_MAX", "MiniMax 最大重连次数", "int", "2"),
+    # MiniMax realtime 无服务端 VAD，断句由 minimax_agent 的能量 VAD 负责：
+    # 高于此 int16 RMS 视为人声。静默窗口与强制断句复用 MANUAL_RESPONSE_* 两项。
+    # 电话上行噪底受 AGENT_UPLINK_GAIN 影响，真机偏噪时上调。
+    ConfigSpec("MINIMAX_VAD_RMS_THRESHOLD", "MiniMax 断句能量阈值", "int", "400"),
     # ---- 远程网页拨号 POC ----
     ConfigSpec("REMOTE_WEB_DIALER_ENABLED", "启用远程网页拨号", "bool", "false",
                requires_restart=True),
@@ -418,6 +448,7 @@ PROVIDER_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "qwen": ("DASHSCOPE_API_KEY",),
     "doubao": ("DOUBAO_APP_ID", "DOUBAO_ACCESS_KEY"),
     "openai": ("OPENAI_API_KEY",),
+    "minimax": ("MINIMAX_API_KEY",),
     # 三段式的默认 LLM 脑是 dashscope 文本模型（qwen-plus），复用同一凭证。
     "local": ("DASHSCOPE_API_KEY",),
 }
@@ -549,6 +580,14 @@ def validate_provider_key_online(
         if provider == "openai":
             _http_request_json(
                 "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {secret}"},
+                timeout=timeout,
+            )
+            return KeyValidationResult(True, "valid")
+        if provider == "minimax":
+            # 国内区端点；国际站 api.minimax.io 与国内 key 不通用（实测 401）。
+            _http_request_json(
+                "https://api.minimaxi.com/v1/models",
                 headers={"Authorization": f"Bearer {secret}"},
                 timeout=timeout,
             )

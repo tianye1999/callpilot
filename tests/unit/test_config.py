@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import json
 import os
 import re
 import threading
@@ -316,8 +317,10 @@ def test_openai_registered_defaults(monkeypatch):
     assert get_spec("OPENAI_REALTIME_URL").requires_restart
 
 
-def test_agent_provider_choices_include_openai_and_local():
-    assert get_spec("AGENT_PROVIDER").choices == ("qwen", "doubao", "openai", "local")
+def test_agent_provider_choices_include_openai_minimax_and_local():
+    assert get_spec("AGENT_PROVIDER").choices == (
+        "qwen", "doubao", "openai", "minimax", "local",
+    )
 
 
 def test_tool_security_config_defaults(monkeypatch):
@@ -891,7 +894,27 @@ def test_panel_marks_doubao_choice_experimental():
     rows = {row["key"]: row for row in read_panel_values()}
     provider = rows["AGENT_PROVIDER"]
     assert provider["choice_labels"]["doubao"] == "doubao (experimental)"
-    assert provider["choices"] == ["qwen", "doubao", "openai", "local"]
+    assert provider["choices"] == ["qwen", "doubao", "openai", "minimax", "local"]
+
+
+def test_panel_warns_minimax_has_no_tool_calling():
+    """能力缺口必须在选项里就看得见：选了 minimax 的人 AI 挂不了电话。"""
+    rows = {row["key"]: row for row in read_panel_values()}
+    label = rows["AGENT_PROVIDER"]["choice_labels"]["minimax"]
+    assert "无工具调用" in label
+
+
+def test_minimax_credentials_and_secret_mask(monkeypatch):
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    assert validate_provider_credentials("minimax") == [
+        "缺少环境变量 MINIMAX_API_KEY（minimax 必需）"
+    ]
+    monkeypatch.setenv("MINIMAX_API_KEY", "sk-cp-secret")
+    assert validate_provider_credentials("minimax") == []
+    # key 属 secret：面板只回「已设置」，绝不回传真值
+    rows = {row["key"]: row for row in read_panel_values()}
+    assert rows["MINIMAX_API_KEY"]["secret"] is True
+    assert "sk-cp-secret" not in json.dumps(rows["MINIMAX_API_KEY"], ensure_ascii=False)
 
 
 # ---- 收口回归护栏 ----

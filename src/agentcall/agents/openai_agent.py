@@ -54,9 +54,13 @@ def _response_id(event: dict[str, Any]) -> str | None:
     return str(raw) if raw else None
 
 
-def _reconnect_max() -> int:
-    """读取运行中断线的最大重连次数（注册表 OPENAI_RECONNECT_MAX，默认 2）。"""
-    return config.get_int("OPENAI_RECONNECT_MAX")
+def _reconnect_max(key: str = "OPENAI_RECONNECT_MAX") -> int:
+    """读取运行中断线的最大重连次数（默认注册表 OPENAI_RECONNECT_MAX，默认值 2）。
+
+    ``key`` 由子类经 ``reconnect_max_key`` 指定，让复用本实现的 provider
+    （如 MiniMax）用自己的配置项，而不是借 OpenAI 的。
+    """
+    return config.get_int(key)
 
 
 def _default_instructions() -> str:
@@ -79,6 +83,14 @@ class OpenAIVoiceAgent(VoiceAgent):
     # OpenAI Realtime pcm16 固定 24kHz mono；桥自动做 8k↔24k 重采样。
     input_rate = 24000
     output_rate = 24000
+
+    # ---- 子类复用本实现时的差异点（见 minimax_agent）----
+    # 日志里的 provider 名；断线/重连等共用路径的消息按此渲染。
+    provider_label = "OpenAI"
+    # 最大重连次数取哪个注册表项。
+    reconnect_max_key = "OPENAI_RECONNECT_MAX"
+    # 说话 Vibe 是 OpenAI 专属能力，其他 provider 不追加该行。
+    supports_vibe = True
 
     def __init__(
         self,
@@ -197,7 +209,7 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._reset_manual_response_state()
         self._instructions = self._session_instructions or _default_instructions()
         # OpenAI-only 说话 Vibe：追加在 VOICE_STYLE（已并入上面的 instructions）之后。
-        vibe_line = openai_vibe_line()
+        vibe_line = openai_vibe_line() if self.supports_vibe else ""
         if vibe_line:
             self._instructions = f"{self._instructions.rstrip()}\n{vibe_line}"
         await self._connect()
@@ -205,19 +217,20 @@ class OpenAIVoiceAgent(VoiceAgent):
 
     async def _reconnect(self) -> bool:
         """断线重连（参照 qwen_agent 语义）；全部失败返回 False。"""
-        max_attempts = _reconnect_max()
+        max_attempts = _reconnect_max(self.reconnect_max_key)
         for attempt in range(1, max_attempts + 1):
             if not self._running:
                 return True  # 已主动 stop：不算失败，也不再重连
             logger.warning(
-                "OpenAI Realtime 尝试重连(第 %d/%d 次)", attempt, max_attempts
+                "%s Realtime 尝试重连(第 %d/%d 次)",
+                self.provider_label, attempt, max_attempts,
             )
             try:
                 await self._connect()
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "OpenAI Realtime 重连失败(第 %d/%d 次): %s",
-                    attempt, max_attempts, exc,
+                    "%s Realtime 重连失败(第 %d/%d 次): %s",
+                    self.provider_label, attempt, max_attempts, exc,
                 )
                 continue
             if not self._running:
@@ -229,7 +242,10 @@ class OpenAIVoiceAgent(VoiceAgent):
                     except Exception:  # noqa: BLE001
                         pass
                 return True
-            logger.info("OpenAI Realtime 重连成功(第 %d/%d 次)", attempt, max_attempts)
+            logger.info(
+                "%s Realtime 重连成功(第 %d/%d 次)",
+                self.provider_label, attempt, max_attempts,
+            )
             try:
                 await self.say(RECONNECT_NOTICE)
             except Exception as exc:  # noqa: BLE001
@@ -562,9 +578,9 @@ class OpenAIVoiceAgent(VoiceAgent):
                     if not self._running:
                         break
             except websockets.ConnectionClosed:
-                logger.info("OpenAI Realtime 连接已关闭")
+                logger.info("%s Realtime 连接已关闭", self.provider_label)
             except Exception as exc:  # noqa: BLE001
-                logger.error("OpenAI 接收循环异常: %s", exc)
+                logger.error("%s 接收循环异常: %s", self.provider_label, exc)
             if not self._running:
                 break
             self._cancel_manual_response_control()
@@ -574,9 +590,12 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._ws = None
             # 通话进行中断线：尝试重连；全部失败则会话不可恢复，置 fatal
             # 让 CallSession 主循环结束整通电话（避免"电话活着但 AI 已死"）。
-            logger.warning("OpenAI Realtime 运行中断线，尝试重连")
+            logger.warning("%s Realtime 运行中断线，尝试重连", self.provider_label)
             if not await self._reconnect():
-                logger.error("OpenAI Realtime 重连全部失败，标记会话不可恢复")
+                logger.error(
+                    "%s Realtime 重连全部失败，标记会话不可恢复",
+                    self.provider_label,
+                )
                 self.fatal = True
                 return
 
@@ -634,7 +653,7 @@ class OpenAIVoiceAgent(VoiceAgent):
                 logger.debug("OpenAI 回复轮次完成")
             self._on_response_done()
         elif event_type == "error":
-            logger.error("OpenAI Realtime 错误: %s", event)
+            logger.error("%s Realtime 错误: %s", self.provider_label, event)
 
     async def _dispatch_tool_call(
         self, name: str, call_id: str, arguments: str, ws: Any
