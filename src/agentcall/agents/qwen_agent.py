@@ -144,6 +144,9 @@ class _QwenCallback(OmniRealtimeCallback):
     ) -> None:
         self._audio_queue = audio_queue
         self._agent = agent
+        # _connect_session 每次重连都会把新 conversation 挂回来；显式声明属性，
+        # 免得类型检查把这个动态赋值当成「类上不存在的属性」。
+        self._conversation: "OmniRealtimeConversation | None" = None
 
     def on_open(self) -> None:
         logger.info("千问 Realtime 连接已建立")
@@ -158,7 +161,10 @@ class _QwenCallback(OmniRealtimeCallback):
         else:
             self._audio_queue.put(None)
 
-    def on_event(self, response: dict) -> None:
+    # dashscope 1.26 的存根把 on_event 的参数写成 str，但运行时投递的是事件 dict
+    # （函数体里就是按 dict 用的）。存根与实现不符，按真实类型标注并抑制 override
+    # 检查；哪天上游存根修对了可以去掉。
+    def on_event(self, response: dict) -> None:  # type: ignore[override]
         event_type = response.get("type", "")
         if event_type == "response.audio.delta":
             delta = response.get("delta", "")
@@ -313,7 +319,9 @@ class QwenVoiceAgent(VoiceAgent):
         start() 与断线重连共用；全部成功后才把新 conversation 挂到
         self._conversation 上，失败则抛出最后一次异常。
         """
-        conversation_kwargs = {
+        # 标注成 dict[str, Any]：值是异构的（str + callback + 可选 url），
+        # 不标注会被推成 dict[str, object]，** 解包时与实参类型对不上。
+        conversation_kwargs: dict[str, Any] = {
             "model": self.model,
             "callback": self._callback,
         }

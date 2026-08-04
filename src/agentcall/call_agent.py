@@ -2849,8 +2849,11 @@ class CallAgentService:
         )
         self._supervisor_thread.start()
 
+    # 连上之后的巡检间隔：只是兜底，不必密集轮询。
+    _SUPERVISOR_POLL_SECONDS = 5.0
+
     def _modem_supervisor(self) -> None:
-        """后台反复尝试连接模组直到成功，期间向 UI 广播连接状态。"""
+        """后台维持模组连接：首连重试到成功，之后持续巡检、掉线自动重连。"""
         delay = 2.0
         while self._service_running:
             try:
@@ -2876,7 +2879,23 @@ class CallAgentService:
                 return
             self._set_modem_connected(True)
             logger.info("模组已连接，等待来电…")
-            return
+            delay = 2.0  # 连上了，下次掉线重来时退避从头算
+
+            # 连上之后继续看着，而不是 return。模组自身的 _reconnect 只在监听
+            # 线程还活着时有效，线程一停它就静默放弃，此后没有任何人再尝试——
+            # 真机表现是 USB→PTY 桥一重启，服务就永远停在「未连接」，只能手动
+            # 重启进程。这里补上外层兜底：确认既没连上、也没在自救，就重跑整个
+            # 连接序列（connect/start_listener 都是幂等的）。
+            while self._service_running:
+                for _ in range(int(self._SUPERVISOR_POLL_SECONDS * 10)):
+                    if not self._service_running:
+                        return
+                    time.sleep(0.1)
+                if self.modem_connected or self.modem.reconnect_in_progress:
+                    continue
+                logger.warning("模组已掉线且未在自动重连，重跑连接序列…")
+                self._set_modem_connected(False, "模组掉线")
+                break
 
     def _set_modem_connected(self, connected: bool, error: str | None = None) -> None:
         """更新模组连接状态并广播给 UI（仅状态翻转时发事件，避免重连期刷屏）。"""
