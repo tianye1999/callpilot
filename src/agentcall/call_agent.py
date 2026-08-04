@@ -404,9 +404,16 @@ class CallSession:
 
             await asyncio.sleep(1.0)
 
-            # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
-            # 否则第二通开始模组无 PCM 流（双向无声）。
+            # 挂断流程会关闭语音通道（AT+QPCMV=0 / AT+CPCMREG=0），每通电话都要
+            # 重新启用，否则第二通开始模组无 PCM 流（双向无声）。
             self.modem.initialize_for_voice(self.audio_mode)
+            # simcom_pcm 只在通话中才能开 PCM：真开成了才允许起桥。往未出流的
+            # USB 端点写会 [Errno 60] 并把 AT 口的桥一起拖死（真机 2026-08-01），
+            # 宁可让这通电话明确失败，也不要静默变哑音 + 拖死模组链路。
+            if self.audio_mode.lower() == "simcom_pcm" and not self.modem.voice_pcm_active:
+                raise RuntimeError(
+                    "SIMCom PCM 通道未启用（AT+CPCMREG=1 未成功），拒绝启动音频桥"
+                )
 
             bridge = create_audio_bridge(
                 mode=self.audio_mode,

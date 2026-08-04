@@ -367,7 +367,12 @@ def test_create_audio_bridge_rejects_unknown_mode_listing_simcom():
 
 
 def test_serial_pcm_bridge_falls_back_when_pty_rejects_baudrate(monkeypatch):
-    """macOS PTY 只接受 ≤230400；921600 抛 ENOTTY 时应降速重开而不是让通话失败。"""
+    """macOS PTY 只接受 ≤230400；921600 抛 ENOTTY 时应降速重开而不是让通话失败。
+
+    这里测的是**判不出**目标是 PTY 时的兜底路径（软链接失效、非 macOS 命名），
+    所以显式把 _is_pty 打成 False——否则本机真跑过桥时 /tmp/ec20-pcm 已是 PTY
+    软链接，走的就是快路径，断言会随环境漂。
+    """
     attempts: list[int] = []
 
     def fake_serial(port, baudrate, timeout, write_timeout):
@@ -376,6 +381,7 @@ def test_serial_pcm_bridge_falls_back_when_pty_rejects_baudrate(monkeypatch):
             raise OSError(errno.ENOTTY, "Inappropriate ioctl for device")
         return _FakeSerial()
 
+    monkeypatch.setattr(audio_bridge, "_is_pty", lambda _port: False)
     monkeypatch.setattr(audio_bridge.serial, "Serial", fake_serial)
     bridge = audio_bridge.SerialPcmAudioBridge("/tmp/ec20-pcm", 921600)
     bridge.start()
@@ -395,6 +401,62 @@ def test_serial_pcm_bridge_keeps_real_serial_errors(monkeypatch):
     with pytest.raises(OSError) as excinfo:
         audio_bridge.SerialPcmAudioBridge("/tmp/nope", 921600).start()
     assert excinfo.value.errno == errno.ENOENT
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("/dev/ttys003", True),          # macOS PTY slave
+    ("/dev/pts/3", True),            # Linux PTY slave
+    ("/dev/cu.usbserial-1420", False),  # 真串口：波特率有物理意义，不能替用户降
+    ("/dev/ttys003x", False),        # 前缀相同但不是 PTY
+    ("COM4", False),
+])
+def test_is_pty_recognises_pseudo_terminals(path, expected):
+    assert audio_bridge._is_pty(path) is expected
+
+
+def test_is_pty_follows_symlinks(tmp_path):
+    """桥给出的是 /tmp/ec20-pcm 这样的软链接，要解析到真实设备名再判。"""
+    link = tmp_path / "ec20-pcm"
+    link.symlink_to("/dev/ttys007")     # 目标不必真实存在，realpath 只做路径解析
+    assert audio_bridge._is_pty(str(link)) is True
+
+
+def test_serial_pcm_bridge_opens_pty_at_safe_baudrate_directly(monkeypatch, tmp_path):
+    """目标是 PTY 时一次开对：省掉每通电话必然失败一次的 open 和那条像故障的告警。"""
+    link = tmp_path / "ec20-pcm"
+    link.symlink_to("/dev/ttys007")
+    attempts: list[int] = []
+
+    def fake_serial(port, baudrate, timeout, write_timeout):
+        attempts.append(baudrate)
+        if baudrate > audio_bridge.PTY_SAFE_BAUDRATE:
+            raise OSError(errno.ENOTTY, "Inappropriate ioctl for device")
+        return _FakeSerial()
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", fake_serial)
+    bridge = audio_bridge.SerialPcmAudioBridge(str(link), 921600)
+    bridge.start()
+    try:
+        assert attempts == [audio_bridge.PTY_SAFE_BAUDRATE]
+    finally:
+        bridge.stop()
+
+
+def test_serial_pcm_bridge_keeps_configured_baudrate_on_real_serial(monkeypatch):
+    """真串口不降速——那里的 921600 是有物理意义的。"""
+    attempts: list[int] = []
+
+    def fake_serial(port, baudrate, timeout, write_timeout):
+        attempts.append(baudrate)
+        return _FakeSerial()
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", fake_serial)
+    bridge = audio_bridge.SerialPcmAudioBridge("/dev/cu.usbserial-1420", 921600)
+    bridge.start()
+    try:
+        assert attempts == [921600]
+    finally:
+        bridge.stop()
 
 
 def test_serial_pcm_bridge_does_not_retry_when_already_safe(monkeypatch):

@@ -24,6 +24,22 @@ logger = logging.getLogger(__name__)
 # macOS PTY 只接受 ≤230400；PCM 走桥出的 PTY 时用它兜底(见 _open_serial)。
 PTY_SAFE_BAUDRATE = 115200
 
+# 伪终端设备名：macOS 是 /dev/ttysNNN，Linux 是 /dev/pts/N。
+_PTY_NAME_RE = re.compile(r"^/dev/(ttys\d+|pts/\d+)$")
+
+
+def _is_pty(port: str) -> bool:
+    """``port`` 是否是伪终端（软链接会先解析）。
+
+    真串口（``/dev/cu.*``、``COMn``）返回 False——那里的波特率有物理意义，
+    绝不能替用户降速。判不出来时一律返回 False，把决定权留给 open 的兜底。
+    """
+    try:
+        resolved = os.path.realpath(port)
+    except OSError:
+        return False
+    return bool(_PTY_NAME_RE.match(resolved))
+
 MODEM_RATE = 8000
 MODEM_CHANNELS = 1
 MODEM_DTYPE = "int16"
@@ -168,27 +184,38 @@ class SerialPcmAudioBridge:
         self._write_timeouts = 0
 
     def _open_serial(self) -> serial.Serial:
-        """打开 PCM 串口；PTY 拒绝高波特率时降到 PTY 安全值重开。
+        """打开 PCM 串口；目标是 PTY 时直接用 PTY 安全波特率，否则失败后降速重开。
 
         simcom_pcm 模式下 MODEM_PCM_PORT 指向的是 ec20_usb_pty 桥出来的 **PTY**，
         不是真串口：macOS 的 PTY 只接受 ≤230400，用 EC20 NMEA 口的 921600 会抛
         ENOTTY，整通电话在 bridge.start() 就炸掉（真机 2026-08-01 实测）。
         PTY 上波特率本就无物理意义（没有实际串行时序），降速不影响吞吐。
+
+        先判目标是不是 PTY：能判出来就一次开对，省掉每通电话必然失败一次的
+        open 和那条看着像故障的 warning；判不出来（软链接失效、非 macOS 命名
+        惯例）仍留 ENOTTY 兜底，行为与之前一致。
         """
+        baudrate = self.baudrate
+        if baudrate > PTY_SAFE_BAUDRATE and _is_pty(self.port):
+            logger.info(
+                "PCM 口 %s 是 PTY，按 PTY 安全波特率 %s 打开（配置值 %s 在 PTY 上无意义）",
+                self.port, PTY_SAFE_BAUDRATE, baudrate,
+            )
+            baudrate = PTY_SAFE_BAUDRATE
         try:
             return serial.Serial(
                 port=self.port,
-                baudrate=self.baudrate,
+                baudrate=baudrate,
                 timeout=0.02,
                 write_timeout=0.2,
             )
         except OSError as exc:
-            if exc.errno != errno.ENOTTY or self.baudrate <= PTY_SAFE_BAUDRATE:
+            if exc.errno != errno.ENOTTY or baudrate <= PTY_SAFE_BAUDRATE:
                 raise
             logger.warning(
                 "PCM 口 %s 不接受 %s 波特率（PTY 上限 %s），降速重开；"
                 "PTY 无物理串行时序，不影响音频吞吐",
-                self.port, self.baudrate, PTY_SAFE_BAUDRATE,
+                self.port, baudrate, PTY_SAFE_BAUDRATE,
             )
             return serial.Serial(
                 port=self.port,
