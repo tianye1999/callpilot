@@ -113,6 +113,10 @@ class BridgeHandle:
     master_fd: int
     slave_fd: int
     stop: threading.Event
+    # 该桥是否致命：AT/控制口挂了整个进程没意义，数据口（PCM 等）挂了不该连坐。
+    # 真机 2026-08-04：PCM 口写超时判死后整座桥退出、清掉 /tmp/ec20-at，
+    # 结果模组"掉线"、ATH 发不出去，通话中挂不掉电话。
+    critical: bool = False
     closed: bool = False
 
     def close(self) -> None:
@@ -313,10 +317,11 @@ def bridge_port(
     dev: usb.core.Device,
     port: UsbPort,
     link: str,
+    critical: bool = False,
 ) -> BridgeHandle:
     master_fd, slave_fd = pty.openpty()
     stop = threading.Event()
-    handle = BridgeHandle(dev, port, link, master_fd, slave_fd, stop)
+    handle = BridgeHandle(dev, port, link, master_fd, slave_fd, stop, critical=critical)
     try:
         # Keep the slave side open so the master does not see EIO before a client opens it.
         make_raw(slave_fd)
@@ -469,12 +474,34 @@ def run_bridges_once(
     ports = discover_ports(dev)
     handles: list[BridgeHandle] = []
     try:
-        for iface, link in maps:
+        for index, (iface, link) in enumerate(maps):
             if iface not in ports:
                 raise RuntimeError(f"接口 {iface} 不存在，可用接口: {sorted(ports)}")
-            handles.append(bridge_port(dev, ports[iface], link))
+            # 首个 --map 视为控制口（约定即 AT 口，MODEM_BRIDGE_MAPS 默认也把它放
+            # 第一位）：它挂了整个桥没意义。其余是数据口，坏掉只摘自己。
+            handles.append(bridge_port(dev, ports[iface], link, critical=index == 0))
 
-        while not stop.is_set() and all(not handle.stop.is_set() for handle in handles):
+        while not stop.is_set():
+            dead_critical = [h for h in handles if h.critical and h.stop.is_set()]
+            if dead_critical:
+                logger.error(
+                    "控制口 interface %d 链路已死，整桥退出",
+                    dead_critical[0].port.interface,
+                )
+                break
+            # 数据口（PCM 等）死掉只摘掉它自己：绝不能连坐 AT 口——那会让模组
+            # 看起来"掉线"、通话中 ATH 发不出去，用户挂不掉电话
+            # （真机 2026-08-04 实测的故障链）。
+            for handle in [h for h in handles if not h.critical and h.stop.is_set()]:
+                logger.error(
+                    "数据口 interface %d 链路已死，仅关闭该口；控制口继续服务",
+                    handle.port.interface,
+                )
+                handle.close()
+                handles.remove(handle)
+            if not handles:
+                logger.error("全部桥均已关闭，退出")
+                break
             time.sleep(0.2)
     finally:
         for handle in handles:

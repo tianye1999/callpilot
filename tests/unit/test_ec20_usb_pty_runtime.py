@@ -274,3 +274,100 @@ def test_describe_device_deduplicates_identical_descriptors():
     dev = _FakeUsbDev(0x1E0E, 0x9001, "SimTech, Incorporated", "SimTech, Incorporated")
 
     assert ec20_usb_pty.describe_device(dev) == "1e0e:9001 (SIMCom SimTech, Incorporated)"
+
+
+# ---- 级联隔离：数据口坏掉不得连坐控制口（真机 2026-08-04：挂不掉电话）----
+
+
+class _FakeHandle:
+    """BridgeHandle 的最小替身，只提供监督循环用到的面。"""
+
+    def __init__(self, interface: int, critical: bool):
+        self.port = ec20_usb_pty.UsbPort(interface, 0x81, 0x01, 512)
+        self.critical = critical
+        self.stop = __import__("threading").Event()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _supervise(handles, stop, max_rounds=50):
+    """复刻 run_bridges_once 的监督循环判定，返回 (是否退出, 存活句柄)。
+
+    不起真 PTY/USB：这里要验的是"谁该被摘掉、谁该活着"的策略。
+    """
+    live = list(handles)
+    for _ in range(max_rounds):
+        if stop.is_set():
+            return True, live
+        if [h for h in live if h.critical and h.stop.is_set()]:
+            return True, live
+        for h in [h for h in live if not h.critical and h.stop.is_set()]:
+            h.close()
+            live.remove(h)
+        if not live:
+            return True, live
+    return False, live
+
+
+def test_data_interface_death_keeps_control_port_alive():
+    """PCM 口判死时 AT 口必须继续服务，否则通话中 ATH 发不出去。"""
+    at = _FakeHandle(2, critical=True)
+    pcm = _FakeHandle(4, critical=False)
+    stop = __import__("threading").Event()
+
+    pcm.stop.set()                      # 模拟 interface 4 写超时判死
+    exited, live = _supervise([at, pcm], stop, max_rounds=3)
+
+    assert exited is False              # 整桥不退出
+    assert pcm.closed is True           # 数据口被摘掉
+    assert at.closed is False and at in live   # 控制口存活
+
+
+def test_control_interface_death_exits_whole_bridge():
+    """AT 口没了，桥继续跑没有意义——交给上层重建。"""
+    at = _FakeHandle(2, critical=True)
+    pcm = _FakeHandle(4, critical=False)
+    stop = __import__("threading").Event()
+
+    at.stop.set()
+    exited, _live = _supervise([at, pcm], stop)
+
+    assert exited is True
+
+
+def test_all_data_ports_dead_without_control_exits():
+    """只映射了数据口且全死，没什么可服务的了。"""
+    a = _FakeHandle(4, critical=False)
+    stop = __import__("threading").Event()
+    a.stop.set()
+
+    exited, live = _supervise([a], stop)
+
+    assert exited is True
+    assert live == [] and a.closed is True
+
+
+def test_first_map_is_marked_critical(monkeypatch):
+    """约定：首个 --map 是控制口。MODEM_BRIDGE_MAPS 默认也把 AT 放第一位。"""
+    created: list[tuple[int, bool]] = []
+
+    def fake_bridge_port(dev, port, link, critical=False):
+        created.append((port.interface, critical))
+        h = _FakeHandle(port.interface, critical)
+        h.stop.set()          # 立刻置位，让监督循环尽快退出
+        return h
+
+    monkeypatch.setattr(ec20_usb_pty, "bridge_port", fake_bridge_port)
+    monkeypatch.setattr(ec20_usb_pty, "discover_ports", lambda dev: {
+        2: ec20_usb_pty.UsbPort(2, 0x84, 0x03, 512),
+        4: ec20_usb_pty.UsbPort(4, 0x88, 0x05, 512),
+    })
+    monkeypatch.setattr(ec20_usb_pty.usb.util, "dispose_resources", lambda dev: None)
+
+    ec20_usb_pty.run_bridges_once(
+        object(), [(2, "/tmp/at"), (4, "/tmp/pcm")], __import__("threading").Event()
+    )
+
+    assert created == [(2, True), (4, False)]
