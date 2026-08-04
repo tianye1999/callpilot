@@ -757,8 +757,34 @@ def test_hangup_closes_channel_with_matching_dialect(monkeypatch):
     modem.initialize_for_voice("simcom_pcm")
     calls.clear()
     modem.hangup()
-    assert "ATH" in calls and "AT+CPCMREG=0" in calls
+    assert "AT+CHUP" in calls and "AT+CPCMREG=0" in calls
+    assert "ATH" not in calls
     assert "AT+QPCMV=0" not in calls
+
+
+def test_simcom_hangup_falls_back_to_ath_when_chup_is_rejected(monkeypatch):
+    modem, calls = _recording_modem(monkeypatch, {"AT+CHUP": "ERROR"})
+    modem.initialize_for_voice("simcom_pcm")
+    calls.clear()
+
+    modem.hangup()
+
+    assert calls[:3] == ["AT+CHUP", "ATH", "AT+CPCMREG=0"]
+
+
+def test_hangup_invalidates_clcc_response_started_by_older_call(monkeypatch):
+    modem, _ = _recording_modem(monkeypatch)
+    modem._audio_mode = "simcom_pcm"
+    old_generation = modem._call_state_generation
+
+    modem.hangup()
+    modem._process_clcc_response(
+        CLCC_ACTIVE_OUTBOUND,
+        expected_generation=old_generation,
+    )
+
+    assert not modem.is_call_connected()
+    assert modem._connected_call_ids == set()
 
 
 def test_hangup_after_uac_still_uses_quectel_dialect(monkeypatch):

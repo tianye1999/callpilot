@@ -221,6 +221,10 @@ class Eg25Modem:
         self._last_dialed: str | None = None
         self._incoming_call_ids: set[str] = set()
         self._connected_call_ids: set[str] = set()
+        # 拨号/接听/挂断每次推进世代。CLCC 查询的响应处理会校验发起查询时的
+        # 世代，避免 hangup 已清状态后，一个较早发出的 CLCC 响应迟到又把
+        # _call_connected_event 置回去（SIM7600 真机 2026-08-04 复现）。
+        self._call_state_generation = 0
         # 通话在线标志：拨号后清除，外呼接通（CLCC dir=0 stat=0）或来电
         # 接听（ATA）时置位。除 _wait_connected 外，还是 CLCC「通话消失」
         # 判定的前提（见 _process_clcc_response）。
@@ -808,9 +812,11 @@ class Eg25Modem:
             self._poll_thread.join(timeout=2)
 
     def answer(self) -> None:
-        self._send("ATA")
-        # 置「通话在线」：让来电同样受 CLCC 消失判定保护（串口死亡场景）。
-        self._call_connected_event.set()
+        with self._serial_lock:
+            self._call_state_generation += 1
+            self._send("ATA")
+            # 置「通话在线」：让来电同样受 CLCC 消失判定保护（串口死亡场景）。
+            self._call_connected_event.set()
         logger.info("已发送 ATA 接听来电")
 
     def dial(self, number: str) -> str:
@@ -822,6 +828,7 @@ class Eg25Modem:
         # 之间 set 事件/加 call_id，导致 _wait_connected 永远等不到接通而误判未接。
         # _serial_lock 是 RLock，_send 内部再取同锁可重入。
         with self._serial_lock:
+            self._call_state_generation += 1
             self._call_connected_event.clear()
             self._connected_call_ids.clear()
             self._clcc_absent_count = 0
@@ -864,7 +871,16 @@ class Eg25Modem:
         # AT+QPCMV=0 之间，扰乱指令/响应配对。_pcm_ready_event.set() 只置位
         # 不等待，持锁调用无死锁风险。
         with self._serial_lock:
-            self._send("ATH")
+            self._call_state_generation += 1
+            if self._audio_mode == "simcom_pcm":
+                # SIM7600 多呼叫（active + held）真机实测 ATH 只清掉一路，
+                # AT+CHUP 会结束全部语音呼叫。失败时回退 ATH，兼容不支持
+                # CHUP 的旧固件。
+                response = self._send("AT+CHUP")
+                if "OK" not in response.upper():
+                    self._send("ATH")
+            else:
+                self._send("ATH")
             self._disable_voice_pcm()
             self._pcm_ready_event.set()
             self._call_connected_event.clear()
@@ -1142,7 +1158,9 @@ class Eg25Modem:
     def _poll_call_status(self) -> None:
         while self._running:
             try:
-                response = self._send("AT+CLCC")
+                with self._serial_lock:
+                    generation = self._call_state_generation
+                    response = self._send("AT+CLCC")
             except Exception as exc:  # noqa: BLE001
                 logger.debug("轮询 CLCC 失败: %s", exc)
                 if self._call_connected_event.is_set():
@@ -1162,10 +1180,15 @@ class Eg25Modem:
                 continue
 
             self._clcc_fail_count = 0
-            self._process_clcc_response(response)
+            self._process_clcc_response(response, expected_generation=generation)
             time.sleep(2)
 
-    def _process_clcc_response(self, response: str) -> None:
+    def _process_clcc_response(
+        self,
+        response: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> None:
         self._process_response_urcs(response)
         seen_incoming_ids: set[str] = set()
         # 与 dial() 对 _connected_call_ids/_call_connected_event 的清除互斥：
@@ -1174,6 +1197,16 @@ class Eg25Modem:
         pending_connected: list[str | None] = []
         call_lost = False
         with self._serial_lock:
+            if (
+                expected_generation is not None
+                and expected_generation != self._call_state_generation
+            ):
+                logger.debug(
+                    "忽略过期 CLCC 响应: query_generation=%d current_generation=%d",
+                    expected_generation,
+                    self._call_state_generation,
+                )
+                return
             has_call_line = False
             for match in CLCC_PATTERN.finditer(response):
                 has_call_line = True

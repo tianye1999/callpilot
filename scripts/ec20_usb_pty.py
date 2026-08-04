@@ -8,6 +8,7 @@ endpoints with libusb/PyUSB and presents a pseudo terminal for pyserial.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import logging
 import os
@@ -53,6 +54,18 @@ WRITE_TIMEOUT_TOLERANCE = 10
 # ~31 帧、连续 10 次就是 10 秒哑音（真机 2026-08-01 实测）。200ms 仍远大于正常
 # 写入耗时，只是不再把实时流拖死。
 WRITE_TIMEOUT_MS = 200
+
+# Windows 的厂商串口驱动在打开虚拟 COM 口时会发 CDC ACM 的
+# SET_CONTROL_LINE_STATE。SIMCom 的 audio 口虽然描述符标成 VENDOR class，
+# 仍可能用 DTR/RTS 作为 host 已打开端口的门控；libusb 直连不会替我们做这一步。
+CDC_HOST_TO_INTERFACE = 0x21
+CDC_SET_CONTROL_LINE_STATE = 0x22
+CDC_DTR_RTS = 0x03
+CONTROL_TRANSFER_TIMEOUT_MS = 1000
+
+
+class EndpointRecoveryError(RuntimeError):
+    """Bulk OUT 明确 STALL 后无法清除 endpoint halt。"""
 
 
 def bundled_libusb_path() -> Path | None:
@@ -103,6 +116,8 @@ class UsbPort:
     bulk_in: int
     bulk_out: int
     max_packet: int
+    interrupt_in: int | None = None
+    interrupt_max_packet: int = 0
 
 
 @dataclass
@@ -237,15 +252,18 @@ def discover_ports(dev: usb.core.Device) -> dict[int, UsbPort]:
         bulk_in = None
         bulk_out = None
         max_packet = 512
+        interrupt_in = None
+        interrupt_max_packet = 0
         for ep in intf:
             attrs = usb.util.endpoint_type(ep.bmAttributes)
             direction = usb.util.endpoint_direction(ep.bEndpointAddress)
-            if attrs != usb.util.ENDPOINT_TYPE_BULK:
-                continue
-            if direction == usb.util.ENDPOINT_IN:
+            if attrs == usb.util.ENDPOINT_TYPE_INTR and direction == usb.util.ENDPOINT_IN:
+                interrupt_in = ep.bEndpointAddress
+                interrupt_max_packet = ep.wMaxPacketSize
+            elif attrs == usb.util.ENDPOINT_TYPE_BULK and direction == usb.util.ENDPOINT_IN:
                 bulk_in = ep.bEndpointAddress
                 max_packet = ep.wMaxPacketSize
-            elif direction == usb.util.ENDPOINT_OUT:
+            elif attrs == usb.util.ENDPOINT_TYPE_BULK and direction == usb.util.ENDPOINT_OUT:
                 bulk_out = ep.bEndpointAddress
         if bulk_in is not None and bulk_out is not None:
             ports[intf.bInterfaceNumber] = UsbPort(
@@ -253,6 +271,8 @@ def discover_ports(dev: usb.core.Device) -> dict[int, UsbPort]:
                 bulk_in=bulk_in,
                 bulk_out=bulk_out,
                 max_packet=max_packet,
+                interrupt_in=interrupt_in,
+                interrupt_max_packet=interrupt_max_packet,
             )
     return ports
 
@@ -313,6 +333,97 @@ def link_pty(slave_name: str, link: str) -> None:
     path.symlink_to(slave_name)
 
 
+def set_control_line_state(dev: usb.core.Device, interface: int) -> bool:
+    """置 DTR/RTS，模拟 Windows 厂商串口驱动打开 COM 口时的握手。
+
+    这些接口的描述符通常是 VENDOR class，部分 Quectel 固件可能不接受 CDC
+    class request。握手失败不能让原本可用的 AT 桥退化，因此只告警并继续。
+    """
+    try:
+        dev.ctrl_transfer(
+            CDC_HOST_TO_INTERFACE,
+            CDC_SET_CONTROL_LINE_STATE,
+            CDC_DTR_RTS,
+            interface,
+            timeout=CONTROL_TRANSFER_TIMEOUT_MS,
+        )
+    except usb.core.USBError as exc:
+        logger.warning(
+            "interface %d 设置 DTR/RTS 失败（继续桥接）: %s",
+            interface,
+            exc,
+        )
+        return False
+    logger.info("interface %d 已设置 DTR/RTS", interface)
+    return True
+
+
+def write_bulk_with_recovery(
+    dev: usb.core.Device,
+    endpoint: int,
+    data: bytes,
+) -> bool:
+    """写一个 bulk chunk；仅在明确 STALL/PIPE 时清 halt 并重试一次。
+
+    返回值表示本次是否走过恢复路径。重试仍超时则把 ``USBTimeoutError``
+    交给调用方累计；普通 timeout 是持续 NAK，不等于 endpoint halt，不能
+    每帧都 clear_halt。clear_halt 本身失败表示端点无法恢复，转换成独立
+    异常，避免被普通写超时容忍逻辑吞掉。
+    """
+    try:
+        dev.write(endpoint, data, timeout=WRITE_TIMEOUT_MS)
+        return False
+    except usb.core.USBTimeoutError:
+        raise
+    except usb.core.USBError as exc:
+        if exc.errno != errno.EPIPE:
+            raise
+        try:
+            dev.clear_halt(endpoint)
+        except usb.core.USBError as clear_exc:
+            raise EndpointRecoveryError(
+                f"endpoint 0x{endpoint:02x} clear_halt 失败: {clear_exc}"
+            ) from clear_exc
+        dev.write(endpoint, data, timeout=WRITE_TIMEOUT_MS)
+        return True
+
+
+def drain_interrupt_notifications(
+    dev: usb.core.Device,
+    port: UsbPort,
+    stop: threading.Event,
+) -> None:
+    """持续接收厂商串口的 interrupt-IN 状态通知。
+
+    Linux ``option`` 驱动会为 SIMCom 9001 的每个串口提交并反复重提 interrupt
+    URB（主要承载 DCD/DSR/RI）。它不是 PCM 数据流，但若 host 完全不轮询这个
+    endpoint，就没有完整模拟官方串口驱动的打开状态。通知读取失败只关闭这条
+    辅助通道；bulk 数据桥仍可继续。
+    """
+    if port.interrupt_in is None:
+        return
+    size = port.interrupt_max_packet or 64
+    while not stop.is_set():
+        try:
+            data = dev.read(port.interrupt_in, size, timeout=100)
+        except usb.core.USBTimeoutError:
+            continue
+        except Exception as exc:  # noqa: BLE001
+            if not stop.is_set():
+                logger.warning(
+                    "interface %d USB interrupt read failed（bulk 继续）: %s",
+                    port.interface,
+                    exc,
+                )
+            return
+        if data:
+            logger.debug(
+                "interface %d USB interrupt notification: %s",
+                port.interface,
+                bytes(data).hex(),
+            )
+
+
 def bridge_port(
     dev: usb.core.Device,
     port: UsbPort,
@@ -333,13 +444,19 @@ def bridge_port(
                 f"无法占用 USB interface {port.interface}: {exc}. "
                 "请确认没有另一个 ec20_usb_pty.py 正在运行；如刚异常退出，重插 EC20 USB 后再试。"
             ) from exc
+        set_control_line_state(dev, port.interface)
         link_pty(slave_name, link)
     except Exception:
         handle.close()
         raise
     logger.info(
-        "interface %d: %s -> %s (in=0x%02x, out=0x%02x)",
-        port.interface, link, slave_name, port.bulk_in, port.bulk_out,
+        "interface %d: %s -> %s (in=0x%02x, out=0x%02x, intr=%s)",
+        port.interface,
+        link,
+        slave_name,
+        port.bulk_in,
+        port.bulk_out,
+        f"0x{port.interrupt_in:02x}" if port.interrupt_in is not None else "none",
     )
 
     def usb_to_pty() -> None:
@@ -368,6 +485,10 @@ def bridge_port(
         # 通话当场中断、模组随后掉线。读路径本就 continue 掉超时，写路径此前
         # 却是致命的，这里补齐对称性；连续超时到阈值才判定链路真的死了。
         consecutive_timeouts = 0
+        reported_recovery = False
+        successful_bytes = 0
+        successful_writes = 0
+        started_at = time.monotonic()
         while not stop.is_set():
             try:
                 ready, _, _ = select.select([master_fd], [], [], 0.1)
@@ -381,7 +502,15 @@ def bridge_port(
                 return
             if data:
                 try:
-                    dev.write(port.bulk_out, data, timeout=WRITE_TIMEOUT_MS)
+                    recovered = write_bulk_with_recovery(dev, port.bulk_out, data)
+                    if recovered and not reported_recovery:
+                        logger.warning(
+                            "interface %d USB endpoint STALL，clear_halt 后重试成功",
+                            port.interface,
+                        )
+                        reported_recovery = True
+                    successful_bytes += len(data)
+                    successful_writes += 1
                     consecutive_timeouts = 0
                 except usb.core.USBTimeoutError:
                     consecutive_timeouts += 1
@@ -396,16 +525,31 @@ def bridge_port(
                     # 首次用 warning 提示，后续降到 debug，避免长通话刷屏。
                     log = logger.warning if consecutive_timeouts == 1 else logger.debug
                     log(
-                        "interface %d USB 写超时，丢弃 %d 字节（第 %d/%d 次）",
+                        "interface %d USB 写超时，丢弃 %d 字节（第 %d/%d 次）；"
+                        "此前成功 %d bytes/%d writes/%.2fs",
                         port.interface, len(data), consecutive_timeouts,
                         WRITE_TIMEOUT_TOLERANCE,
+                        successful_bytes, successful_writes,
+                        time.monotonic() - started_at,
                     )
+                except EndpointRecoveryError as exc:
+                    if not stop.is_set():
+                        logger.error("interface %d USB endpoint 恢复失败: %s", port.interface, exc)
+                    stop.set()
+                    return
                 except Exception as exc:  # noqa: BLE001
                     if not stop.is_set():
                         logger.error("interface %d USB write failed: %s", port.interface, exc)
                     stop.set()
                     return
 
+    if port.interrupt_in is not None:
+        threading.Thread(
+            target=drain_interrupt_notifications,
+            args=(dev, port, stop),
+            name=f"ec20-usb-interrupt-{port.interface}",
+            daemon=True,
+        ).start()
     threading.Thread(target=usb_to_pty, name=f"ec20-usb-to-pty-{port.interface}", daemon=True).start()
     threading.Thread(target=pty_to_usb, name=f"ec20-pty-to-usb-{port.interface}", daemon=True).start()
     return handle

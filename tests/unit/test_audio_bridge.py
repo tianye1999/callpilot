@@ -340,6 +340,36 @@ def test_create_audio_bridge_simcom_pcm_uses_serial_bridge():
     assert isinstance(bridge, audio_bridge.SerialPcmAudioBridge)
     assert bridge.port == "/tmp/ec20-pcm"
     assert bridge.tx_gain == 2.0
+    assert bridge.write_size == audio_bridge.SIMCOM_WRITE_SIZE == 320
+    assert bridge.write_interval_seconds == audio_bridge.SIMCOM_WRITE_INTERVAL_SECONDS == 0.02
+
+
+def test_simcom_pcm_paces_usb_audio_as_20ms_frames():
+    """SIM7600 工作样例按 20ms/320B 喂 audio 口，不得退回 100ms 突发。"""
+    bridge = create_audio_bridge(
+        mode="simcom_pcm",
+        device_keyword="",
+        pcm_port="/tmp/ec20-pcm",
+        pcm_baudrate=115200,
+    )
+    bridge._ser = _FakeSerial()
+    bridge.write_modem_chunks([b"\x01" * 500])
+    silence = b"\x00" * bridge.write_size
+
+    assert bridge._next_write_payload(silence) == b"\x01" * 320
+    assert bridge.pending_output_bytes() == 180
+
+
+def test_nmea_pcm_keeps_existing_100ms_frames():
+    bridge = create_audio_bridge(
+        mode="nmea",
+        device_keyword="",
+        pcm_port="/tmp/ec20-nmea",
+        pcm_baudrate=921600,
+    )
+
+    assert bridge.write_size == audio_bridge.NMEA_WRITE_SIZE == 1600
+    assert bridge.write_interval_seconds == audio_bridge.NMEA_WRITE_INTERVAL_SECONDS == 0.1
 
 
 def test_create_audio_bridge_simcom_pcm_requires_pcm_port():

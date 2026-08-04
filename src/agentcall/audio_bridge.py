@@ -47,6 +47,12 @@ MODEM_BLOCK_MS = 20
 NMEA_READ_SIZE = 640
 NMEA_WRITE_SIZE = 1600
 NMEA_WRITE_INTERVAL_SECONDS = 0.1
+# SIM7600 官方 Linux 示例从麦克风回调每 20ms 向 audio 串口写一次：
+# 8kHz * 20ms * int16 = 320 bytes。SIMCom 路径对齐该节奏，避免沿用
+# Quectel/UAC 的 1600B/100ms 突发。注意真机已证实：仅改分帧仍不能解锁
+# 当前固件的 bulk OUT，P0 根因另在驱动传输/接口握手。
+SIMCOM_WRITE_SIZE = 320
+SIMCOM_WRITE_INTERVAL_SECONDS = 0.02
 
 
 def find_device_index(keyword: str, kind: str | None = None) -> int | None:
@@ -166,10 +172,20 @@ class ModemAudioBridge:
 class SerialPcmAudioBridge:
     """通过 EG25 USB NMEA 口传输 Voice over USB PCM。"""
 
-    def __init__(self, port: str, baudrate: int = 921600, tx_gain: float = 1.0) -> None:
+    def __init__(
+        self,
+        port: str,
+        baudrate: int = 921600,
+        tx_gain: float = 1.0,
+        *,
+        write_size: int = NMEA_WRITE_SIZE,
+        write_interval_seconds: float = NMEA_WRITE_INTERVAL_SECONDS,
+    ) -> None:
         self.port = port
         self.baudrate = baudrate
         self.tx_gain = tx_gain
+        self.write_size = write_size
+        self.write_interval_seconds = write_interval_seconds
         self._ready_check: "Callable[[], bool] | None" = None
         self._ser: serial.Serial | None = None
         self._tx_buffer = bytearray()
@@ -237,9 +253,12 @@ class SerialPcmAudioBridge:
         self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
         self._writer_thread.start()
         logger.info(
-            "NMEA PCM 音频流已启动: %s (8kHz mono, tx_gain=%.2f)",
+            "NMEA PCM 音频流已启动: %s "
+            "(8kHz mono, tx_gain=%.2f, frame=%dB/%.0fms)",
             self.port,
             self.tx_gain,
+            self.write_size,
+            self.write_interval_seconds * 1000,
         )
 
     def stop(self) -> None:
@@ -293,7 +312,7 @@ class SerialPcmAudioBridge:
 
     def _write_loop(self) -> None:
         next_write_at = time.monotonic()
-        silence = b"\x00" * NMEA_WRITE_SIZE
+        silence = b"\x00" * self.write_size
         while self._running:
             now = time.monotonic()
             if now < next_write_at:
@@ -302,7 +321,7 @@ class SerialPcmAudioBridge:
 
             if self._ready_check is not None and not self._ready_check():
                 # 模组上报忙 (+QPCMV:0,0)，本帧不发送，等待就绪。
-                next_write_at += NMEA_WRITE_INTERVAL_SECONDS
+                next_write_at += self.write_interval_seconds
                 continue
 
             payload = self._next_write_payload(silence)
@@ -330,18 +349,18 @@ class SerialPcmAudioBridge:
                 self._running = False
                 break
 
-            next_write_at += NMEA_WRITE_INTERVAL_SECONDS
+            next_write_at += self.write_interval_seconds
 
     def _next_write_payload(self, silence: bytes) -> bytes:
         with self._tx_lock:
-            if len(self._tx_buffer) >= NMEA_WRITE_SIZE:
-                payload = bytes(self._tx_buffer[:NMEA_WRITE_SIZE])
-                del self._tx_buffer[:NMEA_WRITE_SIZE]
+            if len(self._tx_buffer) >= self.write_size:
+                payload = bytes(self._tx_buffer[:self.write_size])
+                del self._tx_buffer[:self.write_size]
                 return payload
             if self._tx_buffer:
                 payload = bytes(self._tx_buffer)
                 self._tx_buffer.clear()
-                return payload + silence[: NMEA_WRITE_SIZE - len(payload)]
+                return payload + silence[: self.write_size - len(payload)]
         return silence
 
     def _log_write_stats(self) -> None:
@@ -722,7 +741,13 @@ def create_audio_bridge(
                 "simcom_pcm 模式需要配置 MODEM_PCM_PORT（指向桥出的 PCM PTY，"
                 "如 scripts/ec20_usb_pty.py --map 4:/tmp/ec20-pcm）"
             )
-        return SerialPcmAudioBridge(pcm_port, pcm_baudrate, tx_gain=tx_gain)
+        return SerialPcmAudioBridge(
+            pcm_port,
+            pcm_baudrate,
+            tx_gain=tx_gain,
+            write_size=SIMCOM_WRITE_SIZE,
+            write_interval_seconds=SIMCOM_WRITE_INTERVAL_SECONDS,
+        )
     raise ValueError(
         "MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg（仅 macOS）、nmea 或 simcom_pcm"
     )

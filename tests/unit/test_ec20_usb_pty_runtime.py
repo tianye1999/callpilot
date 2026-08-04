@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import errno
+
 import pytest
 
 pytest.importorskip("fcntl", reason="EC20 PTY bridge is POSIX-only")
 
 import usb.core
+import usb.util
 
 from scripts import ec20_usb_pty
 
@@ -31,14 +34,18 @@ def test_bundled_libusb_path_missing_returns_none(tmp_path, monkeypatch):
 
 
 class _FakeDev:
-    """只实现 bridge_port 用到的 USB 调用面。"""
+    """只实现 bulk 写与 halt 恢复用到的 USB 调用面。"""
 
-    def __init__(self, write_outcomes):
+    def __init__(self, write_outcomes, clear_outcomes=()):
         self.write_outcomes = list(write_outcomes)
+        self.clear_outcomes = list(clear_outcomes)
         self.writes = 0
+        self.clear_halts = 0
+        self.events = []
 
     def write(self, endpoint, data, timeout=None):
         self.writes += 1
+        self.events.append(("write", endpoint, timeout))
         outcome = (
             self.write_outcomes.pop(0) if self.write_outcomes else None
         )
@@ -46,52 +53,177 @@ class _FakeDev:
             raise outcome
         return len(data)
 
+    def clear_halt(self, endpoint):
+        self.clear_halts += 1
+        self.events.append(("clear_halt", endpoint))
+        outcome = (
+            self.clear_outcomes.pop(0) if self.clear_outcomes else None
+        )
+        if outcome is not None:
+            raise outcome
 
-def _drive_writes(monkeypatch, outcomes):
-    """跑 pty_to_usb 的写分支逻辑，返回 (写次数, 是否判定链路已死)。
 
-    直接复刻脚本里的容忍规则，避免为测一个分支去起真 PTY / 真 USB。
+def _drive_writes(outcomes):
+    """用真实恢复 helper 跑 pty_to_usb 的超时计数策略。
+
+    每个音频帧最多消耗两项 write outcome（首次写 + clear_halt 后重试）。
     """
     tolerance = ec20_usb_pty.WRITE_TIMEOUT_TOLERANCE
     dev = _FakeDev(outcomes)
     consecutive = 0
     died = False
-    for _ in range(len(outcomes)):
+    while dev.write_outcomes:
         try:
-            dev.write(0x05, b"\x00" * 320)
+            ec20_usb_pty.write_bulk_with_recovery(dev, 0x05, b"\x00" * 320)
             consecutive = 0
         except usb.core.USBTimeoutError:
             consecutive += 1
             if consecutive >= tolerance:
                 died = True
                 break
-    return dev.writes, died
+    return dev, died
 
 
-def test_single_write_timeout_is_not_fatal(monkeypatch):
-    """丢一帧音频远好过拆掉整座桥。"""
+def test_write_stall_clears_halt_then_retries_same_frame():
+    stalled = usb.core.USBError("pipe error", -9, errno.EPIPE)
+    dev = _FakeDev([stalled, None])
+
+    recovered = ec20_usb_pty.write_bulk_with_recovery(dev, 0x05, b"pcm")
+
+    assert recovered is True
+    assert dev.events == [
+        ("write", 0x05, ec20_usb_pty.WRITE_TIMEOUT_MS),
+        ("clear_halt", 0x05),
+        ("write", 0x05, ec20_usb_pty.WRITE_TIMEOUT_MS),
+    ]
+
+
+def test_clear_halt_failure_is_distinct_from_retry_timeout():
+    stalled = usb.core.USBError("pipe error", -9, errno.EPIPE)
+    clear_failed = usb.core.USBError("clear failed")
+    dev = _FakeDev([stalled], [clear_failed])
+
+    with pytest.raises(ec20_usb_pty.EndpointRecoveryError, match="clear_halt"):
+        ec20_usb_pty.write_bulk_with_recovery(dev, 0x05, b"pcm")
+
+
+def test_timeout_is_not_misclassified_as_endpoint_stall():
     timeout = usb.core.USBTimeoutError("timed out", None, None)
-    writes, died = _drive_writes(monkeypatch, [timeout, None, None])
-    assert writes == 3 and died is False
+    dev = _FakeDev([timeout])
+
+    with pytest.raises(usb.core.USBTimeoutError):
+        ec20_usb_pty.write_bulk_with_recovery(dev, 0x05, b"pcm")
+    assert dev.clear_halts == 0
 
 
-def test_consecutive_timeouts_reset_on_success(monkeypatch):
+def test_single_write_timeout_is_tolerated_and_next_frame_can_succeed():
+    timeout = usb.core.USBTimeoutError("timed out", None, None)
+    dev, died = _drive_writes([timeout, None])
+    assert dev.writes == 2 and dev.clear_halts == 0 and died is False
+
+
+def test_consecutive_timeouts_reset_on_success():
     """中间成功一次就该清零，否则长通话里零星超时会累积到误杀。"""
     t = usb.core.USBTimeoutError("timed out", None, None)
     outcomes = []
     for _ in range(6):
-        outcomes += [t, t, None]        # 每两次超时后成功一次
-    writes, died = _drive_writes(monkeypatch, outcomes)
-    assert died is False and writes == len(outcomes)
+        outcomes += [t, t, None]        # 一帧恢复后仍超时，下一帧成功
+    dev, died = _drive_writes(outcomes)
+    assert died is False and dev.writes == len(outcomes)
 
 
-def test_sustained_timeouts_eventually_declare_link_dead(monkeypatch):
+def test_sustained_timeouts_eventually_declare_link_dead():
     """真的一直写不进去，还是要停——否则死链路上会无限空转。"""
     t = usb.core.USBTimeoutError("timed out", None, None)
     outcomes = [t] * (ec20_usb_pty.WRITE_TIMEOUT_TOLERANCE + 5)
-    writes, died = _drive_writes(monkeypatch, outcomes)
+    dev, died = _drive_writes(outcomes)
     assert died is True
-    assert writes == ec20_usb_pty.WRITE_TIMEOUT_TOLERANCE
+    assert dev.writes == ec20_usb_pty.WRITE_TIMEOUT_TOLERANCE
+    assert dev.clear_halts == 0
+
+
+# ---- CDC 打开握手：claim 后置 DTR/RTS（SIMCom audio 口的可能门控）----
+
+
+class _FakeControlDev:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def ctrl_transfer(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if self.error is not None:
+            raise self.error
+        return 0
+
+
+def test_set_control_line_state_sends_dtr_and_rts():
+    dev = _FakeControlDev()
+
+    assert ec20_usb_pty.set_control_line_state(dev, 4) is True
+    assert dev.calls == [((0x21, 0x22, 0x03, 4), {"timeout": 1000})]
+
+
+def test_unsupported_control_line_state_does_not_break_bridge():
+    dev = _FakeControlDev(usb.core.USBError("pipe error"))
+
+    assert ec20_usb_pty.set_control_line_state(dev, 4) is False
+
+
+# ---- 串口状态 interrupt-IN：Linux option 驱动会持续轮询 ----
+
+
+class _FakeEndpoint:
+    def __init__(self, address, attrs, max_packet):
+        self.bEndpointAddress = address
+        self.bmAttributes = attrs
+        self.wMaxPacketSize = max_packet
+
+
+class _FakeInterface(list):
+    def __init__(self, number, endpoints):
+        super().__init__(endpoints)
+        self.bInterfaceNumber = number
+
+
+class _FakeDescriptorDev:
+    def __init__(self, config):
+        self.config = config
+
+    def get_active_configuration(self):
+        return self.config
+
+
+def test_discover_ports_preserves_interrupt_in_endpoint():
+    intf = _FakeInterface(4, [
+        _FakeEndpoint(0x87, usb.util.ENDPOINT_TYPE_INTR, 16),
+        _FakeEndpoint(0x88, usb.util.ENDPOINT_TYPE_BULK, 512),
+        _FakeEndpoint(0x05, usb.util.ENDPOINT_TYPE_BULK, 512),
+    ])
+
+    port = ec20_usb_pty.discover_ports(_FakeDescriptorDev([intf]))[4]
+
+    assert (port.bulk_in, port.bulk_out, port.max_packet) == (0x88, 0x05, 512)
+    assert (port.interrupt_in, port.interrupt_max_packet) == (0x87, 16)
+
+
+def test_interrupt_notifications_are_continuously_drained():
+    stop = __import__("threading").Event()
+
+    class Dev:
+        reads = []
+
+        def read(self, endpoint, size, timeout=None):
+            self.reads.append((endpoint, size, timeout))
+            stop.set()
+            return b"\xa1\x20\x00\x00"
+
+    dev = Dev()
+    port = ec20_usb_pty.UsbPort(4, 0x88, 0x05, 512, 0x87, 16)
+
+    ec20_usb_pty.drain_interrupt_notifications(dev, port, stop)
+
+    assert dev.reads == [(0x87, 16, 100)]
 
 
 # ---- 设备发现：--pid 可省（SIM7600 的 PID 随固件 composite 浮动）----
