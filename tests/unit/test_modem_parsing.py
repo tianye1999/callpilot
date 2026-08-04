@@ -726,9 +726,16 @@ def _recording_modem(monkeypatch, responses=None):
     responses = responses or {}
     calls: list[str] = []
     modem = make_modem()
-    monkeypatch.setattr(
-        modem, "_send", lambda cmd: (calls.append(cmd), responses.get(cmd, "OK"))[1]
-    )
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd in responses:
+            return responses[cmd]
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
     return modem, calls
 
 
@@ -736,6 +743,7 @@ def test_initialize_for_voice_simcom_sends_cpcmreg(monkeypatch):
     modem, calls = _recording_modem(monkeypatch)
     modem.initialize_for_voice("simcom_pcm")
     assert "AT+CPCMREG=1" in calls
+    assert "AT+CPCMREG?" in calls
     # 不能误发 Quectel 指令：SIM7600 不认，且会把 AT 队列搅乱
     assert not any(c.startswith("AT+QPCMV") for c in calls)
 
@@ -757,7 +765,7 @@ def test_hangup_closes_channel_with_matching_dialect(monkeypatch):
     modem.initialize_for_voice("simcom_pcm")
     calls.clear()
     modem.hangup()
-    assert "AT+CHUP" in calls and "AT+CPCMREG=0" in calls
+    assert "AT+CHUP" in calls and "AT+CPCMREG=0,1" in calls
     assert "ATH" not in calls
     assert "AT+QPCMV=0" not in calls
 
@@ -769,7 +777,7 @@ def test_simcom_hangup_falls_back_to_ath_when_chup_is_rejected(monkeypatch):
 
     modem.hangup()
 
-    assert calls[:3] == ["AT+CHUP", "ATH", "AT+CPCMREG=0"]
+    assert calls[:3] == ["AT+CHUP", "ATH", "AT+CPCMREG=0,1"]
 
 
 def test_hangup_invalidates_clcc_response_started_by_older_call(monkeypatch):
@@ -794,7 +802,7 @@ def test_hangup_after_uac_still_uses_quectel_dialect(monkeypatch):
     calls.clear()
     modem.hangup()
     assert "AT+QPCMV=0" in calls
-    assert "AT+CPCMREG=0" not in calls
+    assert "AT+CPCMREG=0,1" not in calls
 
 
 def test_hangup_without_init_defaults_to_quectel(monkeypatch):
@@ -825,6 +833,8 @@ def test_simcom_pcm_retries_while_in_call(monkeypatch):
         # 前两次 ERROR，第三次才 OK
         if cmd == "AT+CPCMREG=1":
             return "OK" if calls.count("AT+CPCMREG=1") >= 3 else "ERROR"
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
         return "OK"
 
     monkeypatch.setattr(modem, "_send", fake_send)
@@ -835,6 +845,47 @@ def test_simcom_pcm_retries_while_in_call(monkeypatch):
     # 原先这里断言的是 AT+CPCMFRM=0——手册 5.2.43 明确该命令只支持 8k→16k
     # 单向切换，拿它降回 8k 无效；真正的开关是 CPCMBANDWIDTH（5.2.46）。
     assert "AT+CPCMBANDWIDTH=1,1" in calls
+
+
+def test_simcom_pcm_retries_until_readback_confirms_mode_one(monkeypatch):
+    """写命令的 OK 不是充分条件：必须读回 mode=1 才能启动 USB 音频桥。"""
+    clock = {"now": 0.0}
+    queries = {"count": 0}
+    monkeypatch.setattr(modem_time_sleep_target(), "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        modem_time_sleep_target(),
+        "sleep",
+        lambda delay: clock.__setitem__("now", clock["now"] + delay),
+    )
+    modem = make_modem()
+    modem._call_connected_event.set()
+
+    def fake_send(cmd: str) -> str:
+        if cmd == "AT+CPCMREG?":
+            queries["count"] += 1
+            mode = 1 if queries["count"] >= 2 else 0
+            return f"+CPCMREG: {mode}\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert queries["count"] == 2
+    assert modem.voice_pcm_active is True
+
+
+def test_simcom_pcm_write_ok_without_active_readback_is_not_enabled(monkeypatch):
+    """无通话路径也不能把裸 OK 当作 mode=1，且仍只尝试一次。"""
+    modem = make_modem()
+    monkeypatch.setattr(
+        modem,
+        "_send",
+        lambda cmd: "+CPCMREG: 0\r\nOK" if cmd == "AT+CPCMREG?" else "OK",
+    )
+
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert modem.voice_pcm_active is False
 
 
 def test_simcom_pcm_raises_in_call_when_never_enabled(monkeypatch):
@@ -865,7 +916,11 @@ def test_voice_pcm_active_cleared_on_hangup(monkeypatch):
     monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
     modem = make_modem()
     modem._call_connected_event.set()
-    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    monkeypatch.setattr(
+        modem,
+        "_send",
+        lambda cmd: "+CPCMREG: 1\r\nOK" if cmd == "AT+CPCMREG?" else "OK",
+    )
     modem.initialize_for_voice("simcom_pcm")
     assert modem.voice_pcm_active is True
     modem.hangup()
@@ -892,6 +947,8 @@ def test_simcom_pcm_retry_window_covers_slow_modems(monkeypatch):
     modem._call_connected_event.set()
 
     def fake_send(cmd: str) -> str:
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
         if cmd != "AT+CPCMREG=1":
             return "OK"
         return "OK" if clock["now"] >= 8.0 else "ERROR"   # 8s 才受理
@@ -944,6 +1001,8 @@ def test_simcom_pcm_forces_8k_sampling(monkeypatch):
 
     def fake_send(cmd: str) -> str:
         calls.append(cmd)
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
         return "OK"
 
     monkeypatch.setattr(modem, "_send", fake_send)
@@ -963,6 +1022,8 @@ def test_bandwidth_failure_does_not_block_pcm(monkeypatch):
     def fake_send(cmd: str) -> str:
         if cmd.startswith("AT+CPCMBANDWIDTH"):
             raise RuntimeError("unsupported")
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
         return "OK"
 
     monkeypatch.setattr(modem, "_send", fake_send)

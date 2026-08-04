@@ -8,14 +8,14 @@
 
 ## 0. 一句话现状
 
-CallPilot 原生只支持 Quectel EC20/EG25。本轮把它跑在 **SIMCom SIM7600G** 上，并接入 **MiniMax Realtime**。**AT 控制、拨号、SIM 识别、界面与接收方向已通；发送方向在干净单通基线下连首个 320B 都不接收。DTR/RTS、timeout 后 clear_halt、interrupt-IN 轮询、320B/20ms 分帧均已真机排除为单独解法，下一步应验证官方驱动的接口映射与异步多 URB 传输。**
+CallPilot 原生只支持 Quectel EC20/EG25。本轮把它跑在 **SIMCom SIM7600G** 上，并接入 **MiniMax Realtime**。**AT 控制、拨号、SIM 识别、界面与接收方向已通；发送方向在干净单通基线下连首个 320B 都不接收。DTR/RTS、timeout 后 clear_halt、interrupt-IN 轮询、320B/20ms 分帧，以及 `AT+CPCMREG?` 读回确认 mode=1，均已真机排除为单独解法；下一步应验证官方驱动的接口映射与异步多 URB 传输。**
 
 ## 1. 环境
 
 | 项 | 值 |
 |---|---|
 | 仓库 | `/Users/redtea/Downloads/code/callpilot` |
-| 分支 | `local/simcom-integration`（**未推送**；原 18 个提交，Codex 代码提交 `394adab`，本文另做 docs 提交） |
+| 分支 | `local/simcom-integration`（**未推送**；本提交后比 `origin/main` 多 21 个本地提交） |
 | 基线 | `origin/main` = `c7b4546` |
 | 模组 | SIMCom SIM7600G，USB `1e0e:9001`，固件 `LE20B05SIM7600M21-A_250919` |
 | SIM | 中国电信，IMSI `46011…`，免费客服号 **10000** |
@@ -29,7 +29,7 @@ CallPilot 原生只支持 Quectel EC20/EG25。本轮把它跑在 **SIMCom SIM760
 .venv/bin/pytest -q && .venv/bin/ruff check . && .venv/bin/mypy
 ```
 
-当前状态：**1213 passed / 3 skipped**，ruff 与 mypy 均干净。
+当前状态：**1215 passed / 3 skipped**，ruff 与 mypy 均干净。
 
 ### 打包与运行
 
@@ -87,23 +87,40 @@ CallPilot 整条链路按 `MODEM_RATE=8000` 解 → 收到的就是看着像宽�
 
 已写进 `modem._enable_simcom_pcm()`（commit `0e16c11`）。
 
-### 3.2 `AT+CPCMFRM` 不能用来降到 8k
+### 3.2 `AT+CPCMREG` 的启停契约：启动要读回，停止必须带 stop=1
+
+手册 5.2.25 给出的写法是 `AT+CPCMREG=<mode>[,<stop>]`：通话开始后用
+`AT+CPCMREG=1`，通话停止后用 **`AT+CPCMREG=0,1`**，并且支持
+`AT+CPCMREG?` 读取实际 mode。原代码有两个缺口：只凭启动命令返回 `OK` 就假定已启用，
+关闭时发的是不符合示例的裸 `AT+CPCMREG=0`。
+
+现代码已改为：启动命令返回 `OK` 后必须读回 `+CPCMREG: 1` 才允许启动音频桥；挂断时
+发送 `AT+CPCMREG=0,1`。2026-08-04 19:07 真机拨 10000 验证：第二次启动尝试成功且读回
+mode=1；关闭路径完成且未产生“未获 OK”警告。这个修复消除了状态误判和错误停止命令，
+但**没有修通发送方向**：读回 mode=1 后，bulk OUT 仍从第一个 320B 开始超时。
+
+对 512 页手册做了全文检索：与 USB audio 直接相关的公开命令只有 `AT+CPCMREG` 和
+`AT+CPCMFRM`；另有 `AT+CUSBPIDSWITCH` 仅切 composite PID（9001 是默认值），没有公开的
+audio 端口握手、line coding 或接口映射命令。因此下一步需要从官方驱动行为而不是继续猜
+隐藏 AT 指令入手。
+
+### 3.3 `AT+CPCMFRM` 不能用来降到 8k
 
 手册 5.2.43 明确：**只支持 8k→16k 单向切换**。原代码和测试用 `AT+CPCMFRM=0`
 「显式声明 8k」是无效的，已删除并改断言。
 
-### 3.3 `AT+CODECCTL=1` 会让接收方向变差，不要用
+### 3.4 `AT+CODECCTL=1` 会让接收方向变差，不要用
 
 手册 5.2.45 说 `1` = host 控 codec（配 `CSDVC=1|3` 开启）。听起来正是「接收方向绑在
 模组模拟 codec 上」的解药，**但实测反而变成噪声**（能量比 0.74，对照默认 `CODECCTL=0`
 是 27.5）。`CSDVC=3` 得到能量比 300+，是低频伪迹不是语音。结论：保持默认 `CODECCTL=0`。
 
-### 3.4 音频在 interface 4，其他接口通话中零字节
+### 3.5 音频在 interface 4，其他接口通话中零字节
 
 通话中逐个接口读 bulk IN 的结果：interface 4 有 43071 字节/2s，interface 0/1/3/5 无数据。
 与上游一致。AT 口是 interface 2（`--probe` 显示 2/3 都应答 AT）。
 
-### 3.5 USB 描述符：没有 UAC，没有同步端点，没有 alt setting
+### 3.6 USB 描述符：没有 UAC，没有同步端点，没有 alt setting
 
 ```
 6 个接口全部 class=VENDOR；全部只有 alt=0；端点只有 BULK + INTERRUPT
@@ -114,14 +131,14 @@ interface 1/2/3/4 结构完全相同（interrupt IN + bulk IN/OUT）
 不存在**，是未文档化命令，本机读回 `0`）；也不存在「漏选 alt setting」或「漏收同步端点」
 的问题 —— 用 bulk 搬字节的机制是对的。
 
-### 3.6 VoLTE-only 卡的注册判定
+### 3.7 VoLTE-only 卡的注册判定
 
 电信没有 GSM/WCDMA 电路域，`AT+CREG?` 恒回 `0,3`（CS 域被拒），但 `AT+CEREG?` 为 `0,1`、
 `ATD10000;` 能正常接通（实测 `VOICE CALL: BEGIN` + `+CLCC: …,0,…` stat=0，通了 13.5s）。
 `dial_guard` 原先只看 CS 域，把能打的电话拦死了。已改为看
 `SimIdentity.network_attached`（CS 或 EPS 任一已注册），见 `b66c745`。
 
-### 3.7 MiniMax Realtime 的协议契约（全部真机实测）
+### 3.8 MiniMax Realtime 的协议契约（全部真机实测）
 
 端点 `wss://api.minimaxi.com/ws/v1/realtime`，说 **OpenAI Realtime beta 协议**，
 双向 pcm16 @ 24kHz，模型固定 `abab6.5s-chat`（`?model=` 被忽略）。国内区 key
@@ -141,7 +158,7 @@ REST 面（`/v1/chat/completions`）的 **function calling 是正常的**，TTS
 
 ---
 
-## 4. 本地提交清单（代码截至 19 个，未推送；本文另做 docs 提交）
+## 4. 本地提交清单（本提交后 21 个，均未推送）
 
 上游未合并分支合入（前 4 个不是我写的）：
 
@@ -170,6 +187,8 @@ b5fdf25 fix(packaging): 缺 CallPilot.icns 不再让 macOS 构建在最后一步
 0e16c11 fix(audio): 钉住 PCM 采样率 8k —— VoLTE 默认 16K 是接收噪声的真因
 b16dbbe fix(bridge): 数据口链路判死不再连坐控制口
 394adab fix(simcom): harden usb pcm and call cleanup
+6399bc9 docs(simcom): record pcm probe findings
+（本提交）fix(simcom): verify cpcmreg state and stop per manual
 ```
 
 新增配置项：`MODEM_USB_VID`、`MODEM_BRIDGE_MAPS`、`MINIMAX_API_KEY` /
@@ -235,6 +254,42 @@ Windows 有 SIMCom 官方驱动，我们是 libusb 从用户态直连 bulk 端�
   `libusb_bulk_transfer`。优先做独立、可取消的异步诊断，不要直接把 PyUSB 私有结构
   塞进生产桥。`SET_LINE_CODING` 没有依据：Linux usb_wwan 明确认为波特率无意义，
   只发 DTR/RTS 控制请求。
+
+#### 19:07 手册契约复核（mode=1 已确认，P0 仍复现）
+
+根据手册 5.2.25 补上 `AT+CPCMREG?` 后，用新打包版本拨 10000：
+
+```
+19:07:06.364  AT+CPCMREG=1 第 2 次成功，随后读回 +CPCMREG: 1
+19:07:08.320  PCM bridge 启动，frame=320B/20ms
+19:07:09.216  bulk OUT 首帧超时；此前成功 0 bytes / 0 writes
+19:07:11.216  连续 10 次超时，仅关闭 interface 4
+19:07:13.031  AT+CHUP + AT+CPCMREG=0,1 收尾完成，未出现关闭未获 OK 警告
+```
+
+结论：模组控制面确实已进入 USB audio mode=1，发送端点仍持续 NAK。因此不要再把
+“`AT+CPCMREG=1` 返回假成功”当 P0 主因；继续沿官方驱动接口映射、异步多 URB 与驱动
+特有初始化序列排查。
+
+#### 19:11–19:15 三通连续回归（3/3 失败，不是偶发）
+
+每通前都恢复 `/tmp/ec20-at`、`/tmp/ec20-pcm` 并确认模组在线，只拨中国电信 10000：
+
+| 轮次 | 接通 | CPCMREG | bulk OUT | 收尾 |
+|---|---|---|---|---|
+| 1 | 19:12:00 | 第 2 次成功并读回 mode=1 | 0 bytes / 0 writes，19:12:07 首帧超时 | 19:12:09 自动挂断，failed |
+| 2 | 19:13:01 | 第 2 次成功并读回 mode=1 | 0 bytes / 0 writes，19:13:09 首帧超时 | 19:13:12 自动挂断，failed |
+| 3 | 19:15:15 | 第 2 次成功并读回 mode=1 | 0 bytes / 0 writes，19:15:21 首帧超时 | 19:15:23 自动挂断，failed |
+
+三通都在首帧后约 2 秒达到连续 10 次 timeout，interface 4 被隔离关闭，AT 控制口仍能
+完成 `AT+CHUP` 和 `AT+CPCMREG=0,1`。第 1 通生成了 66542B 的 Agent 侧 downlink WAV，
+但 uplink WAV 只有 44B 文件头；第 2、3 通的双向 WAV 都只有文件头。也就是说 AI 生成过
+语音不等于对方收到，三通都没有形成可判定为正常的双向音频。
+
+测试收尾时还观察到：第一次手工冷重启 bridge 后 app 约 2 秒自动重连；第二次只重启
+bridge 时 app 卡在“串口发送失败，尝试重连后重试”，20 秒以上未恢复，需再重启 app。
+因此人工恢复应按 bridge 先、app 后一起重启；生产代码当前靠“只关闭坏掉的 interface 4”
+避免把 AT 口一起重启。
 
 注意：两次“同步写最长等 5 秒”的独占脚本运行时后来发现存在 active + held 历史呼叫，
 不是干净证据，不能拿来证明异步 URB 必然无效；上面 18:54 的 app 单通复现才是可信基线。

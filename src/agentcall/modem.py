@@ -34,6 +34,7 @@ CLCC_PATTERN = re.compile(
     r'(?P<mpty>\d+)(?:,"(?P<number>[^"]*)",(?P<type>\d+))?'
 )
 QPCMV_PATTERN = re.compile(r"\+QPCMV:\s*(\d+),(\d+)")
+CPCMREG_PATTERN = re.compile(r"\+CPCMREG:\s*(\d+)")
 CMTI_PATTERN = re.compile(r'\+CMTI:\s*"([^"]*)",\s*(\d+)')
 CREG_PATTERN = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?\d+(?=\s|$)")
 QSIMSTAT_PATTERN = re.compile(r"\+QSIMSTAT:\s*(\d+)\s*,\s*(\d+)")
@@ -694,12 +695,25 @@ class Eg25Modem:
         attempts = 0
         while True:
             attempts += 1
-            if "OK" in self._send("AT+CPCMREG=1").upper():
-                self._voice_pcm_active = True
-                logger.info(
-                    "SIMCom PCM 语音通道已启用 (AT+CPCMREG=1，第 %d 次尝试)", attempts
+            start_response = self._send("AT+CPCMREG=1")
+            if "OK" in start_response.upper():
+                # 手册 5.2.25 提供读命令；不能只凭写命令的 OK 推断 USB audio
+                # 已真正切到 mode=1。真机 P0 是 bulk OUT 从首包开始一直 NAK，
+                # 因此把模组实际状态作为起桥前的事实来源。
+                state_response = self._send("AT+CPCMREG?")
+                state_match = CPCMREG_PATTERN.search(state_response)
+                if state_match is not None and state_match.group(1) == "1":
+                    self._voice_pcm_active = True
+                    logger.info(
+                        "SIMCom PCM 语音通道已启用并读回确认 "
+                        "(AT+CPCMREG=1，第 %d 次尝试)",
+                        attempts,
+                    )
+                    return
+                logger.warning(
+                    "AT+CPCMREG=1 返回 OK，但读回未确认 mode=1（第 %d 次尝试）",
+                    attempts,
                 )
-                return
             # 无通话时只试一次：ERROR 是必然结果，重试纯属浪费启动时间。
             if not in_call or time.monotonic() >= deadline:
                 break
@@ -710,8 +724,8 @@ class Eg25Modem:
             logger.info("AT+CPCMREG=1 暂不可用（无通话时模组必回 ERROR），接通后再启用")
             return
         raise RuntimeError(
-            f"通话中启用 SIMCom PCM 失败：AT+CPCMREG=1 在 "
-            f"{self._SIMCOM_PCM_ENABLE_TIMEOUT:.0f}s 内重试 {attempts} 次仍非 OK；"
+            f"通话中启用 SIMCom PCM 失败：AT+CPCMREG=1 / AT+CPCMREG? 在 "
+            f"{self._SIMCOM_PCM_ENABLE_TIMEOUT:.0f}s 内重试 {attempts} 次仍未确认 mode=1；"
             "不启动音频桥，避免向未出流的 USB 端点写入拖死 AT 链路"
         )
 
@@ -722,12 +736,17 @@ class Eg25Modem:
 
     def _disable_voice_pcm(self) -> None:
         """按当前音频模式关闭语音通道；模式未知时按 Quectel 处理（历史默认）。"""
-        if self._audio_mode == "simcom_pcm":
-            self._send("AT+CPCMREG=0")
-        else:
-            self._send("AT+QPCMV=0")
-        # 通道已关：下一通必须重新启用，绝不能让上一通的 True 泄漏过来。
-        self._voice_pcm_active = False
+        try:
+            if self._audio_mode == "simcom_pcm":
+                # SIM7500/7600 AT 手册 5.2.25 明确要求通话结束后用 <mode=0,stop=1>。
+                response = self._send("AT+CPCMREG=0,1")
+                if "OK" not in response.upper():
+                    logger.warning("SIMCom USB audio 通道关闭未获 OK (AT+CPCMREG=0,1)")
+            else:
+                self._send("AT+QPCMV=0")
+        finally:
+            # 即使串口在关闭时异常，宿主侧也不能把上一通的 True 泄漏到下一通。
+            self._voice_pcm_active = False
 
     def on_ring(self, callback: Callable[[str | None], None]) -> None:
         self._on_ring = callback

@@ -404,7 +404,7 @@ class CallSession:
 
             await asyncio.sleep(1.0)
 
-            # 挂断流程会关闭语音通道（AT+QPCMV=0 / AT+CPCMREG=0），每通电话都要
+            # 挂断流程会关闭语音通道（AT+QPCMV=0 / AT+CPCMREG=0,1），每通电话都要
             # 重新启用，否则第二通开始模组无 PCM 流（双向无声）。
             self.modem.initialize_for_voice(self.audio_mode)
             # simcom_pcm 只在通话中才能开 PCM：真开成了才允许起桥。往未出流的
