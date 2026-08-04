@@ -670,12 +670,21 @@ class Eg25Modem:
         """
         in_call = self._call_connected_event.is_set()
         if in_call:
-            # 显式声明 8k PCM，不赖模组默认值（+CPCMFRM: 0=8000Hz, 1=16000Hz）。
-            # 老固件无此指令，ERROR 无害，故 best-effort 不判成败。
+            # 把 PCM 采样率钉成 8k，与本项目整条音频链路（MODEM_RATE=8000）对齐。
+            # AT+CPCMBANDWIDTH=<volte_sample>,<novolte_sample>，取值 0=16K / 1=8K，
+            # 出厂默认是 "0,1" —— 即 **VoLTE 通话走 16K**。电信这类纯 VoLTE 卡上，
+            # 模组按 16K 出流而我们按 8k 解，收到的就是一堆看着像宽带噪声的东西
+            # （这正是上游判定"接收方向不可用/transmit-only"的根因）。
+            # 真机实证（2026-08-04，SIM7600G + 中国电信 VoLTE，拨 10000）：
+            #   设 1,1 后 interface 4 稳定 15999 B/s = 精确 8000Hz×2B；
+            #   低/高频带能量比中位数 226.9、基频 216Hz —— 确凿的人声。
+            #   不设时同一指标约 1.0（噪声）。
+            # 注意 AT+CPCMFRM 不是这件事的开关：手册明确它只支持 8k→16k 单向切换，
+            # 拿它降回 8k 无效。
             try:
-                self._send("AT+CPCMFRM=0")
+                self._send("AT+CPCMBANDWIDTH=1,1")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("AT+CPCMFRM=0 失败（可忽略）: %s", type(exc).__name__)
+                logger.debug("AT+CPCMBANDWIDTH 设置失败（可忽略）: %s", type(exc).__name__)
 
         deadline = time.monotonic() + self._SIMCOM_PCM_ENABLE_TIMEOUT
         attempts = 0

@@ -805,8 +805,10 @@ def test_simcom_pcm_retries_while_in_call(monkeypatch):
     modem.initialize_for_voice("simcom_pcm")
     assert calls.count("AT+CPCMREG=1") == 3
     assert modem.voice_pcm_active is True
-    # 8k PCM 帧格式应显式声明，不赖模组默认
-    assert "AT+CPCMFRM=0" in calls
+    # 8k 采样率应显式钉住，不赖模组默认（默认 VoLTE 走 16K）。
+    # 原先这里断言的是 AT+CPCMFRM=0——手册 5.2.43 明确该命令只支持 8k→16k
+    # 单向切换，拿它降回 8k 无效；真正的开关是 CPCMBANDWIDTH（5.2.46）。
+    assert "AT+CPCMBANDWIDTH=1,1" in calls
 
 
 def test_simcom_pcm_raises_in_call_when_never_enabled(monkeypatch):
@@ -897,3 +899,46 @@ def test_simcom_pcm_no_call_tries_once_only(monkeypatch):
     modem.initialize_for_voice("simcom_pcm")
     assert calls.count("AT+CPCMREG=1") == 1
     assert "AT+CPCMFRM=0" not in calls          # 无通话时连帧格式都不必发
+
+
+# ---- PCM 采样率必须钉成 8k（VoLTE 默认 16K 会被误解成噪声）----
+
+
+def test_simcom_pcm_forces_8k_sampling(monkeypatch):
+    """真机 2026-08-04：不设 CPCMBANDWIDTH 时，电信 VoLTE 通话的接收流是 16K，
+    被按 8k 解就是"宽带噪声"（上游据此误判 transmit-only）。设 1,1 后
+    interface 4 稳定 15999 B/s、基频 216Hz，确凿人声。
+
+    顺带锁死：AT+CPCMFRM 不能用来降回 8k（手册明确只支持 8k→16k 单向）。
+    """
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    modem = make_modem()
+    modem._call_connected_event.set()
+    calls: list[str] = []
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert "AT+CPCMBANDWIDTH=1,1" in calls
+    assert calls.index("AT+CPCMBANDWIDTH=1,1") < calls.index("AT+CPCMREG=1")
+    assert not any(c.startswith("AT+CPCMFRM") for c in calls)
+
+
+def test_bandwidth_failure_does_not_block_pcm(monkeypatch):
+    """老固件可能没这条命令；失败只降级，不能让整通电话没音频。"""
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    modem = make_modem()
+    modem._call_connected_event.set()
+
+    def fake_send(cmd: str) -> str:
+        if cmd.startswith("AT+CPCMBANDWIDTH"):
+            raise RuntimeError("unsupported")
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")     # 不抛
+    assert modem.voice_pcm_active is True
