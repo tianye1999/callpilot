@@ -515,3 +515,58 @@ def test_modem_unlock_wrong_pin_raises_without_leaking_pin(monkeypatch):
     with pytest.raises(ValueError) as excinfo:
         modem.unlock_sim("9999")
     assert "9999" not in str(excinfo.value)   # PIN 明文不进异常消息
+
+
+# ---- EPS(LTE)域注册：VoLTE-only 的卡 CS 域恒被拒 ----
+
+
+def test_parse_eps_registration_accepts_cereg_and_cgreg():
+    from agentcall.sim_identity import parse_eps_registration
+
+    assert parse_eps_registration("\r\n+CEREG: 0,1\r\n\r\nOK") == (True, "已注册")
+    assert parse_eps_registration("\r\n+CGREG: 0,1\r\n\r\nOK") == (True, "已注册")
+    assert parse_eps_registration("\r\n+CEREG: 0,5\r\n\r\nOK") == (True, "已注册(漫游)")
+    assert parse_eps_registration("\r\n+CEREG: 0,3\r\n\r\nOK") == (False, "注册被拒")
+    # 老固件无此命令
+    assert parse_eps_registration("\r\nERROR\r\n") == (False, "未知")
+    assert parse_eps_registration("") == (False, "未知")
+
+
+def test_network_attached_true_when_only_eps_registered():
+    """真机 2026-08-04：中国电信 46011 + SIM7600G，CREG:0,3 但 ATD 能接通。
+
+    语音走 VoLTE over LTE，CS 域被拒是这类卡的正常状态；只看 CS 域会把能打的
+    电话判成"卡不可用"。
+    """
+    from agentcall.sim_identity import identify, with_eps_registration
+
+    sim = identify("460110123456789\r\nOK", "+CREG: 0,3\r\nOK")
+    assert sim.registered is False and sim.reg_status == "注册被拒"
+    assert sim.network_attached is False        # 还没读 EPS 域
+
+    sim = with_eps_registration(sim, "+CEREG: 0,1\r\nOK")
+    assert sim.eps_registered is True and sim.eps_status == "已注册"
+    assert sim.network_attached is True         # 关键：可拨号
+    assert sim.registered is False              # CS 域字段语义不变
+    assert sim.carrier == "中国电信" and sim.service_number == "10000"
+
+
+def test_network_attached_false_when_both_domains_down():
+    from agentcall.sim_identity import identify, with_eps_registration
+
+    sim = with_eps_registration(
+        identify("460110123456789\r\nOK", "+CREG: 0,2\r\nOK"), "+CEREG: 0,2\r\nOK"
+    )
+    assert sim.network_attached is False
+
+
+def test_as_dict_exposes_network_attached():
+    """前端拨号按钮的可用性看这个字段，必须能序列化出去。"""
+    from agentcall.sim_identity import identify, with_eps_registration
+
+    data = with_eps_registration(
+        identify("460110123456789\r\nOK", "+CREG: 0,3\r\nOK"), "+CEREG: 0,1\r\nOK"
+    ).as_dict()
+    assert data["network_attached"] is True
+    assert data["registered"] is False
+    assert data["eps_status"] == "已注册"

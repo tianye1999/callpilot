@@ -70,3 +70,43 @@ def test_missing_identity_capability_preserves_legacy_duck_typed_modems():
     assert check_dial_guard(
         modem_online=True, sim_identity=None, number="10000"
     ) is None
+
+
+# ---- VoLTE-only 卡：CS 域被拒不该拦住拨号 ----
+
+
+def test_volte_only_card_is_allowed_to_dial():
+    """回归：中国电信卡 CREG:0,3（CS 被拒）但 CEREG:0,1，真机 ATD 能接通。
+
+    2026-08-04 真机实测 ATD10000 得到 VOICE CALL: BEGIN 并接通，而 UI 却报
+    「SIM 卡尚未注册到网络（注册被拒）」把按钮拦死——门禁只看 CS 域的后果。
+    """
+    from agentcall.sim_identity import identify, with_eps_registration
+
+    sim = with_eps_registration(
+        identify("460110123456789\r\nOK", "+CREG: 0,3\r\nOK"), "+CEREG: 0,1\r\nOK"
+    )
+    assert check_dial_guard(modem_online=True, sim_identity=sim, number="10000") is None
+
+
+def test_both_domains_denied_still_blocks():
+    """两个域都没注册才该拦——否则真拨不出去只能等 45s 接通超时。"""
+    from agentcall.sim_identity import identify, with_eps_registration
+
+    sim = with_eps_registration(
+        identify("460110123456789\r\nOK", "+CREG: 0,3\r\nOK"), "+CEREG: 0,3\r\nOK"
+    )
+    failure = check_dial_guard(modem_online=True, sim_identity=sim, number="10000")
+    assert failure is not None
+    assert failure.code == "SIM_NOT_REGISTERED"
+    # 两个域的状态都要报出来，否则用户看不出是哪边不通
+    assert "CS：注册被拒" in failure.message and "LTE：注册被拒" in failure.message
+
+
+def test_cs_registered_alone_still_allowed():
+    """移动/联通卡走 CS 域，行为不能因这次改动变化（回归保护）。"""
+    from agentcall.sim_identity import identify
+
+    sim = identify("460010123456789\r\nOK", "+CREG: 0,1\r\nOK")
+    assert sim.eps_registered is False        # 没读 EPS 域
+    assert check_dial_guard(modem_online=True, sim_identity=sim, number="10010") is None

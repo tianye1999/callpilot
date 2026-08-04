@@ -39,14 +39,18 @@ def check_dial_guard(
     if sim_identity is None:
         return None
     if not sim_identity.present or (
-        not sim_identity.registered
+        not sim_identity.network_attached
         and sim_identity.reg_status not in _EXPLICIT_UNREGISTERED
     ):
         return DialGuardFailure("SIM_NOT_READY", "SIM 卡未插入或尚未就绪")
-    if not sim_identity.registered:
+    # 看 network_attached 而非 registered：CS 域被拒但 EPS(LTE)已注册时语音走
+    # VoLTE，照样能拨通（真机实测：中国电信 46011 + SIM7600G，CREG:0,3 而
+    # ATD10000 得到 VOICE CALL: BEGIN 并接通）。只看 CS 域会把可用的卡拦死。
+    if not sim_identity.network_attached:
         return DialGuardFailure(
             "SIM_NOT_REGISTERED",
-            f"SIM 卡尚未注册到网络（{sim_identity.reg_status}）",
+            f"SIM 卡尚未注册到网络（CS：{sim_identity.reg_status}；"
+            f"LTE：{sim_identity.eps_status}）",
         )
     normalized = (number or "").strip()
     if (

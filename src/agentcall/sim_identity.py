@@ -41,6 +41,8 @@ _SERVICE_NUMBERS: dict[str, str] = {
 
 _IMSI_RE = re.compile(r"\b(\d{14,15})\b")
 _CREG_RE = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?(\d+)(?:\s|$)")
+# EPS(LTE)/PS 域注册：+CEREG / +CGREG 的 <stat> 取值与 CREG 同表。
+_EPS_RE = re.compile(r"\+C[EG]REG:\s*(?:\d+\s*,\s*)?(\d+)(?:\s|$)")
 _CPIN_RE = re.compile(r"\+CPIN:\s*([A-Z0-9 ]+?)\s*(?:\r|\n|$)", re.IGNORECASE)
 # SIMCom +SPIC: <pin1>,<puk1>,<pin2>,<puk2> — 首字段是 PIN1 剩余次数。
 _SPIC_RE = re.compile(r"\+SPIC:\s*(\d+)")
@@ -80,12 +82,28 @@ class SimIdentity:
     carrier: str             # 运营商中文名;未识别为 "未知"
     service_number: str      # 该运营商免费客服号;未识别为 ""
     registered: bool         # CS 域已注册(CREG 1/5)
-    reg_status: str          # 注册状态人话(已注册/搜网中/…)
+    reg_status: str          # CS 域注册状态人话(已注册/搜网中/…)
+    # EPS(LTE)域注册(CEREG/CGREG 1/5)。VoLTE 语音走 IMS over LTE,CS 域被拒是
+    # 电信这类无 GSM/WCDMA 电路域的卡的**正常**状态——真机实测 CREG:0,3 时
+    # ATD 仍能接通(2026-08-04,中国电信 46011 + SIM7600G)。只看 CS 域会把可用
+    # 的卡判成不可拨号。
+    eps_registered: bool = False
+    eps_status: str = "未知"   # EPS 域注册状态人话
     # PIN 锁状态:锁卡时 CIMI/COPS 全 ERROR,不区分「没插卡」与「卡锁着」
     # 会让用户对着"SIM 识别失败"无从下手。
     lock_state: str = LOCK_UNKNOWN   # CPIN 原文(READY / SIM PIN / SIM PUK);未知为 ""
     lock_status: str = "未知"        # 锁状态人话
     pin_attempts: int = -1           # 剩余 PIN1 尝试次数;未知为 -1
+
+    @property
+    def network_attached(self) -> bool:
+        """任一域已注册即视为可拨号(CS 或 EPS)。
+
+        拨号前置校验该看这个而不是 ``registered``:VoLTE-only 的卡 CS 域恒被拒,
+        拿 CS 域当门禁会把能打的电话拦下来。真打不通时模组会回 NO CARRIER,
+        上层已有处理——宁可让它失败,也不要提前误拦。
+        """
+        return self.registered or self.eps_registered
 
     @property
     def locked(self) -> bool:
@@ -94,7 +112,9 @@ class SimIdentity:
 
     def as_dict(self) -> dict:
         data = asdict(self)
-        data["locked"] = self.locked  # property 不进 asdict,显式补上供前端用
+        # property 不进 asdict,显式补上供前端用
+        data["locked"] = self.locked
+        data["network_attached"] = self.network_attached
         return data
 
 
@@ -123,6 +143,21 @@ def parse_creg(raw: str) -> tuple[bool, str]:
         return False, "未知"
     stat = m.group(1)
     return stat in _REGISTERED_STATS, _CREG_LABELS.get(stat, f"状态{stat}")
+
+
+def parse_eps_registration(raw: str) -> tuple[bool, str]:
+    """从 AT+CEREG? / AT+CGREG? 原始响应解析 (是否已注册, 状态人话)。"""
+    m = _EPS_RE.search(raw or "")
+    if not m:
+        return False, "未知"
+    stat = m.group(1)
+    return stat in _REGISTERED_STATS, _CREG_LABELS.get(stat, f"状态{stat}")
+
+
+def with_eps_registration(identity: SimIdentity, cereg_raw: str) -> SimIdentity:
+    """Return ``identity`` with only its cached EPS(LTE) registration updated."""
+    eps_registered, eps_status = parse_eps_registration(cereg_raw)
+    return replace(identity, eps_registered=eps_registered, eps_status=eps_status)
 
 
 def identify(imsi_raw: str, creg_raw: str = "") -> SimIdentity:

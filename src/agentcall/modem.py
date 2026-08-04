@@ -20,6 +20,7 @@ from .sim_identity import (
     SimIdentity,
     identify,
     parse_cpin,
+    with_eps_registration,
     with_lock_state,
     with_registration,
 )
@@ -299,20 +300,32 @@ class Eg25Modem:
             raise
         except Exception:  # noqa: BLE001
             creg_raw = ""
+        # EPS(LTE)域也要读:VoLTE-only 的卡 CS 域恒被拒,只看 CREG 会把能拨通的
+        # 卡判成不可用(真机 2026-08-04:中国电信 46011 CREG:0,3 但 ATD 能接通)。
+        # 老固件无 CEREG 时降级为"未知",不影响 CS 域判定。
+        try:
+            cereg_raw = self._send("AT+CEREG?")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("AT+CEREG? 读取失败: %s", type(exc).__name__)
+            cereg_raw = ""
         if (
             expected_generation is not None
             and expected_generation != self._sim_refresh_generation
         ):
             return
         self._set_sim_identity(
-            with_lock_state(identify(imsi_raw, creg_raw), cpin_raw, spic_raw),
+            with_eps_registration(
+                with_lock_state(identify(imsi_raw, creg_raw), cpin_raw, spic_raw),
+                cereg_raw,
+            ),
             notify=notify,
         )
         sim = self._sim_identity
         if sim.present:
             logger.info(
-                "SIM 识别: %s (PLMN %s) → 免费客服 %s | 网络: %s",
-                sim.carrier, sim.plmn, sim.service_number or "?", sim.reg_status,
+                "SIM 识别: %s (PLMN %s) → 免费客服 %s | 网络: CS=%s LTE=%s",
+                sim.carrier, sim.plmn, sim.service_number or "?",
+                sim.reg_status, sim.eps_status,
             )
         elif sim.locked:
             logger.warning(
