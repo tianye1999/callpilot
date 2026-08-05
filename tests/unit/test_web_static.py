@@ -106,6 +106,55 @@ def test_dashboard_listener_recovers_suspended_web_audio():
     assert "void resumeAndPlayPcm(int16, kind);" in text
 
 
+def test_failed_call_stops_listener_and_shows_cpcmreg_error():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'ev.status === "failed"' in text
+    assert "addCallError(ev)" in text
+    assert "stopListen();" in text
+    assert 'event.error_code === "cpcmreg_init_failed"' in text
+    assert "彻底断电约 10 秒" in text
+
+
+def test_live_page_has_sanitized_agent_process_monitor():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'id="agentTrace"' in text
+    assert 'id="traceCopy"' in text
+    assert 'ev.type === "agent_trace"' in text
+    assert "function addAgentTrace(ev)" in text
+    assert "Observable boundaries only" in text
+    assert "模型内部推理、提示词、原始音频和密钥不会暴露" in text
+    assert "JSON.stringify(traceEvents, null, 2)" in text
+    assert "TRACE_LIMIT = 100" in text
+
+
+def test_history_replays_and_compares_persisted_agent_process_traces():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'id="historyCompare"' in text
+    assert "function buildHistoricalTrace(events)" in text
+    assert 'event.type === "agent_trace"' in text
+    assert "appendTraceRows(stream, traces, false)" in text
+    assert "JSON.stringify(traces, null, 2)" in text
+    assert "function renderHistoryComparison(calls)" in text
+    assert "trace_summary" in text
+    assert "FAULT COMPARISON · LATEST 10 CALLS" in text
+    assert "故障对比 · 最近 10 通" in text
+
+
+def test_restart_waits_for_a_new_service_instance_before_reloading():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert '(await before.json()).instance_id' in text
+    assert "previousInstanceId = res.instance_id || previousInstanceId" in text
+    assert "meta.instance_id !== previousInstanceId" in text
+    assert "observedUnavailable = true" in text
+    assert "if (isNewInstance) { location.reload(); return; }" in text
+    assert '$("restartMsg").textContent = t("restart_timeout")' in text
+    assert "setTimeout(poll, 3000)" in text
+
+
 def test_settings_expose_sms_email_forwarding_with_bilingual_privacy_notice():
     text = INDEX.read_text(encoding="utf-8")
 

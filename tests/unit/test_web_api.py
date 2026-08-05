@@ -576,6 +576,10 @@ def test_config_post_enables_sms_email_only_with_complete_atomic_config(
 def test_history_api_lists_and_limits(tmp_path):
     call_logger = CallLogger(base_dir=tmp_path / "calls")
     rec1 = call_logger.begin_call("inbound", "13800000000")
+    rec1.log_event("answered")
+    rec1.log_event(
+        "agent_trace", stage="bridge", event="ready", status="ok", provider="qwen"
+    )
     rec1.finish("completed")
     rec2 = call_logger.begin_call("outbound", "10086")
     rec2.finish("failed")
@@ -587,6 +591,9 @@ def test_history_api_lists_and_limits(tmp_path):
         calls = await resp.json()
         assert {c["number"] for c in calls} == {"13800000000", "10086"}
         assert all(c["status"] in ("completed", "failed") for c in calls)
+        traced = next(c for c in calls if c["number"] == "13800000000")
+        assert traced["trace_summary"]["available"] is True
+        assert traced["trace_summary"]["diagnosis"] == "model_connect_failed"
 
         resp = await client.get("/api/history?limit=1")
         assert len(await resp.json()) == 1
@@ -603,6 +610,14 @@ def test_history_events_returns_timeline(tmp_path):
     call_logger = CallLogger(base_dir=tmp_path / "calls")
     rec = call_logger.begin_call("inbound", "13800000000")
     rec.log_event("transcript", role="user", text="你好")
+    rec.log_event(
+        "agent_trace",
+        stage="model",
+        event="response_done",
+        status="ok",
+        provider="qwen",
+        ms=321,
+    )
     rec.finish("completed")
     app = make_app(FakeService(call_logger=call_logger))
 
@@ -615,6 +630,7 @@ def test_history_events_returns_timeline(tmp_path):
     types = [ev["type"] for ev in events]
     assert types[0] == "call_started"
     assert "transcript" in types
+    assert "agent_trace" in types
     assert types[-1] == "call_finished"
     transcript = next(ev for ev in events if ev["type"] == "transcript")
     assert transcript["text"] == "你好"

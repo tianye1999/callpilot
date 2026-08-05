@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from queue import Empty, Full, Queue
-from typing import Callable
+from typing import Any, Callable
 
 from . import config
 from .agents.base import VoiceAgent
@@ -241,6 +241,24 @@ class CallSession:
         if self.hub:
             self.hub.publish(event)
 
+    def _publish_agent_trace(
+        self, record: CallRecord | None, event: dict[str, Any]
+    ) -> None:
+        """同一份脱敏过程事件既实时广播，也永久关联到当前通话。"""
+        payload = {
+            "type": "agent_trace",
+            "ts": time.time(),
+            **event,
+        }
+        payload["type"] = "agent_trace"
+        log_event = getattr(record, "log_event", None)
+        if callable(log_event):
+            log_event(
+                "agent_trace",
+                **{key: value for key, value in payload.items() if key != "type"},
+            )
+        self._publish(payload)
+
     @property
     def is_active(self) -> bool:
         with self._active_lock:
@@ -336,6 +354,21 @@ class CallSession:
         self._initialize_triage_context(direction, record)
         transcripts: list[tuple[str, str]] = []
 
+        def trace(stage: str, event: str, status: str = "info", **fields) -> None:
+            self._publish_agent_trace(
+                record,
+                {
+                    "stage": stage,
+                    "event": event,
+                    "status": status,
+                    "provider": self.provider,
+                    "generation": self._session_generation,
+                    **fields,
+                }
+            )
+
+        trace("session", "preparing", "running")
+
         def mark(event_type: str, **fields) -> float:
             """记录一个会话节点事件，附带相对会话开始的耗时（毫秒）。"""
             now = time.monotonic()
@@ -388,6 +421,8 @@ class CallSession:
                 log_first_audio(0)
 
         status = "completed"
+        failure_code: str | None = None
+        failure_message: str | None = None
         try:
             if self._outbound_number:
                 if not await self._connect_outbound(mark):
@@ -401,11 +436,13 @@ class CallSession:
                 {"type": "call", "status": "answered", "caller": self.current_caller}
             )
             mark("answered")
+            trace("session", "answered", "ok")
 
             await asyncio.sleep(1.0)
 
             # 挂断流程会关闭语音通道（AT+QPCMV=0 / AT+CPCMREG=0,1），每通电话都要
             # 重新启用，否则第二通开始模组无 PCM 流（双向无声）。
+            trace("bridge", "voice_channel_starting", "running")
             self.modem.initialize_for_voice(self.audio_mode)
             # simcom_pcm 只在通话中才能开 PCM：真开成了才允许起桥。往未出流的
             # USB 端点写会 [Errno 60] 并把 AT 口的桥一起拖死（真机 2026-08-01），
@@ -433,6 +470,16 @@ class CallSession:
             agent.set_status_handler(
                 lambda text: self._publish({"type": "system", "text": text})
             )
+            agent.set_trace_handler(
+                lambda event: self._publish_agent_trace(
+                    record,
+                    {
+                        "provider": self.provider,
+                        "generation": self._session_generation,
+                        **event,
+                    }
+                )
+            )
             tools = self._build_tools(direction)
             with self._dtmf_lock:
                 self._active_tools = tools
@@ -441,13 +488,14 @@ class CallSession:
                 bridge.set_ready_check(self.modem.pcm_ready)
             bridge.start()
             mark("bridge_started")
-
+            trace("bridge", "ready", "ok")
             await agent.start(
                 self._make_agent_audio_handler(
                     agent, bridge, record, note_first_agent_audio
                 )
             )
             mark("agent_started")
+            trace("session", "agent_ready", "ok")
             # #80-B:IVR 热线 profile 可声明 opening_mode=wait——不发开场白,
             # 静默等对方(菜单播报)先说,避免 AI 开场压掉首段 IVR。仅外呼且
             # profile 显式 wait 时生效;人呼人/来电行为不变。
@@ -465,16 +513,53 @@ class CallSession:
                 )
             finally:
                 await self._shutdown_agent(agent, active_bridge)
-        except BaseException:
+        except BaseException as exc:
             status = "failed"
+            if "CPCMREG" in str(exc).upper():
+                failure_code = "cpcmreg_init_failed"
+                failure_message = (
+                    "SIM7600 USB Audio 初始化失败：AT+CPCMREG=1 未进入 mode=1。"
+                    "请将模组彻底断电约 10 秒后重新上电，再重试。"
+                )
+            else:
+                failure_code = "call_failed"
+                failure_message = "通话初始化或处理失败，请查看服务日志。"
             raise
         finally:
+            # initialize_for_voice / 音频桥创建可能在 _shutdown_agent 接管前失败。
+            # 此时应用会话虽结束，模组上的物理呼叫仍可能 active/held；必须兜底
+            # 挂断，避免下一通叠加呼叫并让 CPCMREG 永远无法进入 mode=1。
+            if self.modem.is_call_connected():
+                try:
+                    self.modem.hangup()
+                    logger.info("会话异常收尾已强制挂断仍在线的物理通话")
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("会话异常收尾挂断物理通话失败: %s", exc)
             # 先作废判官世代再 finish record，避免迟到结果在 meta 落盘后追加事件。
             self._stop_dtmf_judge()
             self._stop_triage_judge()
             self._end_takeover_context("CALL_ENDED")
             mark("ended", status=status)
+            trace(
+                "session",
+                "ended",
+                "error" if status == "failed" else "ok",
+                reason=failure_code or status,
+            )
             self._finalize_record(record, status, transcripts, direction, number)
+            # 异步会话的所有结束路径都在这里广播。用户主动挂断会为即时 UI
+            # 反馈提前广播同一幂等事件；这里仍兜住 initialize_for_voice 等
+            # Agent 启动前的异常，否则网页会永远停在 Listening 状态。
+            event = {
+                "type": "call",
+                "status": "failed" if status == "failed" else "ended",
+                "caller": self.current_caller,
+            }
+            if failure_code is not None:
+                event["error_code"] = failure_code
+            if failure_message is not None:
+                event["error"] = failure_message
+            self._publish(event)
 
     async def _connect_outbound(self, mark: Callable[..., float]) -> bool:
         """外呼：拨号并等待接通；未接通时发结束事件、挂断并返回 False。"""
@@ -493,13 +578,6 @@ class CallSession:
         if not connected:
             logger.info("外呼未接通（无人接听/拒接/超时）")
             mark("not_connected")
-            self._publish(
-                {
-                    "type": "call",
-                    "status": "ended",
-                    "caller": self.current_caller,
-                }
-            )
             self.modem.hangup()
             return False
         mark("connected")
@@ -561,12 +639,52 @@ class CallSession:
             self.hub.set_audio_rate(agent.output_rate)
 
         generation = self._session_generation
+        audio_trace = {
+            "started": False,
+            "total_bytes": 0,
+            "last_at": 0.0,
+            "last_bytes": 0,
+        }
 
         def on_agent_audio(pcm_agent: bytes) -> None:
             if not self._agent_effect_allowed(generation):
                 return
             if pcm_agent and on_first_audio is not None:
                 on_first_audio()
+            if pcm_agent:
+                now = time.monotonic()
+                audio_trace["total_bytes"] += len(pcm_agent)
+                should_report = (
+                    not audio_trace["started"]
+                    or now - audio_trace["last_at"] >= 2.0
+                )
+                if should_report:
+                    event = "audio_started" if not audio_trace["started"] else "audio_flow"
+                    interval_bytes = (
+                        audio_trace["total_bytes"] - audio_trace["last_bytes"]
+                    )
+                    interval_ms = (
+                        0
+                        if not audio_trace["started"]
+                        else round((now - audio_trace["last_at"]) * 1000)
+                    )
+                    self._publish_agent_trace(
+                        record,
+                        {
+                            "stage": "audio_out",
+                            "event": event,
+                            "status": "running",
+                            "provider": self.provider,
+                            "generation": generation,
+                            "bytes": interval_bytes,
+                            "total_bytes": audio_trace["total_bytes"],
+                            "interval_ms": interval_ms,
+                            "rate": agent.output_rate,
+                        }
+                    )
+                    audio_trace["started"] = True
+                    audio_trace["last_at"] = now
+                    audio_trace["last_bytes"] = audio_trace["total_bytes"]
             # 浏览器实时旁听下行 AI（Web Audio）：无监听端时零成本返回。kind=0=下行。
             if self.hub is not None:
                 self.hub.broadcast_audio(pcm_agent, kind=0)
@@ -654,6 +772,12 @@ class CallSession:
             agent_uplink_gain = 1.0
         uplink_pre_stats = PcmFlowStats("agent_uplink_pre_gain")
         uplink_post_stats = PcmFlowStats("agent_uplink_post_gain")
+        uplink_trace = {
+            "started": False,
+            "total_bytes": 0,
+            "last_at": 0.0,
+            "last_bytes": 0,
+        }
         winddown_deadline: float | None = None
         generation = self._session_generation
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
@@ -767,6 +891,44 @@ class CallSession:
                     pcm_agent = apply_pcm_gain(pcm_agent, agent_uplink_gain)
                     uplink_post_stats.add(pcm_agent)
                     await agent.send_audio(pcm_agent)
+                    trace_now = time.monotonic()
+                    uplink_trace["total_bytes"] += len(pcm_agent)
+                    if (
+                        not uplink_trace["started"]
+                        or trace_now - uplink_trace["last_at"] >= 2.0
+                    ):
+                        trace_event = (
+                            "audio_started"
+                            if not uplink_trace["started"]
+                            else "audio_flow"
+                        )
+                        interval_bytes = (
+                            uplink_trace["total_bytes"] - uplink_trace["last_bytes"]
+                        )
+                        interval_ms = (
+                            0
+                            if not uplink_trace["started"]
+                            else round(
+                                (trace_now - uplink_trace["last_at"]) * 1000
+                            )
+                        )
+                        self._publish_agent_trace(
+                            record,
+                            {
+                                "stage": "audio_in",
+                                "event": trace_event,
+                                "status": "running",
+                                "provider": self.provider,
+                                "generation": generation,
+                                "bytes": interval_bytes,
+                                "total_bytes": uplink_trace["total_bytes"],
+                                "interval_ms": interval_ms,
+                                "rate": agent.input_rate,
+                            }
+                        )
+                        uplink_trace["started"] = True
+                        uplink_trace["last_at"] = trace_now
+                        uplink_trace["last_bytes"] = uplink_trace["total_bytes"]
             uplink_pre_stats.maybe_log(gain=agent_uplink_gain)
             uplink_post_stats.maybe_log(gain=agent_uplink_gain)
             await asyncio.sleep(0.01)

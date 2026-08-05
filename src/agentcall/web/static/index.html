@@ -80,8 +80,8 @@
     background: var(--ok); box-shadow: 0 0 10px var(--ok);
     animation: breathe 1.5s ease-in-out infinite;
   }
-  .state-chip.ended { border-color: rgba(255, 69, 58, .4); color: var(--err); }
-  .state-chip.ended .sdot { background: var(--err); }
+  .state-chip.ended, .state-chip.failed { border-color: rgba(255, 69, 58, .4); color: var(--err); }
+  .state-chip.ended .sdot, .state-chip.failed .sdot { background: var(--err); }
   .state-chip .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .recording-badge {
     display: none; align-items: center; gap: 5px; padding-left: 8px;
@@ -274,7 +274,11 @@
   .empty { color: var(--dim); font-size: 13px; text-align: center; padding: 26px 0; }
 
   /* ========= 对话面板 ========= */
-  #page-live .wrap { max-width: 860px; margin: 0 auto; }
+  #page-live .wrap { max-width: 1180px; margin: 0 auto; }
+  .live-console-grid {
+    display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(320px, .8fr);
+    gap: 16px; align-items: start;
+  }
   .live-head { display: flex; align-items: center; gap: 10px; }
   .live-tag {
     display: inline-flex; align-items: center; gap: 7px;
@@ -319,6 +323,73 @@
     border-bottom-right-radius: 4px; display: inline-block; text-align: left;
   }
   .bubble .time { font-size: 10px; color: var(--dim); margin-top: 3px; font-family: var(--mono); }
+  .call-error {
+    margin: 12px 0 18px; padding: 12px 14px; border-radius: 12px;
+    color: var(--err); background: rgba(255, 69, 58, .09);
+    border: 1px solid rgba(255, 69, 58, .32); animation: rise .25s ease both;
+  }
+  .call-error b { display: block; margin-bottom: 5px; font-size: 13px; }
+  .call-error span { display: block; color: var(--muted); font-size: 13px; line-height: 1.55; white-space: pre-wrap; }
+  .call-error time { display: block; margin-top: 6px; color: var(--dim); font: 10px var(--mono); }
+
+  /* Agent 可观测流水线：工业仪表风，只展示脱敏的协议边界与流量指标。 */
+  .trace-card { position: sticky; top: 0; }
+  .trace-card > h2 { padding-right: 12px; }
+  .trace-state {
+    margin-left: auto; padding: 3px 8px; border-radius: 999px;
+    color: var(--dim); border: 1px solid var(--border); background: var(--well);
+    font: 10px var(--mono); letter-spacing: .08em;
+  }
+  .trace-state.running { color: var(--ok); border-color: rgba(67,230,154,.35); box-shadow: 0 0 12px rgba(67,230,154,.08); }
+  .trace-state.error { color: var(--err); border-color: rgba(255,69,58,.38); }
+  .trace-copy {
+    border: 0; background: transparent; color: var(--muted); cursor: pointer;
+    padding: 3px 7px; border-radius: 7px; font: 11px var(--mono);
+  }
+  .trace-copy:hover { color: var(--text); background: var(--well); }
+  .trace-note {
+    padding: 10px 13px; color: var(--muted); font-size: 11px; line-height: 1.5;
+    border-bottom: 1px solid var(--border); background: rgba(8, 12, 20, .42);
+  }
+  .trace-stream {
+    min-height: 300px; max-height: calc(100vh - 300px); overflow-y: auto;
+    padding: 8px 10px 12px; background:
+      linear-gradient(rgba(67,230,154,.025) 1px, transparent 1px) 0 0 / 100% 28px,
+      rgba(5, 9, 15, .32);
+  }
+  .trace-stream:empty::before {
+    content: attr(data-empty); display: block; padding: 38px 14px;
+    color: var(--dim); text-align: center; white-space: pre-line; font: 11px/1.6 var(--mono);
+  }
+  .trace-row {
+    position: relative; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto;
+    gap: 8px; padding: 8px 5px 8px 3px; animation: rise .18s ease both;
+  }
+  .trace-row:not(:last-child)::after {
+    content: ""; position: absolute; left: 11px; top: 25px; bottom: -6px;
+    width: 1px; background: var(--border);
+  }
+  .trace-node {
+    width: 17px; height: 17px; border-radius: 5px; display: grid; place-items: center;
+    color: var(--blue); border: 1px solid rgba(10,132,255,.32); background: rgba(10,132,255,.10);
+    font: 9px var(--mono); z-index: 1;
+  }
+  .trace-row.ok .trace-node { color: var(--ok); border-color: rgba(67,230,154,.35); background: rgba(67,230,154,.10); }
+  .trace-row.warning .trace-node { color: var(--warn); border-color: rgba(255,159,10,.38); background: rgba(255,159,10,.10); }
+  .trace-row.error .trace-node { color: var(--err); border-color: rgba(255,69,58,.38); background: rgba(255,69,58,.10); }
+  .trace-main { min-width: 0; }
+  .trace-title { color: var(--text); font-size: 11.5px; line-height: 1.35; }
+  .trace-detail { margin-top: 2px; color: var(--dim); font: 10px/1.35 var(--mono); overflow-wrap: anywhere; }
+  .trace-time { color: var(--dim); font: 9.5px var(--mono); white-space: nowrap; }
+  .trace-divider {
+    margin: 7px 3px 3px; padding: 5px 7px; border: 1px dashed var(--border);
+    color: var(--muted); background: rgba(255,255,255,.02); font: 10px var(--mono);
+  }
+  @media(max-width: 900px) {
+    .live-console-grid { grid-template-columns: 1fr; }
+    .trace-card { position: static; }
+    .trace-stream { min-height: 220px; max-height: 42vh; }
+  }
 
   /* ========= 短信面板 ========= */
   #page-sms .wrap { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
@@ -352,6 +423,17 @@
   #historyList { padding: 14px 20px; }
   .history-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .history-title .title-main { min-width: 0; }
+  .trace-compare { margin: 12px 20px 2px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .trace-compare-title { padding: 9px 11px; color: var(--muted); background: var(--well); font: 700 10.5px var(--mono); letter-spacing: .06em; }
+  .trace-compare-scroll { overflow-x: auto; }
+  .trace-compare table { width: 100%; min-width: 700px; border-collapse: collapse; font: 10.5px/1.35 var(--mono); }
+  .trace-compare th, .trace-compare td { padding: 7px 9px; text-align: left; border-top: 1px solid var(--border); white-space: nowrap; }
+  .trace-compare th { color: var(--dim); font-weight: 600; }
+  .trace-compare td { color: var(--muted); }
+  .diag { display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 999px; padding: 2px 7px; color: var(--muted); font: 700 10px var(--mono); }
+  .diag.healthy { color: var(--ok); border-color: rgba(67,230,154,.35); }
+  .diag.fault { color: var(--err); border-color: rgba(255,69,58,.38); }
+  .diag.no_trace, .diag.no_answer { color: var(--dim); }
   .hist-delete { margin-left: 8px; padding: 5px 8px; border-radius: 8px; font-size: 11px; }
   .rec-audio { margin: 4px 0 10px; }
   .rec-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
@@ -382,6 +464,11 @@
   .hist-item .sum-source.verified { color: var(--ok); }
   .timeline { display: none; margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px; }
   .hist-item.open .timeline { display: block; }
+  .history-trace { margin: 10px 0 12px; padding: 10px; border: 1px solid var(--border); border-radius: 12px; background: rgba(0,0,0,.09); }
+  .history-trace-head { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+  .history-trace-head strong { flex: 1; color: var(--text); font-size: 12px; }
+  .history-trace-stream { min-height: 70px; max-height: 360px; padding: 2px 3px; border: 0; background: transparent; }
+  .history-trace-empty { padding: 14px 4px; color: var(--dim); font-size: 11px; }
   .tl-row { display: flex; gap: 10px; font-size: 11.5px; color: var(--muted); padding: 2.5px 0; font-family: var(--mono); }
   .tl-row .t  { color: var(--blue); min-width: 64px; flex-shrink: 0; }
   .tl-row .ty { color: var(--text); min-width: 88px; flex-shrink: 0; font-family: inherit; }
@@ -866,14 +953,25 @@
     <!-- 实时对话 -->
     <div class="panel-page" id="page-live">
       <div class="wrap">
-        <section class="card">
-          <h2><span data-i18n="live_title"></span>
-            <span class="live-tag" id="liveTag" style="display:none"><span class="ldot"></span>LIVE</span>
-            <span class="sub" id="liveSub"></span>
-            <button id="listenBtn" class="listen-btn" type="button" data-i18n="listen_off"></button>
-          </h2>
-          <div id="chat"></div>
-        </section>
+        <div class="live-console-grid">
+          <section class="card">
+            <h2><span data-i18n="live_title"></span>
+              <span class="live-tag" id="liveTag" style="display:none"><span class="ldot"></span>LIVE</span>
+              <span class="sub" id="liveSub"></span>
+              <button id="listenBtn" class="listen-btn" type="button" data-i18n="listen_off"></button>
+            </h2>
+            <div id="chat"></div>
+          </section>
+          <section class="card trace-card" aria-live="polite">
+            <h2>
+              <span data-i18n="trace_title"></span>
+              <span class="trace-state" id="traceState"></span>
+              <button class="trace-copy" id="traceCopy" type="button" data-i18n="trace_copy"></button>
+            </h2>
+            <div class="trace-note" data-i18n="trace_note"></div>
+            <div class="trace-stream" id="agentTrace"></div>
+          </section>
+        </div>
       </div>
     </div>
 
@@ -903,6 +1001,7 @@
             <span class="title-main"><span data-i18n="hist_title"></span><span class="sub" data-i18n="hist_sub"></span></span>
             <button class="btn sm danger" id="historyClear" data-i18n="hist_clear"></button>
           </h2>
+          <div id="historyCompare"></div>
           <div id="historyList"><div class="empty" data-i18n="empty_history"></div></div>
         </section>
       </div>
@@ -1227,7 +1326,7 @@ const I18N = {
   en: {
     slogan: "Your calls, handled by AI",
     nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_profiles: "Presets", nav_settings: "Settings",
-    st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
+    st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended", st_failed: "Failed",
     conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
     modem_on: "Modem ready", modem_off: "Modem offline",
     keypad: "Keys", hangup: "Hang up",
@@ -1273,6 +1372,34 @@ const I18N = {
     live_title: "Live Transcript", live_sub_idle: "Opens automatically when a call starts",
     listen_off: "🔊 Listen live", listen_on: "🔊 Listening…",
     live_empty: "Waiting for transcript…", dtmf_send_fail: "Send failed", new_call: "NEW CALL",
+    trace_title: "Agent Process", trace_copy: "COPY", trace_copied: "COPIED",
+    trace_note: "Observable boundaries only. Model reasoning, prompts, raw audio and secrets are never exposed here.",
+    trace_empty: "Waiting for an active call…\nAudio and model checkpoints will appear here.",
+    trace_idle: "IDLE", trace_running: "RUNNING", trace_error: "ERROR",
+    trace_stage_session: "Call session", trace_stage_bridge: "USB audio bridge",
+    trace_stage_transport: "Realtime link", trace_stage_audio_in: "Caller audio",
+    trace_stage_vad: "Speech detection", trace_stage_model: "Model response",
+    trace_stage_audio_out: "AI audio", trace_stage_tool: "Tool call",
+    trace_ev_preparing: "Preparing call pipeline", trace_ev_answered: "Call answered",
+    trace_ev_voice_channel_starting: "Opening modem voice channel", trace_ev_ready: "Audio bridge ready",
+    trace_ev_agent_ready: "Agent pipeline ready", trace_ev_connecting: "Connecting to realtime model",
+    trace_ev_connected: "Realtime model connected", trace_ev_connect_failed: "Realtime connection failed",
+    trace_ev_disconnected: "Realtime connection lost", trace_ev_reconnecting: "Reconnecting to realtime model",
+    trace_ev_reconnected: "Realtime connection restored", trace_ev_reconnect_failed: "Realtime reconnection failed",
+    trace_ev_audio_started: "Audio stream started", trace_ev_audio_flow: "Audio is flowing",
+    trace_ev_speech_started: "Speech detected", trace_ev_utterance_committed: "Utterance committed",
+    trace_ev_response_requested: "Response requested", trace_ev_response_request_failed: "Response request failed",
+    trace_ev_response_created: "Model started a response", trace_ev_input_transcript_ready: "Caller transcript ready",
+    trace_ev_output_transcript_ready: "Agent transcript ready", trace_ev_response_done: "Response completed",
+    trace_ev_capability_notice: "Provider capability limit", trace_ev_requested: "Tool requested",
+    trace_ev_completed: "Tool completed", trace_ev_error: "Realtime model error", trace_ev_ended: "Call pipeline ended",
+    trace_cap_no_user_transcript: "MiniMax does not return caller transcripts; judge understanding from the response",
+    trace_reason_silence: "silence detected", trace_reason_max_utterance: "maximum utterance reached",
+    trace_reason_completed: "completed normally", trace_reason_failed: "call failed",
+    trace_reason_call_failed: "call initialization failed", trace_reason_cpcmreg_init_failed: "CPCMREG initialization failed",
+    call_failed_title: "Call setup failed",
+    call_error_cpcmreg: "SIM7600 USB Audio did not enter CPCMREG mode 1. Fully power off the module for about 10 seconds, power it on again, then retry.",
+    call_error_generic: "The call could not be initialized. Check the service log for details.",
     leave_title: "Unsaved changes",
     leave_msg: "You've edited settings that aren't saved yet. What would you like to do?",
     leave_save: "Save & leave", leave_discard: "Discard changes", leave_stay: "Keep editing",
@@ -1290,7 +1417,16 @@ const I18N = {
     sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
     need_sms: "Enter number and text", sms_in: "IN ← ", sms_out: "OUT → ",
-    hist_title: "Call History", hist_sub: "Click to expand timeline", empty_history: "No call records",
+    hist_title: "Call History", hist_sub: "Replay and compare each call's process", empty_history: "No call records",
+    trace_history_title: "Agent process replay", trace_history_empty: "No process trace was recorded for this earlier call.",
+    trace_compare_title: "FAULT COMPARISON · LATEST 10 CALLS", trace_compare_time: "Time", trace_compare_call: "Call",
+    trace_compare_result: "Diagnosis", trace_compare_model: "Model link", trace_compare_media: "PCM IN / OUT",
+    trace_compare_turns: "Speech / responses", trace_compare_errors: "Errors",
+    trace_diag_healthy: "Healthy path", trace_diag_no_trace: "No trace", trace_diag_no_answer: "No answer",
+    trace_diag_cpcmreg_failed: "CPCMREG failed", trace_diag_bridge_failed: "Audio bridge failed",
+    trace_diag_model_connect_failed: "Model unreachable", trace_diag_no_caller_audio: "No caller PCM",
+    trace_diag_no_speech_detected: "No speech detected", trace_diag_no_model_response: "No model response",
+    trace_diag_no_agent_audio: "No Agent PCM", trace_diag_tool_incomplete: "Tool incomplete", trace_diag_has_errors: "Trace errors",
     hist_clear: "Clear all", hist_clear_title: "Clear all call history?",
     hist_clear_msg: "Finished call records and recordings will be deleted. Active calls are kept.",
     hist_delete: "Delete", hist_delete_title: "Delete this call record?",
@@ -1411,7 +1547,7 @@ const I18N = {
   zh: {
     slogan: "电话，交给 AI",
     nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_profiles: "任务库", nav_settings: "设置",
-    st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
+    st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束", st_failed: "初始化失败",
     conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
     modem_on: "模组就绪", modem_off: "模组未连接",
     keypad: "按键", hangup: "挂断",
@@ -1457,6 +1593,34 @@ const I18N = {
     live_title: "实时对话", live_sub_idle: "通话开始后自动进入本页",
     listen_off: "🔊 实时旁听", listen_on: "🔊 旁听中…",
     live_empty: "等待通话转写…", dtmf_send_fail: "发送失败", new_call: "新通话",
+    trace_title: "Agent 过程", trace_copy: "复制", trace_copied: "已复制",
+    trace_note: "这里只展示可观察边界；模型内部推理、提示词、原始音频和密钥不会暴露。",
+    trace_empty: "等待通话开始…\n音频与模型处理节点会显示在这里。",
+    trace_idle: "待命", trace_running: "运行中", trace_error: "异常",
+    trace_stage_session: "通话会话", trace_stage_bridge: "USB 音频桥",
+    trace_stage_transport: "Realtime 链路", trace_stage_audio_in: "对方音频",
+    trace_stage_vad: "语音检测", trace_stage_model: "模型响应",
+    trace_stage_audio_out: "Agent 音频", trace_stage_tool: "工具调用",
+    trace_ev_preparing: "正在准备通话流水线", trace_ev_answered: "电话已接通",
+    trace_ev_voice_channel_starting: "正在开启模组语音通道", trace_ev_ready: "音频桥已就绪",
+    trace_ev_agent_ready: "Agent 流水线已就绪", trace_ev_connecting: "正在连接实时模型",
+    trace_ev_connected: "实时模型已连接", trace_ev_connect_failed: "实时模型连接失败",
+    trace_ev_disconnected: "Realtime 链路中断", trace_ev_reconnecting: "正在重连实时模型",
+    trace_ev_reconnected: "Realtime 链路已恢复", trace_ev_reconnect_failed: "Realtime 重连失败",
+    trace_ev_audio_started: "音频流已开始", trace_ev_audio_flow: "音频持续流动",
+    trace_ev_speech_started: "检测到对方说话", trace_ev_utterance_committed: "本轮语音已提交",
+    trace_ev_response_requested: "已请求模型回答", trace_ev_response_request_failed: "请求模型回答失败",
+    trace_ev_response_created: "模型开始生成回答", trace_ev_input_transcript_ready: "对方转写已完成",
+    trace_ev_output_transcript_ready: "Agent 转写已完成", trace_ev_response_done: "本轮回答已完成",
+    trace_ev_capability_notice: "Provider 能力限制", trace_ev_requested: "模型请求工具",
+    trace_ev_completed: "工具执行完成", trace_ev_error: "实时模型报错", trace_ev_ended: "通话流水线已结束",
+    trace_cap_no_user_transcript: "MiniMax 不返回对方转写，需要根据 Agent 回答内容判断是否听懂",
+    trace_reason_silence: "检测到静默", trace_reason_max_utterance: "达到最长发言时间",
+    trace_reason_completed: "正常结束", trace_reason_failed: "通话失败",
+    trace_reason_call_failed: "通话初始化失败", trace_reason_cpcmreg_init_failed: "CPCMREG 初始化失败",
+    call_failed_title: "通话初始化失败",
+    call_error_cpcmreg: "SIM7600 USB Audio 未进入 CPCMREG mode 1。请将模组彻底断电约 10 秒后重新上电，再重试。",
+    call_error_generic: "通话未能完成初始化，请查看服务日志了解详情。",
     leave_title: "有未保存的修改",
     leave_msg: "你修改了设置但还没保存，要怎么处理？",
     leave_save: "保存并离开", leave_discard: "放弃修改", leave_stay: "继续编辑",
@@ -1474,7 +1638,16 @@ const I18N = {
     sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
     need_sms: "请填写号码和内容", sms_in: "收 ← ", sms_out: "发 → ",
-    hist_title: "通话历史", hist_sub: "点击展开事件时间线", empty_history: "暂无通话记录",
+    hist_title: "通话历史", hist_sub: "回放并对比每通电话的处理过程", empty_history: "暂无通话记录",
+    trace_history_title: "Agent 过程回放", trace_history_empty: "这通较早的电话没有保存过程日志。",
+    trace_compare_title: "故障对比 · 最近 10 通", trace_compare_time: "时间", trace_compare_call: "电话",
+    trace_compare_result: "诊断", trace_compare_model: "模型链路", trace_compare_media: "PCM 入 / 出",
+    trace_compare_turns: "语音 / 回答", trace_compare_errors: "错误",
+    trace_diag_healthy: "链路正常", trace_diag_no_trace: "无过程日志", trace_diag_no_answer: "未接通",
+    trace_diag_cpcmreg_failed: "CPCMREG 失败", trace_diag_bridge_failed: "音频桥失败",
+    trace_diag_model_connect_failed: "模型连接失败", trace_diag_no_caller_audio: "无对方 PCM",
+    trace_diag_no_speech_detected: "未检测到语音", trace_diag_no_model_response: "模型未回答",
+    trace_diag_no_agent_audio: "无 Agent PCM", trace_diag_tool_incomplete: "工具未完成", trace_diag_has_errors: "过程有错误",
     hist_clear: "清除全部", hist_clear_title: "清除全部通话历史？",
     hist_clear_msg: "已结束的通话记录和录音会被删除，进行中的通话会保留。",
     hist_delete: "删除", hist_delete_title: "删除这条通话记录？",
@@ -1562,6 +1735,8 @@ function applyI18n() {
   $("modemState").textContent = t(modemConnected ? "modem_on" : "modem_off");
   $("liveSub").textContent = callActive ? ($("stateNum").textContent || "") : t("live_sub_idle");
   $("chat").dataset.empty = t("live_empty");  // 空转写占位（CSS ::before 读取）
+  $("agentTrace").dataset.empty = t("trace_empty");
+  if (typeof renderAgentTrace === "function") renderAgentTrace();
   if (typeof renderDialPresets === "function") renderDialPresets();
   if (typeof renderProfileList === "function") renderProfileList();
   if (typeof refreshProfileEditorText === "function") refreshProfileEditorText();
@@ -1742,6 +1917,121 @@ function addTranscript(role, text, ts) {
   }
 }
 
+function addCallError(event) {
+  const chat = $("chat");
+  const item = el("div", "call-error");
+  const message = event.error_code === "cpcmreg_init_failed"
+    ? t("call_error_cpcmreg")
+    : (event.error || t("call_error_generic"));
+  item.appendChild(el("b", "", t("call_failed_title")));
+  item.appendChild(el("span", "", message));
+  item.appendChild(el("time", "", fmtTime(event.ts)));
+  chat.appendChild(item);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+/* ========= Agent 过程监控（脱敏事件，不包含音频/提示词/正文/凭证） ========= */
+const TRACE_LIMIT = 100;
+const traceEvents = [];
+const traceKeys = new Set();
+const TRACE_ICONS = { session: "S", bridge: "B", transport: "↔", audio_in: "IN", vad: "V", model: "AI", audio_out: "OUT", tool: "T" };
+
+function traceEventKey(ev) {
+  return [ev.ts, ev.generation, ev.stage, ev.event, ev.total_bytes, ev.ms, ev.status].join("|");
+}
+
+function fmtTraceBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${Math.round(bytes)} B`;
+}
+
+function traceDetail(ev) {
+  const parts = [];
+  if (ev.provider) parts.push(String(ev.provider).toUpperCase());
+  if (Number(ev.ms) > 0) parts.push(`${Math.round(ev.ms)} ms`);
+  if (Number(ev.bytes) > 0) parts.push(`Δ ${fmtTraceBytes(ev.bytes)}`);
+  if (Number(ev.total_bytes) > 0) parts.push(`Σ ${fmtTraceBytes(ev.total_bytes)}`);
+  if (Number(ev.rate) > 0) parts.push(`${Math.round(ev.rate / 1000)} kHz`);
+  if (Number(ev.rms) > 0) parts.push(`RMS ${Math.round(ev.rms)}/${Math.round(ev.threshold || 0)}`);
+  if (Number(ev.chars) > 0) parts.push(`${ev.chars} chars`);
+  if (Number(ev.attempt) > 0) parts.push(`${ev.attempt}/${ev.max_attempts || "?"}`);
+  if (ev.tool) parts.push(`tool=${ev.tool}`);
+  if (ev.reason) parts.push(t(`trace_reason_${ev.reason}`));
+  if (ev.capability) parts.push(t(`trace_cap_${ev.capability}`));
+  if (ev.code) parts.push(`code=${ev.code}`);
+  if (ev.error_type) parts.push(String(ev.error_type));
+  return parts.join(" · ");
+}
+
+function appendTraceRows(stream, events, showGeneration) {
+  let lastGeneration = null;
+  events.forEach((ev) => {
+    if (showGeneration && ev.generation !== undefined && ev.generation !== lastGeneration) {
+      const divider = el("div", "trace-divider", `${t("new_call")} · #${ev.generation}`);
+      stream.appendChild(divider);
+      lastGeneration = ev.generation;
+    }
+    const row = el("div", `trace-row ${ev.status || "info"}`);
+    row.appendChild(el("span", "trace-node", TRACE_ICONS[ev.stage] || "·"));
+    const main = el("div", "trace-main");
+    const stage = t(`trace_stage_${ev.stage}`);
+    const eventLabel = t(`trace_ev_${ev.event}`);
+    main.appendChild(el("div", "trace-title", `${stage} · ${eventLabel}`));
+    const detail = traceDetail(ev);
+    if (detail) main.appendChild(el("div", "trace-detail", detail));
+    row.appendChild(main);
+    row.appendChild(el("time", "trace-time", fmtTime(ev.ts)));
+    stream.appendChild(row);
+  });
+}
+
+function renderAgentTrace() {
+  const stream = $("agentTrace");
+  stream.textContent = "";
+  stream.dataset.empty = t("trace_empty");
+  appendTraceRows(stream, traceEvents, true);
+  stream.scrollTop = stream.scrollHeight;
+}
+
+function setTraceState(state) {
+  const node = $("traceState");
+  node.className = `trace-state ${state === "running" ? "running" : state === "error" ? "error" : ""}`;
+  node.textContent = t(state === "running" ? "trace_running" : state === "error" ? "trace_error" : "trace_idle");
+}
+
+function addAgentTrace(ev) {
+  const key = traceEventKey(ev);
+  if (traceKeys.has(key)) return;
+  traceKeys.add(key);
+  traceEvents.push(ev);
+  while (traceEvents.length > TRACE_LIMIT) {
+    const removed = traceEvents.shift();
+    traceKeys.delete(traceEventKey(removed));
+  }
+  if (ev.stage === "session" && ev.event === "ended") {
+    setTraceState(ev.status === "error" ? "error" : "idle");
+  } else if (ev.status === "error") {
+    setTraceState("error");
+  } else {
+    setTraceState("running");
+  }
+  renderAgentTrace();
+}
+
+$("traceCopy").addEventListener("click", async () => {
+  const button = $("traceCopy");
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(traceEvents, null, 2));
+    button.textContent = t("trace_copied");
+    setTimeout(() => { button.textContent = t("trace_copy"); }, 1600);
+  } catch (err) {
+    console.warn("[trace] 复制失败", err);
+  }
+});
+setTraceState("idle");
+
 /* ========= 短信 ========= */
 function addSms(event) {
   $("smsEmpty")?.remove();
@@ -1781,9 +2071,15 @@ function handleEvent(ev) {
     scheduleMetaRefresh();
   } else if (ev.type === "call") {
     setCall(ev.status, ev.caller);
-    if (ev.status === "ended") setTimeout(() => { loadHistory(); loadRecent(); }, 1200);
+    if (ev.status === "failed") addCallError(ev);
+    if (ev.status === "ended" || ev.status === "failed") {
+      stopListen();
+      setTimeout(() => { loadHistory(); loadRecent(); }, 1200);
+    }
   } else if (ev.type === "transcript") {
     addTranscript(ev.role, ev.text, ev.ts);
+  } else if (ev.type === "agent_trace") {
+    addAgentTrace(ev);
   } else if (ev.type === "sms_in" || ev.type === "sms_out") {
     addSms(ev);
   } else if (ev.type === "call_summary") {
@@ -2567,6 +2863,80 @@ function buildRecPlayers(id) {
   box.appendChild(row);
   return box;
 }
+function traceDiagnosis(summary) {
+  return (summary && summary.diagnosis) || "no_trace";
+}
+function buildDiagnosisBadge(summary) {
+  const diagnosis = traceDiagnosis(summary);
+  const tone = diagnosis === "healthy" ? "healthy" : (diagnosis === "no_trace" || diagnosis === "no_answer" ? diagnosis : "fault");
+  return el("span", `diag ${tone}`, t(`trace_diag_${diagnosis}`));
+}
+function buildHistoricalTrace(events) {
+  const traces = events.filter((event) => event.type === "agent_trace");
+  const box = el("section", "history-trace");
+  box.addEventListener("click", (event) => event.stopPropagation());
+  const head = el("div", "history-trace-head");
+  head.appendChild(el("strong", "", t("trace_history_title")));
+  const copy = el("button", "trace-copy", t("trace_copy"));
+  copy.type = "button";
+  copy.disabled = traces.length === 0;
+  copy.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(traces, null, 2));
+      copy.textContent = t("trace_copied");
+      setTimeout(() => { copy.textContent = t("trace_copy"); }, 1600);
+    } catch (err) { console.warn("[history] 复制过程日志失败", err); }
+  });
+  head.appendChild(copy);
+  box.appendChild(head);
+  if (!traces.length) {
+    box.appendChild(el("div", "history-trace-empty", t("trace_history_empty")));
+    return box;
+  }
+  const stream = el("div", "trace-stream history-trace-stream");
+  appendTraceRows(stream, traces, false);
+  box.appendChild(stream);
+  return box;
+}
+function renderHistoryComparison(calls) {
+  const root = $("historyCompare");
+  root.textContent = "";
+  if (!calls.length) return;
+  const box = el("section", "trace-compare");
+  box.appendChild(el("div", "trace-compare-title", t("trace_compare_title")));
+  const scroll = el("div", "trace-compare-scroll");
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const head = document.createElement("tr");
+  ["trace_compare_time", "trace_compare_call", "trace_compare_result", "trace_compare_model", "trace_compare_media", "trace_compare_turns", "trace_compare_errors"].forEach((key) => {
+    head.appendChild(el("th", "", t(key)));
+  });
+  thead.appendChild(head);
+  table.appendChild(thead);
+  const body = document.createElement("tbody");
+  calls.slice(0, 10).forEach((call) => {
+    const summary = call.trace_summary || {};
+    const row = document.createElement("tr");
+    row.appendChild(el("td", "", fmtDateTime(call.started_at)));
+    row.appendChild(el("td", "", call.number || t("unknown_number")));
+    const diagCell = document.createElement("td");
+    diagCell.appendChild(buildDiagnosisBadge(summary));
+    row.appendChild(diagCell);
+    const model = summary.model_connected
+      ? `${String(summary.provider || "").toUpperCase()}${summary.connect_ms ? ` · ${summary.connect_ms} ms` : ""}`
+      : "—";
+    row.appendChild(el("td", "", model));
+    row.appendChild(el("td", "", summary.available ? `${fmtTraceBytes(summary.audio_in_bytes)} / ${fmtTraceBytes(summary.audio_out_bytes)}` : "—"));
+    row.appendChild(el("td", "", summary.available ? `${summary.speech_turns || 0} / ${summary.responses || 0}` : "—"));
+    row.appendChild(el("td", "", summary.available ? String(summary.errors || 0) : "—"));
+    body.appendChild(row);
+  });
+  table.appendChild(body);
+  scroll.appendChild(table);
+  box.appendChild(scroll);
+  root.appendChild(box);
+}
 async function loadTimeline(tl, id) {
   try {
     const r = await fetch(`/api/history/${encodeURIComponent(id)}/events`);
@@ -2574,7 +2944,9 @@ async function loadTimeline(tl, id) {
     const events = await r.json();
     tl.textContent = "";
     tl.appendChild(buildRecPlayers(id));
+    tl.appendChild(buildHistoricalTrace(events));
     for (const ev of events) {
+      if (ev.type === "agent_trace") continue;
       const row = el("div", "tl-row");
       row.appendChild(el("span", "t", ev.ts ? fmtTime(ev.ts) : ""));
       row.appendChild(el("span", "ty", evTypeText(ev)));
@@ -2599,6 +2971,7 @@ async function fetchHistory() {
 async function loadHistory() {
   try {
     const calls = await fetchHistory();
+    renderHistoryComparison(calls);
     const list = $("historyList");
     list.textContent = "";
     if (!calls.length) { list.appendChild(el("div", "empty", t("empty_history"))); return; }
@@ -2622,6 +2995,7 @@ async function loadHistory() {
       item.appendChild(head1);
       const head2 = el("div", "head");
       head2.appendChild(el("span", "", fmtDateTime(c.started_at)));
+      head2.appendChild(buildDiagnosisBadge(c.trace_summary));
       item.appendChild(head2);
       const summary = c.summary || {};
       if (summary.result_verification === "verified") {

@@ -179,6 +179,10 @@ class _QwenCallback(OmniRealtimeCallback):
             if transcript:
                 logger.info("[上行·用户] %s", transcript)
                 if self._agent:
+                    self._agent._emit_trace(  # noqa: SLF001
+                        "model", "input_transcript_ready", "ok",
+                        role="user", chars=len(transcript),
+                    )
                     self._agent._emit_transcript("user", transcript)  # noqa: SLF001
                     self._agent._on_user_transcription_completed()  # noqa: SLF001
         elif event_type == "conversation.item.input_audio_transcription.delta":
@@ -190,6 +194,10 @@ class _QwenCallback(OmniRealtimeCallback):
             if transcript:
                 logger.info("[下行·Agent] %s", transcript)
                 if self._agent:
+                    self._agent._emit_trace(  # noqa: SLF001
+                        "model", "output_transcript_ready", "ok",
+                        role="agent", chars=len(transcript),
+                    )
                     suppressed = self._agent._audio_gate.complete_transcript(  # noqa: SLF001
                         _response_id(response), transcript
                     )
@@ -200,16 +208,37 @@ class _QwenCallback(OmniRealtimeCallback):
             call_id = response.get("call_id")
             arguments = response.get("arguments") or ""
             logger.info("千问请求调用工具 %s (call_id=%s)", name, call_id)
+            if self._agent:
+                self._agent._emit_trace(  # noqa: SLF001
+                    "tool", "requested", "running",
+                    tool=str(name or "unknown"),
+                )
             if self._agent and name and call_id:
                 self._agent._dispatch_tool_call(  # noqa: SLF001
                     name, call_id, arguments
                 )
         elif event_type == "response.created":
             if self._agent:
+                self._agent._trace_response_started_at = time.monotonic()  # noqa: SLF001
+                self._agent._emit_trace(  # noqa: SLF001
+                    "model", "response_created", "running"
+                )
                 self._agent._on_response_created()  # noqa: SLF001
         elif event_type == "response.done":
             if self._agent:
+                trace_ms = (
+                    round(
+                        (time.monotonic() - self._agent._trace_response_started_at)  # noqa: SLF001
+                        * 1000
+                    )
+                    if self._agent._trace_response_started_at is not None  # noqa: SLF001
+                    else 0
+                )
                 self._agent._audio_gate.complete_response(_response_id(response))  # noqa: SLF001
+                self._agent._emit_trace(  # noqa: SLF001
+                    "model", "response_done", "ok", ms=trace_ms
+                )
+                self._agent._trace_response_started_at = None  # noqa: SLF001
                 self._agent._on_response_done()  # noqa: SLF001
             logger.debug("千问回复轮次完成")
         elif event_type == "session.updated":
@@ -230,6 +259,16 @@ class _QwenCallback(OmniRealtimeCallback):
             )
         elif event_type == "error":
             logger.error("千问 Realtime 错误: %s", response)
+            if self._agent:
+                error = response.get("error")
+                error_data = error if isinstance(error, dict) else {}
+                self._agent._emit_trace(  # noqa: SLF001
+                    "model",
+                    "error",
+                    "error",
+                    code=str(error_data.get("code") or response.get("code") or "unknown"),
+                    error_type=str(error_data.get("type") or "RealtimeError"),
+                )
 
 
 class QwenVoiceAgent(VoiceAgent):
@@ -282,6 +321,7 @@ class QwenVoiceAgent(VoiceAgent):
         self._manual_response_request_pending = False
         self._manual_response_outstanding = 0
         self._manual_response_pending_after_flight = False
+        self._trace_response_started_at: float | None = None
 
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
         self._on_audio_out = on_audio_out
@@ -307,7 +347,20 @@ class QwenVoiceAgent(VoiceAgent):
             "(query_verification_code)。需要时主动调用对应工具，操作完成后用一句话口头确认结果。"
         )
 
-        self._connect_session()
+        connect_started = time.monotonic()
+        self._emit_trace("transport", "connecting", "running")
+        try:
+            self._connect_session()
+        except Exception as exc:
+            self._emit_trace(
+                "transport", "connect_failed", "error",
+                error_type=type(exc).__name__,
+            )
+            raise
+        self._emit_trace(
+            "transport", "connected", "ok",
+            ms=round((time.monotonic() - connect_started) * 1000),
+        )
 
         self._pump_thread = threading.Thread(target=self._pump_audio_out, daemon=True)
         self._pump_thread.start()
@@ -378,6 +431,7 @@ class QwenVoiceAgent(VoiceAgent):
         """回调线程通知：运行中连接被动关闭，等待 send_audio 触发重连。"""
         if not self._disconnected.is_set():
             logger.warning("千问 Realtime 运行中断线，等待下一帧音频触发重连")
+            self._emit_trace("transport", "disconnected", "warning")
         self._cancel_manual_response_control()
         self._disconnected.set()
 
@@ -406,6 +460,10 @@ class QwenVoiceAgent(VoiceAgent):
                 logger.warning(
                     "千问 Realtime 尝试重连(第 %d/%d 次)", attempt, max_attempts
                 )
+                self._emit_trace(
+                    "transport", "reconnecting", "warning",
+                    attempt=attempt, max_attempts=max_attempts,
+                )
                 try:
                     self._connect_session()
                 except Exception as exc:  # noqa: BLE001
@@ -430,6 +488,10 @@ class QwenVoiceAgent(VoiceAgent):
                         return
                     self._disconnected.clear()
                 logger.info("千问 Realtime 重连成功(第 %d/%d 次)", attempt, max_attempts)
+                self._emit_trace(
+                    "transport", "reconnected", "ok",
+                    attempt=attempt, max_attempts=max_attempts,
+                )
                 try:
                     asyncio.run(self.say(RECONNECT_NOTICE))
                 except Exception as exc:  # noqa: BLE001
@@ -438,6 +500,7 @@ class QwenVoiceAgent(VoiceAgent):
             # 重连超限或会话已停止：置 fatal 让 CallSession 主循环感知并
             # 收尾整通电话（否则电话"活着但 AI 已死"，对方只听到沉默）。
             logger.error("千问 Realtime 重连全部失败，标记会话不可恢复")
+            self._emit_trace("transport", "reconnect_failed", "error")
             self.fatal = True
             self._audio_queue.put(None)
         finally:
@@ -718,6 +781,12 @@ class QwenVoiceAgent(VoiceAgent):
                 self._tools.dispatch(name, args)
                 if self._tools is not None
                 else {"success": False, "message": "无可用工具"}
+            )
+            self._emit_trace(
+                "tool",
+                "completed",
+                "ok" if result.get("success") is True else "error",
+                tool=name,
             )
             conversation = self._conversation
             if conversation is None:

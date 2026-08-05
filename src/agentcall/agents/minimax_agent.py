@@ -125,6 +125,12 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
                 "且不发用户转写事件）；断句一律由本端能量 VAD 负责"
             )
         logger.info("MiniMax Realtime 连接已建立: %s", self.model)
+        self._emit_trace(
+            "model",
+            "capability_notice",
+            "warning",
+            capability="no_user_transcript",
+        )
 
     # ---- 客户端 VAD ----
 
@@ -163,8 +169,14 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
             if self._vad_response_in_flight:
                 return False
             if rms >= threshold:
+                speech_started = not self._vad_speech_seen
                 self._vad_speech_seen = True
                 self._vad_silence_ms = 0.0
+                if speech_started:
+                    self._emit_trace(
+                        "vad", "speech_started", "running",
+                        rms=round(rms, 1), threshold=round(threshold, 1),
+                    )
             elif self._vad_speech_seen:
                 self._vad_silence_ms += frame_ms
             if not self._vad_speech_seen:
@@ -174,11 +186,19 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
                 self._vad_silence_ms >= silence_window
                 or self._vad_utterance_ms >= max_utterance
             ):
+                reason = (
+                    "silence"
+                    if self._vad_silence_ms >= silence_window
+                    else "max_utterance"
+                )
                 # 立刻置为在飞并清状态：commit 是 await，不能让下一帧重复触发。
                 self._vad_response_in_flight = True
                 self._vad_speech_seen = False
                 self._vad_silence_ms = 0.0
                 self._vad_utterance_ms = 0.0
+                self._emit_trace(
+                    "vad", "utterance_committed", "ok", reason=reason,
+                )
                 return True
             return False
 
@@ -197,10 +217,15 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         try:
             await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await ws.send(json.dumps({"type": "response.create"}))
+            self._emit_trace("model", "response_requested", "running")
         except Exception as exc:  # noqa: BLE001
             # 断线窗口内失败不炸通话；重连由接收循环统一负责。状态要放开，
             # 否则重连后永远认为"回复在飞"而再也不断句。
             logger.warning("MiniMax 断句提交失败: %s", exc)
+            self._emit_trace(
+                "model", "response_request_failed", "error",
+                error_type=type(exc).__name__,
+            )
             with self._vad_lock:
                 self._vad_response_in_flight = False
 

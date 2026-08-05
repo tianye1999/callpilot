@@ -128,6 +128,7 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._manual_response_request_pending = False
         self._manual_response_outstanding = 0
         self._manual_response_pending_after_flight = False
+        self._trace_response_started_at: float | None = None
 
     # ---- 连接管理 ----
 
@@ -212,7 +213,22 @@ class OpenAIVoiceAgent(VoiceAgent):
         vibe_line = openai_vibe_line() if self.supports_vibe else ""
         if vibe_line:
             self._instructions = f"{self._instructions.rstrip()}\n{vibe_line}"
-        await self._connect()
+        connect_started = time.monotonic()
+        self._emit_trace("transport", "connecting", "running")
+        try:
+            await self._connect()
+        except Exception as exc:
+            self._emit_trace(
+                "transport", "connect_failed", "error",
+                error_type=type(exc).__name__,
+            )
+            raise
+        self._emit_trace(
+            "transport",
+            "connected",
+            "ok",
+            ms=round((time.monotonic() - connect_started) * 1000),
+        )
         self._recv_task = asyncio.create_task(self._recv_loop())
 
     async def _reconnect(self) -> bool:
@@ -224,6 +240,10 @@ class OpenAIVoiceAgent(VoiceAgent):
             logger.warning(
                 "%s Realtime 尝试重连(第 %d/%d 次)",
                 self.provider_label, attempt, max_attempts,
+            )
+            self._emit_trace(
+                "transport", "reconnecting", "warning",
+                attempt=attempt, max_attempts=max_attempts,
             )
             try:
                 await self._connect()
@@ -245,6 +265,10 @@ class OpenAIVoiceAgent(VoiceAgent):
             logger.info(
                 "%s Realtime 重连成功(第 %d/%d 次)",
                 self.provider_label, attempt, max_attempts,
+            )
+            self._emit_trace(
+                "transport", "reconnected", "ok",
+                attempt=attempt, max_attempts=max_attempts,
             )
             try:
                 await self.say(RECONNECT_NOTICE)
@@ -591,12 +615,14 @@ class OpenAIVoiceAgent(VoiceAgent):
             # 通话进行中断线：尝试重连；全部失败则会话不可恢复，置 fatal
             # 让 CallSession 主循环结束整通电话（避免"电话活着但 AI 已死"）。
             logger.warning("%s Realtime 运行中断线，尝试重连", self.provider_label)
+            self._emit_trace("transport", "disconnected", "warning")
             if not await self._reconnect():
                 logger.error(
                     "%s Realtime 重连全部失败，标记会话不可恢复",
                     self.provider_label,
                 )
                 self.fatal = True
+                self._emit_trace("transport", "reconnect_failed", "error")
                 return
 
     def _handle_event(self, event: dict) -> None:
@@ -612,6 +638,10 @@ class OpenAIVoiceAgent(VoiceAgent):
             transcript = (event.get("transcript") or "").strip()
             if transcript:
                 logger.info("[上行·用户] %s", transcript)
+                self._emit_trace(
+                    "model", "input_transcript_ready", "ok",
+                    role="user", chars=len(transcript),
+                )
                 self._emit_transcript("user", transcript)
                 self._on_user_transcription_completed()
         elif event_type in (
@@ -621,6 +651,10 @@ class OpenAIVoiceAgent(VoiceAgent):
             transcript = (event.get("transcript") or "").strip()
             if transcript:
                 logger.info("[下行·Agent] %s", transcript)
+                self._emit_trace(
+                    "model", "output_transcript_ready", "ok",
+                    role="agent", chars=len(transcript),
+                )
                 suppressed = self._audio_gate.complete_transcript(
                     _response_id(event), transcript
                 )
@@ -631,6 +665,10 @@ class OpenAIVoiceAgent(VoiceAgent):
             call_id = event.get("call_id")
             arguments = event.get("arguments") or ""
             logger.info("OpenAI 请求调用工具 %s (call_id=%s)", name, call_id)
+            self._emit_trace(
+                "tool", "requested", "running",
+                tool=str(name or "unknown"),
+            )
             if name and call_id:
                 # 独立任务执行，避免工具耗时阻塞接收循环；捕获当前连接，
                 # 防止工具执行期间断线重连后把旧 call_id 的结果发进新会话。
@@ -638,22 +676,44 @@ class OpenAIVoiceAgent(VoiceAgent):
                     self._dispatch_tool_call(name, call_id, arguments, self._ws)
                 )
         elif event_type == "response.created":
+            self._trace_response_started_at = time.monotonic()
+            self._emit_trace("model", "response_created", "running")
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
             # server_vad 的打断事件本轮忽略（半双工由 call_agent 管理）。
             pass
         elif event_type == "response.done":
             status = (event.get("response") or {}).get("status")
+            trace_ms = (
+                round((time.monotonic() - self._trace_response_started_at) * 1000)
+                if self._trace_response_started_at is not None
+                else 0
+            )
             if status in ("failed", "incomplete"):
                 # 轮次异常结束（内容审核/额度/服务端错误）：连接还活着，
                 # 记 error 便于排查"通着但沉默"。
                 logger.error("OpenAI 回复轮次异常结束: %s", event.get("response"))
+                self._emit_trace(
+                    "model", "response_done", "error",
+                    code=str(status), ms=trace_ms,
+                )
             else:
                 self._audio_gate.complete_response(_response_id(event))
                 logger.debug("OpenAI 回复轮次完成")
+                self._emit_trace("model", "response_done", "ok", ms=trace_ms)
+            self._trace_response_started_at = None
             self._on_response_done()
         elif event_type == "error":
             logger.error("%s Realtime 错误: %s", self.provider_label, event)
+            error = event.get("error")
+            error_data = error if isinstance(error, dict) else {}
+            self._emit_trace(
+                "model",
+                "error",
+                "error",
+                code=str(error_data.get("code") or event.get("code") or "unknown"),
+                error_type=str(error_data.get("type") or "RealtimeError"),
+            )
 
     async def _dispatch_tool_call(
         self, name: str, call_id: str, arguments: str, ws: Any
@@ -682,6 +742,13 @@ class OpenAIVoiceAgent(VoiceAgent):
         except Exception as exc:  # noqa: BLE001
             logger.exception("工具 %s 执行异常: %s", name, exc)
             result = {"success": False, "message": f"工具执行异常: {exc}"}
+
+        self._emit_trace(
+            "tool",
+            "completed",
+            "ok" if result.get("success") is True else "error",
+            tool=name,
+        )
 
         if ws is None or ws is not self._ws:
             # 工具执行期间连接已更换/关闭：旧 call_id 对新会话无效，丢弃结果。

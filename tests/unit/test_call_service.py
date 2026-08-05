@@ -344,6 +344,47 @@ def test_service_hangup_always_forces_physical_line_clear(monkeypatch):
     ok, err = service.hangup()
     assert ok and err is None
     assert stopped == [True]
+    assert modem.call_names() == ["hangup", "hangup"]
+
+
+def test_agent_trace_is_broadcast_and_attached_to_call_record():
+    hub = make_hub()
+    service = make_service(FakeModem(), hub=hub)
+    record = SpyCallRecord()
+
+    service.session._publish_agent_trace(  # noqa: SLF001
+        record,  # type: ignore[arg-type]
+        {
+            "stage": "transport",
+            "event": "connected",
+            "status": "ok",
+            "provider": "minimax",
+            "ms": 855,
+        },
+    )
+
+    event_type, fields = record.events[-1]
+    assert event_type == "agent_trace"
+    assert fields["stage"] == "transport"
+    assert fields["event"] == "connected"
+    assert fields["ts"] > 0
+    live = hub.history()[-1]
+    assert live["type"] == "agent_trace"
+    assert live["ts"] == fields["ts"]
+
+
+def test_service_hangup_reports_modem_failure(monkeypatch):
+    modem = FakeModem()
+    service = make_service(modem)
+    service.session._active = True
+    stopped = []
+    monkeypatch.setattr(service.session, "stop", lambda: stopped.append(True))
+    monkeypatch.setattr(modem, "hangup", lambda: (_ for _ in ()).throw(OSError()))
+
+    ok, err = service.hangup()
+
+    assert not ok and "模组没有响应" in (err or "")
+    assert stopped == [True]
 
 
 def test_service_send_dtmf_requires_active_call():
@@ -779,6 +820,42 @@ def test_outbound_call_uses_digital_twin_prompt(monkeypatch):
     assert "我是李明的数字分身" in agent.said[0]
     assert "让我打" not in agent.said[0]  # 开场白已去掉“让我打来”
     assert "查询本机套餐和剩余流量" in agent.said[0]
+
+
+def test_outbound_voice_init_failure_still_hangs_up_physical_call(monkeypatch):
+    """音频初始化早于 agent/bridge 失败，也不能把物理电话留在模组中。"""
+
+    class FailingVoiceModem(FakeModem):
+        def initialize_for_voice(self, audio_mode: str = "uac") -> None:
+            super().initialize_for_voice(audio_mode)
+            raise RuntimeError(
+                "通话中启用 SIMCom PCM 失败：AT+CPCMREG=1 未确认 mode=1"
+            )
+
+    modem = FailingVoiceModem()
+    bridge = FakeAudioBridge()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    hub = make_hub()
+    service = make_service(modem, hub=hub, audio_mode="simcom_pcm")
+    ok, err = service.dial("10000")
+    assert ok, err
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+    assert not service.session._thread.is_alive()
+    assert "initialize_for_voice" in modem.call_names()
+    assert "hangup" in modem.call_names()
+    assert not modem.is_call_connected()
+    assert not bridge.started
+    call_events = [e for e in hub.history() if e.get("type") == "call"]
+    assert call_events[-1]["status"] == "failed"
+    assert call_events[-1]["error_code"] == "cpcmreg_init_failed"
+    assert "断电约 10 秒" in call_events[-1]["error"]
 
 
 def test_duplicate_sms_not_republished_or_reforwarded():

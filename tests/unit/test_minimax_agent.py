@@ -316,6 +316,33 @@ def test_frame_rms_tolerates_odd_length():
     assert MiniMaxVoiceAgent._frame_rms(odd) == pytest.approx(1000, rel=0.01)
 
 
+def test_trace_exposes_vad_and_response_boundaries_without_audio(monkeypatch):
+    _instances, _calls = _patch_connect(monkeypatch)
+    monkeypatch.setenv("MINIMAX_VAD_RMS_THRESHOLD", "400")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "40")
+    agent = _make_agent()
+    traces: list[dict] = []
+    agent.set_trace_handler(traces.append)
+
+    async def scenario() -> None:
+        await agent.start(lambda _pcm: None)
+        for _ in range(3):
+            await agent.send_audio(_pcm(3000, 20))
+        for _ in range(4):
+            await agent.send_audio(_pcm(0, 20))
+
+    asyncio.run(scenario())
+
+    names = [(item["stage"], item["event"]) for item in traces]
+    assert ("transport", "connected") in names
+    assert ("model", "capability_notice") in names
+    assert ("vad", "speech_started") in names
+    assert ("vad", "utterance_committed") in names
+    assert ("model", "response_requested") in names
+    assert all("audio" not in item and "transcript" not in item for item in traces)
+
+
+
 # ---- 工厂 ----
 
 

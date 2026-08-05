@@ -89,6 +89,74 @@ def test_full_lifecycle_produces_all_artifacts(tmp_path):
     assert summary == {"text": "对方确认了订单"}
 
 
+def test_agent_process_trace_is_persisted_and_summarized_for_comparison(tmp_path):
+    clog = CallLogger(tmp_path)
+    record = clog.begin_call("outbound", "10000")
+    record.log_event("answered")
+    record.log_event(
+        "agent_trace", stage="bridge", event="ready", status="ok", provider="minimax"
+    )
+    record.log_event(
+        "agent_trace",
+        stage="transport",
+        event="connected",
+        status="ok",
+        provider="minimax",
+        ms=855,
+    )
+    record.log_event(
+        "agent_trace",
+        stage="audio_in",
+        event="audio_flow",
+        status="running",
+        total_bytes=64000,
+    )
+    record.log_event(
+        "agent_trace", stage="vad", event="speech_started", status="ok"
+    )
+    record.log_event(
+        "agent_trace",
+        stage="model",
+        event="response_done",
+        status="ok",
+        ms=1420,
+    )
+    record.log_event(
+        "agent_trace",
+        stage="audio_out",
+        event="audio_flow",
+        status="running",
+        total_bytes=48000,
+    )
+    record.finish("completed")
+
+    events = read_events(record.path)
+    traces = [event for event in events if event["type"] == "agent_trace"]
+    assert len(traces) == 6
+    meta = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["trace_summary"] == {
+        "available": True,
+        "events": 6,
+        "errors": 0,
+        "warnings": 0,
+        "provider": "minimax",
+        "bridge_ready": True,
+        "model_connected": True,
+        "connect_ms": 855,
+        "audio_in_bytes": 64000,
+        "audio_out_bytes": 48000,
+        "speech_turns": 1,
+        "responses": 1,
+        "response_avg_ms": 1420,
+        "tools_requested": 0,
+        "tools_completed": 0,
+        "reconnects": 0,
+        "failure_code": None,
+        "diagnosis": "healthy",
+    }
+    assert clog.list_calls()[0]["trace_summary"]["diagnosis"] == "healthy"
+
+
 # ---- 合成对话录音 mixed.wav（立体声 左=AI / 右=对方，按时间轴对齐）----
 
 

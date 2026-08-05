@@ -20,6 +20,7 @@ class VoiceAgent(ABC):
     _on_transcript: "Callable[[str, str], None] | None" = None
     _on_repeat_stuck: "Callable[[str], None] | None" = None
     _on_status: "Callable[[str], None] | None" = None
+    _on_trace: "Callable[[dict[str, Any]], None] | None" = None
     _tools: "ToolRegistry | None" = None
     _session_instructions: str | None = None
 
@@ -47,12 +48,64 @@ class VoiceAgent(ABC):
         """注册面向用户的状态提示回调（如首启下载模型的进度）；多数实现无需用。"""
         self._on_status = handler
 
+    def set_trace_handler(
+        self, handler: "Callable[[dict[str, Any]], None] | None"
+    ) -> None:
+        """注册脱敏过程事件回调，供 UI 展示 Realtime 可观察边界。
+
+        Trace 不是原始协议日志。字段使用白名单，禁止把提示词、转写正文、
+        音频内容、工具参数或凭证送到浏览器。
+        """
+        self._on_trace = handler
+
     def _emit_status(self, text: str) -> None:
         if self._on_status and text:
             try:
                 self._on_status(text)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _emit_trace(
+        self,
+        stage: str,
+        event: str,
+        status: str = "info",
+        **fields: Any,
+    ) -> None:
+        handler = self._on_trace
+        if handler is None:
+            return
+        allowed_fields = {
+            "attempt",
+            "bytes",
+            "capability",
+            "chars",
+            "code",
+            "error_type",
+            "interval_ms",
+            "max_attempts",
+            "ms",
+            "rate",
+            "reason",
+            "rms",
+            "role",
+            "threshold",
+            "tool",
+            "total_bytes",
+        }
+        trace: dict[str, Any] = {
+            "stage": str(stage)[:32],
+            "event": str(event)[:48],
+            "status": str(status)[:16],
+        }
+        for key in allowed_fields:
+            value = fields.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                trace[key] = value if not isinstance(value, str) else value[:96]
+        try:
+            handler(trace)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _emit_transcript(self, role: str, text: str) -> None:
         if self._on_transcript and text:

@@ -50,6 +50,107 @@ CHANNELS = 1
 _ID_TS_RE = re.compile(r"^(\d{8}-\d{6})")
 
 
+def _trace_summary(event_lines: list[str], *, answered: bool, status: str) -> dict[str, Any]:
+    """把持久化过程事件压缩成可横向比较的故障指标。"""
+    summary: dict[str, Any] = {
+        "available": False,
+        "events": 0,
+        "errors": 0,
+        "warnings": 0,
+        "provider": None,
+        "bridge_ready": False,
+        "model_connected": False,
+        "connect_ms": None,
+        "audio_in_bytes": 0,
+        "audio_out_bytes": 0,
+        "speech_turns": 0,
+        "responses": 0,
+        "response_avg_ms": None,
+        "tools_requested": 0,
+        "tools_completed": 0,
+        "reconnects": 0,
+        "failure_code": None,
+    }
+    response_ms: list[float] = []
+    for line in event_lines:
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "agent_trace":
+            continue
+        summary["available"] = True
+        summary["events"] += 1
+        event_status = event.get("status")
+        if event_status == "error":
+            summary["errors"] += 1
+        elif event_status == "warning":
+            summary["warnings"] += 1
+        provider = event.get("provider")
+        if isinstance(provider, str) and provider:
+            summary["provider"] = provider
+        stage = event.get("stage")
+        name = event.get("event")
+        if stage == "bridge" and name == "ready":
+            summary["bridge_ready"] = True
+        elif stage == "transport" and name in {"connected", "reconnected"}:
+            summary["model_connected"] = True
+            if name == "connected" and isinstance(event.get("ms"), (int, float)):
+                summary["connect_ms"] = round(float(event["ms"]))
+        elif stage == "transport" and name == "reconnecting":
+            summary["reconnects"] += 1
+        elif stage == "audio_in":
+            summary["audio_in_bytes"] = max(
+                summary["audio_in_bytes"], int(event.get("total_bytes") or 0)
+            )
+        elif stage == "audio_out":
+            summary["audio_out_bytes"] = max(
+                summary["audio_out_bytes"], int(event.get("total_bytes") or 0)
+            )
+        elif stage == "vad" and name == "speech_started":
+            summary["speech_turns"] += 1
+        elif stage == "model" and name == "response_done":
+            summary["responses"] += 1
+            if isinstance(event.get("ms"), (int, float)):
+                response_ms.append(float(event["ms"]))
+        elif stage == "tool" and name == "requested":
+            summary["tools_requested"] += 1
+        elif stage == "tool" and name == "completed":
+            summary["tools_completed"] += 1
+        if event_status == "error" and summary["failure_code"] is None:
+            summary["failure_code"] = event.get("code") or event.get("reason")
+
+    if response_ms:
+        summary["response_avg_ms"] = round(sum(response_ms) / len(response_ms))
+
+    if not summary["available"]:
+        diagnosis = "no_trace"
+    elif not answered:
+        diagnosis = "no_answer"
+    elif summary["failure_code"] == "cpcmreg_init_failed":
+        diagnosis = "cpcmreg_failed"
+    elif not summary["bridge_ready"]:
+        diagnosis = "bridge_failed"
+    elif not summary["model_connected"]:
+        diagnosis = "model_connect_failed"
+    elif summary["audio_in_bytes"] <= 0:
+        diagnosis = "no_caller_audio"
+    elif summary["speech_turns"] <= 0:
+        diagnosis = "no_speech_detected"
+    elif summary["responses"] <= 0:
+        diagnosis = "no_model_response"
+    elif summary["audio_out_bytes"] <= 0:
+        diagnosis = "no_agent_audio"
+    elif summary["tools_requested"] > summary["tools_completed"]:
+        diagnosis = "tool_incomplete"
+    elif summary["errors"] > 0 or status == "failed":
+        diagnosis = "has_errors"
+    else:
+        diagnosis = "healthy"
+    summary["diagnosis"] = diagnosis
+    return summary
+
+
 def _sanitize_number(number: str | None) -> str:
     """把号码变成目录名安全的片段；空/None 用 unknown。"""
     if not number:
@@ -312,6 +413,9 @@ class CallRecord:
                     "recording_enabled": self.recording_enabled,
                     "uplink_bytes": len(uplink),
                     "downlink_bytes": len(downlink),
+                    "trace_summary": _trace_summary(
+                        event_lines, answered=answered, status=status
+                    ),
                 }
                 if self.source:
                     meta["source"] = self.source
@@ -433,6 +537,9 @@ class CallLogger:
                 "started_at": meta.get("started_at"),
                 "ended_at": meta.get("ended_at"),
                 "status": meta.get("status"),
+                "duration": meta.get("duration"),
+                "answered": meta.get("answered"),
+                "trace_summary": meta.get("trace_summary"),
             }
             summary_path = path / "summary.json"
             if summary_path.exists():
