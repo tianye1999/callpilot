@@ -2202,9 +2202,6 @@ class CallSession:
         except Exception as exc:  # noqa: BLE001
             logger.warning("挂断物理通话出错: %s", exc)
         logger.info("通话 Agent 会话已结束")
-        self._publish(
-            {"type": "call", "status": "ended", "caller": self.current_caller}
-        )
 
     def _drain_agent_audio(self, bridge: AudioBridge) -> None:
         chunks: list[bytes] = []
@@ -2465,15 +2462,30 @@ class CallAgentService:
         return True, None
 
     def hangup(self) -> tuple[bool, str | None]:
-        """挂断进行中的通话（AI 与 IVR 互相不挂断时的人工兜底）。"""
+        """立即挂断物理线路，不依赖 AI 会话仍处于 active 状态。"""
         with self._ring_lock:
             remote_owner = self._remote_call_owner
         if remote_owner is not None:
             remote_owner.request_call_stop("local_dashboard_hangup")
-            return True, None
-        if not self.session.is_active:
-            return False, "当前没有进行中的通话"
-        self.session.stop()
+        elif self.session.is_active:
+            self.session.stop()
+
+        # session.stop()/remote request 都是异步收尾。更重要的是，音频初始化
+        # 失败时逻辑 session 可能已 inactive，但模组中仍留有 active/held call。
+        # 用户点击“挂断”的语义必须是立即向模组发 CHUP，而不是仅改应用状态。
+        try:
+            self.modem.hangup()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("用户触发物理挂断失败: %s", exc)
+            return False, "挂断失败：模组没有响应"
+
+        self._publish(
+            {
+                "type": "call",
+                "status": "ended",
+                "caller": self.session.current_caller,
+            }
+        )
         return True, None
 
     def force_takeover_request(self) -> dict:

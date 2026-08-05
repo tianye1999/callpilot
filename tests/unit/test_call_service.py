@@ -327,10 +327,16 @@ def test_wait_connected_success():
 
 # ---- 服务层高层方法：hangup / send_dtmf ----
 
-def test_service_hangup_requires_active_call(monkeypatch):
-    service = make_service(FakeModem())
+def test_service_hangup_always_forces_physical_line_clear(monkeypatch):
+    modem = FakeModem()
+    hub = make_hub()
+    service = make_service(modem, hub=hub)
+
+    # 即使逻辑会话已因初始化异常而 inactive，按钮仍必须清掉物理线路。
     ok, err = service.hangup()
-    assert not ok and "没有进行中的通话" in (err or "")
+    assert ok and err is None
+    assert modem.call_names() == ["hangup"]
+    assert hub.history()[-1]["status"] == "ended"
 
     stopped = []
     monkeypatch.setattr(service.session, "stop", lambda: stopped.append(True))
@@ -660,7 +666,8 @@ def test_remote_reserved_line_blocks_local_ai_dial_and_routes_hangup(monkeypatch
 
 def test_local_dashboard_dtmf_and_shutdown_route_to_remote_worker(monkeypatch):
     monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
-    service = make_service(FakeModem())
+    modem = FakeModem()
+    service = make_service(modem)
     coordinator = FakeRemoteCoordinator()
     worker = FakeRemoteWorker(coordinator)
     worker.is_running = True
@@ -670,6 +677,11 @@ def test_local_dashboard_dtmf_and_shutdown_route_to_remote_worker(monkeypatch):
     ok, error = service.send_dtmf("2")
     assert ok is True and error is None
     assert coordinator.commands == [{"type": "dtmf", "digits": "2"}]
+
+    ok, error = service.hangup()
+    assert ok is True and error is None
+    assert coordinator.stop_reasons == ["local_dashboard_hangup"]
+    assert modem.call_names() == ["hangup"]
 
     service.stop_service()
     assert worker.stop_reasons == ["service_shutdown"]
