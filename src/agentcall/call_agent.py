@@ -484,13 +484,17 @@ class CallSession:
                     rms_threshold=config.get_int("TURN_REMOTE_RMS_THRESHOLD"),
                     quiet_ms=playback_quiet_ms,
                 )
-                agent.configure_turn_taking(silence_ms=turn_end_ms)
+                agent.configure_turn_taking(
+                    silence_ms=turn_end_ms,
+                    semantic=True,
+                )
                 trace(
                     "turn",
                     "arbiter_ready",
                     "ok",
                     silence_ms=turn_end_ms,
                     quiet_ms=playback_quiet_ms,
+                    policy="semantic",
                 )
             agent.set_transcript_handler(
                 self._make_transcript_handler(record, transcripts, agent)
@@ -1673,14 +1677,17 @@ class CallSession:
         if direction == "outbound" and self._prompt_gen_opening_mode == "wait":
             turn_rule = (
                 "\nTurn-taking rule: the other side may be another voice agent. "
-                "Treat short pauses as continuation; stay silent during announcements, "
-                "searching, or hold messages. Do not fill pauses with acknowledgements "
+                "Decide from the meaning of the latest utterance, not from pause length: "
+                "answer an explicit question, request, confirmation, or voice-input prompt "
+                "directly and promptly; stay silent during announcements, searching, hold "
+                "messages, or incomplete speech. Do not fill pauses with acknowledgements "
                 "such as 'okay, thanks, I will wait', and do not repeat the same request "
                 "unless the other side explicitly asks you to repeat it."
                 if lang == "en"
-                else "\n轮次规则：对方可能也是语音 Agent。把短暂停顿视为对方仍未说完；"
-                "播报、查询中或等待提示期间保持安静，不要用“好的、谢谢、我会等待”等"
-                "套话填充停顿；除非对方明确要求重述，否则不要重复同一请求。"
+                else "\n轮次规则：对方可能也是语音 Agent。根据对方最新话语的语义判断，"
+                "不要按停顿时长机械决定：明确提问、请求、确认或要求语音输入时直接、及时"
+                "回答；播报、查询中、等待提示或尚未说完时保持安静。不要用“好的、谢谢、"
+                "我会等待”等套话填充停顿；除非对方明确要求重述，否则不要重复同一请求。"
             )
             return instructions + turn_rule
         return instructions

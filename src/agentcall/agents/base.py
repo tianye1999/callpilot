@@ -58,11 +58,18 @@ class VoiceAgent(ABC):
         """
         self._on_trace = handler
 
-    def configure_turn_taking(self, *, silence_ms: int | None = None) -> None:
+    def configure_turn_taking(
+        self,
+        *,
+        silence_ms: int | None = None,
+        semantic: bool = False,
+    ) -> None:
         """Configure optional local turn taking for this call.
 
         Providers with server-side turn detection may ignore this.  MiniMax's
         Realtime endpoint has no usable server VAD, so it overrides the hook.
+        ``semantic`` asks a capable provider to decide from the utterance meaning
+        whether to speak at all; silence remains only an audio boundary hint.
         """
 
     def notify_remote_speech(self) -> None:

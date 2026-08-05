@@ -74,6 +74,15 @@ _HYBRID_INSTRUCTIONS = (
     "外部控制器会在播放前审计行动句；执行后以它返回的真实结果为准。"
 )
 
+_SEMANTIC_WAIT_MARKER = "[[WAIT]]"
+_SEMANTIC_TURN_INSTRUCTIONS = (
+    "\n对每次提交的对方语音，先根据完整语义判断对方此刻是否在等你回答。"
+    "如果是明确提问、请求、确认、选择题或要求语音输入，必须直接、简短、及时回答，"
+    "不要仅因不确定而沉默。如果只是系统播报、等待音乐、查询中提示、尚未说完的句子，"
+    "或不需要你回应，请只输出精确标记 [[WAIT]]，不得添加任何其他文字。"
+    "[[WAIT]] 是内部控制标记，不是要说给对方听的内容。不要用客套话填充停顿。"
+)
+
 
 class MiniMaxVoiceAgent(OpenAIVoiceAgent):
     """MiniMax Realtime。协议与能力差异见模块 docstring。"""
@@ -107,6 +116,7 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         self._vad_utterance_ms = 0.0
         self._vad_response_in_flight = False
         self._turn_end_silence_ms: int | None = None
+        self._semantic_turns_enabled = False
         self._turn_deferred_audio: list[bytes] = []
         self._turn_deferred_ms = 0.0
         self._turn_stale_response = False
@@ -121,8 +131,9 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
             timeout=self._hybrid_tool_timeout,
         )
         self._hybrid_tasks: set[asyncio.Task[Any]] = set()
-        self._hybrid_processed: set[str] = set()
-        self._hybrid_held: set[str] = set()
+        # 语义轮次与 M3 工具路由共用同一层“先扣住语音、看完转写再裁决”的门。
+        self._gated_processed: set[str] = set()
+        self._gated_held: set[str] = set()
         self._hybrid_followup_pending = 0
 
     def _hybrid_active(self) -> bool:
@@ -153,6 +164,10 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         ws = await websockets.connect(self._build_url(), additional_headers=headers)
 
         instructions = self._instructions
+        if self._semantic_turns_enabled:
+            instructions = (
+                f"{(instructions or '').rstrip()}{_SEMANTIC_TURN_INSTRUCTIONS}"
+            )
         if self._hybrid_active():
             instructions = f"{(instructions or '').rstrip()}{_HYBRID_INSTRUCTIONS}"
         session: dict = {
@@ -197,6 +212,11 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
             "warning",
             capability="no_user_transcript",
         )
+        if self._semantic_turns_enabled:
+            self._emit_trace(
+                "turn", "semantic_policy_ready", "ok",
+                policy="model_meaning",
+            )
 
     # ---- 客户端 VAD ----
 
@@ -211,11 +231,23 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
             self._turn_stale_response = False
             self._turn_stale_logged = False
 
-    def configure_turn_taking(self, *, silence_ms: int | None = None) -> None:
+    def configure_turn_taking(
+        self,
+        *,
+        silence_ms: int | None = None,
+        semantic: bool = False,
+    ) -> None:
         with self._vad_lock:
             self._turn_end_silence_ms = (
                 max(0, int(silence_ms)) if silence_ms is not None else None
             )
+            self._semantic_turns_enabled = bool(semantic)
+
+    @staticmethod
+    def _is_semantic_wait(transcript: str) -> bool:
+        """Recognize only the private protocol marker, never business keywords."""
+        normalized = "".join((transcript or "").split()).upper()
+        return normalized.rstrip("。.!！") == _SEMANTIC_WAIT_MARKER
 
     def notify_remote_speech(self) -> None:
         resumed = False
@@ -394,14 +426,15 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         suppressed = self._audio_gate.complete_transcript(response_id, transcript)
         self._audio_gate.release_response(response_id)
         if response_id:
-            self._hybrid_processed.add(response_id)
-            self._hybrid_held.discard(response_id)
+            self._gated_processed.add(response_id)
+            self._gated_held.discard(response_id)
         if not suppressed:
             self._emit_transcript("agent", transcript)
 
     def _handle_event(self, event: dict) -> None:
         event_type = event.get("type", "")
         active = self._hybrid_active()
+        gated = active or self._semantic_turns_enabled
         response_id = _response_id(event)
 
         with self._vad_lock:
@@ -419,8 +452,8 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         ):
             self._audio_gate.drop_response(response_id)
             if response_id:
-                self._hybrid_processed.add(response_id)
-                self._hybrid_held.discard(response_id)
+                self._gated_processed.add(response_id)
+                self._gated_held.discard(response_id)
             if not stale_logged:
                 with self._vad_lock:
                     self._turn_stale_logged = True
@@ -439,26 +472,39 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
                     reason="remote_resumed", buffered_ms=buffered_ms,
                 )
 
-        if active and event_type in (
+        if gated and event_type in (
             "response.audio.delta", "response.output_audio.delta",
         ):
             self._audio_gate.hold_response(response_id)
             if response_id:
-                self._hybrid_held.add(response_id)
+                self._gated_held.add(response_id)
 
-        if active and event_type in (
+        if gated and event_type in (
             "response.audio_transcript.done",
             "response.output_audio_transcript.done",
         ):
             transcript = (event.get("transcript") or "").strip()
             if not transcript:
                 return
+            if self._semantic_turns_enabled and self._is_semantic_wait(transcript):
+                self._audio_gate.drop_response(response_id)
+                if response_id:
+                    self._gated_processed.add(response_id)
+                    self._gated_held.discard(response_id)
+                logger.info("[语义轮次] 对方当前无需回答，候选语音已丢弃")
+                self._emit_trace(
+                    "turn", "semantic_wait", "ok",
+                    decision="no_reply_needed",
+                )
+                return
             logger.info("[下行·Agent] %s", transcript)
             self._emit_trace(
                 "model", "output_transcript_ready", "ok",
                 role="agent", chars=len(transcript),
             )
-            if self._hybrid_followup_pending > 0:
+            if not active:
+                self._finish_spoken_response(response_id, transcript)
+            elif self._hybrid_followup_pending > 0:
                 self._hybrid_followup_pending -= 1
                 self._finish_spoken_response(response_id, transcript)
             elif not might_request_tool(transcript):
@@ -471,24 +517,34 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
 
         super()._handle_event(event)
 
-        if active and event_type == "response.done":
+        if gated and event_type == "response.done":
             # 极少数异常轮次可能只有音频而无 transcript。不能永久扣住声音；
             # 比 M3 超时多留 1 秒，正常路由任务会先把 response 标为 processed。
-            for held_id in tuple(self._hybrid_held):
-                self._spawn_hybrid_task(self._release_hybrid_timeout(held_id))
+            for held_id in tuple(self._gated_held):
+                self._spawn_hybrid_task(
+                    self._release_gated_timeout(held_id, hybrid=active)
+                )
 
-    async def _release_hybrid_timeout(self, response_id: str) -> None:
-        await asyncio.sleep(self._hybrid_tool_timeout + 1.0)
-        if response_id in self._hybrid_processed:
+    async def _release_gated_timeout(
+        self,
+        response_id: str,
+        *,
+        hybrid: bool,
+    ) -> None:
+        delay = self._hybrid_tool_timeout + 1.0 if hybrid else 2.0
+        await asyncio.sleep(delay)
+        if response_id in self._gated_processed:
             return
-        logger.warning("MiniMax 混合路由等待转写超时，原语音降级放行")
+        logger.warning("MiniMax 等待输出转写超时，原语音降级放行")
         self._emit_trace(
-            "tool_router", "transcript_timeout", "warning",
-            ms=round((self._hybrid_tool_timeout + 1.0) * 1000),
+            "tool_router" if hybrid else "turn",
+            "transcript_timeout",
+            "warning",
+            ms=round(delay * 1000),
         )
         self._audio_gate.release_response(response_id)
-        self._hybrid_processed.add(response_id)
-        self._hybrid_held.discard(response_id)
+        self._gated_processed.add(response_id)
+        self._gated_held.discard(response_id)
 
     async def _route_hybrid_tools(
         self,
@@ -539,8 +595,8 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         else:
             self._audio_gate.drop_response(response_id)
             if response_id:
-                self._hybrid_processed.add(response_id)
-                self._hybrid_held.discard(response_id)
+                self._gated_processed.add(response_id)
+                self._gated_held.discard(response_id)
 
         results: list[tuple[str, dict[str, Any]]] = []
         for call in calls:
@@ -684,7 +740,7 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._hybrid_tasks.clear()
-        self._hybrid_processed.clear()
-        self._hybrid_held.clear()
+        self._gated_processed.clear()
+        self._gated_held.clear()
         self._hybrid_followup_pending = 0
         await super().stop()

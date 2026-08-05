@@ -71,6 +71,7 @@ def _trace_summary(event_lines: list[str], *, answered: bool, status: str) -> di
         "reconnects": 0,
         "remote_resumed": 0,
         "stale_responses_dropped": 0,
+        "semantic_waits": 0,
         "stale_output_drops": 0,
         "stale_output_bytes": 0,
         "output_deferred_ms": 0,
@@ -126,6 +127,8 @@ def _trace_summary(event_lines: list[str], *, answered: bool, status: str) -> di
             summary["remote_resumed"] += 1
         elif stage == "turn" and name == "stale_response_dropped":
             summary["stale_responses_dropped"] += 1
+        elif stage == "turn" and name == "semantic_wait":
+            summary["semantic_waits"] += 1
         elif stage == "turn" and name == "summary":
             summary["remote_resumed"] = max(
                 summary["remote_resumed"], int(event.get("remote_resumed") or 0)

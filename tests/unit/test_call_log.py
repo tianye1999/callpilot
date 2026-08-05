@@ -153,6 +153,7 @@ def test_agent_process_trace_is_persisted_and_summarized_for_comparison(tmp_path
         "reconnects": 0,
         "remote_resumed": 0,
         "stale_responses_dropped": 0,
+        "semantic_waits": 0,
         "stale_output_drops": 0,
         "stale_output_bytes": 0,
         "output_deferred_ms": 0,
@@ -175,6 +176,7 @@ def test_turn_taking_metrics_are_persisted_in_trace_summary(tmp_path):
         {"stage": "audio_out", "event": "audio_started", "status": "running", "total_bytes": 10},
         {"stage": "turn", "event": "remote_resumed", "status": "running"},
         {"stage": "turn", "event": "stale_response_dropped", "status": "ok"},
+        {"stage": "turn", "event": "semantic_wait", "status": "ok"},
         {
             "stage": "turn",
             "event": "summary",
@@ -191,6 +193,7 @@ def test_turn_taking_metrics_are_persisted_in_trace_summary(tmp_path):
     summary = clog.list_calls()[0]["trace_summary"]
     assert summary["remote_resumed"] == 1
     assert summary["stale_responses_dropped"] == 1
+    assert summary["semantic_waits"] == 1
     assert summary["stale_output_drops"] == 1
     assert summary["stale_output_bytes"] == 3200
     assert summary["output_deferred_ms"] == 850

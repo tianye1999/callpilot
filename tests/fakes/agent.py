@@ -17,11 +17,18 @@ class FakeAgent(VoiceAgent):
         self.received_audio: list[bytes] = []
         self.said: list[str] = []
         self.turn_silence_ms: int | None = None
+        self.semantic_turns = False
         self.remote_speech_notifications = 0
         self._on_audio_out: Callable[[bytes], None] | None = None
 
-    def configure_turn_taking(self, *, silence_ms: int | None = None) -> None:
+    def configure_turn_taking(
+        self,
+        *,
+        silence_ms: int | None = None,
+        semantic: bool = False,
+    ) -> None:
         self.turn_silence_ms = silence_ms
+        self.semantic_turns = semantic
 
     def notify_remote_speech(self) -> None:
         self.remote_speech_notifications += 1

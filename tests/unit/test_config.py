@@ -510,8 +510,8 @@ def test_hotline_turn_taking_defaults(monkeypatch):
         "HOTLINE_PLAYBACK_QUIET_MS",
         "TURN_REMOTE_RMS_THRESHOLD",
     )
-    assert get_int("HOTLINE_TURN_END_SILENCE_MS") == 2500
-    assert get_int("HOTLINE_PLAYBACK_QUIET_MS") == 2500
+    assert get_int("HOTLINE_TURN_END_SILENCE_MS") == 600
+    assert get_int("HOTLINE_PLAYBACK_QUIET_MS") == 250
     assert get_int("TURN_REMOTE_RMS_THRESHOLD") == 400
 
 

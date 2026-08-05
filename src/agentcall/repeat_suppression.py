@@ -134,7 +134,13 @@ class ResponseAudioGate:
     def push_audio(self, response_id: str | None, chunk: bytes) -> None:
         if not chunk:
             return
-        if not response_id or self._suppressor.disabled:
+        if not response_id:
+            self._emit_audio(chunk)
+            return
+        # Semantic/tool routing may explicitly hold a response even when repeat
+        # suppression is disabled.  In that case the provider decision still
+        # has to happen before a single byte reaches the modem.
+        if self._suppressor.disabled and response_id not in self._held:
             self._emit_audio(chunk)
             return
         if response_id in self._suppressed:

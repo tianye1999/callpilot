@@ -201,6 +201,61 @@ def test_vibe_line_not_applied(monkeypatch):
     assert instances[0].first("session.update")["session"]["instructions"] == "你是电话助手。"
 
 
+def test_semantic_turn_policy_is_sent_in_session(monkeypatch):
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent(hybrid_tools_enabled=False)
+    agent.set_session_instructions("你是电话助手。")
+    agent.configure_turn_taking(silence_ms=600, semantic=True)
+
+    asyncio.run(agent.start(lambda _pcm: None))
+
+    instructions = instances[0].first("session.update")["session"]["instructions"]
+    assert "根据完整语义判断" in instructions
+    assert "[[WAIT]]" in instructions
+    assert "明确提问、请求、确认" in instructions
+
+
+def test_semantic_turn_drops_wait_marker_and_releases_real_answer(monkeypatch):
+    """是否回答由 Realtime 对语音的语义判断决定，控制标记绝不下发给电话。"""
+    monkeypatch.setenv("REPEAT_SUPPRESS_SIMILARITY", "0")
+    agent = _make_agent(hybrid_tools_enabled=False)
+    agent.configure_turn_taking(silence_ms=600, semantic=True)
+    emitted: list[bytes] = []
+    transcripts: list[tuple[str, str]] = []
+    traces: list[dict] = []
+    agent._on_audio_out = emitted.append
+    agent.set_transcript_handler(lambda role, text: transcripts.append((role, text)))
+    agent.set_trace_handler(traces.append)
+
+    agent._handle_event({
+        "type": "response.audio.delta",
+        "response_id": "wait-1",
+        "delta": base64.b64encode(b"internal marker audio").decode(),
+    })
+    agent._handle_event({
+        "type": "response.audio_transcript.done",
+        "response_id": "wait-1",
+        "transcript": " [[WAIT]]。 ",
+    })
+    assert emitted == []
+    assert transcripts == []
+    assert any(event.get("event") == "semantic_wait" for event in traces)
+
+    agent._handle_event({
+        "type": "response.audio.delta",
+        "response_id": "answer-1",
+        "delta": base64.b64encode(b"direct answer").decode(),
+    })
+    agent._handle_event({
+        "type": "response.audio_transcript.done",
+        "response_id": "answer-1",
+        "transcript": "我的号码是 13800138000。",
+    })
+
+    assert emitted == [b"direct answer"]
+    assert transcripts == [("agent", "我的号码是 13800138000。")]
+
+
 # ---- M3 混合工具路由 ----
 
 

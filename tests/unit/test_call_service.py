@@ -971,7 +971,9 @@ def test_outbound_opening_mode_wait_skips_opening(monkeypatch, tmp_path):
 
     assert agent.said == []  # wait 模式:全程未主动开场
     assert "IVR 热线" in agent._session_instructions  # profile scenario 已生效
-    assert agent.turn_silence_ms == 2500
+    assert "根据对方最新话语的语义判断" in agent._session_instructions
+    assert agent.turn_silence_ms == 600
+    assert agent.semantic_turns is True
     assert service.session._turn_arbiter is not None
 
 
