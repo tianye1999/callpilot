@@ -367,6 +367,25 @@ def test_send_and_reader_reconnect_do_not_deadlock_on_opposite_lock_order(monkey
     assert open_calls == 1
 
 
+def test_call_status_poll_does_not_hold_serial_lock_while_sending(monkeypatch):
+    """A reader-owned reconnect must not deadlock against the CLCC poller."""
+    modem = make_modem()
+    modem._running = True
+    observed: list[bool] = []
+
+    def send_once(_command: str) -> str:
+        observed.append(modem._serial_lock._is_owned())  # type: ignore[attr-defined]
+        modem._running = False
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", send_once)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda _seconds: None)
+
+    modem._poll_call_status()
+
+    assert observed == [False]
+
+
 def test_reconnect_state_machine_retries_and_replaces_serial(monkeypatch):
     modem = make_modem()
     old_serial = FakeSerial()
@@ -746,6 +765,24 @@ def test_initialize_for_voice_simcom_sends_cpcmreg(monkeypatch):
     assert "AT+CPCMREG?" in calls
     # 不能误发 Quectel 指令：SIM7600 不认，且会把 AT 队列搅乱
     assert not any(c.startswith("AT+QPCMV") for c in calls)
+
+
+def test_reset_module_uses_non_retrying_creset_and_clears_voice_state(monkeypatch):
+    modem = make_modem()
+    modem._voice_pcm_active = True
+    modem._call_connected_event.set()
+    sent: list[str] = []
+
+    def fake_write(command: str) -> str:
+        sent.append(command)
+        return "\r\nOK\r\n"
+
+    monkeypatch.setattr(modem, "_write_command", fake_write)
+
+    assert modem.reset_module() is True
+    assert sent == ["AT+CRESET"]
+    assert modem.voice_pcm_active is False
+    assert modem.is_call_connected() is False
 
 
 def test_initialize_for_voice_simcom_tolerates_error_without_call(monkeypatch, caplog):

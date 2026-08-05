@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from queue import Empty, Full, Queue
 from typing import Any, Callable
 
+import serial
+
 from . import config
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
@@ -423,6 +425,7 @@ class CallSession:
         status = "completed"
         failure_code: str | None = None
         failure_message: str | None = None
+        reset_simcom_module = False
         try:
             if self._outbound_number:
                 if not await self._connect_outbound(mark):
@@ -519,8 +522,16 @@ class CallSession:
                 failure_code = "cpcmreg_init_failed"
                 failure_message = (
                     "SIM7600 USB Audio 初始化失败：AT+CPCMREG=1 未进入 mode=1。"
-                    "请将模组彻底断电约 10 秒后重新上电，再重试。"
+                    "将自动重启模组恢复，请等待重新入网后再试。"
                 )
+                reset_simcom_module = self.audio_mode.lower() == "simcom_pcm"
+            elif self._is_simcom_pcm_transport_failure(exc):
+                failure_code = "simcom_pcm_io_failed"
+                failure_message = (
+                    "SIM7600 USB Audio 数据链路已中断。"
+                    "将自动重启模组恢复，请等待重新入网后再试。"
+                )
+                reset_simcom_module = True
             else:
                 failure_code = "call_failed"
                 failure_message = "通话初始化或处理失败，请查看服务日志。"
@@ -535,6 +546,23 @@ class CallSession:
                     logger.info("会话异常收尾已强制挂断仍在线的物理通话")
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("会话异常收尾挂断物理通话失败: %s", exc)
+            if reset_simcom_module:
+                trace("bridge", "module_reset_starting", "running")
+                try:
+                    reset_accepted = self.modem.reset_module()
+                except Exception as exc:  # noqa: BLE001
+                    reset_accepted = False
+                    logger.exception("SIMCom 音频链路故障后自动重启模组失败: %s", exc)
+                trace(
+                    "bridge",
+                    "module_reset_requested",
+                    "ok" if reset_accepted else "error",
+                )
+                if not reset_accepted:
+                    failure_message = (
+                        "SIM7600 USB Audio 数据链路已中断，且 AT+CRESET 自动重启未成功。"
+                        "请将模组彻底断电约 10 秒后重新上电。"
+                    )
             # 先作废判官世代再 finish record，避免迟到结果在 meta 落盘后追加事件。
             self._stop_dtmf_judge()
             self._stop_triage_judge()
@@ -560,6 +588,24 @@ class CallSession:
             if failure_message is not None:
                 event["error"] = failure_message
             self._publish(event)
+
+    def _is_simcom_pcm_transport_failure(self, exc: BaseException) -> bool:
+        """Return whether a call failure came from the SIMCom PCM transport."""
+        if self.audio_mode.lower() != "simcom_pcm":
+            return False
+        if isinstance(exc, (serial.SerialException, OSError)):
+            return True
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "ec20-pcm",
+                "input/output error",
+                "readiness to read",
+                "pcm port",
+                "pcm 口",
+            )
+        )
 
     async def _connect_outbound(self, mark: Callable[..., float]) -> bool:
         """外呼：拨号并等待接通；未接通时发结束事件、挂断并返回 False。"""

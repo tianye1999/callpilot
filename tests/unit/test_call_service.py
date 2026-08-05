@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 import pytest
+import serial
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
 from agentcall.call_agent import CallAgentService
@@ -850,12 +851,47 @@ def test_outbound_voice_init_failure_still_hangs_up_physical_call(monkeypatch):
     assert not service.session._thread.is_alive()
     assert "initialize_for_voice" in modem.call_names()
     assert "hangup" in modem.call_names()
+    assert "reset_module" in modem.call_names()
     assert not modem.is_call_connected()
     assert not bridge.started
     call_events = [e for e in hub.history() if e.get("type") == "call"]
     assert call_events[-1]["status"] == "failed"
     assert call_events[-1]["error_code"] == "cpcmreg_init_failed"
-    assert "断电约 10 秒" in call_events[-1]["error"]
+    assert "自动重启模组" in call_events[-1]["error"]
+
+
+def test_simcom_pcm_transport_failure_resets_module(monkeypatch):
+    """PCM PTY disappears after answer: fail visibly and request AT recovery."""
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+
+    def fail_start() -> None:
+        raise serial.SerialException(
+            "could not open port /tmp/ec20-pcm: [Errno 2] No such file"
+        )
+
+    bridge.start = fail_start  # type: ignore[method-assign]
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: FakeAgent())
+    hub = make_hub()
+    service = make_service(modem, hub=hub, audio_mode="simcom_pcm")
+
+    ok, err = service.dial("10000")
+    assert ok, err
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+    assert not service.session._thread.is_alive()
+    assert "hangup" in modem.call_names()
+    assert "reset_module" in modem.call_names()
+    call_events = [e for e in hub.history() if e.get("type") == "call"]
+    assert call_events[-1]["status"] == "failed"
+    assert call_events[-1]["error_code"] == "simcom_pcm_io_failed"
+    assert "自动重启模组" in call_events[-1]["error"]
 
 
 def test_duplicate_sms_not_republished_or_reforwarded():

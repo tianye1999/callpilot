@@ -998,6 +998,27 @@ class Eg25Modem:
             self._clcc_fail_count = 0
         logger.info("已挂断并关闭语音 PCM 通道")
 
+    def reset_module(self) -> bool:
+        """Software-reset the modem after a fatal SIMCom USB Audio failure.
+
+        Use ``_write_command`` instead of ``_send`` here: ``AT+CRESET`` tears the
+        USB device down immediately, so retrying the same command after the
+        expected disconnect can reset a module that has already recovered.
+        The regular reader/reconnect loop owns re-enumeration afterwards.
+        """
+        response = self._write_command("AT+CRESET")
+        accepted = "OK" in response.upper()
+        self._voice_pcm_active = False
+        self._pcm_ready_event.set()
+        self._call_connected_event.clear()
+        self._connected_call_ids.clear()
+        self._incoming_call_ids.clear()
+        if accepted:
+            logger.warning("SIMCom USB Audio 链路故障，已发送 AT+CRESET 重启模组")
+        else:
+            logger.error("AT+CRESET 未获得 OK，模组可能需要彻底断电重启")
+        return accepted
+
     def close(self) -> None:
         self._closed = True  # 终态：阻止后续 start_listener/_reconnect 复活
         with self._sim_refresh_lock:
@@ -1269,7 +1290,11 @@ class Eg25Modem:
             try:
                 with self._serial_lock:
                     generation = self._call_state_generation
-                    response = self._send("AT+CLCC")
+                # Do not keep the outer RLock while _send may enter _reconnect.
+                # If the reader thread already owns reconnect and needs this lock
+                # to reopen the new PTY, waiting for it here creates a permanent
+                # cycle (poll -> reconnect_complete -> serial_lock -> poll).
+                response = self._send("AT+CLCC")
             except Exception as exc:  # noqa: BLE001
                 logger.debug("轮询 CLCC 失败: %s", exc)
                 if self._call_connected_event.is_set():

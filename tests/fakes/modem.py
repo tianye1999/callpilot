@@ -50,6 +50,11 @@ class FakeModem:
         self.calls.append(("hangup", ()))
         self.connected_flag.clear()
 
+    def reset_module(self) -> bool:
+        self.calls.append(("reset_module", ()))
+        self.connected_flag.clear()
+        return True
+
     def close(self) -> None:
         self.calls.append(("close", ()))
 
@@ -66,6 +71,10 @@ class FakeModem:
 
     def pcm_ready(self) -> bool:
         return self._pcm_ready
+
+    @property
+    def voice_pcm_active(self) -> bool:
+        return True
 
     # ---- 回调注册（与 Eg25Modem 对齐）----
 
