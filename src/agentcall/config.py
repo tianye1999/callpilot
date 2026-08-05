@@ -397,10 +397,13 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("QWEN_RECONNECT_MAX", "Qwen 最大重连次数", "int", "2"),
     ConfigSpec("OPENAI_RECONNECT_MAX", "OpenAI 最大重连次数", "int", "2"),
     ConfigSpec("MINIMAX_RECONNECT_MAX", "MiniMax 最大重连次数", "int", "2"),
-    # MiniMax realtime 无服务端 VAD，断句由 minimax_agent 的能量 VAD 负责：
-    # 高于此 int16 RMS 视为人声。静默窗口与强制断句复用 MANUAL_RESPONSE_* 两项。
-    # 电话上行噪底受 AGENT_UPLINK_GAIN 影响，真机偏噪时上调。
-    ConfigSpec("MINIMAX_VAD_RMS_THRESHOLD", "MiniMax 断句能量阈值", "int", "400"),
+    # MiniMax realtime 无服务端 VAD。阈值会根据噪底自适应；400 是兼容旧配置的
+    # 低噪基准上限，MIN_RMS 防止静音附近的小脉冲误触发。模型输入另做峰值受限
+    # 的自动增益，解决 SIM7600 真人上行远低于 IVR 的问题。
+    ConfigSpec("MINIMAX_VAD_RMS_THRESHOLD", "MiniMax VAD 基准阈值", "int", "400"),
+    ConfigSpec("MINIMAX_VAD_MIN_RMS", "MiniMax VAD 最低阈值", "int", "40"),
+    ConfigSpec("MINIMAX_INPUT_AUTO_GAIN", "MiniMax 输入自动增益", "bool", "true"),
+    ConfigSpec("MINIMAX_INPUT_MAX_GAIN", "MiniMax 输入最大增益", "float", "16.0"),
     # ---- 远程网页拨号 POC ----
     ConfigSpec("REMOTE_WEB_DIALER_ENABLED", "启用远程网页拨号", "bool", "false",
                requires_restart=True),

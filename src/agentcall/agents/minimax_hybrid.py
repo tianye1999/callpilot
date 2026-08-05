@@ -141,7 +141,7 @@ def might_request_tool(text: str) -> bool:
     lowered = text.casefold()
     cues = (
         "短信", "验证码", "按键", "请按", "准备按", "挂断", "结束通话",
-        "再见", "转接", "机主", "本人接听", "sms", "text message",
+        "再见", "转接", "本人接听", "sms", "text message",
         "verification code", "press ", "dtmf", "hang up", "goodbye",
         "transfer", "owner",
     )

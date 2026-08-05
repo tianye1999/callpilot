@@ -40,6 +40,7 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 from typing import Any
 
 import numpy as np
@@ -66,6 +67,15 @@ TRANSCRIPTION_MODEL = "asr-01"
 
 # 服务端默认 "256" 会把电话里的回答截断；协议要求本字段是字符串。
 MAX_RESPONSE_OUTPUT_TOKENS = "1024"
+
+# SIM7600 上行电平会随对端/网络变化几个数量级。固定 400 RMS 在 IVR 上正常，
+# 但真人手机语音常只有 40~300 RMS。VAD 用噪底自适应阈值，并要求连续人声，
+# 避免把单个脉冲当作一句话；送模型前另做峰值受限的安全自动增益。
+_VAD_NOISE_WINDOW_FRAMES = 200
+_VAD_NOISE_MULTIPLIER = 4.0
+_VAD_MIN_SPEECH_MS = 100.0
+_LOW_SIGNAL_DIAGNOSTIC_MS = 5000.0
+_AUTO_GAIN_TARGET_PEAK = 12000.0
 
 _HYBRID_INSTRUCTIONS = (
     "\n你具备由外部控制器执行电话工具的能力。需要操作时，先生成一句简短、"
@@ -115,6 +125,14 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         self._vad_silence_ms = 0.0
         self._vad_utterance_ms = 0.0
         self._vad_response_in_flight = False
+        self._vad_candidate_ms = 0.0
+        self._vad_candidate_peak = 0.0
+        self._vad_noise_samples: deque[float] = deque(
+            maxlen=_VAD_NOISE_WINDOW_FRAMES
+        )
+        self._vad_unheard_ms = 0.0
+        self._vad_unheard_peak = 0.0
+        self._vad_low_signal_logged = False
         self._turn_end_silence_ms: int | None = None
         self._semantic_turns_enabled = False
         self._turn_deferred_audio: list[bytes] = []
@@ -226,6 +244,12 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
             self._vad_silence_ms = 0.0
             self._vad_utterance_ms = 0.0
             self._vad_response_in_flight = False
+            self._vad_candidate_ms = 0.0
+            self._vad_candidate_peak = 0.0
+            self._vad_noise_samples.clear()
+            self._vad_unheard_ms = 0.0
+            self._vad_unheard_peak = 0.0
+            self._vad_low_signal_logged = False
             self._turn_deferred_audio.clear()
             self._turn_deferred_ms = 0.0
             self._turn_stale_response = False
@@ -275,7 +299,49 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
             return 0.0
         return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
 
-    def _vad_should_commit(self, pcm: bytes) -> bool:
+    def _noise_floor_locked(self) -> float:
+        if not self._vad_noise_samples:
+            return 0.0
+        # 低分位数不容易被偶发按键声、线路爆点或很短的语音污染。
+        return float(np.percentile(tuple(self._vad_noise_samples), 20))
+
+    def _effective_vad_threshold_locked(self) -> tuple[float, float]:
+        configured = max(1.0, float(config.get_int("MINIMAX_VAD_RMS_THRESHOLD")))
+        minimum = max(1.0, float(config.get_int("MINIMAX_VAD_MIN_RMS")))
+        noise_rms = self._noise_floor_locked()
+        adaptive = max(minimum, noise_rms * _VAD_NOISE_MULTIPLIER)
+        # 配置值是低噪线路的旧基准上限；噪底很高时仍允许阈值超过它，
+        # 否则持续底噪会被误判为连续人声。
+        threshold = max(noise_rms * 2.0, min(configured, adaptive))
+        return threshold, noise_rms
+
+    @staticmethod
+    def _frame_peak(pcm: bytes) -> float:
+        if len(pcm) < 2:
+            return 0.0
+        samples = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2")
+        if samples.size == 0:
+            return 0.0
+        return float(np.max(np.abs(samples.astype(np.int32))))
+
+    def _condition_input_audio(self, pcm: bytes) -> tuple[bytes, float]:
+        """Peak-limited auto gain for MiniMax input; never clips valid int16."""
+        if not config.get_bool("MINIMAX_INPUT_AUTO_GAIN"):
+            return pcm, 1.0
+        peak = self._frame_peak(pcm)
+        if peak <= 0:
+            return pcm, 1.0
+        max_gain = max(1.0, config.get_float("MINIMAX_INPUT_MAX_GAIN"))
+        gain = max(1.0, min(max_gain, _AUTO_GAIN_TARGET_PEAK / peak))
+        if gain <= 1.01:
+            return pcm, 1.0
+        usable = pcm[: len(pcm) // 2 * 2]
+        samples = np.frombuffer(usable, dtype="<i2").astype(np.float64)
+        amplified = np.rint(samples * gain)
+        conditioned = np.clip(amplified, -32768, 32767).astype("<i2").tobytes()
+        return conditioned + pcm[len(usable) :], gain
+
+    def _vad_should_commit(self, pcm: bytes, *, input_gain: float = 1.0) -> bool:
         """喂一帧上行音频，返回是否该断句（commit + 触发回复）。
 
         判据：见到过人声之后，静默累计超过 ``MANUAL_RESPONSE_SILENCE_MS``；
@@ -283,7 +349,6 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         时也得让 AI 有机会说话）。回复在飞时不再断句，否则会把同一段话切成
         多个 response 并发，模型侧交错、对方听到重叠语音。
         """
-        threshold = float(config.get_int("MINIMAX_VAD_RMS_THRESHOLD"))
         silence_window = float(
             self._turn_end_silence_ms
             if self._turn_end_silence_ms is not None
@@ -296,20 +361,56 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         with self._vad_lock:
             if self._vad_response_in_flight:
                 return False
+            threshold, noise_rms = self._effective_vad_threshold_locked()
             if rms >= threshold:
-                speech_started = not self._vad_speech_seen
-                self._vad_speech_seen = True
-                self._vad_silence_ms = 0.0
+                speech_started = False
+                if self._vad_speech_seen:
+                    self._vad_silence_ms = 0.0
+                    self._vad_utterance_ms += frame_ms
+                else:
+                    self._vad_candidate_ms += frame_ms
+                    self._vad_candidate_peak = max(
+                        self._vad_candidate_peak, rms
+                    )
+                    if self._vad_candidate_ms >= _VAD_MIN_SPEECH_MS:
+                        self._vad_speech_seen = True
+                        self._vad_silence_ms = 0.0
+                        self._vad_utterance_ms = self._vad_candidate_ms
+                        speech_started = True
                 if speech_started:
+                    self._vad_unheard_ms = 0.0
+                    self._vad_unheard_peak = 0.0
                     self._emit_trace(
                         "vad", "speech_started", "running",
-                        rms=round(rms, 1), threshold=round(threshold, 1),
+                        rms=round(self._vad_candidate_peak, 1),
+                        threshold=round(threshold, 1),
+                        noise_rms=round(noise_rms, 1),
+                        gain=round(input_gain, 2),
                     )
             elif self._vad_speech_seen:
                 self._vad_silence_ms += frame_ms
+                self._vad_utterance_ms += frame_ms
+            else:
+                self._vad_candidate_ms = 0.0
+                self._vad_candidate_peak = 0.0
+                # 只用当前判为非人声的帧学习噪底，避免阈值追着人声上涨。
+                self._vad_noise_samples.append(rms)
             if not self._vad_speech_seen:
+                self._vad_unheard_ms += frame_ms
+                self._vad_unheard_peak = max(self._vad_unheard_peak, rms)
+                if (
+                    not self._vad_low_signal_logged
+                    and self._vad_unheard_ms >= _LOW_SIGNAL_DIAGNOSTIC_MS
+                    and 0 < self._vad_unheard_peak < threshold
+                ):
+                    self._vad_low_signal_logged = True
+                    self._emit_trace(
+                        "vad", "signal_below_threshold", "warning",
+                        rms=round(self._vad_unheard_peak, 1),
+                        threshold=round(threshold, 1),
+                        noise_rms=round(noise_rms, 1),
+                    )
                 return False
-            self._vad_utterance_ms += frame_ms
             if (
                 self._vad_silence_ms >= silence_window
                 or self._vad_utterance_ms >= max_utterance
@@ -324,6 +425,8 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
                 self._vad_speech_seen = False
                 self._vad_silence_ms = 0.0
                 self._vad_utterance_ms = 0.0
+                self._vad_candidate_ms = 0.0
+                self._vad_candidate_peak = 0.0
                 self._emit_trace(
                     "vad", "utterance_committed", "ok", reason=reason,
                 )
@@ -345,8 +448,9 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
                 for remaining in frames[index + 1 :]:
                     self._defer_frame_while_response_in_flight(remaining)
                 return
-            await super().send_audio(frame)
-            if self._vad_should_commit(frame):
+            conditioned, input_gain = self._condition_input_audio(frame)
+            await super().send_audio(conditioned)
+            if self._vad_should_commit(frame, input_gain=input_gain):
                 await self._request_response(ws)
 
     def _take_deferred_frames(self, current: bytes) -> list[bytes]:
@@ -360,7 +464,6 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
 
     def _defer_frame_while_response_in_flight(self, pcm: bytes) -> bool:
         resumed = False
-        threshold = float(config.get_int("MINIMAX_VAD_RMS_THRESHOLD"))
         rms = self._frame_rms(pcm)
         frame_ms = len(pcm) / 2 / self.input_rate * 1000.0
         with self._vad_lock:
@@ -369,6 +472,7 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
                 or not self._vad_response_in_flight
             ):
                 return False
+            threshold, _noise_rms = self._effective_vad_threshold_locked()
             voiced = rms >= threshold
             if voiced and not self._turn_stale_response:
                 self._turn_stale_response = True

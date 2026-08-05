@@ -100,8 +100,9 @@ v0.4.0 adds several call-quality controls for outbound work:
   Realtime handles listening/speech, while `MiniMax-M3` audits explicit action
   proposals through the text API and dispatches the existing local tools. M3
   does not receive raw call audio; router failures fail open to normal Realtime
-  speech. The live endpoint still has no server-side VAD, so turn-taking uses a local energy VAD
-  (`MINIMAX_VAD_RMS_THRESHOLD` plus the `MANUAL_RESPONSE_*` windows). It also
+  speech. The live endpoint still has no server-side VAD, so turn-taking uses a
+  noise-adaptive local energy VAD plus peak-limited input auto gain
+  (`MINIMAX_VAD_*`, `MINIMAX_INPUT_*`, and the `MANUAL_RESPONSE_*` windows). It also
   emits no user-side transcription event, so summaries only see the agent side.
 
 ### Hardware & platform support
@@ -439,8 +440,9 @@ v0.4.0 增加了几项面向外呼质量的控制：
   双向 pcm16 @ 24kHz，自带 ASR。Key 可在设置面板与首启向导里填（带在线校验）。
   默认开启混合工具模式：Realtime 负责听说，`MiniMax-M3` 通过文本接口审计明确的
   行动提案，再调用现有本地工具完成挂断、短信、验证码或 DTMF。M3 不直接接收电话
-  音频；路由异常时会降级为普通 Realtime 对话。该端点没有服务端 VAD，断句由本端能量 VAD 负责
-  （`MINIMAX_VAD_RMS_THRESHOLD` 配合 `MANUAL_RESPONSE_*` 两个窗口）。它也不发
+  音频；路由异常时会降级为普通 Realtime 对话。该端点没有服务端 VAD，断句由本端
+  噪底自适应能量 VAD 负责，并对送入模型的弱上行做峰值受限自动增益
+  （`MINIMAX_VAD_*`、`MINIMAX_INPUT_*` 配合 `MANUAL_RESPONSE_*` 两个窗口）。它也不发
   用户侧转写事件，通话摘要只看得到 Agent 一侧。
 
 ### 硬件与平台支持

@@ -17,7 +17,7 @@ import pytest
 
 from agentcall.agents import factory, minimax_agent
 from agentcall.agents.minimax_agent import MiniMaxVoiceAgent
-from agentcall.agents.minimax_hybrid import MiniMaxM3ToolRouter
+from agentcall.agents.minimax_hybrid import MiniMaxM3ToolRouter, might_request_tool
 from agentcall.agents.tools import SEND_DTMF_SPEC, SEND_SMS_SPEC, ToolRegistry
 
 
@@ -426,6 +426,81 @@ def test_hybrid_router_failure_fails_open_to_realtime_audio():
 # ---- 客户端 VAD（MiniMax 无服务端 VAD，不断句就全程沉默）----
 
 
+def test_owner_assistant_greeting_does_not_trigger_slow_tool_router():
+    """默认开场白含“机主”，不能因此白等一轮 M3 工具审计。"""
+    assert not might_request_tool("您好，我是机主的助理，想了解项目进展。")
+    assert might_request_tool("请帮我转接机主本人接听。")
+
+
+def test_weak_human_speech_uses_adaptive_vad_and_safe_auto_gain(monkeypatch):
+    """SIM7600 真人低电平仍能断句，送模型的副本同时被安全放大。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    monkeypatch.setenv("MINIMAX_VAD_RMS_THRESHOLD", "400")
+    monkeypatch.setenv("MINIMAX_VAD_MIN_RMS", "40")
+    monkeypatch.setenv("MINIMAX_INPUT_AUTO_GAIN", "true")
+    monkeypatch.setenv("MINIMAX_INPUT_MAX_GAIN", "16")
+    monkeypatch.setenv("MANUAL_RESPONSE_SILENCE_MS", "40")
+    agent = _make_agent()
+    traces: list[dict] = []
+    agent.set_trace_handler(traces.append)
+
+    async def scenario() -> None:
+        await agent.start(lambda _pcm: None)
+        for _ in range(20):
+            await agent.send_audio(_pcm(5, 20))
+        for _ in range(5):
+            await agent.send_audio(_pcm(100, 20))
+        for _ in range(3):
+            await agent.send_audio(_pcm(5, 20))
+
+    asyncio.run(scenario())
+
+    assert instances[0].sent_types().count("input_audio_buffer.commit") == 1
+    started = next(
+        item for item in traces
+        if item["stage"] == "vad" and item["event"] == "speech_started"
+    )
+    assert started["threshold"] < 100
+    assert started["gain"] > 1
+    appended = instances[0].first("input_audio_buffer.append")["audio"]
+    assert MiniMaxVoiceAgent._frame_peak(base64.b64decode(appended)) > 5
+
+
+def test_low_signal_is_persisted_as_trace_diagnostic(monkeypatch):
+    _instances, _calls = _patch_connect(monkeypatch)
+    monkeypatch.setenv("MINIMAX_VAD_RMS_THRESHOLD", "400")
+    monkeypatch.setenv("MINIMAX_VAD_MIN_RMS", "40")
+    agent = _make_agent()
+    traces: list[dict] = []
+    agent.set_trace_handler(traces.append)
+
+    async def scenario() -> None:
+        await agent.start(lambda _pcm: None)
+        for _ in range(251):
+            await agent.send_audio(_pcm(10, 20))
+
+    asyncio.run(scenario())
+
+    low = [item for item in traces if item["event"] == "signal_below_threshold"]
+    assert len(low) == 1
+    assert low[0]["status"] == "warning"
+    assert low[0]["rms"] == pytest.approx(10, abs=0.1)
+
+
+def test_minimax_auto_gain_is_peak_limited_and_can_be_disabled(monkeypatch):
+    agent = _make_agent()
+    pcm = _pcm(1000, 20)
+    monkeypatch.setenv("MINIMAX_INPUT_AUTO_GAIN", "true")
+    monkeypatch.setenv("MINIMAX_INPUT_MAX_GAIN", "16")
+
+    conditioned, gain = agent._condition_input_audio(pcm)
+
+    assert gain == pytest.approx(12)
+    assert MiniMaxVoiceAgent._frame_peak(conditioned) == pytest.approx(12000)
+    monkeypatch.setenv("MINIMAX_INPUT_AUTO_GAIN", "false")
+    assert agent._condition_input_audio(pcm) == (pcm, 1.0)
+
+
 def test_silence_after_speech_triggers_commit_and_response(monkeypatch):
     instances, _calls = _patch_connect(monkeypatch)
     monkeypatch.setenv("MINIMAX_VAD_RMS_THRESHOLD", "400")
@@ -495,17 +570,17 @@ def test_no_second_commit_while_response_in_flight(monkeypatch):
 
     async def scenario() -> None:
         await agent.start(lambda _pcm: None)
-        for _ in range(3):
+        for _ in range(5):
             await agent.send_audio(_pcm(3000, 20))
         for _ in range(4):
             await agent.send_audio(_pcm(0, 20))          # 第一次断句
-        for _ in range(3):
+        for _ in range(5):
             await agent.send_audio(_pcm(3000, 20))
         for _ in range(4):
             await agent.send_audio(_pcm(0, 20))          # 在飞中，不应再断
         assert instances[0].sent_types().count("input_audio_buffer.commit") == 1
         agent._on_response_done()                        # 轮次结束后才放开
-        for _ in range(3):
+        for _ in range(5):
             await agent.send_audio(_pcm(3000, 20))
         for _ in range(4):
             await agent.send_audio(_pcm(0, 20))
@@ -530,7 +605,7 @@ def test_hotline_turn_guard_drops_stale_response_and_replays_remote_audio(monkey
 
     async def scenario() -> None:
         await agent.start(emitted.append)
-        for _ in range(3):
+        for _ in range(5):
             await agent.send_audio(_pcm(3000, 20))
         for _ in range(6):
             await agent.send_audio(_pcm(0, 20))
@@ -583,7 +658,7 @@ def test_commit_failure_releases_in_flight_flag(monkeypatch):
     async def scenario() -> None:
         await agent.start(lambda _pcm: None)
         instances[0].closed = True               # send 抛 ConnectionError
-        for _ in range(3):
+        for _ in range(5):
             await agent.send_audio(_pcm(3000, 20))
         for _ in range(4):
             await agent.send_audio(_pcm(0, 20))
@@ -611,7 +686,7 @@ def test_trace_exposes_vad_and_response_boundaries_without_audio(monkeypatch):
 
     async def scenario() -> None:
         await agent.start(lambda _pcm: None)
-        for _ in range(3):
+        for _ in range(5):
             await agent.send_audio(_pcm(3000, 20))
         for _ in range(4):
             await agent.send_audio(_pcm(0, 20))
