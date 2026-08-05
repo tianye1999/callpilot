@@ -151,10 +151,49 @@ def test_agent_process_trace_is_persisted_and_summarized_for_comparison(tmp_path
         "tools_requested": 0,
         "tools_completed": 0,
         "reconnects": 0,
+        "remote_resumed": 0,
+        "stale_responses_dropped": 0,
+        "stale_output_drops": 0,
+        "stale_output_bytes": 0,
+        "output_deferred_ms": 0,
         "failure_code": None,
         "diagnosis": "healthy",
     }
     assert clog.list_calls()[0]["trace_summary"]["diagnosis"] == "healthy"
+
+
+def test_turn_taking_metrics_are_persisted_in_trace_summary(tmp_path):
+    clog = CallLogger(tmp_path)
+    record = clog.begin_call("outbound", "10000")
+    record.log_event("answered")
+    for event in (
+        {"stage": "bridge", "event": "ready", "status": "ok"},
+        {"stage": "transport", "event": "connected", "status": "ok"},
+        {"stage": "audio_in", "event": "audio_started", "status": "running", "total_bytes": 10},
+        {"stage": "vad", "event": "speech_started", "status": "running"},
+        {"stage": "model", "event": "response_done", "status": "ok"},
+        {"stage": "audio_out", "event": "audio_started", "status": "running", "total_bytes": 10},
+        {"stage": "turn", "event": "remote_resumed", "status": "running"},
+        {"stage": "turn", "event": "stale_response_dropped", "status": "ok"},
+        {
+            "stage": "turn",
+            "event": "summary",
+            "status": "ok",
+            "remote_resumed": 1,
+            "stale_output_drops": 1,
+            "stale_output_bytes": 3200,
+            "output_deferred_ms": 850,
+        },
+    ):
+        record.log_event("agent_trace", provider="minimax", **event)
+    record.finish("completed")
+
+    summary = clog.list_calls()[0]["trace_summary"]
+    assert summary["remote_resumed"] == 1
+    assert summary["stale_responses_dropped"] == 1
+    assert summary["stale_output_drops"] == 1
+    assert summary["stale_output_bytes"] == 3200
+    assert summary["output_deferred_ms"] == 850
 
 
 # ---- 合成对话录音 mixed.wav（立体声 左=AI / 右=对方，按时间轴对齐）----

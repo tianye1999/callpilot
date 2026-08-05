@@ -69,6 +69,11 @@ def _trace_summary(event_lines: list[str], *, answered: bool, status: str) -> di
         "tools_requested": 0,
         "tools_completed": 0,
         "reconnects": 0,
+        "remote_resumed": 0,
+        "stale_responses_dropped": 0,
+        "stale_output_drops": 0,
+        "stale_output_bytes": 0,
+        "output_deferred_ms": 0,
         "failure_code": None,
     }
     response_ms: list[float] = []
@@ -117,6 +122,26 @@ def _trace_summary(event_lines: list[str], *, answered: bool, status: str) -> di
             summary["tools_requested"] += 1
         elif stage == "tool" and name == "completed":
             summary["tools_completed"] += 1
+        elif stage == "turn" and name == "remote_resumed":
+            summary["remote_resumed"] += 1
+        elif stage == "turn" and name == "stale_response_dropped":
+            summary["stale_responses_dropped"] += 1
+        elif stage == "turn" and name == "summary":
+            summary["remote_resumed"] = max(
+                summary["remote_resumed"], int(event.get("remote_resumed") or 0)
+            )
+            summary["stale_output_drops"] = max(
+                summary["stale_output_drops"],
+                int(event.get("stale_output_drops") or 0),
+            )
+            summary["stale_output_bytes"] = max(
+                summary["stale_output_bytes"],
+                int(event.get("stale_output_bytes") or 0),
+            )
+            summary["output_deferred_ms"] = max(
+                summary["output_deferred_ms"],
+                int(event.get("output_deferred_ms") or 0),
+            )
         if event_status == "error" and summary["failure_code"] is None:
             summary["failure_code"] = event.get("code") or event.get("reason")
 
