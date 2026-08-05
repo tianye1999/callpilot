@@ -659,7 +659,90 @@ class Eg25Modem:
     # 真机实测成功点散布在接通后 1.3s / 4.9s / 8.0s，2.5s 的窗口会漏掉后两种
     # （2026-08-01 有一通就是重试 5 次全 ERROR、整通无声）。按最慢观测值留足余量。
     _SIMCOM_PCM_ENABLE_TIMEOUT = 12.0
+    # SIMCom 官方 USB Audio 示例允许 ATD 返回后立即启用，以便获取回铃音；
+    # 本机真机 2026-08-05 证明该时序足以让 9001 Audio 口稳定开始收发。
+    # 这里只做短窗口预启用，失败仍由物理接通后的 12s 窗口兜底，不能拖死拨号。
+    _SIMCOM_PCM_EARLY_ENABLE_TIMEOUT = 3.0
     _SIMCOM_PCM_RETRY_DELAY = 0.5
+    _SIMCOM_PREDIAL_CLEAR_TIMEOUT = 6.0
+    _SIMCOM_PREDIAL_SETTLE_DELAY = 0.8
+
+    def _set_simcom_pcm_bandwidth(self) -> None:
+        """把 SIMCom VoLTE/非 VoLTE PCM 都钉到项目使用的 8 kHz。"""
+        try:
+            self._send("AT+CPCMBANDWIDTH=1,1")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("AT+CPCMBANDWIDTH 设置失败（可忽略）: %s", type(exc).__name__)
+
+    def _start_simcom_pcm_once(self) -> bool:
+        """尝试一次 CPCMREG 启动并读回确认，成功才更新本地事实状态。"""
+        self._voice_pcm_active = False
+        start_response = self._send("AT+CPCMREG=1")
+        if "OK" not in start_response.upper():
+            return False
+        state_response = self._send("AT+CPCMREG?")
+        state_match = CPCMREG_PATTERN.search(state_response)
+        if state_match is None or state_match.group(1) != "1":
+            return False
+        self._voice_pcm_active = True
+        return True
+
+    def _early_enable_simcom_pcm(self) -> None:
+        """ATD 后立即预启用 USB Audio；失败不阻断外呼，接通后继续兜底。"""
+        deadline = time.monotonic() + self._SIMCOM_PCM_EARLY_ENABLE_TIMEOUT
+        attempts = 0
+        while True:
+            attempts += 1
+            if self._start_simcom_pcm_once():
+                logger.info(
+                    "SIMCom PCM 在 ATD 后提前启用并读回确认（第 %d 次尝试）",
+                    attempts,
+                )
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self._SIMCOM_PCM_RETRY_DELAY)
+        self._voice_pcm_active = False
+        logger.info(
+            "SIMCom PCM 在 ATD 后 %.0fs 内未提前启用；物理接通后继续重试",
+            self._SIMCOM_PCM_EARLY_ENABLE_TIMEOUT,
+        )
+
+    def _prepare_simcom_for_dial(self) -> None:
+        """拨号前清空残留呼叫并复位 USB Audio，禁止叠加 hidden/held call。"""
+        deadline = time.monotonic() + self._SIMCOM_PREDIAL_CLEAR_TIMEOUT
+        response = self._send("AT+CLCC")
+        while "OK" not in response.upper():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("SIMCom 拨号前无法读取 CLCC，拒绝在未知通话状态下拨号")
+            time.sleep(self._SIMCOM_PCM_RETRY_DELAY)
+            response = self._send("AT+CLCC")
+
+        call_count = len(list(CLCC_PATTERN.finditer(response)))
+        if call_count:
+            logger.warning("拨号前发现 %d 路残留通话，先全部清除", call_count)
+
+        # 即使 CLCC 已空也无条件 CHUP：SIM7600 曾出现 CLCC 与 USB Audio 内部
+        # call context 不同步；已知可复现的干净基线每次拨号前都会先 CHUP。
+        stop_response = self._send("AT+CHUP")
+        if "OK" not in stop_response.upper():
+            self._send("ATH")
+
+        # 手册要求 stop=1 结束 USB Audio 注册；即使 CLCC 已空也必须复位，
+        # 否则上一通异常退出留下的 mode=1 会污染下一通的端点状态。
+        self._send("AT+CPCMREG=0,1")
+        self._voice_pcm_active = False
+
+        time.sleep(self._SIMCOM_PREDIAL_SETTLE_DELAY)
+        while True:
+            response = self._send("AT+CLCC")
+            if "OK" in response.upper() and not CLCC_PATTERN.search(response):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "SIMCom 残留通话在拨号前未能清空，拒绝叠加新的物理呼叫"
+                )
+            time.sleep(self._SIMCOM_PCM_RETRY_DELAY)
 
     def _enable_simcom_pcm(self) -> None:
         """SIMCom(SIM7600 系)：AT+CPCMREG=1 把 PCM 推到 USB 音频接口。
@@ -686,34 +769,33 @@ class Eg25Modem:
             #   不设时同一指标约 1.0（噪声）。
             # 注意 AT+CPCMFRM 不是这件事的开关：手册明确它只支持 8k→16k 单向切换，
             # 拿它降回 8k 无效。
-            try:
-                self._send("AT+CPCMBANDWIDTH=1,1")
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("AT+CPCMBANDWIDTH 设置失败（可忽略）: %s", type(exc).__name__)
+            self._set_simcom_pcm_bandwidth()
+
+            # 外呼路径通常已在 ATD 后立即打开；这里读回确认即可，避免接通后
+            # 再发一次 start 让已工作的 USB Audio 通道重新初始化。
+            if self._voice_pcm_active:
+                state_response = self._send("AT+CPCMREG?")
+                state_match = CPCMREG_PATTERN.search(state_response)
+                if state_match is not None and state_match.group(1) == "1":
+                    logger.info("SIMCom PCM 语音通道保持启用（接通后读回 mode=1）")
+                    return
+                self._voice_pcm_active = False
 
         deadline = time.monotonic() + self._SIMCOM_PCM_ENABLE_TIMEOUT
         attempts = 0
         while True:
             attempts += 1
-            start_response = self._send("AT+CPCMREG=1")
-            if "OK" in start_response.upper():
-                # 手册 5.2.25 提供读命令；不能只凭写命令的 OK 推断 USB audio
-                # 已真正切到 mode=1。真机 P0 是 bulk OUT 从首包开始一直 NAK，
-                # 因此把模组实际状态作为起桥前的事实来源。
-                state_response = self._send("AT+CPCMREG?")
-                state_match = CPCMREG_PATTERN.search(state_response)
-                if state_match is not None and state_match.group(1) == "1":
-                    self._voice_pcm_active = True
-                    logger.info(
-                        "SIMCom PCM 语音通道已启用并读回确认 "
-                        "(AT+CPCMREG=1，第 %d 次尝试)",
-                        attempts,
-                    )
-                    return
-                logger.warning(
-                    "AT+CPCMREG=1 返回 OK，但读回未确认 mode=1（第 %d 次尝试）",
+            if self._start_simcom_pcm_once():
+                logger.info(
+                    "SIMCom PCM 语音通道已启用并读回确认 "
+                    "(AT+CPCMREG=1，第 %d 次尝试)",
                     attempts,
                 )
+                return
+            logger.warning(
+                "AT+CPCMREG=1 尚未读回 mode=1（第 %d 次尝试）",
+                attempts,
+            )
             # 无通话时只试一次：ERROR 是必然结果，重试纯属浪费启动时间。
             if not in_call or time.monotonic() >= deadline:
                 break
@@ -853,7 +935,15 @@ class Eg25Modem:
             self._clcc_absent_count = 0
             self._clcc_fail_count = 0
             self._last_dialed = number
+            if self._audio_mode == "simcom_pcm":
+                # 先清空残留呼叫/USB Audio 状态，再按官方示例在 ATD 前准备
+                # Audio 9001。真机曾发现 active + held 两路残留；不清理就继续
+                # ATD 会导致 CPCMREG 始终无法进入 mode=1。
+                self._prepare_simcom_for_dial()
+                self._set_simcom_pcm_bandwidth()
             response = self._send(f"ATD{number};")
+            if self._audio_mode == "simcom_pcm" and "OK" in response.upper():
+                self._early_enable_simcom_pcm()
         logger.info("已拨号 -> %s", number)
         return response
 

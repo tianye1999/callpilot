@@ -760,6 +760,122 @@ def test_initialize_for_voice_simcom_tolerates_error_without_call(monkeypatch, c
     assert any("接通后再启用" in r.getMessage() for r in caplog.records)
 
 
+def test_simcom_dial_enables_usb_audio_immediately_after_atd(monkeypatch):
+    """官方示例时序：8k 在 ATD 前，CPCMREG 紧跟 ATD，不等待物理接通。"""
+    modem, calls = _recording_modem(monkeypatch)
+    modem._audio_mode = "simcom_pcm"
+
+    response = modem.dial("10000")
+
+    assert response == "OK"
+    assert calls[:6] == [
+        "AT+CLCC",
+        "AT+CHUP",
+        "AT+CPCMREG=0,1",
+        "AT+CLCC",
+        "AT+CPCMBANDWIDTH=1,1",
+        "ATD10000;",
+    ]
+    assert calls[6:8] == ["AT+CPCMREG=1", "AT+CPCMREG?"]
+    assert modem.voice_pcm_active is True
+    assert not modem.is_call_connected()
+
+
+def test_simcom_dial_early_enable_failure_falls_back_after_connect(monkeypatch):
+    """预启用只是优化：短窗口失败仍返回 ATD 结果，接通后走原 12s 兜底。"""
+    clock = {"now": 0.0}
+    monkeypatch.setattr(modem_time_sleep_target(), "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        modem_time_sleep_target(),
+        "sleep",
+        lambda delay: clock.__setitem__("now", clock["now"] + delay),
+    )
+    modem = make_modem()
+    modem._audio_mode = "simcom_pcm"
+    calls: list[str] = []
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd in {"AT+CLCC", "AT+CHUP", "ATD10000;"}:
+            return "OK"
+        return "ERROR"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+
+    assert modem.dial("10000") == "OK"
+    assert calls[0:6] == [
+        "AT+CLCC",
+        "AT+CHUP",
+        "AT+CPCMREG=0,1",
+        "AT+CLCC",
+        "AT+CPCMBANDWIDTH=1,1",
+        "ATD10000;",
+    ]
+    assert calls.count("AT+CPCMREG=1") > 1
+    assert clock["now"] >= modem._SIMCOM_PCM_EARLY_ENABLE_TIMEOUT
+    assert modem.voice_pcm_active is False
+
+
+def test_quectel_dial_does_not_send_simcom_early_audio_commands(monkeypatch):
+    modem, calls = _recording_modem(monkeypatch)
+    modem._audio_mode = "uac"
+
+    assert modem.dial("10000") == "OK"
+    assert calls == ["ATD10000;"]
+
+
+def test_simcom_dial_clears_stale_calls_before_atd(monkeypatch):
+    modem = make_modem()
+    modem._audio_mode = "simcom_pcm"
+    calls: list[str] = []
+    clcc_responses = iter(
+        [
+            '+CLCC: 5,0,0,0,0,"redacted",129\r\nOK',
+            "OK",
+        ]
+    )
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CLCC":
+            return next(clcc_responses)
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda _delay: None)
+
+    assert modem.dial("10000") == "OK"
+    assert calls.index("AT+CHUP") < calls.index("ATD10000;")
+    assert calls.index("AT+CPCMREG=0,1") < calls.index("ATD10000;")
+
+
+def test_simcom_dial_refuses_to_stack_call_that_cannot_be_cleared(monkeypatch):
+    clock = {"now": 0.0}
+    modem = make_modem()
+    modem._audio_mode = "simcom_pcm"
+    calls: list[str] = []
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CLCC":
+            return '+CLCC: 5,0,0,0,0,"redacted",129\r\nOK'
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    monkeypatch.setattr(modem_time_sleep_target(), "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        modem_time_sleep_target(),
+        "sleep",
+        lambda delay: clock.__setitem__("now", clock["now"] + delay),
+    )
+
+    with pytest.raises(RuntimeError, match="拒绝叠加"):
+        modem.dial("10000")
+    assert "ATD10000;" not in calls
+
+
 def test_hangup_closes_channel_with_matching_dialect(monkeypatch):
     modem, calls = _recording_modem(monkeypatch)
     modem.initialize_for_voice("simcom_pcm")

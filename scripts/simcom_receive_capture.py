@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import threading
 import time
 import wave
 from pathlib import Path
@@ -26,6 +27,7 @@ AT_OUT = 0x03
 AT_IN = 0x84
 AUDIO_INTERFACE = 4
 AUDIO_IN = 0x88
+AUDIO_OUT = 0x05
 SCAN_INTERFACES = {
     0: 0x81,
     1: 0x82,
@@ -97,7 +99,16 @@ def enable_usb_audio(dev: usb.core.Device, timeout: float = 12.0) -> int:
                 return attempts
             print(f"  CPCMREG 写 OK 但读回异常: {state}")
         time.sleep(0.5)
-    raise RuntimeError(f"CPCMREG 在 {attempts} 次尝试后仍未读回 mode=1")
+    details = {
+        "CLCC": send_at(dev, "AT+CLCC"),
+        "CEREG": send_at(dev, "AT+CEREG?"),
+        "CPSI": send_at(dev, "AT+CPSI?"),
+        "CPCMREG": send_at(dev, "AT+CPCMREG?"),
+        "CEER": send_at(dev, "AT+CEER"),
+    }
+    raise RuntimeError(
+        f"CPCMREG 在 {attempts} 次尝试后仍未读回 mode=1；状态={details}"
+    )
 
 
 def capture_pcm(dev: usb.core.Device, seconds: float) -> tuple[bytes, float]:
@@ -110,6 +121,29 @@ def capture_pcm(dev: usb.core.Device, seconds: float) -> tuple[bytes, float]:
         except usb.core.USBTimeoutError:
             continue
     return b"".join(chunks), time.monotonic() - started
+
+
+def write_silence(
+    dev: usb.core.Device,
+    stop: threading.Event,
+    stats: dict[str, int],
+) -> None:
+    """持续提交 20ms 静音帧，验证 Audio OUT 是否真正开始接收。"""
+    frame = b"\x00\x00" * 160
+    deadline = time.monotonic()
+    while not stop.is_set():
+        try:
+            written = dev.write(AUDIO_OUT, frame, timeout=1000)
+        except usb.core.USBTimeoutError:
+            stats["timeouts"] += 1
+        except usb.core.USBError:
+            stats["errors"] += 1
+            return
+        else:
+            stats["writes"] += 1
+            stats["bytes"] += int(written)
+        deadline += 0.02
+        stop.wait(max(0.0, deadline - time.monotonic()))
 
 
 def save_wav(path: Path, pcm: bytes, rate: int = 8000) -> None:
@@ -191,6 +225,14 @@ def main() -> None:
         help="每个候选 interface 依次抓取 --seconds 秒，定位当前音频端口",
     )
     parser.add_argument(
+        "--early-start",
+        action="store_true",
+        help=(
+            "拨号前 claim Audio 口，ATD 返回后立即 CPCMREG，并持续写 20ms 静音帧；"
+            "复现 SIMCom/Waveshare 官方示例时序"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=ROOT / "data" / "receive-captures",
@@ -222,32 +264,58 @@ def main() -> None:
         claimed.append(AT_INTERFACE)
         set_control_lines(dev, AT_INTERFACE)
 
+        if args.early_start:
+            if args.scan_interfaces:
+                raise RuntimeError("--early-start 不能与 --scan-interfaces 同时使用")
+            usb.util.claim_interface(dev, AUDIO_INTERFACE)
+            claimed.append(AUDIO_INTERFACE)
+            set_control_lines(dev, AUDIO_INTERFACE)
+
         print(f"ATE0: {send_at(dev, 'ATE0')}")
+        print(f"CODECCTL before: {send_at(dev, 'AT+CODECCTL?')}")
+        print(f"CODECCTL=0: {send_at(dev, 'AT+CODECCTL=0')}")
         for run in range(1, args.count + 1):
             print(f"\n=== run {run}/{args.count} ===")
             print(f"  pre-clean: {send_at(dev, 'AT+CHUP')}")
             time.sleep(0.8)
             clean_state = send_at(dev, "AT+CLCC")
             print(f"  CLCC before dial: {clean_state}")
+            if args.early_start:
+                print(f"  CPCMBANDWIDTH before dial: {send_at(dev, 'AT+CPCMBANDWIDTH=1,1')}")
             print(f"  dial: {send_at(dev, f'ATD{args.number};', timeout=3.0)}")
+            if args.early_start:
+                enable_usb_audio(dev)
             if not wait_for_connected(dev):
                 raise RuntimeError("25 秒内未接通")
             print("  connected")
-            enable_usb_audio(dev)
+            if not args.early_start:
+                enable_usb_audio(dev)
 
             candidates = SCAN_INTERFACES if args.scan_interfaces else {4: AUDIO_IN}
             for interface, in_endpoint in candidates.items():
-                usb.util.claim_interface(dev, interface)
-                claimed.append(interface)
-                try:
-                    set_control_lines(dev, interface)
-                except usb.core.USBError as exc:
-                    # interface 0/1/3/5 未必接受 CDC SET_CONTROL_LINE_STATE；
-                    # 全接口定位时这不应阻止读取其 bulk IN。
-                    if not args.scan_interfaces:
-                        raise
-                    print(f"  interface {interface} DTR/RTS 不支持: {exc}")
-                time.sleep(0.1)
+                already_claimed = interface in claimed
+                if not already_claimed:
+                    usb.util.claim_interface(dev, interface)
+                    claimed.append(interface)
+                    try:
+                        set_control_lines(dev, interface)
+                    except usb.core.USBError as exc:
+                        # interface 0/1/3/5 未必接受 CDC SET_CONTROL_LINE_STATE；
+                        # 全接口定位时这不应阻止读取其 bulk IN。
+                        if not args.scan_interfaces:
+                            raise
+                        print(f"  interface {interface} DTR/RTS 不支持: {exc}")
+                    time.sleep(0.1)
+                writer_stop = threading.Event()
+                writer_stats = {"writes": 0, "bytes": 0, "timeouts": 0, "errors": 0}
+                writer = None
+                if args.early_start:
+                    writer = threading.Thread(
+                        target=write_silence,
+                        args=(dev, writer_stop, writer_stats),
+                        daemon=True,
+                    )
+                    writer.start()
                 try:
                     if in_endpoint == AUDIO_IN:
                         pcm, elapsed = capture_pcm(dev, args.seconds)
@@ -263,8 +331,12 @@ def main() -> None:
                         pcm = b"".join(chunks)
                         elapsed = time.monotonic() - started
                 finally:
-                    usb.util.release_interface(dev, interface)
-                    claimed.remove(interface)
+                    writer_stop.set()
+                    if writer is not None:
+                        writer.join(timeout=2.0)
+                    if not already_claimed:
+                        usb.util.release_interface(dev, interface)
+                        claimed.remove(interface)
                 stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
                 output = (
                     args.output_dir
@@ -273,6 +345,12 @@ def main() -> None:
                 save_wav(output, pcm)
                 print(f"  interface {interface}:")
                 print_metrics(analyze(pcm, elapsed))
+                if args.early_start:
+                    print(
+                        "  audio OUT: "
+                        f"{writer_stats['bytes']} bytes/{writer_stats['writes']} writes, "
+                        f"timeouts={writer_stats['timeouts']}, errors={writer_stats['errors']}"
+                    )
                 print(f"  saved: {output}")
 
             print(f"  hangup: {send_at(dev, 'AT+CHUP')}")
