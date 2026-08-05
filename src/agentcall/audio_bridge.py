@@ -53,6 +53,14 @@ NMEA_WRITE_INTERVAL_SECONDS = 0.1
 # 当前固件的 bulk OUT，P0 根因另在驱动传输/接口握手。
 SIMCOM_WRITE_SIZE = 320
 SIMCOM_WRITE_INTERVAL_SECONDS = 0.02
+# SIM7600 的 USB Audio 在端点刚恢复、PTY flush 或短写边界处，偶尔会让
+# 16-bit PCM 从高字节开始。此时正常几百幅值的人声会瞬间变成接近满幅的
+# 宽带噪音；把字节流再错开 1 byte 后会恢复。只在 SIMCom 路径启用这一
+# 保守检测，避免改变历史 NMEA/Quectel 行为。
+SIMCOM_REALIGN_MIN_RMS = 6000.0
+SIMCOM_REALIGN_MAX_ALTERNATE_RMS = 3000.0
+SIMCOM_REALIGN_IMPROVEMENT_RATIO = 0.25
+SIMCOM_STARTUP_GUARD_SECONDS = 2.5
 
 
 def find_device_index(keyword: str, kind: str | None = None) -> int | None:
@@ -180,12 +188,16 @@ class SerialPcmAudioBridge:
         *,
         write_size: int = NMEA_WRITE_SIZE,
         write_interval_seconds: float = NMEA_WRITE_INTERVAL_SECONDS,
+        auto_realign: bool = False,
+        startup_guard_seconds: float = 0.0,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
         self.tx_gain = tx_gain
         self.write_size = write_size
         self.write_interval_seconds = write_interval_seconds
+        self.auto_realign = auto_realign
+        self.startup_guard_seconds = startup_guard_seconds
         self._ready_check: "Callable[[], bool] | None" = None
         self._ser: serial.Serial | None = None
         self._tx_buffer = bytearray()
@@ -198,6 +210,8 @@ class SerialPcmAudioBridge:
         self._queued_bytes = 0
         self._last_stats_at = 0.0
         self._write_timeouts = 0
+        self._started_at = 0.0
+        self._startup_noise_reported = False
 
     def _open_serial(self) -> serial.Serial:
         """打开 PCM 串口；目标是 PTY 时直接用 PTY 安全波特率，否则失败后降速重开。
@@ -246,6 +260,8 @@ class SerialPcmAudioBridge:
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
         self._running = True
+        self._started_at = time.monotonic()
+        self._startup_noise_reported = False
         self._written_bytes = 0
         self._queued_bytes = 0
         self._write_timeouts = 0
@@ -283,11 +299,57 @@ class SerialPcmAudioBridge:
         if not self._ser:
             return b""
         data = self._rx_carry + self._ser.read(NMEA_READ_SIZE)
+        self._rx_carry = b""
+        if self.auto_realign and self._should_realign_pcm(data):
+            # 丢掉当前错误相位的首字节，让后续 int16 从真正的 low byte 开始。
+            # 末尾若因此落单，仍交给既有 carry 逻辑接到下一块，字节不再丢失。
+            data = data[1:]
+            logger.warning("检测到 SIMCom PCM 字节相位错位，已自动重对齐")
         if len(data) % 2:
             self._rx_carry = data[-1:]
-            return data[:-1]
-        self._rx_carry = b""
+            data = data[:-1]
+        if self._should_mute_startup_noise(data):
+            if not self._startup_noise_reported:
+                logger.warning("SIMCom PCM 启动期仍有异常高能量边界帧，已静音过滤")
+                self._startup_noise_reported = True
+            return b"\x00" * len(data)
         return data
+
+    def _should_mute_startup_noise(self, data: bytes) -> bool:
+        """只过滤开流最初 2.5s 中无法可靠重对齐的满幅异常帧。"""
+        if (
+            not self.auto_realign
+            or not data
+            or self.startup_guard_seconds <= 0
+            or self._started_at <= 0
+            or time.monotonic() - self._started_at > self.startup_guard_seconds
+        ):
+            return False
+        samples = np.frombuffer(data, dtype="<i2").astype(np.float64)
+        rms = float(np.sqrt(np.mean(samples * samples)))
+        return rms >= SIMCOM_REALIGN_MIN_RMS
+
+    @staticmethod
+    def _should_realign_pcm(data: bytes) -> bool:
+        """当前 int16 相位明显是噪音、错开 1 byte 明显正常时才返回 True。"""
+        if len(data) < 64:
+            return False
+        current_size = len(data) // 2 * 2
+        alternate_size = (len(data) - 1) // 2 * 2
+        if alternate_size < 64:
+            return False
+        current = np.frombuffer(data[:current_size], dtype="<i2").astype(np.float64)
+        alternate = np.frombuffer(
+            data[1 : 1 + alternate_size], dtype="<i2"
+        ).astype(np.float64)
+        current_rms = float(np.sqrt(np.mean(current * current)))
+        if current_rms < SIMCOM_REALIGN_MIN_RMS:
+            return False
+        alternate_rms = float(np.sqrt(np.mean(alternate * alternate)))
+        return (
+            alternate_rms <= SIMCOM_REALIGN_MAX_ALTERNATE_RMS
+            and alternate_rms <= current_rms * SIMCOM_REALIGN_IMPROVEMENT_RATIO
+        )
 
     def pending_output_bytes(self) -> int:
         with self._tx_lock:
@@ -747,6 +809,8 @@ def create_audio_bridge(
             tx_gain=tx_gain,
             write_size=SIMCOM_WRITE_SIZE,
             write_interval_seconds=SIMCOM_WRITE_INTERVAL_SECONDS,
+            auto_realign=True,
+            startup_guard_seconds=SIMCOM_STARTUP_GUARD_SECONDS,
         )
     raise ValueError(
         "MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg（仅 macOS）、nmea 或 simcom_pcm"

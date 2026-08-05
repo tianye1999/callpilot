@@ -563,6 +563,45 @@ def test_read_chunk_output_always_parses_as_int16():
         np.frombuffer(chunk, dtype=np.int16)   # 不抛即通过
 
 
+def test_simcom_read_chunk_repairs_one_byte_pcm_phase_shift():
+    """低幅人声错一字节会变满幅噪音；SIMCom 路径应自动丢一字节重对齐。"""
+    phase = np.arange(320, dtype=np.float64) / audio_bridge.MODEM_RATE
+    expected = (np.sin(2 * np.pi * 440 * phase) * 1000).astype("<i2").tobytes()
+    bridge = _bridge_with([b"\x7f" + expected])
+    bridge.auto_realign = True
+
+    out = bridge.read_modem_chunk()
+
+    assert out == expected
+    assert bridge._rx_carry == b""
+
+
+def test_simcom_realign_does_not_touch_legitimate_loud_pcm():
+    """正常的大音量语音不能仅因 RMS 高就被误判为错相。"""
+    expected = np.resize(np.array([-12000, 12000], dtype="<i2"), 320).tobytes()
+    bridge = _bridge_with([expected])
+    bridge.auto_realign = True
+
+    assert bridge.read_modem_chunk() == expected
+
+
+def test_simcom_startup_guard_mutes_uncertain_full_scale_boundary(monkeypatch):
+    """启动边界上两种相位都像噪音时，宁可静音一帧也不送进录音/模型。"""
+    noise = np.resize(
+        np.array([-30000, 18000, 29000, -17000], dtype="<i2"), 320
+    ).tobytes()
+    bridge = _bridge_with([noise, noise])
+    bridge.auto_realign = True
+    bridge.startup_guard_seconds = 2.5
+    bridge._started_at = 100.0
+
+    monkeypatch.setattr(audio_bridge.time, "monotonic", lambda: 101.0)
+    assert bridge.read_modem_chunk() == b"\x00" * len(noise)
+
+    monkeypatch.setattr(audio_bridge.time, "monotonic", lambda: 103.0)
+    assert bridge.read_modem_chunk() == noise
+
+
 def test_start_clears_stale_carry(monkeypatch):
     """上一通剩的半个字节不能漏到下一通，否则新流从一开始就错位。"""
     monkeypatch.setattr(
