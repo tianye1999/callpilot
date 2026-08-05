@@ -120,3 +120,37 @@ def test_response_gate_resets_suppression_streak_after_different_content():
 
     assert emitted == [b"first", b"second", b"different", b"repeat-after-reset"]
     assert stuck == []
+
+
+def test_response_gate_hold_survives_response_done_until_release():
+    emitted: list[bytes] = []
+    gate = ResponseAudioGate(
+        "test",
+        emitted.append,
+        suppressor=RepeatSuppressor(threshold_getter=lambda: 0.9),
+    )
+
+    gate.hold_response("r1")
+    gate.push_audio("r1", b"action proposal")
+    assert gate.complete_transcript("r1", "我准备发送一条短信。") is False
+    gate.complete_response("r1")
+    assert emitted == []
+
+    gate.release_response("r1")
+    assert emitted == [b"action proposal"]
+
+
+def test_response_gate_can_drop_held_action_proposal():
+    emitted: list[bytes] = []
+    gate = ResponseAudioGate(
+        "test",
+        emitted.append,
+        suppressor=RepeatSuppressor(threshold_getter=lambda: 0.9),
+    )
+
+    gate.hold_response("r1")
+    gate.push_audio("r1", b"internal action")
+    gate.drop_response("r1")
+    gate.complete_response("r1")
+
+    assert emitted == []

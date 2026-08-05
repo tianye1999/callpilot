@@ -126,7 +126,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                choices=("qwen", "doubao", "openai", "minimax", "local"),
                requires_restart=True,
                choice_labels={"doubao": "doubao (experimental)",
-                              "minimax": "minimax (无工具调用，仅纯对话)",
+                              "minimax": "minimax (Realtime + M3 混合工具)",
                               "local": "local (三段式，音频不出本机)"}),
     ConfigSpec("DASHSCOPE_API_KEY", "DashScope API Key", "str", "",
                secret=True, requires_restart=True),
@@ -189,10 +189,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("AGENT_MODEL_NAME_OPENAI", "OpenAI 模型显示名", "str",
                "OpenAI Realtime", editable=False, hidden=True,
                requires_restart=True),
-    # MiniMax Realtime（OpenAI Realtime beta 协议兼容，实测 2026-08-04）。
-    # 重要能力缺口：该端点静默丢弃 session.tools（session.updated 回显里无
-    # tools 字段，四种写法均无 function call 事件），所以 AI 无法自行挂断/
-    # 发短信/发 DTMF——详见 agents/minimax_agent 模块 docstring。
+    # MiniMax Realtime（OpenAI Realtime beta 协议兼容）+ M3 文本工具路由。
+    # Realtime 端点仍会丢弃 session.tools；混合模式让 Realtime 负责听说，
+    # MiniMax-M3 审计其行动提案并调用本地 ToolRegistry。
     ConfigSpec("MINIMAX_API_KEY", "MiniMax API Key", "str", "",
                secret=True, requires_restart=True),
     # realtime 端点当前只提供 abab6.5s-chat；?model= 查询参数被服务端忽略，
@@ -209,8 +208,18 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # api.minimax.io 与国内区 key 不通用（实测国内 key 在国际站回 401）。
     ConfigSpec("MINIMAX_REALTIME_URL", "MiniMax Realtime 端点覆写", "str", "",
                requires_restart=True),
+    ConfigSpec("MINIMAX_HYBRID_TOOLS_ENABLED", "MiniMax M3 混合工具模式", "bool",
+               "true", requires_restart=True),
+    ConfigSpec("MINIMAX_TEXT_MODEL", "MiniMax 工具决策模型", "str", "MiniMax-M3",
+               requires_restart=True),
+    # 国内区 Key 默认走 minimaxi.com；国际区用户可覆写为 minimax.io 同路径。
+    ConfigSpec("MINIMAX_TEXT_URL", "MiniMax 文本工具端点", "str",
+               "https://api.minimaxi.com/v1/text/chatcompletion_v2",
+               requires_restart=True),
+    ConfigSpec("MINIMAX_TOOL_TIMEOUT", "MiniMax 工具决策超时(秒)", "float", "10",
+               editable=False, hidden=True),
     ConfigSpec("AGENT_MODEL_NAME_MINIMAX", "MiniMax 模型显示名", "str",
-               "MiniMax Realtime", editable=False, hidden=True,
+               "MiniMax Realtime + M3", editable=False, hidden=True,
                requires_restart=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
     ConfigSpec(

@@ -11,9 +11,8 @@ GA 两代事件名，所以事件处理可直接复用。
 
 1. **``session.tools`` 被静默丢弃** —— 扁平/嵌套两种写法、加不加 ``tool_choice``
    都一样，``session.updated`` 回显里没有 ``tools`` 字段，也从不产生
-   ``response.function_call_arguments.done``；模型会明说"无法执行挂断这类操作"。
-   后果：本 provider 下 AI **无法自行挂断电话 / 发短信 / 查验证码 / 发 DTMF**，
-   收尾只能靠 ``OUTBOUND_MAX_SECONDS`` / ``INBOUND_MAX_SECONDS`` 硬时限兜底。
+   ``response.function_call_arguments.done``。本实现因此采用混合模式：Realtime
+   继续听说，文本侧 MiniMax-M3 审计 Realtime 的行动提案并执行注册工具。
 2. **没有服务端 VAD** —— ``turn_detection`` 同样被丢弃；只推
    ``input_audio_buffer.append`` 而不显式 commit 时，20s 内零事件、全程沉默。
    因此断句必须由本端判定：见 :meth:`send_audio` 的能量 VAD。
@@ -36,16 +35,25 @@ GA 两代事件名，所以事件处理可直接复用。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
+import time
 from typing import Any
 
 import numpy as np
 import websockets
 
 from .. import config
-from .openai_agent import OpenAIVoiceAgent
+from .minimax_hybrid import (
+    DEFAULT_TEXT_MODEL,
+    DEFAULT_TEXT_URL,
+    MiniMaxM3ToolRouter,
+    might_request_tool,
+)
+from .openai_agent import OpenAIVoiceAgent, _response_id
+from .tools import SILENT_AFTER_TOOLS, TERMINAL_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +66,13 @@ TRANSCRIPTION_MODEL = "asr-01"
 
 # 服务端默认 "256" 会把电话里的回答截断；协议要求本字段是字符串。
 MAX_RESPONSE_OUTPUT_TOKENS = "1024"
+
+_HYBRID_INSTRUCTIONS = (
+    "\n你具备由外部控制器执行电话工具的能力。需要操作时，先生成一句简短、"
+    "参数明确的行动句：发短信必须说清正文，按电话菜单必须说清按键数字，"
+    "查验证码或转机主必须明确说明，结束通话先自然道别。不要声称工具不可用。"
+    "外部控制器会在播放前审计行动句；执行后以它返回的真实结果为准。"
+)
 
 
 class MiniMaxVoiceAgent(OpenAIVoiceAgent):
@@ -74,7 +89,16 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
     # 说话 Vibe 是 OpenAI 专属，MiniMax 侧无对应能力。
     supports_vibe = False
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        hybrid_tools_enabled: bool = True,
+        text_model: str = DEFAULT_TEXT_MODEL,
+        text_url: str = DEFAULT_TEXT_URL,
+        tool_timeout: float = 10.0,
+        tool_router: MiniMaxM3ToolRouter | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         # ---- 客户端 VAD 状态（见 send_audio）----
         self._vad_lock = threading.Lock()
@@ -82,6 +106,31 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         self._vad_silence_ms = 0.0
         self._vad_utterance_ms = 0.0
         self._vad_response_in_flight = False
+        # ---- MiniMax Realtime + M3 混合工具路由 ----
+        self._hybrid_tools_enabled = hybrid_tools_enabled
+        self._hybrid_tool_timeout = max(1.0, tool_timeout)
+        self._hybrid_router = tool_router or MiniMaxM3ToolRouter(
+            api_key=self.api_key,
+            model=text_model,
+            url=text_url,
+            timeout=self._hybrid_tool_timeout,
+        )
+        self._hybrid_tasks: set[asyncio.Task[Any]] = set()
+        self._hybrid_processed: set[str] = set()
+        self._hybrid_held: set[str] = set()
+        self._hybrid_followup_pending = 0
+
+    def _hybrid_active(self) -> bool:
+        return bool(
+            self._hybrid_tools_enabled
+            and self._tools is not None
+            and self._tools.has_tools()
+        )
+
+    def _spawn_hybrid_task(self, coroutine: Any) -> None:
+        task = asyncio.get_running_loop().create_task(coroutine)
+        self._hybrid_tasks.add(task)
+        task.add_done_callback(self._hybrid_tasks.discard)
 
     # ---- 连接 ----
 
@@ -98,9 +147,12 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         headers = {"Authorization": f"Bearer {self.api_key}"}
         ws = await websockets.connect(self._build_url(), additional_headers=headers)
 
+        instructions = self._instructions
+        if self._hybrid_active():
+            instructions = f"{(instructions or '').rstrip()}{_HYBRID_INSTRUCTIONS}"
         session: dict = {
             "modalities": ["audio", "text"],
-            "instructions": self._instructions,
+            "instructions": instructions,
             "voice": self.voice,
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
@@ -112,11 +164,20 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         self._ws = ws
         self._reset_vad()
 
-        if self._tools is not None and self._tools.has_tools():
+        if self._hybrid_active():
+            logger.info(
+                "MiniMax 混合工具模式已启用: Realtime 听说 + %s 工具决策（%d 个工具）",
+                self._hybrid_router.model,
+                len(self._tools.specs()) if self._tools is not None else 0,
+            )
+            self._emit_trace(
+                "tool_router", "hybrid_ready", "ok",
+                capability="minimax_m3_tools",
+            )
+        elif self._tools is not None and self._tools.has_tools():
             logger.warning(
-                "MiniMax realtime 不支持工具调用（服务端丢弃 session.tools），"
-                "已注册的 %d 个工具本通电话不会生效：AI 无法自行挂断/发短信/发 DTMF，"
-                "收尾依赖 OUTBOUND_MAX_SECONDS / INBOUND_MAX_SECONDS 硬时限",
+                "MiniMax 混合工具模式已关闭；Realtime 会丢弃 session.tools，"
+                "已注册的 %d 个工具本通电话不会生效",
                 len(self._tools.specs()),
             )
         if self._manual_response_enabled:
@@ -239,6 +300,191 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
             self._vad_response_in_flight = False
         super()._on_response_done()
 
+    # ---- Realtime + M3 混合工具路由 ----
+
+    def _finish_spoken_response(self, response_id: str | None, transcript: str) -> None:
+        suppressed = self._audio_gate.complete_transcript(response_id, transcript)
+        self._audio_gate.release_response(response_id)
+        if response_id:
+            self._hybrid_processed.add(response_id)
+            self._hybrid_held.discard(response_id)
+        if not suppressed:
+            self._emit_transcript("agent", transcript)
+
+    def _handle_event(self, event: dict) -> None:
+        event_type = event.get("type", "")
+        active = self._hybrid_active()
+        response_id = _response_id(event)
+
+        if active and event_type in (
+            "response.audio.delta", "response.output_audio.delta",
+        ):
+            self._audio_gate.hold_response(response_id)
+            if response_id:
+                self._hybrid_held.add(response_id)
+
+        if active and event_type in (
+            "response.audio_transcript.done",
+            "response.output_audio_transcript.done",
+        ):
+            transcript = (event.get("transcript") or "").strip()
+            if not transcript:
+                return
+            logger.info("[下行·Agent] %s", transcript)
+            self._emit_trace(
+                "model", "output_transcript_ready", "ok",
+                role="agent", chars=len(transcript),
+            )
+            if self._hybrid_followup_pending > 0:
+                self._hybrid_followup_pending -= 1
+                self._finish_spoken_response(response_id, transcript)
+            elif not might_request_tool(transcript):
+                self._finish_spoken_response(response_id, transcript)
+            else:
+                self._spawn_hybrid_task(
+                    self._route_hybrid_tools(response_id, transcript, self._ws)
+                )
+            return
+
+        super()._handle_event(event)
+
+        if active and event_type == "response.done":
+            # 极少数异常轮次可能只有音频而无 transcript。不能永久扣住声音；
+            # 比 M3 超时多留 1 秒，正常路由任务会先把 response 标为 processed。
+            for held_id in tuple(self._hybrid_held):
+                self._spawn_hybrid_task(self._release_hybrid_timeout(held_id))
+
+    async def _release_hybrid_timeout(self, response_id: str) -> None:
+        await asyncio.sleep(self._hybrid_tool_timeout + 1.0)
+        if response_id in self._hybrid_processed:
+            return
+        logger.warning("MiniMax 混合路由等待转写超时，原语音降级放行")
+        self._emit_trace(
+            "tool_router", "transcript_timeout", "warning",
+            ms=round((self._hybrid_tool_timeout + 1.0) * 1000),
+        )
+        self._audio_gate.release_response(response_id)
+        self._hybrid_processed.add(response_id)
+        self._hybrid_held.discard(response_id)
+
+    async def _route_hybrid_tools(
+        self,
+        response_id: str | None,
+        transcript: str,
+        ws: Any,
+    ) -> None:
+        started = time.monotonic()
+        self._emit_trace("tool_router", "decision_started", "running")
+        try:
+            specs = self._tools.specs() if self._tools is not None else []
+            calls = await asyncio.wait_for(
+                self._hybrid_router.decide(transcript, specs),
+                timeout=self._hybrid_tool_timeout + 0.5,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "MiniMax M3 工具决策失败，原语音降级放行: error_type=%s",
+                type(exc).__name__,
+            )
+            self._emit_trace(
+                "tool_router", "decision_failed", "warning",
+                error_type=type(exc).__name__,
+                ms=round((time.monotonic() - started) * 1000),
+            )
+            self._finish_spoken_response(response_id, transcript)
+            return
+
+        valid_names = {
+            str(spec.get("function", {}).get("name"))
+            for spec in specs
+            if isinstance(spec.get("function"), dict)
+        }
+        calls = [call for call in calls if call.name in valid_names]
+        if not calls:
+            self._emit_trace(
+                "tool_router", "no_tool", "ok",
+                ms=round((time.monotonic() - started) * 1000),
+            )
+            self._finish_spoken_response(response_id, transcript)
+            return
+
+        # 挂断前的自然道别要播放；其他行动句只是控制信号，执行后再根据真实
+        # 结果生成确认，避免对端听到“已发送”但工具实际失败。
+        has_terminal = any(call.name in TERMINAL_TOOLS for call in calls)
+        if has_terminal:
+            self._finish_spoken_response(response_id, transcript)
+        else:
+            self._audio_gate.drop_response(response_id)
+            if response_id:
+                self._hybrid_processed.add(response_id)
+                self._hybrid_held.discard(response_id)
+
+        results: list[tuple[str, dict[str, Any]]] = []
+        for call in calls:
+            if call.call_id in self._handled_tool_calls:
+                continue
+            self._handled_tool_calls.add(call.call_id)
+            self._emit_trace("tool", "requested", "running", tool=call.name)
+            try:
+                if self._tools is None:
+                    result = {"success": False, "message": "无可用工具"}
+                else:
+                    result = await asyncio.to_thread(
+                        self._tools.dispatch, call.name, call.arguments
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("MiniMax 混合工具 %s 执行异常", call.name)
+                result = {"success": False, "message": f"工具执行异常: {exc}"}
+            self._emit_trace(
+                "tool", "completed",
+                "ok" if result.get("success") is True else "error",
+                tool=call.name,
+            )
+            results.append((call.name, result))
+
+        self._emit_trace(
+            "tool_router", "decision_completed", "ok",
+            ms=round((time.monotonic() - started) * 1000),
+        )
+        needs_followup = any(
+            name not in TERMINAL_TOOLS and name not in SILENT_AFTER_TOOLS
+            for name, _result in results
+        )
+        if needs_followup and ws is self._ws:
+            await self._request_hybrid_followup(results, ws)
+
+    async def _request_hybrid_followup(
+        self,
+        results: list[tuple[str, dict[str, Any]]],
+        ws: Any,
+    ) -> None:
+        safe_results = [
+            {"tool": name, "result": result}
+            for name, result in results
+        ]
+        instruction = (
+            "[hybrid_tool_result] 以下是刚才工具的真实结果："
+            f"{json.dumps(safe_results, ensure_ascii=False)}。"
+            "请只根据真实结果用一句简短中文告诉对方，不要再次调用或提议同一工具。"
+        )
+        self._hybrid_followup_pending += 1
+        try:
+            await ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": self._context_item(instruction, role="user"),
+            }))
+            await ws.send(json.dumps({"type": "response.create"}))
+        except Exception as exc:  # noqa: BLE001
+            self._hybrid_followup_pending = max(0, self._hybrid_followup_pending - 1)
+            logger.warning(
+                "MiniMax 混合工具结果回注失败: error_type=%s",
+                type(exc).__name__,
+            )
+            self._emit_trace(
+                "tool_router", "followup_failed", "warning",
+                error_type=type(exc).__name__,
+            )
+
     # ---- 上下文与主动说话 ----
 
     @staticmethod
@@ -307,3 +553,15 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
             logger.warning("写入外部工具结果失败: error_type=%s", type(exc).__name__)
             return False
         return True
+
+    async def stop(self) -> None:
+        tasks = list(self._hybrid_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._hybrid_tasks.clear()
+        self._hybrid_processed.clear()
+        self._hybrid_held.clear()
+        self._hybrid_followup_pending = 0
+        await super().stop()

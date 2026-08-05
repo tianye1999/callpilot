@@ -61,14 +61,8 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
         )
 
     if selected == "minimax":
-        # 实测能力边界（见 minimax_agent 模块 docstring）：realtime 端点静默丢弃
-        # session.tools，AI 无法自行挂断/发短信/发 DTMF；且无服务端 VAD，断句由
-        # agent 内的能量 VAD 负责。选它之前要清楚这两条。
-        logger.warning(
-            "MiniMax provider 不支持工具调用：AI 无法自行挂断电话或发短信，"
-            "通话收尾依赖 OUTBOUND_MAX_SECONDS / INBOUND_MAX_SECONDS 硬时限；"
-            "需要完整工具能力请用 qwen 或 openai"
-        )
+        # Realtime 端点本身丢弃 session.tools；MiniMaxVoiceAgent 用 M3 文本接口
+        # 审计 Realtime 的行动提案并分发到同一个 ToolRegistry。
         return MiniMaxVoiceAgent(
             # API Key 属凭证不走注册表默认值：缺失即 KeyError fail-fast。
             api_key=os.environ["MINIMAX_API_KEY"],
@@ -76,6 +70,10 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
             model_display_name=config.get_str("AGENT_MODEL_NAME_MINIMAX"),
             voice=config.get_str("MINIMAX_VOICE"),
             realtime_url=config.get_str("MINIMAX_REALTIME_URL") or None,
+            hybrid_tools_enabled=config.get_bool("MINIMAX_HYBRID_TOOLS_ENABLED"),
+            text_model=config.get_str("MINIMAX_TEXT_MODEL"),
+            text_url=config.get_str("MINIMAX_TEXT_URL"),
+            tool_timeout=config.get_float("MINIMAX_TOOL_TIMEOUT"),
         )
 
     raise ValueError(

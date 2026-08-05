@@ -1502,6 +1502,9 @@ const I18N = {
       OPENAI_API_KEY: "OpenAI API key",
       MINIMAX_API_KEY: "MiniMax API key", MINIMAX_REALTIME_MODEL: "MiniMax realtime model",
       MINIMAX_VOICE: "MiniMax voice", MINIMAX_REALTIME_URL: "MiniMax realtime endpoint override",
+      MINIMAX_HYBRID_TOOLS_ENABLED: "MiniMax M3 hybrid tools",
+      MINIMAX_TEXT_MODEL: "MiniMax tool-routing model",
+      MINIMAX_TEXT_URL: "MiniMax text tool endpoint",
       MINIMAX_VAD_RMS_THRESHOLD: "MiniMax turn-end energy threshold",
       MINIMAX_RECONNECT_MAX: "MiniMax max reconnects",
       OPENAI_REALTIME_MODEL: "OpenAI realtime model", OPENAI_VOICE: "OpenAI voice", OPENAI_VIBE: "OpenAI vibe",
@@ -3549,7 +3552,7 @@ const truthy = ["true", "1", "yes"];
 const boolChecked = (v) => truthy.includes(String(v).trim().toLowerCase());
 function cfgGroup(key) {
   if (/^(OWNER_NAME|AGENT_PERSONA|AGENT_LANGUAGE)$/.test(key)) return t("grp_identity");
-  if (/^(AGENT_PROVIDER|QWEN_|OPENAI_|AGENT_MODEL|AGENT_OUTBOUND|DASHSCOPE)/.test(key)) return t("grp_ai");
+  if (/^(AGENT_PROVIDER|QWEN_|OPENAI_|MINIMAX_|AGENT_MODEL|AGENT_OUTBOUND|DASHSCOPE)/.test(key)) return t("grp_ai");
   if (/^MODEM_/.test(key)) return t("grp_modem");
   if (/^(RECORDING_|SUMMARY_|CALL_LOG|HALF_DUPLEX|HANGUP_)/.test(key)) return t("grp_call");
   if (/^MONITOR_/.test(key)) return t("grp_monitor");

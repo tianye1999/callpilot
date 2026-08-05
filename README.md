@@ -96,15 +96,13 @@ v0.4.0 adds several call-quality controls for outbound work:
   `.env` / Settings.
 - **MiniMax provider** (`AGENT_PROVIDER=minimax`): speaks the OpenAI Realtime
   *beta* protocol at `wss://api.minimaxi.com/ws/v1/realtime`, bidirectional
-  pcm16 @ 24 kHz with built-in ASR. The key is configurable from Settings and
-  the first-run wizard (validated online). **Two hard limits, both measured on
-  the live endpoint:** it silently drops `session.tools`, so the AI cannot hang
-  up, send SMS, look up a verification code or dial DTMF on its own — calls end
-  on the `OUTBOUND_MAX_SECONDS` / `INBOUND_MAX_SECONDS` backstop; and it has no
-  server-side VAD, so turn-taking is done by a local energy VAD
+  pcm16 @ 24 kHz with built-in ASR. Hybrid tools are enabled by default:
+  Realtime handles listening/speech, while `MiniMax-M3` audits explicit action
+  proposals through the text API and dispatches the existing local tools. M3
+  does not receive raw call audio; router failures fail open to normal Realtime
+  speech. The live endpoint still has no server-side VAD, so turn-taking uses a local energy VAD
   (`MINIMAX_VAD_RMS_THRESHOLD` plus the `MANUAL_RESPONSE_*` windows). It also
   emits no user-side transcription event, so summaries only see the agent side.
-  Pick Qwen or OpenAI when you need tools.
 
 ### Hardware & platform support
 
@@ -439,11 +437,11 @@ v0.4.0 增加了几项面向外呼质量的控制：
 - **MiniMax provider**（`AGENT_PROVIDER=minimax`）：端点
   `wss://api.minimaxi.com/ws/v1/realtime` 说的是 OpenAI Realtime **beta** 协议，
   双向 pcm16 @ 24kHz，自带 ASR。Key 可在设置面板与首启向导里填（带在线校验）。
-  **两条硬限制，均为真机实测**：该端点静默丢弃 `session.tools`，AI 无法自行挂断、
-  发短信、查验证码或发 DTMF —— 通话收尾只能靠 `OUTBOUND_MAX_SECONDS` /
-  `INBOUND_MAX_SECONDS` 兜底；且没有服务端 VAD，断句由本端能量 VAD 负责
+  默认开启混合工具模式：Realtime 负责听说，`MiniMax-M3` 通过文本接口审计明确的
+  行动提案，再调用现有本地工具完成挂断、短信、验证码或 DTMF。M3 不直接接收电话
+  音频；路由异常时会降级为普通 Realtime 对话。该端点没有服务端 VAD，断句由本端能量 VAD 负责
   （`MINIMAX_VAD_RMS_THRESHOLD` 配合 `MANUAL_RESPONSE_*` 两个窗口）。它也不发
-  用户侧转写事件，通话摘要只看得到 Agent 一侧。需要工具能力请用 Qwen 或 OpenAI。
+  用户侧转写事件，通话摘要只看得到 Agent 一侧。
 
 ### 硬件与平台支持
 

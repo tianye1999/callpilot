@@ -897,11 +897,10 @@ def test_panel_marks_doubao_choice_experimental():
     assert provider["choices"] == ["qwen", "doubao", "openai", "minimax", "local"]
 
 
-def test_panel_warns_minimax_has_no_tool_calling():
-    """能力缺口必须在选项里就看得见：选了 minimax 的人 AI 挂不了电话。"""
+def test_panel_describes_minimax_hybrid_tool_calling():
     rows = {row["key"]: row for row in read_panel_values()}
     label = rows["AGENT_PROVIDER"]["choice_labels"]["minimax"]
-    assert "无工具调用" in label
+    assert "Realtime + M3 混合工具" in label
 
 
 def test_minimax_credentials_and_secret_mask(monkeypatch):
@@ -1042,7 +1041,7 @@ def test_every_provider_choice_has_a_model_display_name():
 def test_model_display_name_per_provider(monkeypatch):
     _unset(monkeypatch, "AGENT_MODEL_NAME", "AGENT_MODEL_NAME_OPENAI",
            "AGENT_MODEL_NAME_MINIMAX", "AGENT_MODEL_NAME_DOUBAO")
-    assert config.model_display_name("minimax") == "MiniMax Realtime"
+    assert config.model_display_name("minimax") == "MiniMax Realtime + M3"
     assert config.model_display_name("openai") == "OpenAI Realtime"
     assert config.model_display_name("qwen") == "Qwen3.5-Omni"
     # 未知 provider 回落 qwen，不抛

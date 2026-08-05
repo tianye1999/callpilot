@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 
@@ -16,7 +17,8 @@ import pytest
 
 from agentcall.agents import factory, minimax_agent
 from agentcall.agents.minimax_agent import MiniMaxVoiceAgent
-from agentcall.agents.tools import SEND_DTMF_SPEC, ToolRegistry
+from agentcall.agents.minimax_hybrid import MiniMaxM3ToolRouter
+from agentcall.agents.tools import SEND_DTMF_SPEC, SEND_SMS_SPEC, ToolRegistry
 
 
 class _FakeWs:
@@ -125,19 +127,22 @@ def test_url_override_used_verbatim(monkeypatch):
     assert calls[0][0] == "wss://proxy.example/ws/v1/realtime"
 
 
-def test_tools_are_not_sent_and_gap_is_logged(monkeypatch, caplog):
-    """服务端丢弃 tools：不发才不会让日志假报"已注册工具"，并显式告警。"""
+def test_tools_are_not_sent_but_hybrid_router_is_enabled(monkeypatch, caplog):
+    """Realtime 不发 tools；工具由独立 M3 文本路由器接管。"""
     instances, _calls = _patch_connect(monkeypatch)
     agent = _make_agent()
     registry = ToolRegistry()
-    registry.register(SEND_DTMF_SPEC, lambda **_kwargs: {"success": True})
+    registry.register(SEND_DTMF_SPEC, lambda _args: {"success": True})
     agent.set_tools(registry)
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         asyncio.run(agent.start(lambda _pcm: None))
 
     assert "tools" not in instances[0].first("session.update")["session"]
-    assert any("不支持工具调用" in record.getMessage() for record in caplog.records)
+    assert any("混合工具模式已启用" in record.getMessage() for record in caplog.records)
+    instructions = instances[0].first("session.update")["session"]["instructions"]
+    assert "MiniMax-M3" not in instructions  # 提示能力，不把具体路由模型硬编码给语音端
+    assert "外部控制器" in instructions
 
 
 def test_say_writes_context_item_then_creates_response(monkeypatch):
@@ -194,6 +199,173 @@ def test_vibe_line_not_applied(monkeypatch):
     asyncio.run(agent.start(lambda _pcm: None))
 
     assert instances[0].first("session.update")["session"]["instructions"] == "你是电话助手。"
+
+
+# ---- M3 混合工具路由 ----
+
+
+def test_m3_router_sends_official_tool_shape_and_parses_calls():
+    captured: list[dict] = []
+
+    def fake_post(payload: dict) -> dict:
+        captured.append(payload)
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "send_dtmf",
+                            "arguments": json.dumps({"digits": "1"}),
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+
+    router = MiniMaxM3ToolRouter(
+        api_key="sk-test", post_json=fake_post,
+    )
+    calls = asyncio.run(router.decide("准备按键 1", [SEND_DTMF_SPEC]))
+
+    assert captured[0]["model"] == "MiniMax-M3"
+    assert captured[0]["tool_choice"] == "auto"
+    assert captured[0]["tools"] == [SEND_DTMF_SPEC]
+    assert calls[0].name == "send_dtmf"
+    assert calls[0].arguments == {"digits": "1"}
+
+
+def test_hybrid_dtmf_drops_action_audio_and_dispatches_silently():
+    dispatched: list[dict] = []
+
+    def fake_post(_payload: dict) -> dict:
+        return {
+            "choices": [{"message": {"tool_calls": [{
+                "id": "call-dtmf-1",
+                "type": "function",
+                "function": {"name": "send_dtmf", "arguments": '{"digits":"1"}'},
+            }]}}],
+        }
+
+    router = MiniMaxM3ToolRouter(api_key="sk-test", post_json=fake_post)
+    agent = _make_agent(tool_router=router)
+    registry = ToolRegistry()
+    registry.register(
+        SEND_DTMF_SPEC,
+        lambda args: dispatched.append(args) or {"success": True, "mode": "inband"},
+    )
+    agent.set_tools(registry)
+    emitted: list[bytes] = []
+    transcripts: list[tuple[str, str]] = []
+    agent._on_audio_out = emitted.append
+    agent.set_transcript_handler(lambda role, text: transcripts.append((role, text)))
+    agent._ws = _FakeWs()
+
+    async def scenario() -> None:
+        agent._handle_event({
+            "type": "response.audio.delta",
+            "response_id": "r1",
+            "delta": base64.b64encode(b"not for caller").decode(),
+        })
+        agent._handle_event({
+            "type": "response.audio_transcript.done",
+            "response_id": "r1",
+            "transcript": "好的，准备按键 1。",
+        })
+        await asyncio.gather(*list(agent._hybrid_tasks))
+
+    asyncio.run(scenario())
+
+    assert dispatched == [{"digits": "1"}]
+    assert emitted == []
+    assert transcripts == []
+    assert agent._ws.sent == []  # DTMF 后等待 IVR，不生成抢话式确认
+
+
+def test_hybrid_sms_uses_real_result_for_followup():
+    def fake_post(_payload: dict) -> dict:
+        return {
+            "choices": [{"message": {"tool_calls": [{
+                "id": "call-sms-1",
+                "type": "function",
+                "function": {
+                    "name": "send_sms",
+                    "arguments": '{"content":"会议改到三点"}',
+                },
+            }]}}],
+        }
+
+    agent = _make_agent(
+        tool_router=MiniMaxM3ToolRouter(api_key="sk-test", post_json=fake_post)
+    )
+    registry = ToolRegistry()
+    registry.register(
+        SEND_SMS_SPEC,
+        lambda _args: {"success": False, "message": "短信发送失败"},
+    )
+    agent.set_tools(registry)
+    agent._on_audio_out = lambda _pcm: None
+    ws = _FakeWs()
+    agent._ws = ws
+
+    async def scenario() -> None:
+        agent._handle_event({
+            "type": "response.audio.delta",
+            "response_id": "r2",
+            "delta": base64.b64encode(b"premature success").decode(),
+        })
+        agent._handle_event({
+            "type": "response.audio_transcript.done",
+            "response_id": "r2",
+            "transcript": "我现在发送短信：会议改到三点。",
+        })
+        await asyncio.gather(*list(agent._hybrid_tasks))
+
+    asyncio.run(scenario())
+
+    assert ws.sent_types() == ["conversation.item.create", "response.create"]
+    result_prompt = ws.sent[0]["item"]["content"][0]["text"]
+    assert "短信发送失败" in result_prompt
+    assert agent._hybrid_followup_pending == 1
+
+
+def test_hybrid_router_failure_fails_open_to_realtime_audio():
+    def broken_post(_payload: dict) -> dict:
+        raise TimeoutError("text endpoint unavailable")
+
+    agent = _make_agent(
+        tool_router=MiniMaxM3ToolRouter(api_key="sk-test", post_json=broken_post)
+    )
+    registry = ToolRegistry()
+    registry.register(SEND_DTMF_SPEC, lambda _args: {"success": True})
+    agent.set_tools(registry)
+    emitted: list[bytes] = []
+    transcripts: list[tuple[str, str]] = []
+    agent._on_audio_out = emitted.append
+    agent.set_transcript_handler(lambda role, text: transcripts.append((role, text)))
+    agent._ws = _FakeWs()
+
+    async def scenario() -> None:
+        agent._handle_event({
+            "type": "response.audio.delta",
+            "response_id": "r3",
+            "delta": base64.b64encode(b"fallback speech").decode(),
+        })
+        agent._handle_event({
+            "type": "response.audio_transcript.done",
+            "response_id": "r3",
+            "transcript": "请按键 1。",
+        })
+        await asyncio.gather(*list(agent._hybrid_tasks))
+
+    asyncio.run(scenario())
+
+    assert emitted == [b"fallback speech"]
+    assert transcripts == [("agent", "请按键 1。")]
 
 
 # ---- 客户端 VAD（MiniMax 无服务端 VAD，不断句就全程沉默）----

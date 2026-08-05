@@ -126,6 +126,10 @@ class ResponseAudioGate:
         self._pending: dict[str, list[bytes]] = {}
         self._allowed: set[str] = set()
         self._suppressed: set[str] = set()
+        # Provider 可在 transcript 已知后再做一次异步裁决（例如 MiniMax
+        # Realtime + M3 混合工具路由）。hold 期间 response.done 也不能提前
+        # 把音频放出去；裁决完成后显式 release/drop。
+        self._held: set[str] = set()
 
     def push_audio(self, response_id: str | None, chunk: bytes) -> None:
         if not chunk:
@@ -170,13 +174,39 @@ class ResponseAudioGate:
     def complete_response(self, response_id: str | None) -> None:
         if not response_id:
             return
+        if response_id in self._held:
+            return
         self._flush(response_id)
         self._suppressed.discard(response_id)
 
+    def hold_response(self, response_id: str | None) -> None:
+        """Hold one response until an asynchronous provider decision finishes."""
+        if response_id:
+            self._held.add(response_id)
+
+    def release_response(self, response_id: str | None) -> None:
+        """Release a previously held response, preserving repeat suppression."""
+        if not response_id:
+            return
+        self._held.discard(response_id)
+        if response_id not in self._suppressed:
+            self._flush(response_id)
+
+    def drop_response(self, response_id: str | None) -> None:
+        """Drop all audio for a held response (the text was an internal action)."""
+        if not response_id:
+            return
+        self._held.discard(response_id)
+        self._pending.pop(response_id, None)
+        self._allowed.discard(response_id)
+        self._suppressed.add(response_id)
+
     def _flush(self, response_id: str) -> None:
-        chunks = self._pending.pop(response_id, [])
         self._allowed.add(response_id)
         self._suppressed.discard(response_id)
+        if response_id in self._held:
+            return
+        chunks = self._pending.pop(response_id, [])
         for chunk in chunks:
             self._emit_audio(chunk)
 
