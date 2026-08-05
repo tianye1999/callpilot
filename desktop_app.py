@@ -241,23 +241,75 @@ def ensure_service_running(
 
 
 def build_error_html(web_url: str, log_path: str, start_cmd: str) -> str:
-    """生成「服务启动失败」错误提示窗的 HTML（含手动启动命令）。"""
+    """生成「服务启动失败」错误提示窗；命令和日志路径可选中、可一键复制。"""
     esc = html_escape.escape
     return f"""
-<div style="font-family: -apple-system, 'PingFang SC', sans-serif;
-            max-width: 620px; margin: 60px auto; padding: 0 24px; color: #333;">
-  <h1 style="font-size: 22px;">AgentCall 服务未能启动</h1>
+<style>
+  body {{ margin: 0; }}
+  .error-page {{
+    font-family: -apple-system, 'PingFang SC', sans-serif;
+    max-width: 760px; margin: 48px auto; padding: 0 24px; color: #333;
+  }}
+  .error-page h1 {{ font-size: 22px; }}
+  .copy-box {{ position: relative; margin: 12px 0 24px; }}
+  .copy-box pre {{
+    box-sizing: border-box; margin: 0; padding: 14px 88px 14px 16px;
+    border-radius: 8px; background: #f4f4f4; font-size: 13px;
+    line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere;
+    word-break: break-word; -webkit-user-select: text; user-select: text;
+  }}
+  .copy-box code {{ -webkit-user-select: text; user-select: text; }}
+  .copy-button {{
+    position: absolute; top: 9px; right: 9px; min-width: 64px;
+    padding: 7px 10px; border: 1px solid #ccc; border-radius: 7px;
+    background: #fff; color: #333; cursor: pointer; font-size: 13px;
+  }}
+  .copy-button:hover {{ background: #e9e9e9; }}
+</style>
+<div class="error-page">
+  <h1>AgentCall 服务未能启动</h1>
   <p>桌面窗口尝试自动拉起后端服务，但等待超时或拉起失败。</p>
   <p>请在终端手动启动服务后重新打开本窗口：</p>
-  <pre style="background: #f4f4f4; padding: 12px 16px; border-radius: 8px;
-              overflow-x: auto; font-size: 13px;">{esc(start_cmd)}</pre>
+  <div class="copy-box">
+    <pre><code id="start-command">{esc(start_cmd)}</code></pre>
+    <button class="copy-button" type="button"
+            onclick="copyText('start-command', this)">复制</button>
+  </div>
   <p>启动报错可查看控制台日志：</p>
-  <pre style="background: #f4f4f4; padding: 12px 16px; border-radius: 8px;
-              overflow-x: auto; font-size: 13px;">{esc(log_path)}</pre>
+  <div class="copy-box">
+    <pre><code id="log-path">{esc(log_path)}</code></pre>
+    <button class="copy-button" type="button"
+            onclick="copyText('log-path', this)">复制</button>
+  </div>
   <p style="color: #888; font-size: 13px;">
     服务就绪后也可直接用浏览器访问 <a href="{esc(web_url)}">{esc(web_url)}</a>。
   </p>
 </div>
+<script>
+  async function copyText(elementId, button) {{
+    const value = document.getElementById(elementId).textContent;
+    let copied = false;
+    if (navigator.clipboard && window.isSecureContext) {{
+      try {{
+        await navigator.clipboard.writeText(value);
+        copied = true;
+      }} catch (_error) {{}}
+    }}
+    if (!copied) {{
+      const helper = document.createElement('textarea');
+      helper.value = value;
+      helper.setAttribute('readonly', '');
+      helper.style.position = 'fixed';
+      helper.style.opacity = '0';
+      document.body.appendChild(helper);
+      helper.select();
+      try {{ copied = document.execCommand('copy'); }} catch (_error) {{}}
+      helper.remove();
+    }}
+    button.textContent = copied ? '已复制' : '复制失败';
+    window.setTimeout(() => {{ button.textContent = '复制'; }}, 1500);
+  }}
+</script>
 """
 
 

@@ -320,7 +320,28 @@ def test_main_startup_timeout_shows_error_window(monkeypatch, tmp_path):
     assert win["html"] is not None
     assert "app.py" in win["html"]  # 提示了手动启动命令
     assert "console.log" in win["html"]  # 提示了日志位置
+    assert win["html"].count(">复制</button>") == 2
     assert fake.start_count == 1
+
+
+def test_error_html_supports_copy_selection_wrapping_and_escapes_values():
+    page = desktop_app.build_error_html(
+        "http://127.0.0.1:47100/?x=<unsafe>",
+        "/tmp/<log>.txt",
+        'python "<app.py>" --service',
+    )
+
+    assert 'id="start-command"' in page
+    assert 'id="log-path"' in page
+    assert "navigator.clipboard.writeText" in page
+    assert "document.execCommand('copy')" in page
+    assert "user-select: text" in page
+    assert "white-space: pre-wrap" in page
+    assert "overflow-wrap: anywhere" in page
+    assert "<unsafe>" not in page
+    assert "<app.py>" not in page
+    assert "&lt;unsafe&gt;" in page
+    assert "&lt;app.py&gt;" in page
 
 
 # ---- pywebview 缺失 ----
