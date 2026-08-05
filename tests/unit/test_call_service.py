@@ -46,6 +46,7 @@ class FakeSmsEmailForwarder:
         self.enqueued: list[tuple[str | None, str]] = []
         self.history_at_enqueue: list[dict] = []
         self.stopped = False
+        self.stop_timeout: float | None = None
 
     def enqueue(self, sender: str | None, body: str, **_kwargs) -> bool:
         self.enqueued.append((sender, body))
@@ -55,6 +56,7 @@ class FakeSmsEmailForwarder:
 
     def stop(self, timeout: float = 2.0) -> None:
         self.stopped = True
+        self.stop_timeout = timeout
 
 
 class SpyCallRecord:
@@ -156,7 +158,18 @@ def test_stop_service_stops_sms_email_worker():
     service.stop_service()
 
     assert forwarder.stopped is True
+    assert forwarder.stop_timeout == 16.0
     assert ("close", ()) in modem.calls
+
+
+def test_stop_service_can_bound_sms_email_shutdown_for_interactive_restart():
+    modem = FakeModem()
+    forwarder = FakeSmsEmailForwarder()
+    service = make_service(modem, sms_email_forwarder=forwarder)
+
+    service.stop_service(email_timeout=2.0)
+
+    assert forwarder.stop_timeout == 2.0
 
 
 # ---- 外呼互斥与等待接通 ----

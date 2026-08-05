@@ -242,6 +242,11 @@ def build_app(
     app["modem"] = modem
     app["service"] = service
     app["meta"] = meta or {}
+    # 每次服务进程启动都有独立标识。前端重启流程不能只看 /api/meta 是否
+    # 返回 200：旧进程在清理模组/录音/WebSocket 时仍可能短暂健康，若此时
+    # 刷新，随后旧进程退出，页面就会永远停在 Loading。实例标识让前端能
+    # 明确等到“新进程”而不是“旧进程尚未退出”。
+    app["instance_id"] = secrets.token_urlsafe(12)
     # 由 app.py 传入的 threading.Event；置位后主循环停止、清理并按运行方式重启。
     app["restart_event"] = restart_event
     app["setup_sms_token"] = [secrets.token_urlsafe(24)]
@@ -347,6 +352,7 @@ async def _remote_dialer_asset(request: web.Request) -> web.StreamResponse:
 
 async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
+    meta["instance_id"] = request.app["instance_id"]
     service = request.app.get("service")
     meta["credentials"] = config.credential_status(meta.get("provider"))
     meta["setup_required"] = config.setup_required()
@@ -1144,7 +1150,9 @@ async def _restart(request: web.Request) -> web.Response:
     restart_event.set()
     loop = asyncio.get_running_loop()
     loop.call_later(0.4, loop.stop)
-    return web.json_response({"ok": True})
+    return web.json_response(
+        {"ok": True, "instance_id": request.app["instance_id"]}
+    )
 
 
 async def _post_config(request: web.Request) -> web.Response:

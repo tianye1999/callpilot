@@ -1285,7 +1285,7 @@ const I18N = {
     batch_ok: "Start dialing",
     restart_title: "Restarting service…",
     restart_msg: "Applying settings that need a restart. This takes a few seconds.",
-    restart_timeout: "Taking longer than expected — please reload the page manually.",
+    restart_timeout: "Restart is taking longer than expected. Still waiting for the service…",
     who_user: "Caller", who_agent: "AI Pilot",
     sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
@@ -1469,7 +1469,7 @@ const I18N = {
     batch_ok: "开始拨打",
     restart_title: "正在重启服务…",
     restart_msg: "正在应用需要重启的设置，请稍候几秒。",
-    restart_timeout: "重启耗时较长，请手动刷新页面。",
+    restart_timeout: "重启耗时较长，仍在等待服务恢复…",
     who_user: "对方", who_agent: "AI 副驾",
     sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
@@ -3320,15 +3320,45 @@ async function restartService() {
   $("restartTitle").textContent = t("restart_title");
   $("restartMsg").textContent = t("restart_msg");
   $("restartOverlay").classList.add("show");
-  try { await postJson("/api/restart", {}); } catch (e) { console.warn("[restart] 请求失败", e); }
+  let previousInstanceId = null;
+  let observedUnavailable = false;
+  // 先记住旧实例。服务可能在 /api/restart 响应完全送达前就开始关停，
+  // 即使 POST 因连接中断报错，也仍应继续等待已经启动的重启流程。
+  try {
+    const before = await fetch("/api/meta", { cache: "no-store" });
+    if (before.ok) previousInstanceId = (await before.json()).instance_id || null;
+  } catch (e) { console.warn("[restart] 读取旧实例失败", e); }
+  try {
+    const { httpOk, res } = await postJson("/api/restart", {});
+    if (!httpOk || !res.ok) throw new Error(res.error || `HTTP ${res.status || "error"}`);
+    previousInstanceId = res.instance_id || previousInstanceId;
+  } catch (e) {
+    console.warn("[restart] 请求失败", e);
+  }
   const deadline = Date.now() + 40000;
   const poll = async () => {
     try {
       const r = await fetch("/api/meta", { cache: "no-store" });
-      if (r.ok) { location.reload(); return; }
-    } catch (e) { /* 重启窗口内连接中断属正常 */ }
-    if (Date.now() < deadline) setTimeout(poll, 1200);
-    else $("restartMsg").textContent = t("restart_timeout");
+      if (r.ok) {
+        const meta = await r.json();
+        // 新版后端用 instance_id 精确识别新进程；兼容旧后端时至少先观察到
+        // 一次连接中断，再把恢复的 200 当成重启完成。
+        const isNewInstance = previousInstanceId && meta.instance_id
+          ? meta.instance_id !== previousInstanceId
+          : observedUnavailable;
+        if (isNewInstance) { location.reload(); return; }
+      } else {
+        observedUnavailable = true;
+      }
+    } catch (e) { observedUnavailable = true; /* 重启窗口内连接中断属正常 */ }
+    if (Date.now() < deadline) {
+      setTimeout(poll, 1200);
+    } else {
+      // 后端受串口/网络清理拖延时可能超过 40 秒；提示变更后继续低频探测，
+      // 避免服务已经恢复但页面永久停在重启遮罩。
+      $("restartMsg").textContent = t("restart_timeout");
+      setTimeout(poll, 3000);
+    }
   };
   setTimeout(poll, 2500);  // 给进程 execv 重启留出时间再开始轮询
 }

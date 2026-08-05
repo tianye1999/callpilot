@@ -2937,8 +2937,12 @@ class CallAgentService:
         else:
             logger.warning("模组连接已断开: disconnected_at=%s", event["disconnected_at"])
 
-    def stop_service(self) -> None:
-        """停止 supervisor 与当前会话，关闭模组（供退出时调用）。"""
+    def stop_service(self, *, email_timeout: float = 16.0) -> None:
+        """停止 supervisor 与当前会话，关闭模组（供退出时调用）。
+
+        ``email_timeout`` 允许交互式重启缩短短信邮件 worker 的收尾等待；
+        普通退出仍保留完整的 SMTP 超时窗口，尽量让在途邮件发送完成。
+        """
         self._service_running = False
         worker = self._remote_worker
         if worker is not None:
@@ -2946,7 +2950,7 @@ class CallAgentService:
         self.session.stop()
         self.modem.close()
         try:
-            self.sms_email_forwarder.stop()
+            self.sms_email_forwarder.stop(timeout=email_timeout)
         except Exception as exc:  # noqa: BLE001
             logger.warning("停止短信邮件转发 worker 失败: error_type=%s", type(exc).__name__)
 

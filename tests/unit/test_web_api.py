@@ -1482,9 +1482,13 @@ def test_restart_sets_event_and_returns_ok():
     ev = threading.Event()
     app = _build(hub=None, modem=None, service=FakeService(), restart_event=ev)
     async def fn(client):
+        meta_resp = await client.get("/api/meta")
+        instance_id = (await meta_resp.json())["instance_id"]
         resp = await client.post("/api/restart", json={})
         assert resp.status == 200
-        assert (await resp.json())["ok"] is True
+        body = await resp.json()
+        assert body["ok"] is True
+        assert body["instance_id"] == instance_id
     api(app, fn)
     assert ev.is_set()
 

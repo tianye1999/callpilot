@@ -307,7 +307,9 @@ def main() -> None:
             prewarm_thread.stop_event.set()
         if cloud_client is not None:
             cloud_client.stop()
-        service.stop_service()
+        # UI 重启不能被 SMTP 的 16 秒网络超时拖到前端 40 秒超时边缘；
+        # 普通退出仍使用完整等待，只有明确的重启请求走 2 秒快速收尾。
+        service.stop_service(email_timeout=2.0 if restart_event.is_set() else 16.0)
         if service.monitor is not None:
             service.monitor.stop()
         if service.uplink_monitor is not None:
