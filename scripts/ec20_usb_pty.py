@@ -363,29 +363,65 @@ def write_bulk_with_recovery(
     endpoint: int,
     data: bytes,
 ) -> bool:
-    """写一个 bulk chunk；仅在明确 STALL/PIPE 时清 halt 并重试一次。
+    """无损写完一个 bulk chunk；仅在明确 STALL/PIPE 时清 halt 并重试。
 
     返回值表示本次是否走过恢复路径。重试仍超时则把 ``USBTimeoutError``
     交给调用方累计；普通 timeout 是持续 NAK，不等于 endpoint halt，不能
     每帧都 clear_halt。clear_halt 本身失败表示端点无法恢复，转换成独立
     异常，避免被普通写超时容忍逻辑吞掉。
+
+    PyUSB 的 ``write`` 返回实际传输长度，不保证必然等于请求长度。PCM 不能
+    丢短写尾部，否则一次奇数字节缺口会让模组侧的 int16 流永久错位。
     """
-    try:
-        dev.write(endpoint, data, timeout=WRITE_TIMEOUT_MS)
-        return False
-    except usb.core.USBTimeoutError:
-        raise
-    except usb.core.USBError as exc:
-        if exc.errno != errno.EPIPE:
-            raise
+    view = memoryview(data)
+    offset = 0
+    recovered = False
+    while offset < len(view):
+        payload = view[offset:]
         try:
-            dev.clear_halt(endpoint)
-        except usb.core.USBError as clear_exc:
+            written = int(dev.write(endpoint, payload, timeout=WRITE_TIMEOUT_MS))
+        except usb.core.USBTimeoutError:
+            raise
+        except usb.core.USBError as exc:
+            if exc.errno != errno.EPIPE:
+                raise
+            try:
+                dev.clear_halt(endpoint)
+            except usb.core.USBError as clear_exc:
+                raise EndpointRecoveryError(
+                    f"endpoint 0x{endpoint:02x} clear_halt 失败: {clear_exc}"
+                ) from clear_exc
+            recovered = True
+            written = int(dev.write(endpoint, payload, timeout=WRITE_TIMEOUT_MS))
+        if written <= 0 or written > len(payload):
             raise EndpointRecoveryError(
-                f"endpoint 0x{endpoint:02x} clear_halt 失败: {clear_exc}"
-            ) from clear_exc
-        dev.write(endpoint, data, timeout=WRITE_TIMEOUT_MS)
-        return True
+                f"endpoint 0x{endpoint:02x} 返回异常写入长度 {written}/{len(payload)}"
+            )
+        offset += written
+    return recovered
+
+
+def write_all_fd(fd: int, data: bytes) -> bool:
+    """把一整个 USB chunk 无损写进 PTY，返回是否发生过短写。
+
+    ``os.write`` 即使在阻塞 fd 上也允许只接收一部分数据。PCM 是连续的
+    16-bit little-endian 字节流：若忽略一次奇数字节短写，后续每个采样都会
+    错一字节并立即变成满幅宽带噪声。必须循环写完，而不能把返回值当成功标志。
+    """
+    view = memoryview(data)
+    offset = 0
+    short_write = False
+    while offset < len(view):
+        try:
+            written = os.write(fd, view[offset:])
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError(errno.EIO, "PTY write returned no progress")
+        offset += written
+        if offset < len(view):
+            short_write = True
+    return short_write
 
 
 def drain_interrupt_notifications(
@@ -460,6 +496,7 @@ def bridge_port(
     )
 
     def usb_to_pty() -> None:
+        reported_short_write = False
         while not stop.is_set():
             try:
                 data = dev.read(port.bulk_in, port.max_packet, timeout=100)
@@ -472,7 +509,13 @@ def bridge_port(
                 return
             if data:
                 try:
-                    os.write(master_fd, bytes(data))
+                    short_write = write_all_fd(master_fd, bytes(data))
+                    if short_write and not reported_short_write:
+                        logger.warning(
+                            "interface %d PTY 曾发生短写；已循环补齐，PCM 字节对齐保持完整",
+                            port.interface,
+                        )
+                        reported_short_write = True
                 except OSError as exc:
                     if not stop.is_set():
                         logger.error("interface %d PTY write failed: %s", port.interface, exc)

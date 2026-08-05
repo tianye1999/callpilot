@@ -49,6 +49,8 @@ class _FakeDev:
         outcome = (
             self.write_outcomes.pop(0) if self.write_outcomes else None
         )
+        if isinstance(outcome, int):
+            return min(outcome, len(data))
         if outcome is not None:
             raise outcome
         return len(data)
@@ -98,6 +100,15 @@ def test_write_stall_clears_halt_then_retries_same_frame():
     ]
 
 
+def test_bulk_short_write_retries_remaining_pcm_without_losing_bytes():
+    dev = _FakeDev([1, 2])
+
+    recovered = ec20_usb_pty.write_bulk_with_recovery(dev, 0x05, b"pcm")
+
+    assert recovered is False
+    assert dev.writes == 2
+
+
 def test_clear_halt_failure_is_distinct_from_retry_timeout():
     stalled = usb.core.USBError("pipe error", -9, errno.EPIPE)
     clear_failed = usb.core.USBError("clear failed")
@@ -114,6 +125,31 @@ def test_timeout_is_not_misclassified_as_endpoint_stall():
     with pytest.raises(usb.core.USBTimeoutError):
         ec20_usb_pty.write_bulk_with_recovery(dev, 0x05, b"pcm")
     assert dev.clear_halts == 0
+
+
+def test_write_all_fd_retries_short_writes_without_losing_pcm_bytes(monkeypatch):
+    """PTY 短写不能丢字节；丢一个字节会让后续 int16 PCM 全部错位成噪声。"""
+    accepted: list[bytes] = []
+    limits = iter([1, 2, 3, 99])
+
+    def fake_write(fd: int, data: memoryview) -> int:
+        assert fd == 42
+        chunk = bytes(data[: next(limits)])
+        accepted.append(chunk)
+        return len(chunk)
+
+    monkeypatch.setattr(ec20_usb_pty.os, "write", fake_write)
+    pcm = bytes(range(12))
+
+    assert ec20_usb_pty.write_all_fd(42, pcm) is True
+    assert b"".join(accepted) == pcm
+
+
+def test_write_all_fd_reports_zero_progress(monkeypatch):
+    monkeypatch.setattr(ec20_usb_pty.os, "write", lambda _fd, _data: 0)
+
+    with pytest.raises(OSError, match="no progress"):
+        ec20_usb_pty.write_all_fd(42, b"pcm")
 
 
 def test_single_write_timeout_is_tolerated_and_next_frame_can_succeed():
