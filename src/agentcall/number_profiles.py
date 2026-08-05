@@ -12,9 +12,9 @@ Missing language falls back to the other language, then any non-empty value,
 so single-language profiles keep working unchanged. Fallback is per-field, so
 prefer supplying both languages for every field to avoid mixed-language output.
 
-``opening_mode``(#80-B,可选): ``say``(默认)拨通即说开场白;``wait``
-静默等对方先说——IVR 热线(如运营商客服)用,避免 AI 开场白压掉首段菜单
-播报。语言无关的普通字符串;非法值按 ``say`` 处理。
+``opening_mode``(#80-B,可选): ``say`` 拨通即说开场白;``wait`` 静默等对方
+先说——IVR 热线(如运营商客服)用,避免 AI 开场白压掉首段菜单播报。已知
+运营商客服号缺省为 ``wait``，普通号码缺省为 ``say``；显式值始终优先。
 
 ``dtmf_spoken_followup``(可选): 默认 ``false``。仅对显式启用的 IVR
 profile，在 Agent 明确说出自己将按键却未调用工具时启用执行层安全网。
@@ -35,6 +35,7 @@ import sys
 import tempfile
 import threading
 import uuid
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,12 @@ _PROFILE_WRITE_LOCK = threading.RLock()
 MAX_PROFILE_SCENARIO_CHARS = 1200
 _PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _DIAL_NUMBER_RE = re.compile(r"\+?[0-9*#]{1,32}")
+# 公共客服热线接通后通常会立即播放 IVR，默认先听再说。profile 仍可显式
+# ``opening_mode=say`` 覆盖；这份兜底同时照顾升级前已经复制到用户目录、尚未
+# 带 opening_mode 的旧配置文件。
+LISTEN_FIRST_SERVICE_NUMBERS = frozenset({"10000", "10010", "10086", "10099"})
+_FUZZY_TASK_MIN_SCORE = 0.72
+_FUZZY_TASK_MIN_MARGIN = 0.08
 _MANAGED_FIELDS = {
     "id",
     "enabled",
@@ -151,6 +158,25 @@ def _task_values(value: Any) -> list[str]:
     return []
 
 
+def _default_opening_mode(number: str) -> str:
+    return "wait" if number in LISTEN_FIRST_SERVICE_NUMBERS else "say"
+
+
+def _task_match_score(left: str, right: str) -> float:
+    """Return a conservative similarity score for short task descriptions.
+
+    The UI often adds harmless qualifiers (for example ``当前``/``一下``), while
+    the saved profile keeps a shorter label.  Sequence similarity fixes that
+    without turning profile lookup into an LLM/network dependency.  Ambiguous
+    best matches are rejected by the caller's margin check.
+    """
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
 def lookup_profile(
     number: str | None,
     task: str | None,
@@ -176,6 +202,7 @@ def lookup_profile(
             logger.warning("号码任务库格式无效: profiles 不是列表")
             return None
         exact: tuple[dict[str, Any], str] | None = None
+        fuzzy: list[tuple[float, dict[str, Any], str]] = []
         wildcard: tuple[dict[str, Any], str] | None = None
         for item, profile_id in _profiles_with_ids(profiles):
             if not _is_enabled(item) or _norm(item.get("number")) != target_number:
@@ -185,9 +212,23 @@ def lookup_profile(
                 if target_task and target_task in task_variants:
                     exact = (item, profile_id)
                     break
+                if target_task:
+                    score = max(
+                        _task_match_score(target_task, variant)
+                        for variant in task_variants
+                    )
+                    if score >= _FUZZY_TASK_MIN_SCORE:
+                        fuzzy.append((score, item, profile_id))
             elif wildcard is None:
                 wildcard = (item, profile_id)
-        matched = exact or wildcard
+        fuzzy_match: tuple[dict[str, Any], str] | None = None
+        if exact is None and fuzzy:
+            fuzzy.sort(key=lambda row: row[0], reverse=True)
+            best = fuzzy[0]
+            runner_up = fuzzy[1][0] if len(fuzzy) > 1 else 0.0
+            if best[0] - runner_up >= _FUZZY_TASK_MIN_MARGIN:
+                fuzzy_match = (best[1], best[2])
+        matched = exact or fuzzy_match or wildcard
         if matched is None:
             return None
         return _normalize_profile(matched[0], target_number, target_task, lang, matched[1])
@@ -362,11 +403,11 @@ def _normalize_profile(
         logger.warning("号码任务库条目缺少有效 scenario: number=%s task=%s", number, task)
         return None
     opening = _normalize_opening(_pick_lang(item.get("opening"), lang))
-    # 开场模式(#80-B):say=拨通即说开场白(默认);wait=静默等对方先说
-    # (IVR 热线场景,AI 开场白会压掉首段菜单播报)。非法值回落 say。
+    # 开场模式(#80-B):say=拨通即说开场白;wait=静默等对方先说。
+    # 已知运营商热线的旧配置若缺字段，安全回落 wait；普通号码回落 say。
     opening_mode = str(item.get("opening_mode") or "").strip().lower()
     if opening_mode not in {"say", "wait"}:
-        opening_mode = "say"
+        opening_mode = _default_opening_mode(number)
     return {
         "ok": True,
         "scenario": scenario,

@@ -7,10 +7,11 @@
       "task": {"zh": "咨询流量使用情况", "en": "check data usage"},
       "label": {"zh": "中国电信·查流量", "en": "China Telecom · Data usage"},
       "scenario": {
-        "zh": "你在替机主拨打中国电信客服热线10000，查机主名下这个号码的流量使用情况（剩余、已用）。你是主叫、替机主求助的一方，不是客服、不代表电信、不冒充机主本人。开场直接说需求、不自我介绍；遇语音菜单说短词（如“流量”），遇按键菜单必须调用 send_dtmf 工具真正按键、不能只嘴上说要按几；对方未明确给出流量数据前，绝不说“已查到”或编造数字，没拿到就说还在等对方。拿到剩余/已用后口头确认一句。",
-        "en": "You are calling China Telecom's hotline 10000 on the owner's behalf to check the data usage (remaining, used) on the owner's number. You are the caller asking for help for the owner — not an agent, not Telecom, and never impersonate the owner. Open by stating the need directly, no self-introduction; say short keywords to voice menus, and for keypad menus you must call the send_dtmf tool to actually press keys, not just say a digit; never claim you have the figures or make up numbers before they are actually given — say you're still waiting. Confirm the remaining/used data in one sentence once you get it."
+        "zh": "你在替机主拨打中国电信客服热线10000，查机主名下这个号码的流量使用情况（剩余、已用）。你是主叫、替机主求助的一方，不是客服、不代表电信、不冒充机主本人。接通后先完整听完客服播报；只有对方明确提示输入时才说短词（如“流量”），客服播报、查询中或短暂停顿时保持安静，不说“好的、谢谢、我会等待”等套话。遇按键菜单必须调用 send_dtmf 工具真正按键、不能只嘴上说要按几；对方未明确给出流量数据前，绝不说“已查到”或编造数字，也不要重复同一请求。拿到剩余/已用后口头确认一句。",
+        "en": "You are calling China Telecom's hotline 10000 on the owner's behalf to check the data usage (remaining, used) on the owner's number. You are the caller asking for help for the owner — not an agent, not Telecom, and never impersonate the owner. Listen through the opening announcement and speak only when prompted; stay silent during announcements, searching, or short pauses, without filler acknowledgements. For keypad menus call send_dtmf to actually press keys; never claim you have the figures, invent data, or repeat the same request unless asked. Confirm the remaining/used data once received."
       },
-      "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."}
+      "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."},
+      "opening_mode": "wait"
     },
     {
       "id": "china_telecom_balance",
@@ -18,10 +19,11 @@
       "task": {"zh": "查询话费余额", "en": "check account balance"},
       "label": {"zh": "中国电信·查话费", "en": "China Telecom · Balance"},
       "scenario": {
-        "zh": "你在替机主拨打中国电信客服热线10000，查机主名下这个号码的话费余额与本月消费。你是主叫、替机主求助的一方，不是客服、不冒充机主本人。开场直接说需求、不自我介绍；遇语音菜单说短词，遇按键菜单调用 send_dtmf 真正按键；对方未明确给出金额前不编造、不声称已查到，没拿到就说还在等对方。拿到余额后口头确认一句。",
-        "en": "You are calling China Telecom's hotline 10000 on the owner's behalf to check the account balance and this month's charges on the owner's number. You are the caller asking for help — not an agent, never impersonate the owner. State the need directly, no self-introduction; short keywords to voice menus, call send_dtmf for keypad menus; never make up an amount or claim you have it before it is given. Confirm the balance in one sentence once you get it."
+        "zh": "你在替机主拨打中国电信客服热线10000，查机主名下这个号码的话费余额与本月消费。你是主叫、替机主求助的一方，不是客服、不冒充机主本人。接通后先完整听完客服播报；只有对方明确提示输入时才说短词，客服播报、查询中或短暂停顿时保持安静，不说“好的、谢谢、我会等待”等套话。遇按键菜单调用 send_dtmf 真正按键；对方未明确给出金额前不编造、不声称已查到，也不要重复同一请求。拿到余额后口头确认一句。",
+        "en": "You are calling China Telecom's hotline 10000 on the owner's behalf to check the account balance and this month's charges. You are the caller asking for help, not an agent, and never impersonate the owner. Listen through the opening announcement and speak only when prompted; stay silent during announcements, searching, or short pauses, without filler acknowledgements. Call send_dtmf for keypad menus. Never invent an amount, claim success early, or repeat the same request unless asked. Confirm the balance once received."
       },
-      "opening": {"zh": "你好，我想查一下这个号码的话费余额。", "en": "Hi, I'd like to check the balance."}
+      "opening": {"zh": "你好，我想查一下这个号码的话费余额。", "en": "Hi, I'd like to check the balance."},
+      "opening_mode": "wait"
     },
     {
       "id": "china_mobile_data",
@@ -55,10 +57,11 @@
       "task": {"zh": "咨询流量使用情况", "en": "check data usage"},
       "label": {"zh": "中国联通·查流量", "en": "China Unicom · Data usage"},
       "scenario": {
-        "zh": "你在替机主拨打中国联通客服热线10010，查机主名下这个号码的流量使用情况（剩余、已用）。你是主叫、替机主求助的一方，不是客服、不代表联通、不冒充机主本人。开场直接说需求、不自我介绍；遇语音菜单说短词，遇按键菜单调用 send_dtmf 真正按键；对方未明确给出数据前不编造、不声称已查到，没拿到就说还在等对方。拿到结果口头确认一句。",
-        "en": "You are calling China Unicom's hotline 10010 on the owner's behalf to check the data usage on the owner's number. You are the caller asking for help — not an agent, not Unicom, never impersonate the owner. State the need directly, no self-introduction; short keywords to voice menus, call send_dtmf for keypad menus; never make up figures or claim you have them before they are given. Confirm the result in one sentence."
+        "zh": "你在替机主拨打中国联通客服热线10010，查机主名下这个号码的流量使用情况（剩余、已用）。你是主叫、替机主求助的一方，不是客服、不代表联通、不冒充机主本人。接通后先完整听完客服播报，只有明确提示输入时才说短词；客服播报、查询中或短暂停顿时保持安静，不用套话填充，也不要重复同一请求。遇按键菜单调用 send_dtmf 真正按键；对方未明确给出数据前不编造、不声称已查到。拿到结果口头确认一句。",
+        "en": "You are calling China Unicom's hotline 10010 on the owner's behalf to check data usage. You are the caller asking for help, not an agent, and never impersonate the owner. Listen through the opening announcement and speak only when prompted; stay silent during announcements, searching, or short pauses. Call send_dtmf for keypad menus. Never invent figures, claim success early, or repeat the same request unless asked. Confirm the result once received."
       },
-      "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."}
+      "opening": {"zh": "你好，我想查一下这个号码的流量使用情况。", "en": "Hi, I'd like to check data usage."},
+      "opening_mode": "wait"
     },
     {
       "id": "icbc_card_statement",

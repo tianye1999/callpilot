@@ -99,6 +99,35 @@ def test_lookup_same_number_different_tasks(tmp_path):
     assert balance["scenario"] == "话费策略"
 
 
+def test_lookup_tolerates_harmless_task_qualifiers(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [
+            {"number": "10000", "task": "咨询流量使用情况", "scenario": "流量策略"},
+            {"number": "10000", "task": "查询话费余额", "scenario": "话费策略"},
+        ],
+    )
+
+    result = number_profiles.lookup_profile("10000", "查询当前话费余额", path=path)
+
+    assert result is not None
+    assert result["scenario"] == "话费策略"
+
+
+def test_lookup_rejects_ambiguous_fuzzy_task(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    write_profiles(
+        path,
+        [
+            {"number": "10000", "task": "查询本月账单", "scenario": "账单 A"},
+            {"number": "10000", "task": "查询上月账单", "scenario": "账单 B"},
+        ],
+    )
+
+    assert number_profiles.lookup_profile("10000", "查询账单", path=path) is None
+
+
 def test_lookup_number_wildcard_when_task_has_no_exact_match(tmp_path):
     path = tmp_path / "number_profiles.json"
     write_profiles(
@@ -430,7 +459,7 @@ def test_profile_scenario_limit_preserves_full_bundled_english_strategy():
 
 
 def test_lookup_profile_opening_mode_wait_and_fallbacks(tmp_path):
-    """#80-B:opening_mode 归一——wait 透传;缺省/非法/大小写混排回落 say。"""
+    """旧热线配置缺字段时 listen-first；显式 say/wait 仍按配置。"""
     path = tmp_path / "number_profiles.json"
     write_profiles(
         path,
@@ -438,12 +467,16 @@ def test_lookup_profile_opening_mode_wait_and_fallbacks(tmp_path):
             {"number": "10086", "scenario": "IVR 热线", "opening_mode": " Wait "},
             {"number": "10000", "scenario": "默认开场"},
             {"number": "10010", "scenario": "非法值", "opening_mode": "shout"},
+            {"number": "13800138000", "scenario": "普通号码"},
+            {"number": "10099", "scenario": "显式开场", "opening_mode": "say"},
         ],
     )
 
     assert number_profiles.lookup_profile("10086", "x", path=path)["opening_mode"] == "wait"
-    assert number_profiles.lookup_profile("10000", "x", path=path)["opening_mode"] == "say"
-    assert number_profiles.lookup_profile("10010", "x", path=path)["opening_mode"] == "say"
+    assert number_profiles.lookup_profile("10000", "x", path=path)["opening_mode"] == "wait"
+    assert number_profiles.lookup_profile("10010", "x", path=path)["opening_mode"] == "wait"
+    assert number_profiles.lookup_profile("13800138000", "x", path=path)["opening_mode"] == "say"
+    assert number_profiles.lookup_profile("10099", "x", path=path)["opening_mode"] == "say"
 
 
 def test_opening_mode_crud_roundtrip(tmp_path):
