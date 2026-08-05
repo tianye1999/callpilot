@@ -503,6 +503,18 @@ def test_manual_response_control_defaults(monkeypatch):
     assert get_int("MANUAL_RESPONSE_MAX_WAIT_MS") == 8000
 
 
+def test_hotline_turn_taking_defaults(monkeypatch):
+    _unset(
+        monkeypatch,
+        "HOTLINE_TURN_END_SILENCE_MS",
+        "HOTLINE_PLAYBACK_QUIET_MS",
+        "TURN_REMOTE_RMS_THRESHOLD",
+    )
+    assert get_int("HOTLINE_TURN_END_SILENCE_MS") == 2500
+    assert get_int("HOTLINE_PLAYBACK_QUIET_MS") == 2500
+    assert get_int("TURN_REMOTE_RMS_THRESHOLD") == 400
+
+
 def test_inbound_hard_deadline_default_matches_example(monkeypatch):
     _unset(monkeypatch, "INBOUND_MAX_SECONDS")
     example = (Path(__file__).parents[2] / ".env.example").read_text(encoding="utf-8")

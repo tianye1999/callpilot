@@ -16,7 +16,15 @@ class FakeAgent(VoiceAgent):
         self.stopped = False
         self.received_audio: list[bytes] = []
         self.said: list[str] = []
+        self.turn_silence_ms: int | None = None
+        self.remote_speech_notifications = 0
         self._on_audio_out: Callable[[bytes], None] | None = None
+
+    def configure_turn_taking(self, *, silence_ms: int | None = None) -> None:
+        self.turn_silence_ms = silence_ms
+
+    def notify_remote_speech(self) -> None:
+        self.remote_speech_notifications += 1
 
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
         self.started = True

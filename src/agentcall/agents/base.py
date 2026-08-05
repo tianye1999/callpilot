@@ -58,6 +58,21 @@ class VoiceAgent(ABC):
         """
         self._on_trace = handler
 
+    def configure_turn_taking(self, *, silence_ms: int | None = None) -> None:
+        """Configure optional local turn taking for this call.
+
+        Providers with server-side turn detection may ignore this.  MiniMax's
+        Realtime endpoint has no usable server VAD, so it overrides the hook.
+        """
+
+    def notify_remote_speech(self) -> None:
+        """Tell the provider that the remote party resumed before playback.
+
+        The default is intentionally a no-op.  Providers that locally buffer
+        response audio can invalidate a stale response without depending on a
+        provider-specific ``response.cancel`` implementation.
+        """
+
     def _emit_status(self, text: str) -> None:
         if self._on_status and text:
             try:
@@ -77,6 +92,7 @@ class VoiceAgent(ABC):
             return
         allowed_fields = {
             "attempt",
+            "buffered_ms",
             "bytes",
             "capability",
             "chars",
@@ -90,6 +106,7 @@ class VoiceAgent(ABC):
             "rms",
             "role",
             "threshold",
+            "quiet_ms",
             "tool",
             "total_bytes",
         }

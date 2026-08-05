@@ -88,6 +88,7 @@ from .triage_judge import (
     TriageVerdict,
     TriageVerdictConsumer,
 )
+from .turn_taking import TurnArbiter
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,10 @@ class CallSession:
         self._thread: threading.Thread | None = None
         self._active = False
         self._active_lock = threading.Lock()
-        self._outgoing_audio: Queue[bytes] = Queue()
+        # (8k modem PCM, provider-rate monitor PCM).  Browser/recording playback
+        # is emitted only when the same chunk is actually released to the modem,
+        # so a turn-arbitration drop never appears as speech in the call replay.
+        self._outgoing_audio: Queue[tuple[bytes, bytes]] = Queue()
         self._record: CallRecord | None = None
         self._summary_thread: threading.Thread | None = None
         # 延迟挂断（hangup 工具）状态：CallSession 跨通复用，上一通排下的
@@ -191,6 +195,7 @@ class CallSession:
         # 会话级可调参数：每通会话开始时从 config 重新读取，支持不重启改参。
         self._hangover_seconds = HALF_DUPLEX_HANGOVER_SECONDS
         self._hangup_delay_seconds = HANGUP_TOOL_DELAY_SECONDS
+        self._turn_arbiter: TurnArbiter | None = None
         # 外呼动态场景提示词：拨号等待接通时后台生成，接通后限时取用。
         self._prompt_gen_thread: threading.Thread | None = None
         self._prompt_gen_done = threading.Event()
@@ -296,6 +301,7 @@ class CallSession:
         self._prompt_gen_opening_mode = "say"
         self._prompt_gen_dtmf_spoken_followup = False
         self._result_verification_mode = "none"
+        self._turn_arbiter = None
         self._cancel_spoken_dtmf_followups(clear_recent=True)
         self._stop_dtmf_judge(join_timeout=0.0)
         self._stop_triage_judge(join_timeout=0.0)
@@ -464,7 +470,28 @@ class CallSession:
             )
             agent = create_agent(self.provider)
             self._start_dtmf_judge(record, session_t0=session_t0)
-            agent.set_session_instructions(self._build_agent_instructions(direction))
+            instructions = self._build_agent_instructions(direction)
+            agent.set_session_instructions(instructions)
+            if direction == "outbound" and self._prompt_gen_opening_mode == "wait":
+                turn_end_ms = max(
+                    0, config.get_int("HOTLINE_TURN_END_SILENCE_MS")
+                )
+                playback_quiet_ms = max(
+                    0, config.get_int("HOTLINE_PLAYBACK_QUIET_MS")
+                )
+                self._turn_arbiter = TurnArbiter(
+                    sample_rate=MODEM_RATE,
+                    rms_threshold=config.get_int("TURN_REMOTE_RMS_THRESHOLD"),
+                    quiet_ms=playback_quiet_ms,
+                )
+                agent.configure_turn_taking(silence_ms=turn_end_ms)
+                trace(
+                    "turn",
+                    "arbiter_ready",
+                    "ok",
+                    silence_ms=turn_end_ms,
+                    quiet_ms=playback_quiet_ms,
+                )
             agent.set_transcript_handler(
                 self._make_transcript_handler(record, transcripts, agent)
             )
@@ -731,19 +758,11 @@ class CallSession:
                     audio_trace["started"] = True
                     audio_trace["last_at"] = now
                     audio_trace["last_bytes"] = audio_trace["total_bytes"]
-            # 浏览器实时旁听下行 AI（Web Audio）：无监听端时零成本返回。kind=0=下行。
-            if self.hub is not None:
-                self.hub.broadcast_audio(pcm_agent, kind=0)
-            monitor = self.monitor
-            if monitor is not None:
-                monitor.feed(pcm_agent)
             pcm_8k = bridge.agent_to_modem(pcm_agent, agent.output_rate)
             if hasattr(bridge, "amplify_for_modem"):
                 pcm_8k = bridge.amplify_for_modem(pcm_8k)
             if pcm_8k:
-                if record is not None:
-                    record.write_downlink(pcm_8k)
-                self._outgoing_audio.put(pcm_8k)
+                self._outgoing_audio.put((pcm_8k, pcm_agent))
 
         return on_agent_audio
 
@@ -843,9 +862,11 @@ class CallSession:
                 if handed_off is not None:
                     return handed_off
             agent_effects_allowed = self._agent_effect_allowed(generation)
-            if agent_effects_allowed:
+            # 普通通话保持原来的低延迟直放；客服热线由 TurnArbiter 在本轮读取
+            # 上行之后决定是否放行，避免“先写下行、后发现客服还在说”。
+            if agent_effects_allowed and self._turn_arbiter is None:
                 self._drain_agent_audio(bridge)
-            else:
+            elif not agent_effects_allowed:
                 self._clear_outgoing_audio()
 
             now = time.monotonic()
@@ -908,7 +929,10 @@ class CallSession:
                 if hasattr(bridge, "pending_output_bytes")
                 else 0
             )
-            agent_speaking = pending > 0 or not self._outgoing_audio.empty()
+            output_pending = not self._outgoing_audio.empty()
+            agent_speaking = pending > 0 or (
+                output_pending and self._turn_arbiter is None
+            )
             if agent_speaking:
                 last_play_at = now
             # 半双工防回环：Agent 说话期间（含挂尾窗口）丢弃上行，
@@ -931,6 +955,35 @@ class CallSession:
                 # 本机监听对方声音（8k 旁路，入队即返回）。
                 if self.uplink_monitor is not None:
                     self.uplink_monitor.feed(pcm_8k)
+                arbiter = self._turn_arbiter
+                if arbiter is not None:
+                    activity = arbiter.observe(
+                        pcm_8k,
+                        now=now,
+                        output_pending=output_pending,
+                        agent_playing=pending > 0,
+                    )
+                    if activity.voiced and not agent_speaking:
+                        # MiniMax 会在回复生成期间据此丢弃旧回复；其他 provider
+                        # 默认 no-op。每帧通知是安全的，provider 内部负责去重。
+                        agent.notify_remote_speech()
+                    if activity.resumed_over_pending_output:
+                        dropped = self._clear_outgoing_audio()
+                        held_ms = arbiter.note_stale_output_dropped(dropped, now)
+                        self._publish_agent_trace(
+                            record,
+                            {
+                                "stage": "turn",
+                                "event": "pending_output_dropped",
+                                "status": "ok",
+                                "provider": self.provider,
+                                "generation": generation,
+                                "bytes": dropped,
+                                "ms": held_ms,
+                                "reason": "remote_resumed",
+                            },
+                        )
+                        output_pending = False
                 if not suppress_uplink and agent_effects_allowed:
                     pcm_agent = bridge.modem_to_agent(pcm_8k, agent.input_rate)
                     uplink_pre_stats.add(pcm_agent)
@@ -975,9 +1028,55 @@ class CallSession:
                         uplink_trace["started"] = True
                         uplink_trace["last_at"] = trace_now
                         uplink_trace["last_bytes"] = uplink_trace["total_bytes"]
+            arbiter = self._turn_arbiter
+            if (
+                arbiter is not None
+                and agent_effects_allowed
+                and not self._outgoing_audio.empty()
+            ):
+                release_now = time.monotonic()
+                if arbiter.can_play(release_now):
+                    held_ms = arbiter.note_output_released(release_now)
+                    released = self._drain_agent_audio(bridge)
+                    self._publish_agent_trace(
+                        record,
+                        {
+                            "stage": "turn",
+                            "event": "output_released",
+                            "status": "ok",
+                            "provider": self.provider,
+                            "generation": generation,
+                            "bytes": released,
+                            "ms": held_ms,
+                        },
+                    )
+                elif arbiter.note_output_pending(release_now):
+                    self._publish_agent_trace(
+                        record,
+                        {
+                            "stage": "turn",
+                            "event": "output_deferred",
+                            "status": "running",
+                            "provider": self.provider,
+                            "generation": generation,
+                            "quiet_ms": round(arbiter.quiet_ms),
+                        },
+                    )
             uplink_pre_stats.maybe_log(gain=agent_uplink_gain)
             uplink_post_stats.maybe_log(gain=agent_uplink_gain)
             await asyncio.sleep(0.01)
+        if self._turn_arbiter is not None:
+            self._publish_agent_trace(
+                record,
+                {
+                    "stage": "turn",
+                    "event": "summary",
+                    "status": "ok",
+                    "provider": self.provider,
+                    "generation": generation,
+                    **self._turn_arbiter.metrics(time.monotonic()),
+                },
+            )
         return bridge
 
     async def _handoff_to_mobile(
@@ -1561,7 +1660,7 @@ class CallSession:
             and triage_mode == "off"
             else None
         )
-        return build_instructions(
+        instructions = build_instructions(
             direction,
             owner_name(lang),
             agent_persona(lang),
@@ -1571,6 +1670,20 @@ class CallSession:
             takeover_preference=takeover_preference,
             triage_pending=triage_mode == "enforce",
         )
+        if direction == "outbound" and self._prompt_gen_opening_mode == "wait":
+            turn_rule = (
+                "\nTurn-taking rule: the other side may be another voice agent. "
+                "Treat short pauses as continuation; stay silent during announcements, "
+                "searching, or hold messages. Do not fill pauses with acknowledgements "
+                "such as 'okay, thanks, I will wait', and do not repeat the same request "
+                "unless the other side explicitly asks you to repeat it."
+                if lang == "en"
+                else "\n轮次规则：对方可能也是语音 Agent。把短暂停顿视为对方仍未说完；"
+                "播报、查询中或等待提示期间保持安静，不要用“好的、谢谢、我会等待”等"
+                "套话填充停顿；除非对方明确要求重述，否则不要重复同一请求。"
+            )
+            return instructions + turn_rule
+        return instructions
 
     def _opening_instructions(self, direction: str) -> str:
         """开场白指令：文本构造在 prompts 模块（纯函数，可独测）。"""
@@ -1987,9 +2100,7 @@ class CallSession:
                     return False, mode
                 # 与 Agent 语音共用 _outgoing_audio，后续由 _drain_agent_audio
                 # 按既有下行链路送入桥；半双工 pending 判定也会自然把它当成正在说话。
-                if self._record is not None:
-                    self._record.write_downlink(tone)
-                self._outgoing_audio.put(tone)
+                self._outgoing_audio.put((tone, b""))
                 sent = True
             if mode in {"qvts", "both"}:
                 ok = self.modem.send_dtmf(digits)
@@ -2411,22 +2522,40 @@ class CallSession:
             logger.warning("挂断物理通话出错: %s", exc)
         logger.info("通话 Agent 会话已结束")
 
-    def _drain_agent_audio(self, bridge: AudioBridge) -> None:
-        chunks: list[bytes] = []
+    def _drain_agent_audio(self, bridge: AudioBridge) -> int:
+        modem_chunks: list[bytes] = []
+        monitor_chunks: list[bytes] = []
         while True:
             try:
-                chunks.append(self._outgoing_audio.get_nowait())
+                modem_pcm, monitor_pcm = self._outgoing_audio.get_nowait()
             except Empty:
                 break
-        if chunks:
-            bridge.write_modem_chunks(chunks)
+            if modem_pcm:
+                modem_chunks.append(modem_pcm)
+            if monitor_pcm:
+                monitor_chunks.append(monitor_pcm)
+        if not modem_chunks:
+            return 0
+        bridge.write_modem_chunks(modem_chunks)
+        record = self._record
+        if record is not None:
+            for chunk in modem_chunks:
+                record.write_downlink(chunk)
+        for chunk in monitor_chunks:
+            if self.hub is not None:
+                self.hub.broadcast_audio(chunk, kind=0)
+            if self.monitor is not None:
+                self.monitor.feed(chunk)
+        return sum(len(chunk) for chunk in modem_chunks)
 
-    def _clear_outgoing_audio(self) -> None:
+    def _clear_outgoing_audio(self) -> int:
+        dropped = 0
         while True:
             try:
-                self._outgoing_audio.get_nowait()
+                modem_pcm, _monitor_pcm = self._outgoing_audio.get_nowait()
+                dropped += len(modem_pcm)
             except Empty:
-                break
+                return dropped
 
 
 class CallAgentService:

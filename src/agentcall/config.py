@@ -312,6 +312,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("REMOTE_DOWNLINK_GAIN", "远程手机下行增益", "float", "16.0"),
     # ---- 通话行为 ----
     ConfigSpec("HALF_DUPLEX_HANGOVER_SECONDS", "半双工挂尾时长（秒）", "float", "0.5"),
+    ConfigSpec("HOTLINE_TURN_END_SILENCE_MS", "客服热线句尾静默窗口（毫秒）", "int", "2500"),
+    ConfigSpec("HOTLINE_PLAYBACK_QUIET_MS", "客服热线播放前静默窗口（毫秒）", "int", "2500"),
+    ConfigSpec("TURN_REMOTE_RMS_THRESHOLD", "轮次仲裁上行能量阈值", "int", "400"),
     ConfigSpec("HANGUP_TOOL_DELAY_SECONDS", "挂断工具延迟（秒）", "float", "4.5"),
     ConfigSpec("DTMF_MODE", "DTMF 发送模式", "select", "inband",
                choices=("inband", "qvts", "both")),

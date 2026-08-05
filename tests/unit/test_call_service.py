@@ -971,16 +971,18 @@ def test_outbound_opening_mode_wait_skips_opening(monkeypatch, tmp_path):
 
     assert agent.said == []  # wait 模式:全程未主动开场
     assert "IVR 热线" in agent._session_instructions  # profile scenario 已生效
+    assert agent.turn_silence_ms == 2500
+    assert service.session._turn_arbiter is not None
 
 
 def test_outbound_opening_mode_default_still_says_opening(monkeypatch, tmp_path):
-    """对照:profile 未声明 opening_mode → 行为不变,照说开场白。"""
+    """对照:普通号码未声明 opening_mode → 行为不变,照说开场白。"""
     import json as _json
 
     profiles = tmp_path / "number_profiles.json"
     profiles.write_text(
         _json.dumps(
-            {"profiles": [{"number": "10000", "scenario": "普通场景"}]},
+            {"profiles": [{"number": "13800138000", "scenario": "普通场景"}]},
             ensure_ascii=False,
         ),
         encoding="utf-8",
@@ -995,12 +997,12 @@ def test_outbound_opening_mode_default_still_says_opening(monkeypatch, tmp_path)
     monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
 
     service = make_service(modem)
-    ok, err = service.dial("10000")
+    ok, err = service.dial("13800138000")
     assert ok, err
     deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+    while time.monotonic() < deadline and ("dial", ("13800138000",)) not in modem.calls:
         time.sleep(0.05)
-    modem.trigger_call_connected("10000")
+    modem.trigger_call_connected("13800138000")
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and not agent.said:
@@ -1082,7 +1084,7 @@ def test_opening_mode_reset_across_calls_no_leak(monkeypatch, tmp_path):
             {
                 "profiles": [
                     {"number": "10000", "scenario": "wait profile", "opening_mode": "wait"},
-                    {"number": "10086", "scenario": "default profile"},
+                    {"number": "13800138000", "scenario": "default profile"},
                 ]
             },
             ensure_ascii=False,
@@ -1135,15 +1137,16 @@ def test_opening_mode_reset_across_calls_no_leak(monkeypatch, tmp_path):
                         lambda self, direction, number: record2)
     modem.calls.clear()
 
-    ok, err = service.dial("10086")
+    ok, err = service.dial("13800138000")
     assert ok, err
     deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and ("dial", ("10086",)) not in modem.calls:
+    while time.monotonic() < deadline and ("dial", ("13800138000",)) not in modem.calls:
         time.sleep(0.05)
-    modem.trigger_call_connected("10086")
+    modem.trigger_call_connected("13800138000")
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and (len(agents) < 2 or not agents[1].started):
         time.sleep(0.05)
+    assert service.session._turn_arbiter is None
     time.sleep(0.3)
     service.session.stop()
     assert service.session._thread is not None

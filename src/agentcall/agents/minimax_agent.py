@@ -106,6 +106,11 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         self._vad_silence_ms = 0.0
         self._vad_utterance_ms = 0.0
         self._vad_response_in_flight = False
+        self._turn_end_silence_ms: int | None = None
+        self._turn_deferred_audio: list[bytes] = []
+        self._turn_deferred_ms = 0.0
+        self._turn_stale_response = False
+        self._turn_stale_logged = False
         # ---- MiniMax Realtime + M3 混合工具路由 ----
         self._hybrid_tools_enabled = hybrid_tools_enabled
         self._hybrid_tool_timeout = max(1.0, tool_timeout)
@@ -201,6 +206,32 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
             self._vad_silence_ms = 0.0
             self._vad_utterance_ms = 0.0
             self._vad_response_in_flight = False
+            self._turn_deferred_audio.clear()
+            self._turn_deferred_ms = 0.0
+            self._turn_stale_response = False
+            self._turn_stale_logged = False
+
+    def configure_turn_taking(self, *, silence_ms: int | None = None) -> None:
+        with self._vad_lock:
+            self._turn_end_silence_ms = (
+                max(0, int(silence_ms)) if silence_ms is not None else None
+            )
+
+    def notify_remote_speech(self) -> None:
+        resumed = False
+        with self._vad_lock:
+            if (
+                self._turn_end_silence_ms is not None
+                and self._vad_response_in_flight
+                and not self._turn_stale_response
+            ):
+                self._turn_stale_response = True
+                resumed = True
+        if resumed:
+            self._emit_trace(
+                "turn", "remote_resumed", "running",
+                reason="response_in_flight",
+            )
 
     @staticmethod
     def _frame_rms(pcm: bytes) -> float:
@@ -221,7 +252,11 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         多个 response 并发，模型侧交错、对方听到重叠语音。
         """
         threshold = float(config.get_int("MINIMAX_VAD_RMS_THRESHOLD"))
-        silence_window = float(config.get_int("MANUAL_RESPONSE_SILENCE_MS"))
+        silence_window = float(
+            self._turn_end_silence_ms
+            if self._turn_end_silence_ms is not None
+            else config.get_int("MANUAL_RESPONSE_SILENCE_MS")
+        )
         max_utterance = float(config.get_int("MANUAL_RESPONSE_MAX_WAIT_MS"))
         frame_ms = len(pcm) / 2 / self.input_rate * 1000.0
         rms = self._frame_rms(pcm)
@@ -272,9 +307,60 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         ws = self._ws
         if not ws or not pcm:
             return
-        await super().send_audio(pcm)
-        if not self._vad_should_commit(pcm):
-            return
+        frames = self._take_deferred_frames(pcm)
+        for index, frame in enumerate(frames):
+            if self._defer_frame_while_response_in_flight(frame):
+                for remaining in frames[index + 1 :]:
+                    self._defer_frame_while_response_in_flight(remaining)
+                return
+            await super().send_audio(frame)
+            if self._vad_should_commit(frame):
+                await self._request_response(ws)
+
+    def _take_deferred_frames(self, current: bytes) -> list[bytes]:
+        with self._vad_lock:
+            if self._vad_response_in_flight or not self._turn_deferred_audio:
+                return [current]
+            frames = [*self._turn_deferred_audio, current]
+            self._turn_deferred_audio.clear()
+            self._turn_deferred_ms = 0.0
+            return frames
+
+    def _defer_frame_while_response_in_flight(self, pcm: bytes) -> bool:
+        resumed = False
+        threshold = float(config.get_int("MINIMAX_VAD_RMS_THRESHOLD"))
+        rms = self._frame_rms(pcm)
+        frame_ms = len(pcm) / 2 / self.input_rate * 1000.0
+        with self._vad_lock:
+            if (
+                self._turn_end_silence_ms is None
+                or not self._vad_response_in_flight
+            ):
+                return False
+            voiced = rms >= threshold
+            if voiced and not self._turn_stale_response:
+                self._turn_stale_response = True
+                resumed = True
+            # Drop leading silence.  Once remote speech starts, retain following
+            # silence as part of the deferred turn so VAD can find its real end.
+            if voiced or self._turn_deferred_audio:
+                self._turn_deferred_audio.append(pcm)
+                self._turn_deferred_ms += frame_ms
+                # A broken endpoint must not grow memory without bound.  This is
+                # longer than MANUAL_RESPONSE_MAX_WAIT_MS, so normal turns fit.
+                while self._turn_deferred_ms > 15000 and self._turn_deferred_audio:
+                    dropped = self._turn_deferred_audio.pop(0)
+                    self._turn_deferred_ms -= (
+                        len(dropped) / 2 / self.input_rate * 1000.0
+                    )
+        if resumed:
+            self._emit_trace(
+                "turn", "remote_resumed", "running",
+                reason="response_in_flight",
+            )
+        return True
+
+    async def _request_response(self, ws: Any) -> None:
         try:
             await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await ws.send(json.dumps({"type": "response.create"}))
@@ -298,6 +384,8 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
     def _on_response_done(self) -> None:
         with self._vad_lock:
             self._vad_response_in_flight = False
+            self._turn_stale_response = False
+            self._turn_stale_logged = False
         super()._on_response_done()
 
     # ---- Realtime + M3 混合工具路由 ----
@@ -315,6 +403,41 @@ class MiniMaxVoiceAgent(OpenAIVoiceAgent):
         event_type = event.get("type", "")
         active = self._hybrid_active()
         response_id = _response_id(event)
+
+        with self._vad_lock:
+            stale_response = self._turn_stale_response
+            stale_logged = self._turn_stale_logged
+            buffered_ms = round(self._turn_deferred_ms)
+        if stale_response and event_type in (
+            "response.audio.delta", "response.output_audio.delta",
+        ):
+            self._audio_gate.drop_response(response_id)
+            return
+        if stale_response and event_type in (
+            "response.audio_transcript.done",
+            "response.output_audio_transcript.done",
+        ):
+            self._audio_gate.drop_response(response_id)
+            if response_id:
+                self._hybrid_processed.add(response_id)
+                self._hybrid_held.discard(response_id)
+            if not stale_logged:
+                with self._vad_lock:
+                    self._turn_stale_logged = True
+                self._emit_trace(
+                    "turn", "stale_response_dropped", "ok",
+                    reason="remote_resumed", buffered_ms=buffered_ms,
+                )
+            return
+        if stale_response and event_type == "response.done":
+            self._audio_gate.drop_response(response_id)
+            if not stale_logged:
+                with self._vad_lock:
+                    self._turn_stale_logged = True
+                self._emit_trace(
+                    "turn", "stale_response_dropped", "ok",
+                    reason="remote_resumed", buffered_ms=buffered_ms,
+                )
 
         if active and event_type in (
             "response.audio.delta", "response.output_audio.delta",

@@ -807,6 +807,7 @@ def test_outbound_prompt_generation_uses_number_profile_without_thread_or_model(
                         "task": "查询流量",
                         "scenario": "预设策略：只说需求，菜单用短词。",
                         "opening": "查流量",
+                        "opening_mode": "say",
                     }
                 ]
             },

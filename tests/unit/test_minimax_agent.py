@@ -460,6 +460,64 @@ def test_no_second_commit_while_response_in_flight(monkeypatch):
     assert instances[0].sent_types().count("input_audio_buffer.commit") == 2
 
 
+def test_hotline_turn_guard_drops_stale_response_and_replays_remote_audio(monkeypatch):
+    """客服在模型思考时续说：旧回复不播放，新语音不能污染/丢失。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    monkeypatch.setenv("MINIMAX_VAD_RMS_THRESHOLD", "400")
+    monkeypatch.setenv("MANUAL_RESPONSE_MAX_WAIT_MS", "8000")
+    agent = _make_agent()
+    agent.configure_turn_taking(silence_ms=100)
+    emitted: list[bytes] = []
+    transcripts: list[tuple[str, str]] = []
+    traces: list[dict] = []
+    agent.set_transcript_handler(lambda role, text: transcripts.append((role, text)))
+    agent.set_trace_handler(traces.append)
+
+    async def scenario() -> None:
+        await agent.start(emitted.append)
+        for _ in range(3):
+            await agent.send_audio(_pcm(3000, 20))
+        for _ in range(6):
+            await agent.send_audio(_pcm(0, 20))
+        assert instances[0].sent_types().count("input_audio_buffer.commit") == 1
+
+        agent._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        append_count = instances[0].sent_types().count("input_audio_buffer.append")
+        for _ in range(5):
+            await agent.send_audio(_pcm(3000, 20))
+        for _ in range(6):
+            await agent.send_audio(_pcm(0, 20))
+        # 在飞期间只缓存在本地，不追加到服务端下一轮 buffer。
+        assert instances[0].sent_types().count("input_audio_buffer.append") == append_count
+
+        agent._handle_event({
+            "type": "response.audio.delta",
+            "response_id": "r1",
+            "delta": base64.b64encode(b"stale audio").decode(),
+        })
+        agent._handle_event({
+            "type": "response.audio_transcript.done",
+            "response_id": "r1",
+            "transcript": "好的，我来回答。",
+        })
+        agent._handle_event({
+            "type": "response.done",
+            "response": {"id": "r1", "status": "completed"},
+        })
+
+        # 下一帧到来时重放本地缓存；缓存里的完整“续说+静默”触发新一轮。
+        await agent.send_audio(_pcm(0, 20))
+
+    asyncio.run(scenario())
+
+    assert emitted == []
+    assert transcripts == []
+    assert instances[0].sent_types().count("input_audio_buffer.commit") == 2
+    names = [(item["stage"], item["event"]) for item in traces]
+    assert ("turn", "remote_resumed") in names
+    assert ("turn", "stale_response_dropped") in names
+
+
 def test_commit_failure_releases_in_flight_flag(monkeypatch):
     """断线时若不放开在飞标志，重连后永远不再断句 —— AI 从此沉默。"""
     instances, _calls = _patch_connect(monkeypatch)
