@@ -94,6 +94,97 @@ def resample_pcm(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     return resampled.astype(np.int16).tobytes()
 
 
+class StreamingPcmDownsampler:
+    """有状态的 mono PCM16 整数倍降采样器。
+
+    Realtime 服务会把一段连续语音拆成大小不固定的 WebSocket delta。旧实现对
+    每个 delta 单独 ``np.interp``：既没有在 8kHz Nyquist 前做低通，又会在
+    每个 delta 重新开始采样相位。24kHz 原音在浏览器旁听正常，但高于电话带宽
+    的能量会折叠进 0-4kHz，块边界还可能产生 click，最终只有电话一侧听到杂音。
+
+    这里在源采样率上先做 3.4kHz 低通，再保持跨 delta 的抽取相位。SIM7600、
+    EC20 的电话 PCM 都是 8kHz；MiniMax/Qwen/OpenAI 常见的 16/24kHz 输出均为
+    整数倍路径。非整数倍仍由 ``resample_pcm`` 兼容处理。
+    """
+
+    _FILTER_TAPS = 127
+    _PHONE_PASSBAND_HZ = 3400.0
+
+    def __init__(self, src_rate: int, dst_rate: int) -> None:
+        if src_rate <= dst_rate or src_rate % dst_rate:
+            raise ValueError("StreamingPcmDownsampler 仅支持整数倍降采样")
+        self.src_rate = src_rate
+        self.dst_rate = dst_rate
+        self.factor = src_rate // dst_rate
+        self._taps = self._design_filter(src_rate, dst_rate)
+        self._history = np.zeros(len(self._taps) - 1, dtype=np.float64)
+        self._phase = 0
+        self._byte_carry = b""
+        self._lock = threading.Lock()
+
+    @classmethod
+    def _design_filter(cls, src_rate: int, dst_rate: int) -> np.ndarray:
+        cutoff_hz = min(cls._PHONE_PASSBAND_HZ, dst_rate * 0.45)
+        center = (cls._FILTER_TAPS - 1) / 2
+        positions = np.arange(cls._FILTER_TAPS, dtype=np.float64) - center
+        normalized_cutoff = cutoff_hz / src_rate
+        taps = (
+            2.0
+            * normalized_cutoff
+            * np.sinc(2.0 * normalized_cutoff * positions)
+            * np.hamming(cls._FILTER_TAPS)
+        )
+        taps /= np.sum(taps)
+        return taps
+
+    def process(self, pcm: bytes) -> bytes:
+        if not pcm:
+            return b""
+        with self._lock:
+            raw = self._byte_carry + pcm
+            aligned = len(raw) - len(raw) % 2
+            self._byte_carry = raw[aligned:]
+            if aligned <= 0:
+                return b""
+            samples = np.frombuffer(raw[:aligned], dtype="<i2").astype(np.float64)
+            combined = np.concatenate((self._history, samples))
+            # 滤波器对称，所以 np.convolve 的核翻转不改变结果。valid 恰好为
+            # 每个新输入样本产生一个连续输出，不重复历史区间。
+            filtered = np.convolve(combined, self._taps, mode="valid")
+            output = filtered[self._phase :: self.factor]
+            self._phase = (self._phase - len(filtered)) % self.factor
+            self._history = combined[-(len(self._taps) - 1) :]
+        encoded = np.clip(np.rint(output), -32768, 32767).astype("<i2")
+        return encoded.tobytes()
+
+
+def _agent_chunk_to_modem(
+    bridge: Any,
+    pcm_agent: bytes,
+    agent_rate: int,
+) -> bytes:
+    """按 bridge 实例保持 Agent→电话降采样状态。"""
+    if not pcm_agent or agent_rate == MODEM_RATE:
+        return pcm_agent
+    if agent_rate > MODEM_RATE and agent_rate % MODEM_RATE == 0:
+        resampler = getattr(bridge, "_downlink_resampler", None)
+        if (
+            resampler is None
+            or resampler.src_rate != agent_rate
+            or resampler.dst_rate != MODEM_RATE
+        ):
+            resampler = StreamingPcmDownsampler(agent_rate, MODEM_RATE)
+            bridge._downlink_resampler = resampler
+            logger.info(
+                "Agent 下行流式降采样已启用: %dHz -> %dHz "
+                "(3.4kHz low-pass, 跨块连续相位)",
+                agent_rate,
+                MODEM_RATE,
+            )
+        return cast(StreamingPcmDownsampler, resampler).process(pcm_agent)
+    return resample_pcm(pcm_agent, agent_rate, MODEM_RATE)
+
+
 def apply_pcm_gain(pcm: bytes, gain: float) -> bytes:
     if gain == 1.0 or not pcm:
         return pcm
@@ -121,6 +212,7 @@ class ModemAudioBridge:
             )
         self._input_stream: Any = None
         self._output_stream: Any = None
+        self._downlink_resampler: StreamingPcmDownsampler | None = None
         self._block_size = int(MODEM_RATE * MODEM_BLOCK_MS / 1000)
 
     def start(self) -> None:
@@ -142,6 +234,7 @@ class ModemAudioBridge:
         )
         self._input_stream.start()
         self._output_stream.start()
+        self._downlink_resampler = None
         logger.info("模组音频流已启动 (8kHz mono)")
 
     def stop(self) -> None:
@@ -172,9 +265,8 @@ class ModemAudioBridge:
     def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:
         return resample_pcm(pcm_8k, MODEM_RATE, agent_rate)
 
-    @staticmethod
-    def agent_to_modem(pcm_agent: bytes, agent_rate: int) -> bytes:
-        return resample_pcm(pcm_agent, agent_rate, MODEM_RATE)
+    def agent_to_modem(self, pcm_agent: bytes, agent_rate: int) -> bytes:
+        return _agent_chunk_to_modem(self, pcm_agent, agent_rate)
 
 
 class SerialPcmAudioBridge:
@@ -212,6 +304,7 @@ class SerialPcmAudioBridge:
         self._write_timeouts = 0
         self._started_at = 0.0
         self._startup_noise_reported = False
+        self._downlink_resampler: StreamingPcmDownsampler | None = None
 
     def _open_serial(self) -> serial.Serial:
         """打开 PCM 串口；目标是 PTY 时直接用 PTY 安全波特率，否则失败后降速重开。
@@ -262,6 +355,7 @@ class SerialPcmAudioBridge:
         self._running = True
         self._started_at = time.monotonic()
         self._startup_noise_reported = False
+        self._downlink_resampler = None
         self._written_bytes = 0
         self._queued_bytes = 0
         self._write_timeouts = 0
@@ -446,9 +540,8 @@ class SerialPcmAudioBridge:
     def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:
         return resample_pcm(pcm_8k, MODEM_RATE, agent_rate)
 
-    @staticmethod
-    def agent_to_modem(pcm_agent: bytes, agent_rate: int) -> bytes:
-        return resample_pcm(pcm_agent, agent_rate, MODEM_RATE)
+    def agent_to_modem(self, pcm_agent: bytes, agent_rate: int) -> bytes:
+        return _agent_chunk_to_modem(self, pcm_agent, agent_rate)
 
     def amplify_for_modem(self, pcm_8k: bytes) -> bytes:
         return apply_pcm_gain(pcm_8k, self.tx_gain)
@@ -508,6 +601,7 @@ class FfmpegAudioBridge:
         # 只统计非静音 payload；补零静音单独计次。仅写线程内使用。
         self._write_stats = PcmFlowStats("uplink3_as_write")
         self._silence_writes = 0
+        self._downlink_resampler: StreamingPcmDownsampler | None = None
 
     @staticmethod
     def _find_avfoundation_input(keyword: str) -> int | None:
@@ -561,6 +655,7 @@ class FfmpegAudioBridge:
         self._dropped_bytes = 0
         self._drop_events = 0
         self._consecutive_play_restarts = 0
+        self._downlink_resampler = None
         self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
         self._writer_thread.start()
         logger.info(
@@ -771,9 +866,8 @@ class FfmpegAudioBridge:
     def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:
         return resample_pcm(pcm_8k, MODEM_RATE, agent_rate)
 
-    @staticmethod
-    def agent_to_modem(pcm_agent: bytes, agent_rate: int) -> bytes:
-        return resample_pcm(pcm_agent, agent_rate, MODEM_RATE)
+    def agent_to_modem(self, pcm_agent: bytes, agent_rate: int) -> bytes:
+        return _agent_chunk_to_modem(self, pcm_agent, agent_rate)
 
     def amplify_for_modem(self, pcm_8k: bytes) -> bytes:
         return apply_pcm_gain(pcm_8k, self.tx_gain)

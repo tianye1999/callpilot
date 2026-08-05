@@ -15,6 +15,7 @@ import agentcall.coreaudio as coreaudio
 from agentcall.audio_bridge import (
     NMEA_WRITE_SIZE,
     FfmpegAudioBridge,
+    StreamingPcmDownsampler,
     create_audio_bridge,
     resample_pcm,
 )
@@ -37,6 +38,51 @@ def test_resample_pcm_round_trip_preserves_length_and_waveform(src_rate, dst_rat
     assert np.sqrt(np.mean(restored.astype(np.float64) ** 2)) == pytest.approx(
         np.sqrt(np.mean(original.astype(np.float64) ** 2)), rel=0.05
     )
+
+
+def test_streaming_downsampler_is_invariant_to_realtime_chunk_boundaries():
+    """同一条连续语音不应因 WebSocket delta 切法不同而产生块边界爆音。"""
+    rate = 24000
+    phase = np.arange(rate, dtype=np.float64) / rate
+    pcm = (
+        (np.sin(2 * np.pi * 440 * phase) + 0.2 * np.sin(2 * np.pi * 2800 * phase))
+        * 10000
+    ).astype("<i2").tobytes()
+
+    whole = StreamingPcmDownsampler(rate, 8000).process(pcm)
+    # 故意在 int16 采样中间切开两个 delta；实现必须把半个采样带到下一块。
+    split_at = [7786 * 2 + 1, 13001 * 2, 17879 * 2 + 1]
+    parts = []
+    start = 0
+    streaming = StreamingPcmDownsampler(rate, 8000)
+    for end in [*split_at, len(pcm)]:
+        parts.append(streaming.process(pcm[start:end]))
+        start = end
+
+    assert b"".join(parts) == whole
+
+
+def test_streaming_downsampler_rejects_above_phone_nyquist_alias():
+    """24kHz 的 6kHz 分量不能像旧 np.interp 那样折叠成电话里的 2kHz 杂音。"""
+    rate = 24000
+    phase = np.arange(rate, dtype=np.float64) / rate
+    passband = (np.sin(2 * np.pi * 1000 * phase) * 12000).astype("<i2")
+    stopband = (np.sin(2 * np.pi * 6000 * phase) * 12000).astype("<i2")
+
+    passed = np.frombuffer(
+        StreamingPcmDownsampler(rate, 8000).process(passband.tobytes()),
+        dtype="<i2",
+    ).astype(np.float64)
+    rejected = np.frombuffer(
+        StreamingPcmDownsampler(rate, 8000).process(stopband.tobytes()),
+        dtype="<i2",
+    ).astype(np.float64)
+
+    # 去掉 127-tap FIR 的短暂启动区再比较稳态能量。
+    passed_rms = np.sqrt(np.mean(passed[100:] ** 2))
+    rejected_rms = np.sqrt(np.mean(rejected[100:] ** 2))
+    assert passed_rms > 7000
+    assert rejected_rms < passed_rms * 0.01
 
 
 def make_ffmpeg_bridge() -> FfmpegAudioBridge:
