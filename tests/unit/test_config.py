@@ -46,9 +46,9 @@ def _unset(monkeypatch, *keys):
 
 def test_get_str_default_and_env_override(monkeypatch):
     _unset(monkeypatch, "QWEN_VOICE")
-    assert get_str("QWEN_VOICE") == "Raymond"
-    monkeypatch.setenv("QWEN_VOICE", "Cherry")
-    assert get_str("QWEN_VOICE") == "Cherry"
+    assert get_str("QWEN_VOICE") == "longanqian"
+    monkeypatch.setenv("QWEN_VOICE", "loongmary")
+    assert get_str("QWEN_VOICE") == "loongmary"
 
 
 def test_get_int_default_and_env_override(monkeypatch):
@@ -540,11 +540,11 @@ def test_update_replaces_in_place_and_keeps_comments(tmp_path, monkeypatch):
     _unset(monkeypatch, "QWEN_VOICE")
     env = tmp_path / ".env"
     env.write_text(
-        "# 模组配置\nMODEM_PORT=/dev/old\n\n# 音色\nQWEN_VOICE=Cherry\n",
+        "# 模组配置\nMODEM_PORT=/dev/old\n\n# 音色\nQWEN_VOICE=loongmary\n",
         encoding="utf-8",
     )
 
-    updated = update_env_file({"QWEN_VOICE": "Raymond"}, env_path=env)
+    updated = update_env_file({"QWEN_VOICE": "longanqian"}, env_path=env)
 
     assert updated == ["QWEN_VOICE"]
     assert env.read_text(encoding="utf-8").splitlines() == [
@@ -552,15 +552,15 @@ def test_update_replaces_in_place_and_keeps_comments(tmp_path, monkeypatch):
         "MODEM_PORT=/dev/old",
         "",
         "# 音色",
-        "QWEN_VOICE=Raymond",
+        "QWEN_VOICE=longanqian",
     ]
-    assert os.environ["QWEN_VOICE"] == "Raymond"
+    assert os.environ["QWEN_VOICE"] == "longanqian"
 
 
 def test_update_appends_new_key_at_end(tmp_path, monkeypatch):
     _unset(monkeypatch, "MODEM_TX_GAIN")
     env = tmp_path / ".env"
-    env.write_text("# 只有注释\nQWEN_VOICE=Cherry\n", encoding="utf-8")
+    env.write_text("# 只有注释\nQWEN_VOICE=loongmary\n", encoding="utf-8")
 
     updated = update_env_file({"MODEM_TX_GAIN": "0.5"}, env_path=env)
 
@@ -587,7 +587,7 @@ def test_update_rejects_non_editable_key(tmp_path, monkeypatch):
     env.write_text("# 原文\n", encoding="utf-8")
 
     with pytest.raises(ValueError):
-        update_env_file({"QWEN_VOICE": "Cherry", "WEB_HOST": "0.0.0.0"}, env_path=env)
+        update_env_file({"QWEN_VOICE": "longanqian", "WEB_HOST": "0.0.0.0"}, env_path=env)
 
     # 整批拒绝：文件与环境都不应被改动
     assert env.read_text(encoding="utf-8") == "# 原文\n"
@@ -625,7 +625,7 @@ def test_update_env_file_concurrent_writers_do_not_lose_keys(
     tmp_path, monkeypatch
 ):
     keys = {
-        "QWEN_VOICE": "Raymond",
+        "QWEN_VOICE": "longanqian",
         "MODEM_TX_GAIN": "0.75",
         "SUMMARY_MODEL": "qwen-plus",
         "MONITOR_OUTPUT_DEVICE": "Built-in Output",
@@ -671,14 +671,14 @@ def test_update_env_file_concurrent_writers_do_not_lose_keys(
 def test_update_env_file_handles_utf8_bom_and_preserves_crlf(tmp_path, monkeypatch):
     _unset(monkeypatch, "QWEN_VOICE")
     env = tmp_path / ".env"
-    env.write_bytes(codecs.BOM_UTF8 + b"QWEN_VOICE=Cherry\r\n# keep\r\n")
+    env.write_bytes(codecs.BOM_UTF8 + b"QWEN_VOICE=loongmary\r\n# keep\r\n")
 
-    update_env_file({"QWEN_VOICE": "Raymond"}, env_path=env)
+    update_env_file({"QWEN_VOICE": "longanqian"}, env_path=env)
 
     raw = env.read_bytes()
     assert raw.startswith(codecs.BOM_UTF8)
-    assert b"QWEN_VOICE=Raymond\r\n" in raw
-    assert b"QWEN_VOICE=Cherry" not in raw
+    assert b"QWEN_VOICE=longanqian\r\n" in raw
+    assert b"QWEN_VOICE=loongmary" not in raw
     assert raw.count(b"QWEN_VOICE=") == 1
 
 
@@ -896,10 +896,10 @@ def test_existing_setup_done_remains_complete_without_recording_choice(monkeypat
 
 
 def test_panel_reflects_env_value(monkeypatch):
-    monkeypatch.setenv("QWEN_VOICE", "Cherry")
+    monkeypatch.setenv("QWEN_VOICE", "loongmary")
     rows = {row["key"]: row for row in read_panel_values()}
-    assert rows["QWEN_VOICE"]["value"] == "Cherry"
-    assert rows["QWEN_VOICE"]["default"] == "Raymond"
+    assert rows["QWEN_VOICE"]["value"] == "loongmary"
+    assert rows["QWEN_VOICE"]["default"] == "longanqian"
 
 
 def test_panel_marks_doubao_choice_experimental():
@@ -973,7 +973,7 @@ def test_editable_specs_covered_by_env_example():
 
 def test_voice_specs_are_selects_with_default_in_choices():
     """音色改为下拉(select)：默认值必须在 choices 内，否则面板/写回校验不一致。"""
-    for key, expected_default in (("QWEN_VOICE", "Raymond"), ("OPENAI_VOICE", "alloy")):
+    for key, expected_default in (("QWEN_VOICE", "longanqian"), ("OPENAI_VOICE", "alloy")):
         spec = get_spec(key)
         assert spec.kind == "select", key
         assert spec.default == expected_default, key
