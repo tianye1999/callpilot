@@ -642,17 +642,38 @@ def validate_provider_key_online(
                 b'{"model":"qwen-turbo","input":{"messages":['
                 b'{"role":"user","content":"ping"}]},"parameters":{"max_tokens":1}}'
             )
-            _http_request_json(
-                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
-                method="POST",
-                headers={
-                    "Authorization": f"Bearer {secret}",
-                    "Content-Type": "application/json",
-                },
-                body=payload,
-                timeout=timeout,
+            headers = {
+                "Authorization": f"Bearer {secret}",
+                "Content-Type": "application/json",
+            }
+            endpoints = (
+                ("cn", "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"),
+                (
+                    "intl",
+                    "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+                ),
             )
-            return KeyValidationResult(True, "valid")
+            last_auth_error: str | None = None
+            for region, url in endpoints:
+                try:
+                    _http_request_json(
+                        url,
+                        method="POST",
+                        headers=headers,
+                        body=payload,
+                        timeout=timeout,
+                    )
+                    return KeyValidationResult(
+                        True, "valid", "intl" if region == "intl" else ""
+                    )
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (401, 403):
+                        last_auth_error = f"HTTP {exc.code}"
+                        continue
+                    return KeyValidationResult(False, "network", f"HTTP {exc.code}")
+            return KeyValidationResult(
+                False, "invalid", last_auth_error or "HTTP 401"
+            )
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             return KeyValidationResult(False, "invalid", f"HTTP {exc.code}")
@@ -662,6 +683,8 @@ def validate_provider_key_online(
     return KeyValidationResult(False, "unsupported", provider)
 
 
+            # 国内站与国际站 Key 不通用；向导若只打国内站，国际站 Key 会误报「无效」。
+            # 先国内、401/403 再试国际站；国际站通过时用 message=intl 提示前端写 Realtime URL。
 # ---- 面板读取 ----
 
 

@@ -3395,11 +3395,15 @@ async function validateSetupKey() {
   try {
     const { httpOk, res } = await postJson("/api/config/validate_key", { provider, api_key: key });
     setupValidated = !!(httpOk && res.ok);
-    const msg = res.status === "valid" ? t("setup_key_valid")
+    // 国际站 Key 校验通过时后端 message=intl，保存时写入 Realtime 国际端点。
+    window._setupKeyRegion = (setupValidated && res.message === "intl") ? "intl" : "cn";
+    let msg = res.status === "valid" ? t("setup_key_valid")
       : res.status === "invalid" ? t("setup_key_invalid")
       : res.status === "network" ? t("setup_key_network")
       : t("setup_key_unsupported");
     setupStatus("setupKeyStatus", setupValidated ? "ok" : "err", msg);
+    if (res.message && res.status !== "valid") msg = `${msg} (${res.message})`;
+    if (setupValidated && res.message === "intl") msg = `${msg} · intl`;
     return setupValidated;
   } catch (e) {
     setupValidated = false;
@@ -3425,6 +3429,10 @@ async function saveSetupApi() {
     if (!setupValidated && !(await validateSetupKey())) return false;
     updates[setupProviderKey(provider)] = key;
   }
+    if (provider === "qwen" && window._setupKeyRegion === "intl") {
+      updates.DASHSCOPE_REALTIME_URL =
+        "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime";
+    }
   const { httpOk, res } = await postJson("/api/config", updates);
   if (!httpOk) {
     setupStatus("setupKeyStatus", "err", t("cfg_savefail") + (res.error || ""));
