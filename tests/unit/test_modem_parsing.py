@@ -805,15 +805,16 @@ def test_simcom_dial_enables_usb_audio_immediately_after_atd(monkeypatch):
     response = modem.dial("10000")
 
     assert response == "OK"
-    assert calls[:6] == [
+    assert calls[:7] == [
         "AT+CLCC",
         "AT+CHUP",
         "AT+CPCMREG=0,1",
         "AT+CLCC",
         "AT+CPCMBANDWIDTH=1,1",
+        "AT+CPCMBANDWIDTH?",
         "ATD10000;",
     ]
-    assert calls[6:8] == ["AT+CPCMREG=1", "AT+CPCMREG?"]
+    assert calls[7:9] == ["AT+CPCMREG=1", "AT+CPCMREG?"]
     assert modem.voice_pcm_active is True
     assert not modem.is_call_connected()
 
@@ -840,12 +841,13 @@ def test_simcom_dial_early_enable_failure_falls_back_after_connect(monkeypatch):
     monkeypatch.setattr(modem, "_send", fake_send)
 
     assert modem.dial("10000") == "OK"
-    assert calls[0:6] == [
+    assert calls[0:7] == [
         "AT+CLCC",
         "AT+CHUP",
         "AT+CPCMREG=0,1",
         "AT+CLCC",
         "AT+CPCMBANDWIDTH=1,1",
+        "AT+CPCMBANDWIDTH?",
         "ATD10000;",
     ]
     assert calls.count("AT+CPCMREG=1") > 1
@@ -1000,6 +1002,93 @@ def test_simcom_pcm_retries_while_in_call(monkeypatch):
     assert "AT+CPCMBANDWIDTH=1,1" in calls
 
 
+def test_simcom_pcm_resets_endpoint_once_when_start_is_rejected(monkeypatch):
+    """`=1` 被拒时先 stop=1 复位端点再重试，且整轮只复位一次。
+
+    外呼路径在 ATD 前就无条件发 `AT+CPCMREG=0,1`（见
+    `test_simcom_dial_clears_stale_calls_before_atd`），来电路径原本没有对应
+    动作，重试只是重复发 =1——清不掉端点里的半开状态。2026-08-11 来电侧
+    连续出现「重试 3 次才 mode=1，实听严重断续」以及「重试 6 次全失败」。
+
+    只复位一次：复位每次要多花一条 AT（模组繁忙时可达数秒），重复复位会把
+    12s 窗口里本该用于重试的预算烧光，反而让慢模组更容易超时失败。
+    """
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    calls: list[str] = []
+    modem = make_modem()
+    modem._call_connected_event.set()
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG=1":
+            return "OK" if calls.count("AT+CPCMREG=1") >= 3 else "ERROR"
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+
+    reg = [c for c in calls if c.startswith("AT+CPCMREG")]
+    # =1(拒) → =0,1 复位 → =1(仍拒，不再复位) → =1(成功) → 读回确认
+    assert reg == [
+        "AT+CPCMREG=1",
+        "AT+CPCMREG=0,1",
+        "AT+CPCMREG=1",
+        "AT+CPCMREG=1",
+        "AT+CPCMREG?",
+    ]
+    assert modem.voice_pcm_active is True
+
+
+def test_simcom_pcm_never_resets_while_registration_is_pending(monkeypatch):
+    """`=1` 已回 OK、只是读回还没到 mode=1 时，绝不能复位。
+
+    那种情形下模组正在异步完成注册，`AT+CPCMREG=0,1` 会把一次本来就要成功的
+    注册打断，把「慢但正常」的模组推进多次重试路径——而多次重试与实听断续
+    强相关（§5.3）。真机存在整段建立慢到 15s 但仍第 1 次注册成功的模组。
+    """
+    clock = {"now": 0.0}
+    queries = {"count": 0}
+    monkeypatch.setattr(modem_time_sleep_target(), "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        modem_time_sleep_target(),
+        "sleep",
+        lambda delay: clock.__setitem__("now", clock["now"] + delay),
+    )
+    calls: list[str] = []
+    modem = make_modem()
+    modem._call_connected_event.set()
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG?":
+            queries["count"] += 1
+            # 前两次注册尚未完成，第三次才读到 mode=1
+            return f"+CPCMREG: {1 if queries['count'] >= 3 else 0}\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert modem.voice_pcm_active is True
+    assert "AT+CPCMREG=0,1" not in calls
+    assert calls.count("AT+CPCMREG=1") == 3
+
+
+def test_simcom_pcm_does_not_reset_endpoint_when_no_call(monkeypatch):
+    """无通话路径只试一次，不该多发复位——那会拖慢每次服务启动。"""
+    calls: list[str] = []
+    modem = make_modem()
+    assert not modem._call_connected_event.is_set()
+    monkeypatch.setattr(modem, "_send", lambda cmd: (calls.append(cmd), "ERROR")[1])
+
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert calls.count("AT+CPCMREG=1") == 1
+    assert "AT+CPCMREG=0,1" not in calls
+
+
 def test_simcom_pcm_retries_until_readback_confirms_mode_one(monkeypatch):
     """写命令的 OK 不是充分条件：必须读回 mode=1 才能启动 USB 音频桥。"""
     clock = {"now": 0.0}
@@ -1141,11 +1230,9 @@ def test_simcom_pcm_no_call_tries_once_only(monkeypatch):
 
 
 def test_simcom_pcm_forces_8k_sampling(monkeypatch):
-    """真机 2026-08-04：不设 CPCMBANDWIDTH 时，电信 VoLTE 通话的接收流是 16K，
-    被按 8k 解就是"宽带噪声"（上游据此误判 transmit-only）。设 1,1 后
-    interface 4 稳定 15999 B/s、基频 216Hz，确凿人声。
+    """默认 pcm_rate=8000 时钉 AT+CPCMBANDWIDTH=1,1（双 8k）。
 
-    顺带锁死：AT+CPCMFRM 不能用来降回 8k（手册明确只支持 8k→16k 单向）。
+    历史：不设时 VoLTE 出厂偏 16K，按 8k 解会成宽带噪声（HANDOVER §3.1）。
     """
     monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
     modem = make_modem()
@@ -1162,8 +1249,54 @@ def test_simcom_pcm_forces_8k_sampling(monkeypatch):
     modem.initialize_for_voice("simcom_pcm")
 
     assert "AT+CPCMBANDWIDTH=1,1" in calls
+    assert "AT+CPCMBANDWIDTH?" in calls
     assert calls.index("AT+CPCMBANDWIDTH=1,1") < calls.index("AT+CPCMREG=1")
+    assert calls.index("AT+CPCMBANDWIDTH=1,1") < calls.index("AT+CPCMBANDWIDTH?")
     assert not any(c.startswith("AT+CPCMFRM") for c in calls)
+
+
+def test_simcom_pcm_forces_16k_sampling_when_configured(monkeypatch):
+    """MODEM_PCM_RATE=16000 时钉 AT+CPCMBANDWIDTH=0,0（双 16k）。"""
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    modem = Eg25Modem(port="/dev/null-not-used", pcm_rate=16000)
+    modem._call_connected_event.set()
+    calls: list[str] = []
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        if cmd == "AT+CPCMBANDWIDTH?":
+            return "+CPCMBANDWIDTH: 0,0\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert "AT+CPCMBANDWIDTH=0,0" in calls
+    assert "AT+CPCMBANDWIDTH=1,1" not in calls
+    assert calls.index("AT+CPCMBANDWIDTH=0,0") < calls.index("AT+CPCMREG=1")
+
+
+def test_simcom_pcm_bandwidth_readback_logged(monkeypatch, caplog):
+    """通话中设置后读回 1,1，确认 VoLTE/非 VoLTE 都钉在 8k。"""
+    import logging
+
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    modem = make_modem()
+    modem._call_connected_event.set()
+
+    def fake_send(cmd: str) -> str:
+        if cmd == "AT+CPCMBANDWIDTH?":
+            return "+CPCMBANDWIDTH: 1,1\r\nOK"
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    with caplog.at_level(logging.INFO, logger="agentcall.modem"):
+        modem.initialize_for_voice("simcom_pcm")
+    assert any("PCM 带宽已确认 8kHz" in r.message for r in caplog.records)
 
 
 def test_bandwidth_failure_does_not_block_pcm(monkeypatch):

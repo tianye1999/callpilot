@@ -4,6 +4,10 @@
 
 初稿曾是 untracked；Codex 续调后决定纳入仓库，避免已否定的假设被重复试验。
 
+> **2026-08-10 续**：Windows + 官方 SimTech Audio COM 路径上，下行已可闻（开场白 / PCM 写通）。  
+> 调试时间线、写超时陷阱与听感调参见 [`docs/sim7600-windows-inbound-debug.md`](docs/sim7600-windows-inbound-debug.md)。  
+> 下文 §5 P0「libusb bulk OUT 首包超时」仍描述 **macOS/libusb** 路径，勿与 Windows COM 混为一谈。
+
 ---
 
 ## 0. 一句话现状

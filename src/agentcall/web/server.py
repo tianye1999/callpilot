@@ -406,8 +406,12 @@ async def _audio_websocket(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
     hub: EventHub = request.app["hub"]
 
-    # rate=下行(AI)采样率；uplink_rate=上行(对方)固定 8kHz（模组 PCM 速率）。
-    await ws.send_json({"type": "meta", "rate": hub.audio_rate, "uplink_rate": 8000})
+    # rate=下行(AI)采样率；uplink_rate=上行(对方)=模组 PCM 速率。
+    from agentcall.audio_bridge import MODEM_RATE
+
+    await ws.send_json(
+        {"type": "meta", "rate": hub.audio_rate, "uplink_rate": MODEM_RATE}
+    )
     hub.register_audio(ws)
     logger.info("音频旁听端已连接")
     try:
@@ -1048,7 +1052,7 @@ async def _validate_key(request: web.Request) -> web.Response:
         )
     provider = str(data.get("provider") or "").strip().lower()
     api_key = str(data.get("api_key") or "").strip()
-    if provider not in {"qwen", "openai"}:
+    if provider not in {"qwen", "openai", "minimax"}:
         return web.json_response(
             {"ok": False, "status": "unsupported", "error": "当前 provider 不支持在线校验"},
             status=400,

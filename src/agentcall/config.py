@@ -307,7 +307,31 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                requires_restart=True),
     ConfigSpec("MODEM_PCM_BAUD", "PCM 串口波特率", "int", "921600",
                requires_restart=True),
-    ConfigSpec("MODEM_TX_GAIN", "上行发送增益", "float", "1.0"),
+    # simcom_pcm：模组 USB Audio PCM 采样率。须与 AT+CPCMBANDWIDTH 一致。
+    # 8000=窄带（默认/兼容）；16000=宽带（VoLTE HD 听感更好，Windows 须真机压测写吞吐）。
+    ConfigSpec(
+        "MODEM_PCM_RATE",
+        "模组 PCM 采样率",
+        "select",
+        "8000",
+        choices=("8000", "16000"),
+        requires_restart=True,
+    ),
+    # 默认 0.83 而非 1.0：它要抵掉 apply_phone_clarity 的预加重降档
+    # （0.65→0.35）带来的 +1.63dB，使默认部署的响度与历史一致。这两个值是
+    # **耦合**的——动了 pre_coef 就必须按新的电平差重算这里，否则音色和响度
+    # 会一起变，听感无法归因。详见 audio_bridge.apply_phone_clarity 的 docstring。
+    ConfigSpec("MODEM_TX_GAIN", "上行发送增益", "float", "0.83"),
+    # 下行动态范围压缩：把句尾/轻辅音抬到窄带电话里仍可辨，静态增益做不到
+    # （只能在削顶和听不清之间二选一）。目标电平是 AGC 拉齐的 RMS，不是峰值；
+    # MODEM_TX_GAIN 仍作为 AGC 之后的总响度微调。这两项只在启动时由
+    # configure_downlink_agc() 读入进程全局，面板改完必须重启才生效。
+    # 默认关：2026-08-11 真机等响 A/B 判定无可闻收益（文档 §5.2），
+    # 保留开关但不默认承担通话链路上的复杂度。
+    ConfigSpec("MODEM_AGC", "下行动态压缩(AGC)", "bool", "false",
+               requires_restart=True),
+    ConfigSpec("MODEM_AGC_TARGET_DBFS", "下行 AGC 目标电平(dBFS)", "float", "-18.0",
+               requires_restart=True),
     # 对方语音送 AI 模型前的独立增益；每通开始读取，录音/监听仍保留各自路径。
     ConfigSpec("AGENT_UPLINK_GAIN", "AI 输入增益（对方语音）", "float", "1.0"),
     # 模组语音送远程手机前的独立增益；每个 LiveKit 会话创建时读取，支持热更新。
@@ -638,6 +662,8 @@ def validate_provider_key_online(
             )
             return KeyValidationResult(True, "valid")
         if provider == "qwen":
+            # 国内站与国际站 Key 不通用；向导若只打国内站，国际站 Key 会误报「无效」。
+            # 先国内、401/403 再试国际站；国际站通过时用 message=intl 提示前端写 Realtime URL。
             payload = (
                 b'{"model":"qwen-turbo","input":{"messages":['
                 b'{"role":"user","content":"ping"}]},"parameters":{"max_tokens":1}}'
@@ -683,8 +709,6 @@ def validate_provider_key_online(
     return KeyValidationResult(False, "unsupported", provider)
 
 
-            # 国内站与国际站 Key 不通用；向导若只打国内站，国际站 Key 会误报「无效」。
-            # 先国内、401/403 再试国际站；国际站通过时用 message=intl 提示前端写 Realtime URL。
 # ---- 面板读取 ----
 
 

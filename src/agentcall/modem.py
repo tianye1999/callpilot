@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from queue import Queue
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import serial
 
@@ -35,6 +35,7 @@ CLCC_PATTERN = re.compile(
 )
 QPCMV_PATTERN = re.compile(r"\+QPCMV:\s*(\d+),(\d+)")
 CPCMREG_PATTERN = re.compile(r"\+CPCMREG:\s*(\d+)")
+CPCMBANDWIDTH_PATTERN = re.compile(r"\+CPCMBANDWIDTH:\s*(\d+)\s*,\s*(\d+)")
 CMTI_PATTERN = re.compile(r'\+CMTI:\s*"([^"]*)",\s*(\d+)')
 CREG_PATTERN = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?\d+(?=\s|$)")
 QSIMSTAT_PATTERN = re.compile(r"\+QSIMSTAT:\s*(\d+)\s*,\s*(\d+)")
@@ -166,6 +167,22 @@ def parse_sms_pdu(pdu: str) -> tuple[str | None, str, str] | None:
         return None
 
 
+class _PcmStartResult(NamedTuple):
+    """一次 `AT+CPCMREG=1` 启用尝试的结果。
+
+    `accepted` 区分两类失败，它们的正确处置**相反**：
+
+    - `accepted=False`：`=1` 本身被拒（ERROR）。端点状态可疑，值得先
+      `=0,1` 复位再重来。
+    - `accepted=True` 而 `ok=False`：`=1` 已回 OK，只是 `AT+CPCMREG?` 还没
+      读到 mode=1 —— 模组正在异步完成注册。此时**绝不能**复位，那会打断
+      一次本来就要成功的注册（真机存在整段建立慢到 15s 但最终一次成功的模组）。
+    """
+
+    ok: bool
+    accepted: bool
+
+
 def _looks_like_pdu(body: str) -> bool:
     compact = re.sub(r"\s+", "", body)
     return len(compact) >= 20 and bool(re.fullmatch(r"[0-9A-Fa-f]+", compact))
@@ -174,9 +191,19 @@ def _looks_like_pdu(body: str) -> bool:
 class Eg25Modem:
     """通过串口控制 EG25 模组：监听来电、接听、挂断、启用 UAC 音频。"""
 
-    def __init__(self, port: str, baudrate: int = 115200) -> None:
+    def __init__(
+        self,
+        port: str,
+        baudrate: int = 115200,
+        *,
+        pcm_rate: int = 8000,
+    ) -> None:
         self.port = port
         self.baudrate = baudrate
+        # 与 audio_bridge.MODEM_RATE / MODEM_PCM_RATE 对齐；决定 CPCMBANDWIDTH。
+        if pcm_rate not in (8000, 16000):
+            raise ValueError(f"pcm_rate 仅支持 8000/16000，收到: {pcm_rate}")
+        self.pcm_rate = pcm_rate
         # port 为 auto 哨兵时每次打开都重新探测，这里存本次解析出的实际端口（供日志）。
         self._active_port: str | None = None
         # SIM 身份缓存(#88):连接/重连后读一次 CIMI/CREG;换卡靠重插/重连触发刷新。
@@ -668,24 +695,50 @@ class Eg25Modem:
     _SIMCOM_PREDIAL_SETTLE_DELAY = 0.8
 
     def _set_simcom_pcm_bandwidth(self) -> None:
-        """把 SIMCom VoLTE/非 VoLTE PCM 都钉到项目使用的 8 kHz。"""
+        """把 SIMCom VoLTE/非 VoLTE PCM 钉到 ``self.pcm_rate``，并读回确认。
+
+        ``AT+CPCMBANDWIDTH=<volte>,<novolte>``：``0``=16k / ``1``=8k。
+        软件采样率必须与此一致，否则会出现「16k 流按 8k 解 → 宽带噪声」。
+        """
+        code = "0" if self.pcm_rate >= 16000 else "1"
+        command = f"AT+CPCMBANDWIDTH={code},{code}"
         try:
-            self._send("AT+CPCMBANDWIDTH=1,1")
+            self._send(command)
+            response = self._send("AT+CPCMBANDWIDTH?")
         except Exception as exc:  # noqa: BLE001
             logger.debug("AT+CPCMBANDWIDTH 设置失败（可忽略）: %s", type(exc).__name__)
+            return
+        match = CPCMBANDWIDTH_PATTERN.search(response)
+        if match is not None and match.group(1) == code and match.group(2) == code:
+            logger.info(
+                "SIMCom PCM 带宽已确认 %dkHz (%s)",
+                self.pcm_rate // 1000,
+                command,
+            )
+            return
+        logger.warning(
+            "SIMCom PCM 带宽读回非预期（期望 %s,%s=%dkHz）: %s",
+            code,
+            code,
+            self.pcm_rate // 1000,
+            response.strip().replace("\r", " ").replace("\n", " "),
+        )
 
-    def _start_simcom_pcm_once(self) -> bool:
-        """尝试一次 CPCMREG 启动并读回确认，成功才更新本地事实状态。"""
+    def _start_simcom_pcm_once(self) -> _PcmStartResult:
+        """尝试一次 CPCMREG 启动并读回确认，成功才更新本地事实状态。
+
+        两类失败必须分开，因为处置相反（见 `_PcmStartResult`）。
+        """
         self._voice_pcm_active = False
         start_response = self._send("AT+CPCMREG=1")
         if "OK" not in start_response.upper():
-            return False
+            return _PcmStartResult(ok=False, accepted=False)
         state_response = self._send("AT+CPCMREG?")
         state_match = CPCMREG_PATTERN.search(state_response)
         if state_match is None or state_match.group(1) != "1":
-            return False
+            return _PcmStartResult(ok=False, accepted=True)
         self._voice_pcm_active = True
-        return True
+        return _PcmStartResult(ok=True, accepted=True)
 
     def _early_enable_simcom_pcm(self) -> None:
         """ATD 后立即预启用 USB Audio；失败不阻断外呼，接通后继续兜底。"""
@@ -693,7 +746,7 @@ class Eg25Modem:
         attempts = 0
         while True:
             attempts += 1
-            if self._start_simcom_pcm_once():
+            if self._start_simcom_pcm_once().ok:
                 logger.info(
                     "SIMCom PCM 在 ATD 后提前启用并读回确认（第 %d 次尝试）",
                     attempts,
@@ -758,17 +811,10 @@ class Eg25Modem:
         """
         in_call = self._call_connected_event.is_set()
         if in_call:
-            # 把 PCM 采样率钉成 8k，与本项目整条音频链路（MODEM_RATE=8000）对齐。
-            # AT+CPCMBANDWIDTH=<volte_sample>,<novolte_sample>，取值 0=16K / 1=8K，
-            # 出厂默认是 "0,1" —— 即 **VoLTE 通话走 16K**。电信这类纯 VoLTE 卡上，
-            # 模组按 16K 出流而我们按 8k 解，收到的就是一堆看着像宽带噪声的东西
-            # （这正是上游判定"接收方向不可用/transmit-only"的根因）。
-            # 真机实证（2026-08-04，SIM7600G + 中国电信 VoLTE，拨 10000）：
-            #   设 1,1 后 interface 4 稳定 15999 B/s = 精确 8000Hz×2B；
-            #   低/高频带能量比中位数 226.9、基频 216Hz —— 确凿的人声。
-            #   不设时同一指标约 1.0（噪声）。
-            # 注意 AT+CPCMFRM 不是这件事的开关：手册明确它只支持 8k→16k 单向切换，
-            # 拿它降回 8k 无效。
+            # 把 PCM 采样率钉到 self.pcm_rate（见 MODEM_PCM_RATE）。
+            # AT+CPCMBANDWIDTH=<volte>,<novolte>：0=16K / 1=8K。
+            # 历史：出厂默认 "0,1"（VoLTE=16K）；若软件仍按 8k 解会成宽带噪声
+            # （HANDOVER §3.1）。8k 模式钉 1,1；16k 模式钉 0,0。
             self._set_simcom_pcm_bandwidth()
 
             # 外呼路径通常已在 ATD 后立即打开；这里读回确认即可，避免接通后
@@ -783,9 +829,11 @@ class Eg25Modem:
 
         deadline = time.monotonic() + self._SIMCOM_PCM_ENABLE_TIMEOUT
         attempts = 0
+        endpoint_reset = False
         while True:
             attempts += 1
-            if self._start_simcom_pcm_once():
+            result = self._start_simcom_pcm_once()
+            if result.ok:
                 logger.info(
                     "SIMCom PCM 语音通道已启用并读回确认 "
                     "(AT+CPCMREG=1，第 %d 次尝试)",
@@ -799,6 +847,18 @@ class Eg25Modem:
             # 无通话时只试一次：ERROR 是必然结果，重试纯属浪费启动时间。
             if not in_call or time.monotonic() >= deadline:
                 break
+            # 仅当 =1 被拒（端点状态可疑）时复位，且整轮只复位一次：
+            # - `accepted=True` 说明注册在异步进行中，复位会打断它；
+            # - 复位每次要多花一条 AT（模组繁忙时可达数秒），重复复位纯粹
+            #   烧掉 12s 窗口里本该用于重试的预算。
+            # 依据：外呼路径 ATD 前就无条件做过这一步（见
+            # `_prepare_simcom_for_dial`：「不清理会导致 CPCMREG 始终无法进入
+            # mode=1」），来电路径原本完全没有，这个不对称是 2026-08-11 来电侧
+            # 反复重试/失败的可疑来源。
+            if not result.accepted and not endpoint_reset:
+                endpoint_reset = True
+                logger.info("AT+CPCMREG=1 被拒，先 stop=1 复位 USB Audio 端点再重试")
+                self._send("AT+CPCMREG=0,1")
             time.sleep(self._SIMCOM_PCM_RETRY_DELAY)
 
         self._voice_pcm_active = False

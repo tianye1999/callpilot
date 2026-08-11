@@ -16,12 +16,15 @@ from typing import Any, Callable
 
 import serial
 
+# 导入模块而非 from-import MODEM_RATE：那是导入时按值拷贝的，
+# configure_modem_rate() 在 main() 里改的是 audio_bridge 的全局，改不到这份拷贝
+# （16k 下会把录音标成 8k、TurnArbiter/DTMF 全按 8k 算）。一律在用时取。
+from . import audio_bridge as _audio_bridge
 from . import config
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
 from .audio_bridge import (
-    MODEM_RATE,
     FfmpegAudioBridge,
     ModemAudioBridge,
     SerialPcmAudioBridge,
@@ -451,6 +454,20 @@ class CallSession:
 
             # 挂断流程会关闭语音通道（AT+QPCMV=0 / AT+CPCMREG=0,1），每通电话都要
             # 重新启用，否则第二通开始模组无 PCM 流（双向无声）。
+            # simcom_pcm：先打开 Audio COM/PTY 占住驱动接口，再 AT+CPCMREG
+            # （官方示例 / Waveshare 时序；Windows 官方虚拟 COM 上后开口易首帧写超时）。
+            bridge = create_audio_bridge(
+                mode=self.audio_mode,
+                device_keyword=self.audio_keyword,
+                pcm_port=self.pcm_port,
+                pcm_baudrate=self.pcm_baudrate,
+                tx_gain=self.tx_gain,
+            )
+            if (
+                self.audio_mode.lower() == "simcom_pcm"
+                and isinstance(bridge, SerialPcmAudioBridge)
+            ):
+                bridge.preclaim()
             trace("bridge", "voice_channel_starting", "running")
             self.modem.initialize_for_voice(self.audio_mode)
             # simcom_pcm 只在通话中才能开 PCM：真开成了才允许起桥。往未出流的
@@ -460,14 +477,6 @@ class CallSession:
                 raise RuntimeError(
                     "SIMCom PCM 通道未启用（AT+CPCMREG=1 未成功），拒绝启动音频桥"
                 )
-
-            bridge = create_audio_bridge(
-                mode=self.audio_mode,
-                device_keyword=self.audio_keyword,
-                pcm_port=self.pcm_port,
-                pcm_baudrate=self.pcm_baudrate,
-                tx_gain=self.tx_gain,
-            )
             agent = create_agent(self.provider)
             self._start_dtmf_judge(record, session_t0=session_t0)
             instructions = self._build_agent_instructions(direction)
@@ -480,7 +489,7 @@ class CallSession:
                     0, config.get_int("HOTLINE_PLAYBACK_QUIET_MS")
                 )
                 self._turn_arbiter = TurnArbiter(
-                    sample_rate=MODEM_RATE,
+                    sample_rate=_audio_bridge.MODEM_RATE,
                     rms_threshold=config.get_int("TURN_REMOTE_RMS_THRESHOLD"),
                     quiet_ms=playback_quiet_ms,
                 )
@@ -2099,7 +2108,7 @@ class CallSession:
             if mode in {"inband", "both"}:
                 tone = dtmf_tone(
                     digits,
-                    MODEM_RATE,
+                    _audio_bridge.MODEM_RATE,
                     tone_ms=config.get_int("DTMF_TONE_MS"),
                     amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
                 )
@@ -2577,6 +2586,7 @@ class CallAgentService:
         audio_mode: str = "uac",
         pcm_port: str | None = None,
         pcm_baudrate: int = 921600,
+        pcm_rate: int = 8000,
         tx_gain: float = 1.0,
         hub: EventHub | None = None,
         modem: Eg25Modem | None = None,
@@ -2584,7 +2594,8 @@ class CallAgentService:
         sms_email_forwarder: SmsEmailForwarder | None = None,
     ) -> None:
         # modem/call_logger 参数供测试注入；默认按串口/环境配置自建。
-        self.modem = modem or Eg25Modem(modem_port, baudrate)
+        self.pcm_rate = pcm_rate
+        self.modem = modem or Eg25Modem(modem_port, baudrate, pcm_rate=pcm_rate)
         self.audio_keyword = audio_keyword
         self.provider = provider
         self.audio_mode = audio_mode
@@ -2664,7 +2675,7 @@ class CallAgentService:
             return None
         monitor = MonitorPlayback(
             config.get_str("MONITOR_OUTPUT_DEVICE"),
-            sample_rate=8000,
+            sample_rate=_audio_bridge.MODEM_RATE,
             gain=config.get_float("MONITOR_UPLINK_GAIN"),
         )
         monitor.start()

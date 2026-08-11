@@ -1519,6 +1519,7 @@ const I18N = {
       MODEM_PCM_PORT: "Modem PCM port", MODEM_PCM_BAUD: "PCM baud rate",
       MODEM_AUDIO_MODE: "Audio mode", MODEM_AUDIO_KEYWORD: "UAC device keyword",
       MODEM_TX_GAIN: "TX gain", AGENT_UPLINK_GAIN: "AI input gain (caller)",
+      MODEM_AGC: "Downlink AGC", MODEM_AGC_TARGET_DBFS: "AGC target level (dBFS)",
       HALF_DUPLEX_HANGOVER_SECONDS: "Half-duplex hangover (s)",
       HOTLINE_TURN_END_SILENCE_MS: "Hotline semantic-check trigger (ms)",
       HOTLINE_PLAYBACK_QUIET_MS: "Hotline semantic-reply guard (ms)",
@@ -3401,9 +3402,9 @@ async function validateSetupKey() {
       : res.status === "invalid" ? t("setup_key_invalid")
       : res.status === "network" ? t("setup_key_network")
       : t("setup_key_unsupported");
-    setupStatus("setupKeyStatus", setupValidated ? "ok" : "err", msg);
     if (res.message && res.status !== "valid") msg = `${msg} (${res.message})`;
     if (setupValidated && res.message === "intl") msg = `${msg} · intl`;
+    setupStatus("setupKeyStatus", setupValidated ? "ok" : "err", msg);
     return setupValidated;
   } catch (e) {
     setupValidated = false;
@@ -3428,11 +3429,11 @@ async function saveSetupApi() {
     }
     if (!setupValidated && !(await validateSetupKey())) return false;
     updates[setupProviderKey(provider)] = key;
-  }
     if (provider === "qwen" && window._setupKeyRegion === "intl") {
       updates.DASHSCOPE_REALTIME_URL =
         "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime";
     }
+  }
   const { httpOk, res } = await postJson("/api/config", updates);
   if (!httpOk) {
     setupStatus("setupKeyStatus", "err", t("cfg_savefail") + (res.error || ""));
