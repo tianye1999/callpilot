@@ -108,7 +108,15 @@ def test_reconnect_success_after_disconnect(monkeypatch):
         assert new_conv.session_kwargs is not None
         assert agent._conversation is new_conv
 
-        # say 被调：安抚语通过新连接的 create_response 发出
+        # say 被调：先 seed user message，再 create_response 发安抚语
+        assert any(
+            item.get("role") == "user"
+            and any(
+                part.get("text") == qwen_agent.RECONNECT_NOTICE
+                for part in item.get("content", [])
+            )
+            for item in new_conv.items
+        )
         assert any(
             r.get("instructions") == qwen_agent.RECONNECT_NOTICE
             for r in new_conv.responses
@@ -728,3 +736,19 @@ def test_qwen_repeat_suppression_nudge_uses_say_channel():
         "换一种说法" in response.get("instructions", "")
         for response in conversation.responses
     )
+
+
+def test_qwen_say_seeds_user_message_before_create_response(monkeypatch):
+    """qwen-audio-3.0 要求先有 user message，否则开场白 response.create 失败。"""
+    fake_cls = _make_fake_conversation_cls()
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        conv = fake_cls.instances[-1]
+        asyncio.run(agent.say("请直接说：你好"))
+        assert len(conv.items) == 1
+        assert conv.items[0]["role"] == "user"
+        assert conv.items[0]["content"][0]["text"] == "请直接说：你好"
+        assert len(conv.responses) == 1
+        assert conv.responses[0]["instructions"] == "请直接说：你好"
+    finally:
+        asyncio.run(agent.stop())

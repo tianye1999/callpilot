@@ -421,7 +421,7 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
         lambda updates, env_path=".env": real_update(updates, env_path=env_file),
     )
     # 先 setenv 注册清理，避免 update_env_file 同步 os.environ 污染其他测试。
-    monkeypatch.setenv("QWEN_VOICE", "Raymond")
+    monkeypatch.setenv("QWEN_VOICE", "longanqian")
     monkeypatch.setenv("AGENT_PROVIDER", "qwen")
     monkeypatch.setenv("RECORDING_ENABLED", "true")
     monkeypatch.setenv("MONITOR_AI_PLAYBACK", "false")
@@ -432,7 +432,7 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
         resp = await client.post(
             "/api/config",
             json={
-                "QWEN_VOICE": "Ethan",
+                "QWEN_VOICE": "loongmary",
                 "AGENT_PROVIDER": "doubao",
                 "RECORDING_ENABLED": False,  # JSON bool 应被宽容转成 "false"
                 "MONITOR_AI_PLAYBACK": True,
@@ -452,11 +452,11 @@ def test_config_post_roundtrip(monkeypatch, tmp_path):
     assert data["requires_restart"] == ["AGENT_PROVIDER", "MONITOR_AI_PLAYBACK"]
 
     text = env_file.read_text(encoding="utf-8")
-    assert "QWEN_VOICE=Ethan" in text
+    assert "QWEN_VOICE=loongmary" in text
     assert "AGENT_PROVIDER=doubao" in text
     assert "RECORDING_ENABLED=false" in text
     assert "MONITOR_AI_PLAYBACK=true" in text
-    assert os.environ["QWEN_VOICE"] == "Ethan"
+    assert os.environ["QWEN_VOICE"] == "loongmary"
 
 
 @pytest.mark.parametrize("enabled", [True, False])

@@ -280,7 +280,7 @@ class QwenVoiceAgent(VoiceAgent):
         api_key: str,
         model: str,
         model_display_name: str,
-        voice: str = "Raymond",
+        voice: str = "longanqian",
         realtime_url: str | None = None,
     ) -> None:
         dashscope.api_key = api_key
@@ -536,18 +536,36 @@ class QwenVoiceAgent(VoiceAgent):
             self._mark_disconnected()
 
     async def say(self, instructions: str) -> None:
+        """主动说话（开场白 / 重连安抚）。
+
+        ``qwen-audio-3.0-realtime-*`` 要求会话里先有 user message，否则
+        ``response.create`` 会报
+        ``Cannot create response: conversation has no messages or no user message``。
+        先 ``create_item`` 注入一条 user 文本，再带 instructions 触发回复。
+        """
         conversation = self._conversation
         if not conversation or self._disconnected.is_set():
             return
+
+        def _say() -> None:
+            # 与 MiniMax 同类约束：必须是 role=user；真正说什么仍由
+            # response.instructions 约束（SDK create_response 支持该字段）。
+            conversation.create_item(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": instructions}],
+                }
+            )
+            conversation.create_response(
+                instructions=instructions,
+                output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
+            )
+
         try:
             # 同 send_audio：同步 ws send 放线程池 + 超时熔断，防拖垮主循环。
             await asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: conversation.create_response(
-                        instructions=instructions,
-                        output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
-                    )
-                ),
+                asyncio.to_thread(_say),
                 timeout=_SAY_TIMEOUT_SECONDS,
             )
         except TimeoutError:

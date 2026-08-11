@@ -132,11 +132,13 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                secret=True, requires_restart=True),
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
                "qwen3.5-omni-plus-realtime", requires_restart=True),
-    # 精选常用音色做下拉;完整 55 种(含方言/多语言)见官网试听页,列表外音色
-    # 可直接在 .env 填 QWEN_VOICE(get_str 读环境变量,不受 choices 限制)。
-    ConfigSpec("QWEN_VOICE", "Qwen 音色", "select", "Raymond",
-               choices=("Raymond", "Ethan", "Tina", "Cindy", "Serena",
-                        "Harvey", "Maia", "Sunnybobi"),
+    # qwen-audio-3.0-realtime-* 仅支持下方音色；列表外可在 .env 直接填
+    # QWEN_VOICE（get_str 读环境变量，不受 choices 限制）。
+    ConfigSpec("QWEN_VOICE", "Qwen 音色", "select", "longanqian",
+               choices=("longanqian", "longanlingxin", "longanlufeng",
+                        "longanlingxi", "longanxiaoxin", "longanfengyue",
+                        "longanyuanfei", "loongmary", "loongeva_v3.6",
+                        "loongjohn"),
                help="https://help.aliyun.com/zh/model-studio/omni-voice-list"),
     # 模型显示名只用于 /api/meta 与豆包自我介绍提示词，属内部项不进面板。
     # 显示名用语言中性的品牌名（Qwen/Doubao 是同款产品的国际名），
