@@ -53,10 +53,12 @@ def test_configure_modem_rate_updates_simcom_frame_bytes():
         assert configure_modem_rate(16000) == 16000
         assert audio_bridge.MODEM_RATE == 16000
         assert audio_bridge.SIMCOM_WRITE_SIZE == 640  # 20ms @16k mono s16
+        assert audio_bridge.SIMCOM_WIN_WRITE_SIZE == 3200  # 100ms @16k
         assert audio_bridge.NMEA_WRITE_SIZE == 3200
     finally:
         configure_modem_rate(8000)
         assert audio_bridge.SIMCOM_WRITE_SIZE == 320
+        assert audio_bridge.SIMCOM_WIN_WRITE_SIZE == 1600
 
 
 def test_nmea_bridge_frame_size_follows_reconfigured_rate():
@@ -739,8 +741,13 @@ def test_create_audio_bridge_invalid_mode_mentions_macos_constraint():
 # ---- simcom_pcm 模式：SIMCom(SIM7600 系)PCM over USB ----
 
 
-def test_create_audio_bridge_simcom_pcm_uses_serial_bridge():
-    """SIMCom PCM 与 NMEA 同为 8k/mono 裸流，复用同一条串口传输实现。"""
+def test_create_audio_bridge_simcom_pcm_uses_serial_bridge(monkeypatch):
+    """SIMCom PCM 与 NMEA 同为 8k/mono 裸流，复用同一条串口传输实现。
+
+    PTY 路径保持官方 20ms/320B；``/tmp/ec20-pcm`` 在未解析到真实 PTY 时
+    ``_is_pty`` 为 False，故显式打成 True 锁定 macOS/Linux 桥行为。
+    """
+    monkeypatch.setattr(audio_bridge, "_is_pty", lambda _port: True)
     bridge = create_audio_bridge(
         mode="simcom_pcm",
         device_keyword="",
@@ -755,8 +762,9 @@ def test_create_audio_bridge_simcom_pcm_uses_serial_bridge():
     assert bridge.write_interval_seconds == audio_bridge.SIMCOM_WRITE_INTERVAL_SECONDS == 0.02
 
 
-def test_simcom_pcm_paces_usb_audio_as_20ms_frames():
+def test_simcom_pcm_paces_usb_audio_as_20ms_frames(monkeypatch):
     """SIM7600 工作样例按 20ms/320B 喂 audio 口，不得退回 100ms 突发。"""
+    monkeypatch.setattr(audio_bridge, "_is_pty", lambda _port: True)
     bridge = create_audio_bridge(
         mode="simcom_pcm",
         device_keyword="",
@@ -770,6 +778,40 @@ def test_simcom_pcm_paces_usb_audio_as_20ms_frames():
 
     assert bridge._next_write_payload(silence) == b"\x01" * 320
     assert bridge.pending_output_bytes() == 180
+
+
+def test_create_audio_bridge_simcom_pcm_windows_com_uses_100ms_frames():
+    """Windows SimTech Audio COM：100ms/1600B@8k，降低每秒 USB 写事务。"""
+    bridge = create_audio_bridge(
+        mode="simcom_pcm",
+        device_keyword="",
+        pcm_port="COM6",
+        pcm_baudrate=115200,
+        tx_gain=1.0,
+    )
+    assert isinstance(bridge, audio_bridge.SerialPcmAudioBridge)
+    assert bridge.write_size == audio_bridge.SIMCOM_WIN_WRITE_SIZE == 1600
+    assert (
+        bridge.write_interval_seconds
+        == audio_bridge.SIMCOM_WIN_WRITE_INTERVAL_SECONDS
+        == 0.1
+    )
+
+
+def test_simcom_pcm_windows_com_paces_as_100ms_frames():
+    bridge = create_audio_bridge(
+        mode="simcom_pcm",
+        device_keyword="",
+        pcm_port="COM6",
+        pcm_baudrate=115200,
+    )
+    bridge._ser = _FakeSerial()
+    bridge._tx_primed = True
+    bridge.write_modem_chunks([b"\x01" * 2000])
+    silence = b"\x00" * bridge.write_size
+
+    assert bridge._next_write_payload(silence) == b"\x01" * 1600
+    assert bridge.pending_output_bytes() == 400
 
 
 def test_nmea_pcm_keeps_existing_100ms_frames():
@@ -924,6 +966,25 @@ def test_serial_pcm_bridge_preclaim_opens_without_writer(monkeypatch):
         assert bridge._writer_thread is not None
     finally:
         bridge.stop()
+
+
+def test_serial_pcm_bridge_release_claim_closes_for_cpcmreg_reset(monkeypatch):
+    """端点复位前必须能释放 PCM 口，复位后再 preclaim。"""
+    opens = 0
+
+    def fake_serial(port, baudrate, timeout, write_timeout):
+        nonlocal opens
+        opens += 1
+        return _FakeSerial()
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", fake_serial)
+    bridge = audio_bridge.SerialPcmAudioBridge("COM6", 115200)
+    bridge.preclaim()
+    bridge.release_claim()
+    assert bridge._ser is None
+    bridge.preclaim()
+    assert opens == 2
+    bridge.stop()
 
 
 def test_serial_pcm_bridge_does_not_retry_when_already_safe(monkeypatch):

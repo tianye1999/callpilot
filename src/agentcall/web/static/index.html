@@ -1398,7 +1398,11 @@ const I18N = {
     trace_reason_completed: "completed normally", trace_reason_failed: "call failed",
     trace_reason_call_failed: "call initialization failed", trace_reason_cpcmreg_init_failed: "CPCMREG initialization failed",
     call_failed_title: "Call setup failed",
-    call_error_cpcmreg: "SIM7600 USB Audio did not enter CPCMREG mode 1. Fully power off the module for about 10 seconds, power it on again, then retry.",
+    call_error_cpcmreg: "SIM7600 USB Audio failed to enter CPCMREG mode 1. This path is not auto-recovered on purpose — power off the module for about 10 seconds, then power it back on and retry.",
+    call_error_no_caller_audio: "No caller PCM on this call (silent phone audio). Wait for the post-hangup modem restart to finish, then retry; if still silent, power off the module for about 10 seconds.",
+    call_error_modem_recovering: "Modem is restarting to restore the audio channel. You can call again in about 20 seconds.",
+    system_notice_title: "Modem",
+    system_modem_recovering: "Restarting the modem to restore the audio channel. Calls are unavailable for about 20 seconds.",
     call_error_generic: "The call could not be initialized. Check the service log for details.",
     leave_title: "Unsaved changes",
     leave_msg: "You've edited settings that aren't saved yet. What would you like to do?",
@@ -1629,7 +1633,11 @@ const I18N = {
     trace_reason_completed: "正常结束", trace_reason_failed: "通话失败",
     trace_reason_call_failed: "通话初始化失败", trace_reason_cpcmreg_init_failed: "CPCMREG 初始化失败",
     call_failed_title: "通话初始化失败",
-    call_error_cpcmreg: "SIM7600 USB Audio 未进入 CPCMREG mode 1。请将模组彻底断电约 10 秒后重新上电，再重试。",
+    call_error_cpcmreg: "SIM7600 USB Audio 未能进入 CPCMREG mode 1。这条路径故意不自动复位，请将模组彻底断电约 10 秒后重新上电再拨。",
+    call_error_no_caller_audio: "本通无对方 PCM（电话侧无声）。请等挂断后模组重启恢复完成再拨；仍无声则将模组彻底断电约 10 秒。",
+    call_error_modem_recovering: "模组正在重启以恢复音频通道，约 20 秒后可再拨。",
+    system_notice_title: "模组",
+    system_modem_recovering: "正在重启模组以恢复音频通道，约 20 秒内无法接打电话。",
     call_error_generic: "通话未能完成初始化，请查看服务日志了解详情。",
     leave_title: "有未保存的修改",
     leave_msg: "你修改了设置但还没保存，要怎么处理？",
@@ -1932,8 +1940,26 @@ function addCallError(event) {
   const item = el("div", "call-error");
   const message = event.error_code === "cpcmreg_init_failed"
     ? t("call_error_cpcmreg")
-    : (event.error || t("call_error_generic"));
+    : (event.error_code === "no_caller_audio"
+      ? t("call_error_no_caller_audio")
+      : (event.error_code === "modem_recovering"
+        ? t("call_error_modem_recovering")
+        : (event.error || t("call_error_generic"))));
   item.appendChild(el("b", "", t("call_failed_title")));
+  item.appendChild(el("span", "", message));
+  item.appendChild(el("time", "", fmtTime(event.ts)));
+  chat.appendChild(item);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function addSystemNotice(event) {
+  const chat = $("chat");
+  const item = el("div", "call-error");
+  const message = event.code === "modem_recovering"
+    ? t("system_modem_recovering")
+    : (event.text || "");
+  if (!message) return;
+  item.appendChild(el("b", "", t("system_notice_title")));
   item.appendChild(el("span", "", message));
   item.appendChild(el("time", "", fmtTime(event.ts)));
   chat.appendChild(item);
@@ -2094,6 +2120,8 @@ function handleEvent(ev) {
     addSms(ev);
   } else if (ev.type === "call_summary") {
     loadHistory(); loadRecent();
+  } else if (ev.type === "system") {
+    addSystemNotice(ev);
   }
 }
 let ws;

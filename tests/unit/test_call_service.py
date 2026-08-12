@@ -700,7 +700,7 @@ def test_remote_reserved_line_blocks_local_ai_dial_and_routes_hangup(monkeypatch
 
     modem.trigger_hangup()
     assert coordinator.stop_reasons == ["remote_party_hangup"]
-    assert ("hangup", ()) not in modem.calls
+    assert "hangup" not in modem.call_names()
 
     service._release_remote_line(coordinator)  # type: ignore[arg-type]
     rate_limit.reset_remote_dial_rate_limit_state()
@@ -851,13 +851,14 @@ def test_outbound_voice_init_failure_still_hangs_up_physical_call(monkeypatch):
     assert not service.session._thread.is_alive()
     assert "initialize_for_voice" in modem.call_names()
     assert "hangup" in modem.call_names()
-    assert "reset_module" in modem.call_names()
+    assert "reset_module" not in modem.call_names()
     assert not modem.is_call_connected()
     assert not bridge.started
     call_events = [e for e in hub.history() if e.get("type") == "call"]
     assert call_events[-1]["status"] == "failed"
     assert call_events[-1]["error_code"] == "cpcmreg_init_failed"
-    assert "自动重启模组" in call_events[-1]["error"]
+    assert "彻底断电" in call_events[-1]["error"]
+    assert "自动重启模组" not in call_events[-1]["error"]
 
 
 def test_simcom_pcm_transport_failure_resets_module(monkeypatch):

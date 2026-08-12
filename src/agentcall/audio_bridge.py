@@ -49,11 +49,15 @@ MODEM_CHANNELS = 1
 MODEM_DTYPE = "int16"
 MODEM_BLOCK_MS = 20
 NMEA_WRITE_INTERVAL_SECONDS = 0.1
-# SIM7600 官方 Linux 示例从麦克风回调每 20ms 向 audio 串口写一次。
+# SIM7600 官方 Linux 示例从麦克风回调每 20ms 向 audio 串口写一次（PTY 路径）。
 SIMCOM_WRITE_INTERVAL_SECONDS = 0.02
+# Windows SimTech Audio COM：20ms/320B 事务过密，真机写耗时常 >20ms →
+# written≈75KB/5s + 听感卡顿（2026-08-11 18:20）。非 PTY 改用 100ms 帧降事务。
+SIMCOM_WIN_WRITE_INTERVAL_SECONDS = 0.1
 NMEA_READ_SIZE = 640
 NMEA_WRITE_SIZE = 1600  # = MODEM_RATE * 0.1 * 2 @8k；configure 时重算
 SIMCOM_WRITE_SIZE = 320  # = MODEM_RATE * 0.02 * 2 @8k；configure 时重算
+SIMCOM_WIN_WRITE_SIZE = 1600  # = MODEM_RATE * 0.1 * 2 @8k；configure 时重算
 # SIM7600 的 USB Audio 在端点刚恢复、PTY flush 或短写边界处，偶尔会让
 # 16-bit PCM 从高字节开始。此时正常几百幅值的人声会瞬间变成接近满幅的
 # 宽带噪音；把字节流再错开 1 byte 后会恢复。只在 SIMCom 路径启用这一
@@ -70,7 +74,8 @@ def configure_modem_rate(rate: int) -> int:
     必须在创建音频桥 / 通话前调用，且与模组 ``AT+CPCMBANDWIDTH`` 一致；
     否则会出现「16k 流按 8k 解 → 宽带噪声」或吞吐对不上。
     """
-    global MODEM_RATE, NMEA_READ_SIZE, NMEA_WRITE_SIZE, SIMCOM_WRITE_SIZE
+    global MODEM_RATE, NMEA_READ_SIZE, NMEA_WRITE_SIZE
+    global SIMCOM_WRITE_SIZE, SIMCOM_WIN_WRITE_SIZE
     if rate not in SUPPORTED_MODEM_RATES:
         raise ValueError(
             f"MODEM_PCM_RATE 仅支持 {SUPPORTED_MODEM_RATES}，收到: {rate}"
@@ -80,11 +85,15 @@ def configure_modem_rate(rate: int) -> int:
     NMEA_READ_SIZE = max(640, int(bytes_per_sec * 0.04))  # ~40ms
     NMEA_WRITE_SIZE = int(bytes_per_sec * NMEA_WRITE_INTERVAL_SECONDS)
     SIMCOM_WRITE_SIZE = int(bytes_per_sec * SIMCOM_WRITE_INTERVAL_SECONDS)
+    SIMCOM_WIN_WRITE_SIZE = int(bytes_per_sec * SIMCOM_WIN_WRITE_INTERVAL_SECONDS)
     logger.info(
-        "模组 PCM 采样率已配置: %dHz (simcom_frame=%dB/%.0fms, nmea_frame=%dB/%.0fms)",
+        "模组 PCM 采样率已配置: %dHz "
+        "(simcom_pty=%dB/%.0fms, simcom_win=%dB/%.0fms, nmea=%dB/%.0fms)",
         MODEM_RATE,
         SIMCOM_WRITE_SIZE,
         SIMCOM_WRITE_INTERVAL_SECONDS * 1000,
+        SIMCOM_WIN_WRITE_SIZE,
+        SIMCOM_WIN_WRITE_INTERVAL_SECONDS * 1000,
         NMEA_WRITE_SIZE,
         NMEA_WRITE_INTERVAL_SECONDS * 1000,
     )
@@ -612,6 +621,8 @@ class SerialPcmAudioBridge:
         self._queued_bytes = 0
         self._last_stats_at = 0.0
         self._write_timeouts = 0
+        self._stats_timeouts = 0
+        self._write_durations_ms: list[float] = []
         self._started_at = 0.0
         self._startup_noise_reported = False
         self._downlink_resampler: StreamingPcmDownsampler | None = None
@@ -684,6 +695,22 @@ class SerialPcmAudioBridge:
         self._ser.reset_output_buffer()
         logger.info("PCM 口已预占用: %s（待 CPCMREG 后再启流）", self.port)
 
+    def release_claim(self) -> None:
+        """释放 PCM 口（供 AT+CPCMREG=0,1 复位前调用）。
+
+        Windows SimTech Audio COM 在宿主仍占着句柄时发 stop=1，下一通首启
+        易被拒或实听卡顿（2026-08-11 17:48：跳过预复位后仍首拒，且复位时
+        COM6 未释放）。preclaim 阶段无写线程，这里只关串口。
+        """
+        if self._writer_thread is not None and self._writer_thread.is_alive():
+            self._running = False
+            self._writer_thread.join(timeout=2)
+            self._writer_thread = None
+        if self._ser is not None and self._ser.is_open:
+            self._ser.close()
+            logger.info("PCM 口已释放: %s（供 CPCMREG 端点复位）", self.port)
+        self._ser = None
+
     def start(self) -> None:
         if self._ser is None or not self._ser.is_open:
             self._ser = self._open_serial()
@@ -697,6 +724,8 @@ class SerialPcmAudioBridge:
         self._written_bytes = 0
         self._queued_bytes = 0
         self._write_timeouts = 0
+        self._stats_timeouts = 0
+        self._write_durations_ms = []
         self._tx_primed = self._preroll_bytes <= 0
         self._last_stats_at = time.monotonic()
         self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
@@ -824,7 +853,11 @@ class SerialPcmAudioBridge:
             payload = self._next_write_payload(silence)
             try:
                 if self._ser and self._ser.is_open:
+                    write_started = time.perf_counter()
                     self._ser.write(payload)
+                    self._write_durations_ms.append(
+                        (time.perf_counter() - write_started) * 1000.0
+                    )
                     self._written_bytes += len(payload)
                     self._write_timeouts = 0
                     self._log_write_stats()
@@ -833,6 +866,7 @@ class SerialPcmAudioBridge:
                 # 注意：不要「回队重试」——Windows COM 在错误波特率/驱动背压下会
                 # 连续超时，回队会把缓冲区撑满并整通静音（2026-08-10 184509）。
                 self._write_timeouts += 1
+                self._stats_timeouts += 1
                 if self._write_timeouts == 1 or self._write_timeouts % 50 == 0:
                     logger.warning(
                         "写入 NMEA PCM 超时，丢弃本帧继续 (累计 %d 次)",
@@ -843,6 +877,7 @@ class SerialPcmAudioBridge:
                         self._ser.reset_output_buffer()
                 except Exception:
                     pass
+                self._log_write_stats()
             except serial.SerialException as exc:
                 logger.error("写入 NMEA PCM 失败: %s", exc)
                 self._running = False
@@ -877,11 +912,26 @@ class SerialPcmAudioBridge:
             buffered = len(self._tx_buffer)
             queued = self._queued_bytes
             self._queued_bytes = 0
+        durations = self._write_durations_ms
+        self._write_durations_ms = []
+        timeouts = self._stats_timeouts
+        self._stats_timeouts = 0
+        if durations:
+            durations.sort()
+            p50 = durations[len(durations) // 2]
+            p95 = durations[min(len(durations) - 1, int(len(durations) * 0.95))]
+        else:
+            p50 = 0.0
+            p95 = 0.0
         logger.info(
-            "NMEA PCM 写入统计: written=%s bytes, agent_queued=%s bytes, buffered=%s bytes",
+            "NMEA PCM 写入统计: written=%s bytes, agent_queued=%s bytes, "
+            "buffered=%s bytes, write_ms_p50=%.2f, write_ms_p95=%.2f, timeouts=%d",
             self._written_bytes,
             queued,
             buffered,
+            p50,
+            p95,
+            timeouts,
         )
         self._written_bytes = 0
         self._last_stats_at = now
@@ -1254,12 +1304,19 @@ def create_audio_bridge(
                 "simcom_pcm 模式需要配置 MODEM_PCM_PORT（指向桥出的 PCM PTY，"
                 "如 scripts/ec20_usb_pty.py --map 4:/tmp/ec20-pcm）"
             )
+        # PTY：官方 20ms 帧；Windows 虚拟 COM：100ms 帧降 USB 事务（见常量注释）。
+        if _is_pty(pcm_port):
+            frame_size = SIMCOM_WRITE_SIZE
+            frame_interval = SIMCOM_WRITE_INTERVAL_SECONDS
+        else:
+            frame_size = SIMCOM_WIN_WRITE_SIZE
+            frame_interval = SIMCOM_WIN_WRITE_INTERVAL_SECONDS
         return SerialPcmAudioBridge(
             pcm_port,
             pcm_baudrate,
             tx_gain=tx_gain,
-            write_size=SIMCOM_WRITE_SIZE,
-            write_interval_seconds=SIMCOM_WRITE_INTERVAL_SECONDS,
+            write_size=frame_size,
+            write_interval_seconds=frame_interval,
             auto_realign=True,
             startup_guard_seconds=SIMCOM_STARTUP_GUARD_SECONDS,
         )

@@ -388,11 +388,15 @@ class CallRecord:
                 content_updated_at = self._content_updated_at
             self._update_content_meta(content_updated_at, "PENDING")
 
-    def finish(self, status: str) -> None:
-        """结束通话：flush 录音为 wav、写 events.jsonl 与 meta.json。幂等。"""
+    def finish(self, status: str) -> str | None:
+        """结束通话：flush 录音为 wav、写 events.jsonl 与 meta.json。幂等。
+
+        Returns the trace diagnosis when meta was written; ``None`` if skipped
+        or disk write failed.
+        """
         with self._lock:
             if self._finished:
-                return
+                return None
             self._finished = True
             ended_at = time.time()
             self._event_lines.append(
@@ -439,6 +443,9 @@ class CallRecord:
                         self._content_updated_at, ended_at
                     )
                     content_updated_at = self._content_updated_at
+                trace_summary = _trace_summary(
+                    event_lines, answered=answered, status=status
+                )
                 meta = {
                     "id": self.id,
                     "public_id": self.public_id,
@@ -456,17 +463,18 @@ class CallRecord:
                     "uplink_bytes": len(uplink),
                     "downlink_bytes": len(downlink),
                     "sample_rate": self.sample_rate,
-                    "trace_summary": _trace_summary(
-                        event_lines, answered=answered, status=status
-                    ),
+                    "trace_summary": trace_summary,
                 }
                 if self.source:
                     meta["source"] = self.source
                 (self.path / "meta.json").write_text(
                     json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
+                diagnosis = trace_summary.get("diagnosis")
+                return str(diagnosis) if diagnosis else None
             except OSError as exc:
                 logger.error("落盘通话记录 %s 失败: %s", self.id, exc)
+                return None
 
     def _update_content_meta(
         self, content_updated_at: float, summary_state: str

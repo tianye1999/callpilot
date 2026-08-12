@@ -271,6 +271,56 @@ class Eg25Modem:
         self._audio_mode = ""
         # 语音 PCM 通道是否确实开着（simcom_pcm 下音频桥的启动前置条件）。
         self._voice_pcm_active = False
+        # 本通拆线是否已执行过：CLCC 丢失与会话 finally 常各调一次 hangup，
+        # 第二次应跳过，但「从未接通就 hangup」仍须走方言关通道（异常路径）。
+        # `_call_hangup_done`：已发 CHUP/ATH；`_hangup_complete`：连 PCM 通道也关完。
+        # 二者分离是因为 CLCC 丢线回调常在音频桥仍写 COM 时触发——若此时
+        # AT+CPCMREG=0,1，下一通首启 =1 易被拒并实听卡顿（2026-08-11 17:36）。
+        self._call_hangup_done = False
+        self._hangup_complete = False
+        # USB Audio 端点是否已由挂断后 USB 软拔插确认干净。进程冷启动默认脏：
+        # 上一进程可能留下半死端点，禁止首通跳过带钩子预复位。
+        self._pcm_endpoint_clean = False
+        # 宿主在 =0,1 前后释放/重占 PCM COM 的钩子（见 set_pcm_endpoint_reset_hooks）。
+        self._before_pcm_endpoint_reset: Callable[[], None] | None = None
+        self._after_pcm_endpoint_reset: Callable[[], None] | None = None
+
+    def set_pcm_endpoint_reset_hooks(
+        self,
+        before: Callable[[], None] | None = None,
+        after: Callable[[], None] | None = None,
+    ) -> None:
+        """注册 AT+CPCMREG=0,1 前后的宿主钩子（通常为关/开 PCM 串口）。"""
+        self._before_pcm_endpoint_reset = before
+        self._after_pcm_endpoint_reset = after
+
+    def mark_pcm_endpoint_clean(self) -> None:
+        """宿主侧确认 USB Audio 已接近冷插拔后调用，允许下一通跳过预复位。"""
+        self._pcm_endpoint_clean = True
+
+    def release_serial_for_usb_cycle(self) -> None:
+        """关闭 AT 串口句柄以便 Windows 能 Disable 复合设备；不置 ``_closed``。
+
+        监听线程读失败后会走 ``_reconnect``；也可由 ``kick_reconnect`` 主动拉起。
+        """
+        with self._serial_lock:
+            ser = self._ser
+            self._ser = None
+        if ser is not None:
+            try:
+                if ser.is_open:
+                    ser.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("USB 软拔插前关闭 AT 串口失败: %s", exc)
+
+    def kick_reconnect(self) -> None:
+        """USB 软拔插后主动触发串口重连（不依赖读线程碰巧撞到错误）。"""
+        if self._closed:
+            return
+        try:
+            self._reconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("USB 软拔插后 kick_reconnect 失败: %s", exc)
 
     def connect(self) -> None:
         self._open_serial()
@@ -738,6 +788,7 @@ class Eg25Modem:
         if state_match is None or state_match.group(1) != "1":
             return _PcmStartResult(ok=False, accepted=True)
         self._voice_pcm_active = True
+        self._pcm_endpoint_clean = False
         return _PcmStartResult(ok=True, accepted=True)
 
     def _early_enable_simcom_pcm(self) -> None:
@@ -785,6 +836,7 @@ class Eg25Modem:
         # 否则上一通异常退出留下的 mode=1 会污染下一通的端点状态。
         self._send("AT+CPCMREG=0,1")
         self._voice_pcm_active = False
+        self._pcm_endpoint_clean = True
 
         time.sleep(self._SIMCOM_PREDIAL_SETTLE_DELAY)
         while True:
@@ -797,6 +849,25 @@ class Eg25Modem:
                 )
             time.sleep(self._SIMCOM_PCM_RETRY_DELAY)
 
+    def _reset_simcom_pcm_endpoint(self, reason: str) -> None:
+        """stop=1 复位 USB Audio；钩子负责在复位前后释放/重占宿主 PCM 口。"""
+        before = self._before_pcm_endpoint_reset
+        after = self._after_pcm_endpoint_reset
+        if before is not None:
+            try:
+                before()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("PCM 端点复位前钩子失败 (%s): %s", reason, exc)
+        logger.info("%s：AT+CPCMREG=0,1 复位 USB Audio 端点", reason)
+        self._send("AT+CPCMREG=0,1")
+        self._pcm_endpoint_clean = True
+        time.sleep(self._SIMCOM_PREDIAL_SETTLE_DELAY)
+        if after is not None:
+            try:
+                after()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("PCM 端点复位后钩子失败 (%s): %s", reason, exc)
+
     def _enable_simcom_pcm(self) -> None:
         """SIMCom(SIM7600 系)：AT+CPCMREG=1 把 PCM 推到 USB 音频接口。
 
@@ -808,6 +879,15 @@ class Eg25Modem:
           「PCM 没开」去启动音频桥，那会往不出流的端点写数据，触发
           ``[Errno 60] Operation timed out`` 并连带把 AT 口的桥一起拖死
           （真机 2026-08-01 实测，通话中途模组直接掉线）。
+
+        通话中额外约束（2026-08-11 真机）：
+
+        - 任一通挂断后标脏：下一通启用前必须带钩子 ``=0,1``（先释放 Audio COM）。
+          真机 18:10/18:13：仅宿主开合口再 ``=1`` 能读回 mode=1，但第 2 通卡顿、
+          第 3 通写超时无声——半死端点，禁止再走「只回收宿主句柄」路径。
+        - 任何 ``=0,1`` 必须先经宿主释放 Audio COM；占口 ``=0,1`` / 无条件预复位已证伪。
+        - 重试循环**每轮**检查通话是否仍在；对方已挂断还继续打 CPCMREG 会把
+          AT 口拖进 Write timeout（同日 17:03 通：CLCC 已判丢失后仍重试到第 4 次）。
         """
         in_call = self._call_connected_event.is_set()
         if in_call:
@@ -827,13 +907,38 @@ class Eg25Modem:
                     return
                 self._voice_pcm_active = False
 
-        deadline = time.monotonic() + self._SIMCOM_PCM_ENABLE_TIMEOUT
         attempts = 0
         endpoint_reset = False
+        # 「=1 曾被拒再进 mode=1」听感多半劣化，但拒绝启桥只是把卡顿换成报错，
+        # 对方已在听筒里等着。这里只记录告警，通道照常启用：真正的复位手段是
+        # 挂断后的 USB 软拔插（2026-08-12 起才真正生效，之前一直误报成功）。
+        saw_cpcmreg_rejected = False
+        if in_call and not self._pcm_endpoint_clean:
+            # 复位+沉降放在重试 deadline 之外，避免慢 AT 吃光 12s 窗口。
+            self._reset_simcom_pcm_endpoint("端点未干净，启用前预复位")
+            endpoint_reset = True
+        elif in_call:
+            logger.info("端点已干净关闭，跳过启用前预复位，直接 AT+CPCMREG=1")
+        deadline = time.monotonic() + self._SIMCOM_PCM_ENABLE_TIMEOUT
         while True:
+            # 每轮重读：挂断线程可能在两次 AT 之间清掉 connected。
+            if in_call and not self._call_connected_event.is_set():
+                self._voice_pcm_active = False
+                logger.info(
+                    "通话在 PCM 启用过程中已结束（已尝试 %d 次），停止 CPCMREG 重试",
+                    attempts,
+                )
+                return
             attempts += 1
             result = self._start_simcom_pcm_once()
             if result.ok:
+                if in_call and saw_cpcmreg_rejected:
+                    logger.warning(
+                        "AT+CPCMREG=1 曾被拒后才进入 mode=1（第 %d 次），"
+                        "端点可能已跨通劣化，本通听感或有卡顿；"
+                        "挂断后的 USB 软拔插负责复位，若持续请确认软拔插助手已安装",
+                        attempts,
+                    )
                 logger.info(
                     "SIMCom PCM 语音通道已启用并读回确认 "
                     "(AT+CPCMREG=1，第 %d 次尝试)",
@@ -841,29 +946,32 @@ class Eg25Modem:
                 )
                 return
             logger.warning(
-                "AT+CPCMREG=1 尚未读回 mode=1（第 %d 次尝试）",
+                "AT+CPCMREG=1 尚未读回 mode=1（第 %d 次尝试，accepted=%s）",
                 attempts,
+                result.accepted,
             )
+            if not result.accepted:
+                saw_cpcmreg_rejected = True
             # 无通话时只试一次：ERROR 是必然结果，重试纯属浪费启动时间。
             if not in_call or time.monotonic() >= deadline:
                 break
-            # 仅当 =1 被拒（端点状态可疑）时复位，且整轮只复位一次：
-            # - `accepted=True` 说明注册在异步进行中，复位会打断它；
-            # - 复位每次要多花一条 AT（模组繁忙时可达数秒），重复复位纯粹
-            #   烧掉 12s 窗口里本该用于重试的预算。
-            # 依据：外呼路径 ATD 前就无条件做过这一步（见
-            # `_prepare_simcom_for_dial`：「不清理会导致 CPCMREG 始终无法进入
-            # mode=1」），来电路径原本完全没有，这个不对称是 2026-08-11 来电侧
-            # 反复重试/失败的可疑来源。
+            # =1 被拒：只允许一次带钩子的 AT stop（禁止「只开合 COM 再 =1」）。
+            # 读回未就绪则只等，不打断。
             if not result.accepted and not endpoint_reset:
                 endpoint_reset = True
-                logger.info("AT+CPCMREG=1 被拒，先 stop=1 复位 USB Audio 端点再重试")
-                self._send("AT+CPCMREG=0,1")
+                self._reset_simcom_pcm_endpoint("AT+CPCMREG=1 被拒后复位")
+                continue
             time.sleep(self._SIMCOM_PCM_RETRY_DELAY)
 
         self._voice_pcm_active = False
         if not in_call:
             logger.info("AT+CPCMREG=1 暂不可用（无通话时模组必回 ERROR），接通后再启用")
+            return
+        if not self._call_connected_event.is_set():
+            logger.info(
+                "通话在 PCM 启用超时前已结束（已尝试 %d 次），不报初始化失败",
+                attempts,
+            )
             return
         raise RuntimeError(
             f"通话中启用 SIMCom PCM 失败：AT+CPCMREG=1 / AT+CPCMREG? 在 "
@@ -884,11 +992,36 @@ class Eg25Modem:
                 response = self._send("AT+CPCMREG=0,1")
                 if "OK" not in response.upper():
                     logger.warning("SIMCom USB audio 通道关闭未获 OK (AT+CPCMREG=0,1)")
+                # 无论 OK 与否，下一通都必须带钩子预复位（见 _verify）。
+                self._pcm_endpoint_clean = False
             else:
                 self._send("AT+QPCMV=0")
         finally:
             # 即使串口在关闭时异常，宿主侧也不能把上一通的 True 泄漏到下一通。
             self._voice_pcm_active = False
+
+    def _verify_simcom_pcm_stopped(self) -> None:
+        """挂断沉降后读回 CPCMREG；simcom 下一通始终标脏以强制带钩子预复位。"""
+        try:
+            with self._serial_lock:
+                response = self._send("AT+CPCMREG?")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("挂断后读回 CPCMREG 失败: %s", exc)
+            self._pcm_endpoint_clean = False
+            return
+        state_match = CPCMREG_PATTERN.search(response)
+        if state_match is None or state_match.group(1) != "0":
+            logger.warning(
+                "挂断后 CPCMREG 读回非 mode=0（%s），标记端点未干净",
+                (response or "").strip().replace("\r", "\\r").replace("\n", "\\n")[:120],
+            )
+        else:
+            logger.info(
+                "挂断后 CPCMREG 已 mode=0，仍标记端点需预复位"
+                "（防跨通 USB Audio 退化）"
+            )
+        # mode=0 不足以保证下一通首启/可写；禁止跳过预复位。
+        self._pcm_endpoint_clean = False
 
     def on_ring(self, callback: Callable[[str | None], None]) -> None:
         self._on_ring = callback
@@ -917,6 +1050,38 @@ class Eg25Modem:
     def on_sim_identity(self, callback: Callable[[SimIdentity], None]) -> None:
         """Register for privacy-safe cached SIM identity transitions."""
         self._on_sim_identity = callback
+
+    @property
+    def is_online(self) -> bool:
+        """AT 传输当前是否可用（重连期间为 False）。"""
+        with self._connection_state_lock:
+            return self._connection_online
+
+    def wait_for_reenumeration(
+        self,
+        *,
+        offline_timeout: float = 25.0,
+        online_timeout: float = 90.0,
+    ) -> bool:
+        """AT+CRESET 后等 USB 先掉线、再重新枚举并连上。
+
+        真机 2026-08-12：掉线约 7s、整段约 14s。掉线那一步允许超时——若模组
+        恢复得比轮询还快，只要最终在线就算成功。
+        """
+        deadline = time.monotonic() + offline_timeout
+        while time.monotonic() < deadline:
+            if not self.is_online:
+                break
+            time.sleep(0.2)
+        else:
+            logger.warning("AT+CRESET 后 %.0fs 内未见 USB 掉线", offline_timeout)
+
+        deadline = time.monotonic() + online_timeout
+        while time.monotonic() < deadline:
+            if self.is_online:
+                return True
+            time.sleep(0.2)
+        return False
 
     def _emit_connection_state(self, online: bool) -> None:
         recovery_seconds: float | None = None
@@ -978,6 +1143,8 @@ class Eg25Modem:
             self._send("ATA")
             # 置「通话在线」：让来电同样受 CLCC 消失判定保护（串口死亡场景）。
             self._call_connected_event.set()
+            self._call_hangup_done = False
+            self._hangup_complete = False
         logger.info("已发送 ATA 接听来电")
 
     def dial(self, number: str) -> str:
@@ -994,6 +1161,9 @@ class Eg25Modem:
             self._connected_call_ids.clear()
             self._clcc_absent_count = 0
             self._clcc_fail_count = 0
+            # 新拨号即开启本通拆线窗口；否则会继承上一通的 hangup 幂等标记而跳过 ATH。
+            self._call_hangup_done = False
+            self._hangup_complete = False
             self._last_dialed = number
             if self._audio_mode == "simcom_pcm":
                 # 先清空残留呼叫/USB Audio 状态，再按官方示例在 ATD 前准备
@@ -1035,28 +1205,43 @@ class Eg25Modem:
         logger.info("DTMF 发送完成: count=%d, result=success", len(digits))
         return True
 
-    def hangup(self) -> None:
-        # 两条指令与状态清理须原子：否则 CLCC 轮询线程可能插进 ATH 与
-        # AT+QPCMV=0 之间，扰乱指令/响应配对。_pcm_ready_event.set() 只置位
-        # 不等待，持锁调用无死锁风险。
+    def hangup(self, *, release_pcm: bool = True) -> None:
+        # 拆线与关 PCM 可分两步：CLCC 丢线回调应立刻 CHUP，但必须等宿主关掉
+        # PCM 串口后再 AT+CPCMREG=0,1（见 release_pcm=False）。
+        # CHUP/状态清理与关通道各自在锁内原子；沉降与读回在锁外，避免拖死 CLCC。
+        need_pcm_settle = False
         with self._serial_lock:
-            self._call_state_generation += 1
-            if self._audio_mode == "simcom_pcm":
-                # SIM7600 多呼叫（active + held）真机实测 ATH 只清掉一路，
-                # AT+CHUP 会结束全部语音呼叫。失败时回退 ATH，兼容不支持
-                # CHUP 的旧固件。
-                response = self._send("AT+CHUP")
-                if "OK" not in response.upper():
+            if self._hangup_complete:
+                logger.info("挂断幂等：本通已拆线，跳过")
+                return
+            if not self._call_hangup_done:
+                self._call_state_generation += 1
+                if self._audio_mode == "simcom_pcm":
+                    # SIM7600 多呼叫（active + held）真机实测 ATH 只清掉一路，
+                    # AT+CHUP 会结束全部语音呼叫。失败时回退 ATH，兼容不支持
+                    # CHUP 的旧固件。
+                    response = self._send("AT+CHUP")
+                    if "OK" not in response.upper():
+                        self._send("ATH")
+                else:
                     self._send("ATH")
-            else:
-                self._send("ATH")
+                self._pcm_ready_event.set()
+                self._call_connected_event.clear()
+                self._connected_call_ids.clear()
+                self._clcc_absent_count = 0
+                self._clcc_fail_count = 0
+                self._call_hangup_done = True
+                logger.info("已挂断物理通话")
+            if not release_pcm:
+                return
             self._disable_voice_pcm()
-            self._pcm_ready_event.set()
-            self._call_connected_event.clear()
-            self._connected_call_ids.clear()
-            self._clcc_absent_count = 0
-            self._clcc_fail_count = 0
-        logger.info("已挂断并关闭语音 PCM 通道")
+            need_pcm_settle = self._audio_mode == "simcom_pcm"
+            self._hangup_complete = True
+        if need_pcm_settle:
+            # 与拨号前沉降同量级：给 USB Audio 端点停流时间，再读回确认。
+            time.sleep(self._SIMCOM_PREDIAL_SETTLE_DELAY)
+            self._verify_simcom_pcm_stopped()
+        logger.info("已关闭语音 PCM 通道")
 
     def reset_module(self) -> bool:
         """Software-reset the modem after a fatal SIMCom USB Audio failure.
@@ -1423,6 +1608,8 @@ class Eg25Modem:
                         self._connected_call_ids.add(call_id)
                         connected_number = number or self._last_dialed
                         self._call_connected_event.set()
+                        self._call_hangup_done = False
+                        self._hangup_complete = False
                         logger.info("外呼已接通, 号码=%s", connected_number or "未知")
                         pending_connected.append(connected_number)
 

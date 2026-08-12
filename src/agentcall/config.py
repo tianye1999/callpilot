@@ -332,6 +332,26 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                requires_restart=True),
     ConfigSpec("MODEM_AGC_TARGET_DBFS", "下行 AGC 目标电平(dBFS)", "float", "-18.0",
                requires_restart=True),
+    # 挂断后重启模组，复位跨通劣化的 USB Audio 端点。真机 2026-08-12 对照实验：
+    # 不复位 / 只做宿主 USB 软拔插 → 下一通 AT+CPCMREG=1 首拒、写入超时甚至全程
+    # 无声；改发 AT+CRESET → 连续两通都是首次进 mode=1、写入零超时。宿主侧
+    # Disable/Enable 只重置 Windows 那一端，模组固件里的端点状态清不掉。
+    # 代价：重启期间约 15-20s 收不到来电。
+    ConfigSpec(
+        "MODEM_RESET_AFTER_HANGUP",
+        "挂断后重启模组（恢复 USB Audio）",
+        "bool",
+        "true",
+        requires_restart=True,
+    ),
+    # 已被上面的对照实验证伪，默认关闭；保留开关仅为回退排查。
+    ConfigSpec(
+        "MODEM_USB_SOFT_CYCLE_AFTER_HANGUP",
+        "挂断后 USB 软拔插（已证伪，默认关）",
+        "bool",
+        "false",
+        requires_restart=True,
+    ),
     # 对方语音送 AI 模型前的独立增益；每通开始读取，录音/监听仍保留各自路径。
     ConfigSpec("AGENT_UPLINK_GAIN", "AI 输入增益（对方语音）", "float", "1.0"),
     # 模组语音送远程手机前的独立增益；每个 LiveKit 会话创建时读取，支持热更新。
