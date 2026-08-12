@@ -42,7 +42,7 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
-# 录音固定格式：8kHz 16bit 单声道（EC20 语音通道的原生采样率）。
+# 录音默认格式：与模组 PCM 一致（见 MODEM_PCM_RATE / audio_bridge.MODEM_RATE）。
 SAMPLE_RATE = 8000
 SAMPLE_WIDTH = 2
 CHANNELS = 1
@@ -187,24 +187,26 @@ def _sanitize_number(number: str | None) -> str:
     return cleaned or "unknown"
 
 
-def _write_wav(path: Path, pcm: bytes) -> None:
+def _write_wav(path: Path, pcm: bytes, *, sample_rate: int = SAMPLE_RATE) -> None:
     # 截断到采样对齐，避免最后半个采样写出坏帧。
     aligned = len(pcm) - (len(pcm) % SAMPLE_WIDTH)
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(SAMPLE_WIDTH)
-        wf.setframerate(SAMPLE_RATE)
+        wf.setframerate(sample_rate)
         wf.writeframes(pcm[:aligned])
 
 
-def _write_wav_stereo(path: Path, interleaved: bytes) -> None:
-    """写立体声 8kHz 16bit WAV（L/R 交错的 PCM）。"""
+def _write_wav_stereo(
+    path: Path, interleaved: bytes, *, sample_rate: int = SAMPLE_RATE
+) -> None:
+    """写立体声 16bit WAV（L/R 交错的 PCM；采样率与模组 PCM 一致）。"""
     frame = SAMPLE_WIDTH * 2
     aligned = len(interleaved) - (len(interleaved) % frame)
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(2)
         wf.setsampwidth(SAMPLE_WIDTH)
-        wf.setframerate(SAMPLE_RATE)
+        wf.setframerate(sample_rate)
         wf.writeframes(interleaved[:aligned])
 
 
@@ -286,6 +288,7 @@ class CallRecord:
         recording_enabled: bool = False,
         source: str | None = None,
         public_id: str | None = None,
+        sample_rate: int = SAMPLE_RATE,
     ) -> None:
         self.id = id
         self.public_id = public_id or f"call_{secrets.token_urlsafe(18)}"
@@ -294,6 +297,7 @@ class CallRecord:
         self.number = number
         self.source = source
         self.recording_enabled = recording_enabled
+        self.sample_rate = sample_rate
         self.started_at = time.time()
         self._content_updated_at = self.started_at
         self._summary_state = "UNAVAILABLE"
@@ -335,23 +339,23 @@ class CallRecord:
         """延迟打点便捷方法，等价于 log_event("latency", stage=..., ms=...)。"""
         self.log_event("latency", stage=stage, ms=ms, **fields)
 
-    def write_uplink(self, pcm8k: bytes) -> None:
-        """追加上行 PCM（8kHz 16bit mono）；录音关闭时 no-op。"""
-        if not self.recording_enabled or not pcm8k:
+    def write_uplink(self, pcm: bytes) -> None:
+        """追加上行 PCM（模组速率 16bit mono）；录音关闭时 no-op。"""
+        if not self.recording_enabled or not pcm:
             return
         with self._lock:
             if not self._finished:
-                self._uplink.append(pcm8k)
-                self._uplink_bytes += len(pcm8k)
+                self._uplink.append(pcm)
+                self._uplink_bytes += len(pcm)
 
-    def write_downlink(self, pcm8k: bytes) -> None:
-        """追加下行 PCM（8kHz 16bit mono）；录音关闭时 no-op。"""
-        if not self.recording_enabled or not pcm8k:
+    def write_downlink(self, pcm: bytes) -> None:
+        """追加下行 PCM（模组速率 16bit mono）；录音关闭时 no-op。"""
+        if not self.recording_enabled or not pcm:
             return
         with self._lock:
             if not self._finished:
                 # 打上"此刻上行已累计字节数"作为时间轴位置，供合成对齐。
-                self._downlink.append((self._uplink_bytes, pcm8k))
+                self._downlink.append((self._uplink_bytes, pcm))
 
     # ---- 低频路径：允许磁盘 IO ----
 
@@ -384,13 +388,21 @@ class CallRecord:
                 content_updated_at = self._content_updated_at
             self._update_content_meta(content_updated_at, "PENDING")
 
-    def finish(self, status: str) -> None:
-        """结束通话：flush 录音为 wav、写 events.jsonl 与 meta.json。幂等。"""
+    def finish(self, status: str, ended_at: float | None = None) -> str | None:
+        """结束通话：flush 录音为 wav、写 events.jsonl 与 meta.json。幂等。
+
+        ``ended_at`` 允许调用方传入真正的挂断时刻。落盘发生在挂断收尾之后，
+        而收尾里的模组重启要花 15-20s，就地取 ``time.time()`` 会把这段时间
+        算进通话时长（真机 2026-08-12：44s 的通话记成 94s）。
+
+        Returns the trace diagnosis when meta was written; ``None`` if skipped
+        or disk write failed.
+        """
         with self._lock:
             if self._finished:
-                return
+                return None
             self._finished = True
-            ended_at = time.time()
+            ended_at = time.time() if ended_at is None else ended_at
             self._event_lines.append(
                 json.dumps(
                     {"type": "call_finished", "ts": ended_at, "status": status},
@@ -415,16 +427,35 @@ class CallRecord:
                     "\n".join(event_lines) + "\n", encoding="utf-8"
                 )
                 if self.recording_enabled:
-                    _write_wav(self.path / "uplink.wav", uplink)
-                    _write_wav(self.path / "downlink.wav", downlink)
+                    _write_wav(
+                        self.path / "uplink.wav", uplink, sample_rate=self.sample_rate
+                    )
+                    _write_wav(
+                        self.path / "downlink.wav",
+                        downlink,
+                        sample_rate=self.sample_rate,
+                    )
                     mixed = _build_stereo_mix(uplink, downlink_chunks)
                     if mixed:
-                        _write_wav_stereo(self.path / "mixed.wav", mixed)
+                        _write_wav_stereo(
+                            self.path / "mixed.wav",
+                            mixed,
+                            sample_rate=self.sample_rate,
+                        )
                 with self._lock:
                     self._content_updated_at = max(
                         self._content_updated_at, ended_at
                     )
                     content_updated_at = self._content_updated_at
+                trace_summary = _trace_summary(
+                    event_lines, answered=answered, status=status
+                )
+                # 接通了却一路没有对方 PCM 的通话不是 completed：历史列表若显示
+                # 成功，用户只会看到「没声音又不报错」。events.jsonl 保留当时的
+                # 原始判断，meta 记最终结论。
+                if trace_summary.get("diagnosis") == "no_caller_audio":
+                    if status == "completed":
+                        status = "failed"
                 meta = {
                     "id": self.id,
                     "public_id": self.public_id,
@@ -441,17 +472,19 @@ class CallRecord:
                     "recording_enabled": self.recording_enabled,
                     "uplink_bytes": len(uplink),
                     "downlink_bytes": len(downlink),
-                    "trace_summary": _trace_summary(
-                        event_lines, answered=answered, status=status
-                    ),
+                    "sample_rate": self.sample_rate,
+                    "trace_summary": trace_summary,
                 }
                 if self.source:
                     meta["source"] = self.source
                 (self.path / "meta.json").write_text(
                     json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
+                diagnosis = trace_summary.get("diagnosis")
+                return str(diagnosis) if diagnosis else None
             except OSError as exc:
                 logger.error("落盘通话记录 %s 失败: %s", self.id, exc)
+                return None
 
     def _update_content_meta(
         self, content_updated_at: float, summary_state: str
@@ -520,6 +553,8 @@ class CallLogger:
             seq += 1
         path = self.base_dir / call_id
         path.mkdir(parents=True)
+        from .audio_bridge import MODEM_RATE
+
         record = CallRecord(
             id=call_id,
             path=path,
@@ -531,6 +566,7 @@ class CallLogger:
                 else recording_enabled
             ),
             source=source,
+            sample_rate=MODEM_RATE,
         )
         started_fields: dict[str, Any] = {"direction": direction, "number": number}
         if source:

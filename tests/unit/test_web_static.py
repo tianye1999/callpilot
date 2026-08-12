@@ -113,7 +113,10 @@ def test_failed_call_stops_listener_and_shows_cpcmreg_error():
     assert "addCallError(ev)" in text
     assert "stopListen();" in text
     assert 'event.error_code === "cpcmreg_init_failed"' in text
+    assert 'event.error_code === "no_caller_audio"' in text
+    assert 'event.error_code === "modem_recovering"' in text
     assert "彻底断电约 10 秒" in text
+    assert "无对方 PCM" in text
 
 
 def test_live_page_has_sanitized_agent_process_monitor():

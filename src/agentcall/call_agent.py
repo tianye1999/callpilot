@@ -16,12 +16,15 @@ from typing import Any, Callable
 
 import serial
 
+# 导入模块而非 from-import MODEM_RATE：那是导入时按值拷贝的，
+# configure_modem_rate() 在 main() 里改的是 audio_bridge 的全局，改不到这份拷贝
+# （16k 下会把录音标成 8k、TurnArbiter/DTMF 全按 8k 算）。一律在用时取。
+from . import audio_bridge as _audio_bridge
 from . import config
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
 from .audio_bridge import (
-    MODEM_RATE,
     FfmpegAudioBridge,
     ModemAudioBridge,
     SerialPcmAudioBridge,
@@ -175,6 +178,12 @@ class CallSession:
         self._thread: threading.Thread | None = None
         self._active = False
         self._active_lock = threading.Lock()
+        # stop()/NO CARRIER 会立刻把 is_active 置 False，但 _run 仍可能在做
+        # 挂断后的端点恢复（模组重启约 15s）。若此时接下一通，会清掉一次性
+        # 标记并让旧 finally 再复位一次，把新通话撕成无声。lifecycle_busy
+        # 覆盖整段收尾。
+        self._lifecycle_busy = False
+        self._lifecycle_lock = threading.Lock()
         # (8k modem PCM, provider-rate monitor PCM).  Browser/recording playback
         # is emitted only when the same chunk is actually released to the modem,
         # so a turn-arbitration drop never appears as speech in the call replay.
@@ -186,6 +195,8 @@ class CallSession:
         # 避免它 stop() 误伤下一通会话。
         self._hangup_timer: threading.Timer | None = None
         self._session_generation = 0
+        # 真正的挂断时刻；收尾恢复期间落盘要用它，而不是落盘那一刻。
+        self._call_ended_at: float | None = None
         self._hangup_lock = threading.Lock()
         # 外呼收尾裁判（LLM 判断对话该继续还是收尾，替代关键词枚举）：
         # 请求收尾标志 + 理由 + 在途裁判 task（每通重置）。
@@ -271,6 +282,12 @@ class CallSession:
         with self._active_lock:
             return self._active
 
+    @property
+    def is_lifecycle_busy(self) -> bool:
+        """True while a call thread is alive, including post-hangup USB cycle."""
+        with self._lifecycle_lock:
+            return self._lifecycle_busy
+
     def _set_active(self, value: bool) -> None:
         with self._active_lock:
             self._active = value
@@ -282,9 +299,13 @@ class CallSession:
         preset_hint: str | None = None,
         preset_id: str | None = None,
     ) -> None:
-        if self.is_active:
-            logger.warning("已有通话进行中，忽略新的呼叫请求")
-            return
+        with self._lifecycle_lock:
+            if self._lifecycle_busy or self.is_active:
+                logger.warning(
+                    "已有通话或上一通仍在收尾（含模组重启），忽略新的呼叫请求"
+                )
+                return
+            self._lifecycle_busy = True
         self._outbound_number = outbound_number
         self._outbound_task_value = task
         self._preset_hint = preset_hint
@@ -313,7 +334,16 @@ class CallSession:
             self._cancel_hangup_timer()
             self._session_generation += 1
             self._set_active(True)
-        self._thread = threading.Thread(target=self._run, daemon=True)
+
+        def _thread_main() -> None:
+            try:
+                self._run()
+            finally:
+                # 必须在 _run 外包一层：单测会 mock _run，收尾锁仍要释放。
+                with self._lifecycle_lock:
+                    self._lifecycle_busy = False
+
+        self._thread = threading.Thread(target=_thread_main, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -432,6 +462,12 @@ class CallSession:
         failure_code: str | None = None
         failure_message: str | None = None
         reset_simcom_module = False
+        bridge: AudioBridge | None = None
+        agent = None
+        active_bridge: AudioBridge | None = None
+        self._usb_soft_cycled = False
+        self._modem_reset_after_hangup_done = False
+        self._call_ended_at = None
         try:
             if self._outbound_number:
                 if not await self._connect_outbound(mark):
@@ -451,16 +487,8 @@ class CallSession:
 
             # 挂断流程会关闭语音通道（AT+QPCMV=0 / AT+CPCMREG=0,1），每通电话都要
             # 重新启用，否则第二通开始模组无 PCM 流（双向无声）。
-            trace("bridge", "voice_channel_starting", "running")
-            self.modem.initialize_for_voice(self.audio_mode)
-            # simcom_pcm 只在通话中才能开 PCM：真开成了才允许起桥。往未出流的
-            # USB 端点写会 [Errno 60] 并把 AT 口的桥一起拖死（真机 2026-08-01），
-            # 宁可让这通电话明确失败，也不要静默变哑音 + 拖死模组链路。
-            if self.audio_mode.lower() == "simcom_pcm" and not self.modem.voice_pcm_active:
-                raise RuntimeError(
-                    "SIMCom PCM 通道未启用（AT+CPCMREG=1 未成功），拒绝启动音频桥"
-                )
-
+            # simcom_pcm：先打开 Audio COM/PTY 占住驱动接口，再 AT+CPCMREG
+            # （官方示例 / Waveshare 时序；Windows 官方虚拟 COM 上后开口易首帧写超时）。
             bridge = create_audio_bridge(
                 mode=self.audio_mode,
                 device_keyword=self.audio_keyword,
@@ -468,6 +496,36 @@ class CallSession:
                 pcm_baudrate=self.pcm_baudrate,
                 tx_gain=self.tx_gain,
             )
+            if (
+                self.audio_mode.lower() == "simcom_pcm"
+                and isinstance(bridge, SerialPcmAudioBridge)
+            ):
+                bridge.preclaim()
+                # 任何通话中 AT+CPCMREG=0,1 必须先释放 Audio COM，否则会把
+                # USB Audio 救成「mode=1 可进、流路径半初始化」→ 第 2 通卡顿
+                # （2026-08-11 真机）。
+                self.modem.set_pcm_endpoint_reset_hooks(
+                    before=bridge.release_claim,
+                    after=bridge.preclaim,
+                )
+            trace("bridge", "voice_channel_starting", "running")
+            try:
+                self.modem.initialize_for_voice(self.audio_mode)
+            finally:
+                self.modem.set_pcm_endpoint_reset_hooks()
+            # simcom_pcm 只在通话中才能开 PCM：真开成了才允许起桥。往未出流的
+            # USB 端点写会 [Errno 60] 并把 AT 口的桥一起拖死（真机 2026-08-01），
+            # 宁可让这通电话明确失败，也不要静默变哑音 + 拖死模组链路。
+            # 若启用过程中对方已挂断，modem 会安静返回且 voice_pcm_active=False——
+            # 这不是 CPCMREG 故障，绝不能走自动 AT+CRESET（会把「用户挂机」打成模组重启）。
+            if self.audio_mode.lower() == "simcom_pcm" and not self.modem.voice_pcm_active:
+                if not self.modem.is_call_connected():
+                    raise RuntimeError(
+                        "通话在 PCM 启用完成前已结束，取消音频桥启动"
+                    )
+                raise RuntimeError(
+                    "SIMCom PCM 通道未启用（AT+CPCMREG=1 未成功），拒绝启动音频桥"
+                )
             agent = create_agent(self.provider)
             self._start_dtmf_judge(record, session_t0=session_t0)
             instructions = self._build_agent_instructions(direction)
@@ -480,7 +538,7 @@ class CallSession:
                     0, config.get_int("HOTLINE_PLAYBACK_QUIET_MS")
                 )
                 self._turn_arbiter = TurnArbiter(
-                    sample_rate=MODEM_RATE,
+                    sample_rate=_audio_bridge.MODEM_RATE,
                     rms_threshold=config.get_int("TURN_REMOTE_RMS_THRESHOLD"),
                     quiet_ms=playback_quiet_ms,
                 )
@@ -551,11 +609,14 @@ class CallSession:
             status = "failed"
             if "CPCMREG" in str(exc).upper():
                 failure_code = "cpcmreg_init_failed"
+                # 勿自动 CRESET：真机证明它拖死 AT 口，恢复仍须彻底断电
+                # （docs/sim7600-windows-inbound-debug.md §2.2）。
                 failure_message = (
                     "SIM7600 USB Audio 初始化失败：AT+CPCMREG=1 未进入 mode=1。"
-                    "将自动重启模组恢复，请等待重新入网后再试。"
+                    "这条路径不会自动复位（此刻重启会连 AT 口一起拖死），"
+                    "请将模组彻底断电约 10 秒后重新上电再试。"
                 )
-                reset_simcom_module = self.audio_mode.lower() == "simcom_pcm"
+                reset_simcom_module = False
             elif self._is_simcom_pcm_transport_failure(exc):
                 failure_code = "simcom_pcm_io_failed"
                 failure_message = (
@@ -568,6 +629,13 @@ class CallSession:
                 failure_message = "通话初始化或处理失败，请查看服务日志。"
             raise
         finally:
+            # initialize_for_voice 失败时还没进 _shutdown_agent：先释放可能已 preclaim
+            # 的 PCM 口，再挂断，再软拔插。
+            if bridge is not None and active_bridge is None:
+                try:
+                    bridge.stop()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("会话异常收尾关闭音频桥出错: %s", exc)
             # initialize_for_voice / 音频桥创建可能在 _shutdown_agent 接管前失败。
             # 此时应用会话虽结束，模组上的物理呼叫仍可能 active/held；必须兜底
             # 挂断，避免下一通叠加呼叫并让 CPCMREG 永远无法进入 mode=1。
@@ -577,7 +645,18 @@ class CallSession:
                     logger.info("会话异常收尾已强制挂断仍在线的物理通话")
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("会话异常收尾挂断物理通话失败: %s", exc)
-            if reset_simcom_module:
+            # 这条路径是 initialize_for_voice / 建桥失败，故意不发 AT+CRESET：
+            # 真机结论是此刻重启会把 AT 口一起拖死，恢复反而只能靠彻底断电
+            # （docs/sim7600-windows-inbound-debug.md §2.2）。挂断后的自动重启
+            # 只服务「正常通完一通」，见 _shutdown_agent。
+            try:
+                await asyncio.to_thread(self._maybe_usb_soft_cycle_after_hangup)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("会话收尾 USB 软拔插异常: %s", exc)
+            # _shutdown_agent 的挂断恢复可能已经重启并等过重新枚举了。再发一次
+            # AT+CRESET 会打断刚重新入网的模组，而且这里不等枚举、随后就释放
+            # _lifecycle_busy，下一通会直接撞上正在重启的模组。
+            if reset_simcom_module and not self._modem_reset_after_hangup_done:
                 trace("bridge", "module_reset_starting", "running")
                 try:
                     reset_accepted = self.modem.reset_module()
@@ -605,7 +684,9 @@ class CallSession:
                 "error" if status == "failed" else "ok",
                 reason=failure_code or status,
             )
-            self._finalize_record(record, status, transcripts, direction, number)
+            diagnosis = self._finalize_record(
+                record, status, transcripts, direction, number
+            )
             # 异步会话的所有结束路径都在这里广播。用户主动挂断会为即时 UI
             # 反馈提前广播同一幂等事件；这里仍兜住 initialize_for_voice 等
             # Agent 启动前的异常，否则网页会永远停在 Listening 状态。
@@ -618,6 +699,17 @@ class CallSession:
                 event["error_code"] = failure_code
             if failure_message is not None:
                 event["error"] = failure_message
+            # bridge 已 ready 但无上行 PCM 时历史为 completed，直播页此前不报错。
+            if diagnosis == "no_caller_audio" and failure_code is None:
+                event["status"] = "failed"
+                event["error_code"] = "no_caller_audio"
+                event["error"] = (
+                    "本通无对方 PCM（电话侧无声）。"
+                    "若刚挂断过请等模组重启恢复完成后再拨；"
+                    "仍无声则将模组彻底断电约 10 秒后重试。"
+                )
+            if diagnosis is not None:
+                event["diagnosis"] = diagnosis
             self._publish(event)
 
     def _is_simcom_pcm_transport_failure(self, exc: BaseException) -> bool:
@@ -1267,12 +1359,16 @@ class CallSession:
         transcripts: list[tuple[str, str]],
         direction: str,
         number: str | None,
-    ) -> None:
-        """收尾：落盘通话记录，并按需在后台线程生成通话摘要。"""
+    ) -> str | None:
+        """收尾：落盘通话记录，并按需在后台线程生成通话摘要。
+
+        Returns the trace diagnosis string when available.
+        """
         if record is None:
-            return
+            return None
+        diagnosis: str | None = None
         try:
-            record.finish(status)
+            diagnosis = record.finish(status, ended_at=self._call_ended_at)
         except Exception as exc:  # noqa: BLE001
             logger.warning("落盘通话记录 %s 失败: %s", record.id, exc)
         sim_identity = getattr(self.modem, "sim_identity", None)
@@ -1285,6 +1381,7 @@ class CallSession:
             self._result_verification_mode,
             service_number,
         )
+        return diagnosis
 
     def _maybe_summarize(
         self,
@@ -2099,7 +2196,7 @@ class CallSession:
             if mode in {"inband", "both"}:
                 tone = dtmf_tone(
                     digits,
-                    MODEM_RATE,
+                    _audio_bridge.MODEM_RATE,
                     tone_ms=config.get_int("DTMF_TONE_MS"),
                     amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
                 )
@@ -2527,7 +2624,146 @@ class CallSession:
             self.modem.hangup()
         except Exception as exc:  # noqa: BLE001
             logger.warning("挂断物理通话出错: %s", exc)
+        # 收尾恢复要花 15-20s，而落盘在它之后；先钉住挂断时刻，否则这段等待会
+        # 被算成通话时长（真机 2026-08-12：44s 的通话记成 94s）。
+        self._call_ended_at = time.time()
+        # 恢复动作异常绝不能冒泡：否则已正常通话会在挂断时被 except 改写成 failed。
+        try:
+            await asyncio.to_thread(self._recover_audio_endpoint_after_hangup)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("挂断后音频端点恢复未执行完: %s", exc)
         logger.info("通话 Agent 会话已结束")
+
+    def _recover_audio_endpoint_after_hangup(self) -> None:
+        """挂断后复位 USB Audio 端点，保证下一通不劣化。
+
+        真机 2026-08-12 对照实验：不复位、或只做宿主侧 USB 软拔插，下一通都会
+        ``AT+CPCMREG=1`` 首拒并写入超时（严重时全程无声）；改发 ``AT+CRESET``
+        让模组自己重启后，连续两通都是首次进 mode=1、写入零超时。
+        """
+        if self._maybe_reset_modem_after_hangup():
+            return
+        self._maybe_usb_soft_cycle_after_hangup()
+
+    def _maybe_reset_modem_after_hangup(self) -> bool:
+        """发 AT+CRESET 并等模组重新枚举；返回是否执行了重启。"""
+        if getattr(self, "_modem_reset_after_hangup_done", False):
+            return False
+        if not config.get_bool("MODEM_RESET_AFTER_HANGUP"):
+            return False
+        if self.audio_mode.lower() != "simcom_pcm":
+            return False
+
+        reset_generation = self._session_generation
+        self._modem_reset_after_hangup_done = True
+        if self.hub is not None:
+            self.hub.publish(
+                {
+                    "type": "system",
+                    "code": "modem_recovering",
+                    "text": "正在重启模组以恢复音频通道，约 20 秒内无法接打电话。",
+                }
+            )
+        try:
+            accepted = self.modem.reset_module()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("挂断后 AT+CRESET 发送失败: %s", exc)
+            return False
+        if not accepted:
+            logger.error("挂断后 AT+CRESET 未获 OK，下一通可能仍会劣化")
+            return False
+        # 模组重启已经复位了整条 USB 链路，收尾其它路径不能再做宿主侧软拔插：
+        # 真机 2026-08-12 15:58，重启完成 13s 后又软拔插一次，白等且再次撕断 AT 口。
+        self._usb_soft_cycled = True
+        if self._session_generation != reset_generation:
+            logger.warning("会话世代已切换，不再等待模组重新枚举")
+            return True
+
+        started = time.monotonic()
+        if self.modem.wait_for_reenumeration():
+            logger.info(
+                "挂断后模组已重启并重新枚举 (%.1fs)，下一通 USB Audio 端点已复位",
+                time.monotonic() - started,
+            )
+        else:
+            logger.error(
+                "模组重启后未在时限内重新连上；若持续如此请将模组彻底断电约 10 秒"
+            )
+            if self.hub is not None:
+                self.hub.publish(
+                    {
+                        "type": "system",
+                        "text": "模组重启后未能重新连上，请将模组彻底断电约 10 秒后重试。",
+                    }
+                )
+        return True
+
+    def _maybe_usb_soft_cycle_after_hangup(self) -> None:
+        """Windows + simcom_pcm：挂断后 USB 软拔插，缓解跨通半死端点。"""
+        if getattr(self, "_usb_soft_cycled", False):
+            return
+        if not config.get_bool("MODEM_USB_SOFT_CYCLE_AFTER_HANGUP"):
+            return
+        from . import platforms, windows_usb_cycle
+
+        if not platforms.IS_WINDOWS:
+            return
+        if self.audio_mode.lower() != "simcom_pcm":
+            return
+
+        cycle_generation = self._session_generation
+        vid = (config.get_str("MODEM_USB_VID") or "1e0e").strip() or "1e0e"
+        self._usb_soft_cycled = True
+        if self._session_generation != cycle_generation:
+            logger.warning("会话世代已切换，跳过 USB 软拔插以免撕掉下一通")
+            return
+        try:
+            self.modem.release_serial_for_usb_cycle()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("USB 软拔插前释放 AT 口失败: %s", exc)
+
+        if self._session_generation != cycle_generation:
+            logger.warning("会话世代已切换，中止 USB 软拔插以免撕掉下一通")
+            return
+        result = windows_usb_cycle.soft_cycle_simtech_usb(vid=vid)
+        if result.ok:
+            # 软拔插只复位宿主 USB；不得标干净去跳过下一通预复位。
+            # 真机 2026-08-12：标干净 → 跳过 =0,1 → 首拒再复位 → mode=1 但听感卡成麻花。
+            logger.info(
+                "挂断后 USB 软拔插成功 (%s): %s；下一通仍将做启用前预复位",
+                result.method,
+                result.detail,
+            )
+            if windows_usb_cycle.wait_for_simtech_ports(vid=vid, timeout_seconds=20.0):
+                self.modem.kick_reconnect()
+            else:
+                logger.warning("USB 软拔插后 COM 口未在时限内恢复，等待 supervisor 重连")
+            if self.hub is not None:
+                self.hub.publish(
+                    {
+                        "type": "system",
+                        "text": "已做 USB 软拔插以恢复音频通道，请稍候模组重连后再拨。",
+                    }
+                )
+            return
+
+        logger.warning(
+            "挂断后 USB 软拔插失败 (%s): %s。"
+            "请管理员安装 scripts/windows/install_usb_cycle_helper.ps1，"
+            "或将模组彻底断电约 10 秒。",
+            result.method,
+            result.detail,
+        )
+        if self.hub is not None:
+            self.hub.publish(
+                {
+                    "type": "system",
+                    "text": (
+                        "USB 软拔插未成功（多半缺管理员权限）。"
+                        "第 2 通可能仍劣化；请安装软拔插助手或断电重插模组。"
+                    ),
+                }
+            )
 
     def _drain_agent_audio(self, bridge: AudioBridge) -> int:
         modem_chunks: list[bytes] = []
@@ -2577,6 +2813,7 @@ class CallAgentService:
         audio_mode: str = "uac",
         pcm_port: str | None = None,
         pcm_baudrate: int = 921600,
+        pcm_rate: int = 8000,
         tx_gain: float = 1.0,
         hub: EventHub | None = None,
         modem: Eg25Modem | None = None,
@@ -2584,7 +2821,8 @@ class CallAgentService:
         sms_email_forwarder: SmsEmailForwarder | None = None,
     ) -> None:
         # modem/call_logger 参数供测试注入；默认按串口/环境配置自建。
-        self.modem = modem or Eg25Modem(modem_port, baudrate)
+        self.pcm_rate = pcm_rate
+        self.modem = modem or Eg25Modem(modem_port, baudrate, pcm_rate=pcm_rate)
         self.audio_keyword = audio_keyword
         self.provider = provider
         self.audio_mode = audio_mode
@@ -2664,7 +2902,7 @@ class CallAgentService:
             return None
         monitor = MonitorPlayback(
             config.get_str("MONITOR_OUTPUT_DEVICE"),
-            sample_rate=8000,
+            sample_rate=_audio_bridge.MODEM_RATE,
             gain=config.get_float("MONITOR_UPLINK_GAIN"),
         )
         monitor.start()
@@ -2698,8 +2936,31 @@ class CallAgentService:
             # 同一通来电会被 RING 主动上报和 CLCC 轮询重复触发，需去重：
             # 已有会话进行中时直接忽略，避免重复接听 / 抢占 PCM 串口导致崩溃。
             with self._ring_lock:
-                if self.session.is_active or self._remote_call_owner is not None:
-                    logger.debug("已有通话进行中，忽略重复的 RING/CLCC: %s", caller)
+                if (
+                    self.session.is_active
+                    or self.session.is_lifecycle_busy
+                    or self._remote_call_owner is not None
+                ):
+                    if self.session.is_lifecycle_busy and not self.session.is_active:
+                        logger.warning(
+                            "上一通仍在收尾（含模组重启），暂拒接听: %s",
+                            caller or "未知",
+                        )
+                        self._publish(
+                            {
+                                "type": "call",
+                                "status": "failed",
+                                "caller": caller,
+                                "error_code": "modem_recovering",
+                                "error": (
+                                    "模组正在重启以恢复音频通道，约 20 秒后可再拨。"
+                                ),
+                            }
+                        )
+                    else:
+                        logger.debug(
+                            "已有通话进行中，忽略重复的 RING/CLCC: %s", caller
+                        )
                     return
                 logger.info("来电号码: %s", caller or "未知")
                 missing_credentials, message = self._reject_if_credentials_missing()
@@ -2725,7 +2986,10 @@ class CallAgentService:
                 remote_owner.request_call_stop("remote_party_hangup")
                 return
             self.session.stop()
-            self.modem.hangup()
+            # 只拆物理通话：此时音频桥可能仍在写 PCM 口。SIMCom 若在写流
+            # 中途 CPCMREG=0,1，下一通首启常被拒并实听卡顿。关通道留给
+            # _shutdown_agent（bridge.stop 之后）。
+            self.modem.hangup(release_pcm=False)
 
         def on_sms(sender: str | None, text: str, sms_ts: str = "") -> None:
             logger.info("收到短信 来自=%s 字符数=%d", sender or "未知", len(text))
@@ -2786,7 +3050,13 @@ class CallAgentService:
             return False, message
         self._remember_outbound_task(task)
         with self._ring_lock:
-            if self.session.is_active or self._remote_call_owner is not None:
+            if (
+                self.session.is_active
+                or self.session.is_lifecycle_busy
+                or self._remote_call_owner is not None
+            ):
+                if self.session.is_lifecycle_busy and not self.session.is_active:
+                    return False, "模组正在重启以恢复音频通道，约 20 秒后可再拨"
                 return False, "当前正在通话中，请稍后再拨"
             self.session.current_caller = number
             if preset_id is None:
@@ -2817,8 +3087,10 @@ class CallAgentService:
         # session.stop()/remote request 都是异步收尾。更重要的是，音频初始化
         # 失败时逻辑 session 可能已 inactive，但模组中仍留有 active/held call。
         # 用户点击“挂断”的语义必须是立即向模组发 CHUP，而不是仅改应用状态。
+        # release_pcm=False 的理由同 on_hangup：此刻音频桥还占着 Audio 口，
+        # 就地 AT+CPCMREG=0,1 会让下一通首启被拒；关通道留给 _shutdown_agent。
         try:
-            self.modem.hangup()
+            self.modem.hangup(release_pcm=False)
         except Exception as exc:  # noqa: BLE001
             logger.exception("用户触发物理挂断失败: %s", exc)
             return False, "挂断失败：模组没有响应"
@@ -3004,7 +3276,10 @@ class CallAgentService:
             worker = self._remote_worker
             remote_session_active = bool(worker and worker.is_running)
         with self._ring_lock:
-            local_session_active = self.session.is_active
+            # 挂断收尾（模组重启约 20s）期间 is_active 已经是 False，但线路还不能用。
+            local_session_active = (
+                self.session.is_active or self.session.is_lifecycle_busy
+            )
             remote_call_active = self._remote_call_owner is not None
         return remote_session_active or local_session_active or remote_call_active
 
@@ -3131,7 +3406,11 @@ class CallAgentService:
             guard_failure = self._dial_guard(None)
             if guard_failure is not None:
                 return guard_failure
-            if self.session.is_active or self._remote_call_owner is not None:
+            if (
+                self.session.is_active
+                or self.session.is_lifecycle_busy
+                or self._remote_call_owner is not None
+            ):
                 return "当前正在通话中，请稍后再拨"
             limit = acquire_remote_dial_slot(
                 config.get_int("REMOTE_DIAL_LIMIT_PER_HOUR")

@@ -132,11 +132,13 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                secret=True, requires_restart=True),
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
                "qwen3.5-omni-plus-realtime", requires_restart=True),
-    # 精选常用音色做下拉;完整 55 种(含方言/多语言)见官网试听页,列表外音色
-    # 可直接在 .env 填 QWEN_VOICE(get_str 读环境变量,不受 choices 限制)。
-    ConfigSpec("QWEN_VOICE", "Qwen 音色", "select", "Raymond",
-               choices=("Raymond", "Ethan", "Tina", "Cindy", "Serena",
-                        "Harvey", "Maia", "Sunnybobi"),
+    # qwen-audio-3.0-realtime-* 仅支持下方音色；列表外可在 .env 直接填
+    # QWEN_VOICE（get_str 读环境变量，不受 choices 限制）。
+    ConfigSpec("QWEN_VOICE", "Qwen 音色", "select", "longanqian",
+               choices=("longanqian", "longanlingxin", "longanlufeng",
+                        "longanlingxi", "longanxiaoxin", "longanfengyue",
+                        "longanyuanfei", "loongmary", "loongeva_v3.6",
+                        "loongjohn"),
                help="https://help.aliyun.com/zh/model-studio/omni-voice-list"),
     # 模型显示名只用于 /api/meta 与豆包自我介绍提示词，属内部项不进面板。
     # 显示名用语言中性的品牌名（Qwen/Doubao 是同款产品的国际名），
@@ -305,7 +307,51 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                requires_restart=True),
     ConfigSpec("MODEM_PCM_BAUD", "PCM 串口波特率", "int", "921600",
                requires_restart=True),
-    ConfigSpec("MODEM_TX_GAIN", "上行发送增益", "float", "1.0"),
+    # simcom_pcm：模组 USB Audio PCM 采样率。须与 AT+CPCMBANDWIDTH 一致。
+    # 8000=窄带（默认/兼容）；16000=宽带（VoLTE HD 听感更好，Windows 须真机压测写吞吐）。
+    ConfigSpec(
+        "MODEM_PCM_RATE",
+        "模组 PCM 采样率",
+        "select",
+        "8000",
+        choices=("8000", "16000"),
+        requires_restart=True,
+    ),
+    # 默认 0.83 而非 1.0：它要抵掉 apply_phone_clarity 的预加重降档
+    # （0.65→0.35）带来的 +1.63dB，使默认部署的响度与历史一致。这两个值是
+    # **耦合**的——动了 pre_coef 就必须按新的电平差重算这里，否则音色和响度
+    # 会一起变，听感无法归因。详见 audio_bridge.apply_phone_clarity 的 docstring。
+    ConfigSpec("MODEM_TX_GAIN", "上行发送增益", "float", "0.83"),
+    # 下行动态范围压缩：把句尾/轻辅音抬到窄带电话里仍可辨，静态增益做不到
+    # （只能在削顶和听不清之间二选一）。目标电平是 AGC 拉齐的 RMS，不是峰值；
+    # MODEM_TX_GAIN 仍作为 AGC 之后的总响度微调。这两项只在启动时由
+    # configure_downlink_agc() 读入进程全局，面板改完必须重启才生效。
+    # 默认关：2026-08-11 真机等响 A/B 判定无可闻收益（文档 §5.2），
+    # 保留开关但不默认承担通话链路上的复杂度。
+    ConfigSpec("MODEM_AGC", "下行动态压缩(AGC)", "bool", "false",
+               requires_restart=True),
+    ConfigSpec("MODEM_AGC_TARGET_DBFS", "下行 AGC 目标电平(dBFS)", "float", "-18.0",
+               requires_restart=True),
+    # 挂断后重启模组，复位跨通劣化的 USB Audio 端点。真机 2026-08-12 对照实验：
+    # 不复位 / 只做宿主 USB 软拔插 → 下一通 AT+CPCMREG=1 首拒、写入超时甚至全程
+    # 无声；改发 AT+CRESET → 连续两通都是首次进 mode=1、写入零超时。宿主侧
+    # Disable/Enable 只重置 Windows 那一端，模组固件里的端点状态清不掉。
+    # 代价：重启期间约 15-20s 收不到来电。
+    ConfigSpec(
+        "MODEM_RESET_AFTER_HANGUP",
+        "挂断后重启模组（恢复 USB Audio）",
+        "bool",
+        "true",
+        requires_restart=True,
+    ),
+    # 已被上面的对照实验证伪，默认关闭；保留开关仅为回退排查。
+    ConfigSpec(
+        "MODEM_USB_SOFT_CYCLE_AFTER_HANGUP",
+        "挂断后 USB 软拔插（已证伪，默认关）",
+        "bool",
+        "false",
+        requires_restart=True,
+    ),
     # 对方语音送 AI 模型前的独立增益；每通开始读取，录音/监听仍保留各自路径。
     ConfigSpec("AGENT_UPLINK_GAIN", "AI 输入增益（对方语音）", "float", "1.0"),
     # 模组语音送远程手机前的独立增益；每个 LiveKit 会话创建时读取，支持热更新。
@@ -636,21 +682,44 @@ def validate_provider_key_online(
             )
             return KeyValidationResult(True, "valid")
         if provider == "qwen":
+            # 国内站与国际站 Key 不通用；向导若只打国内站，国际站 Key 会误报「无效」。
+            # 先国内、401/403 再试国际站；国际站通过时用 message=intl 提示前端写 Realtime URL。
             payload = (
                 b'{"model":"qwen-turbo","input":{"messages":['
                 b'{"role":"user","content":"ping"}]},"parameters":{"max_tokens":1}}'
             )
-            _http_request_json(
-                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
-                method="POST",
-                headers={
-                    "Authorization": f"Bearer {secret}",
-                    "Content-Type": "application/json",
-                },
-                body=payload,
-                timeout=timeout,
+            headers = {
+                "Authorization": f"Bearer {secret}",
+                "Content-Type": "application/json",
+            }
+            endpoints = (
+                ("cn", "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"),
+                (
+                    "intl",
+                    "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+                ),
             )
-            return KeyValidationResult(True, "valid")
+            last_auth_error: str | None = None
+            for region, url in endpoints:
+                try:
+                    _http_request_json(
+                        url,
+                        method="POST",
+                        headers=headers,
+                        body=payload,
+                        timeout=timeout,
+                    )
+                    return KeyValidationResult(
+                        True, "valid", "intl" if region == "intl" else ""
+                    )
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (401, 403):
+                        last_auth_error = f"HTTP {exc.code}"
+                        continue
+                    return KeyValidationResult(False, "network", f"HTTP {exc.code}")
+            return KeyValidationResult(
+                False, "invalid", last_auth_error or "HTTP 401"
+            )
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             return KeyValidationResult(False, "invalid", f"HTTP {exc.code}")

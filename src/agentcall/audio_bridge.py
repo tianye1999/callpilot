@@ -1,9 +1,10 @@
-"""8kHz 模组音频 ↔ AI 音频格式桥接。"""
+"""模组 PCM（8k/16k）↔ AI 音频格式桥接。"""
 
 from __future__ import annotations
 
 import errno
 import logging
+import math
 import os
 import re
 import select
@@ -40,19 +41,23 @@ def _is_pty(port: str) -> bool:
         return False
     return bool(_PTY_NAME_RE.match(resolved))
 
+# 模组 PCM 采样率：默认窄带 8k；宽带 16k 由 configure_modem_rate() /
+# MODEM_PCM_RATE 在进程启动时切换（须与 AT+CPCMBANDWIDTH 一致）。
+SUPPORTED_MODEM_RATES = (8000, 16000)
 MODEM_RATE = 8000
 MODEM_CHANNELS = 1
 MODEM_DTYPE = "int16"
 MODEM_BLOCK_MS = 20
-NMEA_READ_SIZE = 640
-NMEA_WRITE_SIZE = 1600
 NMEA_WRITE_INTERVAL_SECONDS = 0.1
-# SIM7600 官方 Linux 示例从麦克风回调每 20ms 向 audio 串口写一次：
-# 8kHz * 20ms * int16 = 320 bytes。SIMCom 路径对齐该节奏，避免沿用
-# Quectel/UAC 的 1600B/100ms 突发。注意真机已证实：仅改分帧仍不能解锁
-# 当前固件的 bulk OUT，P0 根因另在驱动传输/接口握手。
-SIMCOM_WRITE_SIZE = 320
+# SIM7600 官方 Linux 示例从麦克风回调每 20ms 向 audio 串口写一次（PTY 路径）。
 SIMCOM_WRITE_INTERVAL_SECONDS = 0.02
+# Windows SimTech Audio COM：20ms/320B 事务过密，真机写耗时常 >20ms →
+# written≈75KB/5s + 听感卡顿（2026-08-11 18:20）。非 PTY 改用 100ms 帧降事务。
+SIMCOM_WIN_WRITE_INTERVAL_SECONDS = 0.1
+NMEA_READ_SIZE = 640
+NMEA_WRITE_SIZE = 1600  # = MODEM_RATE * 0.1 * 2 @8k；configure 时重算
+SIMCOM_WRITE_SIZE = 320  # = MODEM_RATE * 0.02 * 2 @8k；configure 时重算
+SIMCOM_WIN_WRITE_SIZE = 1600  # = MODEM_RATE * 0.1 * 2 @8k；configure 时重算
 # SIM7600 的 USB Audio 在端点刚恢复、PTY flush 或短写边界处，偶尔会让
 # 16-bit PCM 从高字节开始。此时正常几百幅值的人声会瞬间变成接近满幅的
 # 宽带噪音；把字节流再错开 1 byte 后会恢复。只在 SIMCom 路径启用这一
@@ -61,6 +66,44 @@ SIMCOM_REALIGN_MIN_RMS = 6000.0
 SIMCOM_REALIGN_MAX_ALTERNATE_RMS = 3000.0
 SIMCOM_REALIGN_IMPROVEMENT_RATIO = 0.25
 SIMCOM_STARTUP_GUARD_SECONDS = 2.5
+
+
+def configure_modem_rate(rate: int) -> int:
+    """设置进程内模组 PCM 采样率，并同步写帧字节数。
+
+    必须在创建音频桥 / 通话前调用，且与模组 ``AT+CPCMBANDWIDTH`` 一致；
+    否则会出现「16k 流按 8k 解 → 宽带噪声」或吞吐对不上。
+    """
+    global MODEM_RATE, NMEA_READ_SIZE, NMEA_WRITE_SIZE
+    global SIMCOM_WRITE_SIZE, SIMCOM_WIN_WRITE_SIZE
+    if rate not in SUPPORTED_MODEM_RATES:
+        raise ValueError(
+            f"MODEM_PCM_RATE 仅支持 {SUPPORTED_MODEM_RATES}，收到: {rate}"
+        )
+    MODEM_RATE = rate
+    bytes_per_sec = rate * MODEM_CHANNELS * 2
+    NMEA_READ_SIZE = max(640, int(bytes_per_sec * 0.04))  # ~40ms
+    NMEA_WRITE_SIZE = int(bytes_per_sec * NMEA_WRITE_INTERVAL_SECONDS)
+    SIMCOM_WRITE_SIZE = int(bytes_per_sec * SIMCOM_WRITE_INTERVAL_SECONDS)
+    SIMCOM_WIN_WRITE_SIZE = int(bytes_per_sec * SIMCOM_WIN_WRITE_INTERVAL_SECONDS)
+    logger.info(
+        "模组 PCM 采样率已配置: %dHz "
+        "(simcom_pty=%dB/%.0fms, simcom_win=%dB/%.0fms, nmea=%dB/%.0fms)",
+        MODEM_RATE,
+        SIMCOM_WRITE_SIZE,
+        SIMCOM_WRITE_INTERVAL_SECONDS * 1000,
+        SIMCOM_WIN_WRITE_SIZE,
+        SIMCOM_WIN_WRITE_INTERVAL_SECONDS * 1000,
+        NMEA_WRITE_SIZE,
+        NMEA_WRITE_INTERVAL_SECONDS * 1000,
+    )
+    return MODEM_RATE
+
+
+def phone_passband_hz(sample_rate: int | None = None) -> float:
+    """电话有效通带上沿：窄带 ~3.4kHz，宽带(AMR-WB) ~7kHz。"""
+    rate = MODEM_RATE if sample_rate is None else sample_rate
+    return 3400.0 if rate <= 8000 else 7000.0
 
 
 def find_device_index(keyword: str, kind: str | None = None) -> int | None:
@@ -94,21 +137,34 @@ def resample_pcm(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     return resampled.astype(np.int16).tobytes()
 
 
+def _design_phone_lpf(src_rate: int, dst_rate: int, *, taps: int = 127) -> np.ndarray:
+    cutoff_hz = min(phone_passband_hz(dst_rate), dst_rate * 0.45)
+    center = (taps - 1) / 2
+    positions = np.arange(taps, dtype=np.float64) - center
+    normalized_cutoff = cutoff_hz / src_rate
+    kernel = (
+        2.0
+        * normalized_cutoff
+        * np.sinc(2.0 * normalized_cutoff * positions)
+        * np.hamming(taps)
+    )
+    kernel /= np.sum(kernel)
+    return kernel
+
+
 class StreamingPcmDownsampler:
     """有状态的 mono PCM16 整数倍降采样器。
 
     Realtime 服务会把一段连续语音拆成大小不固定的 WebSocket delta。旧实现对
-    每个 delta 单独 ``np.interp``：既没有在 8kHz Nyquist 前做低通，又会在
+    每个 delta 单独 ``np.interp``：既没有在电话 Nyquist 前做低通，又会在
     每个 delta 重新开始采样相位。24kHz 原音在浏览器旁听正常，但高于电话带宽
-    的能量会折叠进 0-4kHz，块边界还可能产生 click，最终只有电话一侧听到杂音。
+    的能量会折叠进基带，块边界还可能产生 click。
 
-    这里在源采样率上先做 3.4kHz 低通，再保持跨 delta 的抽取相位。SIM7600、
-    EC20 的电话 PCM 都是 8kHz；MiniMax/Qwen/OpenAI 常见的 16/24kHz 输出均为
-    整数倍路径。非整数倍仍由 ``resample_pcm`` 兼容处理。
+    这里在源采样率上先做电话通带低通，再保持跨 delta 的抽取相位。
+    非整数倍（如 24k→16k）见 ``StreamingPcmRationalResampler``。
     """
 
     _FILTER_TAPS = 127
-    _PHONE_PASSBAND_HZ = 3400.0
 
     def __init__(self, src_rate: int, dst_rate: int) -> None:
         if src_rate <= dst_rate or src_rate % dst_rate:
@@ -116,26 +172,11 @@ class StreamingPcmDownsampler:
         self.src_rate = src_rate
         self.dst_rate = dst_rate
         self.factor = src_rate // dst_rate
-        self._taps = self._design_filter(src_rate, dst_rate)
+        self._taps = _design_phone_lpf(src_rate, dst_rate, taps=self._FILTER_TAPS)
         self._history = np.zeros(len(self._taps) - 1, dtype=np.float64)
         self._phase = 0
         self._byte_carry = b""
         self._lock = threading.Lock()
-
-    @classmethod
-    def _design_filter(cls, src_rate: int, dst_rate: int) -> np.ndarray:
-        cutoff_hz = min(cls._PHONE_PASSBAND_HZ, dst_rate * 0.45)
-        center = (cls._FILTER_TAPS - 1) / 2
-        positions = np.arange(cls._FILTER_TAPS, dtype=np.float64) - center
-        normalized_cutoff = cutoff_hz / src_rate
-        taps = (
-            2.0
-            * normalized_cutoff
-            * np.sinc(2.0 * normalized_cutoff * positions)
-            * np.hamming(cls._FILTER_TAPS)
-        )
-        taps /= np.sum(taps)
-        return taps
 
     def process(self, pcm: bytes) -> bytes:
         if not pcm:
@@ -148,13 +189,66 @@ class StreamingPcmDownsampler:
                 return b""
             samples = np.frombuffer(raw[:aligned], dtype="<i2").astype(np.float64)
             combined = np.concatenate((self._history, samples))
-            # 滤波器对称，所以 np.convolve 的核翻转不改变结果。valid 恰好为
-            # 每个新输入样本产生一个连续输出，不重复历史区间。
             filtered = np.convolve(combined, self._taps, mode="valid")
             output = filtered[self._phase :: self.factor]
             self._phase = (self._phase - len(filtered)) % self.factor
             self._history = combined[-(len(self._taps) - 1) :]
         encoded = np.clip(np.rint(output), -32768, 32767).astype("<i2")
+        return encoded.tobytes()
+
+
+class StreamingPcmRationalResampler:
+    """非整数倍降采样（典型：Agent 24kHz → 模组 16kHz）。
+
+    先 FIR 低通，再按连续分数相位线性插值，避免块边界相位重置。
+    """
+
+    _FILTER_TAPS = 127
+
+    def __init__(self, src_rate: int, dst_rate: int) -> None:
+        if src_rate <= dst_rate:
+            raise ValueError("StreamingPcmRationalResampler 仅支持降采样")
+        if src_rate % dst_rate == 0:
+            raise ValueError("整数倍请用 StreamingPcmDownsampler")
+        self.src_rate = src_rate
+        self.dst_rate = dst_rate
+        self.ratio = src_rate / dst_rate
+        self._taps = _design_phone_lpf(src_rate, dst_rate, taps=self._FILTER_TAPS)
+        self._history = np.zeros(len(self._taps) - 1, dtype=np.float64)
+        self._filtered = np.zeros(0, dtype=np.float64)
+        self._pos = 0.0
+        self._byte_carry = b""
+        self._lock = threading.Lock()
+
+    def process(self, pcm: bytes) -> bytes:
+        if not pcm:
+            return b""
+        with self._lock:
+            raw = self._byte_carry + pcm
+            aligned = len(raw) - len(raw) % 2
+            self._byte_carry = raw[aligned:]
+            if aligned <= 0:
+                return b""
+            samples = np.frombuffer(raw[:aligned], dtype="<i2").astype(np.float64)
+            combined = np.concatenate((self._history, samples))
+            filtered = np.convolve(combined, self._taps, mode="valid")
+            self._history = combined[-(len(self._taps) - 1) :]
+            self._filtered = np.concatenate((self._filtered, filtered))
+            out: list[float] = []
+            last_index = len(self._filtered) - 1
+            while self._pos < last_index:
+                idx = int(self._pos)
+                frac = self._pos - idx
+                left = self._filtered[idx]
+                right = self._filtered[idx + 1]
+                out.append(left + (right - left) * frac)
+                self._pos += self.ratio
+            keep_from = max(0, int(self._pos) - 1)
+            self._pos -= keep_from
+            self._filtered = self._filtered[keep_from:]
+        if not out:
+            return b""
+        encoded = np.clip(np.rint(np.asarray(out)), -32768, 32767).astype("<i2")
         return encoded.tobytes()
 
 
@@ -166,23 +260,29 @@ def _agent_chunk_to_modem(
     """按 bridge 实例保持 Agent→电话降采样状态。"""
     if not pcm_agent or agent_rate == MODEM_RATE:
         return pcm_agent
-    if agent_rate > MODEM_RATE and agent_rate % MODEM_RATE == 0:
-        resampler = getattr(bridge, "_downlink_resampler", None)
-        if (
-            resampler is None
-            or resampler.src_rate != agent_rate
-            or resampler.dst_rate != MODEM_RATE
-        ):
-            resampler = StreamingPcmDownsampler(agent_rate, MODEM_RATE)
-            bridge._downlink_resampler = resampler
-            logger.info(
-                "Agent 下行流式降采样已启用: %dHz -> %dHz "
-                "(3.4kHz low-pass, 跨块连续相位)",
-                agent_rate,
-                MODEM_RATE,
-            )
-        return cast(StreamingPcmDownsampler, resampler).process(pcm_agent)
-    return resample_pcm(pcm_agent, agent_rate, MODEM_RATE)
+    if agent_rate <= MODEM_RATE:
+        return resample_pcm(pcm_agent, agent_rate, MODEM_RATE)
+
+    resampler = getattr(bridge, "_downlink_resampler", None)
+    integer = agent_rate % MODEM_RATE == 0
+    want_type = StreamingPcmDownsampler if integer else StreamingPcmRationalResampler
+    if (
+        resampler is None
+        or not isinstance(resampler, want_type)
+        or resampler.src_rate != agent_rate
+        or resampler.dst_rate != MODEM_RATE
+    ):
+        resampler = want_type(agent_rate, MODEM_RATE)
+        bridge._downlink_resampler = resampler
+        logger.info(
+            "Agent 下行流式重采样已启用: %dHz -> %dHz "
+            "(passband=%.0fHz, %s)",
+            agent_rate,
+            MODEM_RATE,
+            phone_passband_hz(MODEM_RATE),
+            "integer-decimate" if integer else "rational-interp",
+        )
+    return cast(Any, resampler).process(pcm_agent)
 
 
 def apply_pcm_gain(pcm: bytes, gain: float) -> bytes:
@@ -191,6 +291,222 @@ def apply_pcm_gain(pcm: bytes, gain: float) -> bytes:
     samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
     amplified = np.clip(samples * gain, -32768, 32767)
     return amplified.astype(np.int16).tobytes()
+
+
+def apply_phone_clarity(pcm: bytes, *, sample_rate: int | None = None) -> bytes:
+    """电话下行清晰度：去泥 + 抬辅音区，减轻「隔着木板」。
+
+    顺序：一阶高通去掉 <~180Hz 闷泥 → 中等预加重抬通带上沿。
+    仍弱于经典 0.85 全量预加重（那版刺耳/泵感）；不做全程 tanh。
+
+    等效响应是 ``H(z) = 1 - 0.58*pre_coef * z^-1``（见下面的混合），刻度按
+    **3.4kHz 相对 300Hz 抬多少 dB** 来记比按系数记直观：
+
+    | pre_coef | 倾斜 |
+    |---|---|
+    | 0.65 | 6.47dB — 2026-08-10 为治「闷」提上来的，真机实听**刺耳** |
+    | 0.35 | 3.37dB — 当前值 |
+    | 0.20 | 1.90dB — 已低于单测要求的 +25%，再降就等于没做 |
+
+    0.65 那次调高是在模组端点退化期做的，当时的「闷」与断续同源（见文档 §5.3），
+    模组恢复后就显得过亮了。**改这个系数会同时改变总电平**（低频衰减跟着变，
+    0.65→0.35 总电平 +1.63dB），调完必须用 ``MODEM_TX_GAIN`` 补回去，
+    否则音色和响度两个变量一起动，听感归因不了。
+    """
+    if not pcm:
+        return pcm
+    x = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+    if x.size == 0:
+        return pcm
+    rate = MODEM_RATE if sample_rate is None else sample_rate
+    # 一阶 HP：α ≈ exp(-2π·180/fs)；8k≈0.87，16k≈0.93
+    alpha = float(np.exp(-2.0 * np.pi * 180.0 / rate))
+    dx = np.empty_like(x)
+    dx[0] = 0.0
+    dx[1:] = x[1:] - x[:-1]
+    hp = np.empty_like(x)
+    acc = 0.0
+    for i, step in enumerate(dx):
+        acc = alpha * (acc + step)
+        hp[i] = acc
+    pre_coef = 0.35 if rate <= 8000 else 0.30
+    pre = np.empty_like(hp)
+    pre[0] = hp[0]
+    pre[1:] = hp[1:] - pre_coef * hp[:-1]
+    out = 0.42 * hp + 0.58 * pre
+    return np.clip(np.rint(out), -32768, 32767).astype("<i2").tobytes()
+
+
+class PhoneAgc:
+    """下行动态范围压缩 + 自动增益（流式，跨块保持状态）。
+
+    窄带电话里句尾、轻辅音常掉到听阈以下，而静态 ``MODEM_TX_GAIN`` 只能在
+    「削顶」和「听不清」之间二选一。这里按 ~5ms 子块跟踪 RMS，做标准的
+    下压式压缩：超过 ``threshold_dbfs`` 的部分按 ``ratio`` 压回来，然后叠一个
+    静态补偿增益 ``makeup``（= target - threshold）把整体抬回目标电平。
+    ``threshold_dbfs`` 默认跟着 target 走（低 10dB），否则 target 旋钮在自己
+    的量程里有一大截是死的（threshold 写死时 target ≤ threshold 就 makeup=0）。
+
+    抬轻音靠的是 makeup 而不是「慢释放慢慢爬」——句尾辅音只有几十毫秒，
+    等释放爬上来早就过去了（第一版这么写，实测只压不抬）。
+
+    ``gate_dbfs`` 以下**冻结**增益而不是归零：既不在每个词头因为增益从 0 重新
+    爬升而把起音削软，也不会主动继续抬底噪（但冻结值本身仍会作用在底噪上）。
+    块间对增益线性插值以免台阶/咔哒。
+
+    每通电话新建一个实例：增益状态不该跨通继承。
+    """
+
+    BLOCK_MS = 5.0
+    # 增益后允许的块内峰值上限：留一点余量，让下游 apply_soft_limit 还有得救。
+    PEAK_CEILING = 0.99
+
+    def __init__(
+        self,
+        sample_rate: int,
+        *,
+        target_dbfs: float = -18.0,
+        threshold_dbfs: float | None = None,
+        ratio: float = 3.0,
+        attack_ms: float = 6.0,
+        # attack 必须快：放慢到 40ms 起，真机录音上峰值就顶到 32767。
+        release_ms: float = 120.0,
+        max_boost_db: float = 12.0,
+        gate_dbfs: float = -52.0,
+    ) -> None:
+        if sample_rate <= 0:
+            raise ValueError(f"PhoneAgc 采样率非法: {sample_rate}")
+        if ratio < 1.0:
+            raise ValueError(f"PhoneAgc ratio 必须 >=1，收到: {ratio}")
+        self.sample_rate = sample_rate
+        self.target_dbfs = float(target_dbfs)
+        self.threshold_dbfs = (
+            self.target_dbfs - 10.0 if threshold_dbfs is None else float(threshold_dbfs)
+        )
+        self.gate_dbfs = float(gate_dbfs)
+        self.makeup_db = min(
+            max(self.target_dbfs - self.threshold_dbfs, 0.0), float(max_boost_db)
+        )
+        self._block = max(1, int(round(sample_rate * self.BLOCK_MS / 1000.0)))
+        # 超阈部分压掉 (1 - 1/ratio)，ratio=3 即压掉 2/3。
+        self._slope = 1.0 - 1.0 / float(ratio)
+        block_ms = self._block * 1000.0 / float(sample_rate)
+        # 增益下行(信号变响)走 attack，上行(信号变轻)走 release：单极点平滑。
+        self._attack = float(np.exp(-block_ms / max(attack_ms, 0.1)))
+        self._release = float(np.exp(-block_ms / max(release_ms, 0.1)))
+        self._ramp = (np.arange(self._block, dtype=np.float64) + 1.0) / self._block
+        self._lock = threading.Lock()
+        # 从 makeup 起步而不是 0dB：稳态增益就是 makeup，从 0 起会让每通开场白
+        # 被 release 拖出约 500ms 的渐强（真机实测 0~100ms 段低 3.6dB）。
+        self._gain_db = self.makeup_db
+        self._last_gain = float(np.power(10.0, self.makeup_db / 20.0))
+
+    def process(self, pcm: bytes) -> bytes:
+        if not pcm:
+            return pcm
+        x = np.frombuffer(pcm, dtype="<i2").astype(np.float64) / 32768.0
+        if x.size == 0:
+            return pcm
+        block = self._block
+        blocks = -(-x.size // block)
+        pad = blocks * block - x.size
+        padded = np.concatenate([x, np.zeros(pad)]) if pad else x
+        framed = padded.reshape(blocks, block)
+        # 尾块的补零只是为了 reshape：算 RMS 时必须按真实样本数取平均，否则
+        # 电平被稀释→增益虚高，块长不整除时每个 chunk 边界都抖一下。
+        counts = np.full(blocks, block, dtype=np.float64)
+        counts[-1] -= pad
+        rms = np.sqrt(np.sum(np.square(framed), axis=1) / counts)
+        level_db = 20.0 * np.log10(np.maximum(rms, 1e-9))
+        # 每块增益天花板：本块峰值乘增益不得越过 PEAK_CEILING。
+        peaks = np.maximum(np.max(np.abs(framed), axis=1), 1e-9)
+        ceiling_db = 20.0 * np.log10(self.PEAK_CEILING / peaks)
+
+        with self._lock:
+            gain_db = np.empty(blocks, dtype=np.float64)
+            smoothed = self._gain_db
+            for i in range(blocks):
+                level = level_db[i]
+                if level < self.gate_dbfs:
+                    desired = smoothed  # 门限下冻结，见类注释
+                else:
+                    over = level - self.threshold_dbfs
+                    compress = -over * self._slope if over > 0.0 else 0.0
+                    desired = compress + self.makeup_db
+                coef = self._attack if desired < smoothed else self._release
+                smoothed = coef * smoothed + (1.0 - coef) * desired
+                gain_db[i] = smoothed
+            self._gain_db = smoothed
+
+            # 前瞻限幅：块内插值是从「上一块的增益」爬到「本块的增益」，所以
+            # 上一块也不能超过本块的天花板，否则响音起头的前几个样本会硬削。
+            # 硬削发生在 AGC 内部时，下游 apply_soft_limit 已经救不回来了。
+            np.minimum(gain_db, ceiling_db, out=gain_db)
+            for i in range(blocks - 1, 0, -1):
+                if gain_db[i - 1] > ceiling_db[i]:
+                    gain_db[i - 1] = ceiling_db[i]
+
+            linear = np.power(10.0, gain_db / 20.0)
+            prev = np.concatenate(
+                [[min(self._last_gain, float(np.power(10.0, ceiling_db[0] / 20.0)))],
+                 linear[:-1]]
+            )
+            ramp = (prev[:, None] + (linear - prev)[:, None] * self._ramp).reshape(-1)
+            # 记真正作用在最后一个「发出去的」样本上的增益：补零被截掉后，
+            # linear[-1] 是块末值而非实际用到的值，直接沿用会在下个 chunk 起头跳一下。
+            self._last_gain = float(ramp[x.size - 1])
+
+        y = (padded * ramp)[: x.size] * 32768.0
+        return np.clip(np.rint(y), -32768, 32767).astype("<i2").tobytes()
+
+
+# 下行 AGC 的进程内开关，由 configure_downlink_agc() 在启动时按配置写入；
+# 音频桥在构造时据此决定是否挂 PhoneAgc（不在此模块读 config，避免环依赖）。
+DOWNLINK_AGC_ENABLED = True
+DOWNLINK_AGC_TARGET_DBFS = -18.0
+
+
+def configure_downlink_agc(enabled: bool, target_dbfs: float) -> None:
+    """设置进程内下行 AGC 开关与目标电平；须在创建音频桥前调用。"""
+    global DOWNLINK_AGC_ENABLED, DOWNLINK_AGC_TARGET_DBFS
+    DOWNLINK_AGC_ENABLED = bool(enabled)
+    target = float(target_dbfs)
+    # NaN 不能靠下面的 min/max 拦住（与 NaN 的比较恒为 False，会一路穿过去），
+    # 而 NaN 增益会让整通下行变成数字静音。config.get_float 只挡 ValueError。
+    if not math.isfinite(target):
+        logger.warning("MODEM_AGC_TARGET_DBFS 非有限值(%r)，回落默认 -18.0", target_dbfs)
+        target = -18.0
+    # 目标电平钳在合理区间：太高必然常驻限幅，太低等于没开。
+    DOWNLINK_AGC_TARGET_DBFS = min(max(target, -40.0), -6.0)
+    logger.info(
+        "下行 AGC: %s (target=%.1f dBFS)",
+        "开启" if DOWNLINK_AGC_ENABLED else "关闭",
+        DOWNLINK_AGC_TARGET_DBFS,
+    )
+
+
+def make_downlink_agc(sample_rate: int | None = None) -> "PhoneAgc | None":
+    """按当前进程配置创建下行 AGC；关闭时返回 None。"""
+    if not DOWNLINK_AGC_ENABLED:
+        return None
+    rate = MODEM_RATE if sample_rate is None else sample_rate
+    return PhoneAgc(rate, target_dbfs=DOWNLINK_AGC_TARGET_DBFS)
+
+
+def apply_soft_limit(pcm: bytes, *, knee: float = 0.92) -> bytes:
+    """仅作尖峰保护；勿对整段语音常开——tanh 会压高频，听成隔板发闷。"""
+    if not pcm:
+        return pcm
+    x = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+    if x.size == 0:
+        return pcm
+    peak = float(np.max(np.abs(x)))
+    if peak <= 28000:
+        return pcm
+    xn = x / 32768.0
+    knee = min(max(knee, 0.5), 0.99)
+    y = knee * np.tanh(xn / knee)
+    return np.clip(np.rint(y * 32768.0), -32768, 32767).astype("<i2").tobytes()
 
 
 class ModemAudioBridge:
@@ -235,7 +551,7 @@ class ModemAudioBridge:
         self._input_stream.start()
         self._output_stream.start()
         self._downlink_resampler = None
-        logger.info("模组音频流已启动 (8kHz mono)")
+        logger.info("模组音频流已启动 (%dHz mono)", MODEM_RATE)
 
     def stop(self) -> None:
         for stream in (self._input_stream, self._output_stream):
@@ -278,7 +594,10 @@ class SerialPcmAudioBridge:
         baudrate: int = 921600,
         tx_gain: float = 1.0,
         *,
-        write_size: int = NMEA_WRITE_SIZE,
+        # 默认值不能直接写 NMEA_WRITE_SIZE：那是类定义时求值的，
+        # configure_modem_rate() 之后的新值传不进来（16k 下会按 8k 的字节数
+        # 喂 16k 流 → 永久欠载 → 电话侧断续）。None 表示「构造时再取」。
+        write_size: int | None = None,
         write_interval_seconds: float = NMEA_WRITE_INTERVAL_SECONDS,
         auto_realign: bool = False,
         startup_guard_seconds: float = 0.0,
@@ -286,7 +605,7 @@ class SerialPcmAudioBridge:
         self.port = port
         self.baudrate = baudrate
         self.tx_gain = tx_gain
-        self.write_size = write_size
+        self.write_size = NMEA_WRITE_SIZE if write_size is None else write_size
         self.write_interval_seconds = write_interval_seconds
         self.auto_realign = auto_realign
         self.startup_guard_seconds = startup_guard_seconds
@@ -302,9 +621,23 @@ class SerialPcmAudioBridge:
         self._queued_bytes = 0
         self._last_stats_at = 0.0
         self._write_timeouts = 0
+        self._stats_timeouts = 0
+        self._write_durations_ms: list[float] = []
         self._started_at = 0.0
         self._startup_noise_reported = False
         self._downlink_resampler: StreamingPcmDownsampler | None = None
+        # 每通一个 AGC 实例：增益状态不跨通继承（桥本身就是每通新建）。
+        self._downlink_agc = make_downlink_agc()
+        # preroll 默认关闭：Windows SimTech Audio COM 上曾与错误波特率叠出
+        # 「全程写超时→静音」；需要时再显式打开。
+        self._preroll_bytes = 0
+        self._tx_primed = True
+
+    def _write_timeout_seconds(self, *, is_pty: bool) -> float:
+        """PTY 用短超时；Windows 官方 Audio COM 首帧常需数百毫秒才收，
+        过短会整通写超时→电话静音（2026-08-10 真机：0.15s 全丢，1.0s 可闻）。
+        """
+        return 0.2 if is_pty else 1.0
 
     def _open_serial(self) -> serial.Serial:
         """打开 PCM 串口；目标是 PTY 时直接用 PTY 安全波特率，否则失败后降速重开。
@@ -319,18 +652,20 @@ class SerialPcmAudioBridge:
         惯例）仍留 ENOTTY 兜底，行为与之前一致。
         """
         baudrate = self.baudrate
-        if baudrate > PTY_SAFE_BAUDRATE and _is_pty(self.port):
+        is_pty = _is_pty(self.port)
+        if baudrate > PTY_SAFE_BAUDRATE and is_pty:
             logger.info(
                 "PCM 口 %s 是 PTY，按 PTY 安全波特率 %s 打开（配置值 %s 在 PTY 上无意义）",
                 self.port, PTY_SAFE_BAUDRATE, baudrate,
             )
             baudrate = PTY_SAFE_BAUDRATE
+        write_timeout = self._write_timeout_seconds(is_pty=is_pty)
         try:
             return serial.Serial(
                 port=self.port,
                 baudrate=baudrate,
                 timeout=0.02,
-                write_timeout=0.2,
+                write_timeout=write_timeout,
             )
         except OSError as exc:
             if exc.errno != errno.ENOTTY or baudrate <= PTY_SAFE_BAUDRATE:
@@ -344,14 +679,44 @@ class SerialPcmAudioBridge:
                 port=self.port,
                 baudrate=PTY_SAFE_BAUDRATE,
                 timeout=0.02,
-                write_timeout=0.2,
+                write_timeout=self._write_timeout_seconds(is_pty=True),
             )
 
-    def start(self) -> None:
+    def preclaim(self) -> None:
+        """先打开 PCM 口占住驱动接口，再发 AT+CPCMREG（对齐官方示例时序）。
+
+        不启动写线程：无通话时写会超时；只 claim，接通启用后再 ``start()``。
+        """
+        if self._ser is not None and self._ser.is_open:
+            return
         self._ser = self._open_serial()
         self._rx_carry = b""
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
+        logger.info("PCM 口已预占用: %s（待 CPCMREG 后再启流）", self.port)
+
+    def release_claim(self) -> None:
+        """释放 PCM 口（供 AT+CPCMREG=0,1 复位前调用）。
+
+        Windows SimTech Audio COM 在宿主仍占着句柄时发 stop=1，下一通首启
+        易被拒或实听卡顿（2026-08-11 17:48：跳过预复位后仍首拒，且复位时
+        COM6 未释放）。preclaim 阶段无写线程，这里只关串口。
+        """
+        if self._writer_thread is not None and self._writer_thread.is_alive():
+            self._running = False
+            self._writer_thread.join(timeout=2)
+            self._writer_thread = None
+        if self._ser is not None and self._ser.is_open:
+            self._ser.close()
+            logger.info("PCM 口已释放: %s（供 CPCMREG 端点复位）", self.port)
+        self._ser = None
+
+    def start(self) -> None:
+        if self._ser is None or not self._ser.is_open:
+            self._ser = self._open_serial()
+            self._rx_carry = b""
+            self._ser.reset_input_buffer()
+            self._ser.reset_output_buffer()
         self._running = True
         self._started_at = time.monotonic()
         self._startup_noise_reported = False
@@ -359,16 +724,21 @@ class SerialPcmAudioBridge:
         self._written_bytes = 0
         self._queued_bytes = 0
         self._write_timeouts = 0
+        self._stats_timeouts = 0
+        self._write_durations_ms = []
+        self._tx_primed = self._preroll_bytes <= 0
         self._last_stats_at = time.monotonic()
         self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
         self._writer_thread.start()
         logger.info(
             "NMEA PCM 音频流已启动: %s "
-            "(8kHz mono, tx_gain=%.2f, frame=%dB/%.0fms)",
+            "(%dHz mono, tx_gain=%.2f, frame=%dB/%.0fms, preroll=%dB)",
             self.port,
+            MODEM_RATE,
             self.tx_gain,
             self.write_size,
             self.write_interval_seconds * 1000,
+            self._preroll_bytes,
         )
 
     def stop(self) -> None:
@@ -483,32 +853,47 @@ class SerialPcmAudioBridge:
             payload = self._next_write_payload(silence)
             try:
                 if self._ser and self._ser.is_open:
+                    write_started = time.perf_counter()
                     self._ser.write(payload)
+                    self._write_durations_ms.append(
+                        (time.perf_counter() - write_started) * 1000.0
+                    )
                     self._written_bytes += len(payload)
                     self._write_timeouts = 0
                     self._log_write_stats()
             except serial.SerialTimeoutException:
                 # 单帧写超时（模组侧瞬时忙/流控）：丢弃本帧并继续，绝不终止音频线程。
-                # 否则写线程一旦退出，下行永远没声音，且 tx_buffer 排不空会永久屏蔽上行。
+                # 注意：不要「回队重试」——Windows COM 在错误波特率/驱动背压下会
+                # 连续超时，回队会把缓冲区撑满并整通静音（2026-08-10 184509）。
                 self._write_timeouts += 1
+                self._stats_timeouts += 1
                 if self._write_timeouts == 1 or self._write_timeouts % 50 == 0:
                     logger.warning(
-                        "写入 NMEA PCM 超时，丢弃本帧继续 (累计 %d 次)", self._write_timeouts
+                        "写入 NMEA PCM 超时，丢弃本帧继续 (累计 %d 次)",
+                        self._write_timeouts,
                     )
                 try:
                     if self._ser and self._ser.is_open:
                         self._ser.reset_output_buffer()
                 except Exception:
                     pass
+                self._log_write_stats()
             except serial.SerialException as exc:
                 logger.error("写入 NMEA PCM 失败: %s", exc)
                 self._running = False
                 break
 
             next_write_at += self.write_interval_seconds
+            # 单帧写阻塞后不要连发赶进度——突发静音交替在电话侧就是「断断续续」。
+            if next_write_at < time.monotonic() - self.write_interval_seconds:
+                next_write_at = time.monotonic()
 
     def _next_write_payload(self, silence: bytes) -> bytes:
         with self._tx_lock:
+            if not self._tx_primed:
+                if len(self._tx_buffer) < self._preroll_bytes:
+                    return silence
+                self._tx_primed = True
             if len(self._tx_buffer) >= self.write_size:
                 payload = bytes(self._tx_buffer[:self.write_size])
                 del self._tx_buffer[:self.write_size]
@@ -527,11 +912,26 @@ class SerialPcmAudioBridge:
             buffered = len(self._tx_buffer)
             queued = self._queued_bytes
             self._queued_bytes = 0
+        durations = self._write_durations_ms
+        self._write_durations_ms = []
+        timeouts = self._stats_timeouts
+        self._stats_timeouts = 0
+        if durations:
+            durations.sort()
+            p50 = durations[len(durations) // 2]
+            p95 = durations[min(len(durations) - 1, int(len(durations) * 0.95))]
+        else:
+            p50 = 0.0
+            p95 = 0.0
         logger.info(
-            "NMEA PCM 写入统计: written=%s bytes, agent_queued=%s bytes, buffered=%s bytes",
+            "NMEA PCM 写入统计: written=%s bytes, agent_queued=%s bytes, "
+            "buffered=%s bytes, write_ms_p50=%.2f, write_ms_p95=%.2f, timeouts=%d",
             self._written_bytes,
             queued,
             buffered,
+            p50,
+            p95,
+            timeouts,
         )
         self._written_bytes = 0
         self._last_stats_at = now
@@ -544,7 +944,14 @@ class SerialPcmAudioBridge:
         return _agent_chunk_to_modem(self, pcm_agent, agent_rate)
 
     def amplify_for_modem(self, pcm_8k: bytes) -> bytes:
-        return apply_pcm_gain(pcm_8k, self.tx_gain)
+        # 轻抬辅音区 → AGC 收动态 → 静态增益微调总响度 → 仅尖峰才软限。
+        # AGC 放在 clarity 之后：它要对最终送话的电平负责，包含清晰度处理
+        # 带来的电平变化；放在 tx_gain 之前，是为了让 MODEM_TX_GAIN 保持
+        # 「最终响度微调」的原有语义，而不是被 AGC 反向抵消掉。
+        pcm = apply_phone_clarity(pcm_8k)
+        if self._downlink_agc is not None:
+            pcm = self._downlink_agc.process(pcm)
+        return apply_soft_limit(apply_pcm_gain(pcm, self.tx_gain))
 
 
 class FfmpegAudioBridge:
@@ -890,19 +1297,26 @@ def create_audio_bridge(
             raise RuntimeError("NMEA PCM 模式需要配置 MODEM_PCM_PORT")
         return SerialPcmAudioBridge(pcm_port, pcm_baudrate, tx_gain=tx_gain)
     if selected == "simcom_pcm":
-        # SIMCom 的 PCM 也是 8k/mono/16bit 的裸流，只是走模组的 USB 音频接口
-        # （macOS 上由 ec20_usb_pty 桥成 PTY），传输层与 NMEA 模式同构。
+        # SIMCom 的 PCM 是 mono/16bit 裸流（8k 或 16k，见 MODEM_PCM_RATE），
+        # 走模组 USB 音频接口（macOS 上由 ec20_usb_pty 桥成 PTY）。
         if not pcm_port:
             raise RuntimeError(
                 "simcom_pcm 模式需要配置 MODEM_PCM_PORT（指向桥出的 PCM PTY，"
                 "如 scripts/ec20_usb_pty.py --map 4:/tmp/ec20-pcm）"
             )
+        # PTY：官方 20ms 帧；Windows 虚拟 COM：100ms 帧降 USB 事务（见常量注释）。
+        if _is_pty(pcm_port):
+            frame_size = SIMCOM_WRITE_SIZE
+            frame_interval = SIMCOM_WRITE_INTERVAL_SECONDS
+        else:
+            frame_size = SIMCOM_WIN_WRITE_SIZE
+            frame_interval = SIMCOM_WIN_WRITE_INTERVAL_SECONDS
         return SerialPcmAudioBridge(
             pcm_port,
             pcm_baudrate,
             tx_gain=tx_gain,
-            write_size=SIMCOM_WRITE_SIZE,
-            write_interval_seconds=SIMCOM_WRITE_INTERVAL_SECONDS,
+            write_size=frame_size,
+            write_interval_seconds=frame_interval,
             auto_realign=True,
             startup_guard_seconds=SIMCOM_STARTUP_GUARD_SECONDS,
         )

@@ -9,7 +9,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from agentcall import config
+from agentcall import audio_bridge, config
 from agentcall.call_agent import CallAgentService
 
 
@@ -68,6 +68,12 @@ def main() -> None:
         print("错误: 使用千问需设置 DASHSCOPE_API_KEY", file=sys.stderr)
         sys.exit(1)
 
+    pcm_rate = config.get_int("MODEM_PCM_RATE")
+    audio_bridge.configure_modem_rate(pcm_rate)
+    audio_bridge.configure_downlink_agc(
+        config.get_bool("MODEM_AGC"),
+        config.get_float("MODEM_AGC_TARGET_DBFS"),
+    )
     service = CallAgentService(
         modem_port=args.port,
         audio_keyword=args.audio_keyword,
@@ -76,6 +82,7 @@ def main() -> None:
         audio_mode=args.audio_mode,
         pcm_port=args.pcm_port,
         pcm_baudrate=args.pcm_baud,
+        pcm_rate=pcm_rate,
         tx_gain=args.tx_gain,
     )
     service.run()

@@ -29,6 +29,9 @@ from .pcm_stats import PcmFlowStats
 
 logger = logging.getLogger(__name__)
 
+# 注意：这是**导入时**的快照，configure_modem_rate() 改不到它；livekit_media
+# 还按它算了帧字节数等模块级常量。因此远程手机接管这条链目前只支持 8k——
+# 将来做 16k 自适应（#119）必须先把这两处改成运行时取值，否则会静默半速。
 REMOTE_AUDIO_RATE = MODEM_RATE
 REMOTE_CALL_SOURCE = "remote_web_dialer"
 REMOTE_CONTROL_TOPIC = "callpilot.control"

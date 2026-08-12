@@ -17,7 +17,7 @@ import webbrowser
 from aiohttp import web
 from dotenv import load_dotenv
 
-from agentcall import config, number_profiles
+from agentcall import audio_bridge, config, number_profiles
 from agentcall.call_agent import CallAgentService
 from agentcall.cloud_control import CloudControlApi, CloudEdgeClient
 from agentcall.cloud_credentials import CloudCredentialStore
@@ -200,6 +200,12 @@ def main() -> None:
     store_path = data_dir / "messages.json"
     hub = EventHub(loop, store_path=store_path)
 
+    pcm_rate = config.get_int("MODEM_PCM_RATE")
+    audio_bridge.configure_modem_rate(pcm_rate)
+    audio_bridge.configure_downlink_agc(
+        config.get_bool("MODEM_AGC"),
+        config.get_float("MODEM_AGC_TARGET_DBFS"),
+    )
     service = CallAgentService(
         modem_port=modem_port,
         audio_keyword=config.get_str("MODEM_AUDIO_KEYWORD"),
@@ -208,6 +214,7 @@ def main() -> None:
         audio_mode=config.get_str("MODEM_AUDIO_MODE"),
         pcm_port=config.get_str("MODEM_PCM_PORT") or None,
         pcm_baudrate=config.get_int("MODEM_PCM_BAUD"),
+        pcm_rate=pcm_rate,
         tx_gain=config.get_float("MODEM_TX_GAIN"),
         hub=hub,
     )

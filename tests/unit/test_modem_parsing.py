@@ -745,6 +745,8 @@ def _recording_modem(monkeypatch, responses=None):
     responses = responses or {}
     calls: list[str] = []
     modem = make_modem()
+    # hangup 后 simcom 沉降不应拖慢单测。
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
 
     def fake_send(cmd: str) -> str:
         calls.append(cmd)
@@ -805,15 +807,16 @@ def test_simcom_dial_enables_usb_audio_immediately_after_atd(monkeypatch):
     response = modem.dial("10000")
 
     assert response == "OK"
-    assert calls[:6] == [
+    assert calls[:7] == [
         "AT+CLCC",
         "AT+CHUP",
         "AT+CPCMREG=0,1",
         "AT+CLCC",
         "AT+CPCMBANDWIDTH=1,1",
+        "AT+CPCMBANDWIDTH?",
         "ATD10000;",
     ]
-    assert calls[6:8] == ["AT+CPCMREG=1", "AT+CPCMREG?"]
+    assert calls[7:9] == ["AT+CPCMREG=1", "AT+CPCMREG?"]
     assert modem.voice_pcm_active is True
     assert not modem.is_call_connected()
 
@@ -840,12 +843,13 @@ def test_simcom_dial_early_enable_failure_falls_back_after_connect(monkeypatch):
     monkeypatch.setattr(modem, "_send", fake_send)
 
     assert modem.dial("10000") == "OK"
-    assert calls[0:6] == [
+    assert calls[0:7] == [
         "AT+CLCC",
         "AT+CHUP",
         "AT+CPCMREG=0,1",
         "AT+CLCC",
         "AT+CPCMBANDWIDTH=1,1",
+        "AT+CPCMBANDWIDTH?",
         "ATD10000;",
     ]
     assert calls.count("AT+CPCMREG=1") > 1
@@ -975,29 +979,344 @@ def test_initialize_for_voice_rejects_unknown_mode(monkeypatch):
 
 
 def test_simcom_pcm_retries_while_in_call(monkeypatch):
-    """接通后 CPCMREG 可能要几百毫秒才受理，前几次 ERROR 不应放弃。"""
+    """接通后允许短暂 pending（=1 已 OK、读回未齐）；=1 曾被拒则拒启桥。"""
     monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
     calls: list[str] = []
     modem = make_modem()
     modem._call_connected_event.set()          # 模拟通话中
+    modem._pcm_endpoint_clean = True
+    queries = {"n": 0}
 
     def fake_send(cmd: str) -> str:
         calls.append(cmd)
-        # 前两次 ERROR，第三次才 OK
-        if cmd == "AT+CPCMREG=1":
-            return "OK" if calls.count("AT+CPCMREG=1") >= 3 else "ERROR"
+        if cmd == "AT+CPCMREG?":
+            queries["n"] += 1
+            return f"+CPCMREG: {1 if queries['n'] >= 3 else 0}\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+    assert modem.voice_pcm_active is True
+    assert "AT+CPCMBANDWIDTH=1,1" in calls
+    assert "AT+CPCMREG=0,1" not in calls
+
+
+def test_simcom_pcm_skips_proactive_reset_when_endpoint_already_clean(monkeypatch):
+    """挂断已干净关闭端点时，来电启用不得再无条件 =0,1。"""
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    calls: list[str] = []
+    modem = make_modem()
+    modem._call_connected_event.set()
+    modem._pcm_endpoint_clean = True
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
         if cmd == "AT+CPCMREG?":
             return "+CPCMREG: 1\r\nOK"
         return "OK"
 
     monkeypatch.setattr(modem, "_send", fake_send)
     modem.initialize_for_voice("simcom_pcm")
-    assert calls.count("AT+CPCMREG=1") == 3
+    assert "AT+CPCMREG=0,1" not in calls
+    assert calls.count("AT+CPCMREG=1") == 1
+
+
+def test_simcom_pcm_proactive_reset_only_when_endpoint_dirty(monkeypatch):
+    """端点未干净时启用前才预复位，并沉降后再 =1。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        modem_time_sleep_target(), "sleep", lambda s: sleeps.append(s)
+    )
+    calls: list[str] = []
+    modem = make_modem()
+    modem._call_connected_event.set()
+    modem._pcm_endpoint_clean = False
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+    assert "AT+CPCMREG=0,1" in calls
+    assert calls.index("AT+CPCMREG=0,1") < calls.index("AT+CPCMREG=1")
+    assert any(
+        abs(s - modem._SIMCOM_PREDIAL_SETTLE_DELAY) < 1e-9 for s in sleeps
+    ), sleeps
+
+
+def test_simcom_pcm_dirty_reset_settle_does_not_consume_retry_budget(monkeypatch):
+    """脏端点上的慢预复位不得吃掉 12s 窗口；预复位后首次 =1 仍可成功。"""
+    clock = {"now": 0.0}
+    monkeypatch.setattr(modem_time_sleep_target(), "monotonic", lambda: clock["now"])
+
+    def fake_sleep(delay: float) -> None:
+        clock["now"] += delay
+
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", fake_sleep)
+    calls: list[str] = []
+    modem = make_modem()
+    modem._call_connected_event.set()
+    modem._pcm_endpoint_clean = False
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG=0,1":
+            clock["now"] += 11.0
+            return "OK"
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
     assert modem.voice_pcm_active is True
-    # 8k 采样率应显式钉住，不赖模组默认（默认 VoLTE 走 16K）。
-    # 原先这里断言的是 AT+CPCMFRM=0——手册 5.2.43 明确该命令只支持 8k→16k
-    # 单向切换，拿它降回 8k 无效；真正的开关是 CPCMBANDWIDTH（5.2.46）。
-    assert "AT+CPCMBANDWIDTH=1,1" in calls
+    assert calls.count("AT+CPCMREG=1") == 1
+    assert clock["now"] >= 11.0
+
+
+def test_simcom_pcm_reject_uses_hooked_at_reset_not_host_reclaim_only(monkeypatch):
+    """clean 首拒：带钩子 =0,1 后进 mode=1 就启桥——拒接只是把卡顿换成报错。"""
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    calls: list[str] = []
+    hooks: list[str] = []
+    modem = make_modem()
+    modem._call_connected_event.set()
+    modem._pcm_endpoint_clean = True
+    modem.set_pcm_endpoint_reset_hooks(
+        before=lambda: hooks.append("before"),
+        after=lambda: hooks.append("after"),
+    )
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG=1":
+            return "OK" if calls.count("AT+CPCMREG=1") >= 2 else "ERROR"
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+
+    reg = [c for c in calls if c.startswith("AT+CPCMREG")]
+    assert reg[:4] == [
+        "AT+CPCMREG=1",
+        "AT+CPCMREG=0,1",
+        "AT+CPCMREG=1",
+        "AT+CPCMREG?",
+    ]
+    assert hooks == ["before", "after"]
+    assert modem.voice_pcm_active is True
+
+
+def test_simcom_pcm_keeps_retrying_after_reset_reject(monkeypatch):
+    """预复位后仍被拒也要重试到窗口耗尽：早退等于把可用通道判死。"""
+    clock = {"now": 0.0}
+    monkeypatch.setattr(modem_time_sleep_target(), "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        modem_time_sleep_target(),
+        "sleep",
+        lambda delay: clock.__setitem__("now", clock["now"] + delay),
+    )
+    modem = make_modem()
+    modem._call_connected_event.set()
+    modem._pcm_endpoint_clean = False
+    calls: list[str] = []
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG=1":
+            return "ERROR"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    with pytest.raises(RuntimeError, match="仍未确认 mode=1"):
+        modem.initialize_for_voice("simcom_pcm")
+    assert modem.voice_pcm_active is False
+    assert calls.count("AT+CPCMREG=1") > 1
+
+
+def test_simcom_pcm_dirty_reset_invokes_host_hooks(monkeypatch):
+    """dirty 启用前预复位也必须走宿主钩子（先释放 COM）。"""
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    hooks: list[str] = []
+    calls: list[str] = []
+    modem = make_modem()
+    modem._call_connected_event.set()
+    modem._pcm_endpoint_clean = False
+    modem.set_pcm_endpoint_reset_hooks(
+        before=lambda: hooks.append("before"),
+        after=lambda: hooks.append("after"),
+    )
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert hooks == ["before", "after"]
+    assert calls.index("AT+CPCMREG=0,1") < calls.index("AT+CPCMREG=1")
+
+
+def test_simcom_pcm_never_resets_while_registration_is_pending(monkeypatch):
+    """=1 已 OK、只是读回未就绪时，绝不能发 =0,1。"""
+    clock = {"now": 0.0}
+    queries = {"count": 0}
+    monkeypatch.setattr(modem_time_sleep_target(), "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        modem_time_sleep_target(),
+        "sleep",
+        lambda delay: clock.__setitem__("now", clock["now"] + delay),
+    )
+    calls: list[str] = []
+    modem = make_modem()
+    modem._call_connected_event.set()
+    modem._pcm_endpoint_clean = True
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG?":
+            queries["count"] += 1
+            return f"+CPCMREG: {1 if queries['count'] >= 3 else 0}\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert modem.voice_pcm_active is True
+    assert "AT+CPCMREG=0,1" not in calls
+    assert calls.count("AT+CPCMREG=1") == 3
+
+
+def test_simcom_pcm_stops_retrying_when_call_drops_mid_enable(monkeypatch):
+    """通话中途挂断必须立刻停 CPCMREG，不能拖到 12s 超时再抛失败。
+
+    真机 2026-08-11 17:03：CLCC 已判通话丢失后仍重试到第 4 次，随后 AT 口
+    Write timeout。启用循环必须每轮检查 connected。
+    """
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    calls: list[str] = []
+    modem = make_modem()
+    modem._call_connected_event.set()
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG=1":
+            # 第一次失败后模拟对方挂断
+            if calls.count("AT+CPCMREG=1") >= 1:
+                modem._call_connected_event.clear()
+            return "ERROR"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")  # 不抛
+
+    assert modem.voice_pcm_active is False
+    assert calls.count("AT+CPCMREG=1") == 1  # 挂断后不再打第 2 次
+
+
+def test_simcom_hangup_is_idempotent(monkeypatch):
+    """连续两次 hangup 只应真正拆线一次。"""
+    modem, calls = _recording_modem(monkeypatch)
+    modem._audio_mode = "simcom_pcm"
+    modem._call_connected_event.set()
+    modem._voice_pcm_active = True
+    modem._connected_call_ids = {"1"}
+    modem._call_hangup_done = False
+    modem._hangup_complete = False
+    calls.clear()
+
+    modem.hangup()
+    first = list(calls)
+    modem.hangup()
+
+    assert first.count("AT+CHUP") == 1
+    assert first.count("AT+CPCMREG=0,1") == 1
+    assert calls == first  # 第二次零 AT
+    assert modem._hangup_complete is True
+
+
+def test_simcom_hangup_can_defer_pcm_release(monkeypatch):
+    """CLCC 丢线路径：先只 CHUP，等宿主关 PCM 口后再 CPCMREG=0,1。"""
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    modem, calls = _recording_modem(
+        monkeypatch,
+        {"AT+CPCMREG?": "+CPCMREG: 0\r\nOK"},
+    )
+    modem._audio_mode = "simcom_pcm"
+    modem._call_connected_event.set()
+    modem._voice_pcm_active = True
+    modem._call_hangup_done = False
+    modem._hangup_complete = False
+    calls.clear()
+
+    modem.hangup(release_pcm=False)
+    assert "AT+CHUP" in calls
+    assert "AT+CPCMREG=0,1" not in calls
+    assert modem._call_hangup_done is True
+    assert modem._hangup_complete is False
+    assert modem.voice_pcm_active is True  # 宿主尚未 release
+
+    modem.hangup(release_pcm=True)
+    assert calls.count("AT+CHUP") == 1
+    assert "AT+CPCMREG=0,1" in calls
+    assert "AT+CPCMREG?" in calls
+    assert modem._hangup_complete is True
+    assert modem.voice_pcm_active is False
+    # 即使读回 mode=0 也标脏，下一通强制带钩子预复位。
+    assert modem._pcm_endpoint_clean is False
+
+
+def test_simcom_hangup_marks_dirty_even_when_stop_readback_zero(monkeypatch):
+    """挂断读回 mode=0 仍标脏：下一通必须预复位，禁止跳过。"""
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    modem, _ = _recording_modem(
+        monkeypatch,
+        {"AT+CPCMREG?": "+CPCMREG: 0\r\nOK"},
+    )
+    modem._audio_mode = "simcom_pcm"
+    modem._call_hangup_done = False
+    modem._hangup_complete = False
+
+    modem.hangup()
+
+    assert modem._pcm_endpoint_clean is False
+
+
+def test_simcom_hangup_marks_dirty_when_stop_readback_not_zero(monkeypatch):
+    """关通道 OK 但读回仍非 mode=0 → 下一通必须预复位。"""
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    modem, _ = _recording_modem(
+        monkeypatch,
+        {"AT+CPCMREG?": "+CPCMREG: 1\r\nOK"},
+    )
+    modem._audio_mode = "simcom_pcm"
+    modem._call_hangup_done = False
+    modem._hangup_complete = False
+
+    modem.hangup()
+
+    assert modem._pcm_endpoint_clean is False
+
+
+def test_simcom_pcm_does_not_reset_endpoint_when_no_call(monkeypatch):
+    """无通话路径只试一次，不该多发复位——那会拖慢每次服务启动。"""
+    calls: list[str] = []
+    modem = make_modem()
+    assert not modem._call_connected_event.is_set()
+    monkeypatch.setattr(modem, "_send", lambda cmd: (calls.append(cmd), "ERROR")[1])
+
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert calls.count("AT+CPCMREG=1") == 1
+    assert "AT+CPCMREG=0,1" not in calls
 
 
 def test_simcom_pcm_retries_until_readback_confirms_mode_one(monkeypatch):
@@ -1089,6 +1408,7 @@ def test_simcom_pcm_retry_window_covers_slow_modems(monkeypatch):
     """真机成功点散布在接通后 1.3s / 4.9s / 8.0s，窗口必须覆盖到最慢那种。
 
     回归锁：窗口曾是 5×0.5s=2.5s，导致慢启动的通话整通无声（2026-08-01）。
+    慢但可信的路径是 =1 已受理、读回异步变 1（不得用 ERROR 空转）。
     """
     clock = {"now": 0.0}
     monkeypatch.setattr(modem_time_sleep_target(), "monotonic", lambda: clock["now"])
@@ -1098,21 +1418,21 @@ def test_simcom_pcm_retry_window_covers_slow_modems(monkeypatch):
     )
     modem = make_modem()
     modem._call_connected_event.set()
+    modem._pcm_endpoint_clean = True
 
     def fake_send(cmd: str) -> str:
         if cmd == "AT+CPCMREG?":
-            return "+CPCMREG: 1\r\nOK"
-        if cmd != "AT+CPCMREG=1":
-            return "OK"
-        return "OK" if clock["now"] >= 8.0 else "ERROR"   # 8s 才受理
+            return f"+CPCMREG: {1 if clock['now'] >= 8.0 else 0}\r\nOK"
+        return "OK"
 
     monkeypatch.setattr(modem, "_send", fake_send)
     modem.initialize_for_voice("simcom_pcm")
     assert modem.voice_pcm_active is True
+    assert clock["now"] >= 8.0
 
 
 def test_simcom_pcm_gives_up_after_window(monkeypatch):
-    """超出窗口仍不受理就抛，不能无限等着占住通话。"""
+    """读回长期不成 mode=1（accepted 挂起）时必须吃满窗口再抛，不能无限占线。"""
     clock = {"now": 0.0}
     monkeypatch.setattr(modem_time_sleep_target(), "monotonic", lambda: clock["now"])
     monkeypatch.setattr(
@@ -1121,8 +1441,13 @@ def test_simcom_pcm_gives_up_after_window(monkeypatch):
     )
     modem = make_modem()
     modem._call_connected_event.set()
-    monkeypatch.setattr(modem, "_send", lambda cmd: "ERROR")
-    with pytest.raises(RuntimeError):
+    modem._pcm_endpoint_clean = True
+    monkeypatch.setattr(
+        modem,
+        "_send",
+        lambda cmd: "+CPCMREG: 0\r\nOK" if cmd == "AT+CPCMREG?" else "OK",
+    )
+    with pytest.raises(RuntimeError, match="仍未确认 mode=1"):
         modem.initialize_for_voice("simcom_pcm")
     assert clock["now"] >= modem._SIMCOM_PCM_ENABLE_TIMEOUT - 1
 
@@ -1141,11 +1466,9 @@ def test_simcom_pcm_no_call_tries_once_only(monkeypatch):
 
 
 def test_simcom_pcm_forces_8k_sampling(monkeypatch):
-    """真机 2026-08-04：不设 CPCMBANDWIDTH 时，电信 VoLTE 通话的接收流是 16K，
-    被按 8k 解就是"宽带噪声"（上游据此误判 transmit-only）。设 1,1 后
-    interface 4 稳定 15999 B/s、基频 216Hz，确凿人声。
+    """默认 pcm_rate=8000 时钉 AT+CPCMBANDWIDTH=1,1（双 8k）。
 
-    顺带锁死：AT+CPCMFRM 不能用来降回 8k（手册明确只支持 8k→16k 单向）。
+    历史：不设时 VoLTE 出厂偏 16K，按 8k 解会成宽带噪声（HANDOVER §3.1）。
     """
     monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
     modem = make_modem()
@@ -1162,8 +1485,54 @@ def test_simcom_pcm_forces_8k_sampling(monkeypatch):
     modem.initialize_for_voice("simcom_pcm")
 
     assert "AT+CPCMBANDWIDTH=1,1" in calls
+    assert "AT+CPCMBANDWIDTH?" in calls
     assert calls.index("AT+CPCMBANDWIDTH=1,1") < calls.index("AT+CPCMREG=1")
+    assert calls.index("AT+CPCMBANDWIDTH=1,1") < calls.index("AT+CPCMBANDWIDTH?")
     assert not any(c.startswith("AT+CPCMFRM") for c in calls)
+
+
+def test_simcom_pcm_forces_16k_sampling_when_configured(monkeypatch):
+    """MODEM_PCM_RATE=16000 时钉 AT+CPCMBANDWIDTH=0,0（双 16k）。"""
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    modem = Eg25Modem(port="/dev/null-not-used", pcm_rate=16000)
+    modem._call_connected_event.set()
+    calls: list[str] = []
+
+    def fake_send(cmd: str) -> str:
+        calls.append(cmd)
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        if cmd == "AT+CPCMBANDWIDTH?":
+            return "+CPCMBANDWIDTH: 0,0\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    modem.initialize_for_voice("simcom_pcm")
+
+    assert "AT+CPCMBANDWIDTH=0,0" in calls
+    assert "AT+CPCMBANDWIDTH=1,1" not in calls
+    assert calls.index("AT+CPCMBANDWIDTH=0,0") < calls.index("AT+CPCMREG=1")
+
+
+def test_simcom_pcm_bandwidth_readback_logged(monkeypatch, caplog):
+    """通话中设置后读回 1,1，确认 VoLTE/非 VoLTE 都钉在 8k。"""
+    import logging
+
+    monkeypatch.setattr(modem_time_sleep_target(), "sleep", lambda s: None)
+    modem = make_modem()
+    modem._call_connected_event.set()
+
+    def fake_send(cmd: str) -> str:
+        if cmd == "AT+CPCMBANDWIDTH?":
+            return "+CPCMBANDWIDTH: 1,1\r\nOK"
+        if cmd == "AT+CPCMREG?":
+            return "+CPCMREG: 1\r\nOK"
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    with caplog.at_level(logging.INFO, logger="agentcall.modem"):
+        modem.initialize_for_voice("simcom_pcm")
+    assert any("PCM 带宽已确认 8kHz" in r.message for r in caplog.records)
 
 
 def test_bandwidth_failure_does_not_block_pcm(monkeypatch):
@@ -1182,3 +1551,63 @@ def test_bandwidth_failure_does_not_block_pcm(monkeypatch):
     monkeypatch.setattr(modem, "_send", fake_send)
     modem.initialize_for_voice("simcom_pcm")     # 不抛
     assert modem.voice_pcm_active is True
+
+
+# ---- AT+CRESET 后的重新枚举判定 ----
+
+
+def _fake_online_sequence(monkeypatch, modem, states):
+    """按序返回 is_online；序列耗尽后恒为在线。"""
+    seen = iter(states)
+    monkeypatch.setattr(
+        type(modem), "is_online", property(lambda self: next(seen, True))
+    )
+
+
+def test_wait_for_reenumeration_fails_when_usb_never_dropped(monkeypatch):
+    """没见掉线说明 AT+CRESET 没生效，不能报成功让上层放行下一通。"""
+    modem = make_modem()
+    _fake_online_sequence(monkeypatch, modem, [])       # 恒在线
+
+    assert (
+        modem.wait_for_reenumeration(offline_timeout=0.3, online_timeout=0.3) is False
+    )
+
+
+def test_wait_for_reenumeration_fails_when_port_is_back_but_at_is_mute(monkeypatch):
+    """串口能打开 ≠ 模组能应答：_open_serial 的探测 AT 超时只返回空串、不抛异常。"""
+    modem = make_modem()
+    _fake_online_sequence(monkeypatch, modem, [True, False])
+    monkeypatch.setattr(modem, "_at_responds", lambda: False)
+
+    assert (
+        modem.wait_for_reenumeration(
+            offline_timeout=0.5, online_timeout=0.6, settle_seconds=0.1
+        )
+        is False
+    )
+
+
+def test_wait_for_reenumeration_succeeds_after_a_stable_at_reply(monkeypatch):
+    modem = make_modem()
+    _fake_online_sequence(monkeypatch, modem, [True, False])
+    monkeypatch.setattr(modem, "_at_responds", lambda: True)
+
+    assert (
+        modem.wait_for_reenumeration(
+            offline_timeout=0.5, online_timeout=2.0, settle_seconds=0.1
+        )
+        is True
+    )
+
+
+def test_at_probe_treats_a_dead_port_as_no_reply(monkeypatch):
+    """重连线程可能正握着串口；探测失败只代表还没好，不能炸掉收尾。"""
+    modem = make_modem()
+
+    def raise_not_connected(cmd: str) -> str:
+        raise RuntimeError("模组未连接")
+
+    monkeypatch.setattr(modem, "_write_command", raise_not_connected)
+
+    assert modem._at_responds() is False

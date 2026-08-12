@@ -328,12 +328,97 @@ def test_deferred_hangup_ignores_stale_generation(monkeypatch):
     monkeypatch.setattr(session, "_run", lambda: None)  # 只做状态切换，不跑真实会话
 
     session.start()
+    assert wait_until(lambda: not session.is_lifecycle_busy), "第一通线程未收尾"
     stale = session._session_generation
     session._active = False  # 本通结束
     session.start()  # 新会话开始，世代号推进
 
     session._deferred_hangup(stale)  # 旧 Timer 回调此刻才执行
     assert session.is_active, "过期的延迟挂断回调不得停掉新会话"
+
+
+def _recovery_session(monkeypatch, hub: EventHub | None = None) -> CallAgentService:
+    """挂断后恢复路径的最小夹具：simcom_pcm + 开启挂断后重启。"""
+    monkeypatch.setenv("MODEM_RESET_AFTER_HANGUP", "true")
+    session = make_service(FakeModem(), hub=hub).session
+    session.audio_mode = "simcom_pcm"
+    return session
+
+
+def test_hangup_recovery_resets_modem_and_waits_for_reenumeration(monkeypatch):
+    """真机 2026-08-12：只有模组自身重启能复位 USB Audio，宿主软拔插不行。"""
+    session = _recovery_session(monkeypatch)
+    session._modem_reset_after_hangup_done = False
+
+    session._recover_audio_endpoint_after_hangup()
+
+    names = [name for name, _ in session.modem.calls]
+    assert names == ["reset_module", "wait_for_reenumeration"]
+
+
+def test_hangup_recovery_runs_once_per_session(monkeypatch):
+    """收尾路径可能被走两次，模组不能被重启两回。"""
+    session = _recovery_session(monkeypatch)
+    session._modem_reset_after_hangup_done = False
+
+    session._recover_audio_endpoint_after_hangup()
+    session._recover_audio_endpoint_after_hangup()
+
+    assert [name for name, _ in session.modem.calls].count("reset_module") == 1
+
+
+def test_hangup_recovery_falls_back_to_soft_cycle_when_reset_rejected(monkeypatch):
+    """AT+CRESET 没被接受时不能静默放弃，仍要试旧的软拔插。"""
+    monkeypatch.setenv("MODEM_USB_SOFT_CYCLE_AFTER_HANGUP", "false")
+    session = _recovery_session(monkeypatch)
+    session._modem_reset_after_hangup_done = False
+    session._usb_soft_cycled = False
+    session.modem.reset_should_succeed = False
+    attempted: list[bool] = []
+    monkeypatch.setattr(
+        session,
+        "_maybe_usb_soft_cycle_after_hangup",
+        lambda: attempted.append(True),
+    )
+
+    session._recover_audio_endpoint_after_hangup()
+
+    assert attempted == [True]
+
+
+def test_hangup_recovery_is_skipped_when_disabled(monkeypatch):
+    session = _recovery_session(monkeypatch)
+    monkeypatch.setenv("MODEM_RESET_AFTER_HANGUP", "false")
+    session._modem_reset_after_hangup_done = False
+
+    session._recover_audio_endpoint_after_hangup()
+
+    assert "reset_module" not in [name for name, _ in session.modem.calls]
+
+
+def test_lifecycle_busy_blocks_new_call_until_shutdown_finishes(monkeypatch):
+    """stop() 会立刻清 is_active，但 USB 软拔插收尾期间不得接下一通。"""
+    session = make_service(FakeModem()).session
+    release = threading.Event()
+
+    def blocked_run() -> None:
+        release.wait(timeout=2.0)
+
+    monkeypatch.setattr(session, "_run", blocked_run)
+    session.start()
+    assert session.is_lifecycle_busy
+    session._set_active(False)  # 模拟 NO CARRIER → stop() 提前清 active
+    assert not session.is_active
+    assert session.is_lifecycle_busy
+
+    session.start(outbound_number="10010")  # 必须被挡住
+    assert session._session_generation == 1
+
+    release.set()
+    assert wait_until(lambda: not session.is_lifecycle_busy)
+    session.start(outbound_number="10010")
+    assert session._session_generation == 2
+    assert wait_until(lambda: not session.is_lifecycle_busy)
 
 
 def test_scheduled_hangup_stops_current_session(monkeypatch):
@@ -425,7 +510,7 @@ def test_repeat_suppression_stuck_requests_winddown(monkeypatch, tmp_path):
     assert wait_until(lambda: any("再见" in s for s in agent.said), timeout=5), agent.said
     assert service.session._thread is not None
     service.session._thread.join(timeout=5)
-    assert ("hangup", ()) in modem.calls
+    assert ("hangup", (True,)) in modem.calls
 
 
 # ---- P1-4 通话摘要：后台线程 + summary.json + hub 推送 ----
@@ -1628,7 +1713,7 @@ def test_outbound_auto_winddown_hangs_up(monkeypatch):
     assert wait_until(lambda: any("再见" in s for s in agent.said), timeout=6), agent.said
     assert service.session._thread is not None
     service.session._thread.join(timeout=6)
-    assert ("hangup", ()) in modem.calls
+    assert ("hangup", (True,)) in modem.calls
 
 
 def test_inbound_hard_deadline_finalizes_when_all_hangup_signals_are_lost(

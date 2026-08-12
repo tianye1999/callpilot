@@ -17,6 +17,8 @@ class FakeModem:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple]] = []
         self.sms_should_succeed = True
+        self.reset_should_succeed = True
+        self.reenumeration_should_succeed = True
         self.connected_flag = threading.Event()
         self._on_ring: Callable[[str | None], None] | None = None
         self._on_hangup: Callable[[], None] | None = None
@@ -46,14 +48,21 @@ class FakeModem:
         self.calls.append(("dial", (number,)))
         return "OK"
 
-    def hangup(self) -> None:
-        self.calls.append(("hangup", ()))
+    def hangup(self, *, release_pcm: bool = True) -> None:
+        self.calls.append(("hangup", (release_pcm,)))
         self.connected_flag.clear()
+
+    def set_pcm_endpoint_reset_hooks(self, before=None, after=None) -> None:
+        self.calls.append(("set_pcm_endpoint_reset_hooks", (before is not None, after is not None)))
 
     def reset_module(self) -> bool:
         self.calls.append(("reset_module", ()))
         self.connected_flag.clear()
-        return True
+        return self.reset_should_succeed
+
+    def wait_for_reenumeration(self, **kwargs) -> bool:
+        self.calls.append(("wait_for_reenumeration", ()))
+        return self.reenumeration_should_succeed
 
     def close(self) -> None:
         self.calls.append(("close", ()))

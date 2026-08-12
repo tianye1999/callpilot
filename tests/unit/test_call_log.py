@@ -199,6 +199,44 @@ def test_turn_taking_metrics_are_persisted_in_trace_summary(tmp_path):
     assert summary["output_deferred_ms"] == 850
 
 
+def _answered_bridge_ready_call(clog):
+    """接通、桥就绪、模型已连，但一路没有对方 PCM —— 即 no_caller_audio。"""
+    record = clog.begin_call("inbound", "10086")
+    record.log_event("answered")
+    for event in (
+        {"stage": "bridge", "event": "ready", "status": "ok"},
+        {"stage": "transport", "event": "connected", "status": "ok"},
+    ):
+        record.log_event("agent_trace", provider="qwen", **event)
+    return record
+
+
+def test_call_without_caller_audio_is_persisted_as_failed(tmp_path):
+    """接通却整通没有对方 PCM，历史里不能显示成 completed（用户只会看到没声音又不报错）。"""
+    clog = CallLogger(tmp_path)
+    record = _answered_bridge_ready_call(clog)
+
+    assert record.finish("completed") == "no_caller_audio"
+
+    persisted = clog.list_calls()[0]
+    assert persisted["status"] == "failed"
+    assert persisted["trace_summary"]["diagnosis"] == "no_caller_audio"
+
+
+def test_finish_uses_the_real_hangup_time_not_the_persist_time(tmp_path):
+    """落盘发生在挂断收尾（模组重启 15-20s）之后，那段等待不能算进通话时长。"""
+    clog = CallLogger(tmp_path)
+    record = clog.begin_call("inbound", "10086")
+    record.log_event("answered")
+    hung_up_at = record.started_at + 44.0
+
+    record.finish("completed", ended_at=hung_up_at)
+
+    persisted = clog.list_calls()[0]
+    assert persisted["duration"] == pytest.approx(44.0, abs=0.01)
+    assert persisted["ended_at"] == pytest.approx(hung_up_at, abs=0.01)
+
+
 # ---- 合成对话录音 mixed.wav（立体声 左=AI / 右=对方，按时间轴对齐）----
 
 
