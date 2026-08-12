@@ -195,6 +195,8 @@ class CallSession:
         # 避免它 stop() 误伤下一通会话。
         self._hangup_timer: threading.Timer | None = None
         self._session_generation = 0
+        # 真正的挂断时刻；收尾恢复期间落盘要用它，而不是落盘那一刻。
+        self._call_ended_at: float | None = None
         self._hangup_lock = threading.Lock()
         # 外呼收尾裁判（LLM 判断对话该继续还是收尾，替代关键词枚举）：
         # 请求收尾标志 + 理由 + 在途裁判 task（每通重置）。
@@ -465,6 +467,7 @@ class CallSession:
         active_bridge: AudioBridge | None = None
         self._usb_soft_cycled = False
         self._modem_reset_after_hangup_done = False
+        self._call_ended_at = None
         try:
             if self._outbound_number:
                 if not await self._connect_outbound(mark):
@@ -650,7 +653,10 @@ class CallSession:
                 await asyncio.to_thread(self._maybe_usb_soft_cycle_after_hangup)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("会话收尾 USB 软拔插异常: %s", exc)
-            if reset_simcom_module:
+            # _shutdown_agent 的挂断恢复可能已经重启并等过重新枚举了。再发一次
+            # AT+CRESET 会打断刚重新入网的模组，而且这里不等枚举、随后就释放
+            # _lifecycle_busy，下一通会直接撞上正在重启的模组。
+            if reset_simcom_module and not self._modem_reset_after_hangup_done:
                 trace("bridge", "module_reset_starting", "running")
                 try:
                     reset_accepted = self.modem.reset_module()
@@ -1362,7 +1368,7 @@ class CallSession:
             return None
         diagnosis: str | None = None
         try:
-            diagnosis = record.finish(status)
+            diagnosis = record.finish(status, ended_at=self._call_ended_at)
         except Exception as exc:  # noqa: BLE001
             logger.warning("落盘通话记录 %s 失败: %s", record.id, exc)
         sim_identity = getattr(self.modem, "sim_identity", None)
@@ -2618,6 +2624,9 @@ class CallSession:
             self.modem.hangup()
         except Exception as exc:  # noqa: BLE001
             logger.warning("挂断物理通话出错: %s", exc)
+        # 收尾恢复要花 15-20s，而落盘在它之后；先钉住挂断时刻，否则这段等待会
+        # 被算成通话时长（真机 2026-08-12：44s 的通话记成 94s）。
+        self._call_ended_at = time.time()
         # 恢复动作异常绝不能冒泡：否则已正常通话会在挂断时被 except 改写成 failed。
         try:
             await asyncio.to_thread(self._recover_audio_endpoint_after_hangup)
@@ -3078,8 +3087,10 @@ class CallAgentService:
         # session.stop()/remote request 都是异步收尾。更重要的是，音频初始化
         # 失败时逻辑 session 可能已 inactive，但模组中仍留有 active/held call。
         # 用户点击“挂断”的语义必须是立即向模组发 CHUP，而不是仅改应用状态。
+        # release_pcm=False 的理由同 on_hangup：此刻音频桥还占着 Audio 口，
+        # 就地 AT+CPCMREG=0,1 会让下一通首启被拒；关通道留给 _shutdown_agent。
         try:
-            self.modem.hangup()
+            self.modem.hangup(release_pcm=False)
         except Exception as exc:  # noqa: BLE001
             logger.exception("用户触发物理挂断失败: %s", exc)
             return False, "挂断失败：模组没有响应"
@@ -3265,7 +3276,10 @@ class CallAgentService:
             worker = self._remote_worker
             remote_session_active = bool(worker and worker.is_running)
         with self._ring_lock:
-            local_session_active = self.session.is_active
+            # 挂断收尾（模组重启约 20s）期间 is_active 已经是 False，但线路还不能用。
+            local_session_active = (
+                self.session.is_active or self.session.is_lifecycle_busy
+            )
             remote_call_active = self._remote_call_owner is not None
         return remote_session_active or local_session_active or remote_call_active
 
@@ -3392,7 +3406,11 @@ class CallAgentService:
             guard_failure = self._dial_guard(None)
             if guard_failure is not None:
                 return guard_failure
-            if self.session.is_active or self._remote_call_owner is not None:
+            if (
+                self.session.is_active
+                or self.session.is_lifecycle_busy
+                or self._remote_call_owner is not None
+            ):
                 return "当前正在通话中，请稍后再拨"
             limit = acquire_remote_dial_slot(
                 config.get_int("REMOTE_DIAL_LIMIT_PER_HOUR")

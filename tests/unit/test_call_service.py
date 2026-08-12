@@ -895,6 +895,38 @@ def test_simcom_pcm_transport_failure_resets_module(monkeypatch):
     assert "自动重启模组" in call_events[-1]["error"]
 
 
+def test_transport_failure_after_answer_resets_module_only_once(monkeypatch):
+    """接通后链路中断：挂断收尾已重启并等过枚举，异常路径不能再发一次 AT+CRESET。
+
+    第二次重启不等重新枚举就释放 _lifecycle_busy，下一通会直接撞上正在重启的模组。
+    """
+    monkeypatch.setenv("MODEM_RESET_AFTER_HANGUP", "true")
+    modem = FakeModem()
+    bridge = FakeAudioBridge()
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **kw: bridge)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: FakeAgent())
+    hub = make_hub()
+    service = make_service(modem, hub=hub, audio_mode="simcom_pcm")
+
+    async def fail_after_answer(*args, **kwargs):
+        raise serial.SerialException("could not open port COM6: [Errno 2]")
+
+    monkeypatch.setattr(service.session, "_run_agent_loop", fail_after_answer)
+
+    ok, err = service.dial("10000")
+    assert ok, err
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ("dial", ("10000",)) not in modem.calls:
+        time.sleep(0.05)
+    modem.trigger_call_connected("10000")
+
+    assert service.session._thread is not None
+    service.session._thread.join(timeout=5)
+    assert not service.session._thread.is_alive()
+    assert modem.call_names().count("reset_module") == 1
+    assert "wait_for_reenumeration" in modem.call_names()
+
+
 def test_duplicate_sms_not_republished_or_reforwarded():
     """补收/重复上报同一短信：去重后不重复入库、不重复转发邮件（#SMS 补收）。"""
     modem = FakeModem()

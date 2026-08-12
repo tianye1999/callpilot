@@ -388,8 +388,12 @@ class CallRecord:
                 content_updated_at = self._content_updated_at
             self._update_content_meta(content_updated_at, "PENDING")
 
-    def finish(self, status: str) -> str | None:
+    def finish(self, status: str, ended_at: float | None = None) -> str | None:
         """结束通话：flush 录音为 wav、写 events.jsonl 与 meta.json。幂等。
+
+        ``ended_at`` 允许调用方传入真正的挂断时刻。落盘发生在挂断收尾之后，
+        而收尾里的模组重启要花 15-20s，就地取 ``time.time()`` 会把这段时间
+        算进通话时长（真机 2026-08-12：44s 的通话记成 94s）。
 
         Returns the trace diagnosis when meta was written; ``None`` if skipped
         or disk write failed.
@@ -398,7 +402,7 @@ class CallRecord:
             if self._finished:
                 return None
             self._finished = True
-            ended_at = time.time()
+            ended_at = time.time() if ended_at is None else ended_at
             self._event_lines.append(
                 json.dumps(
                     {"type": "call_finished", "ts": ended_at, "status": status},
@@ -446,6 +450,12 @@ class CallRecord:
                 trace_summary = _trace_summary(
                     event_lines, answered=answered, status=status
                 )
+                # 接通了却一路没有对方 PCM 的通话不是 completed：历史列表若显示
+                # 成功，用户只会看到「没声音又不报错」。events.jsonl 保留当时的
+                # 原始判断，meta 记最终结论。
+                if trace_summary.get("diagnosis") == "no_caller_audio":
+                    if status == "completed":
+                        status = "failed"
                 meta = {
                     "id": self.id,
                     "public_id": self.public_id,

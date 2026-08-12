@@ -1062,11 +1062,14 @@ class Eg25Modem:
         *,
         offline_timeout: float = 25.0,
         online_timeout: float = 90.0,
+        settle_seconds: float = 3.0,
     ) -> bool:
-        """AT+CRESET 后等 USB 先掉线、再重新枚举并连上。
+        """AT+CRESET 后等 USB 先掉线、再重新枚举并真正应答 AT。
 
-        真机 2026-08-12：掉线约 7s、整段约 14s。掉线那一步允许超时——若模组
-        恢复得比轮询还快，只要最终在线就算成功。
+        真机 2026-08-12：掉线约 7s、整段约 14s。两处判定都不能放松：没见掉线
+        说明 AT+CRESET 根本没生效，报成功会让上层放行下一通；而 ``is_online``
+        只代表串口打开成功（``_open_serial`` 的探测 AT 超时只返回空串、不抛
+        异常），模组重启途中 USB 会先枚举一次，只等在线会在那一次就误判。
         """
         deadline = time.monotonic() + offline_timeout
         while time.monotonic() < deadline:
@@ -1075,13 +1078,28 @@ class Eg25Modem:
             time.sleep(0.2)
         else:
             logger.warning("AT+CRESET 后 %.0fs 内未见 USB 掉线", offline_timeout)
+            return False
 
         deadline = time.monotonic() + online_timeout
+        online_since: float | None = None
         while time.monotonic() < deadline:
-            if self.is_online:
+            now = time.monotonic()
+            if not self.is_online:
+                online_since = None
+            elif online_since is None:
+                online_since = now
+            elif now - online_since >= settle_seconds and self._at_responds():
                 return True
             time.sleep(0.2)
         return False
+
+    def _at_responds(self) -> bool:
+        """串口能打开 ≠ 模组能应答；重新枚举后用一条 AT 兜底确认。"""
+        try:
+            return "OK" in self._write_command("AT")
+        except (serial.SerialException, OSError, RuntimeError) as exc:
+            logger.debug("重新枚举后 AT 探测未通过: %s", exc)
+            return False
 
     def _emit_connection_state(self, online: bool) -> None:
         recovery_seconds: float | None = None

@@ -1551,3 +1551,63 @@ def test_bandwidth_failure_does_not_block_pcm(monkeypatch):
     monkeypatch.setattr(modem, "_send", fake_send)
     modem.initialize_for_voice("simcom_pcm")     # 不抛
     assert modem.voice_pcm_active is True
+
+
+# ---- AT+CRESET 后的重新枚举判定 ----
+
+
+def _fake_online_sequence(monkeypatch, modem, states):
+    """按序返回 is_online；序列耗尽后恒为在线。"""
+    seen = iter(states)
+    monkeypatch.setattr(
+        type(modem), "is_online", property(lambda self: next(seen, True))
+    )
+
+
+def test_wait_for_reenumeration_fails_when_usb_never_dropped(monkeypatch):
+    """没见掉线说明 AT+CRESET 没生效，不能报成功让上层放行下一通。"""
+    modem = make_modem()
+    _fake_online_sequence(monkeypatch, modem, [])       # 恒在线
+
+    assert (
+        modem.wait_for_reenumeration(offline_timeout=0.3, online_timeout=0.3) is False
+    )
+
+
+def test_wait_for_reenumeration_fails_when_port_is_back_but_at_is_mute(monkeypatch):
+    """串口能打开 ≠ 模组能应答：_open_serial 的探测 AT 超时只返回空串、不抛异常。"""
+    modem = make_modem()
+    _fake_online_sequence(monkeypatch, modem, [True, False])
+    monkeypatch.setattr(modem, "_at_responds", lambda: False)
+
+    assert (
+        modem.wait_for_reenumeration(
+            offline_timeout=0.5, online_timeout=0.6, settle_seconds=0.1
+        )
+        is False
+    )
+
+
+def test_wait_for_reenumeration_succeeds_after_a_stable_at_reply(monkeypatch):
+    modem = make_modem()
+    _fake_online_sequence(monkeypatch, modem, [True, False])
+    monkeypatch.setattr(modem, "_at_responds", lambda: True)
+
+    assert (
+        modem.wait_for_reenumeration(
+            offline_timeout=0.5, online_timeout=2.0, settle_seconds=0.1
+        )
+        is True
+    )
+
+
+def test_at_probe_treats_a_dead_port_as_no_reply(monkeypatch):
+    """重连线程可能正握着串口；探测失败只代表还没好，不能炸掉收尾。"""
+    modem = make_modem()
+
+    def raise_not_connected(cmd: str) -> str:
+        raise RuntimeError("模组未连接")
+
+    monkeypatch.setattr(modem, "_write_command", raise_not_connected)
+
+    assert modem._at_responds() is False
