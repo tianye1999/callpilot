@@ -1543,14 +1543,15 @@ def test_meta_omits_sim_when_no_modem():
     assert "sim" not in api(app, fn)
 
 
-def test_meta_exposes_sim_without_full_imsi():
+@pytest.mark.parametrize("cs_stat,eps_stat", [("1", "0"), ("3", "1")])
+def test_meta_exposes_sim_without_full_imsi(cs_stat, eps_stat):
     """/api/meta 透出 sim 块,含运营商/客服号,绝不含完整 IMSI(#88 隐私)。"""
     import json as _json
 
     from agentcall.sim_identity import identify
 
     class _FakeModem:
-        sim_identity = identify("460110123456789\r\nOK", "+CREG: 0,1")
+        sim_identity = identify("460110123456789\r\nOK", f"+CREG: 0,{cs_stat}", f"+CEREG: 0,{eps_stat}")
 
     service = FakeService()
     service.modem = _FakeModem()  # type: ignore[attr-defined]
@@ -1570,6 +1571,10 @@ def test_meta_exposes_sim_without_full_imsi():
     assert meta["sim"]["carrier"] == "中国电信"
     assert meta["sim"]["service_number"] == "10000"
     assert meta["sim"]["plmn"] == "46011"
+    assert meta["sim"]["registered"] is (cs_stat == "1")
+    assert meta["sim"]["eps_registered"] is (eps_stat == "1")
+    assert meta["sim"]["eps_status"] == ("已注册" if eps_stat == "1" else "未注册")
+    assert meta["sim"]["network_attached"] is True
     assert "460110123456789" not in _json.dumps(meta, ensure_ascii=False)
 
 

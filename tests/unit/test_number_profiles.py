@@ -28,6 +28,7 @@ def test_bundled_seed_has_public_hotline_profiles_without_private_data():
         "10000",
         "10086",
         "10086",
+        "10086",
         "10010",
         "95588",
         "95533",
@@ -641,6 +642,51 @@ def test_bundled_seed_has_sms_verified_china_mobile_billing_profile():
     assert profile["opening_mode"] == "wait"
     assert profile["result_verification"] == "carrier_sms"
     assert "官方短信" in profile["scenario"]["zh"]
+
+
+@pytest.mark.parametrize("task,lang", [
+    ("查询话费余额", "zh"),
+    ("check account balance", "en"),
+    ("查询话费余额", "en"),
+    ("check account balance", "zh"),
+])
+def test_bundled_seed_current_balance_matches_exact_number_and_task(task, lang):
+    seed = number_profiles.bundled_seed_file()
+    result = number_profiles.lookup_profile("10086", task, lang=lang, path=seed)
+
+    assert result is not None
+    assert result["profile_id"] == "china_mobile_current_balance"
+    assert result["opening_mode"] == "wait"
+    assert result["result_verification"] == "carrier_sms"
+    expected_opening = {
+        "zh": "你好，我想查一下这个号码的话费余额。",
+        "en": "Hi, I'd like to check the account balance.",
+    }
+    assert result["opening"] == expected_opening[lang]
+    billing = number_profiles.lookup_profile("10086", "查上个月消费金额", path=seed)
+    assert billing["profile_id"] == "china_mobile_balance"
+    assert number_profiles.lookup_profile("10086", "咨询流量使用情况", path=seed)["profile_id"] == "china_mobile_data"
+    assert number_profiles.lookup_profile("10086", "unmatched task", path=seed) is None
+    assert number_profiles.lookup_profile("10000", task, path=seed)["profile_id"] == "china_telecom_balance"
+
+
+def test_bundled_seed_current_balance_has_bilingual_sms_grounded_scenario():
+    data = json.loads(number_profiles.bundled_seed_file().read_text(encoding="utf-8"))
+    matches = [item for item in data["profiles"] if item["id"] == "china_mobile_current_balance"]
+    assert len(matches) == 1
+    profile = matches[0]
+    assert profile["number"] == "10086"
+    assert profile["task"] == {"zh": "查询话费余额", "en": "check account balance"}
+    assert profile["label"] == {"zh": "中国移动·查话费余额", "en": "China Mobile · Balance"}
+    for fragment in (
+        "当前的话费余额", "不代表移动", "不冒充机主本人", "完整听完首段 IVR", "send_dtmf", "不编造", "官方短信",
+    ):
+        assert fragment in profile["scenario"]["zh"]
+    for fragment in (
+        "current account balance", "not represent China Mobile", "never impersonate", "first IVR",
+        "send_dtmf", "never fabricate", "official post-call SMS",
+    ):
+        assert fragment in profile["scenario"]["en"]
 
 
 # ---- WIL-120 一期：长通话字段 ----

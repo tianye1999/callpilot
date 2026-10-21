@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agentcall.dial_guard import check_dial_guard
-from agentcall.sim_identity import UNKNOWN_SIM, SimIdentity
+from agentcall.sim_identity import UNKNOWN_SIM, SimIdentity, identify
 
 
 def _sim(
@@ -48,6 +50,38 @@ def test_guard_distinguishes_unknown_from_explicit_non_registration():
 
     assert unknown is not None and unknown.code == "SIM_NOT_READY"
     assert rejected is not None and rejected.code == "SIM_NOT_REGISTERED"
+
+
+@pytest.mark.parametrize("cs_stat", ["0", "1", "2", "3", "4", "5", None])
+@pytest.mark.parametrize("eps_stat", ["0", "1", "2", "3", "4", "5", None])
+def test_guard_cs_eps_registration_matrix(cs_stat, eps_stat):
+    sim = identify(
+        "460000123456789\r\nOK",
+        f"+CREG: 0,{cs_stat}" if cs_stat is not None else "ERROR",
+        f"+CEREG: 0,{eps_stat}" if eps_stat is not None else "ERROR",
+    )
+    failure = check_dial_guard(modem_online=True, sim_identity=sim, number="10086")
+
+    if cs_stat in {"4", None}:
+        assert failure is not None and failure.code == "SIM_NOT_READY"
+    elif cs_stat in {"1", "5"} or eps_stat in {"1", "5"}:
+        assert failure is None
+    else:
+        assert failure is not None and failure.code == "SIM_NOT_REGISTERED"
+        assert f"CS：{sim.reg_status}" in failure.message
+        assert f"LTE：{sim.eps_status}" in failure.message
+
+
+def test_eps_registration_does_not_bypass_other_guards():
+    sim = identify("460000123456789\r\nOK", "+CREG: 0,3", "+CEREG: 0,1")
+    for online, identity, number, expected in [
+        (False, sim, "10086", "MODEM_OFFLINE"),
+        (True, identify("ERROR", "+CREG: 0,3", "+CEREG: 0,1"), "10086", "SIM_NOT_READY"),
+        (True, sim, "10010", "SERVICE_NUMBER_MISMATCH"),
+        (True, identify("234159876543210", "+CREG: 0,3", "+CEREG: 0,1"), "10086", "SERVICE_NUMBER_UNKNOWN"),
+    ]:
+        failure = check_dial_guard(modem_online=online, sim_identity=identity, number=number)
+        assert failure is not None and failure.code == expected
 
 
 def test_guard_blocks_only_known_cross_carrier_service_numbers():

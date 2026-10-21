@@ -95,6 +95,14 @@ def test_modem_and_sim_events_debounce_metadata_refresh():
     assert "metaRefreshTimer = setTimeout(() => { void loadMeta(); }" in text
 
 
+def test_setup_hardware_shows_lte_registration_for_volte_only_sim():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert "!sim.registered && sim.eps_registered" in text
+    assert "网络已接入 · LTE ${sim.eps_status}" in text
+    assert "${sim.carrier} · ${simRegistration}" in text
+
+
 def test_dashboard_listener_recovers_suspended_web_audio():
     """WebKit 打断 AudioContext 后，旁听要恢复而不是保持“旁听中”但静音。"""
     text = INDEX.read_text(encoding="utf-8")

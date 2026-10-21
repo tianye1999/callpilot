@@ -4,7 +4,7 @@
 (免费客服热线)随卡而变,拨错跨运营商客服号会按普通通话计费(2026-07-13
 实测);换卡后一段时间网络未注册,拨号 45s 超时而用户无从自诊。
 
-本模块只做纯函数解析(可独测):IMSI/CREG 原始响应 → 结构化身份。
+本模块只做纯函数解析(可独测):IMSI/CREG/CEREG 原始响应 → 结构化身份。
 PLMN(MCC+MNC)→ 运营商映射是公开电信标准的确定性事实数据,不属于
 「对话逻辑枚举」,不违反项目非枚举硬原则。
 
@@ -68,6 +68,7 @@ VALID_SERVICE_NUMBERS: frozenset[str] = frozenset(_SERVICE_NUMBERS.values()) | {
 
 _IMSI_RE = re.compile(r"\b(\d{14,15})\b")
 _CREG_RE = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?(\d+)(?:\s|$)")
+_EPS_RE = re.compile(r"\+C[EG]REG:\s*(?:\d+\s*,\s*)?(\d+)(?=\s*(?:,|$))", re.MULTILINE)
 
 # CREG <stat> 语义(3GPP TS 27.007):1=已注册(本地),5=已注册(漫游)。
 _REGISTERED_STATS = {"1", "5"}
@@ -90,10 +91,17 @@ class SimIdentity:
     carrier: str             # 运营商中文名;未识别为 "未知"
     service_number: str      # 该运营商免费客服号;未识别为 ""
     registered: bool         # CS 域已注册(CREG 1/5)
-    reg_status: str          # 注册状态人话(已注册/搜网中/…)
+    reg_status: str          # CS 域注册状态人话(已注册/搜网中/…)
+    eps_registered: bool = False  # EPS 域已注册(CEREG 1/5)
+    eps_status: str = "未知"
+
+    @property
+    def network_attached(self) -> bool:
+        """CS 或 EPS 任一域已注册;VoLTE-only 卡不要求 CS 域注册。"""
+        return self.registered or self.eps_registered
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        return {**asdict(self), "network_attached": self.network_attached}
 
 
 UNKNOWN_SIM = SimIdentity(
@@ -123,14 +131,25 @@ def parse_creg(raw: str) -> tuple[bool, str]:
     return stat in _REGISTERED_STATS, _CREG_LABELS.get(stat, f"状态{stat}")
 
 
-def identify(imsi_raw: str, creg_raw: str = "") -> SimIdentity:
-    """由 CIMI/CREG 原始响应合成 SimIdentity(纯函数,幂等)。"""
+def parse_eps_registration(raw: str) -> tuple[bool, str]:
+    """解析 CEREG/CGREG 查询或 URC,允许携带位置等扩展字段。"""
+    m = _EPS_RE.search(raw or "")
+    if not m:
+        return False, "未知"
+    stat = m.group(1)
+    return stat in _REGISTERED_STATS, _CREG_LABELS.get(stat, f"状态{stat}")
+
+
+def identify(imsi_raw: str, creg_raw: str = "", cereg_raw: str = "") -> SimIdentity:
+    """由 CIMI/CREG/CEREG 原始响应合成 SimIdentity(纯函数,幂等)。"""
     imsi = parse_imsi(imsi_raw)
+    registered, reg_status = parse_creg(creg_raw)
+    eps_registered, eps_status = parse_eps_registration(cereg_raw)
     if not imsi:
-        registered, reg_status = parse_creg(creg_raw)
         return SimIdentity(
             present=False, plmn="", carrier="未知", service_number="",
             registered=registered, reg_status=reg_status,
+            eps_registered=eps_registered, eps_status=eps_status,
         )
     plmn = imsi[:5]
     carrier = _PLMN_CARRIERS.get(plmn)
@@ -140,7 +159,6 @@ def identify(imsi_raw: str, creg_raw: str = "") -> SimIdentity:
         # service_number 恒为空，dial_guard 的误拨保护会整个失效——而跨运营商
         # 客服号按普通通话计费，从美国卡拨 10086 更是国际长途。
         carrier, service_number = _MCC_FALLBACK.get(imsi[:3], ("未知", ""))
-    registered, reg_status = parse_creg(creg_raw)
     return SimIdentity(
         present=True,
         plmn=plmn,
@@ -148,6 +166,8 @@ def identify(imsi_raw: str, creg_raw: str = "") -> SimIdentity:
         service_number=service_number,
         registered=registered,
         reg_status=reg_status,
+        eps_registered=eps_registered,
+        eps_status=eps_status,
     )
 
 

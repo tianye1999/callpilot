@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+import serial
+
 from agentcall.sim_identity import (
     UNKNOWN_SIM,
     identify,
@@ -51,8 +54,42 @@ def test_parse_creg_malformed():
     assert parse_creg("ERROR") == (False, "未知")
 
 
+@pytest.mark.parametrize("prefix", ["CEREG", "CGREG"])
+@pytest.mark.parametrize("mode", ["", "0,", "2,"])
+@pytest.mark.parametrize("stat,expected", [
+    ("0", (False, "未注册")),
+    ("1", (True, "已注册")),
+    ("2", (False, "搜网中")),
+    ("3", (False, "注册被拒")),
+    ("4", (False, "未知")),
+    ("5", (True, "已注册(漫游)")),
+])
+def test_parse_eps_registration(prefix, mode, stat, expected):
+    from agentcall.sim_identity import parse_eps_registration
+
+    assert parse_eps_registration(f"+{prefix}: {mode}{stat}\r\nOK") == expected
+
+
+@pytest.mark.parametrize("raw", [
+    '+CEREG: 2,1,"1234","01234567",7\r\nOK',
+    '+CEREG: 1,"1234","01234567",7\r\n',
+    '+CGREG: 2,1,"1234","01234567",7\r\nOK',
+])
+def test_parse_eps_registration_with_location_fields(raw):
+    from agentcall.sim_identity import parse_eps_registration
+
+    assert parse_eps_registration(raw) == (True, "已注册")
+
+
+@pytest.mark.parametrize("raw", ["", "OK", "ERROR", "+CME ERROR: 10", "+CREG: 0,1", "+CEREG: junk"])
+def test_parse_eps_registration_unknown(raw):
+    from agentcall.sim_identity import parse_eps_registration
+
+    assert parse_eps_registration(raw) == (False, "未知")
+
+
 def test_with_registration_preserves_sim_identity_fields():
-    sim = identify("460000123456789\r\nOK", "+CREG: 0,1")
+    sim = identify("460000123456789\r\nOK", "+CREG: 0,1", "+CEREG: 0,5")
 
     updated = with_registration(sim, "+CREG: 2")
 
@@ -62,6 +99,28 @@ def test_with_registration_preserves_sim_identity_fields():
     assert updated.service_number == sim.service_number
     assert updated.registered is False
     assert updated.reg_status == "搜网中"
+    assert updated.eps_registered is True
+    assert updated.eps_status == "已注册(漫游)"
+    assert updated.network_attached is True
+
+
+def test_identify_volte_only_keeps_cs_semantics_and_exports_eps():
+    sim = identify("460000123456789\r\nOK", "+CREG: 0,3", "+CEREG: 0,1")
+    assert sim.registered is False
+    assert sim.reg_status == "注册被拒"
+    assert sim.as_dict() == {
+        "present": True, "plmn": "46000", "carrier": "中国移动", "service_number": "10086",
+        "registered": False, "reg_status": "注册被拒",
+        "eps_registered": True, "eps_status": "已注册", "network_attached": True,
+    }
+
+
+def test_identity_defaults_eps_to_unknown_without_changing_cs():
+    sim = identify("460000123456789\r\nOK", "+CREG: 0,1")
+    assert sim.network_attached is True
+    assert (sim.eps_registered, sim.eps_status) == (False, "未知")
+    assert UNKNOWN_SIM.network_attached is False
+    assert UNKNOWN_SIM.as_dict()["eps_registered"] is False
 
 
 # ---- identify:四大运营商映射(全 PLMN 表逐条锁死)----
@@ -136,6 +195,42 @@ def test_modem_refresh_caches_and_logs(monkeypatch, caplog):
     assert not any("460030123456789" in r.getMessage() for r in caplog.records)  # 日志无完整 IMSI
 
 
+def test_modem_refresh_reads_eps_for_volte_only_sim(monkeypatch):
+    modem = _make_modem(monkeypatch, {
+        "AT+CIMI": "460000123456789\r\nOK",
+        "AT+CREG?": "+CREG: 0,3\r\nOK",
+        "AT+CEREG?": "+CEREG: 0,1\r\nOK",
+    })
+    modem.refresh_sim_identity()
+    assert modem.sim_identity.registered is False
+    assert modem.sim_identity.eps_registered is True
+    assert modem.sim_identity.network_attached is True
+
+
+@pytest.mark.parametrize("cs_stat", ["1", "3"])
+@pytest.mark.parametrize("failure", ["ERROR", "", RuntimeError("unsupported"), serial.SerialException("disconnected")])
+def test_modem_eps_read_failure_keeps_cs_result(monkeypatch, cs_stat, failure):
+    modem = _make_modem(monkeypatch, {})
+    commands = []
+
+    def send(command):
+        commands.append(command)
+        if command == "AT+CEREG?":
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+        return {"AT+CIMI": "460000123456789\r\nOK", "AT+CREG?": f"+CREG: 0,{cs_stat}"}[command]
+
+    monkeypatch.setattr(modem, "_send", send)
+    modem.refresh_sim_identity()
+    sim = modem.sim_identity
+    assert commands == ["AT+CIMI", "AT+CREG?", "AT+CEREG?"]
+    assert sim.present is True
+    assert sim.registered is (cs_stat == "1")
+    assert sim.reg_status == ("已注册" if cs_stat == "1" else "注册被拒")
+    assert (sim.eps_registered, sim.eps_status) == (False, "未知")
+
+
 def test_modem_refresh_at_logic_failure_degrades(monkeypatch):
     """AT 返回 ERROR / 非传输层异常 → 降级 UNKNOWN,不抛(主链路不受影响)。"""
 
@@ -192,7 +287,7 @@ def test_creg_urc_updates_registration_without_losing_carrier():
     from agentcall.modem import Eg25Modem
 
     modem = Eg25Modem("unused")
-    modem._sim_identity = identify("460000123456789\r\nOK", "+CREG: 0,1")
+    modem._sim_identity = identify("460000123456789\r\nOK", "+CREG: 0,1", "+CEREG: 0,1")
     events = []
     modem.on_sim_identity(events.append)
 
@@ -204,6 +299,8 @@ def test_creg_urc_updates_registration_without_losing_carrier():
     assert modem.sim_identity.carrier == "中国移动"
     assert modem.sim_identity.service_number == "10086"
     assert modem.sim_identity.reg_status == "搜网中"
+    assert modem.sim_identity.eps_registered is True
+    assert modem.sim_identity.network_attached is True
     assert len(events) == 1
 
 
