@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
 from agentcall.call_agent import CallAgentService
@@ -135,6 +136,40 @@ def test_handoff_stops_old_writer_and_pumps_mobile_then_single_finalizer(monkeyp
     assert endpoint.events == [{"type": "status", "status": "connected"}]
     assert session.takeover_state is TakeoverState.MOBILE_ACTIVE
     assert session.modem.calls == []
+
+
+def test_parallel_cancel_after_takeover_stops_replacement_writer(monkeypatch):
+    service = _service()
+    session = service.session
+    session._parallel_agent_connect = True
+    claimed = _claimed(service, monkeypatch)
+    old_bridge = FakeAudioBridge()
+    old_bridge.start()
+    new_bridge = FakeAudioBridge()
+    endpoint = FakeEndpoint(session)
+    session._takeover_endpoint_factory = lambda _issued: endpoint
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", lambda **_kw: new_bridge)
+
+    async def run():
+        entered = asyncio.Event()
+
+        async def pump(*_args):
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(session, "_pump_mobile_media", pump)
+        task = asyncio.create_task(session._handoff_to_mobile(
+            FakeAgent(), old_bridge, claimed, None, session._session_generation,
+        ))
+        await entered.wait()
+        assert session.takeover_state is TakeoverState.MOBILE_ACTIVE
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert old_bridge.stopped and new_bridge.stopped
+    assert endpoint.closed
 
 
 def test_takeover_hold_is_one_deterministic_line_before_agent_gate(monkeypatch) -> None:

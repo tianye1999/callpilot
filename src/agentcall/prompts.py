@@ -238,9 +238,23 @@ def opening_instructions(
     task: str,
     lang: str = "zh",
     opening: str | None = None,
+    module_greeting: str = "",
 ) -> str:
     """构造开场白指令；``task`` 仅在外呼时使用。"""
     lang = normalize_lang(lang)
+    if direction == "inbound" and module_greeting:
+        if lang == "en":
+            return (
+                f'The system already said "{module_greeting}" when the call connected. '
+                "Do not greet again; continue naturally in the current incoming-call context. "
+                "Use one short sentence in English to find out why they are calling, "
+                "without introducing yourself, explaining or repeating these instructions."
+            )
+        return (
+            f"接通时系统已代为说过「{module_greeting}」。不要再重复打招呼，直接进入开场内容；"
+            "根据当前来电场景自然接续，用一句简短的中文了解对方来意，"
+            "不要自我介绍、不要解释或复述本指令。"
+        )
     if direction == "outbound" and opening and opening.strip():
         if lang == "en":
             return f"Say directly: {opening.strip()}"

@@ -51,6 +51,24 @@ def default_reset_after_call() -> bool:
     return IS_LINUX
 
 
+def default_parallel_agent_connect() -> bool:
+    """Linux overlaps AI startup with modem preparation; other platforms opt in."""
+    return IS_LINUX
+
+
+def default_modem_answer_greeting() -> str:
+    """Only Linux enables the SIM7600 native answer greeting by default."""
+    return "喂" if IS_LINUX else ""
+
+
+def default_modem_answer_greeting_delay_ms() -> int:
+    return 500
+
+
+def default_modem_tts_params() -> str:
+    return "2,2,0,1,1,0"
+
+
 def venv_python(project_root: Path) -> Path:
     """项目 venv 内 Python 解释器路径（POSIX bin/ 与 Windows Scripts\\ 之分）。"""
     if IS_WINDOWS:

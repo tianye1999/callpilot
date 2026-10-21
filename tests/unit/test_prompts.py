@@ -460,6 +460,18 @@ def test_english_build_instructions_are_english():
     assert "机主" not in inb
 
 
+def test_native_greeting_context_replaces_canned_inbound_greeting():
+    zh = opening_instructions("inbound", "李明", "数字分身", "", "zh", module_greeting="喂")
+    assert "系统已代为说过「喂」" in zh and "不要再重复打招呼" in zh
+    assert "喂，你好。" not in zh
+    en = opening_instructions("inbound", "Alex", "AI assistant", "", "en", module_greeting="Hello")
+    assert "already said" in en and "Do not greet again" in en
+    assert "Hello, hi there." not in en
+    assert opening_instructions("outbound", "Alex", "AI assistant", "", "en", module_greeting="Hello") == (
+        opening_instructions("outbound", "Alex", "AI assistant", "", "en")
+    )
+
+
 def test_english_opening_instructions_are_english():
     from agentcall.prompts import opening_instructions
     out = opening_instructions("outbound", "Alex", "AI assistant", "a delivery", "en")

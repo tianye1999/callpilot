@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Iterable
 
-from agentcall.audio_bridge import resample_pcm
+from agentcall.audio_bridge import AgentPcm, resample_pcm
 
 
 class FakeAudioBridge:
@@ -17,6 +17,10 @@ class FakeAudioBridge:
         # 模拟桥内未播积压（barge-in 测试用）：测试直接设字节数。
         self.pending_bytes = 0
         self.discarded_bytes = 0
+        self._output_observer = None
+
+    def set_output_observer(self, observer) -> None:
+        self._output_observer = observer
 
     def start(self) -> None:
         self.started = True
@@ -40,7 +44,11 @@ class FakeAudioBridge:
         return dropped
 
     def write_modem_chunks(self, chunks: Iterable[bytes]) -> None:
-        self.downlink.extend(chunk for chunk in chunks if chunk)
+        for chunk in chunks:
+            if chunk:
+                self.downlink.append(chunk)
+                if self._output_observer is not None and isinstance(chunk, AgentPcm):
+                    self._output_observer(chunk)
 
     @staticmethod
     def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:

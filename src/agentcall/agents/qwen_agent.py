@@ -145,17 +145,30 @@ class _QwenCallback(OmniRealtimeCallback):
         self,
         audio_queue: Queue[bytes | None],
         agent: "QwenVoiceAgent | None" = None,
+        *,
+        fenced: bool = False,
     ) -> None:
         self._audio_queue = audio_queue
         self._agent = agent
+        self._fenced = fenced
+        self._invalidated = False
         # 由 QwenVoiceAgent._connect 在建连后回填；此前是动态挂属性，
         # dashscope 1.26.5 的类型信息补全后被 mypy 判为 attr-defined。
         self._conversation: OmniRealtimeConversation | None = None
 
     def on_open(self) -> None:
+        if self._stale():
+            return
         logger.info("千问 Realtime 连接已建立")
 
+    def _stale(self) -> bool:
+        return self._fenced and (
+            self._invalidated or (self._agent is not None and self._agent._callback is not self)
+        )
+
     def on_close(self, close_status_code, close_msg) -> None:
+        if self._stale():
+            return
         logger.info("千问 Realtime 连接关闭: %s %s", close_status_code, close_msg)
         agent = self._agent
         if agent is not None and agent._running:  # noqa: SLF001
@@ -166,6 +179,8 @@ class _QwenCallback(OmniRealtimeCallback):
             self._audio_queue.put(None)
 
     def on_event(self, response: Any) -> None:
+        if self._stale():
+            return
         # SDK 基类把该参数注解成 str，但运行时传的是事件 dict（下面 .get 即证）。
         # 注解成 Any 以兼容这份不准确的父类签名，运行时行为不变。
         event_type = response.get("type", "")
@@ -314,7 +329,18 @@ class QwenVoiceAgent(VoiceAgent):
             "(query_verification_code)。需要时主动调用对应工具，操作完成后用一句话口头确认结果。"
         )
 
-        self._connect_session()
+        if config.get_bool("PARALLEL_AGENT_CONNECT"):
+            connecting = asyncio.create_task(asyncio.to_thread(self._connect_session))
+            try:
+                await asyncio.shield(connecting)
+            except asyncio.CancelledError:
+                # The SDK is synchronous: join before the owner calls stop(), or a
+                # late successful connect could publish a socket after teardown.
+                self._running = False
+                await asyncio.gather(connecting, return_exceptions=True)
+                raise
+        else:
+            self._connect_session()
 
         self._pump_thread = threading.Thread(target=self._pump_audio_out, daemon=True)
         self._pump_thread.start()
@@ -341,6 +367,13 @@ class QwenVoiceAgent(VoiceAgent):
         conversation: OmniRealtimeConversation | None = None
         last_exc: Exception | None = None
         for attempt in range(1, QWEN_CONNECT_MAX_ATTEMPTS + 1):
+            if config.get_bool("PARALLEL_AGENT_CONNECT") and not self._running:
+                raise RuntimeError("千问建连已取消")
+            if config.get_bool("PARALLEL_AGENT_CONNECT"):
+                # A failed/old candidate may close late. Its callback must not
+                # change the new connection's state or deliver stale audio/tools.
+                self._callback = _QwenCallback(self._audio_queue, self, fenced=True)
+                conversation_kwargs["callback"] = self._callback
             conversation = OmniRealtimeConversation(**conversation_kwargs)
             self._callback._conversation = conversation  # noqa: SLF001
             try:
@@ -349,12 +382,17 @@ class QwenVoiceAgent(VoiceAgent):
                 break
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
+                if config.get_bool("PARALLEL_AGENT_CONNECT"):
+                    self._close_unpublished_session(conversation)
                 logger.warning(
                     "千问 Realtime 连接失败(第 %d/%d 次): %s",
                     attempt, QWEN_CONNECT_MAX_ATTEMPTS, exc,
                 )
         if last_exc is not None or conversation is None:
             raise last_exc if last_exc is not None else RuntimeError("连接失败")
+        if config.get_bool("PARALLEL_AGENT_CONNECT") and not self._running:
+            self._close_unpublished_session(conversation)
+            raise RuntimeError("千问建连已取消")
 
         tool_kwargs: dict = {}
         if self._tools is not None and self._tools.has_tools():
@@ -363,9 +401,26 @@ class QwenVoiceAgent(VoiceAgent):
             logger.info("已为会话注册 %d 个工具", len(self._tools.specs()))
 
         session_kwargs = self._session_kwargs(tool_kwargs)
-        conversation.update_session(**session_kwargs)
+        try:
+            conversation.update_session(**session_kwargs)
+        except BaseException:
+            if config.get_bool("PARALLEL_AGENT_CONNECT"):
+                self._close_unpublished_session(conversation)
+            raise
 
         self._conversation = conversation
+        if config.get_bool("PARALLEL_AGENT_CONNECT"):
+            self._disconnected.clear()
+
+    def _close_unpublished_session(self, conversation) -> None:
+        if self._callback._conversation is conversation:
+            # close() can synchronously drain SDK callbacks, including tools.
+            # Invalidate before closing, not only when installing the next retry.
+            self._callback._invalidated = True
+        try:
+            conversation.close()
+        except Exception:  # noqa: BLE001
+            logger.warning("关闭未完成初始化的千问连接失败", exc_info=True)
 
     def _session_kwargs(self, tool_kwargs: dict) -> dict:
         session_kwargs = {

@@ -414,8 +414,12 @@ class SerialModem:
                 self._send("AT+QSIMSTAT=1")
                 self._send("AT+CREG=1")
                 self.refresh_sim_identity(notify=False)
+                self._init_answer_greeting()
             finally:
                 self._opening = False
+
+    def _init_answer_greeting(self) -> None:
+        """Vendor hook; Quectel keeps its existing initialization sequence."""
 
     def _reconnect(self) -> None:
         """串口断连后重开（USB→PTY 桥重插会换新的 /dev/ttys，需重开才能拿到新 fd）。
@@ -1407,6 +1411,7 @@ class Sim7600Modem(SerialModem):
         self._reset_in_progress = False
         self._reset_access = threading.local()
         self._on_post_call_reset: Callable[[], None] | None = None
+        self._answer_greeting_route_ready = False
 
     @property
     def reset_in_progress(self) -> bool:
@@ -1486,6 +1491,55 @@ class Sim7600Modem(SerialModem):
                 self._ser = None
                 self._buffer = ""
                 self._emit_connection_state(False)
+
+    def _init_answer_greeting(self, *, retry_transport: bool = True) -> None:
+        self._answer_greeting_route_ready = False
+        if not config.get_bool("PARALLEL_AGENT_CONNECT") or not config.get_str("MODEM_ANSWER_GREETING"):
+            return
+        commands = ["AT+CDTAM=1"]
+        params = config.get_str("MODEM_TTS_PARAMS").strip()
+        if params:
+            # Restrict to the six ranges reported by AT+CTTSPARAM=?; never accept AT injection.
+            if re.fullmatch(r"[0-2],[0-3],[0-3],[0-2],[0-2],[0-3]", params):
+                commands.append(f"AT+CTTSPARAM={params}")
+            else:
+                logger.warning("SIM7600 CTTSPARAM 参数无效，跳过设置")
+        for command in commands:
+            name = command.partition("=")[0]
+            try:
+                response = self._send(command) if retry_transport else self._write_command(command)
+                ok = "OK" in response and "ERROR" not in response
+                if name == "AT+CDTAM":
+                    self._answer_greeting_route_ready = ok
+                if not ok:
+                    logger.warning("SIM7600 %s 未成功，继续连接", name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SIM7600 %s 设置失败 (%s)，继续连接", name, type(exc).__name__)
+
+    def play_answer_greeting(self, text: str) -> bool:
+        """Best-effort native TTS; OK is acknowledgement, not proof of far-end playout."""
+        started = time.monotonic()
+        ok = False
+        try:
+            if not self._answer_greeting_route_ready:
+                # A post-reset connection may precede TTS readiness. Retry once on
+                # the live call, without entering an unbounded transport reconnect.
+                self._init_answer_greeting(retry_transport=False)
+            if not self._answer_greeting_route_ready:
+                raise RuntimeError("native greeting route unavailable")
+            if not text or any(ord(ch) > 0xFFFF or 0xD800 <= ord(ch) <= 0xDFFF for ch in text):
+                raise ValueError("greeting must be nonempty UCS2")
+            encoded = text.encode("utf-16-be").hex().upper()
+            # Do not reconnect/retry a non-idempotent greeting after an uncertain write.
+            # _write_command still owns the normal serial lock, response and URC handling.
+            response = self._write_command(f'AT+CTTS=1,"{encoded}"')
+            ok = "OK" in response and "ERROR" not in response
+            if not ok:
+                logger.warning("SIM7600 接听问候未成功，继续准备 PCM")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SIM7600 接听问候失败 (%s)，继续准备 PCM", type(exc).__name__)
+        logger.info("[timing] 模组接听问候耗时 %.3fs ok=%s", time.monotonic() - started, ok)
+        return ok
 
     def initialize_for_voice(self, audio_mode: str = "nmea") -> None:
         """使能 PCM-over-USB 语音通道（``AT+CPCMREG=1``）。

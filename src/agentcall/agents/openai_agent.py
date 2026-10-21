@@ -19,7 +19,7 @@ import threading
 import time
 from array import array
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Coroutine
 
 import websockets
 
@@ -38,6 +38,7 @@ DEFAULT_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 _MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS = 5.0
 _MANUAL_RESPONSE_SEND_TIMEOUT_SECONDS = 5.0
+_PARALLEL_CLOSE_TIMEOUT_SECONDS = 1.0
 
 # 重连成功后让 Agent 主动安抚对方的提示词（与 qwen_agent 语义一致）。
 RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继续。"
@@ -178,6 +179,17 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._manual_response_request_pending = False
         self._manual_response_outstanding = 0
         self._manual_response_pending_after_flight = False
+        self._parallel_mode = config.get_bool("PARALLEL_AGENT_CONNECT")
+        self._response_lock = asyncio.Lock()
+        self._response_idle = asyncio.Event()
+        self._response_idle.set()
+        self._response_requested = False
+        self._active_response_id: str | None = None
+        self._background_tasks: set[asyncio.Task] = set()
+        self._vad_response_task: asyncio.Task | None = None
+        self._response_ack_task: asyncio.Task | None = None
+        self._response_request_generation = 0
+        self._user_speaking = False
 
     # ---- 连接管理 ----
 
@@ -216,7 +228,18 @@ class OpenAIVoiceAgent(VoiceAgent):
         （否则报 beta_api_shape_disabled）。
         """
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        ws = await websockets.connect(self._build_url(), additional_headers=headers)
+        connect_options: dict[str, Any] = {"close_timeout": 0.5} if self._parallel_mode else {}
+        ws = await websockets.connect(self._build_url(), additional_headers=headers, **connect_options)
+        if self._parallel_mode:
+            # The call owner may cancel startup while session.update is pending.
+            # Publish ownership now so stop() can close this already-open socket.
+            self._ws = ws
+            self._response_active = False
+            self._user_speaking = False
+            self._response_requested = False
+            self._active_response_id = None
+            self._response_idle.set()
+            self._response_request_generation += 1
 
         session: dict = {
             "type": "realtime",
@@ -252,7 +275,7 @@ class OpenAIVoiceAgent(VoiceAgent):
                         ),
                         **(
                             {"create_response": False}
-                            if self._manual_response_enabled
+                            if self._manual_response_enabled or self._parallel_mode
                             else {}
                         ),
                     },
@@ -285,7 +308,14 @@ class OpenAIVoiceAgent(VoiceAgent):
             session["tools"] = tool_specs
             logger.info("已为会话注册 %d 个工具", len(tool_specs))
 
-        await ws.send(json.dumps({"type": "session.update", "session": session}))
+        try:
+            await ws.send(json.dumps({"type": "session.update", "session": session}))
+        except BaseException:
+            if self._parallel_mode:
+                if self._ws is ws:
+                    self._ws = None
+                await self._close_parallel_socket(ws)
+            raise
         self._ws = ws
         logger.info("OpenAI Realtime 连接已建立: %s", self.model)
 
@@ -472,14 +502,74 @@ class OpenAIVoiceAgent(VoiceAgent):
         if not ws:
             return
         try:
-            await ws.send(json.dumps({
+            message = {
                 "type": "response.create",
                 "response": {"instructions": instructions},
-            }))
+            }
+            if self._parallel_mode:
+                await self._request_response(ws, message, source="say")
+            else:
+                await ws.send(json.dumps(message))
         except Exception as exc:  # noqa: BLE001
             # 断线窗口内 say 失败不应炸掉整通电话（开场白路径直接 await）；
             # 重连由接收循环统一负责。
             logger.warning("发送说话指令失败: %s", exc)
+
+    def _spawn_response_task(self, operation: Coroutine[Any, Any, Any]) -> asyncio.Task:
+        task = asyncio.create_task(operation)
+        if self._parallel_mode:
+            self._background_tasks.add(task)
+            task.add_done_callback(self._response_task_done)
+        return task
+
+    def _response_task_done(self, task: asyncio.Task) -> None:
+        self._background_tasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.warning("OpenAI 后台任务失败: error_type=%s", type(error).__name__)
+
+    async def _request_response(self, ws: Any, message: dict, *, source: str) -> None:
+        task = asyncio.current_task()
+        was_owned = task in self._background_tasks
+        if task is not None:
+            self._background_tasks.add(task)
+        try:
+            async with self._response_lock:
+                while self._response_active or self._response_requested:
+                    await self._response_idle.wait()
+                    if not self._running or self.fatal or ws is not self._ws:
+                        return
+                if not self._running or self.fatal or ws is not self._ws:
+                    return
+                if source == "vad" and self._user_speaking:
+                    return  # A queued old stop must not answer across a newer speech_started.
+                # Reserve and arm BEFORE send yields: even created/done may
+                # arrive while the websocket is draining its outgoing buffer.
+                self._response_requested = True
+                self._response_idle.clear()
+                self._response_request_generation += 1
+                self._response_ack_task = self._spawn_response_task(self._watch_response_ack(
+                    ws, self._response_request_generation,
+                ))
+                try:
+                    await ws.send(json.dumps(message))
+                except BaseException:
+                    # An uncertain send must not authorize another create on this socket.
+                    self.fatal = True
+                    raise
+                logger.info("[timing] OpenAI response.create source=%s", source)
+        finally:
+            if task is not None and not was_owned:
+                self._background_tasks.discard(task)
+
+    async def _watch_response_ack(self, ws: Any, generation: int) -> None:
+        await asyncio.sleep(_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS)
+        if (self._running and ws is self._ws and self._response_requested
+                and generation == self._response_request_generation):
+            logger.error("OpenAI response.created 超时，结束会话而非重复创建回复")
+            self.fatal = True
+            self._response_idle.set()
 
     async def external_tool_result(
         self,
@@ -632,7 +722,10 @@ class OpenAIVoiceAgent(VoiceAgent):
     async def _send_manual_response(self, ws: Any) -> None:
         if ws is not self._ws or not self._running:
             raise ConnectionError("Realtime connection changed")
-        await ws.send(json.dumps({"type": "response.create"}))
+        if self._parallel_mode:
+            await self._request_response(ws, {"type": "response.create"}, source="manual")
+        else:
+            await ws.send(json.dumps({"type": "response.create"}))
 
     def _on_response_created(self) -> None:
         if not self._manual_response_enabled:
@@ -680,6 +773,11 @@ class OpenAIVoiceAgent(VoiceAgent):
                 )
             ):
                 return
+            if self._parallel_mode and self._response_active:
+                # A slow active response is not an idle conversation. Only its
+                # matching done (or replacing the connection) releases admission.
+                self._manual_response_watchdog_timer = None
+                return
             logger.warning(
                 "手动应答控制等待 OpenAI response.created/done 超时，清理状态"
             )
@@ -716,7 +814,8 @@ class OpenAIVoiceAgent(VoiceAgent):
 
     def _nudge_after_repeat_suppressed(self, _transcript: str) -> None:
         try:
-            asyncio.get_running_loop().create_task(
+            asyncio.get_running_loop()
+            self._spawn_response_task(
                 self.say(repeat_nudge_instructions(agent_language()))
             )
         except RuntimeError:
@@ -735,6 +834,9 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._manual_response_outstanding = 0
             self._manual_response_pending_after_flight = False
         ws, self._ws = self._ws, None
+        if self._parallel_mode:
+            await self._stop_parallel_transport(ws)
+            return
         if ws:
             try:
                 await ws.close()
@@ -757,6 +859,42 @@ class OpenAIVoiceAgent(VoiceAgent):
                 pass  # 任务自身异常不影响收尾
             await asyncio.gather(self._recv_task, return_exceptions=True)
             self._recv_task = None
+
+    async def _stop_parallel_transport(self, ws: Any) -> None:
+        # Cancel recv/reconnect BEFORE closing: it cannot publish a replacement
+        # socket during the closing handshake. Release response admission waiters.
+        self._response_idle.set()
+        tasks = set(self._background_tasks)
+        tasks.update(task for task in (self._recv_task, self._deaf_task) if task is not None)
+        tasks.discard(asyncio.current_task())
+        for task in tasks:
+            task.cancel()
+        started = time.monotonic()
+        try:
+            if ws is not None:
+                await self._close_parallel_socket(ws)
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.clear()
+            self._recv_task = None
+            self._deaf_task = None
+            logger.info("[timing] OpenAI 关闭完成 %.3fs", time.monotonic() - started)
+
+    async def _close_parallel_socket(self, ws: Any) -> None:
+        closing = asyncio.create_task(ws.close())
+        try:
+            done, _pending = await asyncio.wait({closing}, timeout=_PARALLEL_CLOSE_TIMEOUT_SECONDS)
+            if not done:
+                logger.warning("OpenAI websocket 关闭超时，强制终止传输")
+        finally:
+            failed = closing.done() and (closing.cancelled() or closing.exception() is not None)
+            if not closing.done() or failed:
+                transport = getattr(ws, "transport", None)
+                if transport is not None:
+                    transport.abort()
+            if not closing.done():
+                closing.cancel()
+            await asyncio.gather(closing, return_exceptions=True)
 
     async def _recv_loop(self) -> None:
         """接收循环：连接存活期间分发事件；断线走重连，全败置 fatal。"""
@@ -818,6 +956,7 @@ class OpenAIVoiceAgent(VoiceAgent):
                     _response_id(event), base64.b64decode(delta)
                 )
         elif event_type == "input_audio_buffer.speech_stopped":
+            self._user_speaking = False
             self._speech_stopped_at = time.monotonic()
             # audio_end_ms 是 provider 认定的语音终点（其输入缓冲时间轴）。
             # 与 speech_started 的 audio_start_ms 相减 = 它听到的语音时长，
@@ -826,6 +965,11 @@ class OpenAIVoiceAgent(VoiceAgent):
                 "[timing] provider 判停 (speech_stopped, audio_end_ms=%s)",
                 event.get("audio_end_ms"),
             )
+            if self._parallel_mode and not self._manual_response_enabled:
+                if self._vad_response_task is None or self._vad_response_task.done():
+                    self._vad_response_task = self._spawn_response_task(self._request_response(
+                        self._ws, {"type": "response.create"}, source="vad",
+                    ))
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (event.get("transcript") or "").strip()
             if transcript:
@@ -852,13 +996,20 @@ class OpenAIVoiceAgent(VoiceAgent):
             if name and call_id:
                 # 独立任务执行，避免工具耗时阻塞接收循环；捕获当前连接，
                 # 防止工具执行期间断线重连后把旧 call_id 的结果发进新会话。
-                asyncio.get_running_loop().create_task(
+                self._spawn_response_task(
                     self._dispatch_tool_call(name, call_id, arguments, self._ws)
                 )
         elif event_type == "response.created":
             self._response_active = True
+            if self._parallel_mode:
+                self._response_requested = False
+                self._active_response_id = _response_id(event)
+                self._response_idle.clear()
+                if self._response_ack_task is not None:
+                    self._response_ack_task.cancel()
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
+            self._user_speaking = True
             # 与 call_agent 的「本地检测到语音起点」对表用（WIL-112 暗区定位）。
             # audio_start_ms 是 provider 认定的语音起点在其输入缓冲时间轴上的
             # 位置——与 speech_stopped 的 audio_end_ms 相减即它听到的语音时长。
@@ -872,9 +1023,18 @@ class OpenAIVoiceAgent(VoiceAgent):
             # （半双工模式，BARGE_IN_ENABLED=false）时维持原行为：事件忽略。
             if self._on_user_interrupt is not None:
                 if self._emit_user_interrupt() and self._response_active:
-                    asyncio.get_running_loop().create_task(self.cancel_response())
+                    self._spawn_response_task(self.cancel_response())
         elif event_type == "response.done":
+            if self._parallel_mode and self._active_response_id is not None:
+                if _response_id(event) != self._active_response_id:
+                    return
             self._response_active = False
+            if self._parallel_mode:
+                self._response_requested = False
+                self._active_response_id = None
+                self._response_idle.set()
+                if self._response_ack_task is not None:
+                    self._response_ack_task.cancel()
             status = (event.get("response") or {}).get("status")
             if status in ("failed", "incomplete"):
                 # 轮次异常结束（内容审核/额度/服务端错误）：连接还活着，
@@ -953,6 +1113,9 @@ class OpenAIVoiceAgent(VoiceAgent):
             }))
             # hangup 后不再回复；DTMF 后等待 IVR 的下一段音频自然触发回复。
             if name not in TERMINAL_TOOLS and name not in SILENT_AFTER_TOOLS:
-                await ws.send(json.dumps({"type": "response.create"}))
+                if self._parallel_mode:
+                    await self._request_response(ws, {"type": "response.create"}, source="tool")
+                else:
+                    await ws.send(json.dumps({"type": "response.create"}))
         except Exception as exc:  # noqa: BLE001
             logger.warning("回传工具结果失败: %s", exc)
