@@ -1,0 +1,1 @@
+ACTION!="remove", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9001", ENV{ID_MM_DEVICE_IGNORE}="1"

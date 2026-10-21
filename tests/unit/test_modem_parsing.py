@@ -6,9 +6,16 @@ import logging
 import threading
 import time
 
+import pytest
 import serial
 
 from agentcall.modem import Eg25Modem, parse_sms_pdu
+
+
+@pytest.fixture(autouse=True)
+def _disable_pcm_pin_by_default(monkeypatch):
+    # Keep existing command/retry tests independent of the host platform.
+    monkeypatch.setenv("MODEM_PCM_PIN_8K", "false")
 
 
 def make_modem() -> Eg25Modem:
@@ -61,6 +68,48 @@ def test_sim7600_initialize_for_voice_enables_cpcmreg(monkeypatch, caplog):
     # 不再发 AT+CLVL（治的是不存在的削波，且每通白花 2.3s，见 WIL-104）。
     assert sent == ["AT+CPCMREG=1"]
     assert "AT+CPCMREG=1" in caplog.text
+
+
+def test_sim7600_pins_pcm_before_enable_on_every_call(monkeypatch):
+    monkeypatch.setenv("MODEM_PCM_PIN_8K", "true")
+    modem = make_sim7600()
+    sent = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "OK")
+
+    modem.initialize_for_voice("nmea")
+    modem._disable_voice_channel()
+    modem.initialize_for_voice("nmea")
+
+    assert sent == [
+        "AT+CPCMBANDWIDTH=1,1", "AT+CPCMREG=1", "AT+CPCMREG=0",
+        "AT+CPCMBANDWIDTH=1,1", "AT+CPCMREG=1",
+    ]
+    assert modem.last_voice_enable == {"ok": True, "attempts": 1, "degraded": False}
+
+
+@pytest.mark.parametrize("failure", ["ERROR", "", serial.SerialException("unavailable")])
+def test_sim7600_pcm_pin_failure_preserves_enable_retries(monkeypatch, caplog, failure):
+    monkeypatch.setenv("MODEM_PCM_PIN_8K", "true")
+    modem = make_sim7600()
+    sent = []
+    responses = iter(["ERROR", "OK"])
+
+    def fake_send(cmd):
+        sent.append(cmd)
+        if cmd == "AT+CPCMBANDWIDTH=1,1":
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+        return next(responses)
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    with caplog.at_level(logging.WARNING):
+        modem.initialize_for_voice("nmea")
+
+    assert sent == ["AT+CPCMBANDWIDTH=1,1", "AT+CPCMREG=1", "AT+CPCMREG=1"]
+    assert modem.last_voice_enable == {"ok": True, "attempts": 2, "degraded": True}
+    assert "CPCMBANDWIDTH" in caplog.text
 
 
 def test_sim7600_initialize_for_voice_all_error_does_not_raise(monkeypatch):

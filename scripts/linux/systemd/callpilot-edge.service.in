@@ -1,0 +1,25 @@
+[Unit]
+Description=CallPilot Edge (SIM7600)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+SupplementaryGroups=dialout
+# WorkingDirectory takes the whole path, without quote removal (systemd 252).
+WorkingDirectory=@REPO@
+ExecStart="@REPO@/.venv/bin/python" app.py
+Environment="PATH=@REPO@/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=WEB_OPEN_BROWSER=false
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

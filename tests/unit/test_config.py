@@ -196,6 +196,43 @@ def test_modem_defaults_follow_platforms(monkeypatch):
     assert get_spec("MODEM_AUDIO_MODE").choices == ("uac_ffmpeg", "uac", "nmea")
 
 
+@pytest.mark.parametrize(
+    ("is_linux", "is_macos", "is_windows", "expected"),
+    [(True, False, False, True), (False, True, False, False), (False, False, True, False)],
+    ids=["linux", "macos", "windows"],
+)
+def test_pcm_pin_platform_default(monkeypatch, is_linux, is_macos, is_windows, expected):
+    monkeypatch.setattr(platforms, "IS_LINUX", is_linux)
+    monkeypatch.setattr(platforms, "IS_MACOS", is_macos)
+    monkeypatch.setattr(platforms, "IS_WINDOWS", is_windows)
+    assert platforms.default_pcm_pin_8k() is expected
+    assert platforms.default_reset_after_call() is expected
+
+
+def test_pcm_pin_config_uses_platform_default_and_allows_override(monkeypatch):
+    _unset(monkeypatch, "MODEM_PCM_PIN_8K")
+    assert get_spec("MODEM_PCM_PIN_8K").kind == "bool"
+    assert get_bool("MODEM_PCM_PIN_8K") is platforms.default_pcm_pin_8k()
+    monkeypatch.setenv("MODEM_PCM_PIN_8K", "true")
+    assert get_bool("MODEM_PCM_PIN_8K") is True
+    monkeypatch.setenv("MODEM_PCM_PIN_8K", "false")
+    assert get_bool("MODEM_PCM_PIN_8K") is False
+
+
+def test_browser_open_default_remains_enabled(monkeypatch):
+    _unset(monkeypatch, "WEB_OPEN_BROWSER")
+    assert get_spec("WEB_OPEN_BROWSER").kind == "bool"
+    assert get_bool("WEB_OPEN_BROWSER") is True
+
+
+def test_reset_after_call_config_follows_platform_and_allows_override(monkeypatch):
+    _unset(monkeypatch, "MODEM_RESET_AFTER_CALL")
+    assert get_spec("MODEM_RESET_AFTER_CALL").kind == "bool"
+    assert get_bool("MODEM_RESET_AFTER_CALL") is platforms.default_reset_after_call()
+    monkeypatch.setenv("MODEM_RESET_AFTER_CALL", "false")
+    assert get_bool("MODEM_RESET_AFTER_CALL") is False
+
+
 def test_runtime_paths_default_to_project_cwd_or_env_override(tmp_path, monkeypatch):
     _unset(
         monkeypatch,

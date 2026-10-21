@@ -318,6 +318,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                requires_restart=True),
     ConfigSpec("MODEM_PCM_BAUD", "PCM 串口波特率", "int", "921600",
                requires_restart=True),
+    ConfigSpec("MODEM_PCM_PIN_8K", "SIM7600 PCM 固定 8kHz", "bool",
+               str(platforms.default_pcm_pin_8k()).lower(), editable=False, hidden=True),
+    ConfigSpec("MODEM_RESET_AFTER_CALL", "SIM7600 通话后重启模组", "bool",
+               str(platforms.default_reset_after_call()).lower(),
+               editable=False, hidden=True, requires_restart=True),
     ConfigSpec("MODEM_TX_GAIN", "上行发送增益", "float", "1.0"),
     # 对方语音送 AI 模型前的独立增益；每通开始读取，录音/监听仍保留各自路径。
     ConfigSpec("AGENT_UPLINK_GAIN", "AI 输入增益（对方语音）", "float", "1.0"),
@@ -493,6 +498,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("QWEN_PREWARM_INTERVAL", "Qwen 预热保活间隔（秒）", "float", "240.0",
                editable=False, hidden=True),
     # ---- Web 服务 ----
+    ConfigSpec("WEB_OPEN_BROWSER", "启动时打开浏览器", "bool", "true",
+               editable=False, hidden=True, requires_restart=True),
     ConfigSpec("WEB_HOST", "Web 监听地址", "str", "127.0.0.1",
                editable=False, requires_restart=True),
     # 默认用不常见的高位端口，规避 8000/8080 这类常见端口的占用冲突；

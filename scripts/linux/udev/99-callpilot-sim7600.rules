@@ -1,0 +1,5 @@
+# VID/PID are on the USB device, bInterfaceNumber is on its interface child.
+# Separate rules avoid requiring all ATTRS to match the same sysfs ancestor.
+SUBSYSTEM=="tty", KERNEL=="ttyUSB*", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9001", ENV{.CALLPILOT_SIM7600}="1"
+SUBSYSTEM=="tty", KERNEL=="ttyUSB*", ENV{.CALLPILOT_SIM7600}=="1", ATTRS{bInterfaceNumber}=="02", SYMLINK+="callpilot-sim7600-at", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", KERNEL=="ttyUSB*", ENV{.CALLPILOT_SIM7600}=="1", ATTRS{bInterfaceNumber}=="04", SYMLINK+="callpilot-sim7600-pcm", GROUP="dialout", MODE="0660"
