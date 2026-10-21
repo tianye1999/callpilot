@@ -154,7 +154,11 @@ def test_blocked_hold_obeys_overall_deadline_and_recovers(monkeypatch) -> None:
 
     async def run() -> None:
         await asyncio.wait_for(session._speak_takeover_hold_if_needed(BlockedHoldAgent(), FakeAudioBridge(), 4), 0.2)
-        session._expire_takeover(generation=4)
+        # Production polls _expire_takeover every loop turn; this single call must
+        # not depend on clock granularity (~15.6ms on Windows/Python 3.12).
+        deadline = session._takeover_deadline
+        assert deadline is not None
+        session._expire_takeover(generation=4, now=deadline + 0.001)
         await session._resume_ai_after_takeover(FakeAgent(), FakeAudioBridge(), 4)
 
     asyncio.run(run())
