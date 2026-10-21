@@ -771,12 +771,19 @@ class SerialModem:
         if any(ch not in valid for ch in digits):
             logger.warning("DTMF 输入无效: count=%d, result=failure", len(digits))
             return False
+        send_seconds = 0.0
         for ch in digits:
-            if not self._send_dtmf_digit(ch):
+            started = time.monotonic()
+            ok = self._send_dtmf_digit(ch)
+            send_seconds += time.monotonic() - started
+            if not ok:
                 logger.warning("DTMF 发送失败: count=%d, result=failure", len(digits))
                 return False
             time.sleep(0.15)  # 位间间隔，防止连音被 IVR 吞掉
-        logger.info("DTMF 发送完成: count=%d, result=success", len(digits))
+        logger.info(
+            "DTMF 发送完成: count=%d, result=success, send_seconds=%.3f",
+            len(digits), send_seconds,
+        )
         return True
 
     def _send_dtmf_digit(self, ch: str) -> bool:
@@ -891,7 +898,16 @@ class SerialModem:
             return self._write_command(cmd)
 
     def _write_command(self, cmd: str) -> str:
+        started = time.monotonic()
         with self._serial_lock:
+            wait_seconds = time.monotonic() - started
+            if wait_seconds > 0.2:
+                # Extract only an AT verb, never dialed numbers, DTMF or SMS payloads.
+                command_name = re.match(r"AT(?:[+&^%][A-Z]+|[A-Z])?", cmd.strip().upper())
+                logger.info(
+                    "[timing] 串口锁等待 %.3fs cmd=%s",
+                    wait_seconds, command_name.group(0) if command_name else "unknown",
+                )
             if self.transport_paused:
                 raise serial.SerialException("SIM7600 模组重启中，暂停 AT")
             if not self._ser or not self._ser.is_open:
@@ -934,7 +950,10 @@ class SerialModem:
                     generation = self._maintenance_generation
                     if not self._ser or not self._ser.is_open:
                         raise serial.SerialException("串口未打开")
-                    raw = self._ser.read(self._ser.in_waiting or 1)
+                    # Keep the availability check and read atomic with command responses;
+                    # never hold the lock waiting for a byte that has not arrived yet.
+                    waiting = self._ser.in_waiting
+                    raw = self._ser.read(waiting) if waiting else b""
             except (serial.SerialException, OSError) as exc:
                 if not self._running:
                     break
@@ -955,6 +974,8 @@ class SerialModem:
                 logger.error("读线程意外异常，继续运行: %s", exc)
                 time.sleep(1.0)
                 continue
+            # RLock is not fair: yield outside it even during continuous URC traffic.
+            time.sleep(0.01)
             if not raw:
                 continue
             if generation != self._maintenance_generation:
