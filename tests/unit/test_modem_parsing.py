@@ -687,8 +687,19 @@ def test_reader_drops_data_invalidated_during_yield(monkeypatch, invalidate):
 def test_write_command_lock_timing_logs_only_safe_prefix(monkeypatch, caplog, command, prefix, wait_seconds):
     modem = make_modem()
     modem._ser = FakeSerial()
-    timestamps = iter([0.0, wait_seconds])
-    monkeypatch.setattr("agentcall.modem.time.monotonic", lambda: next(timestamps))
+    # Patching time.monotonic is process-wide: other threads (e.g. on Windows/3.13)
+    # may call it too. Script only this thread's readings; everyone else gets real
+    # time, and extra calls here hold the last value instead of StopIteration.
+    test_thread = threading.get_ident()
+    scripted = iter([0.0, wait_seconds])
+    real_monotonic = time.monotonic
+
+    def fake_monotonic() -> float:
+        if threading.get_ident() != test_thread:
+            return real_monotonic()
+        return next(scripted, wait_seconds)
+
+    monkeypatch.setattr("agentcall.modem.time.monotonic", fake_monotonic)
 
     with caplog.at_level(logging.INFO):
         assert "OK" in modem._write_command(command)
