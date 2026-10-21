@@ -189,6 +189,11 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._vad_response_task: asyncio.Task | None = None
         self._response_ack_task: asyncio.Task | None = None
         self._response_request_generation = 0
+        self._response_request_started_at = 0.0
+        self._response_recovering = False
+        self._completed_response_ids: set[str] = set()
+        self._manual_response_task: asyncio.Task | None = None
+        self._manual_response_due = False
         self._user_speaking = False
 
     # ---- 连接管理 ----
@@ -238,6 +243,9 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._user_speaking = False
             self._response_requested = False
             self._active_response_id = None
+            self._response_recovering = False
+            self._completed_response_ids.clear()
+            self._manual_response_due = False
             self._response_idle.set()
             self._response_request_generation += 1
 
@@ -364,8 +372,20 @@ class OpenAIVoiceAgent(VoiceAgent):
         ws = self._ws
         if ws is None:
             return False
+        if self._parallel_mode:
+            return await self._cancel_parallel_response(ws, self._active_response_id)
         try:
             await ws.send(json.dumps({"type": "response.cancel"}))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("打断本轮回复失败: error_type=%s", type(exc).__name__)
+            return False
+        return True
+
+    async def _cancel_parallel_response(self, ws: Any, response_id: str | None) -> bool:
+        if ws is not self._ws or response_id is None or self._response_recovering:
+            return False
+        try:
+            await ws.send(json.dumps({"type": "response.cancel", "response_id": response_id}))
         except Exception as exc:  # noqa: BLE001
             logger.warning("打断本轮回复失败: error_type=%s", type(exc).__name__)
             return False
@@ -383,7 +403,7 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._deaf_task = asyncio.create_task(self._deaf_watchdog())
 
-    async def _reconnect(self) -> bool:
+    async def _reconnect(self, *, announce: bool = True) -> bool:
         """断线重连（参照 qwen_agent 语义）；全部失败返回 False。"""
         max_attempts = _reconnect_max()
         for attempt in range(1, max_attempts + 1):
@@ -410,10 +430,11 @@ class OpenAIVoiceAgent(VoiceAgent):
                         pass
                 return True
             logger.info("OpenAI Realtime 重连成功(第 %d/%d 次)", attempt, max_attempts)
-            try:
-                await self.say(RECONNECT_NOTICE)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("重连后安抚语发送失败: %s", exc)
+            if announce:
+                try:
+                    await self.say(RECONNECT_NOTICE)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("重连后安抚语发送失败: %s", exc)
             return True
         return False
 
@@ -542,23 +563,40 @@ class OpenAIVoiceAgent(VoiceAgent):
                         return
                 if not self._running or self.fatal or ws is not self._ws:
                     return
-                if source == "vad" and self._user_speaking:
+                if self._response_recovering:
+                    return
+                if source in ("vad", "manual") and self._user_speaking:
+                    if source == "manual":
+                        self._manual_response_due = True
                     return  # A queued old stop must not answer across a newer speech_started.
                 # Reserve and arm BEFORE send yields: even created/done may
                 # arrive while the websocket is draining its outgoing buffer.
                 self._response_requested = True
                 self._response_idle.clear()
                 self._response_request_generation += 1
+                generation = self._response_request_generation
+                self._response_request_started_at = time.monotonic()
+                if source == "manual":
+                    self._manual_response_due = False
+                message = {**message, "response": {
+                    **message.get("response", {}),
+                    "metadata": {"agentcall_request": str(self._response_request_generation)},
+                }}
                 self._response_ack_task = self._spawn_response_task(self._watch_response_ack(
                     ws, self._response_request_generation,
                 ))
-                try:
-                    await ws.send(json.dumps(message))
-                except BaseException:
-                    # An uncertain send must not authorize another create on this socket.
+            # Admission is reserved above; do not hold the lock across a socket
+            # drain, which may itself be stalled when recovery replaces the socket.
+            try:
+                await ws.send(json.dumps(message))
+            except BaseException:
+                # Closing a fenced socket may fail an in-flight send. That is
+                # recovery, not a fatal error on the replacement connection.
+                if (self._running and ws is self._ws and not self._response_recovering
+                        and generation == self._response_request_generation):
                     self.fatal = True
-                    raise
-                logger.info("[timing] OpenAI response.create source=%s", source)
+                raise
+            logger.info("[timing] OpenAI response.create source=%s request=%d", source, generation)
         finally:
             if task is not None and not was_owned:
                 self._background_tasks.discard(task)
@@ -566,10 +604,35 @@ class OpenAIVoiceAgent(VoiceAgent):
     async def _watch_response_ack(self, ws: Any, generation: int) -> None:
         await asyncio.sleep(_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS)
         if (self._running and ws is self._ws and self._response_requested
-                and generation == self._response_request_generation):
-            logger.error("OpenAI response.created 超时，结束会话而非重复创建回复")
-            self.fatal = True
-            self._response_idle.set()
+                and generation == self._response_request_generation
+                and not self._response_recovering):
+            elapsed = time.monotonic() - self._response_request_started_at
+            logger.warning("OpenAI response.created 等待超时 request=%d elapsed=%.3fs；"
+                           "隔离旧连接并重连，不结束通话", generation, elapsed)
+            self._emit_latency("response_ack_timeout", round(elapsed * 1000, 1))
+            # Missing ACK is not evidence of idleness. Fence this socket until
+            # recv_loop reconnects; never release admission on the uncertain session.
+            self._response_recovering = True
+            await self._close_parallel_socket(ws)
+
+    def _accept_parallel_response_event(self, event: dict) -> bool:
+        response = event.get("response") or {}
+        request = (response.get("metadata") or {}).get("agentcall_request")
+        response_id = _response_id(event)
+        stale = (
+            (request is not None and request != str(self._response_request_generation))
+            or response_id in self._completed_response_ids
+            or (self._active_response_id is not None and response_id != self._active_response_id)
+        )
+        if stale:
+            logger.info("OpenAI 忽略迟到回复事件 type=%s response=%s request=%s current=%d",
+                        event.get("type"), response_id, request, self._response_request_generation)
+            return False
+        # A done without a created may acknowledge only its own tagged request,
+        # not an unidentified old cancellation on a new pending request.
+        if event.get("type") == "response.done" and self._active_response_id is None:
+            return self._response_requested and request is not None
+        return self._response_requested or self._response_active
 
     async def external_tool_result(
         self,
@@ -680,6 +743,17 @@ class OpenAIVoiceAgent(VoiceAgent):
         return min(silence_seconds, max(0.0, max_wait_seconds - elapsed))
 
     def _fire_manual_response_timer(self, generation: int) -> None:
+        if self._parallel_mode:
+            # The timer owns debounce only. All response state lives on the event loop.
+            with self._manual_response_lock:
+                if generation != self._manual_response_generation or not self._running:
+                    return
+                self._manual_response_timer = None
+                self._manual_response_first_at = None
+                ws, loop = self._ws, self._loop
+            if ws is not None and loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self._queue_parallel_manual_response, ws)
+            return
         with self._manual_response_lock:
             if generation != self._manual_response_generation or not self._running:
                 return
@@ -719,6 +793,22 @@ class OpenAIVoiceAgent(VoiceAgent):
             if should_schedule:
                 self._schedule_manual_response_timer()
 
+    def _queue_parallel_manual_response(self, ws: Any) -> None:
+        if (ws is None or not self._running or self.fatal
+                or ws is not self._ws or self._response_recovering):
+            return
+        self._manual_response_due = True
+        if self._manual_response_task is None or self._manual_response_task.done():
+            self._manual_response_task = self._spawn_response_task(self._send_manual_response(ws))
+            self._manual_response_task.add_done_callback(self._parallel_manual_response_sent)
+
+    def _parallel_manual_response_sent(self, task: asyncio.Task) -> None:
+        # created/done can precede send completion; retain any debounce that
+        # arrived during that drain instead of losing the next turn.
+        if (not task.cancelled() and task.exception() is None
+                and self._manual_response_due and not self._user_speaking):
+            self._queue_parallel_manual_response(self._ws)
+
     async def _send_manual_response(self, ws: Any) -> None:
         if ws is not self._ws or not self._running:
             raise ConnectionError("Realtime connection changed")
@@ -728,7 +818,7 @@ class OpenAIVoiceAgent(VoiceAgent):
             await ws.send(json.dumps({"type": "response.create"}))
 
     def _on_response_created(self) -> None:
-        if not self._manual_response_enabled:
+        if self._parallel_mode or not self._manual_response_enabled:
             return
         with self._manual_response_lock:
             if not self._running:
@@ -762,6 +852,8 @@ class OpenAIVoiceAgent(VoiceAgent):
         next_timer.start()
 
     def _fire_manual_response_watchdog(self, generation: int) -> None:
+        if self._parallel_mode:
+            return
         should_schedule = False
         with self._manual_response_lock:
             if (
@@ -772,11 +864,6 @@ class OpenAIVoiceAgent(VoiceAgent):
                     and self._manual_response_outstanding <= 0
                 )
             ):
-                return
-            if self._parallel_mode and self._response_active:
-                # A slow active response is not an idle conversation. Only its
-                # matching done (or replacing the connection) releases admission.
-                self._manual_response_watchdog_timer = None
                 return
             logger.warning(
                 "手动应答控制等待 OpenAI response.created/done 超时，清理状态"
@@ -791,6 +878,10 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._schedule_manual_response_timer()
 
     def _on_response_done(self) -> None:
+        if self._parallel_mode:
+            if self._manual_response_enabled and self._manual_response_due:
+                self._queue_parallel_manual_response(self._ws)
+            return
         if not self._manual_response_enabled:
             return
         should_schedule = False
@@ -921,6 +1012,7 @@ class OpenAIVoiceAgent(VoiceAgent):
             if not self._running:
                 break
             self._cancel_manual_response_control()
+            recovering_response = self._parallel_mode and self._response_recovering
             # 立即摘掉死连接：重连期间 send_audio/say 看到 _ws 为 None 会
             # 静默丢帧（对齐 qwen 语义），否则每 10ms 一帧的上行都对死连接
             # send 并各刷一条 warning（重连数秒内可积数百条）。
@@ -928,13 +1020,21 @@ class OpenAIVoiceAgent(VoiceAgent):
             # 通话进行中断线：尝试重连；全部失败则会话不可恢复，置 fatal
             # 让 CallSession 主循环结束整通电话（避免"电话活着但 AI 已死"）。
             logger.warning("OpenAI Realtime 运行中断线，尝试重连")
-            if not await self._reconnect():
+            # ACK recovery must not automatically create another reply: a silent
+            # provider would otherwise create a reconnect -> notice -> timeout loop.
+            reconnected = (await self._reconnect(announce=False) if recovering_response
+                           else await self._reconnect())
+            if not reconnected:
                 logger.error("OpenAI Realtime 重连全部失败，标记会话不可恢复")
                 self.fatal = True
                 return
+            if recovering_response:
+                self._emit_latency("response_ack_reconnected", 0.0)
 
     def _handle_event(self, event: dict) -> None:
         event_type = event.get("type", "")
+        if self._parallel_mode and self._response_recovering:
+            return  # Drain late old-session events, including audio, while closing.
         # 任何服务端事件都喂失聪看门狗的时钟（含未识别类型）。
         self._last_event_at = time.monotonic()
         self._deaf_warned = False
@@ -957,6 +1057,8 @@ class OpenAIVoiceAgent(VoiceAgent):
                 )
         elif event_type == "input_audio_buffer.speech_stopped":
             self._user_speaking = False
+            if self._parallel_mode and self._manual_response_enabled and self._manual_response_due:
+                self._queue_parallel_manual_response(self._ws)
             self._speech_stopped_at = time.monotonic()
             # audio_end_ms 是 provider 认定的语音终点（其输入缓冲时间轴）。
             # 与 speech_started 的 audio_start_ms 相减 = 它听到的语音时长，
@@ -1000,6 +1102,8 @@ class OpenAIVoiceAgent(VoiceAgent):
                     self._dispatch_tool_call(name, call_id, arguments, self._ws)
                 )
         elif event_type == "response.created":
+            if self._parallel_mode and not self._accept_parallel_response_event(event):
+                return
             self._response_active = True
             if self._parallel_mode:
                 self._response_requested = False
@@ -1007,6 +1111,10 @@ class OpenAIVoiceAgent(VoiceAgent):
                 self._response_idle.clear()
                 if self._response_ack_task is not None:
                     self._response_ack_task.cancel()
+                elapsed_ms = (time.monotonic() - self._response_request_started_at) * 1000
+                logger.info("[timing] OpenAI response.created response=%s request=%d elapsed=%.3fs",
+                            self._active_response_id, self._response_request_generation, elapsed_ms / 1000)
+                self._emit_latency("response_created", round(elapsed_ms, 1))
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
             self._user_speaking = True
@@ -1023,13 +1131,24 @@ class OpenAIVoiceAgent(VoiceAgent):
             # （半双工模式，BARGE_IN_ENABLED=false）时维持原行为：事件忽略。
             if self._on_user_interrupt is not None:
                 if self._emit_user_interrupt() and self._response_active:
-                    self._spawn_response_task(self.cancel_response())
+                    if self._parallel_mode:
+                        # Capture now, not when the coroutine eventually runs: an
+                        # old barge-in must never cancel a subsequent response.
+                        self._spawn_response_task(self._cancel_parallel_response(
+                            self._ws, self._active_response_id,
+                        ))
+                    else:
+                        self._spawn_response_task(self.cancel_response())
         elif event_type == "response.done":
-            if self._parallel_mode and self._active_response_id is not None:
-                if _response_id(event) != self._active_response_id:
-                    return
+            if self._parallel_mode and not self._accept_parallel_response_event(event):
+                return
             self._response_active = False
             if self._parallel_mode:
+                response_id = _response_id(event)
+                if response_id is not None:
+                    self._completed_response_ids.add(response_id)
+                logger.info("[timing] OpenAI response.done response=%s request=%d",
+                            response_id, self._response_request_generation)
                 self._response_requested = False
                 self._active_response_id = None
                 self._response_idle.set()
