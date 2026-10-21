@@ -1464,6 +1464,7 @@ class CallSession:
                     number,
                     result_verification,
                     service_number,
+                    self._outbound_task(agent_language()),
                 ),
                 daemon=True,
                 name="call-summary",
@@ -1488,6 +1489,7 @@ class CallSession:
         number: str | None,
         result_verification: str = "none",
         service_number: str = "",
+        learner_task: str = "",
     ) -> None:
         """后台线程：调大模型生成结构化摘要并写盘/推送。"""
         try:
@@ -1542,7 +1544,7 @@ class CallSession:
                 self._publish({"type": "call_summary", "call_id": record.id, **result})
             else:
                 logger.warning("通话摘要生成失败: %s", result.get("error"))
-            self._maybe_learn_playbook(record, transcripts, direction, number)
+            self._maybe_learn_playbook(record, transcripts, direction, number, task=learner_task)
         except Exception as exc:  # noqa: BLE001
             logger.exception("通话摘要线程异常: %s", exc)
             try:
@@ -1558,6 +1560,8 @@ class CallSession:
         transcripts: list[tuple[str, str]],
         direction: str,
         number: str | None,
+        *,
+        task: str,
     ) -> None:
         """呼叫情报库自动回流（WIL-129）：摘要线程尾部顺跑一次 learner。
 
@@ -1574,6 +1578,7 @@ class CallSession:
                 self._profile_task_package,
                 call_id=record.id,
                 updated=time.strftime("%Y-%m-%d"),
+                task=task,
             )
             if not learned:
                 return
@@ -1583,8 +1588,10 @@ class CallSession:
                 for entry in learned.get("required_info", [])
                 if isinstance(entry, dict)
             ]
+            requirements = call_playbooks.required_info_status(learned)
             record.log_event(
-                "playbook_updated", playbook_id=learned.get("id"), keys=keys
+                "playbook_updated", playbook_id=learned.get("id"), keys=keys,
+                requirements=requirements,
             )
             self._publish(
                 {
@@ -1592,6 +1599,7 @@ class CallSession:
                     "call_id": record.id,
                     "playbook_id": learned.get("id"),
                     "keys": keys,
+                    "requirements": requirements,
                 }
             )
         except Exception:  # noqa: BLE001
@@ -1897,11 +1905,26 @@ class CallSession:
         if direction == "outbound" and call_playbooks.playbooks_enabled():
             # 呼叫情报库（WIL-129）：命中热线的 IVR 流程知识拼进场景——导航
             # 纪律从"每个预设手写"升级为"按热线沉淀共享"。lookup 宽松 never-raises。
-            notes = call_playbooks.ivr_notes_text(
-                call_playbooks.lookup_playbook(self.current_caller), lang
-            )
+            playbook = call_playbooks.lookup_playbook(self.current_caller)
+            notes = call_playbooks.ivr_notes_text(playbook, lang)
             if notes:
                 scenario = f"{scenario}\n{notes}" if scenario else notes
+            hints = call_playbooks.soft_info_text(playbook, lang)
+            if hints:
+                scenario = f"{scenario}\n{hints}" if scenario else hints
+                requirements = [
+                    status for status in call_playbooks.required_info_status(playbook)
+                    if status["level"] == "soft"
+                ]
+                fields = {"playbook_id": (playbook or {}).get("id"), "requirements": requirements}
+                logger.info("playbook_soft_hints_injected %s", fields)
+                if self._record is not None:
+                    self._record.log_event("playbook_soft_hints_injected", **fields)
+                self._publish({
+                    "type": "playbook_soft_hints_injected",
+                    "call_id": self._record.id if self._record is not None else None,
+                    **fields,
+                })
         triage_mode = self._triage_mode if direction == "inbound" else "off"
         takeover_preference = (
             config.get_str("INBOUND_TAKEOVER_PREFERENCE")
@@ -3508,7 +3531,8 @@ class CallAgentService:
         """拨前硬拦截（WIL-129）：热线情报库要求的必备信息，预设里必须齐。
 
         情报库存"要什么"（键定义），预设 task_package.verification 存"是什么"
-        （值）。命中情报且缺任一必备键即拒绝拨号——信息缺口应在拨号前暴露，
+        （值）。种子/人工字段及达到独立证据阈值的 learner 字段缺失时拒绝拨号；
+        证据不足的 learner 字段仅注入给 AI 参考，不参与拨前拦截。信息缺口应在拨号前暴露，
         而不是在通话里白打一通（611 演练实锤）。库未命中/开关关闭时放行；
         检查器自身异常也放行（挡住拨号主链路比漏检更糟）。
         """

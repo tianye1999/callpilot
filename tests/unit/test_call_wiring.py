@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
-from agentcall import config
+from agentcall import call_playbooks, config
 from agentcall.call_agent import CallAgentService
 from agentcall.call_log import CallLogger
 from agentcall.events import EventHub
@@ -1957,6 +1957,95 @@ def test_playbook_notes_not_injected_when_disabled():
     assert "对语音菜单只说短词" not in text
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_soft_playbook_dial_is_allowed_and_hints_are_injected_with_events(tmp_path, monkeypatch, legacy):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    monkeypatch.setenv("AGENT_LANGUAGE", "zh")
+    pb = _drill_playbook()
+    field = pb["required_info"][0]
+    field["source"] = {"call_id": "old-call", "date": "2026-10-21"}
+    if not legacy:
+        field["evidence"] = [{"call_id": "old-call", "hard_eligible": True}]
+    _write_playbook_env_file([pb])
+    base = tmp_path / "records"
+    service = make_service(FakeModem(), call_logger=CallLogger(base))
+    starts = []
+    monkeypatch.setattr(service.session, "start", lambda **kwargs: starts.append(kwargs))
+    assert service.dial("611") == (True, None)
+    assert len(starts) == 1
+    record = service.session._begin_record("outbound", "611")
+    assert record is not None
+    service.session._record = record
+    service.session._profile_task_package = {"verification": {"account_pin": "secret-value"}}
+    text = service.session._build_agent_instructions("outbound")
+    assert "account_pin" in text and "不是必备条件" in text
+    assert "对语音菜单只说短词。" in text
+    record.finish("completed")
+    events = call_events(base)
+    injected = [e for e in events if e["type"] == "playbook_soft_hints_injected"]
+    assert len(injected) == 1
+    assert injected[0]["requirements"][0]["evidence_count"] == (0 if legacy else 1)
+    assert injected[0]["requirements"][0]["reason"] == "insufficient_eligible_evidence"
+    assert "secret-value" not in json.dumps(events)
+    assert "不是必备条件" not in service.session._build_agent_instructions("inbound")
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "false")
+    assert "不是必备条件" not in service.session._build_agent_instructions("outbound")
+
+
+def test_two_eligible_calls_block_the_actual_dial_gate(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    payload = {
+        "new_required_info": [{
+            "key": "verification_code", "label": {"en": "Verification code"},
+            "purpose": {"en": "Required to complete the task"},
+            "hard_eligible": True, "evidence_reason": "Explicit gate on the successful normal route",
+        }],
+    }
+    service = make_service(FakeModem())
+    starts = []
+    monkeypatch.setattr(service.session, "start", lambda **kwargs: starts.append(kwargs))
+    call_playbooks.merge_learned("611", payload, call_id="a", updated="2026-10-21")
+    assert service.dial("611") == (True, None)
+    call_playbooks.merge_learned("611", payload, call_id="b", updated="2026-10-21")
+    ok, error = service.dial("611")
+    assert ok is False and "verification_code" in error
+    assert len(starts) == 1
+
+
+def test_playbook_learner_uses_goal_snapshot_when_next_call_has_started(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUMMARY_ENABLED", "true")
+    service = make_service(FakeModem(), call_logger=CallLogger(tmp_path / "records"))
+    session = service.session
+    session._preset_hint = "Old preset lookup topic"
+    session._outbound_task_value = "Check the current balance"
+    record = session._begin_record("outbound", "611")
+    assert record is not None
+    pending = []
+    seen = {}
+
+    class DeferredThread:
+        def __init__(self, *, target, args, **kwargs):
+            pending.append(lambda: target(*args))
+
+        def start(self):
+            pass
+
+    def fake_learn(*args, **kwargs):
+        seen["task"] = kwargs["task"]
+        return None
+
+    monkeypatch.setattr("agentcall.call_agent.threading.Thread", DeferredThread)
+    monkeypatch.setattr("agentcall.call_agent.summarize_call", lambda *args: {"ok": True, "summary": "s"})
+    monkeypatch.setattr("agentcall.call_playbooks.learn_from_call", fake_learn)
+    session._maybe_summarize(record, [("user", "Your balance is available.")], "outbound", "611")
+    session._preset_hint = "A different task in the next call"
+    session._outbound_task_value = "A different task in the next call"
+    record.finish("completed")
+    assert len(pending) == 1
+    pending[0]()
+    assert seen["task"] == "Check the current balance"
+
+
 def test_summary_worker_triggers_playbook_learner(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "agentcall.call_agent.summarize_call",
@@ -1967,6 +2056,7 @@ def test_summary_worker_triggers_playbook_learner(tmp_path, monkeypatch):
     def fake_learn(number, transcripts, package, *, call_id, updated, **kwargs):
         seen["number"] = number
         seen["call_id"] = call_id
+        seen["task"] = kwargs.get("task")
         return {
             "id": "att_prepaid_611",
             "required_info": [{"key": "activation_zip"}],
@@ -1975,13 +2065,17 @@ def test_summary_worker_triggers_playbook_learner(tmp_path, monkeypatch):
     monkeypatch.setattr("agentcall.call_playbooks.learn_from_call", fake_learn)
     base = tmp_path / "rec"
     service = make_service(FakeModem(), call_logger=CallLogger(base))
+    service.session._preset_hint = "Check the current balance"
     record = service.session._begin_record("outbound", "611")
     assert record is not None
     record.finish("completed")
     service.session._summarize_worker(
-        record, [("user", "please say your zip")], "outbound", "611", "none", ""
+        record, [("user", "please say your zip")], "outbound", "611", "none", "",
+        learner_task="Check the current balance",
     )
     assert seen["number"] == "611" and seen["call_id"] == record.id
+    assert seen["task"] == "Check the current balance"
     events = call_events(base)
     updated = [e for e in events if e.get("type") == "playbook_updated"]
     assert updated and updated[0]["keys"] == ["activation_zip"]
+    assert updated[0]["requirements"][0]["reason"] == "seed_or_manual"
