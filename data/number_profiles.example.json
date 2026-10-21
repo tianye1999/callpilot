@@ -86,6 +86,28 @@
       "result_verification": "carrier_sms"
     },
     {
+      "id": "china_mobile_current_balance",
+      "number": "10086",
+      "task": {
+        "zh": "查询话费余额",
+        "en": "check account balance"
+      },
+      "label": {
+        "zh": "中国移动·查话费余额",
+        "en": "China Mobile · Balance"
+      },
+      "scenario": {
+        "zh": "你在替机主拨打中国移动客服热线10086，查询机主名下这个号码当前的话费余额。你是主叫、替机主求助的一方，不是客服、不代表移动、不冒充机主本人。拨通后完整听完首段 IVR，按提示用短词或调用 send_dtmf 真正按键。对方未明确给出金额前不编造、不声称已查到；可请求对方把余额通过官方短信发到本机。通话里听到的金额只作过程参考，不得作为已经核实的最终结果；告诉机主最终余额以通话后收到的官方短信为准。",
+        "en": "You are calling China Mobile's 10086 hotline on the owner's behalf to check the current account balance on the owner's number. You are the caller asking for help, not a customer-service agent; you do not represent China Mobile and must never impersonate the owner. Listen through the first IVR announcement completely, then use short spoken choices or call send_dtmf to actually press keys as prompted. Before an amount is explicitly given, never fabricate one or claim you have checked the balance. You may ask the carrier to send the balance to this device by official SMS. Treat any amount heard during the call only as provisional; the final balance must be based on the official post-call SMS."
+      },
+      "opening": {
+        "zh": "你好，我想查一下这个号码的话费余额。",
+        "en": "Hi, I'd like to check the account balance."
+      },
+      "opening_mode": "wait",
+      "result_verification": "carrier_sms"
+    },
+    {
       "id": "china_unicom_data",
       "number": "10010",
       "task": {

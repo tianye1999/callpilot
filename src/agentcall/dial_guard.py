@@ -46,10 +46,11 @@ def check_dial_guard(
         and sim_identity.reg_status not in _EXPLICIT_UNREGISTERED
     ):
         return DialGuardFailure("SIM_NOT_READY", "SIM 卡未插入或尚未就绪")
-    if not sim_identity.registered:
+    # 仅放宽明确的 CS 未注册状态:EPS 已注册时可走 VoLTE,未就绪判定保持不变。
+    if not sim_identity.network_attached:
         return DialGuardFailure(
             "SIM_NOT_REGISTERED",
-            f"SIM 卡尚未注册到网络（{sim_identity.reg_status}）",
+            f"SIM 卡尚未注册到网络（CS：{sim_identity.reg_status}；LTE：{sim_identity.eps_status}）",
         )
     normalized = (number or "").strip()
     if normalized in KNOWN_SERVICE_NUMBERS:

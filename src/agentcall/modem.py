@@ -208,7 +208,7 @@ class SerialModem:
         self.baudrate = baudrate
         # port 为 auto 哨兵时每次打开都重新探测，这里存本次解析出的实际端口（供日志）。
         self._active_port: str | None = None
-        # SIM 身份缓存(#88):连接/重连后读一次 CIMI/CREG;换卡靠重插/重连触发刷新。
+        # SIM 身份缓存(#88):连接/重连后读一次 CIMI/CREG/CEREG;换卡靠重插/重连触发刷新。
         self._sim_identity: SimIdentity = UNKNOWN_SIM
         self._ser: serial.Serial | None = None
         self._reader_thread: threading.Thread | None = None
@@ -294,8 +294,8 @@ class SerialModem:
         notify: bool = True,
         expected_generation: int | None = None,
     ) -> None:
-        """读 CIMI/CREG 刷新 SIM 身份缓存(#88);AT 逻辑失败降级为 UNKNOWN_SIM,
-        传输层故障上抛。connect/重连(``_open_serial``,已持串口锁)自动调用,
+        """读 CIMI/CREG/CEREG 刷新 SIM 身份缓存(#88)。CIMI/CREG 传输故障上抛,
+        可选 CEREG 失败只降级 EPS 为未知。connect/重连(``_open_serial``,已持串口锁)自动调用,
         换卡经拔插重连天然刷新;也可被上层主动调用重刷。
 
         已知限制(follow-up):不拔卡热换 SIM、注册状态后续变化不会自动上报刷新
@@ -325,6 +325,12 @@ class SerialModem:
             raise
         except Exception:  # noqa: BLE001
             creg_raw = ""
+        # VoLTE-only 卡可能 CS 被拒而 LTE 已注册;不支持 CEREG 的固件沿用 CS 结果。
+        try:
+            cereg_raw = self._send("AT+CEREG?")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("AT+CEREG? 读取失败: %s", type(exc).__name__)
+            cereg_raw = ""
         if (
             expected_generation is not None
             and expected_generation != self._sim_refresh_generation
@@ -334,7 +340,7 @@ class SerialModem:
         # /api/meta 展示）拿到的都是同一份「有效身份」，不必各自处理配置。
         self._set_sim_identity(
             with_service_number_override(
-                identify(imsi_raw, creg_raw),
+                identify(imsi_raw, creg_raw, cereg_raw),
                 config.get_str("CARRIER_HOTLINE"),
             ),
             notify=notify,
@@ -342,8 +348,8 @@ class SerialModem:
         sim = self._sim_identity
         if sim.present:
             logger.info(
-                "SIM 识别: %s (PLMN %s) → 免费客服 %s | 网络: %s",
-                sim.carrier, sim.plmn, sim.service_number or "?", sim.reg_status,
+                "SIM 识别: %s (PLMN %s) → 免费客服 %s | 网络: CS=%s LTE=%s",
+                sim.carrier, sim.plmn, sim.service_number or "?", sim.reg_status, sim.eps_status,
             )
         else:
             logger.warning("SIM 识别失败(未插卡/未就绪): %s", sim.reg_status)

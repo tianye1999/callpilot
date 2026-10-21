@@ -3698,8 +3698,10 @@ function renderSetupHardware() {
   if (!box) return;
   box.textContent = "";
   const sim = meta.sim || {};
+  const simRegistration = !sim.registered && sim.eps_registered
+    ? `网络已接入 · LTE ${sim.eps_status}` : sim.reg_status;
   const simText = sim.present
-    ? `${sim.carrier} · ${sim.reg_status}` + (sim.service_number ? ` · 客服 ${sim.service_number}` : "")
+    ? `${sim.carrier} · ${simRegistration}` + (sim.service_number ? ` · 客服 ${sim.service_number}` : "")
     : "-";
   for (const [label, value] of [
     [t("setup_usb"), statusWord(!!hw.usb_online)],
