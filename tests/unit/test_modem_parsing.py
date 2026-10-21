@@ -477,6 +477,38 @@ def test_send_dtmf_modem_failure_does_not_log_failed_digit(monkeypatch, caplog):
     assert "result=failure" in caplog.text
 
 
+@pytest.mark.parametrize("factory", [make_modem, make_sim7600])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_dtmf_completion_sums_send_time_without_logging_digits(factory, fallback, monkeypatch, caplog):
+    modem = factory()
+    now = 0.0
+    commands: list[str] = []
+
+    def send(cmd: str) -> str:
+        nonlocal now
+        commands.append(cmd)
+        now += 0.125
+        if fallback and (cmd.startswith("AT+QVTS") or '"' not in cmd):
+            return "ERROR"
+        return "OK"
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(modem, "_send", send)
+    monkeypatch.setattr("agentcall.modem.time.monotonic", lambda: now)
+    monkeypatch.setattr("agentcall.modem.time.sleep", sleep)
+    with caplog.at_level(logging.INFO):
+        assert modem.send_dtmf("7#A") is True
+
+    expected_seconds = 0.750 if fallback else 0.375
+    assert len(commands) == (6 if fallback else 3)
+    assert [record.getMessage() for record in caplog.records] == [
+        f"DTMF 发送完成: count=3, result=success, send_seconds={expected_seconds:.3f}"
+    ]
+
+
 # ---- hangup 原子性：指令序列不被并发 _send 插队 ----
 
 
@@ -512,6 +544,161 @@ class FakeSerial:
         self.is_open = False
 
 
+class BlockingFakeSerial(FakeSerial):
+    """Model the port's 0.2s empty-read timeout, without opening any device."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reader_checked = threading.Event()
+        self.empty_reads = 0
+
+    @property
+    def in_waiting(self) -> int:
+        with self._lock:
+            waiting = len(self._pending)
+        if threading.current_thread().name == "modem-reader":
+            self.reader_checked.set()
+        return waiting
+
+    def read(self, size: int = 1) -> bytes:
+        with self._lock:
+            available = len(self._pending)
+        if size > available:
+            self.empty_reads += 1
+            time.sleep(0.2)
+        return super().read(size)
+
+
+@pytest.mark.parametrize("factory", [make_modem, make_sim7600])
+def test_reader_does_not_starve_repeated_sends(factory):
+    modem = factory()
+    fake = BlockingFakeSerial()
+    modem._ser = fake
+    modem._running = True
+    elapsed: list[float] = []
+    responses: list[str] = []
+
+    def send_repeatedly() -> None:
+        for _ in range(15):
+            started = time.monotonic()
+            responses.append(modem._send("AT+CSQ"))
+            elapsed.append(time.monotonic() - started)
+            time.sleep(0.02)  # Let the reader run between commands.
+
+    reader = threading.Thread(target=modem._read_loop, name="modem-reader", daemon=True)
+    sender = threading.Thread(target=send_repeatedly, daemon=True)
+    reader.start()
+    try:
+        assert fake.reader_checked.wait(timeout=1)
+        sender.start()
+        sender.join(timeout=3)
+        finished = not sender.is_alive()
+    finally:
+        modem._running = False
+        reader.join(timeout=2)
+        if sender.ident is not None:
+            sender.join(timeout=2)
+
+    assert not reader.is_alive() and not sender.is_alive()
+    assert finished, "reader starved the sender"
+    assert responses == ["\r\nOK\r\n"] * 15  # No command response was stolen.
+    assert max(elapsed) < 0.5, elapsed  # Bounds lock wait AND command completion.
+    assert fake.empty_reads == 0, "reader must not block on an empty port"
+
+
+@pytest.mark.parametrize("has_data", [False, True])
+def test_reader_yields_outside_serial_lock(monkeypatch, has_data):
+    modem = make_modem()
+    polls = 0
+    reads: list[int] = []
+    sleeps: list[float] = []
+
+    class IdleSerial(FakeSerial):
+        @property
+        def in_waiting(self) -> int:
+            nonlocal polls
+            assert modem._serial_lock._is_owned()  # type: ignore[attr-defined]
+            polls += 1
+            if polls == 3:
+                modem._running = False
+            return 6 if has_data else 0
+
+        def read(self, size: int = 1) -> bytes:
+            assert modem._serial_lock._is_owned()  # type: ignore[attr-defined]
+            reads.append(size)
+            return b"\r\nOK\r\n" if has_data else b""
+
+    def sleep(seconds: float) -> None:
+        assert not modem._serial_lock._is_owned()  # type: ignore[attr-defined]
+        sleeps.append(seconds)
+
+    modem._ser = IdleSerial()
+    modem._running = True
+    monkeypatch.setattr("agentcall.modem.time.sleep", sleep)
+    modem._read_loop()
+
+    assert reads == ([6] * 3 if has_data else [])
+    assert polls == 3
+    assert len(sleeps) == polls
+    assert all(0.01 <= seconds <= 0.05 for seconds in sleeps)
+
+
+@pytest.mark.parametrize("invalidate", ["generation", "pause"])
+def test_reader_drops_data_invalidated_during_yield(monkeypatch, invalidate):
+    modem = make_sim7600()
+    fake = FakeSerial()
+    fake._pending = b"\r\nRING\r\n"
+    modem._ser = fake
+    modem._running = True
+    rings: list[str | None] = []
+    modem.on_ring(rings.append)
+
+    def start_maintenance(_seconds: float) -> None:
+        with modem._serial_lock:
+            if invalidate == "generation":
+                modem._maintenance_generation += 1
+            else:
+                modem._reset_in_progress = True
+        modem._running = False
+
+    monkeypatch.setattr("agentcall.modem.time.sleep", start_maintenance)
+    modem._read_loop()
+
+    assert fake._pending == b""
+    assert rings == []
+    assert modem._buffer == ""
+
+
+@pytest.mark.parametrize(
+    ("command", "prefix"),
+    [
+        ("at+vts=9\r", "AT+VTS"),
+        ('AT+VTS="9"', "AT+VTS"),
+        ('AT+QVTS="8"', "AT+QVTS"),
+        ("ATD+8613800138000;", "ATD"),
+        ('AT+CMGS="13800138000"\rprivate sms', "AT+CMGS"),
+        ('AT+CPMS="private"', "AT+CPMS"),
+        ("ATE0", "ATE"),
+        ("AT+CLCC", "AT+CLCC"),
+        ("private sms 12345", "unknown"),
+    ],
+)
+@pytest.mark.parametrize("wait_seconds", [0.2, 0.25])
+def test_write_command_lock_timing_logs_only_safe_prefix(monkeypatch, caplog, command, prefix, wait_seconds):
+    modem = make_modem()
+    modem._ser = FakeSerial()
+    timestamps = iter([0.0, wait_seconds])
+    monkeypatch.setattr("agentcall.modem.time.monotonic", lambda: next(timestamps))
+
+    with caplog.at_level(logging.INFO):
+        assert "OK" in modem._write_command(command)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == (
+        [f"[timing] 串口锁等待 {wait_seconds:.3f}s cmd={prefix}"] if wait_seconds > 0.2 else []
+    )
+
+
 class TrackingRLock:
     """RLock wrapper that exposes when a named thread starts waiting for it."""
 
@@ -534,6 +721,37 @@ class TrackingRLock:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.release()
+
+
+def test_write_command_measures_real_lock_contention(caplog):
+    modem = make_modem()
+    lock = TrackingRLock("dtmf-sender")
+    modem._serial_lock = lock  # type: ignore[assignment]
+    modem._ser = FakeSerial()
+    responses: list[str] = []
+    sender = threading.Thread(
+        target=lambda: responses.append(modem._send('AT+VTS="9"')),
+        name="dtmf-sender",
+        daemon=True,
+    )
+
+    with caplog.at_level(logging.INFO):
+        try:
+            with lock:
+                sender.start()
+                assert lock.waiting.wait(timeout=1)
+                time.sleep(0.25)
+        finally:
+            sender.join(timeout=2)
+
+    assert not sender.is_alive()
+    assert responses == ["\r\nOK\r\n"]
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.levelno == logging.INFO
+    assert record.getMessage().startswith("[timing] 串口锁等待 ")
+    assert record.getMessage().endswith("s cmd=AT+VTS")
+    assert record.args[0] >= 0.25
 
 
 def test_send_and_reader_reconnect_do_not_deadlock_on_opposite_lock_order(monkeypatch):
@@ -778,6 +996,52 @@ def test_send_response_with_cmti_reads_sms():
     assert messages == [("+8613800000000", "hello from send")]
 
 
+@pytest.mark.parametrize("factory", [make_modem, make_sim7600])
+def test_reader_preserves_fragmented_urcs_and_sms(factory):
+    modem = factory()
+
+    class FragmentedSerial(CMTIFakeSerial):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fragments = [b"\r\nRI", b"NG\r\n+CMT", b'I: "SM",5\r\n']
+
+        @property
+        def in_waiting(self) -> int:
+            with self._lock:
+                if not self._pending and self.fragments:
+                    self._pending = self.fragments.pop(0)
+                return len(self._pending)
+
+    fake = FragmentedSerial()
+    modem._ser = fake
+    modem._running = True
+    rings: list[str | None] = []
+    messages: list[tuple[str | None, str]] = []
+    deleted = threading.Event()
+    modem.on_ring(rings.append)
+    modem.on_sms(lambda sender, body, ts: messages.append((sender, body)))
+    delete_sms = modem._delete_stored_sms
+
+    def delete_and_notify(index: str) -> None:
+        delete_sms(index)
+        deleted.set()
+
+    modem._delete_stored_sms = delete_and_notify
+    reader = threading.Thread(target=modem._read_loop, daemon=True)
+    reader.start()
+    try:
+        assert deleted.wait(timeout=2)
+    finally:
+        modem._running = False
+        reader.join(timeout=2)
+
+    assert not reader.is_alive()
+    assert rings == [None]
+    assert messages == [("+8613800000000", "hello from send")]
+    assert fake.writes == ['AT+CPMS="SM"', "AT+CMGR=5", "AT+CMGD=5"]
+    assert fake.fragments == []
+
+
 def test_response_without_cmti_has_no_sms_side_effect():
     modem = make_modem()
     modem._ser = FakeSerial()
@@ -968,9 +1232,9 @@ def test_read_loop_survives_reconnect_exception(monkeypatch):
 
     class _DeadSerial:
         is_open = True
-        in_waiting = 0
 
-        def read(self, _n):
+        @property
+        def in_waiting(self):
             raise serial.SerialException("串口未打开")
 
     modem._ser = _DeadSerial()
