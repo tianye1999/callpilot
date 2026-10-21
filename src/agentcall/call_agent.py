@@ -37,7 +37,7 @@ from .dtmf import dtmf_tone
 from .dtmf_followup import extract_spoken_dtmf
 from .dtmf_judge import DtmfActionLedger, DtmfJudge, WindowMode
 from .events import EventHub
-from .modem import SerialModem, create_modem
+from .modem import SerialModem, Sim7600Modem, create_modem
 from .monitor_playback import MonitorPlayback
 from .number_profiles import lookup_profile, lookup_profile_by_id
 from .pcm_stats import PcmFlowStats
@@ -67,6 +67,7 @@ from .result_verification import (
     is_carrier_service_call,
     select_task_relevant_evidence,
 )
+from .sim7600_reset import Sim7600CallReset
 from .sim_identity import SimIdentity
 from .sms_email_forwarder import SmsEmailForwarder
 from .summarizer import judge_wrap_up, summarize_call
@@ -3272,6 +3273,8 @@ class CallAgentService:
         self._modem_disconnected_at: str | None = None
         self._service_running = False
         self._supervisor_thread: threading.Thread | None = None
+        self._sim7600_reset: Sim7600CallReset | None = None
+        self._reset_queue_pending = False
         self.sms_email_forwarder = (
             sms_email_forwarder if sms_email_forwarder is not None else SmsEmailForwarder()
         )
@@ -3302,6 +3305,10 @@ class CallAgentService:
             takeover_endpoint_factory=self._build_takeover_endpoint,
         )
         self._setup_callbacks()
+        if isinstance(self.modem, Sim7600Modem) and config.get_bool("MODEM_RESET_AFTER_CALL"):
+            self._sim7600_reset = Sim7600CallReset(
+                self.modem, audio_mode, pcm_port, self._set_modem_connected,
+            )
 
     @staticmethod
     def _create_monitor() -> MonitorPlayback | None:
@@ -3337,6 +3344,11 @@ class CallAgentService:
 
     def _handle_session_ended(self) -> None:
         """每次会话结束（含来电/外呼/未接通）驱动外呼队列；队列空则 no-op。"""
+        if self._sim7600_reset is not None:
+            with self._ring_lock:
+                if self.modem.recovery_in_progress or not self.modem_connected:
+                    self._reset_queue_pending = True
+                    return
         try:
             self.dial_queue.on_session_ended()
         except Exception as exc:  # noqa: BLE001
@@ -3363,6 +3375,10 @@ class CallAgentService:
             # 同一通来电会被 RING 主动上报和 CLCC 轮询重复触发，需去重：
             # 已有会话进行中时直接忽略，避免重复接听 / 抢占 PCM 串口导致崩溃。
             with self._ring_lock:
+                if self._sim7600_reset is not None and (
+                    self.modem.recovery_in_progress or not self.modem_connected
+                ):
+                    return
                 if self.session.is_active or self._remote_call_owner is not None:
                     logger.debug("已有通话进行中，忽略重复的 RING/CLCC: %s", caller)
                     return
@@ -3409,6 +3425,8 @@ class CallAgentService:
                 logger.warning("短信邮件转发入队失败: error_type=%s", type(exc).__name__)
 
         def on_connection_state(connected: bool) -> None:
+            if self._sim7600_reset is not None:
+                connected = self.modem.is_connected()
             self._set_modem_connected(connected)
 
         def on_sim_identity(identity: SimIdentity) -> None:
@@ -3456,6 +3474,10 @@ class CallAgentService:
             return False, message
         self._remember_outbound_task(task)
         with self._ring_lock:
+            if self._sim7600_reset is not None:
+                guard_failure = self._dial_guard(number)
+                if guard_failure is not None:
+                    return False, guard_failure.message
             if self.session.is_active or self._remote_call_owner is not None:
                 return False, "当前正在通话中，请稍后再拨"
             self.session.current_caller = number
@@ -3847,7 +3869,8 @@ class CallAgentService:
 
     def _dial_guard(self, number: str | None) -> DialGuardFailure | None:
         return check_dial_guard(
-            modem_online=self.modem_connected,
+            modem_online=self.modem_connected and not self.modem.recovery_in_progress
+            if self._sim7600_reset is not None else self.modem_connected,
             sim_identity=getattr(self.modem, "sim_identity", None),
             number=number,
         )
@@ -4016,6 +4039,9 @@ class CallAgentService:
             time.sleep(self._LINK_WATCHDOG_POLL)
             if not self._service_running:
                 return
+            if self._sim7600_reset is not None and self.modem.recovery_in_progress:
+                disconnected_since = None
+                continue
             if is_connected():
                 disconnected_since = None
                 continue
@@ -4040,6 +4066,8 @@ class CallAgentService:
 
     def _set_modem_connected(self, connected: bool, error: str | None = None) -> None:
         """更新模组连接状态并广播给 UI（仅状态翻转时发事件，避免重连期刷屏）。"""
+        if connected and self._sim7600_reset is not None:
+            connected = self.modem.is_connected()
         with self._modem_state_lock:
             if connected == self.modem_connected:
                 return
@@ -4068,12 +4096,20 @@ class CallAgentService:
                     event["recovery_seconds"],
                 )
             self._publish({"type": "system", "text": "服务已启动，等待来电"})
+            if self._sim7600_reset is not None:
+                with self._ring_lock:
+                    resume_queue = self._reset_queue_pending
+                    self._reset_queue_pending = False
+                if resume_queue:
+                    self._handle_session_ended()
         else:
             logger.warning("模组连接已断开: disconnected_at=%s", event["disconnected_at"])
 
     def stop_service(self) -> None:
         """停止 supervisor 与当前会话，关闭模组（供退出时调用）。"""
         self._service_running = False
+        if self._sim7600_reset is not None:
+            self._sim7600_reset.stop()
         worker = self._remote_worker
         if worker is not None:
             worker.stop("service_shutdown")

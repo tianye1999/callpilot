@@ -6,6 +6,8 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from queue import Queue
 from typing import Any, Callable
@@ -244,6 +246,7 @@ class SerialModem:
         self._sim_refresh_requested_generation: int | None = None
         self._sim_refresh_generation = 0
         self._buffer = ""
+        self._maintenance_generation = 0
         self._processing_response_cmti = False
         self._last_caller: str | None = None
         self._last_dialed: str | None = None
@@ -385,6 +388,8 @@ class SerialModem:
     def _open_serial(self) -> None:
         """打开串口并跑初始化序列（connect 与断线重连共用）。"""
         with self._serial_lock:
+            if self.transport_paused or (self.recovery_in_progress and self._closed):
+                raise serial.SerialException("SIM7600 模组重启中，暂停打开串口")
             self._opening = True
             try:
                 self._active_port = self._resolve_port()
@@ -417,6 +422,8 @@ class SerialModem:
         observed_generation = self._reconnect_generation
         owner = False
         with self._serial_lock:
+            if self.recovery_in_progress:
+                return
             if observed_generation != self._reconnect_generation:
                 return
             with self._reconnect_lock:
@@ -460,6 +467,8 @@ class SerialModem:
         delay = 1.0
         try:
             while self._running and not self._closed:
+                if self.recovery_in_progress:
+                    return
                 try:
                     self._open_serial()
                     with self._serial_lock:
@@ -863,11 +872,13 @@ class SerialModem:
         return False
 
     def _send(self, cmd: str) -> str:
+        if self.transport_paused:
+            raise serial.SerialException("SIM7600 模组重启中，暂停 AT")
         try:
             return self._write_command(cmd)
         except (serial.SerialException, OSError, RuntimeError) as exc:
             # 初始化序列中失败不自触发重连（由 _reconnect 的重试循环兜底），避免死锁。
-            if self._opening:
+            if self._opening or self.recovery_in_progress:
                 raise
             logger.warning("串口发送失败，尝试重连后重试: %s", exc)
             self._reconnect()
@@ -875,6 +886,8 @@ class SerialModem:
 
     def _write_command(self, cmd: str) -> str:
         with self._serial_lock:
+            if self.transport_paused:
+                raise serial.SerialException("SIM7600 模组重启中，暂停 AT")
             if not self._ser or not self._ser.is_open:
                 raise RuntimeError("模组未连接")
             line = cmd if cmd.endswith("\r") else f"{cmd}\r"
@@ -905,8 +918,14 @@ class SerialModem:
 
     def _read_loop(self) -> None:
         while self._running:
+            if self.transport_paused:
+                time.sleep(0.2)
+                continue
             try:
                 with self._serial_lock:
+                    if self.transport_paused:
+                        continue
+                    generation = self._maintenance_generation
                     if not self._ser or not self._ser.is_open:
                         raise serial.SerialException("串口未打开")
                     raw = self._ser.read(self._ser.in_waiting or 1)
@@ -932,6 +951,8 @@ class SerialModem:
                 continue
             if not raw:
                 continue
+            if generation != self._maintenance_generation:
+                continue
             text = raw.decode("ascii", errors="ignore")
             self._buffer += text
             self._process_buffer()
@@ -940,6 +961,14 @@ class SerialModem:
         """串口传输当前是否在线（供上层看门狗判断是否需要重建连接）。"""
         with self._connection_state_lock:
             return self._connection_online
+
+    @property
+    def recovery_in_progress(self) -> bool:
+        return False
+
+    @property
+    def transport_paused(self) -> bool:
+        return False
 
     def pcm_ready(self) -> bool:
         return self._pcm_ready_event.is_set()
@@ -963,6 +992,9 @@ class SerialModem:
             self._processing_response_cmti = False
 
     def _process_buffer(self) -> None:
+        if self.transport_paused:
+            self._buffer = ""
+            return
         self._scan_pcm_flow(self._buffer)
         self._process_sim_urcs()
         while True:
@@ -1072,6 +1104,10 @@ class SerialModem:
 
     def _poll_call_status(self) -> None:
         while self._running:
+            if self.transport_paused:
+                time.sleep(0.2)
+                continue
+            generation = self._maintenance_generation
             try:
                 response = self._send("AT+CLCC")
             except Exception as exc:  # noqa: BLE001
@@ -1093,10 +1129,15 @@ class SerialModem:
                 continue
 
             self._clcc_fail_count = 0
+            if generation != self._maintenance_generation:
+                continue
             self._process_clcc_response(response)
             time.sleep(2)
 
     def _process_clcc_response(self, response: str) -> None:
+        generation = self._maintenance_generation
+        if self.transport_paused:
+            return
         self._process_response_urcs(response)
         seen_incoming_ids: set[str] = set()
         # 与 dial() 对 _connected_call_ids/_call_connected_event 的清除互斥：
@@ -1105,6 +1146,8 @@ class SerialModem:
         pending_connected: list[str | None] = []
         call_lost = False
         with self._serial_lock:
+            if self.transport_paused or generation != self._maintenance_generation:
+                return
             has_call_line = False
             for match in CLCC_PATTERN.finditer(response):
                 has_call_line = True
@@ -1329,6 +1372,94 @@ class Sim7600Modem(SerialModem):
     # 不必盲等一整秒（WIL-104：健康态可省约 0.8s）。
     POST_ANSWER_SETTLE_SECONDS = 0.2
 
+    def __init__(self, port: str, baudrate: int = 115200) -> None:
+        super().__init__(port, baudrate)
+        self._voice_call_armed = False
+        self._voice_call_generation = 0
+        self._call_pcm_enabled = False
+        self._reset_in_progress = False
+        self._reset_access = threading.local()
+        self._on_post_call_reset: Callable[[], None] | None = None
+
+    @property
+    def reset_in_progress(self) -> bool:
+        return self._reset_in_progress
+
+    @property
+    def recovery_in_progress(self) -> bool:
+        return self._reset_in_progress
+
+    @property
+    def transport_paused(self) -> bool:
+        return self._reset_in_progress and not getattr(self._reset_access, "allowed", False)
+
+    def is_connected(self) -> bool:
+        return not self._reset_in_progress and super().is_connected()
+
+    @contextmanager
+    def reset_transport_access(self) -> Iterator[None]:
+        previous = getattr(self._reset_access, "allowed", False)
+        self._reset_access.allowed = True
+        try:
+            yield
+        finally:
+            self._reset_access.allowed = previous
+
+    def on_post_call_reset(self, callback: Callable[[], None]) -> None:
+        self._on_post_call_reset = callback
+
+    def _arm_voice_call(self) -> None:
+        if self._reset_in_progress:
+            raise serial.SerialException("SIM7600 模组重启中，不能开始通话")
+        self._voice_call_generation += 1
+        self._voice_call_armed = True
+        self._call_pcm_enabled = False
+
+    def answer(self) -> None:
+        if self._on_post_call_reset is None:
+            return super().answer()
+        with self._serial_lock:
+            self._arm_voice_call()
+            super().answer()
+
+    def dial(self, number: str) -> str:
+        if self._on_post_call_reset is None:
+            return super().dial(number)
+        with self._serial_lock:
+            self._arm_voice_call()
+            return super().dial(number)
+
+    def hangup(self) -> None:
+        if self._on_post_call_reset is None:
+            return super().hangup()
+        callback = None
+        with self._serial_lock:
+            if self._reset_in_progress:
+                return
+            super().hangup()
+            eligible = self._voice_call_armed and self._call_pcm_enabled
+            self._voice_call_armed = False
+            self._call_pcm_enabled = False
+            if eligible and config.get_bool("MODEM_RESET_AFTER_CALL") and self._on_post_call_reset is not None:
+                self._reset_in_progress = True
+                self._maintenance_generation += 1
+                with self._sim_refresh_lock:
+                    self._sim_refresh_generation += 1
+                    self._sim_refresh_requested_generation = None
+                callback = self._on_post_call_reset
+        if callback is not None:
+            callback()
+
+    def close_reset_transport(self) -> None:
+        with self._serial_lock:
+            try:
+                if self._ser is not None:
+                    self._ser.close()
+            finally:
+                self._ser = None
+                self._buffer = ""
+                self._emit_connection_state(False)
+
     def initialize_for_voice(self, audio_mode: str = "nmea") -> None:
         """使能 PCM-over-USB 语音通道（``AT+CPCMREG=1``）。
 
@@ -1345,8 +1476,22 @@ class Sim7600Modem(SerialModem):
         # audio_bridge 修复），与音量无关；而实测这条指令本身要花 **2.3 秒**，
         # 占「接听→启用」总耗时的 83%（WIL-104）。治的是不存在的病，故移除。
         started = time.monotonic()
+        call_generation = self._voice_call_generation
+        call_armed = self._voice_call_armed
         # 先清快照：中途串口异常时读取方拿到 None（未知），而非上一次的旧结果。
         self.last_voice_enable = None
+        if config.get_bool("MODEM_PCM_PIN_8K"):
+            # VoLTE 出厂为 16k（0,1）；必须在每通启用 PCM 前对齐宿主的 8k 链路。
+            try:
+                response = self._send("AT+CPCMBANDWIDTH=1,1")
+                if "OK" in response:
+                    logger.info("SIM7600 PCM 已钉定 8kHz (AT+CPCMBANDWIDTH=1,1)")
+                else:
+                    logger.warning("AT+CPCMBANDWIDTH=1,1 未成功，继续尝试 CPCMREG")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "AT+CPCMBANDWIDTH=1,1 失败 (%s)，继续尝试 CPCMREG", type(exc).__name__,
+                )
         for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
             attempt_started = time.monotonic()
             ok = "OK" in self._send("AT+CPCMREG=1")
@@ -1355,6 +1500,10 @@ class Sim7600Modem(SerialModem):
                 i + 1, time.monotonic() - attempt_started, "OK" if ok else "ERROR",
             )
             if ok:
+                if call_armed:
+                    with self._serial_lock:
+                        if self._voice_call_armed and call_generation == self._voice_call_generation:
+                            self._call_pcm_enabled = True
                 attempts = i + 1
                 logger.info(
                     "[timing] 启用总耗时 %.2fs", time.monotonic() - started

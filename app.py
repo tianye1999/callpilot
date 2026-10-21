@@ -31,7 +31,7 @@ logger = logging.getLogger("app")
 
 
 def _open_browser_later(url: str, delay: float = 1.0) -> threading.Timer | None:
-    if config._is_frozen():
+    if config._is_frozen() or not config.get_bool("WEB_OPEN_BROWSER"):
         return None
     timer = threading.Timer(delay, lambda: webbrowser.open(url))
     timer.start()

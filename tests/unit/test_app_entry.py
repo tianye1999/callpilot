@@ -38,6 +38,7 @@ def test_open_browser_later_skips_webbrowser_when_frozen(monkeypatch):
 
 
 def test_open_browser_later_opens_browser_in_source_mode(monkeypatch):
+    monkeypatch.delenv("WEB_OPEN_BROWSER", raising=False)
     opened = []
     timers = []
     monkeypatch.setattr(app.config, "_is_frozen", lambda: False)
@@ -54,6 +55,16 @@ def test_open_browser_later_opens_browser_in_source_mode(monkeypatch):
     assert timer.delay == 0.25
     assert timer.started is True
     assert opened == ["http://127.0.0.1:47100"]
+
+
+def test_open_browser_later_skips_timer_when_disabled(monkeypatch):
+    monkeypatch.setenv("WEB_OPEN_BROWSER", "false")
+    monkeypatch.setattr(app.config, "_is_frozen", lambda: False)
+    timers = []
+    monkeypatch.setattr(app.threading, "Timer", lambda *args: timers.append(args))
+
+    assert app._open_browser_later("http://127.0.0.1:47100") is None
+    assert timers == []
 
 
 def test_restart_after_cleanup_exits_for_launchd_managed_service(monkeypatch):

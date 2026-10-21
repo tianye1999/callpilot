@@ -441,6 +441,7 @@ macOS 没有 Quectel 厂商串口的原生设备，需先跑 USB→PTY 桥（`sc
 模组+转接板全套约 **¥100–200**，淘宝搜「EC20 USB 转接板」。
 
 ### 前置
+树莓派 5 / Linux + SIM7600 源码部署见 [Raspberry Pi 指南](docs/raspberry-pi.md)（完整 Edge 真机验收待确认）。
 
 - 普通用户 DMG 路径：一张有效 SIM 的 EC20/EG25 模组；App 已内置 Python runtime、
   CallPilot 代码、`ffmpeg` 与 `libusb`。
