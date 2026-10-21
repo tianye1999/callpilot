@@ -73,3 +73,54 @@ Phase B 必须先拆分 agent 与物理通话生命周期,不能只增加一个�
 
 References: #95, #30, #22, [ADR-001](001-remote-web-dialer-livekit.md),
 [Android ADR](002-android-native-client.md), [remote protocol](../remote-protocol.md).
+
+## Physical SIM Fallback (#131)
+
+Applies only to `product/physical-sim` and its feature branches, never `main`.
+
+- This implementation is Edge-only and requires no shared-cloud changes or new
+  messages. Before either triage or the agent tool requests takeover, Edge checks
+  `REMOTE_WEB_DIALER_ENABLED` and `REMOTE_CLOUD_ENABLED`, then reads the existing
+  `CloudCredentialStore`. Both switches must be enabled and the local credential
+  must parse as a valid Edge registration credential. Missing, malformed, or
+  unreadable credentials reject with `NO_TAKEOVER_ENDPOINT` without creating an
+  offer or changing AI media ownership. Events distinguish `edge_not_registered`
+  from `hosted_takeover_disabled`.
+- Credential I/O runs in a read-only daemon worker outside the takeover lock;
+  both entries wait at most one second (`local_registration_timeout` fails closed),
+  and triage waits off-loop. The result is
+  applied only after rechecking the active call generation. A late credential
+  read cannot create an offer after timeout or against a replacement call.
+- Registration is deliberately only a local indication that a phone **might**
+  take over. It does not prove a phone is paired, online, or push-reachable, nor
+  that the server still accepts the credential. A registered Edge with no phone,
+  an offline App, or an unavailable control connection uses the 20-second fallback.
+  No presence query, heartbeat extension, or cloud deployment is required.
+- The current inbound offer/claim path is hosted-only. Local gateway pairing
+  enables remote outbound calling but has no inbound offer discovery/claim route,
+  so its device records alone do not qualify as a takeover endpoint. This does
+  not add a second, nonfunctional takeover path.
+- One successfully queued takeover attempt is allowed per physical call. A
+  preflight rejection does not consume the attempt. After fallback, triage stops
+  making irreversible decisions; the AI continues intent/message handling rather
+  than repeatedly transferring or rejecting the same caller.
+- `INBOUND_TAKEOVER_TIMEOUT_SECONDS` defaults to 20 on every platform; invalid or
+  non-positive values use 20. The monotonic budget starts at the request and covers
+  hold generation, offer/claim waiting, and media preparation through commit.
+  A claim is not a completed handoff. Successful mobile commit keeps the existing
+  single-writer/media lifecycle and post-commit reconnect behavior.
+- Timeout or another precommit failure uses one finalizer: restore AI ownership,
+  clear request/queued claims, revoke the offer, release the triage fence, cancel
+  old generation output, update provider instructions, and request a natural
+  explanation plus continued intent/message handling. Hold and recovery prompts
+  describe the situation, not fixed phrases. Provider awaits are bounded; actual
+  audio arrival still depends on provider and physical-link health.
+- `takeover_unavailable` carries reason/code/trigger. `takeover_timeout_reclaimed`
+  carries `OWNER_TIMEOUT`, generation, and observed `elapsed_ms` from request to
+  ownership restoration. Metrics schema v5 adds `takeover_unavailable_reasons`
+  and `takeover_reclaim_latency_ms`; absent duration is null with a reason.
+
+This change does not deploy shared infrastructure, pair devices, register tokens,
+or exercise real AT. Real-device acceptance must check an unregistered new Edge,
+audible hold/recovery on a registered Edge whose App is offline or unanswered,
+and normal mobile answer before the budget against the unchanged cloud.

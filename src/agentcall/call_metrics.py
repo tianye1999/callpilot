@@ -35,7 +35,8 @@ from typing import Any
 #   pcm_degraded（文档 D 组异常掉话的蜂窝指纹：CPCMREG 启用行为，WIL-95 第二期收尾）。
 # v4（2026-08-18）：新增 hold_seconds / hold_periods（WIL-120 二期：收尾裁判
 #   判 on_hold 的 hold_started/hold_ended 事件聚合；文档 G 组「排队等待检测」）。
-SCHEMA_VERSION = 4
+# v5: takeover rejection reasons and request-to-AI-reclaim latency (#131).
+SCHEMA_VERSION = 5
 
 # 逐轮时延指标：events.jsonl 里 latency 事件的 stage → metrics.json 字段名。
 # 各 stage 的精确定义（2026-08-14）：
@@ -157,6 +158,8 @@ def build_call_metrics(
     dead_media_hangup = False
     hangup_tool_called = False
     takeover: dict[str, int] = {}
+    takeover_unavailable_reasons: dict[str, int] = {}
+    takeover_reclaim_ms: list[float] = []
     finished_ts: float | None = None
     last_activity_ts: float | None = None
     answered_t_ms: float | None = None
@@ -229,6 +232,14 @@ def build_call_metrics(
         elif isinstance(etype, str) and etype.startswith("takeover_"):
             suffix = etype[len("takeover_"):]
             takeover[suffix] = takeover.get(suffix, 0) + 1
+            if suffix == "unavailable":
+                reason = str(event.get("reason") or "unknown")
+                takeover_unavailable_reasons[reason] = takeover_unavailable_reasons.get(reason, 0) + 1
+            elif suffix == "timeout_reclaimed":
+                elapsed = event.get("elapsed_ms")
+                if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and math.isfinite(elapsed):
+                    if elapsed >= 0:
+                        takeover_reclaim_ms.append(float(elapsed))
             # 首次请求→首次接通即接管时延；重复事件（理论上不会有）取最早的。
             if isinstance(ts, (int, float)):
                 if suffix == "requested" and takeover_requested_ts is None:
@@ -301,6 +312,8 @@ def build_call_metrics(
         unavailable["first_audio_ms"] = "no_samples"
     if contact_known is None:
         unavailable["contact_known"] = "no_call_context_event"
+    if not takeover_reclaim_ms:
+        unavailable["takeover_reclaim_latency_ms"] = "no_timeout_reclaim"
 
     # hangup_latency_ms（v2 定义见 _ACTIVITY_EVENT_TYPES 注释）：对话尾声
     # → 通话实际结束。agent 主动收尾时包含刻意的道别延时，属定义内。
@@ -401,6 +414,8 @@ def build_call_metrics(
         "hangup_latency_ms": hangup_latency_ms,
         "answered_to_first_audio_ms": answered_to_first_audio_ms,
         "takeover": takeover,
+        "takeover_unavailable_reasons": takeover_unavailable_reasons,
+        "takeover_reclaim_latency_ms": _describe(takeover_reclaim_ms),
         "takeover_latency_ms": takeover_latency_ms,
         "contact_known": contact_known,
         "has_task_goal": has_task_goal,
