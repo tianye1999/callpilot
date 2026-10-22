@@ -70,6 +70,9 @@ class FakeService:
     def dial_queue_status(self) -> dict:
         return dict(self.queue)
 
+    def line_busy(self) -> bool:
+        return bool((self.session and self.session.is_active) or self.remote_status["active"])
+
     def dial(
         self,
         number: str,
@@ -143,6 +146,65 @@ def api(app, fn):
 
 
 # ---- /api/config ----
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_meta_reports_current_call_state(active, monkeypatch):
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    service = FakeService(session=_SessionStub(is_active=active))
+
+    async def fn(client):
+        response = await client.get("/api/meta")
+        assert response.status == 200
+        return await response.json()
+
+    meta = api(make_app(service), fn)
+    assert meta["call_active"] is active
+    assert meta["dial_queue_busy"] is False
+    assert service.session.is_active is active
+
+
+def test_meta_uses_line_owner_state_even_without_active_local_session(monkeypatch):
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    service = FakeService(session=_SessionStub(is_active=False))
+    monkeypatch.setattr(service, "line_busy", lambda: True)
+
+    async def fn(client):
+        return await (await client.get("/api/meta")).json()
+
+    assert api(make_app(service), fn)["call_active"] is True
+
+
+@pytest.mark.parametrize("queue", [
+    {"active": True, "pending": [], "current": None},
+    {"active": False, "pending": ["test"], "current": None},
+    {"active": False, "pending": [], "current": "test"},
+])
+def test_meta_reports_dial_queue_busy(queue, monkeypatch):
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    service = FakeService()
+    service.queue = queue
+
+    async def fn(client):
+        return await (await client.get("/api/meta")).json()
+
+    meta = api(make_app(service), fn)
+    assert meta["call_active"] is False
+    assert meta["dial_queue_busy"] is True
+    assert service.queue == queue
+
+
+def test_meta_without_service_reports_no_calls_or_queue(monkeypatch):
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+
+    async def fn(client):
+        response = await client.get("/api/meta")
+        assert response.status == 200
+        return await response.json()
+
+    meta = api(make_app(None), fn)
+    assert meta["call_active"] is False
+    assert meta["dial_queue_busy"] is False
 
 
 def test_meta_reports_missing_credentials_without_blocking(monkeypatch):

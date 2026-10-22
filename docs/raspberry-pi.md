@@ -29,7 +29,7 @@
 
 ```bash
 sudo apt update
-sudo apt install git ffmpeg libportaudio2 libusb-1.0-0 usbutils psmisc pipx
+sudo apt install git curl ffmpeg libportaudio2 libusb-1.0-0 usbutils psmisc pipx
 pipx install uv
 pipx ensurepath
 ```
@@ -124,6 +124,85 @@ sudo systemctl start callpilot-edge.service
 也可在配置好后重跑 `bash scripts/linux/install.sh --now`。已运行服务应用 `.env` 变更时，
 在无通话窗口显式执行 `sudo systemctl restart callpilot-edge.service`。
 不要同时启动手工 `app.py` 和 systemd 服务，否则串口和监听端口会冲突。
+
+## 更新
+
+以下命令均在 **Pi** 上、以服务所属的普通用户执行，不是在 Mac 上运行，也不要用
+`sudo bash scripts/linux/update.sh`。先安排无来电、无外呼/排队任务的维护窗口。
+脚本只更新代码、复用 setup 安装依赖、重启已有服务，不改 install.sh 的行为，
+不重新部署 unit、不重载 udev、不接触 AT 串口。需要 Git、curl、tar、现有 Python 3 和 uv。
+
+**通话安全限制：**新版只读 `GET /api/meta` 返回 `call_active` 与 `dial_queue_busy` 布尔字段。
+`call_active` 复用服务带锁的 `line_busy()`，覆盖本地来电/外呼、远程线路占用及尚未释放线路的收尾阶段；
+`dial_queue_busy` 来自现有外呼队列快照。二者明确为 false，且 `/api/call/queue`、
+`/api/remote_dialer/status` 没有已知忙线时，日常更新无需 `--force`。
+旧版 Edge 缺少 `call_active`、字段无效或接口不可达时，默认拒绝，
+须人工确认空闲后显式加 `--force`；`--force` **不能**越过任何明确的忙线或非空队列。
+脚本在修改代码前和重启前复查，
+但检查与重启不是原子操作，不能阻止检查之后的新来电，维护窗口仍需人工保证。
+只访问 `127.0.0.1`，端口优先取当前环境的 `WEB_PORT`，其次 `.env`，默认 `47100`；
+不要靠改成公网监听来解决检查失败。
+
+### 首次接管 rsync 快照
+
+若 `~/callpilot` 是从 Mac 同步来的非 Git 快照，先确保新 `update.sh` 已通过获准的方式同步到
+`scripts/linux/`，再执行下列命令。目标分支须已存在于公开仓库；本地未发布的改动不会被 fetch 到。
+
+```bash
+cd ~/callpilot
+export PATH="$HOME/.local/bin:$PATH"
+bash scripts/linux/update.sh --adopt --branch product/physical-sim --dry-run
+# 仅在人工确认所有通话均已结束后：
+bash scripts/linux/update.sh --adopt --branch product/physical-sim --force
+git status --short
+git branch -vv
+# adopt 不重启；仍运行旧版 Edge，确认持续空闲后执行首次更新：
+bash scripts/linux/update.sh --dry-run
+bash scripts/linux/update.sh --force
+```
+
+adopt 在临时 Git 元数据中 fetch `https://github.com/tianye1999/callpilot.git` 指定分支，
+先将目标分支中会覆盖的现有文件备份到 `~/callpilot-adopt-backup-<时间>.tgz`（权限 600），
+再原地写入跟踪文件并设置分支 upstream。不会 clone 到别的运行目录，
+不会删除旧快照中无法确认归属的文件，也不会自动 setup 或重启服务；完成后须再跑一次 update。
+已跟踪种子 `data/number_profiles.example.json`、`data/call_playbooks.example.json` 与其它代码一样，
+先备份再写入目标分支版本，不保留旧种子造成工作区永久变脏。
+`.env`、`.venv`、`data/` 下真实预设/情报库/录音等未跟踪或忽略的运行数据不覆盖；
+没有出现在目标 Git 树中的快照文件不改动，本地 ignore 规则匹配的路径也跳过。
+父目录为符号链接、文件/目录冲突等情况会拒绝接管，而不是递归删除。
+
+备份包含 `callpilot-adopt-rollback.sh`，脚本会打印带实际路径的恢复命令。
+它恢复被覆盖文件、删除本次新增文件，把已生成的 `.git` 移到 `<备份文件>.git`，不删除原运行数据。
+接管中途失败会自动尝试恢复；手动恢复只适用于**接管后尚未继续修改/更新**的快照，
+否则可能丢失之后的代码编辑，应先保存这些编辑。不要公开备份，里面可能含旧快照的本地代码信息。
+
+### 日常更新
+
+```bash
+cd ~/callpilot
+export PATH="$HOME/.local/bin:$PATH"
+bash scripts/linux/update.sh --dry-run
+bash scripts/linux/update.sh
+```
+
+默认 fetch 当前分支的 upstream；`--branch <name>` 可指定 origin 的目标分支，只允许
+fast-forward 到其提交，不会自动切换/重命名当前分支。已跟踪文件有暂存或未暂存修改时，
+列出文件并中止，不 stash、不 reset、不自动解决冲突；无关未跟踪文件不清理，
+目标提交若会覆盖未跟踪/忽略文件则由 Git 安全拒绝。
+已跟踪路径（包括 `data/*.example.json` 种子）正常随分支 fast-forward，不按整个 `data/` 目录阻断更新。
+保护边界是本地未跟踪/忽略的运行文件；若远端提交试图覆盖这些本地文件，会拒绝合并。
+已跟踪种子若有人手工编辑，也仍按跟踪文件本地修改中止，不会自动丢弃编辑。
+
+更新器沿用安装器的 uv 查找顺序，安装/定位用户态 Python 3.13，再调用
+`PYTHON=<解释器> bash scripts/setup.sh`。保留已有 `.env`，只打印两个示例文件中缺少的键名，
+不打印凭证、不自动补值。sudo 预检使用 `sudo true`（不是 `sudo -v`）；随后重启
+`callpilot-edge.service`，约 60 秒内须同时满足 `/api/meta` HTTP 200 和 systemd active 才报告成功，
+并打印完整的 `更新前 SHA -> 更新后 SHA`。
+
+失败会返回非 0，打印 journald 查看命令，以及在**无通话窗口**执行的
+`git checkout <旧 SHA>` 和服务重启命令。代码回退不等于依赖回退，必要时在旧 SHA 重跑 setup；
+checkout 到 SHA 后为 detached HEAD，下次更新前须人工确认并恢复正确的跟踪分支。
+脚本不自动回退已运行的服务。更新成功仅证明服务/API 层恢复，仍需按下文确认模组状态与真机通话音频。
 
 ## 分层验证
 

@@ -390,6 +390,16 @@ async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
     service = request.app.get("service")
     modem = getattr(service, "modem", None)
+    line_busy = getattr(service, "line_busy", None)
+    meta["call_active"] = (
+        bool(line_busy()) if callable(line_busy)
+        else bool(getattr(getattr(service, "session", None), "is_active", False))
+    )
+    queue_status = getattr(service, "dial_queue_status", None)
+    queue = queue_status() if callable(queue_status) else {}
+    meta["dial_queue_busy"] = bool(
+        queue.get("active") or queue.get("pending") or queue.get("current") is not None
+    )
     meta["credentials"] = config.credential_status(meta.get("provider"))
     meta["setup_required"] = config.setup_required()
     meta["hardware"] = {
