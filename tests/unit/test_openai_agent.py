@@ -22,6 +22,11 @@ from agentcall.agents.tools import SEND_DTMF_SPEC, ToolRegistry
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _serial_agent_by_default(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "false")
+
+
 class _FakeWs:
     """记录 send 的 JSON；服务端事件经 feed 注入，finish 结束迭代。"""
 
@@ -95,6 +100,602 @@ async def _drain() -> None:
         await asyncio.sleep(0)
 
 
+def test_parallel_response_owner_reserves_until_done_and_coalesces_vad(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "false")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        assert ws.sent[0]["session"]["audio"]["input"]["turn_detection"]["create_response"] is False
+        await agent.say("opening")
+        second = asyncio.create_task(agent.say("follow-up"))
+        await _drain()
+        assert ws.sent_types().count("response.create") == 1
+        ws.feed({"type": "response.created", "response": {"id": "opening"}})
+        await _drain()
+        assert not second.done()
+        ws.feed({"type": "response.done", "response": {"id": "opening", "status": "completed"}})
+        await _drain()
+        await asyncio.wait_for(second, 1)
+        ws.feed({"type": "response.created", "response": {"id": "second"}})
+        ws.feed({"type": "input_audio_buffer.speech_stopped"})
+        ws.feed({"type": "input_audio_buffer.speech_stopped"})
+        await _drain()
+        assert ws.sent_types().count("response.create") == 2
+        ws.feed({"type": "response.done", "response": {"id": "old-response", "status": "completed"}})
+        await _drain()
+        assert ws.sent_types().count("response.create") == 2
+        ws.feed({"type": "response.done", "response": {"id": "second", "status": "completed"}})
+        await _drain()
+        assert ws.sent_types().count("response.create") == 3
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+def test_parallel_manual_watchdog_does_not_relabel_active_response_idle(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        await agent.say("opening")
+        agent._handle_event({"type": "response.created", "response": {"id": "active"}})
+        agent._fire_manual_response_watchdog(agent._manual_response_watchdog_generation)
+        assert agent._manual_response_watchdog_timer is None
+        assert agent._manual_response_outstanding == 0
+        assert agent._response_active
+        pending = asyncio.create_task(agent._send_manual_response(ws))
+        await _drain()
+        assert ws.sent_types().count("response.create") == 1
+        agent._handle_event({"type": "response.done", "response": {"id": "active", "status": "completed"}})
+        await asyncio.wait_for(pending, 1)
+        assert ws.sent_types().count("response.create") == 2
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("close_failure", ["stall", "error"])
+def test_parallel_stop_aborts_stalled_close_and_collects_response_tasks(monkeypatch, close_failure):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setattr(openai_agent, "_PARALLEL_CLOSE_TIMEOUT_SECONDS", 0.05, raising=False)
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        aborted = []
+
+        class Transport:
+            def abort(self):
+                aborted.append(True)
+                ws.finish()
+
+        ws.transport = Transport()
+
+        async def stalled_close():
+            if close_failure == "error":
+                raise ConnectionError("fake close failure")
+            await asyncio.Event().wait()
+
+        ws.close = stalled_close
+        await agent.say("opening")
+        agent._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await _drain()
+        owned = list(agent._background_tasks) + [agent._recv_task, agent._deaf_task]
+        await asyncio.wait_for(agent.stop(), timeout=0.4)
+        assert aborted
+        assert all(task.done() for task in owned)
+        assert agent._ws is None and agent._recv_task is None and agent._deaf_task is None
+        assert not agent._background_tasks
+
+    asyncio.run(run())
+
+
+def test_parallel_ack_during_send_cancels_the_correct_watchdog(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        original_send = ws.send
+
+        async def send(data):
+            await original_send(data)
+            agent._handle_event({"type": "response.created", "response": {"id": "during-send"}})
+            await asyncio.sleep(0)
+
+        ws.send = send
+        await agent.say("opening")
+        await _drain()
+        assert agent._response_ack_task.cancelled()
+        pending = asyncio.create_task(agent._send_manual_response(ws))
+        await _drain()
+        assert pending in agent._background_tasks
+        await agent.stop()
+        assert pending.done()
+
+    asyncio.run(run())
+
+
+def test_parallel_ack_timeout_reconnects_without_ending_call(monkeypatch, caplog):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        events = []
+        agent.set_latency_handler(lambda stage, ms: events.append((stage, ms)))
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        await agent.say("opening")
+        pending = asyncio.create_task(agent.say("clarification"))
+        await _drain()
+        monkeypatch.setattr(openai_agent, "_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS", 0)
+        await agent._watch_response_ack(ws, agent._response_request_generation)
+        await asyncio.wait_for(pending, 0.3)
+        await _drain()
+        assert not agent.fatal and agent._running
+        assert ws.closed
+        assert ws.sent_types().count("response.create") == 1
+        assert len(instances) == 2
+        assert instances[1].sent_types().count("response.create") == 0
+        await _drain()
+        assert len(instances) == 2  # No reconnect -> notice -> ACK timeout loop, even at timeout=0.
+        assert any(stage == "response_ack_timeout" for stage, _ms in events)
+        await agent.stop()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(run())
+    assert "response.created" in caplog.text
+    assert "结束会话而非" not in caplog.text
+
+
+@pytest.mark.parametrize("timing", ["late_created", "during_send", "late_cancelled_done", "no_created"])
+def test_parallel_manual_cancel_then_unconfirmed_request_is_recoverable(monkeypatch, timing):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        agent.set_user_interrupt_handler(lambda: True)
+        ws = instances[0]
+
+        def response(event_type, response_id, request, status="completed"):
+            return {"type": event_type, "response": {
+                "id": response_id, "status": status,
+                "metadata": request["response"]["metadata"],
+            }}
+
+        await agent._send_manual_response(ws)
+        first = ws.sent[-1]
+        ws.feed(response("response.created", "r1", first))
+        ws.feed({"type": "input_audio_buffer.speech_started"})
+        await _drain()
+        assert "response.cancel" in ws.sent_types()
+        ws.feed(response("response.done", "r1", first, "cancelled"))
+        ws.feed({"type": "input_audio_buffer.speech_stopped"})
+        await _drain()
+        assert not agent._response_active
+
+        send = ws.send
+
+        async def send_with_ack(data):
+            await send(data)
+            if json.loads(data)["type"] == "response.create":
+                ws.feed(response("response.created", "r2", ws.sent[-1]))
+                await _drain()  # The receiver runs before send() returns.
+
+        if timing == "during_send":
+            ws.send = send_with_ack
+        await agent._send_manual_response(ws)
+        second = ws.sent[-1]
+        assert ws.sent_types().count("response.create") == 2
+        ws.feed({"type": "input_audio_buffer.speech_started"})
+        await _drain()
+        pending = asyncio.create_task(agent.say("next turn"))
+        await _drain()
+        assert ws.sent_types().count("response.create") == 2
+        if timing == "late_cancelled_done":
+            # A duplicated old done must not acknowledge #2 or release admission.
+            ws.feed(response("response.done", "r1", first, "cancelled"))
+            ws.feed({"type": "response.done", "response": {"id": "r1", "status": "cancelled"}})
+            await _drain()
+            assert agent._response_requested and not pending.done()
+        if timing == "late_created":
+            ws.feed(response("response.created", "r1", first))
+            ws.feed(response("response.created", "unknown-old-id", first))
+            await _drain()
+            assert agent._response_requested and not agent._response_ack_task.cancelled()
+        if timing != "no_created":
+            if timing != "during_send":
+                ws.feed(response("response.created", "r2", second))
+                await _drain()
+            assert not agent._response_requested
+            assert not pending.done()
+            ws.send = send
+            ws.feed(response("response.done", "r2", second, "cancelled"))
+        else:
+            normal_timeout = openai_agent._MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS
+            monkeypatch.setattr(openai_agent, "_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS", 0)
+            await agent._watch_response_ack(ws, agent._response_request_generation)
+            monkeypatch.setattr(openai_agent, "_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS", normal_timeout)
+        await asyncio.wait_for(pending, 1)
+        await _drain()
+        assert not agent.fatal and agent._running
+        assert agent._manual_response_watchdog_timer is None
+        current = instances[-1]
+        if timing == "no_created":
+            assert current.sent_types().count("response.create") == 0
+            await agent._send_manual_response(current)
+        assert current.sent_types().count("response.create") == (1 if timing == "no_created" else 3)
+        request = current.sent[-1]
+        current.feed(response("response.created", "next", request))
+        current.feed(response("response.done", "next", request))
+        current.feed({"type": "input_audio_buffer.speech_stopped"})
+        await _drain()
+        await agent._send_manual_response(current)
+        assert current.sent_types().count("response.create") == (2 if timing == "no_created" else 4)
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("manual", ["true", "false"])
+def test_parallel_real_ack_timer_reconnects_once_then_listens(monkeypatch, manual):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", manual)
+    monkeypatch.setattr(openai_agent, "_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS", 0.02)
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        events = []
+        agent.set_latency_handler(lambda stage, ms: events.append((stage, ms)))
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        closed = asyncio.Event()
+        original_close = ws.close
+
+        async def close():
+            await original_close()
+            closed.set()
+
+        ws.close = close
+        await agent.say("opening")
+        await asyncio.wait_for(closed.wait(), 1)
+        await _drain()
+        # Let several ACK intervals pass, without invoking the watcher directly.
+        await asyncio.sleep(0.08)
+        assert len(instances) == 2 and not agent.fatal and agent._running
+        assert instances[1].sent_types().count("response.create") == 0
+        timeouts = [ms for stage, ms in events if stage == "response_ack_timeout"]
+        assert len(timeouts) == 1 and timeouts[0] >= 10
+        assert any(stage == "response_ack_reconnected" for stage, _ms in events)
+        await agent.stop()
+        assert not agent._background_tasks
+
+    asyncio.run(run())
+
+
+def test_parallel_ack_recovery_fences_late_events_and_stalled_send(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        output = []
+        agent = _make_agent()
+        await agent.start(output.append)
+        ws = instances[0]
+        send_started, close_started, close_allowed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original_send, original_close = ws.send, ws.close
+
+        async def stalled_send(data):
+            await original_send(data)
+            send_started.set()
+            await close_allowed.wait()
+            raise ConnectionError("old socket was closed during drain")
+
+        async def closing():
+            close_started.set()
+            await close_allowed.wait()
+            await original_close()
+
+        ws.send, ws.close = stalled_send, closing
+        sending = asyncio.create_task(agent.say("opening"))
+        await send_started.wait()
+        pending = asyncio.create_task(agent.say("queued"))
+        with monkeypatch.context() as patch:
+            patch.setattr(openai_agent, "_MANUAL_RESPONSE_CREATED_TIMEOUT_SECONDS", 0)
+            recovery = asyncio.create_task(agent._watch_response_ack(ws, agent._response_request_generation))
+            await close_started.wait()
+            ws.feed({"type": "response.created", "response": {"id": "too-late"}})
+            ws.feed({"type": "response.done", "response": {"id": "too-late", "status": "cancelled"}})
+            ws.feed({"type": "response.output_audio.delta", "response_id": "too-late",
+                     "delta": base64.b64encode(b"\x01\x00" * 100).decode()})
+            await _drain()
+            assert agent._response_recovering and agent._response_requested
+            assert ws.sent_types().count("response.create") == 1
+            assert not pending.done() and not output
+            close_allowed.set()
+            await asyncio.wait_for(recovery, 0.5)
+        await asyncio.wait_for(asyncio.gather(sending, pending), 0.5)
+        await _drain()
+        assert not agent.fatal and len(instances) == 2
+        current = instances[1]
+        assert current.sent_types().count("response.create") == 0
+        await agent._send_manual_response(current)
+        assert current.sent_types().count("response.create") == 1
+        await agent.stop()
+        assert not agent._background_tasks
+
+    asyncio.run(run())
+
+
+def test_parallel_manual_timer_only_debounces_and_waits_for_speech_stop(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        agent._handle_event({"type": "input_audio_buffer.speech_started"})
+        # Exercise the real timer-thread entry point without a wall-clock delay.
+        await asyncio.to_thread(agent._fire_manual_response_timer, agent._manual_response_generation)
+        await _drain()
+        assert agent._manual_response_due
+        assert agent._manual_response_watchdog_timer is None
+        assert agent._manual_response_outstanding == 0 and not agent._manual_response_request_pending
+        assert ws.sent_types().count("response.create") == 0
+        agent._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await _drain()
+        assert ws.sent_types().count("response.create") == 1
+        agent._handle_event({"type": "response.created", "response": {"id": "manual"}})
+        agent._fire_manual_response_watchdog(agent._manual_response_watchdog_generation)
+        assert agent._response_active
+        for _ in range(3):
+            await asyncio.to_thread(agent._fire_manual_response_timer, agent._manual_response_generation)
+        await _drain()
+        assert ws.sent_types().count("response.create") == 1
+        agent._handle_event({"type": "response.done", "response": {"id": "manual", "status": "completed"}})
+        await _drain()
+        assert ws.sent_types().count("response.create") == 2
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+def test_parallel_manual_followup_survives_done_before_send_returns(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        send_waiting, send_allowed = asyncio.Event(), asyncio.Event()
+        original_send = ws.send
+
+        async def delayed_send(data):
+            await original_send(data)
+            send_waiting.set()
+            await send_allowed.wait()
+
+        ws.send = delayed_send
+        agent._queue_parallel_manual_response(ws)
+        await send_waiting.wait()
+        ws.feed({"type": "response.created", "response": {"id": "r1"}})
+        await _drain()
+        agent._queue_parallel_manual_response(ws)
+        ws.feed({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+        await _drain()
+        assert agent._manual_response_due and ws.sent_types().count("response.create") == 1
+        send_allowed.set()
+        await _drain()
+        assert ws.sent_types().count("response.create") == 2
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+def test_parallel_manual_callback_does_not_requeue_after_fatal(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        await agent.say("opening")
+        agent._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        agent._queue_parallel_manual_response(ws)
+        await _drain()
+        task = agent._manual_response_task
+        assert task is not None and not task.done()
+        # A genuine unrelated failure can precede a queued request's admission.
+        agent.fatal = True
+        agent._handle_event({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+        await _drain()
+        assert task.done() and agent._manual_response_task is task
+        assert not agent._background_tasks
+        assert ws.sent_types().count("response.create") == 1
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+def test_parallel_delayed_barge_in_targets_original_response(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        await agent.say("first")
+        agent._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        agent.set_user_interrupt_handler(lambda: True)
+        agent._handle_event({"type": "input_audio_buffer.speech_started"})
+        agent._handle_event({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+        await agent.say("second")
+        agent._handle_event({"type": "response.created", "response": {"id": "r2"}})
+        await _drain()
+        assert [m["response_id"] for m in ws.sent if m["type"] == "response.cancel"] == ["r1"]
+        assert agent._active_response_id == "r2"
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+def test_parallel_tagged_done_without_created_releases_only_its_request(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        await agent.say("opening")
+        metadata = ws.sent[-1]["response"]["metadata"]
+        pending = asyncio.create_task(agent.say("next"))
+        await _drain()
+        ws.feed({"type": "response.done", "response": {"id": "unmatched", "status": "cancelled"}})
+        await _drain()
+        assert not pending.done()
+        ws.feed({"type": "response.done", "response": {"id": "matched", "metadata": metadata,
+                                                        "status": "cancelled"}})
+        await asyncio.wait_for(pending, 0.5)
+        assert ws.sent_types().count("response.create") == 2
+        assert not agent.fatal
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+def test_parallel_queued_vad_response_waits_for_new_speech_to_stop(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "false")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        await agent.say("opening")
+        agent._handle_event({"type": "response.created", "response": {"id": "opening"}})
+        agent._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await _drain()
+        agent._handle_event({"type": "input_audio_buffer.speech_started"})
+        agent._handle_event({"type": "response.done", "response": {"id": "opening", "status": "cancelled"}})
+        await _drain()
+        assert ws.sent_types().count("response.create") == 1
+        agent._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await _drain()
+        assert ws.sent_types().count("response.create") == 2
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+def test_parallel_failed_session_update_closes_candidate_before_retry(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    sockets = [_FakeWs(), _FakeWs()]
+    calls = []
+
+    async def failed_send(_data):
+        raise ConnectionError("fake session update failure")
+
+    sockets[0].send = failed_send
+
+    async def connect(*_args, **_kwargs):
+        socket = sockets[len(calls)]
+        calls.append(socket)
+        return socket
+
+    monkeypatch.setattr(openai_agent.websockets, "connect", connect)
+
+    async def run():
+        agent = _make_agent()
+        agent._running = True
+        assert await agent._reconnect()
+        assert sockets[0].closed
+        await agent.stop()
+        assert sockets[1].closed
+
+    asyncio.run(run())
+
+
+def test_parallel_tool_continuation_and_nudge_share_response_admission(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+        ws = instances[0]
+        await agent.say("opening")
+        agent._handle_event({"type": "response.created", "response": {"id": "opening"}})
+        continuation = asyncio.create_task(agent._dispatch_tool_call("fake-tool", "call-1", "{}", ws))
+        await _drain()
+        assert ws.sent_types().count("response.create") == 1
+        agent._handle_event({"type": "response.done", "response": {"id": "opening", "status": "completed"}})
+        await asyncio.wait_for(continuation, 1)
+        assert ws.sent_types().count("response.create") == 2
+        agent._handle_event({"type": "response.created", "response": {"id": "tool"}})
+        agent._nudge_after_repeat_suppressed("not logged")
+        await _drain()
+        assert ws.sent_types().count("response.create") == 2
+        agent._handle_event({"type": "response.done", "response": {"id": "tool", "status": "completed"}})
+        await _drain()
+        assert ws.sent_types().count("response.create") == 3
+        await agent.stop()
+
+    asyncio.run(run())
+
+
+def test_parallel_background_send_failure_is_observed_without_logging_content(monkeypatch, caplog):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    instances, _calls = _patch_connect(monkeypatch)
+
+    async def run():
+        agent = _make_agent()
+        await agent.start(lambda _pcm: None)
+
+        async def fail(_data):
+            raise ConnectionError("private-content")
+
+        instances[0].send = fail
+        agent._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await _drain()
+        assert agent.fatal
+        await agent.stop()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(run())
+    assert "后台任务失败" in caplog.text
+    assert "private-content" not in caplog.text
+
+
 async def _wait_for_sent_count(
     ws: _FakeWs,
     event_type: str,
@@ -114,6 +715,38 @@ async def _wait_for_sent_count(
 # ---------------------------------------------------------------------------
 # 连接与 session.update
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_parallel_failed_session_update_closes_acquired_socket(monkeypatch, cancel):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+
+    async def run():
+        ws = _FakeWs()
+        entered = asyncio.Event()
+
+        async def send(_data):
+            entered.set()
+            if cancel:
+                await asyncio.Event().wait()
+            raise RuntimeError("session.update failed")
+
+        async def connect(*_args, **_kwargs):
+            return ws
+
+        monkeypatch.setattr(ws, "send", send)
+        monkeypatch.setattr(openai_agent.websockets, "connect", connect)
+        agent = _make_agent()
+        task = asyncio.create_task(agent.start(lambda _pcm: None))
+        await entered.wait()
+        if cancel:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
+            await task
+        await agent.stop()
+        assert ws.closed
+
+    asyncio.run(run())
 
 
 def test_start_sends_session_update_with_expected_fields(monkeypatch):

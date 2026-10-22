@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
+
+import pytest
 
 from agentcall.agents.local_agent import LocalPipelineAgent
 from agentcall.agents.tools import SEND_DTMF_SPEC, SEND_SMS_SPEC, ToolRegistry
@@ -59,6 +62,40 @@ def _make_agent(replies):
 
     agent = LocalPipelineAgent(pipeline_factory=lambda: pipeline, llm_chat=scripted_llm)
     return agent, pipeline, seen_requests
+
+
+def test_parallel_cancel_joins_model_loader_before_return(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def build(**_kwargs):
+        entered.set()
+        assert release.wait(timeout=1)
+        finished.set()
+        return FakePipeline()
+
+    agent = LocalPipelineAgent(pipeline_factory=build)
+
+    async def run():
+        task = asyncio.create_task(agent.start(lambda _pcm: None))
+        while not entered.is_set():
+            await asyncio.sleep(0.005)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert not task.done(), "cancel must join the loader, not orphan it"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await agent.stop()
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+    assert finished.is_set()
+    assert agent._vad_thread is None and agent._brain_thread is None
 
 
 def test_speech_to_reply_full_pipeline():

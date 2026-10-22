@@ -36,7 +36,11 @@ from typing import Any
 # v4（2026-08-18）：新增 hold_seconds / hold_periods（WIL-120 二期：收尾裁判
 #   判 on_hold 的 hold_started/hold_ended 事件聚合；文档 G 组「排队等待检测」）。
 # v5: takeover rejection reasons and request-to-AI-reclaim latency (#131).
-SCHEMA_VERSION = 5
+# v6 (#130): startup_marks_ms and distinct local-write playout metrics. Legacy
+# arrival metrics retain their definition and are null for local-write events.
+# v7 (#130): native modem greeting acknowledgement/timing, separate from AI playout.
+# （#131 与 #130 在各自分支上都从 v4 起号，合入 product/physical-sim 时顺延为 v5–v7。）
+SCHEMA_VERSION = 7
 
 # 逐轮时延指标：events.jsonl 里 latency 事件的 stage → metrics.json 字段名。
 # 各 stage 的精确定义（2026-08-14）：
@@ -145,6 +149,10 @@ def build_call_metrics(
     tool_latencies: list[float] = []
     config_snapshot: dict[str, Any] | None = None
     first_audio_ms: float | None = None
+    first_playout_ms: float | None = None
+    first_playout_boundary: str | None = None
+    startup_marks_ms: dict[str, float] = {}
+    module_greeting: dict[str, Any] | None = None
     agent_turn_chars: list[float] = []
     peer_turns = 0
     tool_calls: dict[str, int] = {}
@@ -174,6 +182,13 @@ def build_call_metrics(
 
     for event in events:
         etype = event.get("type")
+        if etype in {
+            "answered", "pcm_ready", "bridge_started", "agent_connect_started", "agent_connected",
+            "greeting_requested", "agent_audio_received", "first_audio", "module_greeting",
+        }:
+            t_ms = event.get("t_ms")
+            if isinstance(t_ms, (int, float)) and math.isfinite(t_ms) and t_ms >= 0:
+                startup_marks_ms.setdefault(str(etype), float(t_ms))
         ts = event.get("ts")
         if etype in _ACTIVITY_EVENT_TYPES and isinstance(ts, (int, float)):
             if last_activity_ts is None or ts > last_activity_ts:
@@ -191,9 +206,22 @@ def build_call_metrics(
             config_snapshot = {
                 k: v for k, v in event.items() if k not in ("type", "ts")
             }
+        elif etype == "module_greeting" and isinstance(event.get("ok"), bool):
+            # Native TTS has no host PCM and OK does not prove far-end audibility.
+            # Whitelist only result/timings; never copy the configured greeting text.
+            module_greeting = {"ok": event["ok"]}
+            for field in ("duration_ms", "started_after_answer_ms", "t_ms"):
+                value = event.get(field)
+                if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                    module_greeting[field] = value
         elif etype == "first_audio":
             ms = event.get("ms")
-            if isinstance(ms, (int, float)):
+            boundary = event.get("boundary")
+            if boundary in {"pcm_written", "audio_device_written", "playback_pipe_written"}:
+                first_playout_boundary = str(boundary)
+                if isinstance(ms, (int, float)):
+                    first_playout_ms = float(ms)
+            elif isinstance(ms, (int, float)):
                 first_audio_ms = float(ms)
         elif etype == "transcript":
             role = event.get("role")
@@ -279,6 +307,8 @@ def build_call_metrics(
             finished_ts = float(ts)
 
     unavailable = dict(_STATIC_UNAVAILABLE)
+    if module_greeting is None:
+        unavailable["module_greeting"] = "no_module_greeting_event"
     if config_snapshot is None:
         unavailable["config"] = "config_snapshot_event_missing"
     # 打断类（WIL-95 2.3）：随 BARGE_IN_ENABLED 分岔。开着也还没埋点（WIL-94
@@ -309,7 +339,9 @@ def build_call_metrics(
     else:
         latency_out["tool_call_latency_ms"] = tool_described
     if first_audio_ms is None:
-        unavailable["first_audio_ms"] = "no_samples"
+        unavailable["first_audio_ms"] = (
+            "local_write_use_first_playout_ms" if first_playout_boundary else "no_samples"
+        )
     if contact_known is None:
         unavailable["contact_known"] = "no_call_context_event"
     if not takeover_reclaim_ms:
@@ -341,6 +373,19 @@ def build_call_metrics(
     else:
         answered_to_first_audio_ms = round(
             (greeting_t_ms - answered_t_ms) + first_audio_ms, 1
+        )
+
+    # Local output acceptance, not provider arrival or measured far-end audibility.
+    # Keep separate keys so existing reports never pool the two boundaries.
+    answered_to_first_playout_ms: float | None = None
+    first_write_t_ms = startup_marks_ms.get("first_audio") if first_playout_boundary else None
+    if answered_t_ms is not None and first_write_t_ms is not None and first_write_t_ms >= answered_t_ms:
+        answered_to_first_playout_ms = round(first_write_t_ms - answered_t_ms, 1)
+    else:
+        unavailable["answered_to_first_playout_ms"] = "no_consistent_local_write_marks"
+    if first_playout_ms is None:
+        unavailable["first_playout_ms"] = (
+            "greeting_not_requested" if first_playout_boundary else "no_local_write_sample"
         )
 
     # takeover_latency_ms（v3，文档 F 组「转接建立时延」）：首次 takeover_requested
@@ -405,6 +450,11 @@ def build_call_metrics(
         # greeting 下发→整通首块音频到达；**不是**文档的「接起→首字」——
         # 那要用 answered/greeting_sent 事件的 t_ms 推导（WIL-95 A 类注）。
         "first_audio_ms": first_audio_ms,
+        "first_playout_ms": first_playout_ms,
+        "answered_to_first_playout_ms": answered_to_first_playout_ms,
+        "first_playout_boundary": first_playout_boundary,
+        "startup_marks_ms": startup_marks_ms,
+        "module_greeting": module_greeting,
         "agent_turn_chars": _describe(agent_turn_chars),
         "peer_turns": peer_turns,
         "tool_calls": tool_calls,

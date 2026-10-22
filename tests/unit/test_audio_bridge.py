@@ -102,6 +102,112 @@ def test_ffmpeg_uac_write_payload_keeps_silence_clock_when_empty():
     assert bridge._next_write_payload(silence) == (silence, 0)
 
 
+def test_serial_output_observer_tracks_only_written_agent_audio(monkeypatch):
+    from agentcall.audio_bridge import AgentPcm, SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("unused", write_size=8, write_interval=0)
+    observed = []
+    writes = []
+
+    class Port:
+        is_open = True
+
+        def write(self, payload):
+            writes.append(payload)
+            if len(writes) == 3:
+                bridge._running = False
+            return len(payload)
+
+    bridge._ser = Port()
+    bridge.set_output_observer(observed.append)
+    bridge.write_modem_chunks([b"tone", AgentPcm(b"voice!")])
+    bridge._running = True
+    bridge._write_loop()
+
+    assert b"".join(observed) == b"voice!"  # No tone or silence padding.
+    assert bridge.output_progress_bytes() == 10  # Tone + voice, never filler/padding.
+    assert writes == [b"tonevoic", b"e!\x00\x00\x00\x00\x00\x00", b"\x00" * 8]
+
+
+def test_serial_output_observer_ignores_timeout_and_discarded_audio():
+    import serial
+
+    from agentcall.audio_bridge import AgentPcm, SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("unused", write_size=4, write_interval=0)
+    observed = []
+
+    class Port:
+        is_open = True
+        calls = 0
+
+        def write(self, payload):
+            self.calls += 1
+            if self.calls == 1:
+                raise serial.SerialTimeoutException()
+            bridge._running = False
+            return 2  # A short successful write must not observe the suffix.
+
+        def reset_output_buffer(self):
+            pass
+
+    bridge._ser = Port()
+    bridge.set_output_observer(observed.append)
+    bridge.write_modem_chunks([AgentPcm(b"drop")])
+    assert bridge.discard_pending_output() == 4
+    bridge.write_modem_chunks([AgentPcm(b"fail"), AgentPcm(b"good")])
+    bridge._running = True
+    bridge._write_loop()
+    assert observed == [b"go"]
+    assert bridge.output_progress_bytes() == 2  # Discards/timeouts/short-write suffix aren't progress.
+
+
+def test_ffmpeg_output_observer_ignores_filler_tones_and_restarted_buffer(monkeypatch):
+    from agentcall.audio_bridge import AgentPcm
+
+    bridge = make_ffmpeg_bridge()
+    bridge._play = FakeProcess(fd=95)
+    observed = []
+    bridge.set_output_observer(observed.append)
+    bridge.write_modem_chunks([AgentPcm(b"old")])
+    bridge._drop_stale_tx_buffer()
+    bridge.write_modem_chunks([b"tone", AgentPcm(b"voice")])
+
+    def write(_payload):
+        bridge._running = False
+        return True
+
+    monkeypatch.setattr(bridge, "_write_play_payload", write)
+    bridge._running = True
+    bridge._write_loop()
+    assert observed == [b"voice"]
+    assert bridge.output_progress_bytes() == 9
+
+
+def test_uac_observer_runs_after_output_write_and_never_observes_dtmf():
+    from agentcall.audio_bridge import AgentPcm, ModemAudioBridge
+
+    bridge = ModemAudioBridge.__new__(ModemAudioBridge)
+    writes = []
+    observed = []
+
+    class Stream:
+        def write(self, pcm):
+            writes.append(pcm)
+
+    bridge._output_stream = Stream()
+
+    def observe(pcm):
+        assert pcm in writes
+        observed.append(pcm)
+
+    bridge.set_output_observer(observe)
+    bridge.write_modem_chunks([b"tone", AgentPcm(b"voice")])
+    assert writes == [b"tone", b"voice"]
+    assert observed == [b"voice"]
+    assert bridge.output_progress_bytes() == 9
+
+
 def test_ffmpeg_uac_write_payload_pads_partial_agent_audio():
     bridge = make_ffmpeg_bridge()
     silence = b"\x00" * NMEA_WRITE_SIZE

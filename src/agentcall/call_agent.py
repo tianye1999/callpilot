@@ -14,7 +14,7 @@ import time
 from array import array
 from datetime import UTC, datetime
 from queue import Empty, Full, Queue
-from typing import Callable
+from typing import Awaitable, Callable
 
 from . import call_playbooks, config, platforms
 from .agents.base import VoiceAgent
@@ -22,6 +22,7 @@ from .agents.factory import create_agent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
 from .audio_bridge import (
     MODEM_RATE,
+    AgentPcm,
     FfmpegAudioBridge,
     ModemAudioBridge,
     SerialPcmAudioBridge,
@@ -139,6 +140,7 @@ HANGUP_TOOL_DELAY_SECONDS = 4.5
 DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS = 3.0
 DTMF_RECENT_SEND_WINDOW_SECONDS = 5.0
 _EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
+_PARALLEL_PLAYOUT_STALL_SECONDS = 1.0
 _INBOUND_TAKEOVER_HOLD_INSTRUCTIONS = {
     "zh": "正在尝试联系机主接听，但尚未接通。结合上下文简短、自然地告知来电者正在等待机主，"
           "不要承诺一定能够转接，也不要展开新的话题。",
@@ -215,6 +217,8 @@ class CallSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._active = False
+        self._parallel_agent_connect = False
+        self._last_downlink_play_at = 0.0
         self._active_lock = threading.Lock()
         self._outgoing_audio: Queue[bytes] = Queue()
         # 本轮是否已记过「排队时长」（每轮只记一次，见 _make_agent_audio_handler）。
@@ -363,6 +367,15 @@ class CallSession:
         with self._active_lock:
             return self._active
 
+    @property
+    def owns_modem_shutdown(self) -> bool:
+        """Keep admission closed until the parallel owner has joined its workers."""
+        return self._parallel_agent_connect and self._thread is not None and self._thread.is_alive()
+
+    @property
+    def is_busy(self) -> bool:
+        return self.is_active or self.owns_modem_shutdown
+
     def _set_active(self, value: bool) -> None:
         with self._active_lock:
             self._active = value
@@ -374,10 +387,11 @@ class CallSession:
         preset_hint: str | None = None,
         preset_id: str | None = None,
     ) -> None:
-        if self.is_active:
+        if self.is_busy:
             logger.warning("已有通话进行中，忽略新的呼叫请求")
             return
         self._outbound_number = outbound_number
+        self._parallel_agent_connect = config.get_bool("PARALLEL_AGENT_CONNECT")
         self._outbound_task_value = task
         self._preset_hint = preset_hint
         self._preset_id = preset_id
@@ -418,6 +432,8 @@ class CallSession:
             self._cancel_spoken_dtmf_followups_locked()
         self._stop_dtmf_judge()
         self._stop_triage_judge()
+        if self._parallel_agent_connect:
+            return  # The parallel owner polls is_active and cancels blocked operations.
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
 
@@ -438,6 +454,9 @@ class CallSession:
             # 会话收尾统一取消未触发的延迟挂断，不让它跨到下一通。
             self._cancel_hangup_timer()
             self._loop.close()
+            # All resources/workers are joined. The completion callback may now
+            # admit the next queued call even though this thread has not returned.
+            self._parallel_agent_connect = False
             # 会话结束通知（含异常/未接通路径）：驱动外呼队列拨下一个等。
             if self._on_ended is not None:
                 try:
@@ -448,6 +467,8 @@ class CallSession:
     async def _handle_call(self) -> None:
         self._clear_outgoing_audio()
         self._load_session_config()
+        self._parallel_agent_connect = config.get_bool("PARALLEL_AGENT_CONNECT")
+        self._last_downlink_play_at = 0.0
 
         session_t0 = time.monotonic()
         direction = "outbound" if self._outbound_number else "inbound"
@@ -511,6 +532,12 @@ class CallSession:
 
         status = "completed"
         try:
+            if self._parallel_agent_connect:
+                if not await self._handle_parallel_startup(
+                    direction, number, record, transcripts, mark, session_t0
+                ):
+                    status = "not_connected"
+                return
             if self._outbound_number:
                 if not await self._connect_outbound(mark):
                     status = "not_connected"
@@ -547,76 +574,7 @@ class CallSession:
                 tx_gain=self.tx_gain,
             )
             agent = create_agent(self.provider)
-            self._start_dtmf_judge(record, session_t0=session_t0)
-            agent.set_session_instructions(self._build_agent_instructions(direction))
-            agent.set_transcript_handler(
-                self._make_transcript_handler(record, transcripts, agent)
-            )
-            agent.set_repeat_stuck_handler(self._request_repeat_stuck_wrap_up)
-            # 面向用户的状态提示（如 local provider 首启下载模型进度）经 EventHub 播给 UI。
-            agent.set_status_handler(
-                lambda text: self._publish({"type": "system", "text": text})
-            )
-            tools = self._build_tools(direction)
-            with self._dtmf_lock:
-                self._active_tools = tools
-            agent.set_tools(tools)
-            if isinstance(bridge, SerialPcmAudioBridge):
-                bridge.set_ready_check(self.modem.pcm_ready)
-            self._barge_in = config.get_bool("BARGE_IN_ENABLED")
-            self._barge_in_echo_strikes = 0
-            self._turn_audio_started_at = 0.0
-            if self._barge_in:
-                # 对端开口（provider VAD speech_started）→ 丢弃本地未播积压，
-                # AI 闭嘴听对方说完；护窗期让位与自激兜底见 _handle_peer_barge_in。
-                # 掐生成（response.cancel）由 agent 侧按回调返回值决定。
-                agent.set_user_interrupt_handler(
-                    lambda: self._handle_peer_barge_in(bridge)
-                )
-            # 复读晚截（ResponseAudioGate on_late_cut）：同一个清积压动作、
-            # 不同语义——不计自激笔数，且半双工模式也要清（复读开头已播出的
-            # 尾巴不清会多拖 1~2s）。护窗让位逻辑在 _discard_agent_playback 内。
-            agent.set_late_cut_handler(
-                lambda: self._discard_agent_playback(bridge, "复读晚截")
-            )
-            # provider 侧逐轮时延（如判停→首音频）经回调落 events.jsonl
-            # （WIL-95 第一期：测量早已校准，缺的只是持久化）。
-            if record is not None:
-                agent.set_latency_handler(record.log_latency)
-            # 配置快照（WIL-95 第一期硬要求）：没有它，跨时间对比无法归因——
-            # 指标变了可能只是切了 provider / 判停方式 / barge-in。字段增删
-            # 属指标契约变更，要同步升 call_metrics.SCHEMA_VERSION。
-            if record is not None:
-                # 快照失败绝不影响通话（metrics.json 会记 config 缺失 + 原因）。
-                try:
-                    record.log_event(
-                        "config_snapshot",
-                        provider=self.provider,
-                        model=getattr(agent, "model", "") or "",
-                        turn_detection=config.get_str("OPENAI_TURN_DETECTION"),
-                        vad_eagerness=config.get_str("OPENAI_VAD_EAGERNESS"),
-                        vad_silence_ms=config.get_int("OPENAI_VAD_SILENCE_MS"),
-                        barge_in_enabled=self._barge_in,
-                        hangover_seconds=self._hangover_seconds,
-                        dtmf_mode=config.get_str("DTMF_MODE"),
-                        recording_enabled=getattr(
-                            record, "recording_enabled", False
-                        ),
-                        audio_mode=self.audio_mode,
-                        modem_vendor=config.get_str("MODEM_VENDOR"),
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning("配置快照落盘失败（不影响通话）", exc_info=True)
-            if record is not None:
-                # 通话上下文（WIL-95 第二期）：熟人布尔——只记 bool 不记身份
-                # （§7 同款约束）。是 Stage 2「熟人来电处理占比」的数据前置。
-                try:
-                    known = bool(number) and number in known_contact_numbers(
-                        self.hub, self.call_logger
-                    )
-                    record.log_event("call_context", contact_known=known)
-                except Exception:  # noqa: BLE001
-                    pass
+            self._configure_call_agent(agent, lambda: bridge, record, transcripts, direction, number, session_t0)
             bridge.start()
             mark("bridge_started")
 
@@ -654,7 +612,273 @@ class CallSession:
             mark("ended", status=status)
             self._finalize_record(record, status, transcripts, direction, number)
 
-    async def _connect_outbound(self, mark: Callable[..., float]) -> bool:
+    def _configure_call_agent(
+        self, agent, get_bridge: Callable[[], AudioBridge | None], record: CallRecord | None,
+        transcripts: list[tuple[str, str]], direction: str, number: str | None, session_t0: float,
+    ) -> None:
+        self._start_dtmf_judge(record, session_t0=session_t0)
+        agent.set_session_instructions(self._build_agent_instructions(direction))
+        agent.set_transcript_handler(self._make_transcript_handler(record, transcripts, agent))
+        agent.set_repeat_stuck_handler(self._request_repeat_stuck_wrap_up)
+        agent.set_status_handler(lambda text: self._publish({"type": "system", "text": text}))
+        tools = self._build_tools(direction)
+        with self._dtmf_lock:
+            self._active_tools = tools
+        agent.set_tools(tools)
+        bridge = get_bridge()
+        if isinstance(bridge, SerialPcmAudioBridge):
+            bridge.set_ready_check(self.modem.pcm_ready)
+        self._barge_in = config.get_bool("BARGE_IN_ENABLED")
+        self._barge_in_echo_strikes = 0
+        self._turn_audio_started_at = 0.0
+        if self._barge_in:
+            agent.set_user_interrupt_handler(lambda: self._handle_peer_barge_in(get_bridge()))
+        # The same queue is used before/after bridge startup, including guard-aware cuts.
+        agent.set_late_cut_handler(lambda: self._discard_agent_playback(get_bridge(), "复读晚截"))
+        if record is not None:
+            agent.set_latency_handler(record.log_latency)
+            try:
+                record.log_event(
+                    "config_snapshot", provider=self.provider, model=getattr(agent, "model", "") or "",
+                    turn_detection=config.get_str("OPENAI_TURN_DETECTION"),
+                    vad_eagerness=config.get_str("OPENAI_VAD_EAGERNESS"),
+                    vad_silence_ms=config.get_int("OPENAI_VAD_SILENCE_MS"),
+                    barge_in_enabled=self._barge_in, hangover_seconds=self._hangover_seconds,
+                    dtmf_mode=config.get_str("DTMF_MODE"),
+                    recording_enabled=getattr(record, "recording_enabled", False),
+                    audio_mode=self.audio_mode, modem_vendor=config.get_str("MODEM_VENDOR"),
+                    **({"parallel_agent_connect": True} if self._parallel_agent_connect else {}),
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("配置快照落盘失败（不影响通话）", exc_info=True)
+            try:
+                known = bool(number) and number in known_contact_numbers(self.hub, self.call_logger)
+                record.log_event("call_context", contact_known=known)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _threaded_modem_call(self, operation: Callable, *args):
+        # Cancelling to_thread does not stop its thread. Join before any later hangup/reset.
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    async def _cleanup_step(self, stage: str, operation: Awaitable) -> None:
+        started = time.monotonic()
+        logger.info("[timing] 通话收尾开始 stage=%s", stage)
+        try:
+            await operation
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+            logger.info("[timing] 通话收尾 stage=%s elapsed_ms=%.1f", stage, elapsed_ms)
+            if self._record is not None:
+                try:
+                    self._record.log_event("cleanup_stage", stage=stage, duration_ms=elapsed_ms)
+                except Exception:  # noqa: BLE001
+                    logger.warning("收尾计时落盘失败（不影响清理）")
+
+    async def _handle_parallel_startup(
+        self, direction: str, number: str | None, record: CallRecord | None,
+        transcripts: list[tuple[str, str]], mark: Callable[..., float], session_t0: float,
+    ) -> bool:
+        agent = None
+        bridge: AudioBridge | None = None
+        active_bridge: AudioBridge | None = None
+        prepare_task: asyncio.Task | None = None
+        connect_task: asyncio.Task | None = None
+        loop_task: asyncio.Task | None = None
+        stop_preparing = threading.Event()
+        bridge_ready = threading.Event()
+        agent_ready = asyncio.Event()
+        generation = self._session_generation
+        greeting_at: float | None = None
+        first_output = False
+        first_received = False
+        output_lock = threading.Lock()
+        hangup_owned = True
+        native_greeting = (
+            config.get_str("MODEM_ANSWER_GREETING")
+            if direction == "inbound" and isinstance(self.modem, Sim7600Modem) else ""
+        )
+        native_greeting_spoken = ""
+        native_greeting_done = asyncio.Event()
+        event_loop = asyncio.get_running_loop()
+        answered_at = 0.0
+
+        def startup_current() -> bool:
+            return not stop_preparing.is_set() and self._agent_generation_current(generation)
+
+        def note_received() -> None:
+            nonlocal first_received
+            if not first_received:
+                first_received = True
+                mark("agent_audio_received")
+
+        def observe_output(pcm: bytes) -> None:
+            nonlocal first_output
+            # This observer belongs to this record/bridge, not the next session.
+            # Bytes accepted while stop() is closing the provider still played.
+            if record is not None:
+                record.write_downlink(pcm)
+            if not self._agent_generation_current(generation):
+                return
+            self._last_downlink_play_at = time.monotonic()
+            with output_lock:
+                if first_output:
+                    return
+                first_output = True
+                elapsed = None if greeting_at is None else max(0, round((time.monotonic() - greeting_at) * 1000))
+                boundary = {
+                    "nmea": "pcm_written", "uac": "audio_device_written", "uac_ffmpeg": "playback_pipe_written",
+                }[self.audio_mode]
+                mark("first_audio", boundary=boundary, **({"ms": elapsed} if elapsed is not None else {}))
+            if elapsed is not None:
+                logger.info("首音频延迟: %dms (本地下行写出)", elapsed)
+
+        def prepare_media() -> None:
+            nonlocal bridge, native_greeting_spoken
+            if native_greeting:
+                delay = max(0, config.get_int("MODEM_ANSWER_GREETING_DELAY_MS")) / 1000
+                delay = max(0.0, answered_at + delay - time.monotonic())
+            else:
+                delay = getattr(self.modem, "POST_ANSWER_SETTLE_SECONDS", 1.0)
+            if stop_preparing.wait(delay):
+                return
+            if not startup_current():
+                return
+            if native_greeting:
+                assert isinstance(self.modem, Sim7600Modem)
+                started = time.monotonic()
+                try:
+                    ok = self.modem.play_answer_greeting(native_greeting)
+                    if ok:
+                        native_greeting_spoken = native_greeting
+                    mark(
+                        "module_greeting", ok=ok,
+                        duration_ms=round((time.monotonic() - started) * 1000, 1),
+                        started_after_answer_ms=round((started - answered_at) * 1000, 1),
+                    )
+                finally:
+                    # Connect stays parallel; only the opening needs the CTTS result.
+                    event_loop.call_soon_threadsafe(native_greeting_done.set)
+                if not startup_current():
+                    return
+            self.modem.initialize_for_voice(self.audio_mode)
+            enable_info = getattr(self.modem, "last_voice_enable", None)
+            if record is not None and isinstance(enable_info, dict):
+                record.log_event("pcm_enable", **enable_info)
+            if isinstance(enable_info, dict) and enable_info.get("ok") is False:
+                raise RuntimeError("PCM 启用失败，结束通话以避免死寂线路")
+            if not startup_current():
+                return
+            mark("pcm_ready")
+            bridge = create_audio_bridge(
+                mode=self.audio_mode, device_keyword=self.audio_keyword, pcm_port=self.pcm_port,
+                pcm_baudrate=self.pcm_baudrate, tx_gain=self.tx_gain,
+            )
+            if isinstance(bridge, SerialPcmAudioBridge):
+                bridge.set_ready_check(self.modem.pcm_ready)
+            bridge.set_output_observer(observe_output)
+            if not startup_current():
+                return
+            bridge.start()
+            mark("bridge_started")
+            bridge_ready.set()
+
+        async def connect_and_greet() -> None:
+            nonlocal greeting_at
+            assert agent is not None
+            mark("agent_connect_started")
+            await agent.start(self._make_agent_audio_handler(
+                agent, None, record, note_received, bridge_getter=lambda: bridge, record_at_playout=True,
+            ))
+            if not startup_current():
+                return
+            mark("agent_connected")
+            mark("agent_started")
+            agent_ready.set()
+            if direction == "outbound" and self._prompt_gen_opening_mode == "wait":
+                mark("opening_skipped", mode="wait")
+            else:
+                if native_greeting:
+                    await native_greeting_done.wait()
+                    if not startup_current():
+                        return
+                greeting_at = mark("greeting_requested")
+                await agent.say(self._opening_instructions(direction, module_greeting=native_greeting_spoken))
+                mark("greeting_sent")
+
+        try:
+            if self._outbound_number and not await self._connect_outbound(mark, threaded=True):
+                hangup_owned = False
+                return False
+            agent = create_agent(self.provider)
+            self._configure_call_agent(agent, lambda: bridge, record, transcripts, direction, number, session_t0)
+            if not self._outbound_number:
+                logger.info("开始处理来电（并行准备）...")
+                await self._threaded_modem_call(self.modem.answer)
+            if not startup_current():
+                return True
+            self._publish({"type": "call", "status": "answered", "caller": self.current_caller})
+            answered_at = mark("answered")
+            prepare_task = asyncio.create_task(asyncio.to_thread(prepare_media))
+            connect_task = asyncio.create_task(connect_and_greet())
+            while startup_current():
+                for task in (prepare_task, connect_task):
+                    if task.done():
+                        task.result()
+                if bridge_ready.is_set() and agent_ready.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            if not startup_current() or bridge is None or not bridge_ready.is_set():
+                return True
+            active_bridge = bridge
+            # Run normal duplex/recording/takeover processing even while say() is streaming.
+            loop_task = asyncio.create_task(self._run_agent_loop(agent, bridge, record, transcripts))
+            connect_checked = False
+            # Physical hangup must cancel a loop blocked in say()/send_audio(),
+            # not wait for that operation to notice is_active on its own.
+            while self.is_active:
+                if connect_task.done() and not connect_checked:
+                    connect_checked = True
+                    if generation == self._session_generation:
+                        connect_task.result()
+                    else:
+                        # Mobile takeover fences the AI owner, not the physical call.
+                        await asyncio.gather(connect_task, return_exceptions=True)
+                if loop_task.done():
+                    active_bridge = loop_task.result()
+                    break
+                if generation == self._session_generation and agent.fatal:
+                    break
+                await asyncio.sleep(0.01)
+            return True
+        finally:
+            stop_preparing.set()
+            self._set_active(False)
+            for pending_task in (connect_task, loop_task):
+                if pending_task is not None and not pending_task.done():
+                    pending_task.cancel()
+            await self._cleanup_step("agent_tasks", asyncio.gather(
+                *(t for t in (connect_task, loop_task) if t is not None), return_exceptions=True,
+            ))
+            if loop_task is not None and not loop_task.cancelled() and loop_task.exception() is None:
+                # Cancellation can arrive after mobile handoff returned its new
+                # bridge but before the normal assignment above resumes.
+                active_bridge = loop_task.result()
+            await self._stop_agent_resources(agent, None)
+            if prepare_task is not None:
+                await self._cleanup_step("modem_prepare", asyncio.shield(asyncio.gather(
+                    prepare_task, return_exceptions=True,
+                )))
+            self._clear_outgoing_audio()
+            if hangup_owned:
+                await self._shutdown_agent(None, active_bridge or bridge, threaded=True)
+
+    async def _connect_outbound(self, mark: Callable[..., float], *, threaded: bool = False) -> bool:
         """外呼：拨号并等待接通；未接通时发结束事件、挂断并返回 False。"""
         number = self._outbound_number
         if number is None:
@@ -662,7 +886,10 @@ class CallSession:
         logger.info("开始外呼: %s", number)
         self.current_caller = number
         self._start_prompt_generation()
-        self.modem.dial(number)
+        if threaded:
+            await self._threaded_modem_call(self.modem.dial, number)
+        else:
+            self.modem.dial(number)
         mark("dialing", number=number)
         self._publish(
             {"type": "call", "status": "dialing", "caller": self.current_caller}
@@ -678,7 +905,10 @@ class CallSession:
                     "caller": self.current_caller,
                 }
             )
-            self.modem.hangup()
+            if threaded:
+                await self._threaded_modem_call(self.modem.hangup)
+            else:
+                self.modem.hangup()
             return False
         mark("connected")
         return True
@@ -734,9 +964,12 @@ class CallSession:
     def _make_agent_audio_handler(
         self,
         agent,
-        bridge: AudioBridge,
+        bridge: AudioBridge | None,
         record: CallRecord | None,
         on_first_audio: Callable[[], None] | None = None,
+        *,
+        bridge_getter: Callable[[], AudioBridge | None] | None = None,
+        record_at_playout: bool = False,
     ) -> Callable[[bytes], None]:
         """Agent 下行音频回调：浏览器实时旁听、本机监听旁路、重采样到 8k、录音、入发送队列。"""
 
@@ -789,16 +1022,22 @@ class CallSession:
             monitor = self.monitor
             if monitor is not None:
                 monitor.feed(pcm_agent)
-            pcm_8k = bridge.agent_to_modem(pcm_agent, agent.output_rate)
-            if hasattr(bridge, "amplify_for_modem"):
-                pcm_8k = bridge.amplify_for_modem(pcm_8k)
+            current_bridge = bridge_getter() if bridge_getter is not None else bridge
+            if current_bridge is None:
+                pcm_8k = ModemAudioBridge.agent_to_modem(pcm_agent, agent.output_rate)
+                if self.audio_mode in {"nmea", "uac_ffmpeg"}:
+                    pcm_8k = apply_pcm_gain(pcm_8k, self.tx_gain)
+            else:
+                pcm_8k = current_bridge.agent_to_modem(pcm_agent, agent.output_rate)
+                if hasattr(current_bridge, "amplify_for_modem"):
+                    pcm_8k = current_bridge.amplify_for_modem(pcm_8k)
             # 掐掉本轮开头的静音垫（WIL-112 最后一块）：TTS 音频前缘实测垫
             # 中位 470ms、最长 ~1s 纯静音——仪器在「首字节到达」停表，对端耳朵
             # 却要等垫子播完。只掐轮首、设上限防误伤；句中停顿原样保留。
             if pcm_8k and self._turn_trim_budget > 0:
                 pcm_8k = self._trim_leading_silence(pcm_8k)
             if pcm_8k:
-                if record is not None:
+                if record is not None and not record_at_playout:
                     record.write_downlink(pcm_8k)
                 # 本轮首块音频入队时，记录「它前面还排着多少秒没播完」——这才是
                 # 对端真正要等的时间。判停→首音频只是 OpenAI 生成耗时，不含排队
@@ -808,8 +1047,8 @@ class CallSession:
                     # 自激兜底的时间锚点：本轮首块回复音频到达时刻。
                     self._turn_audio_started_at = time.monotonic()
                     pending = (
-                        bridge.pending_output_bytes()
-                        if hasattr(bridge, "pending_output_bytes") else 0
+                        current_bridge.pending_output_bytes()
+                        if current_bridge is not None and hasattr(current_bridge, "pending_output_bytes") else 0
                     )
                     queued = self._outgoing_audio.qsize() * len(pcm_8k)
                     ahead = (pending + queued) / (MODEM_RATE * 2)
@@ -849,7 +1088,7 @@ class CallSession:
                                 "[timing] 端到端轮次延迟(本地音尾→首音频): %.0fms",
                                 e2e * 1000,
                             )
-                self._outgoing_audio.put(pcm_8k)
+                self._outgoing_audio.put(AgentPcm(pcm_8k) if record_at_playout else pcm_8k)
 
         return on_agent_audio
 
@@ -930,8 +1169,13 @@ class CallSession:
         transcripts: list[tuple[str, str]],
     ) -> AudioBridge:
         """通话主循环：下行音频搬运 + 半双工防回环的上行转发。"""
-        last_play_at = 0.0
+        last_play_at = self._last_downlink_play_at if self._parallel_agent_connect else 0.0
         loop_started = time.monotonic()
+        last_output_progress_at = loop_started
+        previous_pending = 0
+        previous_output_progress = 0
+        last_uplink_gate: str | None = None
+        last_gate_log_at = 0.0
         # 外呼硬时限：LLM 收尾裁判失灵/漏判时的最后防线（到点道别挂断）。
         # profile 可覆盖（WIL-120 一期）：长通话（客服排队 30 分钟+）是场景属性，
         # 只给点名的预设放开；0=不限时，其余外呼保持全局安全默认。
@@ -1102,7 +1346,31 @@ class CallSession:
                 if hasattr(bridge, "pending_output_bytes")
                 else 0
             )
+            if self._parallel_agent_connect:
+                progress = bridge.output_progress_bytes() if hasattr(bridge, "output_progress_bytes") else None
+                progressed = (
+                    progress != previous_output_progress if progress is not None else pending < previous_pending
+                )
+                if pending == 0 or progressed or self._last_downlink_play_at > last_output_progress_at:
+                    last_output_progress_at = now
+                if progress is not None:
+                    previous_output_progress = progress
+                if (pending > 0 and now - last_output_progress_at >= _PARALLEL_PLAYOUT_STALL_SECONDS
+                        and now >= self._dtmf_guard_until and hasattr(bridge, "discard_pending_output")):
+                    if self._discard_agent_playback(bridge, "下行写出停滞"):
+                        logger.warning("下行写出停滞，已清积压并释放半双工屏蔽")
+                        if record is not None:
+                            try:
+                                record.log_event("playout_stalled", pending_bytes=pending)
+                            except Exception:  # noqa: BLE001
+                                logger.warning("下行停滞事件落盘失败（不影响通话）")
+                        pending = 0
+                        last_play_at = self._last_downlink_play_at
+                        last_output_progress_at = now
+                previous_pending = pending
             agent_speaking = pending > 0 or not self._outgoing_audio.empty()
+            if self._parallel_agent_connect:
+                last_play_at = max(last_play_at, self._last_downlink_play_at)
             if agent_speaking:
                 last_play_at = now
             # 半双工防回环：Agent 说话期间（含挂尾窗口）丢弃上行，
@@ -1113,6 +1381,25 @@ class CallSession:
                 agent_speaking
                 or (now - last_play_at) < self._hangover_seconds
             )
+            if self._parallel_agent_connect:
+                gate = "ownership" if not agent_effects_allowed else "half_duplex" if suppress_uplink else "forward"
+                if gate != last_uplink_gate or (gate != "forward" and now - last_gate_log_at >= 5):
+                    state = self.takeover_state
+                    fields = {
+                        "reason": gate, "pending_bytes": pending, "queued_chunks": self._outgoing_audio.qsize(),
+                        "last_write_age_ms": max(0, round((now - self._last_downlink_play_at) * 1000, 1))
+                        if self._last_downlink_play_at else None,
+                        "triage_terminal": self._triage_terminal,
+                        "takeover_state": state.value if state is not None else None,
+                    }
+                    logger.info("[timing] 上行门状态 %s", fields)
+                    if record is not None:
+                        try:
+                            record.log_event("uplink_gate", **fields)
+                        except Exception:  # noqa: BLE001
+                            logger.warning("上行门事件落盘失败（不影响通话）")
+                    last_uplink_gate = gate
+                    last_gate_log_at = now
 
             pcm_8k = bridge.read_modem_chunk()
             if self._dead_media_expired(pcm_8k, now) and not self._dead_media_reported:
@@ -1244,6 +1531,10 @@ class CallSession:
             finally:
                 status_task.cancel()
                 await asyncio.gather(status_task, return_exceptions=True)
+        except asyncio.CancelledError:
+            if self._parallel_agent_connect and new_bridge is not None:
+                await self._threaded_modem_call(new_bridge.stop)
+            raise
         except Exception as exc:  # noqa: BLE001
             if committed:
                 logger.warning("接管后媒体泵失败: error_type=%s", type(exc).__name__)
@@ -2001,7 +2292,7 @@ class CallSession:
             ),
         )
 
-    def _opening_instructions(self, direction: str) -> str:
+    def _opening_instructions(self, direction: str, *, module_greeting: str = "") -> str:
         """开场白指令：文本构造在 prompts 模块（纯函数，可独测）。"""
         lang = agent_language()
         return opening_instructions(
@@ -2011,6 +2302,7 @@ class CallSession:
             self._outbound_task(lang),
             lang,
             opening=self._prompt_gen_opening if direction == "outbound" else None,
+            module_greeting=module_greeting,
         )
 
     async def _run_wrap_up_judge(
@@ -2514,7 +2806,7 @@ class CallSession:
                 self._dtmf_guard_until = previous_guard
             return ok, mode
 
-    def _handle_peer_barge_in(self, bridge: AudioBridge) -> bool:
+    def _handle_peer_barge_in(self, bridge: AudioBridge | None) -> bool:
         """对端开口（provider VAD speech_started）→ 让 AI 让路；返回是否接受打断。
 
         返回 False（provider 侧据此**不发** ``response.cancel``）的两种情形：
@@ -2538,7 +2830,7 @@ class CallSession:
             return False
         pending = (
             bridge.pending_output_bytes()
-            if hasattr(bridge, "pending_output_bytes")
+            if bridge is not None and hasattr(bridge, "pending_output_bytes")
             else 0
         )
         agent_in_flight = pending > 0 or not self._outgoing_audio.empty()
@@ -2578,7 +2870,7 @@ class CallSession:
         except Exception:  # noqa: BLE001
             pass
 
-    def _discard_agent_playback(self, bridge: AudioBridge, reason: str) -> bool:
+    def _discard_agent_playback(self, bridge: AudioBridge | None, reason: str) -> bool:
         """清掉 AI 未播出的下行积压（桥内 + 队列）；护窗期拒绝，双音优先。
 
         barge-in 让路与复读晚截（ResponseAudioGate ``on_late_cut``）共用的
@@ -2595,7 +2887,7 @@ class CallSession:
                 logger.info("护窗在清积压途中装上（%s）：让位，双音优先", reason)
                 return False
             dropped = 0
-            if hasattr(bridge, "discard_pending_output"):
+            if bridge is not None and hasattr(bridge, "discard_pending_output"):
                 dropped = bridge.discard_pending_output()
             cleared = 0
             try:
@@ -3405,15 +3697,21 @@ class CallSession:
                 except Full:
                     pass
 
-    async def _stop_agent_resources(self, agent, bridge: AudioBridge | None) -> None:
+    async def _stop_agent_resources(self, agent, bridge: AudioBridge | None, *, threaded: bool = False) -> None:
         if agent is not None:
             try:
-                await agent.stop()
+                if self._parallel_agent_connect:
+                    await self._cleanup_step("agent_stop", agent.stop())
+                else:
+                    await agent.stop()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("关闭 Agent 出错: %s", exc)
         if bridge is not None:
             try:
-                bridge.stop()
+                if threaded:
+                    await self._cleanup_step("bridge_stop", self._threaded_modem_call(bridge.stop))
+                else:
+                    bridge.stop()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("关闭音频桥出错: %s", exc)
 
@@ -3433,11 +3731,14 @@ class CallSession:
         await self._stop_agent_resources(agent, bridge)
         logger.info("Agent 已从物理通话分离（modem 与 QPCMV 保持）")
 
-    async def _shutdown_agent(self, agent, bridge: AudioBridge | None) -> None:
-        await self._stop_agent_resources(agent, bridge)
+    async def _shutdown_agent(self, agent, bridge: AudioBridge | None, *, threaded: bool = False) -> None:
+        await self._stop_agent_resources(agent, bridge, threaded=threaded)
         # 会话结束（含异常/端口冲突）时确保挂断物理通话，避免线路悬空。
         try:
-            self.modem.hangup()
+            if threaded:
+                await self._cleanup_step("modem_hangup", self._threaded_modem_call(self.modem.hangup))
+            else:
+                self.modem.hangup()
         except Exception as exc:  # noqa: BLE001
             logger.warning("挂断物理通话出错: %s", exc)
         logger.info("通话 Agent 会话已结束")
@@ -3613,7 +3914,7 @@ class CallAgentService:
                     self.modem.recovery_in_progress or not self.modem_connected
                 ):
                     return
-                if self.session.is_active or self._remote_call_owner is not None:
+                if self.session.is_busy or self._remote_call_owner is not None:
                     logger.debug("已有通话进行中，忽略重复的 RING/CLCC: %s", caller)
                     return
                 logger.info("来电号码: %s", caller or "未知")
@@ -3639,8 +3940,10 @@ class CallAgentService:
             if remote_owner is not None:
                 remote_owner.request_call_stop("remote_party_hangup")
                 return
+            shutdown_owned = self.session.owns_modem_shutdown
             self.session.stop()
-            self.modem.hangup()
+            if not shutdown_owned:
+                self.modem.hangup()
 
         def on_sms(sender: str | None, text: str, sms_ts: str = "") -> None:
             logger.info("收到短信 来自=%s 字符数=%d", sender or "未知", len(text))
@@ -3712,7 +4015,7 @@ class CallAgentService:
                 guard_failure = self._dial_guard(number)
                 if guard_failure is not None:
                     return False, guard_failure.message
-            if self.session.is_active or self._remote_call_owner is not None:
+            if self.session.is_busy or self._remote_call_owner is not None:
                 return False, "当前正在通话中，请稍后再拨"
             self.session.current_caller = number
             if preset_id is None:
@@ -3964,7 +4267,7 @@ class CallAgentService:
             worker = self._remote_worker
             remote_session_active = bool(worker and worker.is_running)
         with self._ring_lock:
-            local_session_active = self.session.is_active
+            local_session_active = self.session.is_busy
             remote_call_active = self._remote_call_owner is not None
         return remote_session_active or local_session_active or remote_call_active
 
@@ -4091,7 +4394,7 @@ class CallAgentService:
             guard_failure = self._dial_guard(None)
             if guard_failure is not None:
                 return guard_failure
-            if self.session.is_active or self._remote_call_owner is not None:
+            if self.session.is_busy or self._remote_call_owner is not None:
                 return "当前正在通话中，请稍后再拨"
             limit = acquire_remote_dial_slot(
                 config.get_int("REMOTE_DIAL_LIMIT_PER_HOUR")

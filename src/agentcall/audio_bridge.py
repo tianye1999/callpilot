@@ -10,6 +10,7 @@ import select
 import subprocess
 import threading
 import time
+from collections import deque
 from typing import Any, BinaryIO, Callable, Iterable, cast
 
 import numpy as np
@@ -86,7 +87,68 @@ def apply_pcm_gain(pcm: bytes, gain: float) -> bytes:
     return amplified.astype(np.int16).tobytes()
 
 
-class ModemAudioBridge:
+class AgentPcm(bytes):
+    """PCM eligible for AI playout observation; ordinary bytes include DTMF."""
+
+
+class _OutputObserver:
+    """Opt-in source spans follow queued bytes, including drops and partial writes."""
+
+    _output_observer: Callable[[bytes], None] | None = None
+    _output_ranges: tuple[tuple[int, int], ...] = ()
+    _output_progress = 0
+
+    def set_output_observer(self, observer: Callable[[bytes], None]) -> None:
+        """Before start(), observe successfully written AI bytes, excluding filler/DTMF.
+
+        This is a local output boundary, not confirmation of far-end audibility.
+        """
+        self._output_observer = observer
+        self._output_spans: deque[tuple[int, bool]] = deque()
+        self._output_progress = 0
+
+    def output_progress_bytes(self) -> int:
+        """Confirmed non-filler writes, including DTMF; dequeues/drops aren't progress."""
+        return self._output_progress
+
+    def _note_output_progress(self, count: int) -> None:
+        if self._output_observer is not None:
+            self._output_progress += count
+
+    def _queue_output_span(self, chunk: bytes) -> None:
+        if self._output_observer is not None and chunk:
+            self._output_spans.append((len(chunk), isinstance(chunk, AgentPcm)))
+
+    def _take_output_ranges(self, count: int) -> tuple[tuple[int, int], ...]:
+        if self._output_observer is None:
+            return ()
+        offset = 0
+        ranges = []
+        while count and self._output_spans:
+            length, agent_audio = self._output_spans.popleft()
+            take = min(count, length)
+            if agent_audio:
+                ranges.append((offset, offset + take))
+            if take < length:
+                self._output_spans.appendleft((length - take, agent_audio))
+            offset += take
+            count -= take
+        return tuple(ranges)
+
+    def _notify_output(self, payload: bytes, ranges: tuple[tuple[int, int], ...]) -> None:
+        observer = self._output_observer
+        if observer is None:
+            return
+        for start, end in ranges:
+            pcm = payload[start:end]
+            if pcm:
+                try:
+                    observer(pcm)
+                except Exception:  # noqa: BLE001
+                    logger.warning("下行写出观测失败（不影响播放）", exc_info=True)
+
+
+class ModemAudioBridge(_OutputObserver):
     """在 EG25 USB 声卡与 Agent 之间转发 PCM 音频（PortAudio 直连）。
 
     Windows（WASAPI）/ Linux（ALSA）的标准路径；macOS 上 PortAudio 打不开
@@ -151,6 +213,9 @@ class ModemAudioBridge:
         for chunk in chunks:
             if chunk:
                 self._output_stream.write(chunk)
+                self._note_output_progress(len(chunk))
+                if isinstance(chunk, AgentPcm):
+                    self._notify_output(chunk, ((0, len(chunk)),))
 
     @staticmethod
     def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:
@@ -161,7 +226,7 @@ class ModemAudioBridge:
         return resample_pcm(pcm_agent, agent_rate, MODEM_RATE)
 
 
-class SerialPcmAudioBridge:
+class SerialPcmAudioBridge(_OutputObserver):
     """通过 EG25 USB NMEA 口传输 Voice over USB PCM。"""
 
     def __init__(
@@ -261,6 +326,7 @@ class SerialPcmAudioBridge:
             self._ser.close()
         self._ser = None
         with self._tx_lock:
+            self._take_output_ranges(len(self._tx_buffer))
             self._tx_buffer.clear()
 
     def read_modem_chunk(self) -> bytes:
@@ -390,6 +456,7 @@ class SerialPcmAudioBridge:
         """
         with self._tx_lock:
             dropped = len(self._tx_buffer)
+            self._take_output_ranges(dropped)
             self._tx_buffer.clear()
         return dropped
 
@@ -405,6 +472,7 @@ class SerialPcmAudioBridge:
             for chunk in chunks:
                 if chunk:
                     self._tx_buffer.extend(chunk)
+                    self._queue_output_span(chunk)
                     appended += len(chunk)
             self._queued_bytes += appended
         if appended:
@@ -427,7 +495,10 @@ class SerialPcmAudioBridge:
             payload = self._next_write_payload(silence)
             try:
                 if self._ser and self._ser.is_open:
-                    self._ser.write(payload)
+                    written = self._ser.write(payload)
+                    if written:
+                        self._note_output_progress(min(written, self._output_real_bytes))
+                        self._notify_output(payload[:written], self._output_ranges)
                     self._written_bytes += len(payload)
                     self._write_timeouts = 0
                     self._log_write_stats()
@@ -456,11 +527,17 @@ class SerialPcmAudioBridge:
             if len(self._tx_buffer) >= self._write_size:
                 payload = bytes(self._tx_buffer[: self._write_size])
                 del self._tx_buffer[: self._write_size]
+                self._output_real_bytes = len(payload)
+                self._output_ranges = self._take_output_ranges(len(payload))
             elif self._tx_buffer:
                 payload = bytes(self._tx_buffer)
                 self._tx_buffer.clear()
+                self._output_real_bytes = len(payload)
+                self._output_ranges = self._take_output_ranges(len(payload))
                 payload = payload + silence[: self._write_size - len(payload)]
             else:
+                self._output_real_bytes = 0
+                self._output_ranges = ()
                 return silence
         # 下行盲区埋点（WIL-112）：≥1s 静默后的首个真实帧=新一轮开播进串口。
         # 与「判停→首音频」「端到端」两条日志的时间戳相减，即可归属
@@ -500,7 +577,7 @@ class SerialPcmAudioBridge:
         return apply_pcm_gain(pcm_8k, self.tx_gain)
 
 
-class FfmpegAudioBridge:
+class FfmpegAudioBridge(_OutputObserver):
     """经 ffmpeg 子进程与 EG25 UAC 声卡收发 PCM（仅 macOS）。
 
     macOS 上 PortAudio 打不开 EC20 的 UAC 声卡（AUHAL -66740），但
@@ -624,6 +701,7 @@ class FfmpegAudioBridge:
         self._cap = None
         self._play = None
         with self._tx_lock:
+            self._take_output_ranges(len(self._tx_buffer))
             self._tx_buffer.clear()
 
     def read_modem_chunk(self) -> bytes:
@@ -644,11 +722,13 @@ class FfmpegAudioBridge:
             for chunk in chunks:
                 if chunk:
                     self._tx_buffer.extend(chunk)
+                    self._queue_output_span(chunk)
             overflow = len(self._tx_buffer) - self._MAX_TX_BUFFER_BYTES
             if overflow > 0:
                 # PCM 是 int16；从队首丢弃偶数字节，不能把后续样本切到半字边界。
                 dropped = overflow + overflow % 2
                 del self._tx_buffer[:dropped]
+                self._take_output_ranges(dropped)
                 self._dropped_bytes += dropped
                 self._drop_events += 1
                 should_log_drop = self._drop_events == 1 or self._drop_events % 50 == 0
@@ -679,6 +759,7 @@ class FfmpegAudioBridge:
     def _drop_stale_tx_buffer(self) -> None:
         with self._tx_lock:
             dropped = len(self._tx_buffer)
+            self._take_output_ranges(dropped)
             self._tx_buffer.clear()
             self._dropped_bytes += dropped
         if dropped:
@@ -783,6 +864,8 @@ class FfmpegAudioBridge:
             self._consecutive_play_restarts = 0
             # 只统计完整写成功的：真实 payload 记帧/峰值，纯静音只计次。
             if real_bytes:
+                self._note_output_progress(real_bytes)
+                self._notify_output(payload, self._output_ranges)
                 self._write_stats.add(payload[:real_bytes])
             else:
                 self._silence_writes += 1
@@ -805,12 +888,15 @@ class FfmpegAudioBridge:
             if len(self._tx_buffer) >= NMEA_WRITE_SIZE:
                 payload = bytes(self._tx_buffer[:NMEA_WRITE_SIZE])
                 del self._tx_buffer[:NMEA_WRITE_SIZE]
+                self._output_ranges = self._take_output_ranges(len(payload))
                 return payload, len(payload)
             if self._tx_buffer:
                 payload = bytes(self._tx_buffer)
                 self._tx_buffer.clear()
+                self._output_ranges = self._take_output_ranges(len(payload))
                 padded = payload + silence[: NMEA_WRITE_SIZE - len(payload)]
                 return padded, len(payload)
+        self._output_ranges = ()
         return silence, 0
 
     @staticmethod

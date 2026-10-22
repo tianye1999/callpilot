@@ -278,7 +278,17 @@ class LocalPipelineAgent(VoiceAgent):
             except TypeError:
                 return self._pipeline_factory()
         try:
-            self._pipeline = await asyncio.to_thread(_build)
+            if config.get_bool("PARALLEL_AGENT_CONNECT"):
+                building = asyncio.create_task(asyncio.to_thread(_build))
+                try:
+                    self._pipeline = await asyncio.shield(building)
+                except asyncio.CancelledError:
+                    # Model loading cannot be interrupted. Keep the call's owner
+                    # until this worker is joined; do not start VAD/brain afterward.
+                    await asyncio.gather(building, return_exceptions=True)
+                    raise
+            else:
+                self._pipeline = await asyncio.to_thread(_build)
         except Exception as exc:
             logger.error("local 管线初始化失败: %s", exc)
             self._emit_status(f"本地语音模型初始化失败：{exc}")

@@ -116,6 +116,28 @@ def test_missing_metrics_are_null_with_reason_never_zero():
     assert unavailable["takeover_latency_ms"] == "no_takeover_request"
 
 
+def test_parallel_startup_playout_is_not_pooled_with_legacy_arrival_metrics():
+    events = [
+        {"type": "answered", "t_ms": 100},
+        {"type": "agent_connect_started", "t_ms": 110},
+        {"type": "agent_connected", "t_ms": 300},
+        {"type": "greeting_requested", "t_ms": 310},
+        {"type": "agent_audio_received", "t_ms": 400},
+        {"type": "greeting_sent", "t_ms": 320},
+        {"type": "pcm_ready", "t_ms": 600},
+        {"type": "bridge_started", "t_ms": 650},
+        {"type": "first_audio", "t_ms": 682, "ms": 372, "boundary": "pcm_written"},
+    ]
+    metrics = _build(events)
+    assert metrics["first_playout_ms"] == 372
+    assert metrics["answered_to_first_playout_ms"] == 582
+    assert metrics["first_playout_boundary"] == "pcm_written"
+    assert metrics["startup_marks_ms"]["agent_audio_received"] == 400
+    assert metrics["startup_marks_ms"]["pcm_ready"] == 600
+    assert metrics["first_audio_ms"] is None
+    assert metrics["answered_to_first_audio_ms"] is None
+
+
 def test_interruption_reason_forks_on_barge_in_flag():
     half_duplex = _build([_snapshot(barge_in_enabled=False)])
     assert half_duplex["unavailable"]["interruption_latency_ms"] == "half_duplex_mode"
@@ -123,6 +145,23 @@ def test_interruption_reason_forks_on_barge_in_flag():
     assert (
         barge_in["unavailable"]["interruption_latency_ms"] == "not_instrumented_yet"
     )
+
+
+def test_module_greeting_metrics_are_separate_from_ai_first_audio_and_private():
+    metrics = _build([
+        {"type": "answered", "t_ms": 100},
+        {"type": "module_greeting", "t_ms": 2200, "ok": True, "duration_ms": 1600,
+         "started_after_answer_ms": 500, "text": "private-text"},
+    ])
+    assert metrics["module_greeting"] == {
+        "ok": True, "duration_ms": 1600, "started_after_answer_ms": 500, "t_ms": 2200,
+    }
+    assert metrics["startup_marks_ms"]["module_greeting"] == 2200
+    assert metrics["first_playout_ms"] is None and metrics["first_audio_ms"] is None
+    assert "private-text" not in json.dumps(metrics)
+    missing = _build([])
+    assert missing["module_greeting"] is None
+    assert missing["unavailable"]["module_greeting"] == "no_module_greeting_event"
 
 
 def test_audio_derived_reason_forks_on_recording_flag():

@@ -233,6 +233,45 @@ def test_reset_after_call_config_follows_platform_and_allows_override(monkeypatc
     assert get_bool("MODEM_RESET_AFTER_CALL") is False
 
 
+@pytest.mark.parametrize("platform", ["linux", "macos", "windows"])
+def test_parallel_agent_connect_platform_default(monkeypatch, platform):
+    monkeypatch.setattr(platforms, "IS_LINUX", platform == "linux")
+    monkeypatch.setattr(platforms, "IS_MACOS", platform == "macos")
+    monkeypatch.setattr(platforms, "IS_WINDOWS", platform == "windows")
+    # Off everywhere until #130 item 2 passes real-device acceptance.
+    assert platforms.default_parallel_agent_connect() is False
+
+
+def test_parallel_agent_connect_config_follows_platform_and_allows_override(monkeypatch):
+    _unset(monkeypatch, "PARALLEL_AGENT_CONNECT")
+    assert get_spec("PARALLEL_AGENT_CONNECT").kind == "bool"
+    assert get_bool("PARALLEL_AGENT_CONNECT") is platforms.default_parallel_agent_connect()
+    for value in ("true", "false"):
+        monkeypatch.setenv("PARALLEL_AGENT_CONNECT", value)
+        assert get_bool("PARALLEL_AGENT_CONNECT") is (value == "true")
+
+
+@pytest.mark.parametrize("platform", ["linux", "macos", "windows"])
+def test_modem_answer_greeting_platform_defaults(monkeypatch, platform):
+    monkeypatch.setattr(platforms, "IS_LINUX", platform == "linux")
+    monkeypatch.setattr(platforms, "IS_MACOS", platform == "macos")
+    monkeypatch.setattr(platforms, "IS_WINDOWS", platform == "windows")
+    assert platforms.default_modem_answer_greeting() == ("喂" if platform == "linux" else "")
+    assert platforms.default_modem_answer_greeting_delay_ms() == 500
+    assert platforms.default_modem_tts_params() == "2,2,0,1,1,0"
+
+
+def test_modem_answer_greeting_config_defaults_and_empty_override(monkeypatch):
+    _unset(monkeypatch, "MODEM_ANSWER_GREETING", "MODEM_ANSWER_GREETING_DELAY_MS", "MODEM_TTS_PARAMS")
+    assert get_spec("MODEM_ANSWER_GREETING").default == platforms.default_modem_answer_greeting()
+    assert get_spec("MODEM_ANSWER_GREETING_DELAY_MS").default == "500"
+    assert get_spec("MODEM_TTS_PARAMS").default == "2,2,0,1,1,0"
+    monkeypatch.setenv("MODEM_ANSWER_GREETING", "")
+    monkeypatch.setenv("MODEM_TTS_PARAMS", "")
+    assert get_str("MODEM_ANSWER_GREETING") == ""
+    assert get_str("MODEM_TTS_PARAMS") == ""
+
+
 def test_runtime_paths_default_to_project_cwd_or_env_override(tmp_path, monkeypatch):
     _unset(
         monkeypatch,

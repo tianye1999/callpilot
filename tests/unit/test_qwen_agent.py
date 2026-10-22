@@ -9,6 +9,8 @@ import threading
 import time
 from queue import Empty
 
+import pytest
+
 from agentcall.agents import qwen_agent
 from agentcall.agents.tools import SEND_DTMF_SPEC, ToolRegistry
 
@@ -75,6 +77,97 @@ def _wait_until(cond, timeout: float = 1.0) -> bool:
             return True
         time.sleep(0.005)
     return False
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_parallel_start_does_not_block_loop_and_joins_cancelled_connect(monkeypatch, cancel):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    fake_cls = _make_fake_conversation_cls()
+    entered = threading.Event()
+    release = threading.Event()
+    original_connect = fake_cls.connect
+
+    def connect(self):
+        entered.set()
+        assert release.wait(timeout=1)
+        original_connect(self)
+
+    monkeypatch.setattr(fake_cls, "connect", connect)
+    monkeypatch.setattr(qwen_agent, "OmniRealtimeConversation", fake_cls)
+    agent = qwen_agent.QwenVoiceAgent(api_key="test", model="test", model_display_name="test")
+
+    async def run():
+        task = asyncio.create_task(agent.start(lambda _pcm: None))
+        for _ in range(100):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert entered.is_set() and not task.done()
+        if cancel:
+            task.cancel()
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await task
+        await agent.stop()
+
+    asyncio.run(run())
+    assert all(instance.closed for instance in fake_cls.instances)
+    assert agent._pump_thread is None or not agent._pump_thread.is_alive()
+
+
+@pytest.mark.parametrize("failure", ["connect", "update_session"])
+def test_parallel_failed_connection_candidates_are_closed(monkeypatch, failure):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    fake_cls = _make_fake_conversation_cls()
+    if failure == "connect":
+        fake_cls.fail_connect = True
+    else:
+        def fail(self, **_kwargs):
+            raise RuntimeError("session failed")
+        monkeypatch.setattr(fake_cls, "update_session", fail)
+    with pytest.raises(RuntimeError):
+        _start_agent(monkeypatch, fake_cls)
+    assert fake_cls.instances and all(instance.closed for instance in fake_cls.instances)
+
+
+def test_parallel_retry_close_cannot_silence_successful_or_later_session(monkeypatch):
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
+    fake_cls = _make_fake_conversation_cls()
+    original_connect = fake_cls.connect
+    original_close = fake_cls.close
+    dispatched = []
+
+    def connect(self):
+        if len(fake_cls.instances) == 1:
+            raise RuntimeError("first candidate failed")
+        original_connect(self)
+
+    def close(self):
+        original_close(self)
+        self.kwargs["callback"].on_close(1000, "closed")
+        if self is fake_cls.instances[0]:
+            self.kwargs["callback"].on_event({
+                "type": "response.function_call_arguments.done", "name": "hangup_call",
+                "call_id": "stale", "arguments": "{}",
+            })
+
+    monkeypatch.setattr(fake_cls, "connect", connect)
+    monkeypatch.setattr(fake_cls, "close", close)
+    monkeypatch.setattr(qwen_agent.QwenVoiceAgent, "_dispatch_tool_call", lambda _self, *args: dispatched.append(args))
+    agent = _start_agent(monkeypatch, fake_cls)
+    try:
+        assert not agent._disconnected.is_set()
+        assert dispatched == []
+        stale = fake_cls.instances[0].kwargs["callback"]
+        stale.on_close(1000, "late close")
+        assert not agent._disconnected.is_set()
+        asyncio.run(agent.say("opening"))
+        assert fake_cls.instances[-1].responses
+    finally:
+        asyncio.run(agent.stop())
 
 
 # ---------------------------------------------------------------------------
