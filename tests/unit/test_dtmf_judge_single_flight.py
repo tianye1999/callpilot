@@ -11,9 +11,13 @@
 from __future__ import annotations
 
 import threading
-import time
+
+import pytest
 
 from agentcall.dtmf_judge import DtmfActionLedger, DtmfJudge
+
+pytestmark = pytest.mark.usefixtures("dtmf_judge_lifecycle")
+BLOCKED_MODEL_SECONDS = 10.0
 
 
 class SpyRecord:
@@ -29,7 +33,7 @@ def make_judge(model_call) -> DtmfJudge:
         model="stub-model",
         window_mode="remote_only",
         model_call=model_call,
-        timeout_seconds=2.0,
+        timeout_seconds=BLOCKED_MODEL_SECONDS,
     )
 
 
@@ -44,7 +48,7 @@ def test_two_concurrent_calls_do_not_time_each_other_out():
 
     def slow_call(messages, model, timeout):
         started.set()
-        release.wait(1.5)
+        release.wait(BLOCKED_MODEL_SECONDS)
         return '{"action":"wait","reason_code":"ok"}', None
 
     def fast_call(messages, model, timeout):
@@ -59,15 +63,19 @@ def test_two_concurrent_calls_do_not_time_each_other_out():
             "slow", slow_judge._invoke_model([{"role": "user", "content": "x"}])
         )
     )
-    slow_thread.start()
-    assert started.wait(1.0), "慢判官应已进入模型调用"
+    try:
+        slow_thread.start()
+        assert started.wait(5.0), "慢判官应已进入模型调用"
 
-    # 第二通在第一通仍在飞行中时判定 —— 旧实现在这里给伪 timeout。
-    results["fast"] = fast_judge._invoke_model(
-        [{"role": "user", "content": "y"}]
-    )
-    release.set()
-    slow_thread.join(2.0)
+        # 第二通在第一通仍在飞行中时判定 —— 旧实现在这里给伪 timeout。
+        results["fast"] = fast_judge._invoke_model(
+            [{"role": "user", "content": "y"}]
+        )
+    finally:
+        release.set()
+        if slow_thread.ident is not None:
+            slow_thread.join(5.0)
+            assert not slow_thread.is_alive()
 
     assert results["fast"][1] != "timeout", (
         "并发通话被模块级 single-flight 顶成了伪 timeout"
@@ -84,23 +92,26 @@ def test_single_flight_still_applies_within_one_judge():
     def slow_call(messages, model, timeout):
         calls.append(1)
         started.set()
-        release.wait(1.5)
+        release.wait(BLOCKED_MODEL_SECONDS)
         return '{"action":"wait","reason_code":"ok"}', None
 
     judge = make_judge(slow_call)
     thread = threading.Thread(
         target=lambda: judge._invoke_model([{"role": "user", "content": "x"}])
     )
-    thread.start()
-    assert started.wait(1.0)
+    try:
+        thread.start()
+        assert started.wait(5.0)
 
-    # 同一实例的第二次判定必须被 single-flight 挡住。
-    _raw, err = judge._invoke_model([{"role": "user", "content": "y"}])
-    assert err == "timeout", "同实例内的重入应仍被 single-flight 拦下"
-    assert len(calls) == 1, "被拦下的那次不应真的发起模型调用"
-
-    release.set()
-    thread.join(2.0)
+        # 同一实例的第二次判定必须被 single-flight 挡住。
+        _raw, err = judge._invoke_model([{"role": "user", "content": "y"}])
+        assert err == "timeout", "同实例内的重入应仍被 single-flight 拦下"
+        assert len(calls) == 1, "被拦下的那次不应真的发起模型调用"
+    finally:
+        release.set()
+        if thread.ident is not None:
+            thread.join(5.0)
+            assert not thread.is_alive()
 
 
 def test_slot_is_released_so_the_next_turn_can_judge():
@@ -112,8 +123,10 @@ def test_slot_is_released_so_the_next_turn_can_judge():
         assert err != "timeout", "槽位没释放，后续判定全被顶掉"
         assert raw
 
-    # 线程收尾是在 finally 里做的，给它一点时间也应保持可用。
-    time.sleep(0.05)
+    # Join actual cleanup instead of assuming a fixed sleep was long enough.
+    model_thread = judge._single_flight_thread
+    if model_thread is not None:
+        model_thread.join(5.0)
     assert judge._single_flight_thread is None or not judge._single_flight_thread.is_alive()
 
 
@@ -130,7 +143,7 @@ def test_slot_exhaustion_is_not_labelled_as_a_model_timeout():
 
     def blocking(messages, model, timeout):
         entered.release()
-        release.wait(2.0)
+        release.wait(BLOCKED_MODEL_SECONDS)
         return '{"action":"wait","reason_code":"ok"}', None
 
     # 占满所有全局槽位（每个判官实例内部各自 single-flight，故要多个实例）。
@@ -139,17 +152,20 @@ def test_slot_exhaustion_is_not_labelled_as_a_model_timeout():
         threading.Thread(target=j._invoke_model, args=([{"role": "user", "content": "x"}],))
         for j in judges
     ]
-    for thread in threads:
-        thread.start()
-    for _ in judges:
-        assert entered.acquire(timeout=2.0), "所有槽位应已占满"
+    try:
+        for thread in threads:
+            thread.start()
+        for _ in judges:
+            assert entered.acquire(timeout=5.0), "所有槽位应已占满"
 
-    overflow = make_judge(lambda m, model, t: ("unused", None))
-    _raw, err = overflow._invoke_model([{"role": "user", "content": "y"}])
-
-    release.set()
-    for thread in threads:
-        thread.join(3.0)
+        overflow = make_judge(lambda m, model, t: ("unused", None))
+        _raw, err = overflow._invoke_model([{"role": "user", "content": "y"}])
+    finally:
+        release.set()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(5.0)
+                assert not thread.is_alive()
 
     assert err == "model_saturated", f"槽位耗尽应报 model_saturated，实际 {err!r}"
     assert err != "timeout"

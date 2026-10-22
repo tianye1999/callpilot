@@ -72,10 +72,119 @@ def test_rendered_unit_uses_setting_specific_path_quoting(repo):
     assert f'Environment="PATH={repo}/.venv/bin:/usr/local/bin:/usr/bin:/bin"' in unit.splitlines()
 
 
-@pytest.fixture
-def installer(tmp_path):
+@pytest.fixture(scope="module")
+def fake_tool(tmp_path_factory):
     if os.name == "nt" or shutil.which("bash") is None:
         pytest.skip("Installer execution requires a POSIX host with bash")
+    # Most fakes only print a value or record argv; do not boot Python for each one.
+    stub = f"#!{shutil.which('bash')}\n" + r"""set -eu
+tool=${0##*/}
+{
+    printf '['
+    separator=''
+    for arg in "$tool" "$@"; do
+        arg=${arg//\\/\\\\}
+        arg=${arg//\"/\\\"}
+        arg=${arg//$'\n'/\\n}
+        arg=${arg//$'\r'/\\r}
+        arg=${arg//$'\t'/\\t}
+        printf '%s"%s"' "$separator" "$arg"
+        separator=,
+    done
+    printf ']\n'
+} >> "$TRACE"
+[ "$tool" != "${FAIL_TOOL:-}" ] || exit 1
+case "$tool" in
+    git)
+        if [ "${TEST_FAIL_CHECKOUT:-}" = 1 ]; then
+            prefix=()
+            for arg in "$@"; do
+                prefix+=("$arg")
+                if [ "$arg" = checkout-index ]; then
+                    IFS= read -r -d '' first_path
+                    "$REAL_GIT" "${prefix[@]}" --force -- "$first_path"
+                    exit 1
+                fi
+            done
+        fi
+        if [ "${TEST_NON_GIT:-}" = 1 ] && [ "${1:-}" = rev-parse ]; then exit 128; fi
+        if [[ " $* " == *" remote add "* ]] && [ -n "${TEST_ADOPT_REMOTE:-}" ]; then
+            args=("$@")
+            args[$(($# - 1))]=$TEST_ADOPT_REMOTE
+            set -- "${args[@]}"
+        fi
+        exec "$REAL_GIT" "$@"
+        ;;
+    curl)
+        meta='{"call_active": false, "dial_queue_busy": false}'
+        queue='{"ok": true, "active": false, "pending": [], "current": null}'
+        remote='{"ok": true, "active": false}'
+        case "${!#}" in
+            */api/meta)
+                if [[ " $* " == *" --write-out "* ]]; then
+                    printf '%s' "${TEST_HEALTH_CODE-200}"
+                    exit "${TEST_HEALTH_EXIT:-0}"
+                fi
+                printf '%s\n' "${TEST_META-$meta}"
+                exit "${TEST_META_EXIT:-0}"
+                ;;
+            */api/call/queue)
+                count=0
+                if [ -f "$TRACE.queue-count" ]; then read -r count < "$TRACE.queue-count"; fi
+                count=$((count + 1))
+                printf '%s\n' "$count" > "$TRACE.queue-count"
+                if [ "${TEST_BUSY_AFTER:-0}" -gt 0 ] && [ "$count" -ge "$TEST_BUSY_AFTER" ]; then
+                    printf '%s\n' '{"ok": true, "active": true, "pending": [], "current": null}'
+                else
+                    printf '%s\n' "${TEST_QUEUE-$queue}"
+                fi
+                ;;
+            */api/remote_dialer/status) printf '%s\n' "${TEST_REMOTE-$remote}" ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    python) exec "$REAL_PYTHON" "$@" ;;
+    uname) printf '%s\n' "${TEST_OS:-Linux}" ;;
+    id)
+        if [ "${1:-}" = -u ]; then printf '%s\n' "${TEST_UID:-1000}"; else printf 'edge\n'; fi
+        ;;
+    uv) if [ "$*" = 'python find 3.13' ]; then printf '%s\n' "$REAL_PYTHON"; fi ;;
+    systemctl)
+        if [ "${1:-}" = is-active ] && [ "${TEST_SERVICE_ACTIVE:-}" = 0 ]; then exit 3; fi
+        ;;
+    sudo)
+        if [ "${1:-}" = -v ]; then
+            if [ "${TEST_SUDO_VERIFYPW_ALL:-}" = 1 ]; then
+                printf 'sudo: a password is required\n' >&2
+                exit 1
+            fi
+            exit 0
+        fi
+        executable=$(PATH="$SUDO_PATH" type -P "$1") || {
+            printf 'sudo: %s: command not found\n' "$1" >&2
+            exit 1
+        }
+        case "$1" in
+            install)
+                args=("$@")
+                destination=${!#}
+                target="$SYSTEM_ROOT/${destination#/}"
+                mkdir -p -- "${target%/*}"
+                cp -- "${args[$(($# - 2))]}" "$target"
+                ;;
+            usermod|true|systemctl) exec "$executable" "${@:2}" ;;
+        esac
+        ;;
+esac
+"""
+    path = tmp_path_factory.mktemp("installer-tools") / "stub"
+    path.write_text(stub, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+@pytest.fixture
+def installer(tmp_path, fake_tool):
     root = tmp_path / "repo with spaces"
     shutil.copytree(LINUX, root / "scripts" / "linux")
     shutil.copy2(ROOT / "scripts" / "setup.sh", root / "scripts" / "setup.sh")
@@ -92,88 +201,19 @@ def installer(tmp_path):
         assert executable is not None
         (bin_dir / command).symlink_to(executable)
     trace = tmp_path / "trace.jsonl"
-    stub = f"""#!{sys.executable} -S
-import json, os, shutil, sys
-from pathlib import Path
-tool, args = Path(sys.argv[0]).name, sys.argv[1:]
-with open(os.environ['TRACE'], 'a', encoding='utf-8') as stream:
-    stream.write(json.dumps([tool, *args]) + '\\n')
-if tool == os.environ.get('FAIL_TOOL'):
-    sys.exit(1)
-if tool == 'git' and os.environ.get('TEST_FAIL_CHECKOUT') == '1' and 'checkout-index' in args:
-    checkout = args.index('checkout-index')
-    paths = sys.stdin.buffer.read().split(b'\\0')
-    import subprocess
-    subprocess.run([os.environ['REAL_GIT'], *args[:checkout + 1], '--force', '--',
-                    os.fsdecode(next(path for path in paths if path))], check=True)
-    sys.exit(1)
-if tool == 'systemctl' and args[:1] == ['is-active'] and os.environ.get('TEST_SERVICE_ACTIVE') == '0':
-    sys.exit(3)
-if tool == 'git':
-    if os.environ.get('TEST_NON_GIT') == '1' and args[:1] == ['rev-parse']:
-        sys.exit(128)
-    if 'remote' in args and 'add' in args and os.environ.get('TEST_ADOPT_REMOTE'):
-        args[-1] = os.environ['TEST_ADOPT_REMOTE']
-    os.execv(os.environ['REAL_GIT'], ['git', *args])
-elif tool == 'curl':
-    url = args[-1]
-    if url.endswith('/api/meta'):
-        if '--write-out' in args:
-            print(os.environ.get('TEST_HEALTH_CODE', '200'), end='')
-            sys.exit(int(os.environ.get('TEST_HEALTH_EXIT', '0')))
-        print(os.environ.get('TEST_META', '{{"call_active": false, "dial_queue_busy": false}}'))
-        sys.exit(int(os.environ.get('TEST_META_EXIT', '0')))
-    elif url.endswith('/api/call/queue'):
-        busy_after = int(os.environ.get('TEST_BUSY_AFTER', '0'))
-        lines = Path(os.environ['TRACE']).read_text(encoding='utf-8').splitlines()
-        count = sum('/api/call/queue' in line for line in lines)
-        if busy_after and count >= busy_after:
-            print('{{"ok": true, "active": true, "pending": [], "current": null}}')
-        else:
-            print(os.environ.get('TEST_QUEUE', '{{"ok": true, "active": false, "pending": [], "current": null}}'))
-    elif url.endswith('/api/remote_dialer/status'):
-        print(os.environ.get('TEST_REMOTE', '{{"ok": true, "active": false}}'))
-    else:
-        sys.exit(1)
-elif tool == 'python':
-    os.execv(sys.executable, [sys.executable, *args])
-elif tool == 'uname':
-    print(os.environ.get('TEST_OS', 'Linux'))
-elif tool == 'id':
-    print(os.environ.get('TEST_UID', '1000') if args == ['-u'] else 'edge')
-elif tool == 'uv' and args == ['python', 'find', '3.13']:
-    print(sys.executable)
-elif tool == 'sudo' and args == ['-v'] and os.environ.get('TEST_SUDO_VERIFYPW_ALL') == '1':
-    print('sudo: a password is required', file=sys.stderr)
-    sys.exit(1)
-elif tool == 'sudo' and args != ['-v']:
-    executable = shutil.which(args[0], path=os.environ['SUDO_PATH'])
-    if executable is None:
-        print('sudo: ' + args[0] + ': command not found', file=sys.stderr)
-        sys.exit(1)
-    if args[0] == 'install':
-        target = Path(os.environ['SYSTEM_ROOT']) / args[-1].lstrip('/')
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(args[-2], target)
-    elif args[0] in ('usermod', 'true', 'systemctl'):
-        os.execv(executable, args)
-"""
     for name in (
         "uname", "id", "getent", "sudo", "true", "uv", "ffmpeg", "systemctl",
         "udevadm", "usermod", "git", "curl",
     ):
-        path = bin_dir / name
-        path.write_text(stub, encoding="utf-8")
-        path.chmod(0o755)
+        (bin_dir / name).symlink_to(fake_tool)
     venv = root / ".venv" / "bin"
     venv.mkdir(parents=True)
     for name in ("python", "pip"):
-        path = venv / name
-        path.write_text(stub, encoding="utf-8")
-        path.chmod(0o755)
+        (venv / name).symlink_to(fake_tool)
     env = {
         **os.environ, "PATH": str(bin_dir), "HOME": str(tmp_path / "home"), "TRACE": str(trace),
         "SYSTEM_ROOT": str(tmp_path / "system"), "SUDO_PATH": str(bin_dir),
+        "REAL_PYTHON": sys.executable,
         "REAL_GIT": shutil.which("git") or "", "CALLPILOT_UPDATE_HEALTH_TIMEOUT": "1",
     }
 
@@ -320,24 +360,24 @@ def _git(repo, *args, input=None):
     ).stdout.strip()
 
 
-@pytest.fixture
-def updater(installer, tmp_path):
-    root, trace, system, bin_dir, run = installer
+@pytest.fixture(scope="module")
+def updater_template(tmp_path_factory, fake_tool):
+    root = tmp_path_factory.mktemp("updater-template") / "repo"
+    shutil.copytree(LINUX, root / "scripts" / "linux")
+    shutil.copy2(ROOT / "scripts" / "setup.sh", root / "scripts" / "setup.sh")
+    shutil.copy2(ROOT / ".env.example", root / ".env.example")
     shutil.copy2(ROOT / ".gitignore", root / ".gitignore")
     (root / "data").mkdir()
-    (root / "data" / "private.json").write_text('{"keep": true}\n', encoding="utf-8")
     (root / "data" / "number_profiles.example.json").write_text("original seed\n", encoding="utf-8")
     (root / "data" / "call_playbooks.example.json").write_text("original playbook\n", encoding="utf-8")
-    (root / "recordings").mkdir()
-    (root / "recordings" / "private.wav").write_bytes(b"private audio")
     (root / "tracked.txt").write_text("old code\n", encoding="utf-8")
     _git(root, "init", "-b", "product/physical-sim")
     _git(root, "add", ".")
     tree = _git(root, "write-tree")
     old = _git(root, "commit-tree", tree, input="Initial test snapshot\n")
     _git(root, "update-ref", "HEAD", old)
-    remote = tmp_path / "remote"
-    _git(tmp_path, "clone", "--bare", str(root), str(remote))
+    remote = root.parent / "remote"
+    _git(root.parent, "clone", "--bare", str(root), str(remote))
     _git(root, "remote", "add", "origin", str(remote))
     _git(root, "fetch", "origin")
     _git(root, "branch", "--set-upstream-to=origin/product/physical-sim")
@@ -347,6 +387,21 @@ def updater(installer, tmp_path):
     new_tree = _git(remote, "write-tree")
     new = _git(remote, "commit-tree", new_tree, "-p", old, input="Update test snapshot\n")
     _git(remote, "update-ref", "refs/heads/product/physical-sim", new)
+    return root, remote, old, new
+
+
+@pytest.fixture
+def updater(installer, tmp_path, updater_template):
+    root, trace, system, bin_dir, run = installer
+    template, template_remote, old, new = updater_template
+    # Copy both metadata trees, not hardlinks/shared refs: every test mutates its own remote.
+    shutil.copytree(template, root, dirs_exist_ok=True)
+    remote = tmp_path / "remote"
+    shutil.copytree(template_remote, remote)
+    _git(root, "remote", "set-url", "origin", str(remote))
+    (root / "data" / "private.json").write_text('{"keep": true}\n', encoding="utf-8")
+    (root / "recordings").mkdir()
+    (root / "recordings" / "private.wav").write_bytes(b"private audio")
 
     def update(*args, **overrides):
         return run(*args, script="update.sh", **overrides)
@@ -356,6 +411,23 @@ def updater(installer, tmp_path):
 
 def _calls(trace):
     return [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+
+
+def test_fake_tool_trace_preserves_argument_boundaries_and_escaping(installer):
+    _root, trace, _system, bin_dir, _run = installer
+    args = ["two words", 'a"quote', "back\\slash", "line\nbreak", "\r\t", ""]
+    subprocess.run([str(bin_dir / "getent"), *args], env={"TRACE": str(trace)}, check=True)
+    assert _calls(trace) == [["getent", *args]]
+
+
+def test_updater_copies_worktree_and_remote_independently(updater, updater_template):
+    root, _trace, _system, _bin, _run, old, _new, remote = updater
+    template, template_remote, _old, new = updater_template
+    assert not (root / ".git" / "index").samefile(template / ".git" / "index")
+    (root / "tracked.txt").write_text("private test edit\n", encoding="utf-8")
+    _git(remote, "update-ref", "refs/heads/product/physical-sim", old)
+    assert (template / "tracked.txt").read_text(encoding="utf-8") == "old code\n"
+    assert _git(template_remote, "rev-parse", "refs/heads/product/physical-sim") == new
 
 
 def test_update_non_git_requires_adopt(updater):

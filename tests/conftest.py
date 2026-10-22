@@ -1,6 +1,8 @@
 """pytest 共享配置：让测试能导入 tests/fakes，并隔离会写盘/联网的默认配置。"""
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -26,3 +28,40 @@ def _isolate_side_effects(tmp_path, monkeypatch):
     reset_sms_rate_limit_state()
     yield
     reset_sms_rate_limit_state()
+
+
+@pytest.fixture
+def dtmf_judge_lifecycle(monkeypatch):
+    """Drain real judge threads and check the shared slots, without replacing the semaphore."""
+    from agentcall import dtmf_judge
+
+    def judge_threads():
+        return [thread for thread in threading.enumerate() if thread.name.startswith("dtmf-judge-")]
+
+    def assert_idle():
+        assert not judge_threads(), "DTMF judge threads leaked across tests"
+        acquired = 0
+        try:
+            for _ in range(dtmf_judge._MAX_CONCURRENT_MODEL_CALLS):
+                assert dtmf_judge._MODEL_CALL_SLOTS.acquire(blocking=False), "DTMF model slot leaked"
+                acquired += 1
+        finally:
+            for _ in range(acquired):
+                dtmf_judge._MODEL_CALL_SLOTS.release()
+
+    assert_idle()
+    judges = []
+    original_init = dtmf_judge.DtmfJudge.__init__
+
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        judges.append(self)
+
+    monkeypatch.setattr(dtmf_judge.DtmfJudge, "__init__", tracked_init)
+    yield
+    for judge in judges:
+        judge.stop(join_timeout=0)
+    deadline = time.monotonic() + 5.0
+    for thread in judge_threads():
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    assert_idle()

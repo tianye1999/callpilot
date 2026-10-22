@@ -22,6 +22,9 @@ from agentcall.dtmf_judge import (
     parse_judge_decision,
 )
 
+pytestmark = pytest.mark.usefixtures("dtmf_judge_lifecycle")
+BLOCKED_MODEL_SECONDS = 10.0
+
 
 def test_default_model_call_uses_agent_provider_and_dtmf_auto_model(monkeypatch):
     from agentcall import dtmf_judge
@@ -61,7 +64,7 @@ class SpyRecord:
             self.events.append((event_type, fields))
 
 
-def wait_until(predicate, timeout: float = 2.0) -> None:
+def wait_until(predicate, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -363,7 +366,7 @@ def test_model_call_exceeding_timeout_is_abandoned_without_blocking_worker(tmp_p
     release = threading.Event()
 
     def slow_call(messages, model, timeout):
-        release.wait(timeout=1)
+        release.wait(timeout=BLOCKED_MODEL_SECONDS)
         return valid_response(), None
 
     judge = DtmfJudge(
@@ -376,13 +379,15 @@ def test_model_call_exceeding_timeout_is_abandoned_without_blocking_worker(tmp_p
         throttle_seconds=0.01,
         timeout_seconds=0.03,
     )
-    judge.start()
-    judge.submit_remote_transcript("请按一", t_ms=10.0)
-
-    wait_until(lambda: any(kind == "judge_error" for kind, _ in record.events))
-    judge.stop()
-    release.set()
-    wait_for_model_threads()
+    try:
+        judge.start()
+        judge.submit_remote_transcript("请按一", t_ms=10.0)
+        wait_until(lambda: any(kind == "judge_error" for kind, _ in record.events))
+        judge.stop()
+    finally:
+        release.set()
+        judge.stop()
+        wait_for_model_threads()
 
     error = next(fields for kind, fields in record.events if kind == "judge_error")
     assert error["code"] == "timeout"
@@ -400,7 +405,7 @@ def test_default_model_timeout_never_starts_a_second_live_sdk_request(
         nonlocal calls
         calls += 1
         entered.set()
-        release.wait(timeout=10)
+        release.wait(timeout=BLOCKED_MODEL_SECONDS)
         return None
 
     monkeypatch.setenv("AGENT_PROVIDER", "qwen")
@@ -418,26 +423,28 @@ def test_default_model_timeout_never_starts_a_second_live_sdk_request(
         throttle_seconds=0.01,
         timeout_seconds=0.03,
     )
-    judge.start()
-    judge.submit_remote_transcript("第一段", t_ms=10.0)
-    assert entered.wait(timeout=1)
-    wait_until(
-        lambda: len([kind for kind, _ in record.events if kind == "judge_error"])
-        >= 1
-    )
-
-    for index in range(3):
-        judge.submit_remote_transcript(f"后续段{index}", t_ms=20.0 + index)
+    try:
+        judge.start()
+        judge.submit_remote_transcript("第一段", t_ms=10.0)
+        assert entered.wait(timeout=5)
         wait_until(
-            lambda index=index: len(
-                [kind for kind, _ in record.events if kind == "judge_error"]
-            )
-            >= index + 2
+            lambda: len([kind for kind, _ in record.events if kind == "judge_error"])
+            >= 1
         )
 
-    judge.stop()
-    release.set()
-    wait_for_model_threads()
+        for index in range(3):
+            judge.submit_remote_transcript(f"后续段{index}", t_ms=20.0 + index)
+            wait_until(
+                lambda index=index: len(
+                    [kind for kind, _ in record.events if kind == "judge_error"]
+                )
+                >= index + 2
+            )
+        judge.stop()
+    finally:
+        release.set()
+        judge.stop()
+        wait_for_model_threads()
     assert calls == 1
 
 
@@ -459,7 +466,7 @@ def test_hung_sdk_cannot_grow_model_threads_without_bound(tmp_path, monkeypatch)
         nonlocal calls
         calls += 1
         entered.set()
-        release.wait(timeout=10)
+        release.wait(timeout=BLOCKED_MODEL_SECONDS)
         return None
 
     monkeypatch.setenv("AGENT_PROVIDER", "qwen")
@@ -468,8 +475,9 @@ def test_hung_sdk_cannot_grow_model_threads_without_bound(tmp_path, monkeypatch)
     monkeypatch.setattr(
         dashscope.Generation, "call", staticmethod(blocked_sdk_call)
     )
+    first_record = SpyRecord(tmp_path / "first")
     first = DtmfJudge(
-        record=SpyRecord(tmp_path / "first"),
+        record=first_record,
         task_goal="查询套餐余量",
         ledger=DtmfActionLedger(),
         model="qwen-plus",
@@ -477,12 +485,6 @@ def test_hung_sdk_cannot_grow_model_threads_without_bound(tmp_path, monkeypatch)
         throttle_seconds=0.01,
         timeout_seconds=0.03,
     )
-    first.start()
-    first.submit_remote_transcript("第一通菜单", t_ms=10.0)
-    assert entered.wait(timeout=1)
-    time.sleep(0.05)
-    first.stop()
-
     second_record = SpyRecord(tmp_path / "second")
     second = DtmfJudge(
         record=second_record,
@@ -493,14 +495,24 @@ def test_hung_sdk_cannot_grow_model_threads_without_bound(tmp_path, monkeypatch)
         throttle_seconds=0.01,
         timeout_seconds=0.03,
     )
-    second.start()
-    second.submit_remote_transcript("第二通菜单", t_ms=10.0)
-    wait_until(
-        lambda: any(kind == "judge_error" for kind, _ in second_record.events)
-    )
-    second.stop()
-    release.set()
-    wait_for_model_threads()
+    try:
+        first.start()
+        first.submit_remote_transcript("第一通菜单", t_ms=10.0)
+        assert entered.wait(timeout=5)
+        wait_until(lambda: any(kind == "judge_error" for kind, _ in first_record.events))
+        first.stop()
+
+        second.start()
+        second.submit_remote_transcript("第二通菜单", t_ms=10.0)
+        wait_until(
+            lambda: any(kind == "judge_error" for kind, _ in second_record.events)
+        )
+        second.stop()
+    finally:
+        release.set()
+        first.stop()
+        second.stop()
+        wait_for_model_threads()
 
     # 两通并发**都**必须真的调到模型（#72 的核心）。写成 `1 <= calls <= 上限`
     # 是没用的断言——旧的模块级 single-flight 下 calls==1 也能通过（Codex 评审 P2）。
@@ -514,10 +526,12 @@ def test_blocked_judge_does_not_block_submit_or_stop_and_stale_result_is_dropped
     record = SpyRecord(tmp_path / "recording")
     entered = threading.Event()
     release = threading.Event()
+    model_finished = threading.Event()
 
     def blocked_call(messages, model, timeout):
         entered.set()
-        release.wait(timeout=10)
+        release.wait(timeout=BLOCKED_MODEL_SECONDS)
+        model_finished.set()
         return valid_response(), None
 
     judge = DtmfJudge(
@@ -529,17 +543,24 @@ def test_blocked_judge_does_not_block_submit_or_stop_and_stale_result_is_dropped
         model_call=blocked_call,
         throttle_seconds=0.01,
     )
-    judge.start()
-    started = time.monotonic()
-    judge.submit_remote_transcript("请按一", t_ms=10.0)
-    assert time.monotonic() - started < 0.05
-    assert entered.wait(timeout=1)
+    # Both operations must finish well before the blocked model, not win a 50ms race.
+    nonblocking_budget = BLOCKED_MODEL_SECONDS / 4
+    try:
+        judge.start()
+        started = time.monotonic()
+        judge.submit_remote_transcript("请按一", t_ms=10.0)
+        assert time.monotonic() - started < nonblocking_budget
+        assert entered.wait(timeout=5)
 
-    stopped_at = time.monotonic()
-    judge.stop(join_timeout=0.05)
-    assert time.monotonic() - stopped_at < 0.2
-    release.set()
-    wait_for_model_threads()
+        stopped_at = time.monotonic()
+        judge.stop(join_timeout=0.05)
+        assert time.monotonic() - stopped_at < nonblocking_budget
+        assert not model_finished.is_set(), "stop must return while the model is still blocked"
+    finally:
+        release.set()
+        judge.stop(join_timeout=5)
+        assert judge._thread is not None and not judge._thread.is_alive()
+        wait_for_model_threads()
 
     assert record.events == []
     assert not (record.path / "judge_shadow.jsonl").exists()
@@ -552,7 +573,7 @@ def test_stop_between_model_result_and_commit_rejects_late_result(tmp_path):
     class PausedCommitJudge(DtmfJudge):
         def _commit_decision(self, generation, decision, latency_ms):
             entered_commit.set()
-            release_commit.wait(timeout=2)
+            release_commit.wait(timeout=BLOCKED_MODEL_SECONDS)
             return super()._commit_decision(generation, decision, latency_ms)
 
     record = SpyRecord(tmp_path / "recording")
@@ -565,13 +586,15 @@ def test_stop_between_model_result_and_commit_rejects_late_result(tmp_path):
         model_call=lambda messages, model, timeout: (valid_response(), None),
         throttle_seconds=0.01,
     )
-    judge.start()
-    judge.submit_remote_transcript("请按一", t_ms=10.0)
-    assert entered_commit.wait(timeout=1)
-
-    judge.stop(join_timeout=0.01)
-    release_commit.set()
-    time.sleep(0.05)
+    try:
+        judge.start()
+        judge.submit_remote_transcript("请按一", t_ms=10.0)
+        assert entered_commit.wait(timeout=5)
+        judge.stop(join_timeout=0.01)
+    finally:
+        release_commit.set()
+        judge.stop(join_timeout=5)
+        assert judge._thread is not None and not judge._thread.is_alive()
 
     assert record.events == []
     assert not (record.path / "judge_shadow.jsonl").exists()
@@ -590,14 +613,13 @@ def test_record_action_does_not_do_disk_io_on_the_live_dtmf_path(
         window_mode="fragmented",
     )
     judge.start()
-    real_open = open
 
     def fail_open(*args, **kwargs):
         raise AssertionError("record_action must not open files")
 
-    monkeypatch.setattr("builtins.open", fail_open)
-    judge.record_action(ledger.record("1", "realtime", timestamp=1.0))
-    monkeypatch.setattr("builtins.open", real_open)
+    with monkeypatch.context() as patch:
+        patch.setattr("builtins.open", fail_open)
+        judge.record_action(ledger.record("1", "realtime", timestamp=1.0))
     judge.stop()
 
     assert (record.path / "judge_shadow.jsonl").exists()
