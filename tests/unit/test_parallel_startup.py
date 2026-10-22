@@ -117,7 +117,9 @@ def test_native_greeting_sequence_parallel_connect_and_conditional_hint(native_c
     monkeypatch.setattr(agent, "start", connect)
     monkeypatch.setattr(agent, "say", say)
     asyncio.run(session._handle_call())
-    assert tts_at - answered_at >= 0.04
+    # Sampled intervals can lose one monotonic tick; allow 1ms for metric rounding.
+    tick_ms = time.get_clock_info("monotonic").resolution * 1000
+    assert tts_at - answered_at >= (50 - tick_ms - 1) / 1000
     assert order.index("ATA") < order.index("CTTS") < order.index("CTTS_return") < order.index("AT+CPCMREG=1")
     assert order.index("agent_connected") < order.index("CTTS_return")
     assert ("系统已代为说过" in instructions[0]) is ok
@@ -130,8 +132,8 @@ def test_native_greeting_sequence_parallel_connect_and_conditional_hint(native_c
     marks = events(base)
     module = next(event for event in marks if event["type"] == "module_greeting")
     assert module["ok"] is ok
-    assert module["duration_ms"] >= 20
-    assert module["started_after_answer_ms"] >= 40
+    assert module["duration_ms"] >= 30 - tick_ms - 1
+    assert module["started_after_answer_ms"] >= 50 - tick_ms - 1
     assert "text" not in module and "喂" not in json.dumps(module, ensure_ascii=False)
     metrics = json.loads((next(base.iterdir()) / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["module_greeting"]["ok"] is ok
@@ -318,7 +320,7 @@ def test_startup_order_and_overlap(setup_call, monkeypatch, parallel):
         assert elapsed < 0.45, elapsed  # 0.25s overlapping work, not 0.50s serial.
     else:
         assert order == ["answer", "pcm_begin", "pcm_end", "bridge_start", "agent_connect", "agent_ready", "say"]
-        assert elapsed >= 0.5
+        assert elapsed >= 0.5 - time.get_clock_info("monotonic").resolution
     assert agent.stopped and bridge.stopped
 
 
