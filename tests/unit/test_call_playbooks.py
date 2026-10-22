@@ -435,3 +435,175 @@ def test_learner_system_prompt_is_demand_gated():
     s = call_playbooks._LEARNER_SYSTEM
     assert "EXPLICITLY DEMANDED" in s
     assert "announcements, marketing" in s
+
+
+def evidence_payload(*, eligible=True, reason="Explicit prerequisite on the successful normal route"):
+    payload = learned_payload()
+    payload["new_required_info"][0].update(
+        hard_eligible=eligible, evidence_reason=reason
+    )
+    return payload
+
+
+def test_single_learned_demand_is_soft_then_two_independent_calls_promote(tmp_path, caplog):
+    path = tmp_path / "pb.json"
+    with caplog.at_level("INFO"):
+        first = merge_learned(
+            "611", evidence_payload(), call_id="call-a", updated="2026-10-21", path=path
+        )
+        assert missing_required_info(first, None) == []
+        assert "activation_zip" in call_playbooks.soft_info_text(first, "en")
+        # Reprocessing one call must not create independent evidence or rewrite the file.
+        original = path.read_bytes()
+        assert merge_learned(
+            "611", evidence_payload(), call_id="call-a", updated="2026-10-21", path=path
+        ) is None
+        assert path.read_bytes() == original
+        second = merge_learned(
+            "611", evidence_payload(), call_id="call-b", updated="2026-10-21", path=path
+        )
+    assert [e["key"] for e in missing_required_info(second, None)] == ["activation_zip"]
+    assert call_playbooks.soft_info_text(second, "en") == ""
+    assert "playbook_requirement_promoted" in caplog.text
+    assert "evidence_count=2" in caplog.text
+    assert "independent_explicit_demands" in caplog.text
+
+
+@pytest.mark.parametrize("reason", [
+    "One-off human follow-up after transfer",
+    "Call ended before the goal was achieved",
+    "Caller account is automatically identified by the calling SIM",
+])
+def test_weak_model_evidence_cannot_promote_even_when_repeated(tmp_path, reason):
+    path = tmp_path / "pb.json"
+    for call_id in ("weak-a", "weak-b"):
+        merged = merge_learned(
+            "611", evidence_payload(eligible=False, reason=reason),
+            call_id=call_id, updated="2026-10-21", path=path,
+        )
+        assert merged is not None
+    assert missing_required_info(merged, None) == []
+    assert "activation_zip" in call_playbooks.soft_info_text(merged, "zh")
+    merged = merge_learned(
+        "611", evidence_payload(), call_id="strong-a", updated="2026-10-21", path=path
+    )
+    assert missing_required_info(merged, None) == []
+
+
+def test_legacy_single_source_is_soft_without_rewriting_and_not_strong_evidence(tmp_path):
+    path = tmp_path / "pb.json"
+    pb = sample_playbook()
+    # Old learners also appended sourced fields to otherwise manual/seed playbooks.
+    pb["required_info"][0]["source"] = {"call_id": "old-call", "date": "2026-08-18"}
+    write_playbooks(path, [pb])
+    original = path.read_bytes()
+    loaded = lookup_playbook("611", path=path)
+    assert [e["key"] for e in missing_required_info(loaded, None)] == ["activation_zip"]
+    assert "account_pin" in call_playbooks.soft_info_text(loaded, "en")
+    assert path.read_bytes() == original
+    payload = evidence_payload()
+    payload["new_required_info"][0]["key"] = "account_pin"
+    merged = merge_learned(
+        "611", payload, call_id="new-call", updated="2026-10-21", path=path
+    )
+    assert [e["key"] for e in missing_required_info(merged, None)] == ["activation_zip"]
+
+
+def test_legacy_auto_discovered_entry_without_source_is_also_soft():
+    pb = sample_playbook()
+    pb["id"] = "learned_hotline"
+    assert missing_required_info(pb, None) == []
+
+
+@pytest.mark.parametrize("threshold", ["3", "1", "0", "-1", "invalid"])
+def test_evidence_threshold_is_configurable_but_never_below_two(tmp_path, monkeypatch, threshold):
+    monkeypatch.setenv("CALL_PLAYBOOKS_MIN_EVIDENCE_CALLS", threshold)
+    path = tmp_path / "pb.json"
+    for i in range(2):
+        merged = merge_learned(
+            "611", evidence_payload(), call_id=f"call-{i}", updated="2026-10-21", path=path
+        )
+    assert bool(missing_required_info(merged, None)) is (threshold != "3")
+    if threshold == "3":
+        merged = merge_learned(
+            "611", evidence_payload(), call_id="call-3", updated="2026-10-21", path=path
+        )
+        assert missing_required_info(merged, None)
+
+
+def test_ungraded_model_findings_default_to_soft(tmp_path):
+    path = tmp_path / "pb.json"
+    for call_id in ("a", "b"):
+        merged = merge_learned(
+            "611", learned_payload(), call_id=call_id, updated="2026-10-21", path=path
+        )
+        assert merged is not None
+    assert missing_required_info(merged, None) == []
+
+
+def test_evidence_is_per_field_and_deduplicates_repeated_demands_in_one_payload(tmp_path):
+    path = tmp_path / "pb.json"
+    payload = evidence_payload()
+    payload["new_required_info"] *= 2
+    merged = merge_learned("611", payload, call_id="a", updated="2026-10-21", path=path)
+    assert call_playbooks.required_info_status(merged)[0]["evidence_count"] == 1
+    other = evidence_payload()
+    other["new_required_info"][0]["key"] = "other_field"
+    merged = merge_learned("611", other, call_id="b", updated="2026-10-21", path=path)
+    assert merged is not None and missing_required_info(merged, None) == []
+
+
+@pytest.mark.parametrize("evidence", [
+    None, "bad", [None, "bad", {"call_id": []}],
+    [{"call_id": "a", "hard_eligible": True}] * 2,
+    [{"call_id": "a", "hard_eligible": "true"}, {"call_id": "b", "hard_eligible": 1}],
+])
+def test_bad_or_duplicate_persisted_evidence_never_creates_strong_calls(evidence):
+    pb = sample_playbook()
+    for entry in pb["required_info"]:
+        entry["evidence"] = evidence
+    assert missing_required_info(pb, None) == []
+
+
+@pytest.mark.parametrize("overrides", [
+    {"hard_eligible": "true"}, {"hard_eligible": 1},
+    {"evidence_reason": "PIN was 5566"}, {"evidence_reason": {}},
+])
+def test_invalid_evidence_metadata_is_rejected_without_writing(tmp_path, overrides):
+    path = tmp_path / "pb.json"
+    write_playbooks(path, [])
+    before = path.read_bytes()
+    payload = evidence_payload()
+    payload["new_required_info"][0].update(overrides)
+    with pytest.raises(PlaybookValidationError):
+        merge_learned("611", payload, call_id="a", updated="2026-10-21", path=path)
+    assert path.read_bytes() == before
+
+
+def test_learner_reobserves_known_fields_and_receives_goal_and_caller_id_guidance(tmp_path, monkeypatch):
+    path = _enable(monkeypatch, tmp_path)
+    seen = []
+
+    def fake_model(messages, **kwargs):
+        seen.append(messages)
+        return json.dumps(evidence_payload()), None
+
+    monkeypatch.setattr("agentcall.prompt_gen.call_text_model", fake_model)
+    for call_id in ("a", "b"):
+        learned = learn_from_call(
+            "611", [("user", "Please provide the verification field to proceed.")],
+            {"verification": {"activation_zip": "55401"}},
+            task="Check the current plan", call_id=call_id, updated="2026-10-21", path=path,
+        )
+    system = seen[-1][0]["content"]
+    user = seen[-1][1]["content"]
+    assert "including already known keys" in system
+    assert "calling SIM's own carrier" in system
+    assert "caller ID" in system
+    assert "account number" in system
+    assert "one-off human" in system
+    assert "goal was not achieved" in system
+    assert "hard_eligible" in system
+    assert "Check the current plan" in user
+    assert "activation_zip" in user and "55401" not in user
+    assert missing_required_info(learned, None)

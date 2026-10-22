@@ -282,6 +282,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("NUMBER_PROFILES_FILE", "预调教任务库文件", "str", ""),
     ConfigSpec("CALL_PLAYBOOKS_ENABLED", "呼叫情报库", "bool", "true"),
     ConfigSpec("CALL_PLAYBOOKS_FILE", "呼叫情报库文件", "str", ""),
+    ConfigSpec("CALL_PLAYBOOKS_MIN_EVIDENCE_CALLS", "情报必填项最少独立通话证据", "int", "2"),
     # ---- 本地三段式（AGENT_PROVIDER=local）----
     ConfigSpec("LOCAL_LLM_MODEL", "三段式 LLM 模型", "str", "qwen-plus",
                requires_restart=True),

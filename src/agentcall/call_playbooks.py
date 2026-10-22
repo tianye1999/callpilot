@@ -28,8 +28,9 @@ number_profiles 的 ``task_package.verification``（WIL-95 §7：值只进模型
 ``use_cases`` 是该热线常见办理事项的知识（自助 vs 转人工、费用、部门路由），
 P1 只存储与 API 暴露，P2 由建单/intake 消费。
 
-``required_info[].key`` 与 number_profiles ``task_package.verification`` 的键
-对齐：拨前拦截即"该热线要的 key，预设的 verification 里有没有"。
+``required_info[].key`` 与 number_profiles ``task_package.verification`` 的键对齐。
+种子/人工字段仍硬拦截；learner 字段须有足够独立、模型分级合格的通话证据，
+否则仅注入 AI 软提示。旧单 source 字段按未分级证据处理，读时不改文件。
 
 自动回流（learner）的隐私硬校验：模型输出的任何文本字段出现 ≥4 位连续数字
 即整条拒绝——转写里可能包含口述的 PIN/ZIP 值，绝不允许渗入知识库。
@@ -161,6 +162,87 @@ def _normalized_required_info(playbook: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _is_learned_info(playbook: dict[str, Any], entry: dict[str, Any]) -> bool:
+    source = entry.get("source")
+    return (
+        "evidence" in entry
+        or (isinstance(source, dict) and "call_id" in source)
+        or _norm(playbook.get("id")).startswith("learned_")
+    )
+
+
+def _info_evidence(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """按 call_id 去重；旧 source 只保留溯源，不假定模型曾分过级。"""
+    by_call: dict[str, dict[str, Any]] = {}
+    raw = entry.get("evidence")
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("call_id"), str):
+            continue
+        call_id = item["call_id"].strip()
+        if call_id and call_id not in by_call:
+            by_call[call_id] = {**item, "call_id": call_id}
+    source = entry.get("source")
+    if isinstance(source, dict) and isinstance(source.get("call_id"), str):
+        call_id = source["call_id"].strip()
+        if call_id and call_id not in by_call:
+            by_call[call_id] = {**source, "call_id": call_id, "hard_eligible": False}
+    return list(by_call.values())
+
+
+def _info_status(playbook: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+    threshold = max(2, config.get_int("CALL_PLAYBOOKS_MIN_EVIDENCE_CALLS"))
+    learned = _is_learned_info(playbook, entry)
+    evidence = _info_evidence(entry) if learned else []
+    count = sum(item.get("hard_eligible") is True for item in evidence)
+    hard = not learned or count >= threshold
+    return {
+        "key": entry["key"],
+        "level": "hard" if hard else "soft",
+        "evidence_count": count,
+        "observed_calls": len(evidence),
+        "threshold": threshold,
+        "reason": (
+            "seed_or_manual" if not learned else
+            "independent_explicit_demands" if hard else "insufficient_eligible_evidence"
+        ),
+    }
+
+
+def required_info_status(playbook: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """可公开记录的证据分级：仅键名、计数、原因，不含核身值或转写。"""
+    if not playbook:
+        return []
+    return [_info_status(playbook, entry) for entry in _normalized_required_info(playbook)]
+
+
+def soft_info_text(playbook: dict[str, Any] | None, lang: str) -> str:
+    if not playbook:
+        return ""
+    entries = [
+        e for e in _normalized_required_info(playbook)
+        if _info_status(playbook, e)["level"] == "soft"
+    ]
+    if not entries:
+        return ""
+    if lang == "en":
+        heading = (
+            "Unconfirmed reference from past calls, NOT mandatory prerequisites. "
+            "Proceed with the task; do not require the owner to supply these in advance. "
+            "Judge the current situation and use available verification only if actually requested; "
+            "never invent values."
+        )
+    else:
+        heading = (
+            "历史通话的未确认参考信息，不是必备条件。正常推进任务，不要要求机主提前补齐；"
+            "根据本通场景判断，仅在对方确实索要时按需使用已有核身信息，不得编造值。"
+        )
+    lines = [
+        f"- {_pick_lang(e.get('label'), lang) or e['key']} ({e['key']}): {_pick_lang(e.get('purpose'), lang)}"
+        for e in entries
+    ]
+    return "\n".join([heading, *lines])
+
+
 def missing_required_info(
     playbook: dict[str, Any] | None, task_package: dict[str, Any] | None
 ) -> list[dict[str, Any]]:
@@ -176,7 +258,7 @@ def missing_required_info(
     return [
         entry
         for entry in _normalized_required_info(playbook)
-        if entry["key"] not in have
+        if entry["key"] not in have and _info_status(playbook, entry)["level"] == "hard"
     ]
 
 
@@ -242,6 +324,15 @@ def _validate_learned_entry(entry: Any) -> dict[str, Any]:
         if not picked:
             raise PlaybookValidationError(f"required_info.{field} 没有可用语言文本")
         out[field] = picked
+    eligible = entry.get("hard_eligible", False)
+    reason = entry.get("evidence_reason", "ungraded_model_finding")
+    if not isinstance(eligible, bool) or not isinstance(reason, str) or not reason.strip():
+        raise PlaybookValidationError("required_info 证据须含布尔 hard_eligible 和非空 evidence_reason")
+    out["hard_eligible"] = eligible
+    out["evidence_reason"] = _reject_if_private(reason[:_MAX_TEXT], "required_info.evidence_reason")
+    # 不接受缺少解释的强证据；旧模型响应仍可作为软提示回流。
+    if "evidence_reason" not in entry:
+        out["hard_eligible"] = False
     return out
 
 
@@ -255,7 +346,8 @@ def merge_learned(
 ) -> dict[str, Any] | None:
     """把 learner 的发现合并进情报库。
 
-    合并策略（防污染）：required_info **只增不删**（已有 key 不动）；
+    合并策略（防污染）：required_info **只增不删**（已有定义不动，learner
+    字段累计按 call_id 去重的证据；种子/人工字段不降级）；
     ivr_notes 以"实测补充"段追加并限长；来源记 call_id + 日期；号码无条目时
     自动新建（热线自动发现）。返回合并后的条目；没有任何新知识时返回 None。
 
@@ -281,6 +373,9 @@ def merge_learned(
     number_clean = _norm(number)
     if not number_clean:
         raise PlaybookValidationError("number 不能为空")
+    call_id = call_id.strip()
+    if not call_id:
+        raise PlaybookValidationError("call_id 不能为空")
 
     with _PLAYBOOK_WRITE_LOCK:
         if target.exists():
@@ -317,20 +412,39 @@ def merge_learned(
             existing = []
             entry["required_info"] = existing
         have = {
-            _norm(item.get("key")).lower()
+            _norm(item.get("key")).lower(): item
             for item in existing
             if isinstance(item, dict)
         }
         added = False
+        promotions = []
         for candidate in new_entries:
-            if candidate["key"] in have:
+            observation = {
+                "call_id": call_id, "date": updated,
+                "hard_eligible": candidate.pop("hard_eligible"),
+                "reason": candidate.pop("evidence_reason"),
+            }
+            current = have.get(candidate["key"])
+            evidence = _info_evidence(current) if current is not None else []
+            if current is None:
+                if len(existing) >= _MAX_REQUIRED_INFO:
+                    continue
+                candidate["source"] = {"call_id": call_id, "date": updated}
+                candidate["evidence"] = []
+                current = candidate
+                existing.append(current)
+                have[candidate["key"]] = current
+            elif not _is_learned_info(entry, current):
+                # 模型不能把种子/人工定义改成 learner 的证据门槛。
                 continue
-            candidate["source"] = {"call_id": call_id, "date": updated}
-            existing.append(candidate)
-            have.add(candidate["key"])
+            before = _info_status(entry, current)
+            if any(e["call_id"] == call_id for e in evidence):
+                continue
+            current["evidence"] = [*evidence, observation]
+            after = _info_status(entry, current)
+            if before["level"] == "soft" and after["level"] == "hard":
+                promotions.append(after)
             added = True
-        if len(existing) > _MAX_REQUIRED_INFO:
-            del existing[_MAX_REQUIRED_INFO:]
 
         if notes_clean:
             notes = entry.get("ivr_notes")
@@ -350,6 +464,11 @@ def merge_learned(
             return None
         entry["updated"] = updated
         _write_profiles_file(target, data)
+        for status in promotions:
+            logger.info(
+                "playbook_requirement_promoted key=%s evidence_count=%s threshold=%s reason=%s",
+                status["key"], status["evidence_count"], status["threshold"], status["reason"],
+            )
         return entry
 
 
@@ -358,21 +477,37 @@ def merge_learned(
 # ---------------------------------------------------------------------------
 
 _LEARNER_SYSTEM = """You maintain a per-hotline knowledge base for an AI phone agent.
-Given a call transcript, the hotline's current known requirements, and the list of
-verification KEYS the caller already had, identify ONLY:
+Given a call transcript, the call's goal, current known fields and the list of
+verification KEYS the caller already had, use scenario understanding to identify ONLY:
 1. new_required_info: identity/verification items the remote side EXPLICITLY DEMANDED
-   the caller provide during THIS call as a prerequisite to proceed (e.g. "please say
-   or enter your PIN"), that are NOT in the known keys. A demand means the call could
+   the caller provide during THIS call as a prerequisite to proceed,
+   including already known keys so independent calls can corroborate a requirement.
+   Reuse an existing key for the same field. Report each field at most once per call,
+   even if the remote side repeated the demand or the caller already had its value.
+   A demand means the call could
    not move forward without it. Do NOT include anything merely mentioned in
    announcements, marketing, or website/app-login instructions ("your user ID and
    password are unchanged" is an ad, not a demand). Use short snake_case keys.
    NEVER include actual values or digits — describe the field only.
+   Each observation needs hard_eligible (boolean) and evidence_reason (short explanation
+   without personal values). Set hard_eligible=true ONLY when the transcript clearly
+   establishes an unavoidable prerequisite on the normal route AND the call's goal was
+   achieved. If the goal was not achieved, the call was transferred to human support,
+   or a one-off human follow-up is the only evidence, set false. Ambiguous outcome or
+   missing goal context also means false. Such observations are only soft references,
+   never evidence that can promote a field to a mandatory pre-dial requirement.
+   Consider this scenario: when dialing the calling SIM's own carrier customer service,
+   the carrier can identify the account automatically from caller ID. Do not learn an
+   account number as a mandatory field when this automatic identification applies.
+   Judge from the scenario and transcript, not from a table of hotline numbers or words.
+   All new fields start as soft hints; code, not the model, counts independent calls.
 2. ivr_notes_update: one short factual note about how this hotline's IVR flow works,
    ONLY if the transcript reveals something not already in the current notes
    (menu behavior, transfer path, verification order). Otherwise null.
 Respond with JSON only:
 {"new_required_info": [{"key": "...", "label": {"zh": "...", "en": "..."},
-  "purpose": {"zh": "...", "en": "..."}}], "ivr_notes_update": {"zh": "...", "en": "..."} | null}
+  "purpose": {"zh": "...", "en": "..."}, "hard_eligible": false,
+  "evidence_reason": "..."}], "ivr_notes_update": {"zh": "...", "en": "..."} | null}
 Empty findings => {"new_required_info": [], "ivr_notes_update": null}.
 Never output any digit sequence of 4 or more digits anywhere."""
 
@@ -384,6 +519,7 @@ def learn_from_call(
     *,
     call_id: str,
     updated: str,
+    task: str = "",
     path: str | Path | None = None,
     timeout: float | None = None,
 ) -> dict[str, Any] | None:
@@ -406,10 +542,11 @@ def learn_from_call(
 
         playbook = lookup_playbook(number, path=path)
         known_keys: list[str] = [e["key"] for e in _normalized_required_info(playbook or {})]
+        available_keys: list[str] = []
         if isinstance(task_package, dict) and isinstance(
             task_package.get("verification"), dict
         ):
-            known_keys.extend(
+            available_keys.extend(
                 _norm(k).lower() for k in task_package["verification"] if _norm(k)
             )
         notes_now = ""
@@ -424,7 +561,9 @@ def learn_from_call(
         )
         user_prompt = (
             f"Hotline number: {number}\n"
-            f"Known required-info keys (already collected or known): {sorted(set(known_keys))}\n"
+            f"Call goal: {task or '(unknown; do not infer success)'}\n"
+            f"Known field keys (reobserve when demanded): {sorted(set(known_keys))}\n"
+            f"Available verification keys (no values): {sorted(set(available_keys))}\n"
             f"Current IVR notes: {notes_now or '(none)'}\n\n"
             f"Transcript:\n{convo[-6000:]}"
         )
@@ -440,7 +579,7 @@ def learn_from_call(
             provider=provider,
             model=model,
             timeout=timeout,
-            max_tokens=500,
+            max_tokens=900,
         )
         if error is not None or not text:
             logger.warning("playbook learner 模型调用失败: %s", error or "空响应")
