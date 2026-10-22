@@ -21,12 +21,14 @@ from agentcall.takeover_coordinator import (
 
 
 def _service() -> CallAgentService:
-    return CallAgentService(
+    service = CallAgentService(
         modem_port="unused",
         audio_keyword="unused",
         provider="openai",
         modem=FakeModem(),  # type: ignore[arg-type]
     )
+    service.session._takeover_endpoint_rejection = lambda: None
+    return service
 
 
 def _prepare_inbound(service: CallAgentService, generation: int = 7) -> None:

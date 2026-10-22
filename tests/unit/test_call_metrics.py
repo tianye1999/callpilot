@@ -72,6 +72,21 @@ def test_schema_version_and_meta_always_present():
     assert metrics["status"] == "completed"
 
 
+def test_takeover_fallback_reports_reasons_and_observed_reclaim_duration():
+    metrics = _build([
+        {"type": "takeover_unavailable", "reason": "edge_not_registered"},
+        {"type": "takeover_unavailable", "reason": "hosted_takeover_disabled"},
+        {"type": "takeover_timeout_reclaimed", "elapsed_ms": 20_012.5},
+    ])
+    assert metrics["takeover"]["unavailable"] == 2
+    assert metrics["takeover"]["timeout_reclaimed"] == 1
+    assert metrics["takeover_unavailable_reasons"] == {"edge_not_registered": 1, "hosted_takeover_disabled": 1}
+    assert metrics["takeover_reclaim_latency_ms"]["values"] == [20_012.5]
+    absent = _build([])
+    assert absent["takeover_reclaim_latency_ms"] is None
+    assert absent["unavailable"]["takeover_reclaim_latency_ms"] == "no_timeout_reclaim"
+
+
 def test_latency_stats_use_nearest_rank_p90():
     events = [
         {"type": "latency", "ts": 1.0, "stage": "local_response", "ms": float(v)}

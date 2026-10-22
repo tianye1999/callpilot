@@ -22,6 +22,7 @@ def _service() -> CallAgentService:
     session._session_generation = 4
     session._initialize_takeover_context("inbound")
     session._triage_mode = "enforce"
+    service.session._takeover_endpoint_rejection = lambda: None
     return service
 
 

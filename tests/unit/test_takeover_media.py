@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
 from agentcall.call_agent import CallAgentService
@@ -14,6 +15,7 @@ from agentcall.takeover_coordinator import (
     TakeoverOffer,
     TakeoverState,
 )
+from agentcall.triage_judge import TriageVerdict
 
 
 class FakeEndpoint:
@@ -58,12 +60,14 @@ class FakeRecord:
 
 
 def _service() -> CallAgentService:
-    return CallAgentService(
+    service = CallAgentService(
         modem_port="unused",
         audio_keyword="unused",
         provider="openai",
         modem=FakeModem(),  # type: ignore[arg-type]
     )
+    service.session._takeover_endpoint_rejection = lambda: None
+    return service
 
 
 def _issued(expires_at: float) -> IssuedLiveKitSession:
@@ -78,7 +82,7 @@ def _issued(expires_at: float) -> IssuedLiveKitSession:
     )
 
 
-def _claimed(service: CallAgentService, monkeypatch) -> InboundTakeoverSession:
+def _claimed(service: CallAgentService, monkeypatch, trigger="agent_tool") -> InboundTakeoverSession:
     monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
     session = service.session
     session._active = True
@@ -86,7 +90,16 @@ def _claimed(service: CallAgentService, monkeypatch) -> InboundTakeoverSession:
     session._session_generation = 7
     session._initialize_takeover_context("inbound")
     service.session._build_tools("inbound")
-    service.session._request_owner_takeover(7)
+    if trigger == "triage_judge":
+        session._triage_mode = "enforce"
+        session._triage_pending = True
+        session._triage_results.put_nowait(TriageVerdict(
+            category="personal", action="transfer", confidence=0.9,
+            reason_code="owner_requested", turn_id=1, call_generation=7,
+        ))
+        assert asyncio.run(session._consume_triage_results(FakeAgent(), FakeAudioBridge(), 7)) == "transfer"
+    else:
+        assert service.session._build_tools("inbound").dispatch("request_owner_takeover", {})["success"]
     request = service.next_inbound_takeover_offer()
     assert request is not None
     offer = TakeoverOffer(
@@ -106,10 +119,11 @@ def _claimed(service: CallAgentService, monkeypatch) -> InboundTakeoverSession:
     return claimed
 
 
-def test_handoff_stops_old_writer_and_pumps_mobile_then_single_finalizer(monkeypatch) -> None:
+@pytest.mark.parametrize("trigger", ["agent_tool", "triage_judge"])
+def test_handoff_stops_old_writer_and_pumps_mobile_then_single_finalizer(monkeypatch, trigger) -> None:
     service = _service()
     session = service.session
-    claimed = _claimed(service, monkeypatch)
+    claimed = _claimed(service, monkeypatch, trigger)
     old_bridge = FakeAudioBridge()
     old_bridge.start()
     new_bridge = FakeAudioBridge()
@@ -137,7 +151,7 @@ def test_handoff_stops_old_writer_and_pumps_mobile_then_single_finalizer(monkeyp
     assert session.modem.calls == []
 
 
-def test_takeover_hold_is_one_deterministic_line_before_agent_gate(monkeypatch) -> None:
+def test_takeover_hold_is_one_scenario_instruction_before_agent_gate(monkeypatch) -> None:
     service = _service()
     session = service.session
     monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
@@ -153,15 +167,17 @@ def test_takeover_hold_is_one_deterministic_line_before_agent_gate(monkeypatch) 
 
     asyncio.run(session._speak_takeover_hold_if_needed(agent, bridge, 7))
 
-    assert agent.said == ["请稍等，我确认一下，马上帮您转接。"]
+    assert len(agent.said) == 1
+    assert "尚未接通" in agent.said[0]
     assert bridge.downlink
     assert session._agent_effect_allowed(7) is False
 
 
-def test_handoff_start_failure_restarts_old_bridge_and_rolls_back(monkeypatch) -> None:
+@pytest.mark.parametrize("trigger", ["agent_tool", "triage_judge"])
+def test_handoff_start_failure_restarts_old_bridge_and_rolls_back(monkeypatch, trigger) -> None:
     service = _service()
     session = service.session
-    claimed = _claimed(service, monkeypatch)
+    claimed = _claimed(service, monkeypatch, trigger)
     old_bridge = FakeAudioBridge()
     old_bridge.start()
     endpoint = FakeEndpoint(session)
@@ -184,7 +200,43 @@ def test_handoff_start_failure_restarts_old_bridge_and_rolls_back(monkeypatch) -
     assert result is None
     assert old_bridge.stopped and old_bridge.started
     assert session.takeover_state is TakeoverState.AI_ACTIVE
+    assert session._agent_effect_allowed(7)
+    assert not session._triage_terminal and not session._triage_pending
+    assert session._takeover_request is None
     assert endpoint.closed
+
+
+def test_claim_without_media_before_deadline_recovers_and_rejects_late_claim(monkeypatch) -> None:
+    import time
+
+    service = _service()
+    session = service.session
+    claimed = _claimed(service, monkeypatch, "triage_judge")
+    session._takeover_deadline = time.monotonic() + 0.02
+    old_bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    agent._on_audio_out = session._make_agent_audio_handler(agent, old_bridge, None)
+
+    class BlockedEndpoint(FakeEndpoint):
+        async def connect(self) -> None:
+            await asyncio.Event().wait()
+
+    endpoint = BlockedEndpoint(session)
+    session._takeover_endpoint_factory = lambda _issued: endpoint
+    result = asyncio.run(asyncio.wait_for(
+        session._handoff_to_mobile(agent, old_bridge, claimed, None, 7), timeout=0.5,
+    ))
+    assert result is None
+    assert session._agent_effect_allowed(7)
+    assert session.takeover_state is TakeoverState.AI_ACTIVE
+    assert old_bridge.downlink and not old_bridge.stopped
+    assert len(agent.said) == 1
+    assert endpoint.closed
+    assert not service.provide_inbound_takeover_session(claimed).accepted
+    assert service.take_inbound_takeover_session() is None
+    revoke = service.next_inbound_takeover_revoke()
+    assert revoke is not None and revoke.reason == "OWNER_TIMEOUT"
+    assert service.modem.calls == []
 
 
 def test_takeover_connected_snapshot_repeats_until_call_stops() -> None:

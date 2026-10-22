@@ -235,6 +235,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
         "false",
         requires_restart=True,
     ),
+    ConfigSpec("INBOUND_TAKEOVER_TIMEOUT_SECONDS", "来电真人接管等待时限（秒）", "float", "20"),
     # 机主确认环（WIL-120 二期 Path A）：ask_owner 工具等 Web 确认卡答复的
     # 窗口；超时=拒绝（fail-closed，机主没看到不等于同意）。
     ConfigSpec("OWNER_CONFIRM_TIMEOUT_SECONDS", "机主确认等待窗口（秒）", "int", "60"),
