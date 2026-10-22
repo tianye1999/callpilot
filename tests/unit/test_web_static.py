@@ -95,6 +95,17 @@ def test_modem_and_sim_events_debounce_metadata_refresh():
     assert "metaRefreshTimer = setTimeout(() => { void loadMeta(); }" in text
 
 
+def test_modem_reset_state_is_preserved_in_meta_events_and_language_switches():
+    text = INDEX.read_text(encoding="utf-8")
+    assert "模组重启中（约 30 秒）" in text
+    assert "Modem restarting (about 30 seconds)" in text
+    assert "function setModem(connected, resetting = false)" in text
+    assert 'setModem(!!ev.connected, !!ev.modem_resetting)' in text
+    assert 'setModem(!!m.hardware.modem_connected, !!m.hardware.modem_resetting)' in text
+    assert 'setModem(modemConnected, modemResetting)' in text
+    assert 'modemResetting ? "modem_resetting"' in text
+
+
 def test_setup_hardware_shows_lte_registration_for_volte_only_sim():
     text = INDEX.read_text(encoding="utf-8")
 

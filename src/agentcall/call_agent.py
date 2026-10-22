@@ -25,6 +25,7 @@ from .audio_bridge import (
     AgentPcm,
     FfmpegAudioBridge,
     ModemAudioBridge,
+    PrebufferedPcm,
     SerialPcmAudioBridge,
     apply_pcm_gain,
     create_audio_bridge,
@@ -255,6 +256,11 @@ class CallSession:
         self._on_hold = False
         self._hold_started_ts = 0.0
         self._judge_task: asyncio.Task | None = None
+        self._wrap_up_carrier_sms_enabled = False
+        self._wrap_up_sms_service_number = ""
+        self._wrap_up_sms_started_at = 0.0
+        self._wrap_up_sms_seen: set[tuple[float, str]] = set()
+        self._wrap_up_sms_evidence: list[dict] = []
         # 会话级可调参数：每通会话开始时从 config 重新读取，支持不重启改参。
         self._hangover_seconds = HALF_DUPLEX_HANGOVER_SECONDS
         self._hangup_delay_seconds = HANGUP_TOOL_DELAY_SECONDS
@@ -475,6 +481,8 @@ class CallSession:
         number = self._outbound_number or self.current_caller
         record = self._begin_record(direction, number)
         self._record = record
+        if self._wrap_up_carrier_sms_enabled and record is not None:
+            self._wrap_up_sms_started_at = record.started_at
         self._initialize_takeover_context(direction)
         self._initialize_triage_context(direction, record)
         transcripts: list[tuple[str, str]] = []
@@ -578,21 +586,26 @@ class CallSession:
             bridge.start()
             mark("bridge_started")
 
-            await agent.start(
-                self._make_agent_audio_handler(
-                    agent, bridge, record, note_first_agent_audio
+            try:
+                await agent.start(
+                    self._make_agent_audio_handler(
+                        agent, bridge, record, note_first_agent_audio
+                    )
                 )
-            )
-            mark("agent_started")
-            # #80-B:IVR 热线 profile 可声明 opening_mode=wait——不发开场白,
-            # 静默等对方(菜单播报)先说,避免 AI 开场压掉首段 IVR。仅外呼且
-            # profile 显式 wait 时生效;人呼人/来电行为不变。
-            if direction == "outbound" and self._prompt_gen_opening_mode == "wait":
-                mark("opening_skipped", mode="wait")
-                logger.info("按 profile opening_mode=wait 跳过开场白,等待对方先说")
-            else:
-                await agent.say(self._opening_instructions(direction))
-                mark_greeting_sent()
+                mark("agent_started")
+                # #80-B:IVR 热线 profile 可声明 opening_mode=wait——不发开场白,
+                # 静默等对方(菜单播报)先说,避免 AI 开场压掉首段 IVR。仅外呼且
+                # profile 显式 wait 时生效;人呼人/来电行为不变。
+                if direction == "outbound" and self._prompt_gen_opening_mode == "wait":
+                    mark("opening_skipped", mode="wait")
+                    logger.info("按 profile opening_mode=wait 跳过开场白,等待对方先说")
+                else:
+                    await agent.say(self._opening_instructions(direction))
+                    mark_greeting_sent()
+            except BaseException:
+                if isinstance(bridge, SerialPcmAudioBridge) and bridge.uplink_prebuffer_enabled:
+                    await self._shutdown_agent(agent, bridge)
+                raise
 
             active_bridge = bridge
             try:
@@ -605,6 +618,8 @@ class CallSession:
             status = "failed"
             raise
         finally:
+            if self._wrap_up_carrier_sms_enabled:
+                await self._stop_wrap_up_sms_judge()
             # 先作废判官世代再 finish record，避免迟到结果在 meta 落盘后追加事件。
             self._stop_dtmf_judge()
             self._stop_triage_judge()
@@ -1444,7 +1459,12 @@ class CallSession:
                 # 本机监听对方声音（8k 旁路，入队即返回）。
                 if self.uplink_monitor is not None:
                     self.uplink_monitor.feed(pcm_8k)
-                if not suppress_uplink and agent_effects_allowed:
+                # Historical startup speech must not cancel a later AI opening through
+                # delayed provider VAD. Wait profiles have no opening to protect.
+                replay_during_opening = isinstance(pcm_8k, PrebufferedPcm) and not (
+                    self._outbound_number and self._prompt_gen_opening_mode == "wait"
+                )
+                if not suppress_uplink and not replay_during_opening and agent_effects_allowed:
                     pcm_agent = bridge.modem_to_agent(pcm_8k, agent.input_rate)
                     uplink_pre_stats.add(pcm_agent)
                     pcm_agent = apply_pcm_gain(pcm_agent, agent_uplink_gain)
@@ -1661,6 +1681,18 @@ class CallSession:
         self._dead_media_silent_seconds = 0.0
         self._dead_media_reported = False
         self._hangup_delay_seconds = config.get_float("HANGUP_TOOL_DELAY_SECONDS")
+        self._wrap_up_carrier_sms_enabled = False
+        self._wrap_up_sms_service_number = ""
+        self._wrap_up_sms_started_at = 0.0
+        self._wrap_up_sms_seen = set()
+        self._wrap_up_sms_evidence = []
+        if config.get_bool("WRAP_UP_JUDGE_CARRIER_SMS"):
+            sim = getattr(self.modem, "sim_identity", None)
+            service_number = str(getattr(sim, "service_number", "") or "")
+            if is_carrier_service_call(self._outbound_number, service_number):
+                self._wrap_up_carrier_sms_enabled = True
+                self._wrap_up_sms_service_number = service_number
+                self._wrap_up_sms_started_at = time.time()
 
     def _begin_record(self, direction: str, number: str | None) -> CallRecord | None:
         """创建通话记录；录音选择在每通开始时锁定，本通中途不再变化。"""
@@ -2324,6 +2356,63 @@ class CallSession:
             module_greeting=module_greeting,
         )
 
+    async def _in_call_carrier_sms(
+        self, goal: str, generation: int, record: CallRecord | None,
+    ) -> list[dict]:
+        if self.hub is None:
+            return []
+        if self._wrap_up_sms_evidence:
+            return list(self._wrap_up_sms_evidence)
+        seen = self._wrap_up_sms_seen
+        candidates = []
+        for item in carrier_sms_evidence(
+            self.hub.history(), service_number=self._wrap_up_sms_service_number,
+            started_at=self._wrap_up_sms_started_at, ended_at=time.time(),
+        ):
+            key = (float(item["ts"]), str(item["text"]))
+            if not math.isfinite(key[0]) or key in seen:
+                continue
+            # Mark before awaiting: failures/cancellation must never retry this SMS.
+            seen.add(key)
+            candidates.append(item)
+        if not candidates:
+            return []
+        try:
+            selected = await asyncio.to_thread(
+                select_task_relevant_evidence, candidates, task=goal, lang=agent_language(),
+            )
+            code = "relevant" if selected else "not_selected"
+            if selected and (len(selected) != 1 or selected[0] not in candidates):
+                selected, code = [], "invalid_selection"
+        except Exception:  # noqa: BLE001 -- fail closed, never log model/SMS payloads
+            selected, code = [], "relevance_error"
+        if (
+            not self._agent_generation_current(generation) or self._record is not record
+            or seen is not self._wrap_up_sms_seen or not self._wrap_up_carrier_sms_enabled
+        ):
+            return []
+        for item in candidates:
+            if record is not None:
+                try:
+                    record.log_event(
+                        "in_call_sms_evidence", relevant=item in selected,
+                        reason_code=code if item in selected or not selected else "not_selected",
+                        chars=len(str(item["text"])),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("通话短信证据事件未记录: error_type=%s", type(exc).__name__)
+        self._wrap_up_sms_evidence = list(selected)
+        return list(selected)
+
+    async def _stop_wrap_up_sms_judge(self) -> None:
+        self._wrap_up_carrier_sms_enabled = False
+        self._wrap_up_sms_seen = set()
+        self._wrap_up_sms_evidence = []
+        task = self._judge_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _run_wrap_up_judge(
         self, transcripts: list[tuple[str, str]], goal: str
     ) -> None:
@@ -2331,10 +2420,36 @@ class CallSession:
 
         judge_wrap_up 是同步的（内部带超时），放线程池跑，绝不阻塞音频主循环。
         """
+        sms_enabled = self._wrap_up_carrier_sms_enabled
+        generation = self._session_generation
+        record = self._record
+        evidence: list[dict] = []
         try:
-            result = await asyncio.to_thread(judge_wrap_up, transcripts, goal)
+            if sms_enabled:
+                if not self._agent_generation_current(generation):
+                    return
+                evidence = await self._in_call_carrier_sms(goal, generation, record)
+                if (
+                    not self._agent_generation_current(generation) or self._record is not record
+                    or not self._wrap_up_carrier_sms_enabled
+                ):
+                    return
+            if evidence:
+                result = await asyncio.to_thread(judge_wrap_up, transcripts, goal, carrier_sms=evidence)
+                # Model-authored reasons can echo an SMS; keep bodies out of all events/logs.
+                result = {**result, "reason": "carrier_sms_evidence"}
+            else:
+                result = await asyncio.to_thread(judge_wrap_up, transcripts, goal)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("收尾裁判调度异常: %s", exc)
+            if sms_enabled:
+                logger.debug("收尾裁判调度异常: error_type=%s", type(exc).__name__)
+            else:
+                logger.debug("收尾裁判调度异常: %s", exc)
+            return
+        if sms_enabled and (
+            not self._agent_generation_current(generation) or self._record is not record
+            or not self._wrap_up_carrier_sms_enabled
+        ):
             return
         # 每次裁判决策落 events：真机验证「否定式答复→收尾」与事后排障都靠它（#16）。
         record = self._record
@@ -3822,6 +3937,7 @@ class CallAgentService:
         # supervisor 反复重连直到成功（首次连上后由 modem 读循环自愈接管）。
         # 注入 modem（测试/直连）视为已就绪；自建的由 supervisor 连上后置 True。
         self.modem_connected = modem is not None
+        self._reported_modem_resetting = False
         self._modem_state_lock = threading.Lock()
         self._modem_disconnected_monotonic: float | None = None
         self._modem_disconnected_at: str | None = None
@@ -3965,7 +4081,7 @@ class CallAgentService:
                 self.modem.hangup()
 
         def on_sms(sender: str | None, text: str, sms_ts: str = "") -> None:
-            logger.info("收到短信 来自=%s 字符数=%d", sender or "未知", len(text))
+            logger.info("收到短信 来自=%s 时间=%s 字符数=%d", sender or "未知", sms_ts, len(text))
             # publish 返回是否为新短信：补收 SIM 已存短信 / +CMTI 重复上报时，
             # 去重后重复的一条既不入库也不重复转发邮件（is_new=False 直接跳过）。
             is_new = True
@@ -4621,15 +4737,22 @@ class CallAgentService:
             self._set_modem_connected(True)
             logger.info("看门狗已恢复模组连接，等待来电…")
 
+    @property
+    def modem_resetting(self) -> bool:
+        return isinstance(self.modem, Sim7600Modem) and self.modem.recovery_in_progress
+
     def _set_modem_connected(self, connected: bool, error: str | None = None) -> None:
         """更新模组连接状态并广播给 UI（仅状态翻转时发事件，避免重连期刷屏）。"""
         if connected and self._sim7600_reset is not None:
             connected = self.modem.is_connected()
         with self._modem_state_lock:
-            if connected == self.modem_connected:
+            resetting = self.modem_resetting
+            connection_changed = connected != self.modem_connected
+            if not connection_changed and resetting == self._reported_modem_resetting:
                 return
             self.modem_connected = connected
-            event: dict = {"type": "modem_status", "connected": connected}
+            self._reported_modem_resetting = resetting
+            event: dict = {"type": "modem_status", "connected": connected, "modem_resetting": resetting}
             if connected:
                 if self._modem_disconnected_monotonic is not None:
                     event["recovery_seconds"] = round(
@@ -4640,12 +4763,15 @@ class CallAgentService:
                 self._modem_disconnected_monotonic = None
                 self._modem_disconnected_at = None
             else:
-                self._modem_disconnected_monotonic = time.monotonic()
-                self._modem_disconnected_at = datetime.now(UTC).isoformat()
+                if connection_changed:
+                    self._modem_disconnected_monotonic = time.monotonic()
+                    self._modem_disconnected_at = datetime.now(UTC).isoformat()
                 event["disconnected_at"] = self._modem_disconnected_at
             if error:
                 event["error"] = error
         self._publish(event)
+        if not connection_changed:
+            return  # Reset completion while still offline is a UI-only status change.
         if connected:
             if "recovery_seconds" in event:
                 logger.info(

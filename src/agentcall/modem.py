@@ -527,7 +527,7 @@ class SerialModem:
         try:
             response = self._send('AT+CMGL="ALL"')
         except Exception as exc:  # noqa: BLE001
-            logger.warning("读取已存短信失败: %s", exc)
+            logger.warning("读取已存短信失败: error_type=%s", type(exc).__name__)
             return
 
         entries = self._parse_cmgl(response)
@@ -538,7 +538,7 @@ class SerialModem:
         delete_after = config.get_bool("SMS_DELETE_AFTER_INGEST")
         for index, sender, timestamp, body in entries:
             logger.info(
-                "[补收短信] 来自 %s (%s): %s", sender or "未知", timestamp, body or "(空)"
+                "[补收短信] 来自=%s 时间=%s 字符数=%d", sender or "未知", timestamp, len(body)
             )
             delivered = False
             if self._on_sms:
@@ -546,7 +546,7 @@ class SerialModem:
                     self._on_sms(sender, body, timestamp)
                     delivered = True
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("补收短信回调异常: %s", exc)
+                    logger.warning("补收短信回调异常: error_type=%s", type(exc).__name__)
             # 补收进 app（含去重跳过=已在 app）后删 SIM 上这条，腾存储防满。
             if delivered and index and delete_after:
                 self._delete_stored_sms(index)
@@ -561,7 +561,7 @@ class SerialModem:
             self._send(f"AT+CMGD={index}")
             logger.debug("已删除 SIM 存储短信 index=%s", index)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("删除已存短信失败 (index=%s): %s", index, exc)
+            logger.warning("删除已存短信失败 (index=%s): error_type=%s", index, type(exc).__name__)
 
     def _parse_cmgl(self, response: str) -> list[tuple[str, str | None, str, str]]:
         """解析 ``AT+CMGL`` 响应为 ``(存储索引, 发件方, 时间戳, 正文)`` 列表。
@@ -857,7 +857,7 @@ class SerialModem:
                 self._send('AT+CSCS="GSM"')
 
         if ok:
-            logger.info("短信已发送 -> %s: %s", number, text)
+            logger.info("短信已发送 -> %s 字符数=%d", number, len(text))
         else:
             logger.warning("短信发送失败 -> %s", number)
         return ok
@@ -1239,7 +1239,7 @@ class SerialModem:
                 self._send(f'AT+CPMS="{mem}"')
             response = self._send(f"AT+CMGR={index}")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("读取短信失败 (index=%s): %s", index, exc)
+            logger.warning("读取短信失败 (index=%s): error_type=%s", index, type(exc).__name__)
             return
 
         cmgr_line = next(
@@ -1251,7 +1251,7 @@ class SerialModem:
         )
 
         logger.info(
-            "[短信] 来自 %s (%s): %s", sender or "未知", timestamp, body or "(空)"
+            "[短信] 来自=%s 时间=%s 字符数=%d", sender or "未知", timestamp, len(body)
         )
         delivered = False
         if self._on_sms:
@@ -1259,7 +1259,7 @@ class SerialModem:
                 self._on_sms(sender, body, timestamp)
                 delivered = True
             except Exception as exc:  # noqa: BLE001
-                logger.warning("短信回调异常: %s", exc)
+                logger.warning("短信回调异常: error_type=%s", type(exc).__name__)
         # 实时短信读入 app 后删 SIM 上这条，防存储堆满（默认开，可配关）。
         if delivered and index and config.get_bool("SMS_DELETE_AFTER_INGEST"):
             self._delete_stored_sms(index)

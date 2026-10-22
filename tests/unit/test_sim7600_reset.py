@@ -321,6 +321,47 @@ def test_service_defers_queue_until_modem_recovery_is_ready(modem, monkeypatch):
     modem.close()
 
 
+@pytest.mark.parametrize("success", [False, True])
+def test_local_modem_events_include_reset_start_and_end_even_if_still_offline(modem, monkeypatch, success):
+    from agentcall.call_agent import CallAgentService
+
+    service = CallAgentService("/dev/fake-at", "unused", modem=modem)
+    events = []
+    monkeypatch.setattr(service, "_publish", events.append)
+    modem._reset_in_progress = True
+    service._set_modem_connected(False)
+    disconnected_at = service._modem_disconnected_at
+    disconnected_clock = service._modem_disconnected_monotonic
+    assert service.modem_resetting is True
+    service._set_modem_connected(False)  # Duplicate connection callbacks are quiet.
+    modem._reset_in_progress = False
+    modem._connection_online = success
+    service._set_modem_connected(success)
+    service._set_modem_connected(success)
+    status = [event for event in events if event["type"] == "modem_status"]
+    assert [(event["connected"], event["modem_resetting"]) for event in status] == [
+        (False, True), (success, False),
+    ]
+    assert service.modem_resetting is False
+    if not success:
+        assert service._modem_disconnected_at == disconnected_at
+        assert service._modem_disconnected_monotonic == disconnected_clock
+    modem.close()
+
+
+def test_quectel_modem_event_never_reports_resetting(monkeypatch):
+    from agentcall.call_agent import CallAgentService
+
+    modem = Eg25Modem("unused-fake-port")
+    service = CallAgentService("unused-fake-port", "unused", modem=modem)
+    events = []
+    monkeypatch.setattr(service, "_publish", events.append)
+    service._set_modem_connected(False)
+    assert service.modem_resetting is False
+    assert events[0]["modem_resetting"] is False
+    modem.close()
+
+
 def test_next_completed_call_can_reset_before_previous_callback_exits(modem, recovery):
     controller, states, calls = recovery
     ready = threading.Event()

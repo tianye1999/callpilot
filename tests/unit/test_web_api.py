@@ -191,6 +191,7 @@ def test_meta_includes_setup_and_hardware_status(monkeypatch):
     assert meta["hardware"] == {
         "usb_online": True,
         "modem_connected": False,
+        "modem_resetting": False,
         "port": "/tmp/ec20-at",
     }
     assert meta["setup_sms_token"]
@@ -1028,7 +1029,30 @@ def test_meta_returns_injected_metadata(monkeypatch):
     assert meta["model"] == "qwen-x"
     assert meta["credentials"]["ok"] is False
     assert meta["setup_required"] is True
-    assert set(meta["hardware"]) == {"usb_online", "modem_connected", "port"}
+    assert set(meta["hardware"]) == {"usb_online", "modem_connected", "modem_resetting", "port"}
+
+
+@pytest.mark.parametrize("simcom", [False, True])
+def test_meta_tracks_modem_reset_lifecycle_without_hardware(monkeypatch, simcom):
+    from agentcall.modem import Eg25Modem, Sim7600Modem
+
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    modem = (Sim7600Modem if simcom else Eg25Modem)("unused-fake-port")
+    service = FakeService()
+    service.modem = modem
+    service.modem_connected = True
+    app = build_app(hub=None, modem=modem, service=service, meta={"provider": "qwen"})
+
+    async def check(client):
+        for resetting, connected in ((False, True), (True, False), (False, True), (False, False)):
+            modem._reset_in_progress = resetting
+            service.modem_connected = connected
+            response = await client.get("/api/meta")
+            hardware = (await response.json())["hardware"]
+            assert hardware["modem_resetting"] is (resetting and simcom)
+            assert hardware["modem_connected"] is connected
+
+    api(app, check)
 
 
 # ---- /api/call/dial ----

@@ -44,7 +44,7 @@
 
   /* ========= 顶部全局状态条 ========= */
   header {
-    display: flex; align-items: center; gap: 14px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
     padding: 12px 24px;
     border-bottom: 1px solid var(--border);
     background: rgba(14, 19, 29, .72);
@@ -158,13 +158,17 @@
   /* 通话中快捷操作（任意面板可见） */
   .quick-acts { display: none; gap: 8px; }
   .quick-acts.show { display: flex; }
-  .meta { display: flex; gap: 14px; font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+  .meta { display: flex; flex-wrap: wrap; align-items: center; max-width: 100%; gap: 14px;
+    font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+  .meta > span { overflow-wrap: anywhere; }
+  .meta > button { flex-shrink: 0; }
   .meta b { color: var(--text); font-weight: 500; }
   .conn-dot {
     width: 8px; height: 8px; border-radius: 50%; display: inline-block;
     background: var(--err); box-shadow: 0 0 8px var(--err); margin-right: 5px;
   }
   .conn-dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .conn-dot.resetting { background: var(--warn); box-shadow: none; }
 
   /* ========= 按钮体系（poc 语言：渐变 primary + 透明 danger）========= */
   button { font-family: inherit; }
@@ -881,7 +885,7 @@
       </button>
       <div class="lang-menu" id="langMenu" role="menu"></div>
       <span><span id="dot" class="conn-dot"></span><span id="conn"></span></span>
-      <span><span id="modemDot" class="conn-dot"></span><span id="modemState"></span></span>
+      <span role="status"><span id="modemDot" class="conn-dot"></span><span id="modemState"></span></span>
       <span>MODEL <b id="model">-</b></span>
       <span>PROVIDER <b id="provider">-</b></span>
     </div>
@@ -1339,6 +1343,7 @@ const I18N = {
     st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
     conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
     modem_on: "Modem ready", modem_off: "Modem offline",
+    modem_resetting: "Modem restarting (about 30 seconds)",
     keypad: "Keys", hangup: "Hang up",
     dial_label: "MAKE A CALL", preset_label: "PRESET TASK", preset_custom: "Custom (manual input)",
     dial: "Call", ph_number: "Phone number", remote_pair: "Pair phone", remote_invite: "Temporary link",
@@ -1607,6 +1612,7 @@ const I18N = {
     st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
     conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
     modem_on: "模组就绪", modem_off: "模组未连接",
+    modem_resetting: "模组重启中（约 30 秒）",
     keypad: "按键", hangup: "挂断",
     dial_label: "拨打电话", preset_label: "预设任务", preset_custom: "自定义（手动输入）",
     dial: "拨打", ph_number: "输入号码", remote_pair: "配对手机", remote_invite: "临时链接",
@@ -1842,7 +1848,7 @@ function applyI18n() {
   $("slogan").textContent = t("slogan");
   renderLangMenu();
   $("stateText").textContent = t("st_" + callStatus) !== "st_" + callStatus ? t("st_" + callStatus) : callStatus;
-  $("modemState").textContent = t(modemConnected ? "modem_on" : "modem_off");
+  setModem(modemConnected, modemResetting);
   $("liveSub").textContent = callActive ? ($("stateNum").textContent || "") : t("live_sub_idle");
   $("chat").dataset.empty = t("live_empty");  // 空转写占位（CSS ::before 读取）
   if (typeof renderDialPresets === "function") renderDialPresets();
@@ -2050,11 +2056,15 @@ function addSms(event) {
 
 /* ========= WebSocket ========= */
 let modemConnected = false;
+let modemResetting = false;
+let modemStatusRevision = 0;
 let lastMeta = null;
-function setModem(connected) {
+function setModem(connected, resetting = false) {
   modemConnected = connected;
-  $("modemDot").classList.toggle("on", connected);
-  $("modemState").textContent = t(connected ? "modem_on" : "modem_off");
+  modemResetting = resetting;
+  $("modemDot").classList.toggle("on", connected && !resetting);
+  $("modemDot").classList.toggle("resetting", resetting);
+  $("modemState").textContent = t(modemResetting ? "modem_resetting" : connected ? "modem_on" : "modem_off");
 }
 let metaRefreshTimer = null;
 function scheduleMetaRefresh() {
@@ -2063,7 +2073,10 @@ function scheduleMetaRefresh() {
 }
 function handleEvent(ev) {
   if (ev.type === "modem_status" || ev.type === "sim_status") {
-    if (ev.type === "modem_status") setModem(!!ev.connected);
+    if (ev.type === "modem_status") {
+      modemStatusRevision++;
+      setModem(!!ev.connected, !!ev.modem_resetting);
+    }
     scheduleMetaRefresh();
   } else if (ev.type === "call") {
     setCall(ev.status, ev.caller);
@@ -2350,9 +2363,13 @@ function connect() {
   ws.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (err) { console.warn("[ws] 处理事件失败", err); } };
 }
 async function loadMeta() {
+  const statusRevision = modemStatusRevision;
   try {
     const m = await (await fetch("/api/meta")).json();
     lastMeta = m;
+    if (m.hardware && statusRevision === modemStatusRevision) {
+      setModem(!!m.hardware.modem_connected, !!m.hardware.modem_resetting);
+    }
     $("model").textContent = m.model || "-";
     $("provider").textContent = m.provider || "-";
     $("portSub").textContent = t("modem_prefix") + (m.port || "-");

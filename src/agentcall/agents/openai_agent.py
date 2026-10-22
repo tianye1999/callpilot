@@ -27,7 +27,7 @@ from .. import config
 from ..prompts import agent_language, openai_vibe_line, repeat_nudge_instructions
 from ..repeat_suppression import ResponseAudioGate
 from .base import VoiceAgent
-from .tools import SILENT_AFTER_TOOLS, TERMINAL_TOOLS
+from .tools import SILENT_AFTER_TOOLS, SMS_TOOL_NAMES, TERMINAL_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -1204,7 +1204,10 @@ class OpenAIVoiceAgent(VoiceAgent):
             else:
                 result = {"success": False, "message": "无可用工具"}
         except Exception as exc:  # noqa: BLE001
-            logger.exception("工具 %s 执行异常: %s", name, exc)
+            if name in SMS_TOOL_NAMES:
+                logger.error("工具 %s 执行异常: error_type=%s", name, type(exc).__name__)
+            else:
+                logger.exception("工具 %s 执行异常: %s", name, exc)
             result = {"success": False, "message": f"工具执行异常: {exc}"}
 
         if ws is None or ws is not self._ws:
@@ -1215,8 +1218,11 @@ class OpenAIVoiceAgent(VoiceAgent):
             return
         try:
             output = json.dumps(result, ensure_ascii=False)
-        except (TypeError, ValueError):
-            logger.warning("工具 %s 结果无法序列化: %r", name, result)
+        except (TypeError, ValueError) as exc:
+            if name in SMS_TOOL_NAMES:
+                logger.warning("工具 %s 结果无法序列化: error_type=%s", name, type(exc).__name__)
+            else:
+                logger.warning("工具 %s 结果无法序列化: %r", name, result)
             output = json.dumps(
                 {"success": False, "message": "工具结果无法序列化"},
                 ensure_ascii=False,

@@ -23,7 +23,7 @@ from ..audio_bridge import apply_pcm_gain
 from ..call_playbooks import list_playbooks, playbooks_enabled
 from ..contacts import is_reply_target_allowed
 from ..events import EventHub
-from ..modem import SerialModem
+from ..modem import SerialModem, Sim7600Modem
 from ..number_profiles import (
     ProfileConflictError,
     ProfileNotFoundError,
@@ -389,15 +389,16 @@ async def _remote_dialer_asset(request: web.Request) -> web.StreamResponse:
 async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
     service = request.app.get("service")
+    modem = getattr(service, "modem", None)
     meta["credentials"] = config.credential_status(meta.get("provider"))
     meta["setup_required"] = config.setup_required()
     meta["hardware"] = {
         "usb_online": detect_quectel_usb_online(),
         "modem_connected": bool(getattr(service, "modem_connected", False)),
+        "modem_resetting": isinstance(modem, Sim7600Modem) and modem.recovery_in_progress,
         "port": meta.get("port") or config.get_str("MODEM_PORT"),
     }
     # SIM 身份(#88):运营商/免费客服号/注册状态——换卡后 UI 与拨测目标自适应。
-    modem = getattr(service, "modem", None)
     sim = getattr(modem, "sim_identity", None)
     if sim is not None:
         meta["sim"] = sim.as_dict()
@@ -514,7 +515,7 @@ async def _send_sms(request: web.Request) -> web.Response:
     try:
         ok = await loop.run_in_executor(None, modem.send_sms, number, text)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("发送短信异常")
+        logger.warning("发送短信异常: error_type=%s", type(exc).__name__)
         hub.publish(
             {"type": "sms_out", "number": number, "text": text, "status": "error"}
         )
@@ -1227,7 +1228,7 @@ async def _setup_test_sms(request: web.Request) -> web.Response:
     try:
         ok = await loop.run_in_executor(None, modem.send_sms, number, text)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("向导测试短信异常")
+        logger.warning("向导测试短信异常: error_type=%s", type(exc).__name__)
         if hub is not None:
             hub.publish(
                 {"type": "sms_out", "number": number, "text": text, "status": "error"}

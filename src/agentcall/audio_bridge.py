@@ -17,7 +17,7 @@ import numpy as np
 import serial
 
 # 导入模块而非 from-import 常量：让测试能 monkeypatch platforms.IS_MACOS。
-from . import platforms
+from . import config, platforms
 from .pcm_stats import PcmFlowStats
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,7 @@ _ALIGN_CLEAR_WIN = 0.6          # 判定所需的「明确赢家」相关性下�
 _ALIGN_BAD_CORR = 0.3           # 锁定后监控：有声段相关性低于此=疑似中途错位，重探
 _ALIGN_MONITOR_BYTES = 32000    # 锁定后每 ~2s 有声数据复核一次相关性
 SERIAL_PCM_WRITE_INTERVAL_SECONDS = 0.032   # 512B @ 8kHz/16-bit = 32ms 实时
+_UPLINK_PREBUFFER_BYTES = MODEM_RATE * 2 * 3
 
 
 def find_device_index(keyword: str, kind: str | None = None) -> int | None:
@@ -89,6 +90,10 @@ def apply_pcm_gain(pcm: bytes, gain: float) -> bytes:
 
 class AgentPcm(bytes):
     """PCM eligible for AI playout observation; ordinary bytes include DTMF."""
+
+
+class PrebufferedPcm(bytes):
+    """Historical uplink, not evidence of a live interruption of the AI opening."""
 
 
 class _OutputObserver:
@@ -271,6 +276,14 @@ class SerialPcmAudioBridge(_OutputObserver):
         self._queued_bytes = 0
         self._last_stats_at = 0.0
         self._write_timeouts = 0
+        self._prebuffer_enabled = False
+        self._prebuffer = bytearray()
+        self._prebuffer_dropped = 0
+        self._prebuffer_stop = threading.Event()
+        self._prebuffer_thread: threading.Thread | None = None
+        self._prebuffer_error: Exception | None = None
+        self._prebuffer_handed_off = False
+        self._rx_lock = threading.Lock()
 
     def start(self) -> None:
         self._ser = self._open_serial()
@@ -286,6 +299,17 @@ class SerialPcmAudioBridge(_OutputObserver):
         self._queued_bytes = 0
         self._write_timeouts = 0
         self._last_stats_at = time.monotonic()
+        self._prebuffer_enabled = config.get_bool("MODEM_PCM_UPLINK_PREBUFFER")
+        if self._prebuffer_enabled:
+            self._prebuffer.clear()
+            self._prebuffer_dropped = 0
+            self._prebuffer_error = None
+            self._prebuffer_handed_off = False
+            self._prebuffer_stop.clear()
+            self._prebuffer_thread = threading.Thread(
+                target=self._prebuffer_loop, name="pcm-uplink-prebuffer", daemon=True,
+            )
+            self._prebuffer_thread.start()
         self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
         self._writer_thread.start()
         logger.info(
@@ -319,6 +343,16 @@ class SerialPcmAudioBridge(_OutputObserver):
             )
 
     def stop(self) -> None:
+        if self._prebuffer_enabled:
+            # Serialize stop with the first read; never close a serial read in flight.
+            with self._rx_lock:
+                self._join_prebuffer()
+                self._stop_serial()
+                self._prebuffer.clear()
+            return
+        self._stop_serial()
+
+    def _stop_serial(self) -> None:
         self._running = False
         if self._writer_thread:
             self._writer_thread.join(timeout=2)
@@ -330,8 +364,80 @@ class SerialPcmAudioBridge(_OutputObserver):
             self._tx_buffer.clear()
 
     def read_modem_chunk(self) -> bytes:
+        if self._prebuffer_enabled:
+            with self._rx_lock:
+                return self._read_modem_chunk()
+        return self._read_modem_chunk()
+
+    @property
+    def uplink_prebuffer_enabled(self) -> bool:
+        return self._prebuffer_enabled
+
+    def _join_prebuffer(self) -> None:
+        self._prebuffer_stop.set()
+        if self._prebuffer_thread is not None:
+            # Serial reads have a 20ms timeout. A timed-out join is NOT a handoff.
+            self._prebuffer_thread.join()
+
+    def _prebuffer_loop(self) -> None:
+        try:
+            while not self._prebuffer_stop.is_set() and self._running:
+                data = self._read_serial_chunk()
+                self._prebuffer.extend(data)
+                excess = len(self._prebuffer) - _UPLINK_PREBUFFER_BYTES
+                if excess > 0:
+                    # Discard whole samples, preserving the stream's original byte phase.
+                    drop = excess + excess % 2
+                    del self._prebuffer[:drop]
+                    self._prebuffer_dropped += drop
+        except (OSError, serial.SerialException) as exc:
+            self._prebuffer_error = exc
+            logger.warning("上行预缓冲读取失败: error_type=%s", type(exc).__name__)
+
+    def _read_modem_chunk(self) -> bytes:
         if not self._ser:
             return b""
+        if self._prebuffer_enabled and not self._prebuffer_handed_off:
+            self._join_prebuffer()
+            self._prebuffer_handed_off = True
+            logger.info(
+                "[timing] 上行预缓冲: bytes=%d(≈%.0fms) dropped=%d",
+                len(self._prebuffer), len(self._prebuffer) / (MODEM_RATE * 2) * 1000,
+                self._prebuffer_dropped,
+            )
+        if self._prebuffer_enabled and self._prebuffer:
+            # Return the snapshot in one call: replaying 640B per main-loop iteration
+            # would leave the tty undrained long enough to overflow a second time.
+            data = b"".join(
+                self._align_uplink(bytes(self._prebuffer[offset:offset + NMEA_READ_SIZE]))
+                for offset in range(0, len(self._prebuffer), NMEA_READ_SIZE)
+            )
+            self._prebuffer.clear()
+            return PrebufferedPcm(data)
+        if self._prebuffer_enabled and self._prebuffer_error is not None:
+            raise self._prebuffer_error
+        return self._align_uplink(self._read_serial_chunk())
+
+    def _align_uplink(self, raw: bytes) -> bytes:
+        # carry + 本次读，保证返回偶数字节（16-bit 对齐）；奇出的 1 字节留到下次。
+        data = self._rx_carry + raw
+        if self._align_drop and data:
+            # 判定为错位：丢 1 字节把整条流拨回采样边界（此后 carry 维持新对齐）。
+            data = data[1:]
+            self._align_drop = False
+        if len(data) % 2:
+            self._rx_carry = data[-1:]
+            data = data[:-1]
+        else:
+            self._rx_carry = b""
+        if not self._align_locked:
+            self._probe_alignment(data)
+        else:
+            self._monitor_alignment(data)
+        return data
+
+    def _read_serial_chunk(self) -> bytes:
+        assert self._ser is not None
         # 上行盲区埋点（WIL-112）：读之前串口里积着多少字节。常驻高水位=我们
         # 落后实时（这段延迟对录音/发送/本地埋点全部不可见，只有对端耳朵在付）；
         # 锯齿形=模组攒批发送。每 5s 聚合一行。
@@ -356,22 +462,7 @@ class SerialPcmAudioBridge(_OutputObserver):
                 self._inwaiting_sum = 0
                 self._inwaiting_n = 0
                 self._inwaiting_logged_at = now
-        # carry + 本次读，保证返回偶数字节（16-bit 对齐）；奇出的 1 字节留到下次。
-        data = self._rx_carry + self._ser.read(NMEA_READ_SIZE)
-        if self._align_drop and data:
-            # 判定为错位：丢 1 字节把整条流拨回采样边界（此后 carry 维持新对齐）。
-            data = data[1:]
-            self._align_drop = False
-        if len(data) % 2:
-            self._rx_carry = data[-1:]
-            data = data[:-1]
-        else:
-            self._rx_carry = b""
-        if not self._align_locked:
-            self._probe_alignment(data)
-        else:
-            self._monitor_alignment(data)
-        return data
+        return self._ser.read(NMEA_READ_SIZE)
 
     def _probe_alignment(self, data: bytes) -> None:
         """用相邻样本相关性判断上行是否整体错位 1 字节。

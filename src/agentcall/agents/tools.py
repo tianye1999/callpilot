@@ -14,6 +14,7 @@ from .. import config
 logger = logging.getLogger(__name__)
 
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
+SMS_TOOL_NAMES = frozenset({"send_sms", "query_verification_code", "wait_for_sms"})
 
 
 # 发送短信工具规格（千问 Realtime 要求 function 嵌套格式）
@@ -301,7 +302,10 @@ class ToolRegistry:
             return {"success": False, "message": f"未知工具: {name}"}
         _spec, handler = entry
         dtmf_count = _dtmf_count(args) if name == "send_dtmf" else None
-        if dtmf_count is None:
+        sms_tool = name in SMS_TOOL_NAMES
+        if sms_tool:
+            logger.info("执行工具 %s（短信载荷不记录）", name)
+        elif dtmf_count is None:
             logger.info("执行工具 %s，参数=%s", name, args)
         else:
             logger.info("执行工具 %s: count=%d", name, dtmf_count)
@@ -316,6 +320,8 @@ class ToolRegistry:
                     dtmf_count,
                     type(exc).__name__,
                 )
+            elif sms_tool:
+                logger.error("工具 %s 执行异常: error_type=%s", name, type(exc).__name__)
             else:
                 logger.exception("工具 %s 执行异常: %s", name, exc)
             if dtmf_count is not None:
@@ -326,7 +332,12 @@ class ToolRegistry:
                     "message": "按键发送失败",
                 }
             return {"success": False, "message": f"工具执行异常: {exc}"}
-        if dtmf_count is None:
+        if sms_tool:
+            logger.info(
+                "工具 %s 执行结果: success=%s", name,
+                isinstance(result, dict) and result.get("success") is True,
+            )
+        elif dtmf_count is None:
             logger.info("工具 %s 执行结果=%s", name, result)
         else:
             logger.info(

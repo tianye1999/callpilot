@@ -343,7 +343,7 @@ class CallTools:
         try:
             ok = self._modem.send_sms(number, content)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("工具发送短信失败: %s", exc)
+            logger.warning("工具发送短信失败: error_type=%s", type(exc).__name__)
             self._audit_tool(
                 "send_sms",
                 args={"to": number, "content_length": len(content)},
