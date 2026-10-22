@@ -1745,7 +1745,7 @@ def _watchdog_service(tmp_path, port_exists=True):
     """构造只用于看门狗测试的 service：复用 FakeModem，补上端口与连接状态。"""
     port = tmp_path / "sim7600-at"
     if port_exists:
-        port.write_text("")
+        port.write_text("", encoding="utf-8")
 
     class _WatchdogModem(FakeModem):
         def __init__(self) -> None:

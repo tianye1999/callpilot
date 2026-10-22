@@ -57,7 +57,7 @@ def test_ensure_asset_archive_download_and_extract(tmp_path, monkeypatch):
         src = tmp_path / "src" / "pkg"
         src.mkdir(parents=True)
         (src / "model.onnx").write_bytes(b"m")
-        (src / "tokens.txt").write_text("t")
+        (src / "tokens.txt").write_text("t", encoding="utf-8")
         with tarfile.open(dest, "w:bz2") as tar:
             tar.add(src, arcname="pkg")
 

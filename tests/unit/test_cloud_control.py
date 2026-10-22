@@ -377,9 +377,9 @@ def test_content_relay_preserves_shared_v1_fixture_contract() -> None:
     fixture_dir = (
         Path(__file__).resolve().parents[2] / "docs/fixtures/content-sync/v1"
     )
-    request = json.loads((fixture_dir / "edge-data-request.json").read_text())
+    request = json.loads((fixture_dir / "edge-data-request.json").read_text(encoding="utf-8"))
     repository = _ContentRepository(
-        body=json.loads((fixture_dir / "messages-page.json").read_text())
+        body=json.loads((fixture_dir / "messages-page.json").read_text(encoding="utf-8"))
     )
     now = round(time.time() * 1000)
     request.update(issuedAtUnixMs=now, expiresAtUnixMs=now + 5_000)

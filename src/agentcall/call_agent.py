@@ -1476,13 +1476,32 @@ class CallSession:
         new_bridge: AudioBridge | None = None
         committed = False
         old_stopped = False
+        connect_timeout_reason: str | None = None
         try:
             endpoint = factory(claimed.issued)
+            owner_deadline = self._takeover_deadline
+            now = time.monotonic()
             deadline = min(
-                self._takeover_deadline or time.monotonic(),
-                time.monotonic() + _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS,
+                owner_deadline if owner_deadline is not None else now,
+                now + _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS,
             )
-            await asyncio.wait_for(endpoint.connect(), timeout=max(0.0, deadline - time.monotonic()))
+            deadline_reason = (
+                "OWNER_TIMEOUT" if owner_deadline is not None and deadline == owner_deadline
+                else "MEDIA_PREPARE_FAILED"
+            )
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining == 0:
+                connect_timeout_reason = deadline_reason
+                raise TimeoutError("takeover_deadline")
+            connect_timeout = asyncio.timeout(remaining)
+            try:
+                async with connect_timeout:
+                    await endpoint.connect()
+            except TimeoutError:
+                if connect_timeout.expired():
+                    # Timers can fire a clock tick early; classify the budget, not a later clock read.
+                    connect_timeout_reason = deadline_reason
+                raise
             while not endpoint.media_ready and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
             if not endpoint.media_ready:
@@ -1553,7 +1572,7 @@ class CallSession:
                         "回滚重启旧音频桥失败: error_type=%s",
                         type(restart_exc).__name__,
                     )
-            reason = (
+            reason = connect_timeout_reason or (
                 "OWNER_TIMEOUT" if self._takeover_deadline is not None
                 and time.monotonic() >= self._takeover_deadline else "MEDIA_PREPARE_FAILED"
             )

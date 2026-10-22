@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from types import SimpleNamespace
 
 import pytest
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
@@ -241,8 +243,6 @@ def test_handoff_start_failure_restarts_old_bridge_and_rolls_back(monkeypatch, t
 
 
 def test_claim_without_media_before_deadline_recovers_and_rejects_late_claim(monkeypatch) -> None:
-    import time
-
     service = _service()
     session = service.session
     claimed = _claimed(service, monkeypatch, "triage_judge")
@@ -270,6 +270,107 @@ def test_claim_without_media_before_deadline_recovers_and_rejects_late_claim(mon
     assert service.take_inbound_takeover_session() is None
     revoke = service.next_inbound_takeover_revoke()
     assert revoke is not None and revoke.reason == "OWNER_TIMEOUT"
+    assert service.modem.calls == []
+
+
+@pytest.fixture
+def windows_monotonic(monkeypatch):
+    clock = SimpleNamespace(now=1024.0, resolution=1 / 64)
+    original_info = time.get_clock_info
+
+    def clock_info(name):
+        info = original_info(name)
+        if name != "monotonic":
+            return info
+        return SimpleNamespace(
+            implementation=info.implementation, monotonic=info.monotonic,
+            adjustable=info.adjustable, resolution=clock.resolution,
+        )
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(time, "get_clock_info", clock_info)
+    return clock
+
+
+@pytest.mark.parametrize(("budget", "endpoint_timeout", "slow_cancel"), [
+    pytest.param("owner", False, False, id="owner-deadline"),
+    pytest.param("media", False, False, id="media-deadline"),
+    pytest.param("media", False, True, id="media-deadline-slow-cancel"),
+    pytest.param("owner", True, False, id="endpoint-timeout"),
+])
+def test_handoff_connect_timeout_uses_limiting_deadline(
+    monkeypatch, windows_monotonic, budget, endpoint_timeout, slow_cancel,
+) -> None:
+    clock = windows_monotonic
+    service = _service()
+    session = service.session
+    claimed = _claimed(service, monkeypatch, "triage_judge")
+    owner_deadline = clock.now + (0.02 if budget == "owner" else 1.0)
+    session._takeover_deadline = owner_deadline
+    media_timeout = 0.02 if budget == "media" else 1.0
+    monkeypatch.setattr("agentcall.call_agent._INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS", media_timeout)
+    deadline = min(owner_deadline, clock.now + media_timeout)
+    old_bridge = FakeAudioBridge()
+    agent = FakeAgent()
+    agent._on_audio_out = session._make_agent_audio_handler(agent, old_bridge, None)
+    cancelled_at = []
+
+    class BlockedEndpoint(FakeEndpoint):
+        async def connect(self) -> None:
+            assert asyncio.get_running_loop()._clock_resolution == clock.resolution
+            if endpoint_timeout:
+                raise TimeoutError("endpoint's own connection failure")
+            # One Windows tick leaves now < deadline, inside asyncio's lookahead.
+            clock.now += clock.resolution
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled_at.append(clock.now)
+                if slow_cancel:
+                    clock.now = owner_deadline + clock.resolution
+
+    endpoint = BlockedEndpoint(session)
+    session._takeover_endpoint_factory = lambda _issued: endpoint
+
+    async def run():
+        result = await asyncio.wait_for(
+            session._handoff_to_mobile(agent, old_bridge, claimed, None, 7), timeout=0.5,
+        )
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        return result
+
+    assert asyncio.run(run()) is None
+    if not endpoint_timeout:
+        assert len(cancelled_at) == 1 and cancelled_at[0] < deadline
+    assert session.takeover_state is TakeoverState.AI_ACTIVE
+    assert session._agent_effect_allowed(7)
+    assert old_bridge.downlink and not old_bridge.stopped
+    assert len(agent.said) == 1 and endpoint.closed
+    assert not service.provide_inbound_takeover_session(claimed).accepted
+    assert service.take_inbound_takeover_session() is None
+    revoke = service.next_inbound_takeover_revoke()
+    expected = "OWNER_TIMEOUT" if budget == "owner" and not endpoint_timeout else "MEDIA_PREPARE_FAILED"
+    assert revoke is not None and revoke.reason == expected
+    assert service.modem.calls == []
+
+
+@pytest.mark.parametrize("budget", ["owner", "media"])
+def test_expired_handoff_budget_never_starts_endpoint(monkeypatch, windows_monotonic, budget):
+    service = _service()
+    session = service.session
+    claimed = _claimed(service, monkeypatch)
+    session._takeover_deadline = windows_monotonic.now + (-1.0 if budget == "owner" else 1.0)
+    media_timeout = 0.0 if budget == "media" else 1.0
+    monkeypatch.setattr("agentcall.call_agent._INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS", media_timeout)
+    endpoint = FakeEndpoint(session)
+    session._takeover_endpoint_factory = lambda _issued: endpoint
+
+    assert asyncio.run(session._handoff_to_mobile(FakeAgent(), FakeAudioBridge(), claimed, None, 7)) is None
+    assert not endpoint.connected and endpoint.closed
+    assert session.takeover_state is TakeoverState.AI_ACTIVE
+    revoke = service.next_inbound_takeover_revoke()
+    expected = "OWNER_TIMEOUT" if budget == "owner" else "MEDIA_PREPARE_FAILED"
+    assert revoke is not None and revoke.reason == expected
     assert service.modem.calls == []
 
 

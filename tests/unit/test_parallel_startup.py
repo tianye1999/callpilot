@@ -46,7 +46,7 @@ def setup_call(monkeypatch, tmp_path):
 
 def events(base):
     path = next(base.iterdir()) / "events.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines()]
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 @pytest.fixture
@@ -133,7 +133,7 @@ def test_native_greeting_sequence_parallel_connect_and_conditional_hint(native_c
     assert module["duration_ms"] >= 20
     assert module["started_after_answer_ms"] >= 40
     assert "text" not in module and "喂" not in json.dumps(module, ensure_ascii=False)
-    metrics = json.loads((next(base.iterdir()) / "metrics.json").read_text())
+    metrics = json.loads((next(base.iterdir()) / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["module_greeting"]["ok"] is ok
     assert metrics["first_playout_boundary"] == "pcm_written"
 
@@ -172,13 +172,22 @@ def test_native_greeting_failed_route_keeps_original_opening(native_call, monkey
     modem._init_answer_greeting()
     monkeypatch.setattr(modem, "_write_command", lambda _cmd: "ERROR")
     instructions = []
+    opening_done = asyncio.Event()
     original_say = agent.say
+    original_loop = session._run_agent_loop
 
     async def say(text):
         instructions.append(text)
         await original_say(text)
+        opening_done.set()
+
+    async def finish_after_opening(*args):
+        # The fixture's simulated hangup must not cancel the opening being tested.
+        await asyncio.wait_for(opening_done.wait(), timeout=2)
+        return await original_loop(*args)
 
     monkeypatch.setattr(agent, "say", say)
+    monkeypatch.setattr(session, "_run_agent_loop", finish_after_opening)
     asyncio.run(session._handle_call())
     assert "系统已代为说过" not in instructions[0]
     assert not any(cmd.startswith("AT+CTTS") for cmd in sent)
@@ -388,13 +397,15 @@ def test_startup_failure_closes_every_resource(setup_call, monkeypatch, failure)
 def test_hangup_or_cancel_during_startup_joins_workers(setup_call, monkeypatch, phase, cancel):
     session, modem, bridge, agent, _base = setup_call
     entered = threading.Event()
+    pcm_entered = threading.Event()
     release = threading.Event()
     order = []
 
     def pcm(_mode):
+        pcm_entered.set()
         if phase == "pcm":
             entered.set()
-            assert release.wait(timeout=1)
+            assert release.wait(timeout=5)
         order.append("pcm_finished")
 
     async def blocked(*_args):
@@ -410,8 +421,7 @@ def test_hangup_or_cancel_during_startup_joins_workers(setup_call, monkeypatch, 
         order.append("hangup")
 
     async def run_loop(_agent, active_bridge, _record, _transcripts):
-        while session.is_active:
-            await asyncio.sleep(0.005)
+        await asyncio.Event().wait()  # The startup owner cancels the loop on hangup.
         return active_bridge
 
     monkeypatch.setattr(modem, "initialize_for_voice", pcm)
@@ -423,11 +433,9 @@ def test_hangup_or_cancel_during_startup_joins_workers(setup_call, monkeypatch, 
 
     async def run():
         task = asyncio.create_task(session._handle_call())
-        for _ in range(200):
-            if entered.is_set():
-                break
-            await asyncio.sleep(0.005)
-        assert entered.is_set()
+        assert await asyncio.to_thread(entered.wait, 5)
+        # Agent connection/opening can run before the executor starts PCM at all.
+        assert await asyncio.to_thread(pcm_entered.wait, 5)
         if cancel:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
