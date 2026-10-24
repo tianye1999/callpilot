@@ -269,6 +269,7 @@ def test_startup_order_and_overlap(setup_call, monkeypatch, parallel):
     session, modem, bridge, agent, _base = setup_call
     monkeypatch.setenv("PARALLEL_AGENT_CONNECT", str(parallel).lower())
     order = []
+    spans: dict[str, list[float]] = {}
     pcm_entered = threading.Event()
     connecting = threading.Event()
     loop_thread = threading.get_ident()
@@ -284,13 +285,17 @@ def test_startup_order_and_overlap(setup_call, monkeypatch, parallel):
         if parallel:
             assert threading.get_ident() != loop_thread
             assert connecting.wait(timeout=1)
+        spans["pcm"] = [time.monotonic()]
         time.sleep(0.25)
+        spans["pcm"].append(time.monotonic())
         order.append("pcm_end")
 
     async def connect(callback):
         order.append("agent_connect")
         connecting.set()
+        spans["connect"] = [time.monotonic()]
         await asyncio.sleep(0.25)
+        spans["connect"].append(time.monotonic())
         await FakeAgent.start(agent, callback)
         order.append("agent_ready")
 
@@ -317,9 +322,14 @@ def test_startup_order_and_overlap(setup_call, monkeypatch, parallel):
 
     if parallel:
         assert order.index("agent_connect") < order.index("pcm_end")
-        assert elapsed < 0.45, elapsed  # 0.25s overlapping work, not 0.50s serial.
+        # The two 0.25s waits must overlap in time. Comparing spans instead of the
+        # whole call's wall time keeps scheduler overhead (slow Windows runners)
+        # out of the verdict; a serial path cannot produce an overlap.
+        (pcm_start, pcm_stop), (connect_start, connect_stop) = spans["pcm"], spans["connect"]
+        assert max(pcm_start, connect_start) < min(pcm_stop, connect_stop), spans
     else:
         assert order == ["answer", "pcm_begin", "pcm_end", "bridge_start", "agent_connect", "agent_ready", "say"]
+        assert spans["pcm"][1] <= spans["connect"][0], spans
         assert elapsed >= 0.5 - time.get_clock_info("monotonic").resolution
     assert agent.stopped and bridge.stopped
 
