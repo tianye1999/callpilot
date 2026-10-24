@@ -25,6 +25,7 @@ import tempfile
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import config
 
@@ -44,6 +45,7 @@ class ModelAsset:
     required_files: tuple[str, ...]
     # None = 单文件直下（存为 required_files[0]）；否则 tar.bz2 解压到 models_dir。
     archive: bool = True
+    required_dirs: tuple[str, ...] = ()
 
 
 MODEL_ASSETS: tuple[ModelAsset, ...] = (
@@ -75,7 +77,113 @@ MODEL_ASSETS: tuple[ModelAsset, ...] = (
     ),
 )
 
-_ASSETS_BY_ID = {asset.id: asset for asset in MODEL_ASSETS}
+@dataclass(frozen=True)
+class TtsModel:
+    """One registry entry defines downloads and sherpa constructor arguments.
+
+    Another vits/matcha (or kokoro multi-speaker) voice needs only an entry here;
+    speaker selection is passed to generate(), independently of model kind.
+    """
+
+    kind: str
+    config_class: str
+    assets: tuple[ModelAsset, ...]
+    # Tuples become comma-joined absolute paths (Kokoro's bilingual lexicon).
+    files: dict[str, str | tuple[str, ...]]
+    rule_fsts: tuple[str, ...] = ()
+
+
+_CHAOWEN = "vits-piper-zh_CN-chaowen-medium-int8"
+_BAKER = "matcha-icefall-zh-baker"
+_KOKORO = "kokoro-int8-multi-lang-v1_1"
+_AISHELL3 = "vits-icefall-zh-aishell3"
+TTS_MODELS: dict[str, TtsModel] = {
+    _CHAOWEN: TtsModel(
+        kind="vits", config_class="OfflineTtsVitsModelConfig",
+        assets=(MODEL_ASSETS[2],),
+        files={"model": f"{_CHAOWEN}/zh_CN-chaowen-medium.onnx",
+               "tokens": f"{_CHAOWEN}/tokens.txt", "lexicon": f"{_CHAOWEN}/lexicon.txt"},
+    ),
+    _BAKER: TtsModel(
+        kind="matcha", config_class="OfflineTtsMatchaModelConfig",
+        assets=(
+            ModelAsset(
+                id="tts", description="Matcha icefall zh baker",
+                url=f"{_RELEASE_BASE}/tts-models/{_BAKER}.tar.bz2",
+                required_files=tuple(f"{_BAKER}/{f}" for f in (
+                    "model-steps-3.onnx", "lexicon.txt", "tokens.txt",
+                    "phone.fst", "date.fst", "number.fst",
+                )),
+                required_dirs=(f"{_BAKER}/dict",),
+            ),
+            ModelAsset(
+                id="vocoder", description="Vocos universal 22kHz vocoder",
+                url=f"{_RELEASE_BASE}/vocoder-models/vocos-22khz-univ.onnx",
+                required_files=("vocos-22khz-univ.onnx",), archive=False,
+            ),
+        ),
+        files={"acoustic_model": f"{_BAKER}/model-steps-3.onnx",
+               "vocoder": "vocos-22khz-univ.onnx", "lexicon": f"{_BAKER}/lexicon.txt",
+               "tokens": f"{_BAKER}/tokens.txt", "dict_dir": f"{_BAKER}/dict"},
+        rule_fsts=tuple(f"{_BAKER}/{f}.fst" for f in ("phone", "date", "number")),
+    ),
+    _KOKORO: TtsModel(
+        kind="kokoro", config_class="OfflineTtsKokoroModelConfig",
+        assets=(ModelAsset(
+            id="tts", description="Kokoro int8 multi-lang v1.1 (multi-speaker)",
+            url=f"{_RELEASE_BASE}/tts-models/{_KOKORO}.tar.bz2",
+            required_files=tuple(f"{_KOKORO}/{f}" for f in (
+                "model.int8.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt", "lexicon-zh.txt",
+                "date-zh.fst", "number-zh.fst", "phone-zh.fst",
+            )),
+            required_dirs=(f"{_KOKORO}/dict", f"{_KOKORO}/espeak-ng-data"),
+        ),),
+        files={"model": f"{_KOKORO}/model.int8.onnx", "voices": f"{_KOKORO}/voices.bin",
+               "tokens": f"{_KOKORO}/tokens.txt",
+               "lexicon": (f"{_KOKORO}/lexicon-us-en.txt", f"{_KOKORO}/lexicon-zh.txt"),
+               "data_dir": f"{_KOKORO}/espeak-ng-data", "dict_dir": f"{_KOKORO}/dict"},
+        rule_fsts=tuple(f"{_KOKORO}/{f}-zh.fst" for f in ("date", "number", "phone")),
+    ),
+    _AISHELL3: TtsModel(
+        kind="vits", config_class="OfflineTtsVitsModelConfig",
+        assets=(ModelAsset(
+            id="tts", description="VITS icefall zh aishell3 (multi-speaker, 8kHz)",
+            url=f"{_RELEASE_BASE}/tts-models/{_AISHELL3}.tar.bz2",
+            required_files=tuple(f"{_AISHELL3}/{f}" for f in (
+                "model.onnx", "lexicon.txt", "tokens.txt",
+                "phone.fst", "date.fst", "number.fst", "new_heteronym.fst",
+            )),
+        ),),
+        files={"model": f"{_AISHELL3}/model.onnx", "lexicon": f"{_AISHELL3}/lexicon.txt",
+               "tokens": f"{_AISHELL3}/tokens.txt"},
+        rule_fsts=tuple(f"{_AISHELL3}/{f}.fst" for f in ("phone", "date", "number", "new_heteronym")),
+    ),
+}
+
+
+def tts_model(name: str | None = None) -> TtsModel:
+    selected = name if name is not None else config.get_str("LOCAL_TTS_MODEL")
+    try:
+        return TTS_MODELS[selected]
+    except KeyError:
+        raise ValueError(f"未知的 LOCAL_TTS_MODEL: {selected}") from None
+
+
+def selected_assets() -> tuple[ModelAsset, ...]:
+    return MODEL_ASSETS[:2] + tts_model().assets
+
+
+def build_tts_config(sherpa: Any, root: Path, name: str | None = None) -> Any:
+    model = tts_model(name)
+    root = root.resolve()
+    voice = getattr(sherpa, model.config_class)(**{
+        key: ",".join(str(root / rel) for rel in ((paths,) if isinstance(paths, str) else paths))
+        for key, paths in model.files.items()
+    })
+    return sherpa.OfflineTtsConfig(
+        model=sherpa.OfflineTtsModelConfig(**{model.kind: voice, "num_threads": 2}),
+        rule_fsts=",".join(str(root / rel) for rel in model.rule_fsts if (root / rel).is_file()),
+    )
 
 
 def models_dir() -> Path:
@@ -92,11 +200,13 @@ def asset_paths(asset: ModelAsset, base: Path | None = None) -> dict[str, Path]:
 
 
 def asset_ready(asset: ModelAsset, base: Path | None = None) -> bool:
-    return all(path.is_file() for path in asset_paths(asset, base).values())
+    root = base if base is not None else models_dir()
+    return (all(path.is_file() for path in asset_paths(asset, root).values())
+            and all((root / rel).is_dir() for rel in asset.required_dirs))
 
 
 def missing_assets(base: Path | None = None) -> list[ModelAsset]:
-    return [asset for asset in MODEL_ASSETS if not asset_ready(asset, base)]
+    return [asset for asset in selected_assets() if not asset_ready(asset, base)]
 
 
 def _download(url: str, dest: Path) -> None:
@@ -148,6 +258,7 @@ def ensure_asset(asset: ModelAsset, base: Path | None = None) -> bool:
         finally:
             archive_path.unlink(missing_ok=True)
     still_missing = [rel for rel, path in asset_paths(asset, root).items() if not path.is_file()]
+    still_missing.extend(rel for rel in asset.required_dirs if not (root / rel).is_dir())
     if still_missing:
         raise RuntimeError(f"模型资产 {asset.id} 下载后仍缺文件: {', '.join(still_missing)}")
     logger.info("模型资产 %s 就绪", asset.id)
@@ -157,15 +268,15 @@ def ensure_asset(asset: ModelAsset, base: Path | None = None) -> bool:
 def ensure_all(base: Path | None = None) -> dict[str, Path]:
     """确保三件资产全部就绪，返回 {asset_id: 首个关键文件路径}。"""
     root = base if base is not None else models_dir()
-    for asset in MODEL_ASSETS:
+    for asset in selected_assets():
         ensure_asset(asset, root)
-    return {asset.id: root / asset.required_files[0] for asset in MODEL_ASSETS}
+    return resolved_paths(root)
 
 
 def resolved_paths(base: Path | None = None) -> dict[str, Path]:
     """不下载，仅返回资产关键文件路径（调用方自查存在性）。"""
     root = base if base is not None else models_dir()
-    return {asset.id: root / asset.required_files[0] for asset in MODEL_ASSETS}
+    return {asset.id: root / asset.required_files[0] for asset in selected_assets()}
 
 
 def main(argv: list[str] | None = None) -> int:

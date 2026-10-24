@@ -122,12 +122,21 @@ def test_speech_to_reply_full_pipeline():
     assert seen[0][0]["content"] == "你是测试助手"
 
 
-def test_output_rate_follows_pipeline_sample_rate():
+@pytest.mark.parametrize("sample_rate", [8000, 16000, 22050, 24000])
+def test_output_rate_follows_pipeline_sample_rate(sample_rate):
+    from agentcall.audio_bridge import FfmpegAudioBridge, ModemAudioBridge, SerialPcmAudioBridge
+
     agent, pipeline, _seen = _make_agent([])
-    pipeline.sample_rate = 16000
+    pipeline.sample_rate = sample_rate
     asyncio.run(agent.start(lambda pcm: None))
     try:
-        assert agent.output_rate == 16000
+        assert agent.output_rate == sample_rate
+        pcm = b"\x01\x00" * (sample_rate // 10)
+        for bridge in (ModemAudioBridge, SerialPcmAudioBridge, FfmpegAudioBridge):
+            converted = bridge.agent_to_modem(pcm, agent.output_rate)
+            assert len(converted) == 1600  # 100ms at the modem's 8kHz rate.
+            if sample_rate == 8000:
+                assert converted == pcm
     finally:
         asyncio.run(agent.stop())
 

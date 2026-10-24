@@ -284,12 +284,26 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("CALL_PLAYBOOKS_FILE", "呼叫情报库文件", "str", ""),
     ConfigSpec("CALL_PLAYBOOKS_MIN_EVIDENCE_CALLS", "情报必填项最少独立通话证据", "int", "2"),
     # ---- 本地三段式（AGENT_PROVIDER=local）----
+    ConfigSpec("LOCAL_LLM_PROVIDER", "三段式 LLM 提供方", "select", "dashscope",
+               choices=("dashscope", "deepseek"), requires_restart=True),
+    ConfigSpec("LOCAL_LLM_BASE_URL", "三段式 DeepSeek API 地址", "str", "https://api.deepseek.com",
+               requires_restart=True),
+    ConfigSpec("DEEPSEEK_API_KEY", "DeepSeek API Key", "str", "",
+               secret=True, requires_restart=True),
     ConfigSpec("LOCAL_LLM_MODEL", "三段式 LLM 模型", "str", "qwen-plus",
                requires_restart=True),
+    ConfigSpec("LOCAL_LLM_THINKING", "三段式 DeepSeek 思考模式", "select", "disabled",
+               choices=("disabled", "low", "high"), requires_restart=True),
     ConfigSpec("LOCAL_LLM_TIMEOUT", "三段式 LLM 超时（秒）", "float", "20.0",
                editable=False, hidden=True),
     ConfigSpec("LOCAL_MODELS_DIR", "三段式模型目录", "str", "",
                editable=False, hidden=True, requires_restart=True),
+    ConfigSpec("LOCAL_TTS_MODEL", "三段式 TTS 模型", "str", "vits-piper-zh_CN-chaowen-medium-int8",
+               requires_restart=True),
+    ConfigSpec("LOCAL_TTS_SPEAKER_ID", "三段式 TTS 说话人", "int", "0", requires_restart=True),
+    ConfigSpec("LOCAL_TTS_STREAMING", "三段式分句流式合成", "bool", "false", requires_restart=True),
+    ConfigSpec("LOCAL_TTS_CACHE_PHRASES", "三段式 TTS 缓存短句", "str", "", requires_restart=True),
+    ConfigSpec("LOCAL_TTS_PEAK", "三段式 TTS 目标峰值（空为关闭）", "str", "", requires_restart=True),
     ConfigSpec("MANUAL_RESPONSE_CONTROL", "手动应答控制", "bool", "false"),
     # barge-in：对端开口即打断 AI（掐生成+清积压），代替半双工丢上行。开启前提：
     # 模组无下行→上行回采（SIM7600 CPCMREG 实测互相关 r=0.009，干净；Quectel UAC
@@ -593,6 +607,11 @@ def get_bool(key: str) -> bool:
 def validate_provider_credentials(provider: str) -> list[str]:
     """校验指定 Agent 提供方所需凭证；返回缺失项的错误消息列表（空列表=通过）。"""
     required = PROVIDER_REQUIRED_KEYS.get(provider)
+    if provider == "local":
+        llm_provider = get_str("LOCAL_LLM_PROVIDER")
+        if llm_provider not in {"dashscope", "deepseek"}:
+            return [f"未知的 LOCAL_LLM_PROVIDER: {llm_provider}"]
+        required = ("DEEPSEEK_API_KEY",) if llm_provider == "deepseek" else ("DASHSCOPE_API_KEY",)
     if required is None:
         known = ", ".join(sorted(PROVIDER_REQUIRED_KEYS))
         return [f"未知的 Agent 提供方: {provider}（可选: {known}）"]

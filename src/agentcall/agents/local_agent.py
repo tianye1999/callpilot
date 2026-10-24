@@ -7,7 +7,7 @@
 - 半双工/录音/摘要/工具审计等仍由 CallSession 统一编排，本类只实现 VoiceAgent 接口。
 
 管线（roadmap 附录 A 的关键约束逐条落实）：
-- ``send_audio()`` 非阻塞：入队即返回，VAD/brain 两个 worker 线程消费；
+- ``send_audio()`` 非阻塞：入队即返回，VAD/brain worker 消费，流式模式另有顺序 TTS worker；
 - utterance 合并：brain 忙时堆积的语音段在出队时拼成一轮，不逐段打断 LLM；
 - TTS PCM 适配：sherpa float32 → int16 bytes，采样率由 ``output_rate`` 告知
   CallSession（audio_bridge 负责 → 8k 重采样）；
@@ -22,17 +22,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import Any, Callable, Protocol
+from weakref import WeakSet
 
 from .. import config
 from ..prompts import agent_language, repeat_nudge_instructions
 from ..repeat_suppression import RepeatSuppressor
 from .base import VoiceAgent
+from .local_llm import DeepSeekChat
+from .local_speech import ClauseSplitter, normalize_peak
 from .tools import SILENT_AFTER_TOOLS, TERMINAL_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -67,6 +71,34 @@ class SpeechPipeline(Protocol):
 @dataclass
 class _SayRequest:
     instructions: str
+
+
+@dataclass(eq=False)
+class _Turn:
+    ended_at: float | None
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    stages: set[str] = field(default_factory=set)
+
+
+@dataclass
+class _UserSpeech:
+    pcm: bytes
+    turn: _Turn
+
+
+@dataclass
+class _SpeechBatch:
+    turn: _Turn
+    splitter: ClauseSplitter = field(default_factory=ClauseSplitter)
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    received_text: bool = False
+    audio_emitted: bool = False
+
+
+@dataclass
+class _TtsRequest:
+    text: str
+    batch: _SpeechBatch
 
 
 class _SherpaPipeline:
@@ -111,20 +143,14 @@ class _SherpaPipeline:
             num_threads=2,
         )
 
-        tts_dir = root / "vits-piper-zh_CN-chaowen-medium-int8"
-        tts_config = sherpa_onnx.OfflineTtsConfig(
-            model=sherpa_onnx.OfflineTtsModelConfig(
-                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                    model=str(tts_dir / "zh_CN-chaowen-medium.onnx"),
-                    tokens=str(tts_dir / "tokens.txt"),
-                    # 中文 piper 模型走 lexicon（非 espeak data_dir）。
-                    lexicon=str(tts_dir / "lexicon.txt"),
-                ),
-                num_threads=2,
-            )
-        )
+        tts_config = local_models.build_tts_config(sherpa_onnx, root)
         self._tts = sherpa_onnx.OfflineTts(tts_config)
+        self._speaker_id = config.get_int("LOCAL_TTS_SPEAKER_ID")
         self.sample_rate = int(self._tts.sample_rate)
+        self.synthesize("你好。")  # Load lazy kernels before the first real turn; never output.
+
+    def is_speech_detected(self) -> bool:
+        return bool(self._vad.is_speech_detected())
 
     # numpy 仅在真实管线里用（核心依赖已有）；fake 管线不需要。
     def _to_float32(self, pcm16: bytes):
@@ -163,7 +189,7 @@ class _SherpaPipeline:
     def synthesize(self, text: str) -> bytes:
         import numpy as np
 
-        audio = self._tts.generate(text, sid=0, speed=1.0)
+        audio = self._tts.generate(text, sid=self._speaker_id, speed=1.0)
         samples = np.asarray(audio.samples, dtype="float32")
         return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
@@ -251,15 +277,26 @@ class LocalPipelineAgent(VoiceAgent):
         *,
         pipeline_factory: "Callable[[], SpeechPipeline] | None" = None,
         llm_chat: Callable[[list[dict], list[dict] | None, float], dict] | None = None,
+        llm_stream: Callable[[list[dict], list[dict] | None, float, Callable[[str], None]], dict] | None = None,
     ) -> None:
         self._pipeline_factory = pipeline_factory or _SherpaPipeline
         self._llm_chat = llm_chat or _default_llm_chat
+        self._llm_stream = llm_stream
+        self._deepseek = (DeepSeekChat() if llm_chat is None and llm_stream is None
+                          and config.get_str("LOCAL_LLM_PROVIDER") == "deepseek" else None)
+        self._streaming = config.get_bool("LOCAL_TTS_STREAMING")
         self._pipeline: SpeechPipeline | None = None
         self._on_audio_out: Callable[[bytes], None] | None = None
         self._running = False
         self._audio_queue: Queue[bytes] = Queue()
-        # brain 队列：语音段（bytes）或 SayRequest。
-        self._brain_queue: "Queue[bytes | _SayRequest]" = Queue()
+        self._brain_queue: Queue[_UserSpeech | _SayRequest] = Queue()
+        self._tts_queue: Queue[_TtsRequest] = Queue()
+        self._tts_thread: threading.Thread | None = None
+        self._turn: _Turn | None = None
+        self._turns: WeakSet[_Turn] = WeakSet()
+        self._turn_lock = threading.RLock()
+        self._tts_cache: dict[str, bytes] = {}
+        self._peak: float | None = None
         self._vad_thread: threading.Thread | None = None
         self._brain_thread: threading.Thread | None = None
         self._messages: list[dict[str, Any]] = []
@@ -273,10 +310,18 @@ class LocalPipelineAgent(VoiceAgent):
         # 模型加载重（首次含 ~300MB 下载），放线程池，不卡 CallSession 事件循环。
         # 工厂支持 on_progress 时把下载进度播给 UI（首启体验）；fake 工厂不支持则退回无参。
         def _build() -> SpeechPipeline:
+            raw_peak = config.get_str("LOCAL_TTS_PEAK").strip()
+            self._peak = float(raw_peak) if raw_peak else None
+            if self._peak is not None and (not math.isfinite(self._peak) or not 0 < self._peak <= 1):
+                raise ValueError("LOCAL_TTS_PEAK 必须为空或 (0, 1] 内的峰值")
             try:
-                return self._pipeline_factory(on_progress=self._emit_status)  # type: ignore[call-arg]
+                pipeline = self._pipeline_factory(on_progress=self._emit_status)  # type: ignore[call-arg]
             except TypeError:
-                return self._pipeline_factory()
+                pipeline = self._pipeline_factory()
+            for phrase in config.get_str("LOCAL_TTS_CACHE_PHRASES").split("|"):
+                if phrase.strip() and phrase not in self._tts_cache:
+                    self._tts_cache[phrase] = normalize_peak(pipeline.synthesize(phrase), self._peak)
+            return pipeline
         try:
             if config.get_bool("PARALLEL_AGENT_CONNECT"):
                 building = asyncio.create_task(asyncio.to_thread(_build))
@@ -311,6 +356,9 @@ class LocalPipelineAgent(VoiceAgent):
         )
         self._vad_thread.start()
         self._brain_thread.start()
+        if self._streaming:
+            self._tts_thread = threading.Thread(target=self._tts_worker, name="local-tts", daemon=True)
+            self._tts_thread.start()
         logger.info(
             "local 三段式 Agent 已启动（LLM=%s, TTS %dHz）",
             config.get_str("LOCAL_LLM_MODEL"),
@@ -351,12 +399,18 @@ class LocalPipelineAgent(VoiceAgent):
         return True
 
     async def stop(self) -> None:
-        self._running = False
-        for thread in (self._vad_thread, self._brain_thread):
+        with self._turn_lock:
+            self._running = False
+            self._cancel_turn()
+        if self._deepseek is not None:
+            self._deepseek.close()
+        # Never block the event loop while a model kernel / network call finishes.
+        for thread in (self._vad_thread, self._brain_thread, self._tts_thread):
             if thread is not None:
-                thread.join(timeout=3)
+                await asyncio.to_thread(thread.join, 3)
         self._vad_thread = None
         self._brain_thread = None
+        self._tts_thread = None
         self._pipeline = None
         logger.info("local 三段式 Agent 已停止")
 
@@ -365,14 +419,25 @@ class LocalPipelineAgent(VoiceAgent):
     def _vad_worker(self) -> None:
         pipeline = self._pipeline
         assert pipeline is not None
+        was_speaking = False
         while self._running:
             try:
                 pcm = self._audio_queue.get(timeout=0.2)
             except Empty:
                 continue
             try:
-                for segment in pipeline.vad_push(pcm):
-                    self._brain_queue.put(segment)
+                segments = pipeline.vad_push(pcm)
+                detector = getattr(pipeline, "is_speech_detected", None)
+                speaking = bool(detector()) if self._streaming and detector is not None else False
+                if self._streaming and ((speaking and not was_speaking) or (segments and not was_speaking)):
+                    # CallSession may reject barge-in during DTMF guard windows.
+                    with self._turn_lock:
+                        if self._on_user_interrupt is None or self._emit_user_interrupt():
+                            self._cancel_turn()
+                was_speaking = speaking
+                for segment in segments:
+                    turn = self._new_turn(time.monotonic())
+                    self._brain_queue.put(_UserSpeech(segment, turn))
             except Exception as exc:  # noqa: BLE001 - VAD 异常丢帧继续
                 logger.warning("VAD 处理失败（丢弃本帧）: %s", exc)
 
@@ -389,7 +454,8 @@ class LocalPipelineAgent(VoiceAgent):
                     self._handle_say(item.instructions)
                     continue
                 # utterance 合并：LLM 忙期间堆积的语音段拼成同一轮。
-                segments = [item]
+                segments = [item.pcm]
+                turn = item.turn
                 while True:
                     try:
                         follow = self._brain_queue.get_nowait()
@@ -398,24 +464,26 @@ class LocalPipelineAgent(VoiceAgent):
                     if isinstance(follow, _SayRequest):
                         self._brain_queue.put(follow)  # say 不并轮，退回队列
                         break
-                    segments.append(follow)
-                self._handle_user_speech(b"".join(segments))
+                    segments.append(follow.pcm)
+                    turn = follow.turn
+                if not turn.cancelled.is_set():
+                    self._handle_user_speech(b"".join(segments), turn)
             except Exception as exc:  # noqa: BLE001 - 单轮失败不杀线程
                 logger.warning("brain 处理一轮失败: %s", exc)
 
     # ---- 每轮语义 ----
 
-    def _handle_user_speech(self, segment: bytes) -> None:
+    def _handle_user_speech(self, segment: bytes, turn: _Turn) -> None:
         pipeline = self._pipeline
         assert pipeline is not None
         text = pipeline.transcribe(segment)
-        if not text:
+        if not text or turn.cancelled.is_set() or not self._running:
             return
         logger.info("[上行·用户] %s", text)
         self._emit_transcript("user", text)
         with self._messages_lock:
             self._messages.append({"role": "user", "content": text})
-        self._respond()
+        self._respond(turn)
 
     def _handle_say(self, instructions: str) -> None:
         # say 语义（开场白/收尾道别/复读提示）：临时把指令并进本轮请求，
@@ -428,21 +496,28 @@ class LocalPipelineAgent(VoiceAgent):
                     "请直接输出你要对对方说的话本身，不要解释。",
                 }
             )
-        self._respond()
+        self._respond(self._new_turn(None))
 
-    def _respond(self) -> None:
-        reply = self._chat_with_tools()
-        if reply is None:
+    def _respond(self, turn: _Turn) -> None:
+        response = self._chat_with_tools(turn)
+        if response is None or turn.cancelled.is_set() or not self._running:
             return
+        reply, batch = response
         if not reply.strip():
             return
         if self._suppressor.should_suppress(reply):
             logger.info("[local] 抑制复读: %s", reply)
+            self._discard_batch(batch)
             self._nudge_after_suppressed()
             return
         logger.info("[下行·Agent] %s", reply)
         self._emit_transcript("agent", reply)
-        self._speak(reply)
+        if self._streaming:
+            for clause in batch.splitter.finish():
+                self._queue_clause(clause, batch)
+        else:
+            self._mark_latency(turn, "first_clause_ready")
+            self._speak(reply, batch)
 
     def _nudge_after_suppressed(self) -> None:
         now = time.monotonic()
@@ -457,16 +532,43 @@ class LocalPipelineAgent(VoiceAgent):
                 }
             )
 
-    def _chat_with_tools(self) -> str | None:
+    def _chat_with_tools(self, turn: _Turn) -> tuple[str, _SpeechBatch] | None:
         """LLM 对话 + 工具循环；失败计数达到阈值置 fatal。返回最终应答文本。"""
         tools = self._tools.specs() if self._tools and self._tools.has_tools() else None
         timeout = config.get_float("LOCAL_LLM_TIMEOUT")
         for _round in range(_MAX_TOOL_ROUNDS + 1):
+            if turn.cancelled.is_set() or not self._running:
+                return None
+            batch = _SpeechBatch(turn)
+
+            def on_content(text: str) -> None:
+                if turn.cancelled.is_set() or batch.cancelled.is_set() or not self._running:
+                    return
+                batch.received_text = True
+                self._mark_latency(turn, "llm_first_token")
+                if self._streaming:
+                    for clause in batch.splitter.feed(text):
+                        self._queue_clause(clause, batch)
+
             with self._messages_lock:
                 messages = list(self._messages)
             try:
-                message = self._llm_chat(messages, tools, timeout)
+                if self._deepseek is not None:
+                    message = self._deepseek.chat(
+                        messages, tools, timeout, on_content, turn.cancelled,
+                        on_tools=lambda: self._discard_batch(batch),
+                    )
+                elif self._llm_stream is not None:
+                    message = self._llm_stream(messages, tools, timeout, on_content)
+                else:
+                    message = self._llm_chat(messages, tools, timeout)
+            except InterruptedError:
+                self._discard_batch(batch)
+                return None
             except Exception as exc:  # noqa: BLE001
+                self._discard_batch(batch)
+                if turn.cancelled.is_set() or not self._running:
+                    return None
                 self._llm_failures += 1
                 logger.warning(
                     "LLM 请求失败(%d/%d): %s", self._llm_failures, _LLM_FATAL_FAILURES, exc
@@ -475,23 +577,32 @@ class LocalPipelineAgent(VoiceAgent):
                     logger.error("LLM 连续失败，标记会话不可恢复")
                     self.fatal = True
                 return None
+            if turn.cancelled.is_set() or not self._running:
+                self._discard_batch(batch)
+                return None
             self._llm_failures = 0
             tool_calls = message.get("tool_calls") or []
             with self._messages_lock:
                 self._messages.append(message)
             if not tool_calls:
-                return str(message.get("content") or "")
-            wait_for_remote = self._run_tool_calls(tool_calls)
+                reply = str(message.get("content") or "")
+                if reply and not batch.received_text:
+                    on_content(reply)
+                return reply, batch
+            self._discard_batch(batch)
+            wait_for_remote = self._run_tool_calls(tool_calls, turn)
             if wait_for_remote:
                 # 挂断后结束；DTMF 后等待对端下一段话，不生成口头确认。
                 return None
         logger.warning("工具调用超过 %d 轮仍未产出应答，跳过本轮", _MAX_TOOL_ROUNDS)
         return None
 
-    def _run_tool_calls(self, tool_calls: list[dict]) -> bool:
+    def _run_tool_calls(self, tool_calls: list[dict], turn: _Turn) -> bool:
         """执行工具并回填结果；返回本轮是否应停止生成后续回复。"""
         wait_for_remote = False
         for call in tool_calls:
+            if turn.cancelled.is_set() or not self._running:
+                return True
             function = call.get("function") or {}
             name = str(function.get("name") or "")
             call_id = str(call.get("id") or "")
@@ -516,14 +627,72 @@ class LocalPipelineAgent(VoiceAgent):
                 )
         return wait_for_remote
 
-    def _speak(self, text: str) -> None:
+    def _new_turn(self, ended_at: float | None) -> _Turn:
+        with self._turn_lock:
+            self._turn = _Turn(ended_at)
+            self._turns.add(self._turn)
+            return self._turn
+
+    def _cancel_turn(self) -> None:
+        with self._turn_lock:
+            for turn in list(self._turns):
+                turn.cancelled.set()
+            while True:
+                try:
+                    self._tts_queue.get_nowait()
+                except Empty:
+                    break
+                self._tts_queue.task_done()
+
+    def _mark_latency(self, turn: _Turn, stage: str) -> None:
+        with self._turn_lock:
+            if turn.ended_at is None or stage in turn.stages or turn.cancelled.is_set():
+                return
+            turn.stages.add(stage)
+            self._emit_latency(stage, round((time.monotonic() - turn.ended_at) * 1000, 1))
+
+    def _discard_batch(self, batch: _SpeechBatch) -> None:
+        with self._turn_lock:
+            batch.cancelled.set()
+            if batch.audio_emitted and not batch.turn.cancelled.is_set() and self._running:
+                self._emit_late_cut()
+
+    def _queue_clause(self, text: str, batch: _SpeechBatch) -> None:
+        with self._turn_lock:
+            if not self._running or batch.turn.cancelled.is_set() or batch.cancelled.is_set():
+                return
+            self._mark_latency(batch.turn, "first_clause_ready")
+            self._tts_queue.put(_TtsRequest(text, batch))
+
+    def _tts_worker(self) -> None:
+        while self._running:
+            try:
+                request = self._tts_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            try:
+                self._speak(request.text, request.batch)
+            except Exception as exc:  # noqa: BLE001 - keep the dedicated worker alive
+                logger.warning("TTS 输出失败: %s", exc)
+            finally:
+                self._tts_queue.task_done()
+
+    def _speak(self, text: str, batch: _SpeechBatch) -> None:
         pipeline = self._pipeline
-        if pipeline is None or self._on_audio_out is None:
+        if (pipeline is None or self._on_audio_out is None or not self._running
+                or batch.cancelled.is_set() or batch.turn.cancelled.is_set()):
             return
         try:
-            pcm = pipeline.synthesize(text)
+            pcm = self._tts_cache.get(text)
+            if pcm is None:
+                pcm = normalize_peak(pipeline.synthesize(text), self._peak)
         except Exception as exc:  # noqa: BLE001
             logger.warning("TTS 合成失败: %s", exc)
             return
-        if pcm:
-            self._on_audio_out(pcm)
+        # Generation may finish after stop / a new utterance. Check under the same
+        # lock as cancellation so no stale output can cross the cancellation edge.
+        with self._turn_lock:
+            if pcm and self._running and not batch.cancelled.is_set() and not batch.turn.cancelled.is_set():
+                self._mark_latency(batch.turn, "tts_first_audio")
+                batch.audio_emitted = True
+                self._on_audio_out(pcm)
