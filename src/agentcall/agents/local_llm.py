@@ -19,6 +19,12 @@ def deepseek_body(messages: list[dict], tools: list[dict] | None) -> dict[str, A
     thinking = config.get_str("LOCAL_LLM_THINKING")
     if thinking not in {"disabled", "low", "high"}:
         raise ValueError(f"未知的 LOCAL_LLM_THINKING: {thinking}")
+    # With tools, DeepSeek requires all prior reasoning, even after a new user
+    # turn (https://api-docs.deepseek.com/guides/thinking_mode/#tool-calls).
+    # Strip only on the wire otherwise; never erase the agent's stored history.
+    if thinking == "disabled" or not tools:
+        messages = [{k: v for k, v in message.items() if k != "reasoning_content"}
+                    if "reasoning_content" in message else message for message in messages]
     body: dict[str, Any] = {
         "model": config.get_str("LOCAL_LLM_MODEL"), "messages": messages, "stream": True,
         "thinking": {"type": "disabled" if thinking == "disabled" else "enabled"},
@@ -36,6 +42,7 @@ def read_sse(
     *, sensitive_texts: Iterable[str] = (),
 ) -> dict[str, Any]:
     content: list[str] = []
+    reasoning: list[str] = []
     calls: dict[int, dict[str, Any]] = {}
     data: list[str] = []
     for raw in lines:
@@ -47,6 +54,8 @@ def read_sse(
         payload, data = "\n".join(data), []
         if payload == "[DONE]":
             result: dict[str, Any] = {"role": "assistant", "content": "".join(content)}
+            if reasoning:
+                result["reasoning_content"] = "".join(reasoning)
             if calls:
                 result["tool_calls"] = [calls[i] for i in sorted(calls)]
             return result
@@ -58,7 +67,7 @@ def read_sse(
                                if isinstance(fields.get(name), (str, int, float)))
             # Whitelist diagnostic fields, not the event/request object. Servers
             # can reflect credentials or input, so redact before truncating.
-            for value in (config.get_str("DEEPSEEK_API_KEY"), *sensitive_texts):
+            for value in (config.get_str("DEEPSEEK_API_KEY"), *sensitive_texts, "".join(reasoning), *reasoning):
                 if value:
                     detail = detail.replace(value, "[redacted]")
             detail = " ".join(detail.split())[:200]
@@ -67,6 +76,8 @@ def read_sse(
         if not choices:  # optional usage chunk
             continue
         delta = choices[0].get("delta") or {}
+        if isinstance(delta.get("reasoning_content"), str):
+            reasoning.append(delta["reasoning_content"])
         fragments = delta.get("tool_calls") or []
         if fragments and not calls and on_tools is not None:
             on_tools()  # Stop speculative TTS before waiting for long argument fragments.
@@ -82,7 +93,6 @@ def read_sse(
             function = fragment.get("function") or {}
             for key in ("name", "arguments"):
                 call["function"][key] += function.get(key) or ""
-        # reasoning_content is intentionally neither spoken nor put in history.
     raise RuntimeError("DeepSeek SSE 提前结束（缺少 [DONE]）")
 
 
@@ -118,7 +128,9 @@ class DeepSeekChat:
         on_content: Callable[[str], None], cancelled: threading.Event | None = None,
         on_tools: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        body = json.dumps(deepseek_body(messages, tools), ensure_ascii=False).encode("utf-8")
+        payload = deepseek_body(messages, tools)
+        thinking_enabled = payload["thinking"]["type"] == "enabled"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         endpoint = config.get_str("LOCAL_LLM_BASE_URL").rstrip("/")
         url = urlsplit(endpoint)
         if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.query or url.fragment:
@@ -131,7 +143,8 @@ class DeepSeekChat:
         box: dict[str, Any] = {}
         deadline = time.monotonic() + timeout
         sensitive_texts = (key, body.decode("utf-8"), *(
-            message["content"] for message in messages if isinstance(message.get("content"), str)
+            message[field] for message in messages for field in ("content", "reasoning_content")
+            if isinstance(message.get(field), str)
         ))
 
         def inactive() -> bool:
@@ -188,6 +201,8 @@ class DeepSeekChat:
                                 raise RuntimeError(f"DeepSeek HTTP {response.status}")
                             result = read_sse(response_lines(response), content, tool_event,
                                               sensitive_texts=sensitive_texts)
+                            if not thinking_enabled:
+                                result.pop("reasoning_content", None)
                             response.read()  # Consume the chunked terminator for socket reuse.
                             if getattr(response, "will_close", False):
                                 self._discard_connection(connection)

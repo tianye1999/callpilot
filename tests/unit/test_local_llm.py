@@ -35,7 +35,7 @@ def test_sse_accumulates_content_and_interleaved_tool_call_fragments():
     seen = []
     data = sse(
         {"reasoning_content": "private"},
-        {"content": "你好，"},
+        {"reasoning_content": "-plan", "content": "你好，"},
         {"content": "稍等。", "tool_calls": [
             {"index": 1, "id": "call_", "function": {"name": "send_", "arguments": '{"digits":'}},
             {"index": 0, "id": "sms", "function": {"name": "send_sms", "arguments": "{"}},
@@ -48,12 +48,52 @@ def test_sse_accumulates_content_and_interleaved_tool_call_fragments():
     result = read_sse(io.BytesIO(data), seen.append)
     assert seen == ["你好，", "稍等。"]
     assert result["content"] == "你好，稍等。"
-    assert "reasoning_content" not in result
+    assert result["reasoning_content"] == "private-plan"
     assert result["tool_calls"] == [
         {"id": "sms", "type": "function", "function": {"name": "send_sms", "arguments": "{}"}},
         {"id": "call_key", "type": "function",
          "function": {"name": "send_dtmf", "arguments": '{"digits":"1"}'}},
     ]
+
+
+@pytest.mark.parametrize("thinking", ["disabled", "low", "high"])
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_reasoning_history_wire_policy_does_not_mutate_history(monkeypatch, thinking, with_tools):
+    monkeypatch.setenv("LOCAL_LLM_THINKING", thinking)
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "done", "reasoning_content": "internal-plan"},
+        {"role": "user", "content": "next"},
+    ]
+    original = json.loads(json.dumps(messages))
+    tools = [{"type": "function", "function": {"name": "lookup"}}] if with_tools else None
+    body = deepseek_body(messages, tools)
+    assert ("reasoning_content" in body["messages"][1]) == (thinking != "disabled" and with_tools)
+    assert messages == original
+    if thinking == "disabled":
+        expected = {
+            "model": body["model"], "stream": True, "thinking": {"type": "disabled"},
+            "messages": [{k: v for k, v in m.items() if k != "reasoning_content"} for m in messages],
+        }
+        if tools:
+            expected["tools"] = tools
+        assert body == expected
+
+
+def test_sse_keeps_explicit_empty_reasoning():
+    result = read_sse(io.BytesIO(sse({"reasoning_content": ""}, {"content": "done"})), lambda _: None)
+    assert result == {"role": "assistant", "content": "done", "reasoning_content": ""}
+
+
+def test_sse_error_redacts_current_reasoning_fragments():
+    data = sse({"reasoning_content": "internal-"}, {"reasoning_content": "plan"})
+    data = data.replace(b"data: [DONE]\n\n", (
+        b'data: {"error":{"message":"Rejected internal-plan or internal-"}}\n\n'
+    ))
+    with pytest.raises(RuntimeError) as caught:
+        read_sse(io.BytesIO(data), lambda _: None)
+    assert "internal-" not in str(caught.value)
+    assert "[redacted]" in str(caught.value)
 
 
 def test_tool_start_notifies_before_content_in_same_delta_and_only_once():
@@ -90,6 +130,56 @@ class FakeConnection:
 
     def close(self):
         self.closed = True
+
+
+def test_disabled_transport_does_not_add_reasoning_to_history_or_request(monkeypatch):
+    from agentcall.agents import local_llm
+
+    class Connection(FakeConnection):
+        def getresponse(self):
+            response = io.BytesIO(sse({"reasoning_content": "internal-plan"}, {"content": "done"}))
+            response.status = 200
+            return response
+
+    connection = Connection()
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+    monkeypatch.setenv("LOCAL_LLM_THINKING", "disabled")
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setattr(local_llm.http.client, "HTTPSConnection", lambda *a, **kw: connection)
+    client, seen = DeepSeekChat(), []
+    try:
+        message = client.chat([], None, 1, seen.append)
+        assert message == {"role": "assistant", "content": "done"}
+        assert seen == ["done"]
+        assert connection.requests[0][2] == {
+            "model": connection.requests[0][2]["model"], "messages": [], "stream": True,
+            "thinking": {"type": "disabled"},
+        }
+    finally:
+        client.close()
+
+
+def test_sse_error_redacts_reasoning_from_request_history(monkeypatch):
+    from agentcall.agents import local_llm
+
+    class Connection(FakeConnection):
+        def getresponse(self):
+            response = io.BytesIO(b'data: {"error":{"message":"Rejected internal-plan"}}\n\n')
+            response.status = 200
+            return response
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+    monkeypatch.setenv("LOCAL_LLM_THINKING", "low")
+    monkeypatch.setattr(local_llm.http.client, "HTTPSConnection", Connection)
+    client = DeepSeekChat()
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            client.chat([{"role": "assistant", "content": "done", "reasoning_content": "internal-plan"}],
+                        [{"type": "function", "function": {"name": "lookup"}}], 1, lambda _: None)
+        assert "internal-plan" not in str(caught.value)
+        assert "[redacted]" in str(caught.value)
+    finally:
+        client.close()
 
 
 def test_connection_is_reused_and_request_uses_config(monkeypatch):

@@ -318,6 +318,72 @@ def test_deepseek_sse_tools_feedback_and_optional_clause_tts(monkeypatch, stream
         asyncio.run(agent.stop())
 
 
+@pytest.mark.parametrize("thinking", ["low", "high"])
+@pytest.mark.parametrize("streaming", ["false", "true"])
+def test_thinking_tool_rounds_and_new_user_preserve_reasoning_privately(monkeypatch, caplog, thinking, streaming):
+    import io
+    import logging
+
+    from agentcall.agents import local_llm
+
+    monkeypatch.setenv("LOCAL_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("LOCAL_LLM_THINKING", thinking)
+    monkeypatch.setenv("LOCAL_TTS_STREAMING", streaming)
+    caplog.set_level(logging.DEBUG, logger="agentcall")
+    reasoning = [f"internal-plan-{i}" for i in range(4)]
+    replies = [sse(
+        {"reasoning_content": reasoning[i][:8]},
+        {"reasoning_content": reasoning[i][8:], "tool_calls": [{
+            "index": 0, "id": f"lookup-{i}",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }]},
+    ) for i in range(2)] + [
+        sse({"reasoning_content": reasoning[2]}, {"content": "第一句。"}),
+        sse({"reasoning_content": reasoning[3]}, {"content": "第二句。"}),
+    ]
+
+    class Connection(FakeConnection):
+        def getresponse(self):
+            response = io.BytesIO(replies.pop(0))
+            response.status = 200
+            return response
+
+    connection, transcripts, audio, calls = Connection(), [], [], []
+    monkeypatch.setattr(local_llm.http.client, "HTTPSConnection", lambda *a, **kw: connection)
+    pipeline = FakePipeline()
+    registry = ToolRegistry()
+    registry.register({"type": "function", "function": {
+        "name": "lookup", "parameters": {"type": "object", "properties": {}},
+    }}, lambda args: calls.append(args) or {"success": True})
+    agent = LocalPipelineAgent(pipeline_factory=lambda: pipeline)
+    agent.set_tools(registry)
+    agent.set_transcript_handler(lambda role, text: transcripts.append((role, text)))
+    asyncio.run(agent.start(audio.append))
+    try:
+        asyncio.run(agent.send_audio(b"first"))
+        assert _wait_until(lambda: len(audio) == 1)
+        asyncio.run(agent.send_audio(b"next"))
+        assert _wait_until(lambda: len(audio) == 2)
+        assert calls == [{}, {}]
+        assert len(connection.requests) == 4
+        for i, (_, _, body, _) in enumerate(connection.requests):
+            assert body["thinking"] == {"type": "enabled"}
+            assert body["reasoning_effort"] == thinking
+            assistants = [m for m in body["messages"] if m["role"] == "assistant"]
+            assert [m["reasoning_content"] for m in assistants] == reasoning[:i]
+            assert len([m for m in body["messages"] if m["role"] == "tool"]) == min(i, 2)
+        assert connection.requests[3][2]["messages"][-1] == {"role": "user", "content": "next"}
+        assert pipeline.synthesized == ["第一句。", "第二句。"]
+        assert transcripts == [("user", "first"), ("agent", "第一句。"),
+                               ("user", "next"), ("agent", "第二句。")]
+        assert all(secret not in caplog.text for secret in reasoning)
+        assert [m["reasoning_content"] for m in agent._messages if m["role"] == "assistant"] == reasoning
+    finally:
+        asyncio.run(agent.stop())
+
+
 def test_streaming_tool_loop_retains_round_limit(monkeypatch):
     monkeypatch.setenv("LOCAL_TTS_STREAMING", "true")
     calls = []
