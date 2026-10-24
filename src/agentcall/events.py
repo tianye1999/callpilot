@@ -51,6 +51,8 @@ class EventHub:
         # 实时旁听：下行 PCM 二进制帧的订阅端（与 JSON 事件端分开，无监听者时零成本）。
         self._audio_clients: set[web.WebSocketResponse] = set()
         self._audio_tasks: set[asyncio.Task[None]] = set()
+        self._audio_lock = threading.Lock()
+        self._audio_send_locks: dict[web.WebSocketResponse, asyncio.Lock] = {}
         self._audio_rate = 24000
         # 收到过的短信指纹（发件方+时间戳+正文），跨重启去重：启动补收 SIM 已存
         # 短信、或 +CMTI 重复上报时，同一条不会重复入库/重复转发邮件。
@@ -71,17 +73,34 @@ class EventHub:
 
     @property
     def audio_rate(self) -> int:
-        return self._audio_rate
+        with self._audio_lock:
+            return self._audio_rate
 
     def set_audio_rate(self, rate: int) -> None:
-        if rate and rate > 0:
+        if not rate or rate <= 0:
+            return
+        with self._audio_lock:
+            if self._audio_rate == int(rate):
+                return
             self._audio_rate = int(rate)
+            self._schedule_audio(self._audio_meta(), tuple(self._audio_clients))
+
+    def _audio_meta(self) -> dict[str, str | int]:
+        return {"type": "meta", "rate": self._audio_rate, "uplink_rate": 8000}
 
     def register_audio(self, ws: web.WebSocketResponse) -> None:
-        self._audio_clients.add(ws)
+        with self._audio_lock:
+            if ws in self._audio_clients:
+                return
+            self._audio_clients.add(ws)
+            self._audio_send_locks[ws] = asyncio.Lock()
+            # Subscription and its initial meta share the same ordering as live updates.
+            self._schedule_audio(self._audio_meta(), (ws,))
 
     def unregister_audio(self, ws: web.WebSocketResponse) -> None:
-        self._audio_clients.discard(ws)
+        with self._audio_lock:
+            self._audio_clients.discard(ws)
+            self._audio_send_locks.pop(ws, None)
 
     def broadcast_audio(self, pcm: bytes, kind: int = 0) -> None:
         """把通话 PCM 帧广播给旁听端（任意线程调用，非阻塞、满即丢）。
@@ -90,26 +109,52 @@ class EventHub:
         方向标记，浏览器据此分两条时间线各按其采样率播放（双向可同时出声）。
         无旁听端时立即返回（零成本）；在途发送积压时丢帧不堆积（旁听可丢）。
         """
-        if not self._audio_clients or not pcm:
+        if not pcm:
             return
-        frame = bytes((kind & 0xFF,)) + pcm
+        with self._audio_lock:
+            if self._audio_clients:
+                frame = bytes((kind & 0xFF,)) + pcm
+                self._schedule_audio(frame, tuple(self._audio_clients))
+
+    def _schedule_audio(
+        self, payload: bytes | dict[str, str | int], clients: tuple[web.WebSocketResponse, ...],
+    ) -> None:
+        # Called under _audio_lock: metadata cannot be enqueued behind later PCM.
+        if not clients:
+            return
         try:
-            self._loop.call_soon_threadsafe(self._broadcast_audio, frame)
+            self._loop.call_soon_threadsafe(self._broadcast_audio, payload, clients)
         except RuntimeError:
             pass
 
-    def _broadcast_audio(self, pcm: bytes) -> None:
+    def _broadcast_audio(
+        self, payload: bytes | dict[str, str | int], clients: tuple[web.WebSocketResponse, ...],
+    ) -> None:
         # 丢帧保护：在途发送远超监听端数说明浏览器跟不上，丢这帧而非堆积。
-        if len(self._audio_tasks) > len(self._audio_clients) * 4:
+        if isinstance(payload, bytes) and len(self._audio_tasks) > len(clients) * 4:
             return
-        for ws in list(self._audio_clients):
-            task = asyncio.create_task(self._safe_send_audio(ws, pcm))
+        for ws in clients:
+            task = asyncio.create_task(self._safe_send_audio(ws, payload))
             self._audio_tasks.add(task)
             task.add_done_callback(self._audio_tasks.discard)
 
-    async def _safe_send_audio(self, ws: web.WebSocketResponse, pcm: bytes) -> None:
+    async def _safe_send_audio(
+        self, ws: web.WebSocketResponse, payload: bytes | dict[str, str | int],
+    ) -> None:
+        with self._audio_lock:
+            send_lock = self._audio_send_locks.get(ws)
+        if send_lock is None:
+            return
         try:
-            await ws.send_bytes(pcm)
+            # A slow meta send must finish before subsequent PCM on this socket.
+            async with send_lock:
+                with self._audio_lock:
+                    if ws not in self._audio_clients:
+                        return
+                if isinstance(payload, bytes):
+                    await ws.send_bytes(payload)
+                else:
+                    await ws.send_json(payload)
         except (ConnectionResetError, RuntimeError):
             self.unregister_audio(ws)
         except Exception as exc:  # noqa: BLE001

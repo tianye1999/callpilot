@@ -125,6 +125,14 @@ def test_dashboard_listener_recovers_suspended_web_audio():
     assert "void resumeAndPlayPcm(int16, kind);" in text
 
 
+def test_dashboard_listener_resets_only_downlink_timeline_on_rate_change():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert "if (m.rate && m.rate !== listenRate[0])" in text
+    assert "listenRate[0] = m.rate; listenNextAt[0] = 0;" in text
+    assert "if (m.uplink_rate) listenRate[1] = m.uplink_rate;" in text
+
+
 def test_settings_expose_sms_email_forwarding_with_bilingual_privacy_notice():
     text = INDEX.read_text(encoding="utf-8")
 

@@ -2406,7 +2406,9 @@ async function toggleListen() {
     if (typeof e.data === "string") {
       try {
         const m = JSON.parse(e.data);
-        if (m.rate) listenRate[0] = m.rate;
+        if (m.rate && m.rate !== listenRate[0]) {
+          listenRate[0] = m.rate; listenNextAt[0] = 0;
+        }
         if (m.uplink_rate) listenRate[1] = m.uplink_rate;
       } catch (_) {}
       return;

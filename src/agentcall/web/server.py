@@ -446,14 +446,13 @@ async def _websocket(request: web.Request) -> web.WebSocketResponse:
 async def _audio_websocket(request: web.Request) -> web.WebSocketResponse:
     """实时旁听：把通话下行 PCM 二进制帧推给浏览器（Web Audio 播放，绕开 native 音频）。
 
-    先发一条 JSON meta 告知采样率，之后全是 s16le 单声道二进制帧。
+    先发 JSON meta 告知采样率，之后推送 s16le 单声道帧；采样率变化时先更新 meta。
     """
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     hub: EventHub = request.app["hub"]
 
-    # rate=下行(AI)采样率；uplink_rate=上行(对方)固定 8kHz（模组 PCM 速率）。
-    await ws.send_json({"type": "meta", "rate": hub.audio_rate, "uplink_rate": 8000})
+    # Hub serializes the initial meta, rate updates and PCM on this connection.
     hub.register_audio(ws)
     logger.info("音频旁听端已连接")
     try:

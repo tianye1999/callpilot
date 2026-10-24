@@ -202,6 +202,9 @@ def test_broadcast_audio_fans_out_only_to_audio_clients():
             received: list[bytes] = []
 
             class AudioWS:
+                async def send_json(self, data):
+                    assert data == {"type": "meta", "rate": 16000, "uplink_rate": 8000}
+
                 async def send_bytes(self, data):
                     received.append(bytes(data))
 

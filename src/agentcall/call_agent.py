@@ -998,6 +998,11 @@ class CallSession:
         def on_agent_audio(pcm_agent: bytes) -> None:
             if not self._agent_effect_allowed(generation):
                 return
+            # Local TTS learns its real output rate during start(), after wiring this callback.
+            if agent.output_rate != self._agent_output_rate:
+                self._agent_output_rate = agent.output_rate
+                if self.hub is not None:
+                    self.hub.set_audio_rate(self._agent_output_rate)
             if pcm_agent and self._takeover_hold_generation == generation and not self._takeover_hold_done:
                 self._takeover_hold_audio_at = time.monotonic()
             # 单轮长度闸门必须在护窗**之前**结算（2026-08-05 Codex 评审 P1）。
