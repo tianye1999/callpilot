@@ -56,7 +56,7 @@ _EXPECTED_FIELDS = frozenset(
 )
 _MAX_TRANSCRIPTS = 8
 _MAX_RECENT_ACTIONS = 3
-# 全局在飞模型调用上限。它防的是**SDK 挂死**：dashscope 的调用可能几十秒不返回，
+# 全局在飞模型调用上限。它防的是**SDK 挂死**：文本后端的调用可能几十秒不返回，
 # 而判官每个转写片段都会想判一次，线程会无上限堆积。
 #
 # 但这个上限不能是 1。曾经用「模块级 single-flight」实现，等价于全局并发=1，

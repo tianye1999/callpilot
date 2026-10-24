@@ -23,11 +23,14 @@ def _isolate_side_effects(tmp_path, monkeypatch):
     monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "false")
     monkeypatch.setenv("SUMMARY_ENABLED", "false")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-dashscope-key")
+    from agentcall.agents.local_agent import reset_shared_speech_models
     from agentcall.rate_limit import reset_sms_rate_limit_state
 
     reset_sms_rate_limit_state()
+    reset_shared_speech_models()
     yield
     reset_sms_rate_limit_state()
+    reset_shared_speech_models()
 
 
 @pytest.fixture

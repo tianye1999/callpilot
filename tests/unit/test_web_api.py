@@ -227,6 +227,35 @@ def test_meta_reports_missing_credentials_without_blocking(monkeypatch):
     assert any("DASHSCOPE_API_KEY" in err for err in meta["credentials"]["errors"])
 
 
+def test_local_meta_displays_actual_model_combination(monkeypatch):
+    monkeypatch.setenv("AGENT_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "deepseek-flash")
+    monkeypatch.setenv("LOCAL_TTS_MODEL", "vits-icefall-zh-aishell3")
+    monkeypatch.setenv("LOCAL_TTS_SPEAKER_ID", "25")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+    monkeypatch.setenv("DTMF_JUDGE_MODE", "shadow")
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    app = build_app(
+        hub=None, modem=None, service=FakeService(),
+        meta=config.runtime_meta(provider="local", model="Qwen3.5-Omni", port="unused"),
+    )
+
+    async def fn(client):
+        return await (await client.get("/api/meta")).json()
+
+    meta = api(app, fn)
+    assert meta["model"] == "本地 · deepseek-flash + vits-icefall-zh-aishell3#25"
+    assert meta["provider"] == "local"
+    assert meta["credentials"]["ok"] is True
+
+
+@pytest.mark.parametrize("provider", ["qwen", "openai", "doubao"])
+def test_nonlocal_meta_keeps_supplied_display_name(provider):
+    assert config.runtime_meta(provider, "configured-name", "unused")["model"] == "configured-name"
+
+
 def test_meta_includes_setup_and_hardware_status(monkeypatch):
     monkeypatch.delenv("SETUP_DONE", raising=False)
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)

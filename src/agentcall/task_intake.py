@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 _INTAKE_TIMEOUT_SECONDS = 12.0  # 交互式：比 prompt_gen 的 5s 宽、比摘要的 30s 紧
 # 建单是面向机主的多轮结构化对话，比摘要/裁判难——不跟 SUMMARY_MODEL 的便宜
 # 默认档（2026-08-18 真机：gpt-4o-mini 追问蠢 + JSON 纪律差），各 provider 用强档。
-_INTAKE_DEFAULT_BY_PROVIDER = {"openai": "gpt-4o", "qwen": "qwen-plus"}
+_INTAKE_DEFAULT_BY_PROVIDER = {
+    "openai": "gpt-4o", "qwen": "qwen-plus",
+    "deepseek": "",  # select_text_model follows LOCAL_LLM_MODEL.
+}
 _MAX_MESSAGES = 40
 _MAX_CONTENT_CHARS = 2000
 # 追问阶段回复要短；出草稿那轮 JSON 较长（含 task_package），给足余量。

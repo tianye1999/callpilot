@@ -11,7 +11,8 @@
 - utterance 合并：brain 忙时堆积的语音段在出队时拼成一轮，不逐段打断 LLM；
 - TTS PCM 适配：sherpa float32 → int16 bytes，采样率由 ``output_rate`` 告知
   CallSession（audio_bridge 负责 → 8k 重采样）；
-- 模型加载放 ``start()`` 的线程池里，失败置 ``fatal`` 结束整通（不留死寂电话）。
+- ASR/TTS 进程常驻，启动后后台加载；首通未就绪时在 ``start()`` 线程池里加载，
+  失败置 ``fatal`` 结束整通（不留死寂电话）。VAD 每通独立。
 
 sherpa-onnx 为可选依赖（``pip install 'callpilot[local]'``）；单测经
 ``pipeline_factory`` 注入 fake 管线，CI 零模型可跑。
@@ -27,6 +28,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Callable, Protocol
 from weakref import WeakSet
@@ -101,10 +103,12 @@ class _TtsRequest:
     batch: _SpeechBatch
 
 
-class _SherpaPipeline:
-    """sherpa-onnx 实现（惰性 import；缺库抛错，缺模型则首启自动下载）。"""
+class _SharedSpeechModels:
+    """Process-resident kernels and raw phrase PCM; VAD stays per call."""
 
-    def __init__(self, on_progress: "Callable[[str], None] | None" = None) -> None:
+    def __init__(
+        self, key: tuple[str, str, int, str], on_progress: Callable[[str], None] | None,
+    ) -> None:
         try:
             import sherpa_onnx  # noqa: PLC0415 - 可选依赖，惰性导入
         except ImportError as exc:
@@ -127,7 +131,102 @@ class _SherpaPipeline:
             if on_progress is not None:
                 on_progress("语音模型下载完成，正在加载…")
             logger.info("local 模型下载完成")
-        root = local_models.models_dir()
+        self.root = root = Path(key[0])
+        self._asr_lock = threading.Lock()
+        self._tts_lock = threading.Lock()
+        stt_dir = root / "sherpa-onnx-paraformer-zh-2023-09-14"
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
+            paraformer=str(stt_dir / "model.int8.onnx"),
+            tokens=str(stt_dir / "tokens.txt"),
+            num_threads=2,
+        )
+        tts_config = local_models.build_tts_config(sherpa_onnx, root, key[1])
+        self._tts = sherpa_onnx.OfflineTts(tts_config)
+        self._speaker_id = key[2]
+        self.sample_rate = int(self._tts.sample_rate)
+        self.cached_phrases: dict[str, bytes] = {}
+        warmup = self.synthesize("你好。")
+        for phrase in key[3].split("|"):
+            if phrase.strip() and phrase not in self.cached_phrases:
+                self.cached_phrases[phrase] = warmup if phrase == "你好。" else self.synthesize(phrase)
+
+    def transcribe(self, segment_pcm16: bytes) -> str:
+        with self._asr_lock:
+            stream = self._recognizer.create_stream()
+            stream.accept_waveform(16000, _to_float32(segment_pcm16))
+            self._recognizer.decode_stream(stream)
+            return (stream.result.text or "").strip()
+
+    def synthesize(self, text: str) -> bytes:
+        import numpy as np
+
+        cached = self.cached_phrases.get(text)
+        if cached is not None:
+            return cached
+        with self._tts_lock:
+            audio = self._tts.generate(text, sid=self._speaker_id, speed=1.0)
+            samples = np.asarray(audio.samples, dtype="float32")
+            return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+
+
+_SHARED_MODELS_LOCK = threading.Lock()
+_SHARED_MODELS: tuple[tuple[str, str, int, str], _SharedSpeechModels] | None = None
+
+
+def reset_shared_speech_models() -> None:
+    """Discard the resident cache (tests must join any preload worker first)."""
+    global _SHARED_MODELS
+    with _SHARED_MODELS_LOCK:
+        _SHARED_MODELS = None
+
+
+def _get_shared_models(on_progress: Callable[[str], None] | None = None) -> _SharedSpeechModels:
+    from .. import local_models
+
+    global _SHARED_MODELS
+    key = (
+        str(local_models.models_dir().resolve()), config.get_str("LOCAL_TTS_MODEL"),
+        config.get_int("LOCAL_TTS_SPEAKER_ID"), config.get_str("LOCAL_TTS_CACHE_PHRASES"),
+    )
+    if on_progress is not None and (_SHARED_MODELS is None or _SHARED_MODELS[0] != key):
+        on_progress("正在加载本地语音模型…")
+    # Serialize cold loads, including preload vs. first-call races. Publish only
+    # after warmup/cache succeeds; failures leave the next caller free to retry.
+    with _SHARED_MODELS_LOCK:
+        if _SHARED_MODELS is None or _SHARED_MODELS[0] != key:
+            models = _SharedSpeechModels(key, on_progress)
+            _SHARED_MODELS = (key, models)
+        return _SHARED_MODELS[1]
+
+
+def start_model_preload() -> threading.Thread:
+    """Best-effort daemon preload, independent of the web/event-loop executor."""
+    def load() -> None:
+        try:
+            _get_shared_models(on_progress=logger.info)
+            logger.info("local 语音模型预加载完成")
+        except Exception as exc:  # noqa: BLE001 - first call will retry normally
+            logger.warning("local 语音模型预加载失败，首通时重试: %s", exc)
+
+    thread = threading.Thread(target=load, name="local-model-preload", daemon=True)
+    thread.start()
+    return thread
+
+
+def _to_float32(pcm16: bytes):
+    import numpy as np
+
+    return np.frombuffer(pcm16, dtype=np.int16).astype("float32") / 32768.0
+
+
+class _SherpaPipeline:
+    """Per-call VAD backed by shared, lazily imported sherpa-onnx models."""
+
+    def __init__(self, on_progress: Callable[[str], None] | None = None) -> None:
+        self._models = _get_shared_models(on_progress)
+        import sherpa_onnx
+
+        root = self._models.root
         vad_config = sherpa_onnx.VadModelConfig()
         vad_config.silero_vad.model = str(root / "silero_vad.onnx")
         vad_config.silero_vad.threshold = 0.5
@@ -136,32 +235,16 @@ class _SherpaPipeline:
         vad_config.sample_rate = 16000
         self._vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
 
-        stt_dir = root / "sherpa-onnx-paraformer-zh-2023-09-14"
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
-            paraformer=str(stt_dir / "model.int8.onnx"),
-            tokens=str(stt_dir / "tokens.txt"),
-            num_threads=2,
-        )
-
-        tts_config = local_models.build_tts_config(sherpa_onnx, root)
-        self._tts = sherpa_onnx.OfflineTts(tts_config)
-        self._speaker_id = config.get_int("LOCAL_TTS_SPEAKER_ID")
-        self.sample_rate = int(self._tts.sample_rate)
-        self.synthesize("你好。")  # Load lazy kernels before the first real turn; never output.
+        self.sample_rate = self._models.sample_rate
+        self.cached_phrases = self._models.cached_phrases
 
     def is_speech_detected(self) -> bool:
         return bool(self._vad.is_speech_detected())
 
-    # numpy 仅在真实管线里用（核心依赖已有）；fake 管线不需要。
-    def _to_float32(self, pcm16: bytes):
-        import numpy as np
-
-        return np.frombuffer(pcm16, dtype=np.int16).astype("float32") / 32768.0
-
     def vad_push(self, pcm16: bytes) -> list[bytes]:
         import numpy as np
 
-        self._vad.accept_waveform(self._to_float32(pcm16))
+        self._vad.accept_waveform(_to_float32(pcm16))
         segments: list[bytes] = []
         while not self._vad.empty():
             samples = self._vad.front.samples
@@ -181,17 +264,10 @@ class _SherpaPipeline:
         return segments
 
     def transcribe(self, segment_pcm16: bytes) -> str:
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(16000, self._to_float32(segment_pcm16))
-        self._recognizer.decode_stream(stream)
-        return (stream.result.text or "").strip()
+        return self._models.transcribe(segment_pcm16)
 
     def synthesize(self, text: str) -> bytes:
-        import numpy as np
-
-        audio = self._tts.generate(text, sid=self._speaker_id, speed=1.0)
-        samples = np.asarray(audio.samples, dtype="float32")
-        return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+        return self._models.synthesize(text)
 
 
 def _default_llm_chat(

@@ -18,6 +18,7 @@ from collections import OrderedDict
 from typing import Any, cast
 
 from . import config
+from .agents.local_llm import deepseek_body
 from .prompts import agent_persona, normalize_lang, owner_name
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ _DEFAULT_MODEL_BY_PROVIDER = {
     "qwen": "qwen-plus",
     "openai": "gpt-4o-mini",
 }
-_TEXT_BACKENDS = frozenset(_DEFAULT_MODEL_BY_PROVIDER)
+_TEXT_BACKENDS = frozenset(_DEFAULT_MODEL_BY_PROVIDER) | {"deepseek"}
 
 _SYSTEM_PROMPT = {
     "zh": (
@@ -95,11 +96,12 @@ def clear_cache() -> None:
 def text_backend_for_agent(provider: str | None = None) -> str:
     """Map the voice provider to the compatible auxiliary text backend.
 
-    OpenAI uses its own chat completions endpoint. Other voice providers keep
-    the historical Qwen text path; this preserves local/doubao behavior without
-    changing their realtime agent implementations.
+    Local DeepSeek uses the same backend as its conversational LLM. Other
+    non-OpenAI voice providers keep the historical Qwen text path.
     """
     selected = (provider or config.get_str("AGENT_PROVIDER")).strip().lower()
+    if selected == "local" and config.get_str("LOCAL_LLM_PROVIDER") == "deepseek":
+        return "deepseek"
     return "openai" if selected == "openai" else "qwen"
 
 
@@ -109,6 +111,8 @@ def select_text_model(provider: str, override: str | None = None) -> str:
     explicit = (override or "").strip()
     if explicit:
         return explicit
+    if selected == "deepseek":
+        return config.get_str("LOCAL_LLM_MODEL")
     return _DEFAULT_MODEL_BY_PROVIDER.get(selected, "qwen-plus")
 
 
@@ -130,6 +134,8 @@ def call_text_model(
         return None, "缺少环境变量 DASHSCOPE_API_KEY"
     if selected == "openai" and not os.environ.get("OPENAI_API_KEY", "").strip():
         return None, "缺少环境变量 OPENAI_API_KEY"
+    if selected == "deepseek" and not os.environ.get("DEEPSEEK_API_KEY", "").strip():
+        return None, "缺少环境变量 DEEPSEEK_API_KEY"
 
     def invoke() -> tuple[str | None, str | None]:
         try:
@@ -140,6 +146,7 @@ def call_text_model(
                 resolved_model,
                 timeout,
                 max_tokens=max_tokens,
+                provider=selected,
             )
         except Exception as exc:  # noqa: BLE001 - daemon request must not escape
             return None, f"文本模型请求失败: {type(exc).__name__}: {exc}"
@@ -224,19 +231,22 @@ def _call_openai_sync(
     timeout: float,
     *,
     max_tokens: int,
+    provider: str = "openai",
 ) -> tuple[str | None, str | None]:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": max_tokens,
-        }
-    ).encode("utf-8")
+    if provider == "deepseek":
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        url = config.get_str("LOCAL_LLM_BASE_URL").rstrip("/") + "/chat/completions"
+        request_body = deepseek_body(messages, None)
+        request_body["stream"] = False
+    else:
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        url = "https://api.openai.com/v1/chat/completions"
+        request_body = {"messages": messages}
+    request_body.update(model=model, temperature=0.2, max_tokens=max_tokens)
+    payload = json.dumps(request_body).encode("utf-8")
     try:
         status, body = _http_request_json(
-            "https://api.openai.com/v1/chat/completions",
+            url,
             method="POST",
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -319,6 +329,8 @@ def generate_prompt_scenario(
         if not config.get_bool("PROMPT_GEN_ENABLED"):
             return _fail("动态场景提示词生成已关闭", provider)
         selected_provider = (provider or config.get_str("AGENT_PROVIDER")).strip().lower()
+        if selected_provider == "local":
+            selected_provider = text_backend_for_agent(selected_provider)
         selected_timeout = timeout if timeout is not None else config.get_float("PROMPT_GEN_TIMEOUT")
         model = _select_model(selected_provider)
         messages = build_prompt_messages(
@@ -332,6 +344,10 @@ def generate_prompt_scenario(
             text, error = _call_qwen(messages, model, selected_timeout)
         elif selected_provider == "openai":
             text, error = _call_openai(messages, model, selected_timeout)
+        elif selected_provider == "deepseek":
+            text, error = call_text_model(
+                messages, provider=selected_provider, model=model, timeout=selected_timeout,
+            )
         else:
             return _fail(f"不支持的动态提示词提供方: {selected_provider}", selected_provider)
         if error is not None:

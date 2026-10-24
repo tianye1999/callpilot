@@ -620,6 +620,8 @@ def validate_provider_credentials(provider: str) -> list[str]:
         if not os.environ.get(key, "").strip():
             errors.append(f"缺少环境变量 {key}（{provider} 必需）")
     text_key = "OPENAI_API_KEY" if provider == "openai" else "DASHSCOPE_API_KEY"
+    if provider == "local":
+        text_key = required[0]
     if (
         get_str("DTMF_JUDGE_MODE") == "shadow"
         and not os.environ.get(text_key, "").strip()
@@ -648,6 +650,11 @@ def setup_required() -> bool:
 
 def runtime_meta(provider: str, model: str, port: str) -> dict:
     """Build /api/meta payload with non-fatal configuration readiness."""
+    if provider == "local":
+        model = (
+            f"本地 · {get_str('LOCAL_LLM_MODEL')} + "
+            f"{get_str('LOCAL_TTS_MODEL')}#{get_int('LOCAL_TTS_SPEAKER_ID')}"
+        )
     return {
         "provider": provider,
         "model": model,
