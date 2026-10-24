@@ -4,7 +4,8 @@
 
 This is offline *audio input*, not an offline LLM: running it sends recognized
 text to the configured provider and consumes API credits. Models may download
-on first use. Input is processed faster than real time, not replayed to a device.
+on first use. Input is not replayed to a device. The default is faster than real
+time; --segmented paces input in real time to overlap ASR with incoming speech.
 """
 
 from __future__ import annotations
@@ -67,6 +68,9 @@ class TimedPipeline:
     def vad_flush(self):
         return self._timed("vad_compute", self.pipeline.vad_flush)
 
+    def is_speech_detected(self):
+        return self.pipeline.is_speech_detected()
+
     def transcribe(self, segment):
         return self._timed("asr", self.pipeline.transcribe, segment)
 
@@ -121,11 +125,29 @@ async def run_benchmark(source: Path, output: Path, instructions: str) -> list[t
                 if agent._llm_failures:
                     raise RuntimeError("LLM failed; see the preceding provider error")
 
-        # Append silence so the last phrase can endpoint normally; flush any tail.
-        padded = pcm + b"\0\0" * 16000
-        for offset in range(0, len(padded), 1024):
-            await process(pipeline.vad_push(padded[offset:offset + 1024]))
-        await process(pipeline.vad_flush())
+        # Pace only the segmented comparison: otherwise a fast WAV producer
+        # artificially queues every segment before the ASR worker can catch up.
+        if config.get_bool("LOCAL_ASR_SEGMENTED"):
+            padding = max(1.0, config.get_float("LOCAL_TURN_SILENCE")
+                          + config.get_float("LOCAL_ASR_SEGMENT_SILENCE") + 0.1)
+            padded = pcm + b"\0\0" * round(padding * 16000)
+            for offset in range(0, len(padded), 1024):
+                frame = padded[offset:offset + 1024]
+                segments_seen += await asyncio.to_thread(agent._process_audio, frame)
+                deadline = ready_at + (offset + len(frame)) / 32000
+                await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+            segments_seen += await asyncio.to_thread(agent._process_audio, b"", flush=True)
+            await asyncio.to_thread(agent._asr_queue.join)
+            await asyncio.to_thread(agent._brain_queue.join)
+            await asyncio.to_thread(agent._tts_queue.join)
+            if agent._llm_failures:
+                raise RuntimeError("LLM failed; see the preceding provider error")
+        else:
+            # Append silence so the last phrase can endpoint normally; flush any tail.
+            padded = pcm + b"\0\0" * 16000
+            for offset in range(0, len(padded), 1024):
+                await process(pipeline.vad_push(padded[offset:offset + 1024]))
+            await process(pipeline.vad_flush())
         if not segments_seen:
             raise RuntimeError("VAD found no speech in the input WAV")
         if not chunks:
@@ -149,17 +171,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("wav", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--whole-tts", action="store_true", help="Use whole-response TTS as a baseline")
+    parser.add_argument("--segmented", action="store_true", help="Segmented ASR with real-time paced input")
     parser.add_argument("--instructions", default="你是电话助理。请用简短、自然的中文回答对方。")
     args = parser.parse_args(argv)
     load_dotenv(config.env_file_path())
     # This benchmark opts into clause TTS unless explicitly comparing the baseline.
     # Only this process's environment changes; the user's .env is never modified.
     os.environ["LOCAL_TTS_STREAMING"] = "false" if args.whole_tts else "true"
+    if args.segmented:
+        os.environ["LOCAL_ASR_SEGMENTED"] = "true"
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     output = args.output or args.wav.with_name(args.wav.stem + ".local-reply.wav")
     print("Uses configured LLM API credits; no SIM, Edge or audio device is used.")
     print(f"LLM={config.get_str('LOCAL_LLM_PROVIDER')}/{config.get_str('LOCAL_LLM_MODEL')} "
-          f"TTS={config.get_str('LOCAL_TTS_MODEL')} streaming={config.get_bool('LOCAL_TTS_STREAMING')}")
+          f"TTS={config.get_str('LOCAL_TTS_MODEL')} streaming={config.get_bool('LOCAL_TTS_STREAMING')} "
+          f"segmented={config.get_bool('LOCAL_ASR_SEGMENTED')}")
     try:
         rows = asyncio.run(run_benchmark(args.wav, output, args.instructions))
     except (ValueError, RuntimeError, OSError, wave.Error) as exc:
@@ -171,8 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{stage:28s} sum={sum(values):9.1f} ms  n={len(values)}  "
               f"min={min(values):.1f} max={max(values):.1f}")
     print(f"WAV: {output}")
-    print("Turn stages start at VAD endpoint delivery, like provider speech_stopped (includes ASR).")
-    print("VAD compute is measured separately; real-time silence hangover and phone playout are not replayed.")
+    print("Turn stages start at turn endpoint, like provider speech_stopped (includes remaining ASR tail).")
+    print("Segmented input is real-time paced; baseline input is faster than real time. Phone playout is not replayed.")
     return 0
 
 

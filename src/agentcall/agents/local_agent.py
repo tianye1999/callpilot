@@ -49,6 +49,13 @@ _LLM_FATAL_FAILURES = 3
 _MAX_TOOL_ROUNDS = 3
 
 
+def _positive_seconds(key: str) -> float:
+    seconds = config.get_float(key)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{key} 必须是有限正数")
+    return seconds
+
+
 class SpeechPipeline(Protocol):
     """三段式的本地管线接口：真实实现包 sherpa-onnx，测试注入 fake。"""
 
@@ -85,6 +92,17 @@ class _Turn:
 @dataclass
 class _UserSpeech:
     pcm: bytes
+    turn: _Turn
+
+
+@dataclass
+class _RecognizedSpeech:
+    text: str
+    turn: _Turn
+
+
+@dataclass
+class _AsrEnd:
     turn: _Turn
 
 
@@ -230,7 +248,10 @@ class _SherpaPipeline:
         vad_config = sherpa_onnx.VadModelConfig()
         vad_config.silero_vad.model = str(root / "silero_vad.onnx")
         vad_config.silero_vad.threshold = 0.5
-        vad_config.silero_vad.min_silence_duration = 0.6
+        vad_config.silero_vad.min_silence_duration = (
+            _positive_seconds("LOCAL_ASR_SEGMENT_SILENCE")
+            if config.get_bool("LOCAL_ASR_SEGMENTED") else 0.6
+        )
         vad_config.silero_vad.min_speech_duration = 0.25
         vad_config.sample_rate = 16000
         self._vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
@@ -361,11 +382,24 @@ class LocalPipelineAgent(VoiceAgent):
         self._deepseek = (DeepSeekChat() if llm_chat is None and llm_stream is None
                           and config.get_str("LOCAL_LLM_PROVIDER") == "deepseek" else None)
         self._streaming = config.get_bool("LOCAL_TTS_STREAMING")
+        self._segmented_asr = config.get_bool("LOCAL_ASR_SEGMENTED")
+        turn_silence = config.get_float("LOCAL_TURN_SILENCE") if self._segmented_asr else 0.0
+        if not math.isfinite(turn_silence):
+            raise ValueError("LOCAL_TURN_SILENCE 必须是有限数")
+        self._turn_silence_samples = round(turn_silence * self.input_rate)
+        self._segment_silence_samples = (
+            round(_positive_seconds("LOCAL_ASR_SEGMENT_SILENCE") * self.input_rate) if self._segmented_asr else 0
+        )
+        self._vad_speaking = False
+        self._asr_pending = False
+        self._silence_samples = 0
         self._pipeline: SpeechPipeline | None = None
         self._on_audio_out: Callable[[bytes], None] | None = None
         self._running = False
         self._audio_queue: Queue[bytes] = Queue()
-        self._brain_queue: Queue[_UserSpeech | _SayRequest] = Queue()
+        self._brain_queue: Queue[_UserSpeech | _RecognizedSpeech | _SayRequest] = Queue()
+        self._asr_queue: Queue[bytes | _AsrEnd] = Queue()
+        self._asr_thread: threading.Thread | None = None
         self._tts_queue: Queue[_TtsRequest] = Queue()
         self._tts_thread: threading.Thread | None = None
         self._turn: _Turn | None = None
@@ -383,6 +417,12 @@ class LocalPipelineAgent(VoiceAgent):
 
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
         self._on_audio_out = on_audio_out
+        if self._segmented_asr and self._turn_silence_samples <= self._segment_silence_samples:
+            logger.warning(
+                "LOCAL_TURN_SILENCE (%gs) <= LOCAL_ASR_SEGMENT_SILENCE (%gs)：吐段即判停",
+                self._turn_silence_samples / self.input_rate,
+                self._segment_silence_samples / self.input_rate,
+            )
         # 模型加载重（首次含 ~300MB 下载），放线程池，不卡 CallSession 事件循环。
         # 工厂支持 on_progress 时把下载进度播给 UI（首启体验）；fake 工厂不支持则退回无参。
         def _build() -> SpeechPipeline:
@@ -394,6 +434,8 @@ class LocalPipelineAgent(VoiceAgent):
                 pipeline = self._pipeline_factory(on_progress=self._emit_status)  # type: ignore[call-arg]
             except TypeError:
                 pipeline = self._pipeline_factory()
+            if self._segmented_asr and not callable(getattr(pipeline, "is_speech_detected", None)):
+                raise ValueError("分段识别管线需要 is_speech_detected()")
             for phrase in config.get_str("LOCAL_TTS_CACHE_PHRASES").split("|"):
                 if phrase.strip() and phrase not in self._tts_cache:
                     self._tts_cache[phrase] = normalize_peak(pipeline.synthesize(phrase), self._peak)
@@ -430,6 +472,9 @@ class LocalPipelineAgent(VoiceAgent):
         self._brain_thread = threading.Thread(
             target=self._brain_worker, name="local-brain", daemon=True
         )
+        if self._segmented_asr:
+            self._asr_thread = threading.Thread(target=self._asr_worker, name="local-asr", daemon=True)
+            self._asr_thread.start()
         self._vad_thread.start()
         self._brain_thread.start()
         if self._streaming:
@@ -481,10 +526,11 @@ class LocalPipelineAgent(VoiceAgent):
         if self._deepseek is not None:
             self._deepseek.close()
         # Never block the event loop while a model kernel / network call finishes.
-        for thread in (self._vad_thread, self._brain_thread, self._tts_thread):
+        for thread in (self._vad_thread, self._asr_thread, self._brain_thread, self._tts_thread):
             if thread is not None:
                 await asyncio.to_thread(thread.join, 3)
         self._vad_thread = None
+        self._asr_thread = None
         self._brain_thread = None
         self._tts_thread = None
         self._pipeline = None
@@ -493,29 +539,88 @@ class LocalPipelineAgent(VoiceAgent):
     # ---- worker 线程 ----
 
     def _vad_worker(self) -> None:
-        pipeline = self._pipeline
-        assert pipeline is not None
-        was_speaking = False
         while self._running:
             try:
                 pcm = self._audio_queue.get(timeout=0.2)
             except Empty:
                 continue
             try:
-                segments = pipeline.vad_push(pcm)
-                detector = getattr(pipeline, "is_speech_detected", None)
-                speaking = bool(detector()) if self._streaming and detector is not None else False
-                if self._streaming and ((speaking and not was_speaking) or (segments and not was_speaking)):
-                    # CallSession may reject barge-in during DTMF guard windows.
-                    with self._turn_lock:
-                        if self._on_user_interrupt is None or self._emit_user_interrupt():
-                            self._cancel_turn()
-                was_speaking = speaking
-                for segment in segments:
-                    turn = self._new_turn(time.monotonic())
-                    self._brain_queue.put(_UserSpeech(segment, turn))
+                self._process_audio(pcm)
             except Exception as exc:  # noqa: BLE001 - VAD 异常丢帧继续
                 logger.warning("VAD 处理失败（丢弃本帧）: %s", exc)
+            finally:
+                self._audio_queue.task_done()
+
+    def _process_audio(self, pcm: bytes, *, flush: bool = False) -> int:
+        pipeline = self._pipeline
+        assert pipeline is not None
+        segments = pipeline.vad_flush() if flush else pipeline.vad_push(pcm)
+        detector = getattr(pipeline, "is_speech_detected", None)
+        speaking = bool(detector()) if (self._streaming or self._segmented_asr) and detector else False
+        if self._streaming and not self._vad_speaking and (speaking or segments):
+            # Cancellation belongs to responses, never to unsubmitted ASR input.
+            with self._turn_lock:
+                if self._on_user_interrupt is None or self._emit_user_interrupt():
+                    self._cancel_turn()
+        self._vad_speaking = speaking
+        if not self._segmented_asr:
+            for segment in segments:
+                self._brain_queue.put(_UserSpeech(segment, self._new_turn(time.monotonic())))
+            return len(segments)
+        for segment in segments:
+            self._asr_pending = True
+            self._asr_queue.put(segment)
+        if flush:
+            self._finish_asr_turn()
+        elif speaking:
+            self._silence_samples = 0
+        elif self._asr_pending:
+            if segments:
+                # Silero delivers a segment only after observing this tail
+                # silence; credit it once, without also counting this frame.
+                self._silence_samples = self._segment_silence_samples
+            else:
+                self._silence_samples += len(pcm) // 2
+            if self._silence_samples >= self._turn_silence_samples:
+                self._finish_asr_turn()
+        return len(segments)
+
+    def _finish_asr_turn(self) -> None:
+        if self._asr_pending:
+            self._asr_pending = False
+            self._silence_samples = 0
+            self._asr_queue.put(_AsrEnd(self._new_turn(time.monotonic())))
+
+    def _asr_worker(self) -> None:
+        pipeline = self._pipeline
+        assert pipeline is not None
+        texts: list[str] = []
+        completed_at = 0.0
+        failed = False
+        while self._running:
+            try:
+                item = self._asr_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            try:
+                if isinstance(item, bytes):
+                    try:
+                        texts.append(pipeline.transcribe(item))
+                    except Exception as exc:  # noqa: BLE001 - do not submit a partial amount/menu
+                        failed = True
+                        logger.warning("ASR 小段识别失败（跳过本轮）: %s", exc)
+                    finally:
+                        completed_at = time.monotonic()
+                else:
+                    # The FIFO marker is a barrier after the last segment. If ASR
+                    # finished during speech, tail is zero, not marker scheduling time.
+                    self._mark_latency(item.turn, "asr_tail", at=completed_at)
+                    if not failed and self._running:
+                        self._brain_queue.put(_RecognizedSpeech("".join(texts), item.turn))
+                    texts = []
+                    failed = False
+            finally:
+                self._asr_queue.task_done()
 
     def _brain_worker(self) -> None:
         pipeline = self._pipeline
@@ -530,22 +635,31 @@ class LocalPipelineAgent(VoiceAgent):
                     self._handle_say(item.instructions)
                     continue
                 # utterance 合并：LLM 忙期间堆积的语音段拼成同一轮。
-                segments = [item.pcm]
+                utterances = [item]
                 turn = item.turn
                 while True:
                     try:
                         follow = self._brain_queue.get_nowait()
                     except Empty:
                         break
+                    self._brain_queue.task_done()
                     if isinstance(follow, _SayRequest):
                         self._brain_queue.put(follow)  # say 不并轮，退回队列
                         break
-                    segments.append(follow.pcm)
+                    utterances.append(follow)
                     turn = follow.turn
-                if not turn.cancelled.is_set():
-                    self._handle_user_speech(b"".join(segments), turn)
+                if isinstance(item, _RecognizedSpeech):
+                    self._handle_user_text("".join(
+                        u.text for u in utterances if isinstance(u, _RecognizedSpeech)
+                    ), turn)
+                elif not turn.cancelled.is_set():
+                    self._handle_user_speech(b"".join(
+                        u.pcm for u in utterances if isinstance(u, _UserSpeech)
+                    ), turn)
             except Exception as exc:  # noqa: BLE001 - 单轮失败不杀线程
                 logger.warning("brain 处理一轮失败: %s", exc)
+            finally:
+                self._brain_queue.task_done()
 
     # ---- 每轮语义 ----
 
@@ -554,6 +668,13 @@ class LocalPipelineAgent(VoiceAgent):
         assert pipeline is not None
         text = pipeline.transcribe(segment)
         if not text or turn.cancelled.is_set() or not self._running:
+            return
+        self._handle_user_text(text, turn)
+
+    def _handle_user_text(self, text: str, turn: _Turn) -> None:
+        # A new utterance can cancel a response before its ASR barrier completes.
+        # Preserve recognized input in history even when that response is obsolete.
+        if not text or not self._running:
             return
         logger.info("[上行·用户] %s", text)
         self._emit_transcript("user", text)
@@ -720,12 +841,13 @@ class LocalPipelineAgent(VoiceAgent):
                     break
                 self._tts_queue.task_done()
 
-    def _mark_latency(self, turn: _Turn, stage: str) -> None:
+    def _mark_latency(self, turn: _Turn, stage: str, *, at: float | None = None) -> None:
         with self._turn_lock:
             if turn.ended_at is None or stage in turn.stages or turn.cancelled.is_set():
                 return
             turn.stages.add(stage)
-            self._emit_latency(stage, round((time.monotonic() - turn.ended_at) * 1000, 1))
+            elapsed = (time.monotonic() if at is None else at) - turn.ended_at
+            self._emit_latency(stage, round(max(0.0, elapsed) * 1000, 1))
 
     def _discard_batch(self, batch: _SpeechBatch) -> None:
         with self._turn_lock:

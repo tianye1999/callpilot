@@ -13,6 +13,9 @@ from agentcall import config
     ("LOCAL_LLM_BASE_URL", "https://api.deepseek.com"),
     ("DEEPSEEK_API_KEY", ""),
     ("LOCAL_LLM_THINKING", "disabled"),
+    ("LOCAL_ASR_SEGMENTED", "false"),
+    ("LOCAL_ASR_SEGMENT_SILENCE", "0.25"),
+    ("LOCAL_TURN_SILENCE", "0.6"),
     ("LOCAL_TTS_MODEL", "vits-piper-zh_CN-chaowen-medium-int8"),
     ("LOCAL_TTS_SPEAKER_ID", "0"),
     ("LOCAL_TTS_STREAMING", "false"),
@@ -35,3 +38,8 @@ def test_deepseek_credentials_do_not_require_dashscope(monkeypatch):
     assert config.get_spec("DEEPSEEK_API_KEY").secret
     monkeypatch.setenv("LOCAL_LLM_PROVIDER", "dashscope")
     assert "DASHSCOPE_API_KEY" in config.validate_provider_credentials("local")[0]
+
+
+def test_turn_silence_label_describes_physical_silence():
+    label = config.get_spec("LOCAL_TURN_SILENCE").label
+    assert "物理静音" in label and "含切段等待" in label
