@@ -255,7 +255,7 @@ def test_non_ai_calls_have_one_durable_record_and_masked_logs(phone, tmp_path, c
         modem.handle_signal(MODEM, "org.ofono.VoiceCallManager", "CallRemoved", [CALL])
     records = list(tmp_path.glob("*/meta.json"))
     assert len(records) == 1
-    assert json.loads(records[0].read_text())["status"] == "missed"
+    assert json.loads(records[0].read_text(encoding="utf-8"))["status"] == "missed"
     assert NUMBER not in caplog.text and NUMBER.lstrip("+") not in caplog.text
     assert not service.session.is_busy
 
@@ -287,7 +287,7 @@ def test_offline_cancels_delayed_answer_and_finishes_record(phone, monkeypatch, 
     modem.poll_once(now[0])
     assert not modem.inbound_ready and not service.session.is_busy
     assert "Register" not in methods(bus)
-    assert json.loads(next(tmp_path.glob("*/meta.json")).read_text())["status"] == "missed"
+    assert json.loads(next(tmp_path.glob("*/meta.json")).read_text(encoding="utf-8"))["status"] == "missed"
 
 
 @pytest.mark.parametrize("parallel", [False, True])
@@ -323,11 +323,11 @@ def test_real_service_inbound_session_records_audio_transcript_and_cleanup(phone
     assert methods(bus).count("Unregister") == 1
     records = list(tmp_path.glob("*/meta.json"))
     assert len(records) == 1
-    meta = json.loads(records[0].read_text())
+    meta = json.loads(records[0].read_text(encoding="utf-8"))
     assert meta["status"] == "completed" and meta["answered"] is True
     assert meta["direction"] == "inbound" and meta["uplink_bytes"] == 320
     assert records[0].with_name("uplink.wav").exists()
-    assert "A fictional message" in records[0].with_name("events.jsonl").read_text()
+    assert "A fictional message" in records[0].with_name("events.jsonl").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("parallel", [False, True])
@@ -376,7 +376,7 @@ def test_owner_answer_record_is_answered_without_recording(phone, tmp_path):
     modem.handle_signal(CALL, "org.ofono.VoiceCall", "PropertyChanged", ["State", "active"])
     bus.state(None)
     modem.handle_signal(MODEM, "org.ofono.VoiceCallManager", "CallRemoved", [CALL])
-    meta = json.loads(next(tmp_path.glob("*/meta.json")).read_text())
+    meta = json.loads(next(tmp_path.glob("*/meta.json")).read_text(encoding="utf-8"))
     assert meta["status"] == "owner_answered" and meta["answered"]
     assert not meta["recording_enabled"] and meta["uplink_bytes"] == 0
 
@@ -547,8 +547,11 @@ def test_sco_close_fences_ai_then_classifies_and_finalizes_record(
     assert [event["status"] for event in events].count("owner_took_over") == int(not remote_ended)
     records = list(tmp_path.glob("*/meta.json"))
     assert len(records) == 1
-    assert json.loads(records[0].read_text())["status"] == ("completed" if remote_ended else "owner_took_over")
-    assert ('"type": "owner_took_over"' in records[0].with_name("events.jsonl").read_text()) is not remote_ended
+    assert json.loads(records[0].read_text(encoding="utf-8"))["status"] == (
+        "completed" if remote_ended else "owner_took_over"
+    )
+    events_text = records[0].with_name("events.jsonl").read_text(encoding="utf-8")
+    assert ('"type": "owner_took_over"' in events_text) is not remote_ended
 
 
 @pytest.mark.parametrize("final_state", ["active", "disconnected", "removed"])
@@ -619,7 +622,9 @@ def test_record_waits_for_live_sco_classification(phone, monkeypatch, tmp_path, 
     asyncio.run(asyncio.wait_for(scenario(), timeout=2))
     meta_path = next(tmp_path.glob("*/meta.json"))
     takeover = final_state == "active"
-    assert json.loads(meta_path.read_text())["status"] == ("owner_took_over" if takeover else "completed")
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["status"] == (
+        "owner_took_over" if takeover else "completed"
+    )
     assert statuses(events).count("owner_took_over") == int(takeover)
     assert not {"Hangup", "HangupAll", "Connect"}.intersection(methods(bus))
     assert methods(bus).count("Unregister") == 1
@@ -728,7 +733,7 @@ def test_inbound_configuration_defaults_and_registry(monkeypatch):
     assert config.get_int("INBOUND_AI_ANSWER_AFTER_SECONDS") == 15
     assert config.get_spec("INBOUND_AI_ALLOWLIST").hidden
     assert not config.get_spec("INBOUND_AI_ALLOWLIST").editable
-    example = (Path(__file__).parents[2] / ".env.example").read_text()
+    example = (Path(__file__).parents[2] / ".env.example").read_text(encoding="utf-8")
     assert "INBOUND_AI_ANSWER_MODE=off" in example
     assert "INBOUND_AI_ALLOWLIST=\n" in example
     assert "INBOUND_AI_ANSWER_AFTER_SECONDS=15" in example

@@ -282,7 +282,7 @@ def test_call_session_real_hfp_bridge_cleanup_and_records(tmp_path, monkeypatch,
     assert methods(bus).count("Unregister") == 1
     records = list(tmp_path.glob("*/meta.json"))
     assert len(records) == 1
-    meta = json.loads(records[0].read_text())
+    meta = json.loads(records[0].read_text(encoding="utf-8"))
     assert meta["direction"] == "outbound"
     assert meta["status"] == ("failed" if failure else "completed")
     assert records[0].with_name("events.jsonl").exists()

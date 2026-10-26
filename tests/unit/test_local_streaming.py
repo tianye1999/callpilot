@@ -351,6 +351,18 @@ def test_thinking_tool_rounds_and_new_user_preserve_reasoning_privately(monkeypa
             return response
 
     connection, transcripts, audio, calls = Connection(), [], [], []
+    completed = threading.Condition()
+
+    def on_transcript(role, text):
+        with completed:
+            transcripts.append((role, text))
+            completed.notify_all()
+
+    def on_audio(pcm):
+        with completed:
+            audio.append(pcm)
+            completed.notify_all()
+
     monkeypatch.setattr(local_llm.http.client, "HTTPSConnection", lambda *a, **kw: connection)
     pipeline = FakePipeline()
     registry = ToolRegistry()
@@ -359,13 +371,21 @@ def test_thinking_tool_rounds_and_new_user_preserve_reasoning_privately(monkeypa
     }}, lambda args: calls.append(args) or {"success": True})
     agent = LocalPipelineAgent(pipeline_factory=lambda: pipeline)
     agent.set_tools(registry)
-    agent.set_transcript_handler(lambda role, text: transcripts.append((role, text)))
-    asyncio.run(agent.start(audio.append))
+    agent.set_transcript_handler(on_transcript)
+    asyncio.run(agent.start(on_audio))
     try:
         asyncio.run(agent.send_audio(b"first"))
-        assert _wait_until(lambda: len(audio) == 1)
+        # Streaming TTS can deliver PCM before the brain publishes the final
+        # transcript. This history test does not intend to interrupt that turn.
+        with completed:
+            assert completed.wait_for(
+                lambda: len(audio) == 1 and transcripts[-1:] == [("agent", "第一句。")], timeout=3,
+            )
         asyncio.run(agent.send_audio(b"next"))
-        assert _wait_until(lambda: len(audio) == 2)
+        with completed:
+            assert completed.wait_for(
+                lambda: len(audio) == 2 and transcripts[-1:] == [("agent", "第二句。")], timeout=3,
+            )
         assert calls == [{}, {}]
         assert len(connection.requests) == 4
         for i, (_, _, body, _) in enumerate(connection.requests):
