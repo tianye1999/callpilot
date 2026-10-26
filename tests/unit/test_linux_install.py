@@ -149,6 +149,7 @@ case "$tool" in
         if [ "${1:-}" = -u ]; then printf '%s\n' "${TEST_UID:-1000}"; else printf 'edge\n'; fi
         ;;
     uv) if [ "$*" = 'python find 3.13' ]; then printf '%s\n' "$REAL_PYTHON"; fi ;;
+    wireplumber) printf '%s\n' "${TEST_WP_VERSION:-wireplumber 0.4.13}" ;;
     systemctl)
         if [ "${1:-}" = is-active ] && [ "${TEST_SERVICE_ACTIVE:-}" = 0 ]; then exit 3; fi
         ;;
@@ -172,7 +173,7 @@ case "$tool" in
                 mkdir -p -- "${target%/*}"
                 cp -- "${args[$(($# - 2))]}" "$target"
                 ;;
-            usermod|true|systemctl) exec "$executable" "${@:2}" ;;
+            usermod|true|systemctl|apt-get) exec "$executable" "${@:2}" ;;
         esac
         ;;
 esac
@@ -204,6 +205,7 @@ def installer(tmp_path, fake_tool):
     for name in (
         "uname", "id", "getent", "sudo", "true", "uv", "ffmpeg", "systemctl",
         "udevadm", "usermod", "git", "curl",
+        "wireplumber", "apt-get",
     ):
         (bin_dir / name).symlink_to(fake_tool)
     venv = root / ".venv" / "bin"
@@ -225,6 +227,45 @@ def installer(tmp_path, fake_tool):
         )
 
     return root, trace, Path(env["SYSTEM_ROOT"]), bin_dir, run
+
+
+def test_bluetooth_setup_is_opt_in_and_preserves_env(installer):
+    root, trace, system_root, _, run = installer
+    before = (root / ".env").read_bytes()
+    result = run("--bluetooth")
+    assert result.returncode == 0, result.stderr
+    assert (root / ".env").read_bytes() == before
+    home = root.parent / "home"
+    lua = (home / ".config/wireplumber/bluetooth.lua.d/51-callpilot-bluetooth.lua").read_text()
+    assert '["bluez5.hfphsp-backend"] = "none"' in lua
+    assert '["bluez5.roles"] = "[ a2dp_source ]"' in lua
+    policy = (system_root / "etc/dbus-1/system.d/callpilot-ofono.conf").read_text()
+    assert 'user="edge"' in policy and 'send_destination="org.ofono"' in policy
+    calls = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert ["apt-get", "install", "-y", "ofono"] in calls
+    assert ["systemctl", "enable", "--now", "bluetooth", "ofono"] in calls
+    assert ["systemctl", "--user", "restart", "wireplumber"] in calls
+    assert any(call[0:3] == ["uv", "pip", "install"] and call[-1].endswith("[bluetooth]") for call in calls)
+    assert not any("pactl" in call for call in calls)
+
+
+def test_bluetooth_helper_refuses_unconfirmed_idle_or_wireplumber_05(installer):
+    _, trace, system_root, _, run = installer
+    result = run(script="setup-bluetooth.sh")
+    assert result.returncode != 0 and "idle-confirmed" in result.stderr
+    result = run("--idle-confirmed", script="setup-bluetooth.sh", TEST_WP_VERSION="wireplumber 0.5.0")
+    assert result.returncode != 0 and "0.4.x only" in result.stderr
+    assert not system_root.exists()
+    calls = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert all(call[0] not in {"uv", "sudo", "apt-get"} for call in calls)
+
+
+@pytest.mark.parametrize("script", ["install.sh", "update.sh"])
+def test_bluetooth_help_is_read_only(installer, script):
+    _, trace, _, _, run = installer
+    result = run("--help", script=script)
+    assert result.returncode == 0 and "--bluetooth" in result.stdout
+    assert not trace.exists()
 
 
 def test_install_is_repeatable_and_now_is_explicit(installer):

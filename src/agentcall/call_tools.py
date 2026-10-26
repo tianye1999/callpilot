@@ -240,6 +240,8 @@ class CallTools:
 
     def _send_sms(self, args: dict) -> dict:
         """工具处理：Agent 在通话中请求发送短信。"""
+        if not getattr(self._modem, "supports_sms", True):
+            return self._sms_unavailable("send_sms")
         stale = self._stale_effect_result("send_sms", args)
         if stale is not None:
             return stale
@@ -508,6 +510,8 @@ class CallTools:
 
     def _query_code(self, args: dict) -> dict:
         """工具处理：从最近收到的短信里查验证码。"""
+        if not getattr(self._modem, "supports_sms", True):
+            return self._sms_unavailable("query_verification_code")
         stale = self._stale_effect_result("query_verification_code", args)
         if stale is not None:
             return stale
@@ -540,6 +544,8 @@ class CallTools:
         时间窗从调用时刻起算——不吃通话前的旧短信（query_verification_code
         的已知坑：会捞到历史验证码）。跑在工具线程，不阻塞音频主循环。
         """
+        if not getattr(self._modem, "supports_sms", True):
+            return self._sms_unavailable("wait_for_sms")
         stale = self._stale_effect_result("wait_for_sms", args)
         if stale is not None:
             return stale
@@ -577,6 +583,12 @@ class CallTools:
             "code": code_match.group(1) if code_match else None,
             "message": "新短信已到达",
         }
+
+    def _sms_unavailable(self, tool: str) -> dict:
+        result = {"success": False, "code": "SMS_UNSUPPORTED",
+                  "message": "蓝牙手机线路不支持短信或验证码读取；请在手机上查看，或通过 ask_owner 请求机主提供。"}
+        self._audit_tool(tool, args={}, result=result)
+        return result
 
     def _find_latest_code(self) -> tuple[str | None, str | None, str | None]:
         """在已收到的短信中查找最近的数字验证码。

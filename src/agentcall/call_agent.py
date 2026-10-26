@@ -30,6 +30,8 @@ from .audio_bridge import (
     apply_pcm_gain,
     create_audio_bridge,
 )
+from .bluetooth_audio import BluetoothAudioBridge
+from .bluetooth_modem import BluetoothModem
 from .call_log import CallLogger, CallRecord
 from .call_tools import CallTools
 from .cloud_credentials import CloudCredentialStore
@@ -126,7 +128,7 @@ _OUTCOME_WINDOW_SECONDS = 8.0
 _OUTCOME_LATE_GRACE_SECONDS = 30.0
 
 
-AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge
+AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge | BluetoothAudioBridge
 
 # Agent 说话结束后，再屏蔽上行这么久，吸收模组回采的尾音回声。
 # （仅作缺省值；每通会话开始时从 config.HALF_DUPLEX_HANGOVER_SECONDS 重新读取。）
@@ -575,6 +577,7 @@ class CallSession:
                 record.log_event("pcm_enable", **enable_info)
 
             bridge = create_audio_bridge(
+                modem=self.modem,
                 mode=self.audio_mode,
                 device_keyword=self.audio_keyword,
                 pcm_port=self.pcm_port,
@@ -618,6 +621,12 @@ class CallSession:
             status = "failed"
             raise
         finally:
+            if isinstance(self.modem, BluetoothModem):
+                # Includes provider/bridge construction failures and cancelled startup.
+                try:
+                    await asyncio.to_thread(self.modem.hangup)
+                except Exception:
+                    logger.warning("Bluetooth call cleanup failed", exc_info=True)
             if self._wrap_up_carrier_sms_enabled:
                 await self._stop_wrap_up_sms_judge()
             # 先作废判官世代再 finish record，避免迟到结果在 meta 落盘后追加事件。
@@ -749,6 +758,8 @@ class CallSession:
                 boundary = {
                     "nmea": "pcm_written", "uac": "audio_device_written", "uac_ffmpeg": "playback_pipe_written",
                 }[self.audio_mode]
+                if isinstance(self.modem, BluetoothModem):
+                    boundary = "sco_written"
                 mark("first_audio", boundary=boundary, **({"ms": elapsed} if elapsed is not None else {}))
             if elapsed is not None:
                 logger.info("首音频延迟: %dms (本地下行写出)", elapsed)
@@ -791,6 +802,7 @@ class CallSession:
                 return
             mark("pcm_ready")
             bridge = create_audio_bridge(
+                modem=self.modem,
                 mode=self.audio_mode, device_keyword=self.audio_keyword, pcm_port=self.pcm_port,
                 pcm_baudrate=self.pcm_baudrate, tx_gain=self.tx_gain,
             )
@@ -1538,6 +1550,7 @@ class CallSession:
             old_bridge.stop()
             old_stopped = True
             new_bridge = create_audio_bridge(
+                modem=self.modem,
                 mode=self.audio_mode,
                 device_keyword=self.audio_keyword,
                 pcm_port=self.pcm_port,
@@ -1691,7 +1704,7 @@ class CallSession:
         self._wrap_up_sms_started_at = 0.0
         self._wrap_up_sms_seen = set()
         self._wrap_up_sms_evidence = []
-        if config.get_bool("WRAP_UP_JUDGE_CARRIER_SMS"):
+        if config.get_bool("WRAP_UP_JUDGE_CARRIER_SMS") and getattr(self.modem, "supports_sms", True):
             sim = getattr(self.modem, "sim_identity", None)
             service_number = str(getattr(sim, "service_number", "") or "")
             if is_carrier_service_call(self._outbound_number, service_number):
@@ -1883,6 +1896,7 @@ class CallSession:
                 should_collect_evidence = (
                     direction == "outbound"
                     and is_carrier_service_call(number, service_number)
+                    and getattr(self.modem, "supports_sms", True)
                 )
                 if self.hub is not None and should_collect_evidence:
                     self.hub.wait_for_event(
@@ -2323,6 +2337,12 @@ class CallSession:
                     **fields,
                 })
         triage_mode = self._triage_mode if direction == "inbound" else "off"
+        if not getattr(self.modem, "supports_sms", True):
+            note = (
+                "This Bluetooth HFP line cannot send or receive SMS or read verification codes. "
+                "Do not wait for SMS; ask the owner via ask_owner when needed."
+            )
+            scenario = f"{scenario}\n{note}" if scenario else note
         takeover_preference = (
             config.get_str("INBOUND_TAKEOVER_PREFERENCE")
             if direction == "inbound"
@@ -2596,7 +2616,7 @@ class CallSession:
         )
         self._result_verification_mode = (
             "carrier_sms"
-            if result.get("result_verification") == "carrier_sms"
+            if result.get("result_verification") == "carrier_sms" and getattr(self.modem, "supports_sms", True)
             else "none"
         )
         # 长通话覆盖（WIL-120 一期）：仅 profile 来源提供；动态生成结果无此键。
@@ -3337,6 +3357,8 @@ class CallSession:
                 self._pending_dtmf_outcome["action_id"] = entry.action_id
 
     def _resolve_dtmf_mode(self) -> str:
+        if isinstance(self.modem, BluetoothModem):
+            return "qvts"  # Existing out-of-band dispatch delegates to oFono SendTones.
         configured = config.get_str("DTMF_MODE").strip().lower()
         if configured not in {"inband", "qvts", "both"}:
             configured = "inband"
@@ -4047,6 +4069,10 @@ class CallAgentService:
 
     def _setup_callbacks(self) -> None:
         def on_ring(caller: str | None) -> None:
+            if not getattr(self.modem, "auto_answer", True):
+                self._publish({"type": "call", "status": "incoming_skipped", "caller": caller,
+                               "reason": "bluetooth_outbound_only"})
+                return
             # 同一通来电会被 RING 主动上报和 CLCC 轮询重复触发，需去重：
             # 已有会话进行中时直接忽略，避免重复接听 / 抢占 PCM 串口导致崩溃。
             with self._ring_lock:
@@ -4155,7 +4181,8 @@ class CallAgentService:
                 guard_failure = self._dial_guard(number)
                 if guard_failure is not None:
                     return False, guard_failure.message
-            if self.session.is_busy or self._remote_call_owner is not None:
+            if (self.session.is_busy or self._remote_call_owner is not None
+                    or (isinstance(self.modem, BluetoothModem) and self.modem.phone_call_busy)):
                 return False, "当前正在通话中，请稍后再拨"
             self.session.current_caller = number
             if preset_id is None:
@@ -4372,7 +4399,7 @@ class CallAgentService:
 
             return livekit_media_host(config.get_str("LIVEKIT_URL"))
 
-        enabled = config.get_bool("REMOTE_WEB_DIALER_ENABLED")
+        enabled = config.get_bool("REMOTE_WEB_DIALER_ENABLED") and not isinstance(self.modem, BluetoothModem)
         cloud_enabled = config.get_bool("REMOTE_CLOUD_ENABLED")
         required = (
             ("REMOTE_CLOUD_URL",)
@@ -4409,7 +4436,8 @@ class CallAgentService:
         with self._ring_lock:
             local_session_active = self.session.is_busy
             remote_call_active = self._remote_call_owner is not None
-        return remote_session_active or local_session_active or remote_call_active
+        phone_active = isinstance(self.modem, BluetoothModem) and self.modem.phone_call_busy
+        return remote_session_active or local_session_active or remote_call_active or phone_active
 
     def next_inbound_takeover_offer(
         self, timeout: float = 0.0
@@ -4525,6 +4553,8 @@ class CallAgentService:
     def _reserve_remote_line(
         self, owner: RemoteWebDialerCoordinator
     ) -> str | DialGuardFailure | None:
+        if isinstance(self.modem, BluetoothModem):
+            return "蓝牙线路 Phase 1 仅支持 AI 外呼，暂不支持非 AI 的远程网页通话"
         with self._ring_lock:
             worker = self._remote_worker
             if worker is None or worker.coordinator is not owner:
@@ -4546,6 +4576,8 @@ class CallAgentService:
         return None
 
     def _dial_guard(self, number: str | None) -> DialGuardFailure | None:
+        if isinstance(self.modem, BluetoothModem) and not self.modem.is_connected():
+            return DialGuardFailure("MODEM_OFFLINE", "手机未连接，请检查手机蓝牙与 HFP 连接")
         return check_dial_guard(
             modem_online=self.modem_connected and not self.modem.recovery_in_progress
             if self._sim7600_reset is not None else self.modem_connected,
@@ -4641,6 +4673,9 @@ class CallAgentService:
             if not self._service_running:
                 self.modem.close()
                 return
+            if isinstance(self.modem, BluetoothModem):
+                self._set_modem_connected(self.modem.is_connected())
+                return  # HFP listener owns reconnection, not the serial-port watchdog.
             self._set_modem_connected(True)
             logger.info("模组已连接，等待来电…")
             self._watch_modem_link()

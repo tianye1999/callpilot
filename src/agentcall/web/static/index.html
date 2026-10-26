@@ -390,6 +390,7 @@
   /* ========= 短信面板 ========= */
   #page-sms .wrap { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
   #smsList { max-height: calc(100vh - 420px); overflow-y: auto; padding: 14px 20px; }
+  #smsCapability { margin: 14px 20px 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
   .sms-item {
     padding: 10px 13px; border-radius: 12px; margin-bottom: 10px;
     background: var(--well); border: 1px solid var(--border);
@@ -972,6 +973,7 @@
       <div class="wrap">
         <section class="card">
           <h2 data-i18n="sms_title"></h2>
+          <p class="hint" id="smsCapability" hidden></p>
           <div id="smsList"><div class="empty" id="smsEmpty" data-i18n="empty_sms"></div></div>
           <div class="sms-form">
             <input id="smsNumber" type="text" data-i18n-ph="ph_number" />
@@ -1343,6 +1345,8 @@ const I18N = {
     st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
     conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
     modem_on: "Modem ready", modem_off: "Modem offline",
+    phone_on: "Phone connected", phone_off: "Phone disconnected", phone_line: "Bluetooth phone",
+    phone_signal: "Phone signal", phone_sms_unavailable: "SMS is unavailable on this Bluetooth line. Use the phone.",
     modem_resetting: "Modem restarting (about 30 seconds)",
     keypad: "Keys", hangup: "Hang up",
     dial_label: "MAKE A CALL", preset_label: "PRESET TASK", preset_custom: "Custom (manual input)",
@@ -1612,6 +1616,8 @@ const I18N = {
     st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
     conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
     modem_on: "模组就绪", modem_off: "模组未连接",
+    phone_on: "手机已连接", phone_off: "手机未连接", phone_line: "蓝牙手机线路",
+    phone_signal: "手机信号", phone_sms_unavailable: "蓝牙线路不支持短信，请在手机上收发短信。",
     modem_resetting: "模组重启中（约 30 秒）",
     keypad: "按键", hangup: "挂断",
     dial_label: "拨打电话", preset_label: "预设任务", preset_custom: "自定义（手动输入）",
@@ -2064,7 +2070,11 @@ function setModem(connected, resetting = false) {
   modemResetting = resetting;
   $("modemDot").classList.toggle("on", connected && !resetting);
   $("modemDot").classList.toggle("resetting", resetting);
-  $("modemState").textContent = t(modemResetting ? "modem_resetting" : connected ? "modem_on" : "modem_off");
+  const phoneLine = lastMeta?.hardware?.line_kind === "bluetooth";
+  $("modemState").textContent = phoneLine
+    ? [t(connected ? "phone_on" : "phone_off"), ...(connected ? [lastMeta.sim?.carrier,
+        lastMeta.hardware.signal_strength == null ? "" : `${lastMeta.hardware.signal_strength}%`] : [])].filter(Boolean).join(" · ")
+    : t(modemResetting ? "modem_resetting" : connected ? "modem_on" : "modem_off");
 }
 let metaRefreshTimer = null;
 function scheduleMetaRefresh() {
@@ -2079,6 +2089,10 @@ function handleEvent(ev) {
     }
     scheduleMetaRefresh();
   } else if (ev.type === "call") {
+    if (ev.status === "incoming_skipped") {
+      scheduleMetaRefresh();
+      return;
+    }
     setCall(ev.status, ev.caller);
     if (ev.status === "ended") setTimeout(() => { loadHistory(); loadRecent(); }, 1200);
   } else if (ev.type === "transcript") {
@@ -2372,7 +2386,19 @@ async function loadMeta() {
     }
     $("model").textContent = m.model || "-";
     $("provider").textContent = m.provider || "-";
-    $("portSub").textContent = t("modem_prefix") + (m.port || "-");
+    const phoneLine = m.hardware?.line_kind === "bluetooth";
+    const strength = m.hardware?.signal_strength;
+    $("portSub").textContent = phoneLine
+      ? [t("phone_line"), m.sim?.carrier || "-", strength == null ? "" : `${strength}%`].filter(Boolean).join(" · ")
+      : t("modem_prefix") + (m.port || "-");
+    const smsAvailable = m.capabilities?.sms !== false;
+    $("smsCapability").hidden = smsAvailable;
+    $("smsCapability").textContent = smsAvailable ? "" : t("phone_sms_unavailable");
+    for (const id of ["smsSend", "setupSendSms"]) {
+      $(id).disabled = !smsAvailable;
+      $(id).title = smsAvailable ? "" : t("phone_sms_unavailable");
+    }
+    if (!smsAvailable) setupStatus("setupTestStatus", "", t("phone_sms_unavailable"));
     renderSetupHardware();
     syncRecordingUi();
     if (m.setup_required && !$("setupWizard").classList.contains("show")) {
@@ -3717,15 +3743,16 @@ function renderSetupHardware() {
   if (!box) return;
   box.textContent = "";
   const sim = meta.sim || {};
+  const phoneLine = hw.line_kind === "bluetooth";
   const simRegistration = !sim.registered && sim.eps_registered
     ? `网络已接入 · LTE ${sim.eps_status}` : sim.reg_status;
   const simText = sim.present
     ? `${sim.carrier} · ${simRegistration}` + (sim.service_number ? ` · 客服 ${sim.service_number}` : "")
     : "-";
   for (const [label, value] of [
-    [t("setup_usb"), statusWord(!!hw.usb_online)],
+    [phoneLine ? t("phone_line") : t("setup_usb"), statusWord(phoneLine ? !!hw.phone_connected : !!hw.usb_online)],
     [t("setup_at"), statusWord(!!hw.modem_connected)],
-    [t("setup_port"), hw.port || "-"],
+    [phoneLine ? t("phone_signal") : t("setup_port"), phoneLine ? (hw.signal_strength == null ? "-" : `${hw.signal_strength}%`) : hw.port || "-"],
     [t("setup_sim"), simText],
   ]) {
     const row = el("div", "line");
@@ -3733,7 +3760,7 @@ function renderSetupHardware() {
     row.appendChild(el("span", "", value));
     box.appendChild(row);
   }
-  const ready = !!hw.usb_online && !!hw.modem_connected;
+  const ready = (phoneLine || !!hw.usb_online) && !!hw.modem_connected;
   setupStatus("setupHwStatus", ready ? "ok" : "err", ready ? t("setup_hw_ok") : t("setup_hw_wait"));
 }
 

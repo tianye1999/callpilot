@@ -608,3 +608,20 @@ macOS 版本、以及哪里成功/失败开 issue。测试：`.venv/bin/pytest`�
 模组原子能力（原始 AT、拨号、短信、DTMF），见 [`examples/modem/`](examples/modem/)。
 
 许可证：[Apache-2.0](LICENSE)。
+
+## Optional Bluetooth Phone Line (Linux / Pi)
+
+Phase 1 supports AI outbound calls through a paired Android phone using oFono
+HFP and an Edge-owned CVSD audio agent. The SIM stays in the phone. Incoming
+calls only produce events; Edge never answers them or claims their audio.
+SMS and verification-code reading are unavailable on this line.
+
+Opt in with `bash scripts/linux/install.sh --bluetooth` (or
+`bash scripts/linux/update.sh --bluetooth` on an existing installation), only
+when the phone itself has no active calls. Default installs are unchanged.
+Set `MODEM_VENDOR=bluetooth` and `BLUETOOTH_PHONE_ADDRESS` in local `.env`;
+serial/audio-mode settings are ignored for this line. Do not publish the phone
+address. See [Pi pairing, prerequisites and acceptance](docs/raspberry-pi.md#bluetooth-phone-line-phase-1).
+
+可选的 Linux / Pi 手机蓝牙线路仅做 AI 外呼，来电只发事件、不接听、不抢手机音频；
+HFP 不支持短信。完整配对与验收步骤见上述 Pi 指南。默认 SIM7600 / Quectel 路径不变。

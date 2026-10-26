@@ -408,6 +408,13 @@ async def _meta(request: web.Request) -> web.Response:
         "modem_resetting": isinstance(modem, Sim7600Modem) and modem.recovery_in_progress,
         "port": meta.get("port") or config.get_str("MODEM_PORT"),
     }
+    bluetooth = getattr(modem, "line_kind", "") == "bluetooth"
+    if bluetooth and modem is not None:
+        meta["hardware"]["line_kind"] = "bluetooth"
+        meta["capabilities"] = {"sms": False, "auto_answer": False}
+        meta["hardware"]["phone_connected"] = modem.is_connected()
+        meta["hardware"]["modem_connected"] = modem.is_connected()
+        meta["hardware"]["signal_strength"] = modem.signal_strength
     # SIM 身份(#88):运营商/免费客服号/注册状态——换卡后 UI 与拨测目标自适应。
     sim = getattr(modem, "sim_identity", None)
     if sim is not None:
@@ -468,6 +475,9 @@ async def _audio_websocket(request: web.Request) -> web.WebSocketResponse:
 async def _send_sms(request: web.Request) -> web.Response:
     hub: EventHub = request.app["hub"]
     modem: SerialModem = request.app["modem"]
+    if not getattr(modem, "supports_sms", True):
+        return web.json_response({"ok": False, "code": "SMS_UNSUPPORTED",
+                                  "error": "蓝牙手机线路不支持短信，请在手机上收发短信"})
     data = await read_json(request)
 
     number = (data.get("number") or "").strip()
@@ -1214,6 +1224,9 @@ async def _setup_test_sms(request: web.Request) -> web.Response:
     """One explicit setup-wizard SMS test, separate from the normal reply-only SMS API."""
     hub: EventHub = request.app["hub"]
     modem: SerialModem = request.app["modem"]
+    if not getattr(modem, "supports_sms", True):
+        return web.json_response({"ok": False, "code": "SMS_UNSUPPORTED",
+                                  "error": "蓝牙手机线路不支持短信，请跳过短信测试"})
     data = await read_json(request)
     if not isinstance(data, dict):
         return web.json_response(

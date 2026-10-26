@@ -110,6 +110,18 @@ UNKNOWN_SIM = SimIdentity(
 )
 
 
+def identify_hfp(properties: dict) -> SimIdentity:
+    """HFP exposes network identity, not IMSI or direct SIM presence."""
+    carrier = str(properties.get("Name") or "未知")
+    status = str(properties.get("Status") or "unknown")
+    registered = status in {"registered", "roaming"}
+    return SimIdentity(
+        present=registered, plmn="", carrier=carrier,
+        service_number=_SERVICE_NUMBERS.get(carrier, ""), registered=registered,
+        reg_status="已注册" if registered else "未注册",
+    )
+
+
 def parse_imsi(raw: str) -> str:
     """从 AT+CIMI 原始响应提取 IMSI(14-15 位数字);无则返回 ""。
 

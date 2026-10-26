@@ -1656,7 +1656,8 @@ def create_modem(
 ) -> SerialModem:
     """按厂商创建 modem 实例。
 
-    支持 ``quectel``（EC20/EG25，默认）与 ``simcom``（SIM7600）。未识别的 vendor
+    支持 ``quectel``（EC20/EG25，默认）、``simcom``（SIM7600）及 Linux ``bluetooth``。
+    未识别的 vendor
     回退 quectel 并告警，保证现网行为不变。
     """
     normalized = (vendor or "quectel").strip().lower()
@@ -1664,5 +1665,13 @@ def create_modem(
         return Eg25Modem(port, baudrate)
     if normalized in ("simcom", "sim7600", "sim7600g"):
         return Sim7600Modem(port, baudrate)
+    if normalized == "bluetooth":
+        import sys
+
+        if sys.platform != "linux":
+            raise RuntimeError("MODEM_VENDOR=bluetooth is supported on Linux only")
+        from .bluetooth_modem import BluetoothModem
+
+        return BluetoothModem(config.get_str("BLUETOOTH_PHONE_ADDRESS"))
     logger.warning("MODEM_VENDOR=%r 暂未支持，回退 quectel", vendor)
     return Eg25Modem(port, baudrate)

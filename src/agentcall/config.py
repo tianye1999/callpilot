@@ -325,7 +325,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 模组厂商：quectel=EC20/EG25（UAC/QPCMV 音频）；simcom=SIM7600（CPCMREG
     # PCM-over-USB 音频，须配 MODEM_AUDIO_MODE=nmea 走串口 PCM 桥）。
     ConfigSpec("MODEM_VENDOR", "模组厂商", "select", "quectel",
-               choices=("quectel", "simcom"), requires_restart=True),
+               choices=("quectel", "simcom", "bluetooth"), requires_restart=True),
+    ConfigSpec("BLUETOOTH_PHONE_ADDRESS", "手机蓝牙地址", "str", "",
+               help="仅 Linux 蓝牙手机线路；只填本地 .env，不上传手机地址。",
+               secret=True, editable=False, hidden=True, requires_restart=True),
     # 默认值按当前平台在模块加载时定死（Windows 为 auto 哨兵，连接时扫描）。
     ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", platforms.default_modem_port(),
                requires_restart=True),

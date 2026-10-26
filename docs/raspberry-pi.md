@@ -325,3 +325,96 @@ shellcheck scripts/linux/install.sh
 
 以上测试不打开串口、不部署 systemd，也不发送真实 AT。交接时分别记录本地质量门结果和真机待验收项；
 不要将既有手工音频脚本的成功等同于完整 Edge 的部署与通话成功。共享文件仍需其他平台维护者 review。
+
+## Bluetooth Phone Line (Phase 1)
+
+This optional path replaces the USB modem with one paired Android phone. It
+targets Pi 5 / Bookworm, BlueZ 5.66, WirePlumber 0.4.13 and oFono with its HFP
+plugin enabled. Python 3.12/3.13 uses the pip-installable `bluetooth` extra
+(`dbus-fast`, Unix fd negotiation enabled); no dbus-python/GLib is needed.
+See the [dbus-fast fd contract](https://dbus-fast.readthedocs.io/en/stable/low-level-interface/index.html)
+and [oFono audio API](https://github.com/rilmodem/ofono/blob/master/doc/handsfree-audio-api.txt).
+WirePlumber 0.5 is deliberately rejected by the setup helper, not fed Lua.
+
+1. End **all calls on the phone**, including owner-handled calls. Run as the
+   same user that runs Edge and WirePlumber, not root:
+   `bash scripts/linux/install.sh --bluetooth` (optional `--now` after config),
+   or `bash scripts/linux/update.sh --bluetooth` for an existing checkout.
+   Neither default command performs Bluetooth setup. These optional commands
+   install the extra in the existing venv, install/enable oFono and Bluetooth,
+   grant only the Edge user D-Bus access, and restart user WirePlumber.
+   They leave `.env` untouched. Do not restart WirePlumber during a call.
+2. Pair interactively; confirm the displayed PIN on both devices. The address
+   below is a placeholder, replace it locally and never paste a real address
+   into committed files, issue comments or logs:
+
+   ```text
+   bluetoothctl
+   power on
+   agent on
+   default-agent
+   scan on
+   pair 00:11:22:33:44:55
+   trust 00:11:22:33:44:55
+   scan off
+   quit
+   ```
+
+3. In local `.env`, set `MODEM_VENDOR=bluetooth` and
+   `BLUETOOTH_PHONE_ADDRESS=00:11:22:33:44:55` (replace locally). Audio mode,
+   audio keyword and USB serial ports are ignored. `CARRIER_HOTLINE` remains
+   the existing validated override when the phone's operator name cannot be
+   identified. HFP has no IMSI; Edge does not fabricate a PLMN or LTE status.
+4. Restart Edge only while idle: `sudo systemctl restart callpilot-edge`.
+   Edge discovers the paired BlueZ device and calls `ConnectProfile` with
+   HFP AG UUID `0000111f-0000-1000-8000-00805f9b34fb`, not generic `Connect`.
+   Confirm `/api/meta` has `hardware.line_kind=bluetooth`, `phone_connected`,
+   `signal_strength` (0..100, or null), operator in `sim.carrier`, and
+   `capabilities.sms=false`. `usb_online` still means USB hardware, not phone
+   connectivity. `sim.present` means network evidence from the phone, not a
+   direct physical-SIM probe. The dashboard shows phone status, carrier and signal.
+
+The helper installs `~/.config/wireplumber/bluetooth.lua.d/51-callpilot-bluetooth.lua`:
+`bluez5.hfphsp-backend = "none"`, roles `[ a2dp_source ]` (no A2DP sink and no
+PipeWire HFP role). Never use `pactl set-card-profile ... off`: it can hang up
+an active phone call. The Edge user needs a running user WirePlumber service;
+check `systemctl --user status wireplumber` when installing from SSH. Missing
+oFono, a competing agent (`InUse`), missing D-Bus permission or an unpaired phone
+are real setup failures, not reasons to claim the phone is connected.
+
+### Ownership and Acceptance
+
+Only AI outbound dialing registers `HandsfreeAudioAgent` (CVSD codec 1), before
+`Dial`. On `NewConnection`, Edge verifies the oFono sender and selected card,
+authorizes a deferred SCO fd, waits up to 5 seconds for POLLOUT, then reads/writes
+8 kHz s16le, one equally sized output packet per input packet. Missing output is
+silence. After active + 4 seconds without packets, bounded card `Connect` retries
+request SCO; a successful method reply is not evidence of audio. Cleanup stops
+the pump, closes its fd and unregisters, including startup failures. HFP offline
+blocks dialing and reconnects with 2..30 second backoff. Phase 2 inbound policies
+and Phase 3 App acceptance are not implemented here.
+The non-AI remote Web dialer cannot reserve this line in Phase 1; otherwise it
+would claim an agent outside AI ownership. Remote-triggered AI tasks still use
+the ordinary CallSession path. Conference/second-call AT operations are also
+unavailable on this backend.
+
+Before deployment, verify on the actual Pi/phone (no such hardware is used by
+unit tests):
+
+- Dial **only the current SIM operator's verified free hotline**. Complete an
+  AI task including SendTones and two-way speech. Inspect call events, per-turn
+  latency, both recording tracks, transcripts and history.
+- Call the phone from an authorized test source, answer/reject on the phone,
+  and confirm Edge emits `incoming_skipped`, never answers/registers an audio
+  agent, and both voice directions stay on the phone. Play phone media and
+  confirm the Pi does not receive A2DP audio.
+- Turn phone Bluetooth off/on and leave/return to range. Confirm offline gating,
+  backoff and reconnection, including two successive AI calls and failed dialing.
+- Confirm SMS send/setup/OTP tools respond immediately with `SMS_UNSUPPORTED`,
+  do not read old USB-modem SMS and never wait for HFP messages.
+
+Rollback, only while idle: switch `.env` back to the previous modem vendor and
+restart Edge; remove the **helper-owned** Lua file and
+`/etc/dbus-1/system.d/callpilot-ofono.conf`, reload D-Bus and restart user
+WirePlumber. Disable oFono only if nothing else uses it. Do not remove unrelated
+WirePlumber configuration or automatically unpair the phone.

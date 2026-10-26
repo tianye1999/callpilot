@@ -8,6 +8,7 @@ REPOSITORY=https://github.com/tianye1999/callpilot.git
 ADOPT=false
 FORCE=false
 DRY_RUN=false
+BLUETOOTH=false
 BRANCH=""
 TMP=""
 BACKUP=""
@@ -52,11 +53,13 @@ while [ "$#" -gt 0 ]; do
         --adopt) ADOPT=true ;;
         --force) FORCE=true ;;
         --dry-run) DRY_RUN=true ;;
+        --bluetooth) BLUETOOTH=true ;;
         --branch)
             [ "$#" -ge 2 ] && [ -n "$2" ] || die "--branch requires a branch name."
             BRANCH="$2"; shift ;;
         -h|--help)
-            printf 'Usage: bash scripts/linux/update.sh [--branch NAME] [--force] [--dry-run]\n'
+            printf 'Usage: bash scripts/linux/update.sh [--branch NAME] [--force] [--dry-run] [--bluetooth]\n'
+            printf '%s\n' '--bluetooth confirms the phone itself is idle and runs optional HFP setup.'
             printf '       bash scripts/linux/update.sh --adopt --branch NAME [--force] [--dry-run]\n'
             printf 'Run without sudo. --force accepts UNKNOWN call state, never a known busy line.\n'
             exit 0 ;;
@@ -73,6 +76,9 @@ case "$HEALTH_TIMEOUT" in ''|*[!0-9]*) die "Health timeout must be a positive in
 [ "$HEALTH_TIMEOUT" -gt 0 ] || die "Health timeout must be positive."
 cd "$ROOT"
 if [ "$DRY_RUN" = true ]; then
+    if [ "$BLUETOOTH" = true ]; then
+        info "Would install Bluetooth extra/oFono and configure WirePlumber 0.4.x; phone must be idle."
+    fi
     info "DRY RUN: no fetch, backup, checkout, dependency installation, API request, or sudo."
     info "Check repository ownership, tracked changes, and local Web call/queue state (--force only accepts unknown state)."
     if [ "$ADOPT" = true ]; then
@@ -295,6 +301,10 @@ if [ -x .venv/bin/python ] && ! .venv/bin/python -c 'import sys; sys.exit(0 if s
 fi
 info "Reusing scripts/setup.sh; existing .env and untracked runtime data are preserved."
 PYTHON="$PYTHON_BIN" bash scripts/setup.sh
+if [ "$BLUETOOTH" = true ]; then
+    check_idle
+    bash scripts/linux/setup-bluetooth.sh --idle-confirmed
+fi
 info "Keys present in examples but missing from .env (names only; merge manually):"
 .venv/bin/python - <<'PY'
 from dotenv import dotenv_values

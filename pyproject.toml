@@ -27,6 +27,9 @@ Homepage = "https://github.com/tianye1999/callpilot"
 Issues = "https://github.com/tianye1999/callpilot/issues"
 
 [project.optional-dependencies]
+bluetooth = [
+    "dbus-fast>=5.2,<6; sys_platform == 'linux'",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.15",

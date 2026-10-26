@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from typing import Any, BinaryIO, Callable, Iterable, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Iterable, cast
 
 import numpy as np
 import serial
@@ -19,6 +19,10 @@ import serial
 # 导入模块而非 from-import 常量：让测试能 monkeypatch platforms.IS_MACOS。
 from . import config, platforms
 from .pcm_stats import PcmFlowStats
+
+if TYPE_CHECKING:
+    from .bluetooth_audio import BluetoothAudioBridge
+    from .modem import SerialModem
 
 logger = logging.getLogger(__name__)
 
@@ -1008,7 +1012,13 @@ def create_audio_bridge(
     pcm_port: str | None,
     pcm_baudrate: int,
     tx_gain: float = 1.0,
-) -> "ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge":
+    modem: SerialModem | None = None,
+) -> ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge | BluetoothAudioBridge:
+    if getattr(modem, "line_kind", "") == "bluetooth":
+        from .bluetooth_modem import BluetoothModem
+        assert isinstance(modem, BluetoothModem)
+        modem.audio_bridge.tx_gain = tx_gain
+        return modem.audio_bridge
     selected = mode.lower()
     if selected == "uac":
         return ModemAudioBridge(device_keyword)

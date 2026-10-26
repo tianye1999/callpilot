@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LINUX="$ROOT/scripts/linux"
 SERVICE=callpilot-edge.service
 START_NOW=false
+BLUETOOTH=false
 
 info() { printf '[linux-install] %s\n' "$*"; }
 die() { printf '[linux-install] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -13,8 +14,10 @@ die() { printf '[linux-install] ERROR: %s\n' "$*" >&2; exit 1; }
 for arg in "$@"; do
     case "$arg" in
         --now) START_NOW=true ;;
+        --bluetooth) BLUETOOTH=true ;;
         -h|--help)
-            printf 'Usage: bash scripts/linux/install.sh [--now]\n'
+            printf 'Usage: bash scripts/linux/install.sh [--now] [--bluetooth]\n'
+            printf '%s\n' '--bluetooth explicitly confirms the phone is idle and enables optional HFP setup.'
             printf 'Install and enable on boot; --now also starts the service. Run without sudo.\n'
             exit 0 ;;
         *) die "Unknown argument: $arg (use --help)" ;;
@@ -64,6 +67,9 @@ if [ -x .venv/bin/python ] && ! .venv/bin/python -c 'import sys; sys.exit(0 if s
 fi
 info "Reusing scripts/setup.sh (keeps any existing .env)."
 PYTHON="$PYTHON_BIN" bash scripts/setup.sh
+if [ "$BLUETOOTH" = true ]; then
+    bash "$LINUX/setup-bluetooth.sh" --idle-confirmed
+fi
 
 UNIT_TMP="$(mktemp)"
 trap 'rm -f "$UNIT_TMP"' EXIT
