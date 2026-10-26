@@ -228,6 +228,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # owner 时由系统解析成这个号码，模型不接触真实号码）。同时进发信白名单——
     # 这个号码即使从未与本机通信过也放行（WIL-116）。留空 = 无法代发给机主。
     ConfigSpec("OWNER_PHONE", "机主手机号（转告短信收件号码）", "str", ""),
+    ConfigSpec("INBOUND_AI_ANSWER_MODE", "蓝牙手机 AI 接听策略", "select", "off",
+               choices=("off", "allowlist", "unanswered")),
+    ConfigSpec("INBOUND_AI_ALLOWLIST", "蓝牙 AI 接听白名单（仅本地 .env）", "str", "",
+               editable=False, hidden=True, secret=True),
+    ConfigSpec("INBOUND_AI_ANSWER_AFTER_SECONDS", "蓝牙来电无人接听等待（秒）", "int", "15"),
     ConfigSpec(
         "INBOUND_TAKEOVER_ENABLED",
         "来电转手机真人接管",
@@ -774,6 +779,7 @@ _NUMERIC_RANGES: dict[str, tuple[float, float, bool]] = {
     "DTMF_TONE_MS": (0, 2000, True),          # >0 且 ≤2000ms
     "DTMF_TONE_AMPLITUDE": (0.0, 1.0, True),  # (0, 1]
     "INBOUND_MAX_SECONDS": (0, 86400, True),   # >0 且 ≤24h
+    "INBOUND_AI_ANSWER_AFTER_SECONDS": (0, 600, True),  # Bluetooth unanswered policy
     # 0=不限时合法（number_profiles 的 max_call_seconds 可按场景覆盖，WIL-120）。
     "OUTBOUND_MAX_SECONDS": (0, 86400, False),  # ≥0 且 ≤24h
     "OWNER_CONFIRM_TIMEOUT_SECONDS": (0, 600, True),  # >0 且 ≤10min

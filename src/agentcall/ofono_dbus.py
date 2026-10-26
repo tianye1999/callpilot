@@ -12,6 +12,15 @@ import threading
 from typing import Any, Callable
 
 
+class OfonoCallError(RuntimeError):
+    """Keep daemon detail for classification without leaking it into logs."""
+
+    def __init__(self, error_name: str, detail: str, *, operation: str = "") -> None:
+        super().__init__(f"{operation}: {error_name}" if operation else error_name)
+        self.error_name = error_name
+        self.detail = detail
+
+
 class OfonoDBus:
     def __init__(self, agent_path: str) -> None:
         self.agent_path = agent_path
@@ -110,7 +119,9 @@ class OfonoDBus:
             signature=signature, body=body or [],
         )), timeout=10)
         if reply.message_type == self._MessageType.ERROR:
-            raise RuntimeError(f"{interface}.{member}: {reply.error_name}")
+            error_body = getattr(reply, "body", [])
+            raise OfonoCallError(reply.error_name, str(error_body[0]) if error_body else "",
+                                 operation=f"{interface}.{member}")
         return self._unwrap(reply.body)
 
     def call(self, destination: str, path: str, interface: str, member: str,

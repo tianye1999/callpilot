@@ -411,7 +411,8 @@ async def _meta(request: web.Request) -> web.Response:
     bluetooth = getattr(modem, "line_kind", "") == "bluetooth"
     if bluetooth and modem is not None:
         meta["hardware"]["line_kind"] = "bluetooth"
-        meta["capabilities"] = {"sms": False, "auto_answer": False}
+        meta["capabilities"] = {"sms": False, "auto_answer": config.get_str("INBOUND_AI_ANSWER_MODE")
+                                in {"allowlist", "unanswered"}}
         meta["hardware"]["phone_connected"] = modem.is_connected()
         meta["hardware"]["modem_connected"] = modem.is_connected()
         meta["hardware"]["signal_strength"] = modem.signal_strength

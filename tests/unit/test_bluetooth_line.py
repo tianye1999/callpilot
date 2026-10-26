@@ -104,10 +104,10 @@ def test_incoming_is_event_only_even_when_owner_answers():
     modem.handle_signal(MODEM + "/incoming", "org.ofono.VoiceCall", "PropertyChanged", ["State", "active"])
     modem.handle_signal(MODEM, "org.ofono.VoiceCallManager", "CallRemoved", [MODEM + "/incoming"])
     assert rings == ["+15550000102"]
-    assert ended == []  # Never route owner's hangup through AI cleanup/HangupAll.
-    with pytest.raises(RuntimeError, match="Phase 1"):
+    assert ended == []  # Never route owner's hangup through AI cleanup/Hangup.
+    with pytest.raises(RuntimeError, match="No eligible"):
         modem.answer()
-    assert not {"Register", "Answer", "HangupAll"}.intersection(methods(bus))
+    assert not {"Register", "Answer", "Hangup", "HangupAll"}.intersection(methods(bus))
     modem.close()
 
 
@@ -219,7 +219,8 @@ def test_service_incoming_never_starts_session_and_offline_guard(tmp_path, monke
     events = []
     monkeypatch.setattr(service, "_publish", events.append)
     monkeypatch.setattr(service.session, "start", lambda **_: pytest.fail("incoming started AI"))
-    modem._on_ring("+15550000102")
+    modem.handle_signal(MODEM, "org.ofono.VoiceCallManager", "CallAdded",
+                        [MODEM + "/incoming", {"State": "incoming", "LineIdentification": "+15550000102"}])
     assert events[-1]["status"] == "incoming_skipped"
     assert "Register" not in methods(bus)
     modem._offline()

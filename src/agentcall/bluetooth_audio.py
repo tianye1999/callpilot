@@ -41,8 +41,10 @@ class BluetoothAudioBridge(_OutputObserver):
     thread_name = "hfp-sco"
     _WRITE_EAGAIN_LOG_INTERVAL_SECONDS = 5.0
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_closed: Callable[[], None] | None = None) -> None:
         self._stop = threading.Event()
+        self.closed = threading.Event()
+        self._on_closed = on_closed
         self._lock = threading.RLock()
         self._lifecycle = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -61,9 +63,11 @@ class BluetoothAudioBridge(_OutputObserver):
 
     def accept_fd(self, fd: int, codec: int) -> bool:
         with self._lifecycle:
-            if codec != 1 or self._stop.is_set() or (self._thread and self._thread.is_alive()):
+            if (codec != 1 or self._stop.is_set() or (self.closed.is_set() and self.packet_count > 0)
+                    or (self._thread and self._thread.is_alive())):
                 os.close(fd)
                 return False
+            self.closed.clear()
             self._thread = threading.Thread(target=self._pump, args=(fd,), name=self.thread_name, daemon=True)
             try:
                 self._thread.start()
@@ -118,10 +122,13 @@ class BluetoothAudioBridge(_OutputObserver):
                 self._notify_output(payload, ranges)
         except OSError:
             if not self._stop.is_set():
-                logger.warning("SCO unavailable; waiting for audio reconnect", exc_info=True)
+                logger.warning("SCO unavailable; link closed", exc_info=True)
         finally:
             # Only the pump owns this fd. stop() joins it before returning.
             os.close(fd)
+            self.closed.set()
+            if not self._stop.is_set() and self.packet_count > 0 and self._on_closed:
+                self._on_closed()
 
     def _log_write_eagain(self) -> None:
         now = time.monotonic()

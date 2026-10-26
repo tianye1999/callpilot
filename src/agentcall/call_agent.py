@@ -242,6 +242,12 @@ class CallSession:
         self._barge_in_echo_strikes = 0
         self._turn_audio_started_at = 0.0
         self._record: CallRecord | None = None
+        self._inbound_record: CallRecord | None = None
+        self._phone_owner_took_over = False
+        self._phone_audio_lost = False
+        self._call_task: asyncio.Task | None = None
+        self._resources_released = True
+        self._bluetooth_cleanup_started = False
         self._summary_thread: threading.Thread | None = None
         # 延迟挂断（hangup 工具）状态：CallSession 跨通复用，上一通排下的
         # Timer 必须可取消；世代号兜住已越过 cancel、正在执行的回调，
@@ -377,8 +383,11 @@ class CallSession:
 
     @property
     def owns_modem_shutdown(self) -> bool:
-        """Keep admission closed until the parallel owner has joined its workers."""
-        return self._parallel_agent_connect and self._thread is not None and self._thread.is_alive()
+        """Keep admission closed until parallel/Bluetooth cleanup has joined workers."""
+        owns_cleanup = self._parallel_agent_connect or (
+            isinstance(self.modem, BluetoothModem) and not self._resources_released
+        )
+        return owns_cleanup and self._thread is not None and self._thread.is_alive()
 
     @property
     def is_busy(self) -> bool:
@@ -394,11 +403,18 @@ class CallSession:
         task: str | None = None,
         preset_hint: str | None = None,
         preset_id: str | None = None,
+        *,
+        inbound_record: CallRecord | None = None,
     ) -> None:
         if self.is_busy:
             logger.warning("已有通话进行中，忽略新的呼叫请求")
             return
         self._outbound_number = outbound_number
+        self._inbound_record = inbound_record
+        self._phone_owner_took_over = False
+        self._phone_audio_lost = False
+        self._resources_released = False
+        self._bluetooth_cleanup_started = False
         self._parallel_agent_connect = config.get_bool("PARALLEL_AGENT_CONNECT")
         self._outbound_task_value = task
         self._preset_hint = preset_hint
@@ -440,10 +456,38 @@ class CallSession:
             self._cancel_spoken_dtmf_followups_locked()
         self._stop_dtmf_judge()
         self._stop_triage_judge()
+        if isinstance(self.modem, BluetoothModem):
+            self._cancel_bluetooth_call()
+            return
         if self._parallel_agent_connect:
             return  # The parallel owner polls is_active and cancels blocked operations.
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
+
+    def phone_owner_took_over(self) -> None:
+        """Classify a previously fenced SCO closure after live-state confirmation."""
+        if not isinstance(self.modem, BluetoothModem):
+            return
+        self._phone_owner_took_over = True
+        self.phone_audio_lost()
+
+    def phone_audio_lost(self) -> None:
+        """Fence late audio/tools now, without guessing why SCO closed."""
+        if not isinstance(self.modem, BluetoothModem):
+            return
+        self._phone_audio_lost = True
+        self._set_active(False)
+        self._clear_outgoing_audio()
+        self._cancel_bluetooth_call()
+
+    def _cancel_bluetooth_call(self) -> None:
+        loop = self._loop
+        task = self._call_task
+        if loop and loop.is_running():
+            def cancel_call() -> None:
+                if task and not task.done() and not task.cancelling() and not self._bluetooth_cleanup_started:
+                    task.cancel()
+            loop.call_soon_threadsafe(cancel_call)
 
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -465,6 +509,7 @@ class CallSession:
             # All resources/workers are joined. The completion callback may now
             # admit the next queued call even though this thread has not returned.
             self._parallel_agent_connect = False
+            self._resources_released = True
             # 会话结束通知（含异常/未接通路径）：驱动外呼队列拨下一个等。
             if self._on_ended is not None:
                 try:
@@ -473,6 +518,7 @@ class CallSession:
                     logger.warning("会话结束回调异常: %s", exc)
 
     async def _handle_call(self) -> None:
+        self._call_task = asyncio.current_task()
         self._clear_outgoing_audio()
         self._load_session_config()
         self._parallel_agent_connect = config.get_bool("PARALLEL_AGENT_CONNECT")
@@ -542,6 +588,9 @@ class CallSession:
 
         status = "completed"
         try:
+            if isinstance(self.modem, BluetoothModem) and not self.is_active:
+                status = "not_connected"
+                return
             if self._parallel_agent_connect:
                 if not await self._handle_parallel_startup(
                     direction, number, record, transcripts, mark, session_t0
@@ -606,7 +655,8 @@ class CallSession:
                     await agent.say(self._opening_instructions(direction))
                     mark_greeting_sent()
             except BaseException:
-                if isinstance(bridge, SerialPcmAudioBridge) and bridge.uplink_prebuffer_enabled:
+                if (isinstance(self.modem, BluetoothModem)
+                        or isinstance(bridge, SerialPcmAudioBridge) and bridge.uplink_prebuffer_enabled):
                     await self._shutdown_agent(agent, bridge)
                 raise
 
@@ -617,10 +667,23 @@ class CallSession:
                 )
             finally:
                 await self._shutdown_agent(agent, active_bridge)
+        except asyncio.CancelledError:
+            if not isinstance(self.modem, BluetoothModem):
+                status = "failed"
+                raise
         except BaseException:
             status = "failed"
             raise
         finally:
+            if isinstance(self.modem, BluetoothModem):
+                self._bluetooth_cleanup_started = True
+                if self._phone_audio_lost:
+                    if self.modem.audio_loss_pending:
+                        await asyncio.to_thread(self.modem.wait_audio_resolution)
+                    self._phone_owner_took_over = self.modem.owner_takeover_confirmed
+            if self._phone_owner_took_over:
+                status = "owner_took_over"
+                mark("owner_took_over", physical_call_preserved=True)
             if isinstance(self.modem, BluetoothModem):
                 # Includes provider/bridge construction failures and cancelled startup.
                 try:
@@ -635,6 +698,7 @@ class CallSession:
             self._end_takeover_context("CALL_ENDED")
             mark("ended", status=status)
             self._finalize_record(record, status, transcripts, direction, number)
+            self._call_task = None
 
     def _configure_call_agent(
         self, agent, get_bridge: Callable[[], AudioBridge | None], record: CallRecord | None,
@@ -884,6 +948,8 @@ class CallSession:
                 await asyncio.sleep(0.01)
             return True
         finally:
+            if isinstance(self.modem, BluetoothModem):
+                self._bluetooth_cleanup_started = True
             stop_preparing.set()
             self._set_active(False)
             for pending_task in (connect_task, loop_task):
@@ -1714,12 +1780,17 @@ class CallSession:
 
     def _begin_record(self, direction: str, number: str | None) -> CallRecord | None:
         """创建通话记录；录音选择在每通开始时锁定，本通中途不再变化。"""
+        if isinstance(self.modem, BluetoothModem) and direction == "inbound" and self._inbound_record:
+            record, self._inbound_record = self._inbound_record, None
+            record.recording_enabled = config.get_bool("RECORDING_ENABLED")
+            return record
         if self.call_logger is None:
             return None
         try:
             return self.call_logger.begin_call(
                 direction,
                 number,
+                **({"source": "bluetooth"} if isinstance(self.modem, BluetoothModem) else {}),
                 recording_enabled=config.get_bool("RECORDING_ENABLED"),
             )
         except Exception as exc:  # noqa: BLE001
@@ -2021,6 +2092,7 @@ class CallSession:
         registry = tools.register()
         if (
             direction == "inbound"
+            and not isinstance(self.modem, BluetoothModem)
             and config.get_bool("INBOUND_TAKEOVER_ENABLED")
             and self._triage_mode == "off"
         ):
@@ -2102,6 +2174,10 @@ class CallSession:
     ) -> None:
         self._stop_triage_judge(join_timeout=0.0)
         mode = config.get_str("INBOUND_TRIAGE_MODE").strip().lower()
+        if isinstance(self.modem, BluetoothModem):
+            if mode != "off":
+                logger.info("Bluetooth inbound policy overrides INBOUND_TRIAGE_MODE; triage disabled")
+            mode = "off"
         self._triage_mode = mode if mode in {"off", "shadow", "enforce"} else "off"
         self._triage_results = Queue(maxsize=4)
         self._triage_consumer = TriageVerdictConsumer(
@@ -2346,6 +2422,7 @@ class CallSession:
         takeover_preference = (
             config.get_str("INBOUND_TAKEOVER_PREFERENCE")
             if direction == "inbound"
+            and not isinstance(self.modem, BluetoothModem)
             and config.get_bool("INBOUND_TAKEOVER_ENABLED")
             and triage_mode == "off"
             and not self._takeover_ai_fallback
@@ -3441,7 +3518,9 @@ class CallSession:
             self._takeover_resuming = False
             self._takeover_started_at = None
             self._takeover_deadline = None
-            if direction != "inbound":
+            if direction != "inbound" or isinstance(self.modem, BluetoothModem):
+                if direction == "inbound" and isinstance(self.modem, BluetoothModem):
+                    logger.info("Bluetooth App takeover disabled; owner can select the phone earpiece")
                 self._takeover_coordinator = None
                 return
             router = _CallSessionMediaRouter()
@@ -3615,6 +3694,9 @@ class CallSession:
         bypass_enabled: bool = False,
         endpoint_check: Callable[[], str | None] | None = None,
     ) -> dict:
+        if isinstance(self.modem, BluetoothModem):
+            return {"success": False, "code": "TAKEOVER_UNSUPPORTED",
+                    "message": "蓝牙线路不支持 App 接管，请在手机上切回听筒"}
         if not bypass_enabled and not config.get_bool("INBOUND_TAKEOVER_ENABLED"):
             return {
                 "success": False,
@@ -3859,6 +3941,8 @@ class CallSession:
                     pass
 
     async def _stop_agent_resources(self, agent, bridge: AudioBridge | None, *, threaded: bool = False) -> None:
+        if isinstance(self.modem, BluetoothModem):
+            self._bluetooth_cleanup_started = True
         if agent is not None:
             try:
                 if self._parallel_agent_connect:
@@ -3955,6 +4039,7 @@ class CallAgentService:
         self.tx_gain = tx_gain
         self.hub = hub
         self._ring_lock = threading.Lock()
+        self._bluetooth_incoming_records: dict[str, CallRecord] = {}
         self._remote_setup_lock = threading.Lock()
         self._remote_worker: RemoteDialerWorker | None = None
         self._remote_invite: RemoteDialerInvite | None = None
@@ -4069,6 +4154,23 @@ class CallAgentService:
 
     def _setup_callbacks(self) -> None:
         def on_ring(caller: str | None) -> None:
+            if isinstance(self.modem, BluetoothModem):
+                if not self.modem.inbound_ready:
+                    return
+                with self._ring_lock:
+                    if self.session.is_busy or self._remote_call_owner is not None:
+                        self.modem.skip_inbound("session_busy")
+                        return
+                    missing, _ = self._reject_if_credentials_missing()
+                    if missing:
+                        self.modem.skip_inbound("credentials_missing")
+                        return
+                    path = self.modem.claim_inbound()
+                    if not path:
+                        return
+                    self.session.current_caller = caller
+                    self.session.start(inbound_record=self._bluetooth_incoming_records.get(path))
+                return
             if not getattr(self.modem, "auto_answer", True):
                 self._publish({"type": "call", "status": "incoming_skipped", "caller": caller,
                                "reason": "bluetooth_outbound_only"})
@@ -4138,12 +4240,43 @@ class CallAgentService:
         self.modem.on_ring(on_ring)
         self.modem.on_hangup(on_hangup)
         self.modem.on_sms(on_sms)
+        if isinstance(self.modem, BluetoothModem):
+            self.modem.on_call_event(self._bluetooth_call_event)
         connection_registrar = getattr(self.modem, "on_connection_state", None)
         if callable(connection_registrar):
             connection_registrar(on_connection_state)
         sim_registrar = getattr(self.modem, "on_sim_identity", None)
         if callable(sim_registrar):
             sim_registrar(on_sim_identity)
+
+    def _bluetooth_call_event(self, event: dict) -> None:
+        status, path = event["status"], event["call_path"]
+        if status == "sco_closed":
+            self.session.phone_audio_lost()
+        if status == "owner_took_over":
+            self.session.phone_owner_took_over()
+        if status == "incoming_ringing":
+            try:
+                self._bluetooth_incoming_records[path] = self.call_logger.begin_call(
+                    "inbound", event.get("caller"), source="bluetooth", recording_enabled=False,
+                )
+            except Exception:
+                logger.warning("Bluetooth incoming record creation failed", exc_info=True)
+        record = self._bluetooth_incoming_records.get(path)
+        if record is not None:
+            if status == "incoming_identified":
+                record.number = event.get("caller")
+            if status == "incoming_owner_answered":
+                record.log_event("answered", owner=True)
+            if status != "owner_took_over":
+                record.log_event(
+                    status, **{key: value for key, value in event.items() if key not in {"type", "status"}},
+                )
+            if status == "incoming_finished":
+                if not event.get("session_started"):
+                    record.finish(event["outcome"])
+                self._bluetooth_incoming_records.pop(path, None)
+        self._publish(event)
 
     def dial(
         self,

@@ -424,7 +424,7 @@ class CallLogger:
         if source:
             started_fields["source"] = source
         record.log_event("call_started", **started_fields)
-        logger.info("开始记录通话 %s", call_id)
+        logger.info("开始记录通话 %s", record.public_id if source == "bluetooth" else call_id)
         return record
 
     def list_calls(self, limit: int = 50) -> list[dict]:
