@@ -210,6 +210,7 @@ class CallSession:
         self._on_ended = on_ended
         self._takeover_endpoint_factory = takeover_endpoint_factory
         self.current_caller: str | None = None
+        self.call_started_at: float | None = None
         self._outbound_number: str | None = None
         # 本通外呼主题：start() 显式传入；未传时回退 AGENT_OUTBOUND_TASK 配置。
         self._outbound_task_value: str | None = None
@@ -395,6 +396,9 @@ class CallSession:
 
     def _set_active(self, value: bool) -> None:
         with self._active_lock:
+            if value and not self._active:
+                # 菜单栏计时不依赖录音开关；每次占线重新计时。
+                self.call_started_at = time.time()
             self._active = value
 
     def start(

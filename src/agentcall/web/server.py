@@ -11,6 +11,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 import wave
 from contextlib import suppress
 from functools import partial
@@ -273,6 +274,7 @@ def build_app(
     app["modem"] = modem
     app["service"] = service
     app["meta"] = meta or {}
+    app["tray_usb"] = {"task": None, "online": None, "checked": -float("inf")}
     # 由 app.py 传入的 threading.Event；置位后主循环停止、清理并按运行方式重启。
     app["restart_event"] = restart_event
     app["setup_sms_token"] = [secrets.token_urlsafe(24)]
@@ -390,6 +392,23 @@ async def _remote_dialer_asset(request: web.Request) -> web.StreamResponse:
     )
 
 
+def _tray_usb_online(app: web.Application) -> bool | None:
+    """托盘读缓存；慢速 USB 枚举离开事件循环，扫描不重叠、完成后缓存 10 秒。"""
+    cache = app["tray_usb"]
+    task = cache["task"]
+    if task is not None and task.done():
+        try:
+            cache["online"] = task.result()
+        except Exception:  # noqa: BLE001
+            logger.exception("托盘 USB 扫描失败")
+            cache["online"] = None
+        cache["checked"] = time.monotonic()
+        cache["task"] = task = None
+    if task is None and time.monotonic() - cache["checked"] >= 10:
+        cache["task"] = asyncio.create_task(asyncio.to_thread(detect_quectel_usb_online))
+    return cache["online"]
+
+
 async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
     if _macos_shell_available():
@@ -403,6 +422,19 @@ async def _meta(request: web.Request) -> web.Response:
         bool(line_busy()) if callable(line_busy)
         else bool(getattr(getattr(service, "session", None), "is_active", False))
     )
+    meta["call"] = None
+    if meta["call_active"]:
+        session = getattr(service, "session", None)
+        # 其他占线者不借用上一次本地通话的号码和时间。
+        local_active = bool(getattr(session, "is_active", False))
+        outbound = getattr(session, "_outbound_number", None) if local_active else None
+        number = (outbound or getattr(session, "current_caller", None)) if local_active else None
+        digits = re.sub(r"[^0-9]", "", str(number or ""))
+        meta["call"] = {
+            "direction": ("outbound" if outbound else "inbound") if local_active else None,
+            "number_suffix": digits[-4:] or None,
+            "started_at": getattr(session, "call_started_at", None) if local_active else None,
+        }
     queue_status = getattr(service, "dial_queue_status", None)
     queue = queue_status() if callable(queue_status) else {}
     meta["dial_queue_busy"] = bool(
@@ -411,7 +443,8 @@ async def _meta(request: web.Request) -> web.Response:
     meta["credentials"] = config.credential_status(meta.get("provider"))
     meta["setup_required"] = config.setup_required()
     meta["hardware"] = {
-        "usb_online": detect_quectel_usb_online(),
+        "usb_online": _tray_usb_online(request.app) if request.query.get("tray") == "1"
+                      else detect_quectel_usb_online(),
         "modem_connected": bool(getattr(service, "modem_connected", False)),
         "modem_resetting": isinstance(modem, SerialModem) and modem.recovery_in_progress,
         "port": meta.get("port") or config.get_str("MODEM_PORT"),
@@ -420,6 +453,10 @@ async def _meta(request: web.Request) -> web.Response:
         "firmware": getattr(modem, "firmware", ""),
         "signal": getattr(modem, "signal", {"csq": None, "level": "unknown", "updated_at": None}),
     }
+    if (request.query.get("tray") == "1" and meta["call_active"]
+            and meta["hardware"]["signal"].get("csq") is None):
+        # 只回退展示值，不伪造采样时间，也不掩盖非通话时的断线未知状态。
+        meta["hardware"]["signal"] = getattr(modem, "last_signal", meta["hardware"]["signal"])
     bluetooth = getattr(modem, "line_kind", "") == "bluetooth"
     if bluetooth and modem is not None:
         meta["hardware"]["vendor"] = "bluetooth"

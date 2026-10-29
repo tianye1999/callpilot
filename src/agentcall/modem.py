@@ -220,6 +220,7 @@ class SerialModem:
         self.model = ""
         self.firmware = ""
         self.signal: dict[str, Any] = {"csq": None, "level": "unknown", "updated_at": None}
+        self.last_signal = self.signal.copy()
         self._last_signal_poll = 0.0
         self._sim_reread_until = 0.0
         self._hardware_call_present = False
@@ -331,6 +332,8 @@ class SerialModem:
                     csq, level = parse_csq(self._write_command("AT+CSQ"))
                     if csq is not None:
                         self.signal = {"csq": csq, "level": level, "updated_at": time.time()}
+                        # 通话中暂停 CSQ，传输短暂重连也保留最近成功样本的原始时间。
+                        self.last_signal = self.signal.copy()
                 except Exception:  # noqa: BLE001
                     pass
         if self.run_idle_hardware is not None:
@@ -363,6 +366,7 @@ class SerialModem:
             self._buffer = ""
             self._set_sim_identity(UNKNOWN_SIM, notify=False)
             self.signal = {"csq": None, "level": "unknown", "updated_at": None}
+            self.last_signal = self.signal.copy()
             try:
                 if self._ser:
                     self._ser.close()

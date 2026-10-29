@@ -4,12 +4,8 @@
 比整窗 App 更贴合本项目「服务常驻、随手查看」的真实用法——关掉面板窗口
 不影响接打电话，托盘图标始终在顶栏显示服务状态、一键打开面板/重启/退出。
 
-菜单：
-    ● CallPilot            （标题，图标随服务状态：🟢 在线 / 🔴 离线）
-    打开控制台             （开 pywebview 面板窗口，即 desktop_app.py 子进程）
-    重启服务               （POST /api/restart，按当前运行方式重启后端）
-    ——
-    退出 CallPilot         （打包版确认后停止服务与桥，再退出托盘）
+打包版菜单显示四态状态与详情，通话时提供挂断和旁听定位；
+源码版保留原有控制台与重启入口。退出打包版时停止服务与桥。
 
 用法：
     .venv/bin/python tray_app.py
@@ -38,6 +34,8 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_WEB_URL = "http://127.0.0.1:47100"
 HEALTH_PROBE_INTERVAL = 3.0
+CALL_PROBE_INTERVAL = 1.0
+MENU_PROBE_INTERVAL = 0.5
 
 
 def icon_path(online: bool) -> str:
@@ -62,12 +60,18 @@ _MENU_LABELS = {
         "restart": "Restart service",
         "uninstall": "Uninstall background services",
         "quit": "Quit CallPilot",
+        "open_app": "Open CallPilot",
+        "hangup": "Hang up",
+        "listen": "Listen live",
     },
     "zh": {
         "open": "打开控制台",
         "restart": "重启服务",
         "uninstall": "卸载常驻",
         "quit": "退出 CallPilot",
+        "open_app": "打开 CallPilot",
+        "hangup": "挂断",
+        "listen": "旁听",
     },
 }
 
@@ -136,6 +140,28 @@ def request_restart(url: str, timeout: float = 4.0) -> bool:
             return 200 <= int(status) < 300
     except (urllib.error.URLError, OSError, ValueError):
         return False
+
+
+def request_hangup(url: str, timeout: float = 4.0) -> bool:
+    """复用现有挂断 API；失败交回主线程显示，不假装已经挂断。"""
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}/api/call/hangup", data=b"{}",
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300 and json.loads(resp.read()).get("ok") is True
+    except (urllib.error.URLError, OSError, ValueError, AttributeError):
+        return False
+
+
+def update_status_icon(app, state: str) -> None:
+    from agentcall.macos_shell import draw_tray_icon
+
+    # rumps 的 icon 属性只收文件名；复用它的 NSImage 存储和刷新入口，不写临时素材。
+    app._icon_nsimage = draw_tray_icon(icon_path(False), state)
+    if hasattr(app, "_nsapp"):
+        app._nsapp.setStatusBarIcon()
 
 
 def _is_frozen() -> bool:
@@ -284,6 +310,18 @@ def open_or_focus_dashboard(
     return popen(cmd_factory(), cwd=str(PROJECT_ROOT))
 
 
+def open_listen_dashboard(current_proc, support: Path | None = None):
+    """复用窗口；定位请求由窗口消费，启动页等待服务时也不会丢失。"""
+    from agentcall.macos_launchd import app_support_dir
+
+    directory = support if support is not None else app_support_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "listen-window").touch(mode=0o600)
+    proc = open_or_focus_dashboard(current_proc)
+    (directory / "focus-window").touch(mode=0o600)
+    return proc
+
+
 # ---- rumps 菜单栏胶水（薄层，惰性导入，仅 macOS）----
 
 def _acquire_tray_singleton_lock(lock_path: Path | None = None) -> "IO[str] | object | None":
@@ -339,6 +377,17 @@ def _install_reopen_handler(callback) -> None:
 
 def _bundled_macos() -> bool:
     return sys.platform == "darwin" and _is_frozen()
+
+
+def _install_tracking_hooks(app, rumps) -> None:
+    from agentcall.macos_shell import install_menu_tracking
+
+    callbacks = {getattr(callback, "__func__", callback) for callback in (app._requests, app._refresh)}
+    timers = [timer for timer in rumps.timers()
+              if getattr(timer.callback, "__func__", timer.callback) in callbacks]
+    app._menu_delegate = install_menu_tracking(
+        app.menu._menu, timers, app._menu_will_open, app._menu_did_close,
+    )
 
 
 def _start_background_services(user_initiated: bool = False) -> None:
@@ -405,9 +454,10 @@ def main() -> None:
         except OSError:
             logger.exception("提前打开控制台失败，将由菜单栏重试")
     rumps = _import_rumps()
-    from agentcall.macos_shell import ui_language
+    from agentcall.macos_shell import bundled_version, ui_language
 
     lang = ui_language()
+    version = bundled_version(sys.executable) if bundled else ""
     if not bundled:
         _start_background_services()
         maybe_autoopen_dashboard(
@@ -428,10 +478,21 @@ def main() -> None:
             self._quitting = False
             self._probe_thread: threading.Thread | None = None
             self._last_probe_started: float | None = None
-            self._online = False
-            self._displayed_online = False
+            self._started_at = time.monotonic()
+            self._meta: dict = {}
+            self._connecting_since: float | None = None
+            self._displayed_state: str | None = None
+            self._menu_open = False
+            self._hangup_thread: threading.Thread | None = None
+            self._hangup_result: bool | None = None
             self._status_item = rumps.MenuItem(status_label(False, lang))
-            self.menu = [
+            self._detail_item = rumps.MenuItem("")
+            self._action_items = {
+                key: rumps.MenuItem(menu_label(key, lang), callback=callback)
+                for key, callback in (("hangup", self._hangup), ("listen", self._listen),
+                                      ("open_app", self._open), ("uninstall", self._uninstall), ("quit", self._quit))
+            } if bundled else {}
+            self.menu = [self._status_item, self._detail_item] if bundled else [
                 self._status_item,
                 None,
                 rumps.MenuItem(menu_label("open", lang), callback=self._open),
@@ -446,6 +507,7 @@ def main() -> None:
                 from agentcall import macos_launchd, macos_shell
 
                 layout = macos_launchd.make_layout(sys.executable)
+                self._render_status()
                 macos_shell.write_startup_failure(layout.support_dir, "")
                 setup = str(dotenv_values(layout.env_file).get("SETUP_DONE", "")).lower() not in {"1", "true", "yes"}
                 if early_window is None and macos_shell.should_open_window("--login" in sys.argv, setup):
@@ -454,6 +516,8 @@ def main() -> None:
                 self._start_services(user_initiated="--login" not in sys.argv)
                 _install_reopen_handler(self._reopen)
                 self._request_observer = macos_shell.observe_commands(lambda: self._requests(None))
+                # before_start 时 rumps 的原生定时器和菜单才全部就绪。
+                rumps.events.before_start.register(lambda: _install_tracking_hooks(self, rumps))
             else:
                 self._refresh(None)
 
@@ -490,21 +554,73 @@ def main() -> None:
             if self._enable_requested and self._install_thread is not None and not self._install_thread.is_alive():
                 self._start_services()
             self._refresh(None)
-            online = self._online
-            if online != self._displayed_online:
-                self.icon = icon_path(online)
-                self._status_item.title = status_label(online, lang)
-                self._displayed_online = online
+            self._render_status()
+            if self._hangup_result is not None:
+                succeeded, self._hangup_result = self._hangup_result, None
+                if not succeeded:
+                    from agentcall.macos_shell import ui_text
+
+                    rumps.alert(title=menu_label("hangup", lang), message=ui_text(
+                        "挂断失败，请打开 CallPilot 查看当前通话后重试。",
+                        "Could not hang up. Open CallPilot to check the call and retry.", lang,
+                    ))
+
+        def _menu_will_open(self) -> None:
+            self._menu_open = True
+            self._render_status(rebuild_menu=True)
+            self._refresh(None, immediate=True)
+
+        def _menu_did_close(self) -> None:
+            self._menu_open = False
+
+        def _render_status(self, *, rebuild_menu: bool = False) -> None:
+            from agentcall.macos_shell import tray_status
+
+            now = time.monotonic()
+            hardware = self._meta.get("hardware") or {}
+            if hardware.get("usb_online") and not hardware.get("modem_connected"):
+                if self._connecting_since is None:
+                    self._connecting_since = now
+            else:
+                self._connecting_since = None
+            status = tray_status(
+                {"version": version, **self._meta} if self._meta else None,
+                uptime=now - self._started_at, now=time.time(), lang=lang,
+                connecting_for=now - self._connecting_since if self._connecting_since is not None else 0,
+            )
+            if self._status_item.title != status.title:
+                self._status_item.title = status.title
+            if self._detail_item.title != status.detail:
+                self._detail_item.title = status.detail
+            if status.state != self._displayed_state:
+                update_status_icon(self, status.state)
+            # 开菜单或进出通话时重建；秒数变化仅改标题，不抖动图标和菜单。
+            if rebuild_menu or self._displayed_state is None or (status.state == "in_call") != (
+                self._displayed_state == "in_call"
+            ):
+                self.menu.clear()
+                # rumps 的回调注册表强持有菜单项，复用实例避免每通累积对象。
+                keys = (["hangup", "listen"] if status.state == "in_call" else [])
+                keys += ["open_app", "uninstall", "quit"]
+                self.menu = [self._status_item, self._detail_item, *[self._action_items[key] for key in keys]]
+            self._displayed_state = status.state
 
         @rumps.timer(5)
-        def _refresh(self, _sender) -> None:
+        def _refresh(self, _sender, *, immediate: bool = False) -> None:
             if bundled:
                 now = time.monotonic()
-                if self._last_probe_started is not None and now - self._last_probe_started < HEALTH_PROBE_INTERVAL:
+                # 缩短就绪态的发现窗口，不能等知道 call_active 后才加速发现来电。
+                interval = MENU_PROBE_INTERVAL if self._menu_open else (
+                    CALL_PROBE_INTERVAL if self._displayed_state in {"ready", "in_call"} else HEALTH_PROBE_INTERVAL
+                )
+                if (not immediate and self._last_probe_started is not None
+                        and now - self._last_probe_started < interval):
                     return
                 if self._probe_thread is None or not self._probe_thread.is_alive():
                     def probe():
-                        self._online = probe_online(web_url())
+                        from agentcall.macos_shell import fetch_meta
+
+                        self._meta = fetch_meta(web_url(), tray=True)
 
                     self._probe_thread = threading.Thread(target=probe, daemon=True)
                     self._last_probe_started = now
@@ -526,6 +642,20 @@ def main() -> None:
 
         def _restart(self, _sender) -> None:
             request_restart(web_url())
+
+        def _hangup(self, _sender) -> None:
+            if self._hangup_thread is None or not self._hangup_thread.is_alive():
+                def hangup():
+                    self._hangup_result = request_hangup(web_url())
+
+                self._hangup_thread = threading.Thread(target=hangup, daemon=True)
+                self._hangup_thread.start()
+
+        def _listen(self, _sender) -> None:
+            try:
+                self._window_proc = open_listen_dashboard(self._window_proc)
+            except OSError:
+                logger.exception("打开旁听位置失败")
 
         def _uninstall(self, _sender) -> None:
             try:

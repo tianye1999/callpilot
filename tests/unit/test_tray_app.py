@@ -273,12 +273,13 @@ def test_ensure_launchd_forwards_user_launch_flag(monkeypatch, tmp_path, user_in
     assert calls == [{"no_restart_labels": {macos_launchd.TRAY_LABEL}, "user_initiated": user_initiated}]
 
 
-@pytest.mark.parametrize("login", [False, True])
-def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, tmp_path, login):
+@pytest.fixture(params=[False, True], ids=["foreground", "login"])
+def bundled_tray(monkeypatch, tmp_path, request):
     import types
 
     from agentcall import macos_launchd, macos_shell
 
+    login = request.param
     now = [0.0]
     instances = []
     threads = []
@@ -287,10 +288,13 @@ def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, tmp_path, 
     installs = []
     startup_order = []
     reopen_callbacks = []
+    before_start = []
+    tracking = []
 
     class FakeMenuItem:
         def __init__(self, title, **kwargs):
             self.titles = [title]
+            self.callback = kwargs.get("callback")
 
         @property
         def title(self):
@@ -338,13 +342,17 @@ def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, tmp_path, 
     monkeypatch.setattr(tray_app, "open_or_focus_dashboard",
                         lambda proc: startup_order.append("window") or _FakeProc(123, True))
     monkeypatch.setattr(macos_shell, "observe_commands", lambda callback: None)
+    monkeypatch.setattr(tray_app, "_install_tracking_hooks", lambda app, rumps: tracking.append(app))
     monkeypatch.setattr(macos_shell, "ui_language", lambda: "zh")
     monkeypatch.setattr(tray_app, "_install_reopen_handler", reopen_callbacks.append)
     monkeypatch.setattr(tray_app.sys, "argv", ["CallPilot"] + (["--login"] if login else []))
     monkeypatch.setattr(tray_app, "_start_background_services", lambda **kwargs: installs.append(kwargs))
     monkeypatch.setattr(tray_app.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(tray_app.threading, "Thread", FakeThread)
-    monkeypatch.setattr(tray_app, "probe_online", lambda url: probes.append(now[0]) or True)
+    meta = {"hardware": {"usb_online": True, "modem_connected": True},
+            "sim": {"present": True, "network_attached": True}, "credentials": {"ok": True}}
+    monkeypatch.setattr(macos_shell, "fetch_meta", lambda url, **kw: probes.append(now[0]) or meta.copy())
+    monkeypatch.setattr(tray_app, "update_status_icon", lambda app, state: app.icon_updates.append(state))
     monkeypatch.setattr(
         macos_launchd, "make_layout",
         lambda executable: types.SimpleNamespace(env_file=tmp_path / ".env", support_dir=tmp_path),
@@ -354,6 +362,7 @@ def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, tmp_path, 
     monkeypatch.setattr(tray_app, "_import_rumps", lambda: startup_order.append("rumps") or types.SimpleNamespace(
         App=FakeApp, MenuItem=FakeMenuItem,
         timer=lambda interval: lambda fn: fn,
+        events=types.SimpleNamespace(before_start=types.SimpleNamespace(register=before_start.append)),
     ))
     tray_app.main()
     assert startup_order == (["rumps"] if login else ["window", "rumps"])
@@ -361,38 +370,93 @@ def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, tmp_path, 
     threads[0].finish()
     assert installs == [{"user_initiated": not login}]
     threads.clear()  # 安装目标已打桩；后面只统计健康探测线程。
+    assert len(before_start) == 1
+    before_start[0]()
+    assert tracking == [app]
+    return types.SimpleNamespace(app=app, threads=threads, probes=probes, ticks=ticks,
+                                 now=now, installs=installs, reopen_callbacks=reopen_callbacks, meta=meta)
+
+
+def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, bundled_tray):
+    env = bundled_tray
+    app, threads, probes, ticks, now = env.app, env.threads, env.probes, env.ticks, env.now
+    installs, reopen_callbacks, meta = env.installs, env.reopen_callbacks, env.meta
 
     app._requests(None)
     assert len(threads) == 1
     assert probes == []  # 主线程只启动工作线程，不执行 HTTP 探测。
     threads[-1].finish()
-    for now[0] in (0.2, 0.4, 1.0, 2.8, 2.999):
+    for now[0] in (0.2, 0.4, 0.6, 0.8, 0.999):
         app._requests(None)
         app._refresh(None)  # 旧的五秒定时入口也不能绕过节流。
     assert probes == [0.0]
     assert len(threads) == 1
     assert len(ticks) == 6
-    assert app.icon == tray_app.icon_path(True)
-    assert app.icon_updates == [tray_app.icon_path(True)]
-    assert app._status_item.titles == [tray_app.status_label(False), tray_app.status_label(True)]
+    assert app.icon_updates == ["transient", "ready"]
+    assert app._status_item.titles == [tray_app.status_label(False), "正在启动…", "可以接打电话"]
+    assert [item.title for item in app.menu][2:] == ["打开 CallPilot", "卸载常驻", "退出 CallPilot"]
+    assert app.menu[0].callback is None and app.menu[1].callback is None
 
-    now[0] = 3.0
+    now[0] = 1.0
     app._requests(None)
     assert len(threads) == 2
-    now[0] = 6.0
+    now[0] = 2.0
     app._requests(None)
     assert len(threads) == 2  # 慢探测仍在运行时不重叠启动。
     threads[-1].finish()
-    now[0] = 6.2
+    now[0] = 2.2
     app._requests(None)
     assert len(threads) == 3  # 间隔从启动而非结束时间计算。
-    app._online = False
+    app._meta = {}
     app._requests(None)
     app._requests(None)
-    assert app.icon_updates == [tray_app.icon_path(True), tray_app.icon_path(False)]
+    assert app.icon_updates == ["transient", "ready", "transient"]
     assert app._status_item.titles == [
-        tray_app.status_label(False), tray_app.status_label(True), tray_app.status_label(False),
+        tray_app.status_label(False), "正在启动…", "可以接打电话", "正在启动…",
     ]
+
+    app._meta = {**meta, "call_active": True, "call": {"number_suffix": "1234", "started_at": 100}}
+    monkeypatch.setattr(tray_app.time, "time", lambda: 183)
+    app._render_status()
+    assert [item.title for item in app.menu][2:] == ["挂断", "旁听", "打开 CallPilot", "卸载常驻", "退出 CallPilot"]
+    assert app._status_item.title == "通话中 · 尾号 1234 · 01:23"
+    monkeypatch.setattr(tray_app.time, "time", lambda: 184)
+    before = len(app.icon_updates)
+    app._render_status()
+    assert app._status_item.title.endswith("01:24")
+    assert len(app.icon_updates) == before
+    hangups = []
+    monkeypatch.setattr(tray_app, "request_hangup", lambda url: hangups.append(url) or True)
+    app.menu[2].callback(None)
+    assert not hangups
+    hangup_thread = threads[-1]
+    app.menu[2].callback(None)
+    assert threads[-1] is hangup_thread
+    hangup_thread.finish()
+    assert hangups == [tray_app.web_url()]
+    listens = []
+    monkeypatch.setattr(tray_app, "open_listen_dashboard", lambda proc: listens.append(proc) or proc)
+    app.menu[3].callback(None)
+    assert listens == [app._window_proc]
+    app._meta = meta.copy()
+    app._render_status()
+    assert "挂断" not in [item.title for item in app.menu]
+    assert app.menu[2] is app._action_items["open_app"]
+
+    app._meta["hardware"] = {"usb_online": True, "modem_connected": False}
+    now[0] = 100
+    app._render_status()
+    now[0] = 160
+    app._render_status()
+    assert app._displayed_state == "transient"
+    now[0] = 160.001
+    app._render_status()
+    assert app._displayed_state == "attention"
+    app._meta["hardware"]["usb_online"] = False
+    app._render_status()
+    app._meta["hardware"]["usb_online"] = True
+    app._render_status()
+    assert app._displayed_state == "transient"
 
     app._start_services()
     pending_install = threads[-1]
@@ -408,6 +472,143 @@ def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, tmp_path, 
     monkeypatch.setattr(app, "_start_services", lambda: actions.append("services"))
     reopen_callbacks[0]()  # Cocoa reopen 直接处理，不等下一次 tick。
     assert actions == ["window", "services"]
+
+
+def test_menu_open_rebuilds_cached_call_and_forces_async_probe(bundled_tray):
+    env = bundled_tray
+    app = env.app
+    app._meta = {**env.meta, "call_active": True}
+    app._render_status()
+    app.menu.clear()
+    app._last_probe_started = env.now[0]
+    app._menu_will_open()
+    assert [item.title for item in app.menu][2:4] == ["挂断", "旁听"]
+    assert len(env.threads) == 1 and env.probes == []
+    env.threads[-1].finish()
+    # 探测已返回空闲，菜单保持展开，由 common-modes tick 消费最新缓存。
+    app._requests(None)
+    assert app._menu_open
+    assert app._displayed_state == "ready"
+    assert "挂断" not in [item.title for item in app.menu]
+    app._menu_did_close()
+    assert not app._menu_open
+
+
+def test_call_start_and_open_menu_probe_cadence(bundled_tray, monkeypatch):
+    env = bundled_tray
+    app = env.app
+    app._requests(None)
+    env.threads[-1].finish()
+    env.now[0] = 0.2
+    app._requests(None)
+    env.meta.update(call_active=True, call={"number_suffix": "1234", "started_at": 100})
+    monkeypatch.setattr(tray_app.time, "time", lambda: 101)
+    env.now[0] = 0.999
+    app._requests(None)
+    assert len(env.threads) == 1
+    env.now[0] = 1.0
+    app._requests(None)
+    env.threads[-1].finish()
+    env.now[0] = 1.2
+    app._menu_will_open()
+    assert app._displayed_state == "in_call"
+    assert "挂断" in [item.title for item in app.menu]
+    assert len(env.threads) == 3  # 开菜单立即探测，不等一秒节流。
+    app._menu_will_open()
+    assert len(env.threads) == 3  # 重复打开不重叠探测。
+    env.threads[-1].finish()
+    env.now[0] = 1.699
+    app._requests(None)
+    assert len(env.threads) == 3
+    env.now[0] = 1.7
+    app._requests(None)
+    assert len(env.threads) == 4
+    monkeypatch.setattr(tray_app.time, "time", lambda: 102)
+    app._requests(None)
+    assert app._status_item.title.endswith("00:02")
+    env.threads[-1].finish()
+    app._menu_did_close()
+    app._meta = {}
+    app._render_status()
+    env.now[0] = 4.699
+    app._requests(None)
+    assert len(env.threads) == 4
+    env.now[0] = 4.7
+    app._requests(None)
+    assert len(env.threads) == 5  # 服务不可达时恢复三秒节流。
+
+
+def test_tracking_hooks_only_register_owned_timers_in_common_modes(monkeypatch):
+    import types
+
+    from agentcall import macos_shell
+
+    opened, closed, registered, delegates = [], [], [], []
+    def requests(sender):
+        pass
+    def refresh(sender):
+        pass
+    class Delegate:
+        @classmethod
+        def alloc(cls):
+            return cls()
+        def init(self):
+            return self
+    monkeypatch.setattr(macos_shell, "_tray_menu_delegate_class", lambda: Delegate)
+    monkeypatch.setitem(sys.modules, "Foundation", types.SimpleNamespace(
+        NSRunLoop=types.SimpleNamespace(mainRunLoop=lambda: types.SimpleNamespace(
+            addTimer_forMode_=lambda timer, mode: registered.append((timer, mode)))),
+        NSRunLoopCommonModes="common",
+    ))
+    app = types.SimpleNamespace(
+        menu=types.SimpleNamespace(_menu=types.SimpleNamespace(setDelegate_=delegates.append)),
+        _requests=requests, _refresh=refresh,
+        _menu_will_open=lambda: opened.append(True), _menu_did_close=lambda: closed.append(True),
+    )
+    timers = [types.SimpleNamespace(callback=callback, _nstimer=index)
+              for index, callback in enumerate([requests, refresh, lambda sender: None])]
+    tray_app._install_tracking_hooks(app, types.SimpleNamespace(timers=lambda: timers))
+    assert registered == [(0, "common"), (1, "common")]
+    assert delegates == [app._menu_delegate]
+    app._menu_delegate.on_open()
+    app._menu_delegate.on_close()
+    assert opened == closed == [True]
+
+
+def test_open_listen_reuses_window_and_queues_anchor(monkeypatch, tmp_path):
+    proc = _FakeProc(123, True)
+    calls = []
+    monkeypatch.setattr(tray_app, "open_or_focus_dashboard", lambda current: calls.append(current) or proc)
+    assert tray_app.open_listen_dashboard(proc, tmp_path) is proc
+    assert calls == [proc]
+    assert (tmp_path / "listen-window").exists()
+    assert (tmp_path / "focus-window").exists()
+
+
+@pytest.mark.parametrize("payload,success", [(b'{"ok":true}', True), (b'{"ok":false}', False),
+                                            (b'bad', False)])
+def test_request_hangup_posts_existing_endpoint(monkeypatch, payload, success):
+    import io
+
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        response = io.BytesIO(payload)
+        response.status = 200
+        return response
+
+    monkeypatch.setattr(tray_app.urllib.request, "urlopen", urlopen)
+    assert tray_app.request_hangup("http://test/") is success
+    assert requests[0].full_url == "http://test/api/call/hangup"
+    assert requests[0].method == "POST" and requests[0].data == b"{}"
+
+
+def test_request_hangup_failure(monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("offline")
+    monkeypatch.setattr(tray_app.urllib.request, "urlopen", fail)
+    assert not tray_app.request_hangup("http://test")
 
 
 def test_fetch_setup_required_true_false(monkeypatch):

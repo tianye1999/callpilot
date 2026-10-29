@@ -357,6 +357,7 @@
     cursor: pointer; font-family: var(--mono);
   }
   .listen-btn.on { color: var(--ok); border-color: var(--ok); box-shadow: 0 0 9px rgba(67,230,154,.4); }
+  .listen-btn.listen-target { outline: 3px solid var(--blue); outline-offset: 4px; }
   #chat { min-height: 300px; max-height: calc(100vh - 300px); overflow-y: auto; padding: 18px 20px; }
   #chat:empty::before { content: attr(data-empty); color: var(--dim); font-size: 13px; display: block; text-align: center; padding: 40px 0; }
   /* 通话之间的分割线：一行居中标签 + 两侧渐隐横线 */
@@ -962,7 +963,7 @@
     <!-- 实时对话 -->
     <div class="panel-page" id="page-live">
       <div class="wrap">
-        <section class="card">
+        <section class="card" id="listen">
           <h2><span data-i18n="live_title"></span>
             <span class="live-tag" id="liveTag" style="display:none"><span class="ldot"></span>LIVE</span>
             <span class="sub" id="liveSub"></span>
@@ -4384,6 +4385,18 @@ loadRemoteDialerStatus();
 setInterval(refreshQueue, 2000);
 // 支持 /#metrics 直达指标面板（旧 /static/metrics.html 链接由后端 302 到这里）。
 if (location.hash === "#metrics") navTo("metrics");
+async function focusListenAnchor() {
+  if (location.hash !== "#listen") return;
+  await navTo("live");
+  if (currentPage !== "live") return;
+  const button = $("listenBtn");
+  $("listen").scrollIntoView({block: "start"});
+  button.classList.add("listen-target");
+  button.focus({preventScroll: true});
+}
+window.addEventListener("hashchange", focusListenAnchor);
+$("listenBtn").addEventListener("click", () => $("listenBtn").classList.remove("listen-target"));
+focusListenAnchor();
 </script>
 </body>
 </html>

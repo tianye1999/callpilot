@@ -235,6 +235,42 @@ def test_startup_retry_and_ready_transition(monkeypatch, tmp_path):
     assert not worker.is_alive()
 
 
+@pytest.mark.parametrize("initial", [False, True])
+def test_listen_request_survives_startup_and_reuses_loaded_page(monkeypatch, tmp_path, initial):
+    import threading
+
+    from agentcall import macos_shell
+
+    loaded = threading.Event()
+    focused = threading.Event()
+    calls = []
+    scripts = []
+    window = types.SimpleNamespace(
+        load_url=lambda url: (calls.append(url), loaded.set()),
+        evaluate_js=lambda script: (scripts.append(script), focused.set()),
+        restore=lambda: None, show=lambda: None,
+    )
+    request = tmp_path / "listen-window"
+    if initial:
+        request.touch()
+    startup = desktop_app.BundledStartup(window, "http://test", types.SimpleNamespace(support_dir=tmp_path))
+    monkeypatch.setattr(macos_shell, "fetch_meta", lambda url: {"setup_required": False, "hardware": {}})
+    worker = threading.Thread(target=startup.run)
+    worker.start()
+    try:
+        assert loaded.wait(2)
+        assert calls == ["http://test/#listen" if initial else "http://test"]
+        request.touch()
+        assert focused.wait(2)
+    finally:
+        startup.closed.set()
+        worker.join(2)
+    assert not worker.is_alive() and not request.exists()
+    assert len(calls) == 1
+    assert "#listen" in scripts[0] and "hashchange" in scripts[0]
+    assert "toggleListen" not in scripts[0]
+
+
 @pytest.mark.parametrize("late_failure", [False, True])
 def test_launchctl_failure_shown_immediately_and_retry_recovers(monkeypatch, tmp_path, late_failure):
     import threading

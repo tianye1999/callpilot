@@ -191,6 +191,72 @@ def test_meta_reports_current_call_state(active, monkeypatch):
     assert service.session.is_active is active
 
 
+@pytest.mark.parametrize("active,outbound", [(False, False), (True, False), (True, True)])
+def test_meta_call_details_only_expose_suffix(active, outbound, monkeypatch):
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+    session = SimpleNamespace(is_active=active, current_caller="+12025551234",
+                              _outbound_number="+12025555678" if outbound else None,
+                              call_started_at=1234.5)
+    service = FakeService(session=session)
+
+    async def fn(client):
+        response = await client.get("/api/meta")
+        text = await response.text()
+        assert "+1202555" not in text
+        return json.loads(text)
+
+    meta = api(make_app(service), fn)
+    assert meta["call"] == ({"direction": "outbound" if outbound else "inbound",
+                             "number_suffix": "5678" if outbound else "1234",
+                             "started_at": 1234.5} if active else None)
+
+
+def test_meta_other_line_owner_never_reuses_previous_call(monkeypatch):
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+    service = FakeService(session=SimpleNamespace(is_active=False, current_caller="+12025551234",
+                                                  _outbound_number="+12025555678", call_started_at=1234))
+    service.remote_status["active"] = True
+
+    async def fn(client):
+        return await (await client.get("/api/meta")).json()
+
+    assert api(make_app(service), fn)["call"] == {"direction": None, "number_suffix": None, "started_at": None}
+
+
+def test_tray_meta_usb_scan_is_background_cached_and_nonoverlapping(monkeypatch):
+    scans = []
+    now = [0.0]
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: scans.append(True) or True)
+
+    async def fn(client):
+        response = await client.get("/api/meta?tray=1")
+        assert response.status == 200
+        assert (await response.json())["hardware"]["usb_online"] is None
+        app = client.server.app
+        cache = app["tray_usb"]
+        task = cache["task"]
+        # 在途扫描复用，主线程直接返回未知或旧值。
+        if not task.done():
+            assert server._tray_usb_online(app) is None
+            assert cache["task"] is task
+        await task
+        assert server._tray_usb_online(app) is True
+        now[0] = 9.999
+        assert server._tray_usb_online(app) is True
+        assert cache["task"] is None
+        now[0] = 10
+        assert server._tray_usb_online(app) is True
+        next_task = cache["task"]
+        assert next_task is not task
+        server._tray_usb_online(app)
+        assert cache["task"] is next_task
+        await next_task
+        assert scans == [True, True]
+
+    api(make_app(FakeService()), fn)
+
+
 def test_meta_uses_line_owner_state_even_without_active_local_session(monkeypatch):
     monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
     service = FakeService(session=_SessionStub(is_active=False))
@@ -490,6 +556,30 @@ def test_meta_exposes_cached_modem_info_and_signal(monkeypatch):
     assert hw["vendor"] == "simcom"
     assert hw["model"] == "TEST-MODEL" and hw["firmware"] == "TEST-FIRMWARE"
     assert hw["signal"] == modem.signal
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("tray", [False, True])
+def test_meta_retains_last_signal_only_during_call(monkeypatch, active, tray):
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("/dev/fake-at")
+    modem._connection_online = True
+    monkeypatch.setenv("MODEM_SIGNAL_POLL_SECONDS", "1")
+    monkeypatch.setattr(modem, "_write_command", lambda cmd: "+CSQ: 25,99\r\nOK")
+    modem.poll_signal()
+    sample = modem.signal.copy()
+    modem._emit_connection_state(False)
+    service = FakeService(session=_SessionStub(is_active=active))
+    service.modem = modem
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+
+    async def fn(client):
+        return await (await client.get("/api/meta?tray=1" if tray else "/api/meta")).json()
+
+    meta = api(make_app(service), fn)
+    assert meta["hardware"]["signal"] == (sample if active and tray else modem.signal)
+    assert modem.signal["level"] == "unknown"
 
 
 def test_validate_key_endpoint_valid_invalid_and_network(monkeypatch):

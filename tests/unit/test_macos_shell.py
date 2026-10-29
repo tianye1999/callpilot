@@ -18,6 +18,39 @@ def test_ui_language_uses_preferred_languages_not_agent_language(monkeypatch, la
     assert macos_shell.ui_language(languages) == expected
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="需要 macOS 原生 run loop，不创建托盘或窗口")
+def test_common_mode_timer_fires_during_menu_tracking():
+    result = subprocess.run([sys.executable, "-c", '''
+import time
+import rumps
+from AppKit import NSApplication, NSMenu, NSEventTrackingRunLoopMode
+from Foundation import NSDate, NSRunLoop
+from agentcall.macos_shell import install_menu_tracking
+NSApplication.sharedApplication()
+ticks, opened, closed = [], [], []
+timer = rumps.Timer(lambda sender: ticks.append(time.monotonic()), 0.01)
+timer.start()
+loop = NSRunLoop.mainRunLoop()
+def track(seconds, until=None):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and (until is None or len(ticks) < until):
+        loop.runMode_beforeDate_(NSEventTrackingRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.01))
+try:
+    track(0.05)
+    assert not ticks, ticks
+    menu = NSMenu.alloc().initWithTitle_("Offline test")
+    delegate = install_menu_tracking(menu, [timer], lambda: opened.append(True), lambda: closed.append(True))
+    delegate.menuWillOpen_(menu)
+    track(1, until=2)
+    delegate.menuDidClose_(menu)
+    assert opened == closed == [True]
+    assert len(ticks) >= 2, ticks
+finally:
+    timer.stop()
+'''], capture_output=True, text=True, encoding="utf-8", timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_native_failure_and_quit_messages_are_bilingual():
     assert "port" in macos_shell.failure_reason("Address already in use", lang="en")
     assert "通话" in macos_shell.quit_message({"call_active": True}, lang="zh")

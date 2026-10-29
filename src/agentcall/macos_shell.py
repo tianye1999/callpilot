@@ -16,7 +16,7 @@ import time
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from agentcall import macos_launchd
 
@@ -37,6 +37,157 @@ def ui_language(languages: list[str] | None = None) -> str:
 
 def ui_text(zh: str, en: str, lang: str | None = None) -> str:
     return zh if (lang or ui_language()) == "zh" else en
+
+
+@lru_cache(maxsize=1)
+def _tray_menu_delegate_class():
+    from Foundation import NSObject
+
+    class CallPilotMenuDelegate(NSObject):
+        def menuWillOpen_(self, menu):
+            self.on_open()
+
+        def menuDidClose_(self, menu):
+            self.on_close()
+
+    return CallPilotMenuDelegate
+
+
+def install_menu_tracking(menu, timers, on_open, on_close):
+    """rumps 启动完定时器后补注册 common modes，不修改其全局 Timer 实现。"""
+    from Foundation import NSRunLoop, NSRunLoopCommonModes
+
+    for timer in timers:
+        NSRunLoop.mainRunLoop().addTimer_forMode_(timer._nstimer, NSRunLoopCommonModes)
+    delegate = _tray_menu_delegate_class().alloc().init()
+    delegate.on_open = on_open
+    delegate.on_close = on_close
+    menu.setDelegate_(delegate)
+    return delegate  # NSMenu 不强持有 delegate，由托盘实例保存。
+
+
+class TrayStatus(NamedTuple):
+    state: str
+    title: str
+    detail: str
+
+
+def tray_status(
+    meta: dict | None, *, uptime: float, now: float, connecting_for: float = 0,
+    startup_grace: float = 45, lang: str = "zh",
+) -> TrayStatus:
+    """纯状态判定；时间由调用方注入，不读系统、不做 I/O。"""
+    def text(zh, en):
+        return ui_text(zh, en, lang)
+
+    if not meta:
+        if uptime <= startup_grace:
+            return TrayStatus("transient", text("正在启动…", "Starting…"), "")
+        return TrayStatus("attention", text("服务没有运行：打开 CallPilot 查看原因",
+                                            "Service is not running: open CallPilot to check why"), "")
+    hardware = meta.get("hardware") or {}
+    sim = meta.get("sim") or {}
+    details = []
+    carrier = sim.get("carrier")
+    if carrier and carrier != "未知":
+        details.append(text(carrier, {"美国运营商": "US carrier", "中国移动": "China Mobile",
+                                     "中国联通": "China Unicom", "中国电信": "China Telecom",
+                                     "中国广电": "China Broadnet"}.get(carrier, carrier)))
+    if sim:
+        details.append(text("已注册", "Registered") if sim.get("registered") else (
+            text("仅 LTE 已注册", "LTE registered only") if sim.get("eps_registered") else
+            text("搜网中…", "Searching…")
+        ))
+    level = (hardware.get("signal") or {}).get("level")
+    if level:
+        signals = {"excellent": ("很好", "Excellent"), "good": ("良好", "Good"),
+                   "fair": ("一般", "Fair"), "weak": ("弱", "Weak"), "unknown": ("未知", "Unknown")}
+        details.append(text(*signals.get(level, signals["unknown"])))
+    if meta.get("version"):
+        details.append(str(meta["version"]))
+    detail = " · ".join(details)
+
+    def status(state, zh, en):
+        return TrayStatus(state, text(zh, en), detail)
+
+    if meta.get("call_active"):
+        call = meta.get("call") or {}
+        started = call.get("started_at")
+        seconds = max(0, int(now - started)) if isinstance(started, (int, float)) else 0
+        suffix = re.sub(r"[^0-9]", "", str(call.get("number_suffix") or ""))[-4:]
+        parts = [text("通话中", "In call")]
+        if suffix:
+            parts.append(text(f"尾号 {suffix}", f"ending {suffix}"))
+        parts.append(f"{seconds // 60:02d}:{seconds % 60:02d}" if started is not None else "--:--")
+        return TrayStatus("in_call", " · ".join(parts), detail)
+
+    # 未连上 AT 时 SIM 缓存可能是 UNKNOWN_SIM，不据此判定缺卡。
+    connected = hardware.get("modem_connected")
+    resetting = hardware.get("modem_resetting")
+    if hardware.get("usb_online") is False:
+        return status("attention", "没检测到模组：检查 USB 线，换个 USB 口",
+                      "No modem detected: Check the USB cable or try another port")
+    if hardware.get("usb_online") and not connected and connecting_for > 60:
+        return status("attention", "未能连接模组：重新插拔 USB，在窗口里查看原因",
+                      "Cannot connect to modem: reconnect USB and open CallPilot to check why")
+    if connected and sim.get("present") is False:
+        return status("attention", "没检测到 SIM 卡：插好卡后在窗口里点『重新读卡』",
+                      "No SIM detected: insert the SIM, then choose Read SIM again in CallPilot")
+    if (connected and not sim.get("network_attached")
+            and sim.get("reg_status") == sim.get("eps_status") == "注册被拒"):
+        return status("attention", "卡被网络拒绝：确认卡已开通、未欠费",
+                      "SIM rejected by network: check activation and account balance")
+    if (meta.get("credentials") or {}).get("ok") is False:
+        return status("attention", "还没填写模型 Key：打开 CallPilot 完成设置",
+                      "Missing model key: open CallPilot to finish setup")
+    if resetting:
+        return status("transient", "模组恢复中，约 30 秒", "Modem recovering, about 30 seconds")
+    if not connected:
+        return status("transient", "正在连接模组…", "Connecting to modem…")
+    if sim.get("network_attached"):
+        return status("ready", "可以接打电话", "Ready to make and receive calls")
+    return status("transient", "正在搜网，一般 30 秒内完成", "Searching for network, usually within 30 seconds")
+
+
+def tray_icon_color(state: str) -> tuple[float, float, float]:
+    return {"ready": (0.15, 0.75, 0.35), "in_call": (0.1, 0.55, 1.0),
+            "transient": (1.0, 0.75, 0.1), "attention": (0.95, 0.2, 0.2)}[state]
+
+
+def bundled_version(executable: str) -> str:
+    import plistlib
+
+    bundle = macos_launchd.bundle_root_for_executable(executable)
+    if bundle is not None:
+        try:
+            with (bundle / "Contents" / "Info.plist").open("rb") as stream:
+                return str(plistlib.load(stream).get("CFBundleShortVersionString", ""))
+        except (OSError, ValueError):
+            pass
+    return ""
+
+
+def draw_tray_icon(path: str, state: str):
+    """在现有品牌图标上叠点；黑白双描边在明暗菜单栏上都保留边界。"""
+    from AppKit import NSBezierPath, NSColor, NSCompositingOperationSourceOver, NSImage, NSMakeRect
+
+    base = NSImage.alloc().initWithContentsOfFile_(path)
+    image = NSImage.alloc().initWithSize_((22, 22))
+    image.lockFocus()
+    try:
+        base.drawInRect_fromRect_operation_fraction_(
+            NSMakeRect(1, 2, 18, 18), NSMakeRect(0, 0, 0, 0), NSCompositingOperationSourceOver, 1.0,
+        )
+        for rect, color in [((13, 0, 9, 9), NSColor.blackColor()),
+                            ((14, 1, 7, 7), NSColor.whiteColor()),
+                            ((15, 2, 5, 5), NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                                *tray_icon_color(state), 1.0))]:
+            color.setFill()
+            NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(*rect)).fill()
+    finally:
+        image.unlockFocus()
+    image.setTemplate_(False)
+    return image
 
 
 def configure_shell_logging(
@@ -198,9 +349,10 @@ def take_commands(support: Path | None = None) -> set[str]:
     return commands
 
 
-def fetch_meta(url: str) -> dict:
+def fetch_meta(url: str, *, tray: bool = False) -> dict:
     try:
-        with urllib.request.urlopen(f"{url.rstrip('/')}/api/meta", timeout=0.5) as response:
+        suffix = "?tray=1" if tray else ""
+        with urllib.request.urlopen(f"{url.rstrip('/')}/api/meta{suffix}", timeout=0.5) as response:
             data = json.loads(response.read(65536))
         # 不能把占用端口的任意 HTTP 200 当作 CallPilot。
         if isinstance(data, dict) and isinstance(data.get("setup_required"), bool) and "hardware" in data:

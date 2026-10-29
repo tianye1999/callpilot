@@ -461,6 +461,7 @@ class BundledStartup:
         displayed_failure = ""
         close_request = self.layout.support_dir / "close-window"
         focus_request = self.layout.support_dir / "focus-window"
+        listen_request = self.layout.support_dir / "listen-window"
         while not self.closed.wait(0.1):
             if close_request.exists():
                 close_request.unlink(missing_ok=True)
@@ -492,13 +493,24 @@ class BundledStartup:
                 pass
             if not waiting:
                 if not startup_failure:
+                    if listen_request.exists():
+                        # 重复点击仍定位；只改锚点，不刷新页面或触发音频播放。
+                        self.window.evaluate_js(
+                            "if (location.hash !== '#listen') { location.hash = 'listen'; } "
+                            "else { window.dispatchEvent(new Event('hashchange')); }"
+                        )
+                        listen_request.unlink(missing_ok=True)
                     continue
                 # app 可能先健康、tray 稍后安装失败；进入管理页后仍接收最终失败结果。
                 waiting = True
                 diagnosing = False
             meta = macos_shell.fetch_meta(self.url)
             if meta and not startup_failure:
-                self.window.load_url(self.url)
+                target = self.url
+                if listen_request.exists():
+                    target = self.url.rstrip("/") + "/#listen"
+                    listen_request.unlink(missing_ok=True)
+                self.window.load_url(target)
                 waiting = False
             elif (startup_failure or time.monotonic() >= deadline) and not diagnosing:
                 diagnosing = True

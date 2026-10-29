@@ -130,6 +130,34 @@ def test_signal_failure_preserves_cache_without_reconnect(monkeypatch):
     assert modem.signal == old
 
 
+def test_last_signal_survives_transport_loss_and_call_without_new_csq(monkeypatch):
+    modem = make_modem()
+    modem._connection_online = True
+    monkeypatch.setenv("MODEM_SIGNAL_POLL_SECONDS", "1")
+    sent = []
+    monkeypatch.setattr(modem, "_write_command", lambda cmd: sent.append(cmd) or "+CSQ: 25,99\r\nOK")
+    modem.poll_signal()
+    sample = modem.signal.copy()
+    modem._emit_connection_state(False)
+    assert modem.signal["level"] == "unknown"
+    assert modem.last_signal == sample
+    modem._connection_online = True
+    modem._call_connected_event.set()
+    modem._last_signal_poll = 0
+    modem.poll_signal()
+    assert sent == ["AT+CSQ"]
+    assert modem.last_signal == sample
+
+
+def test_reread_sim_invalidates_last_signal(monkeypatch):
+    modem = make_sim7600()
+    modem._connection_online = True
+    modem.last_signal = {"csq": 25, "level": "excellent", "updated_at": 123.0}
+    monkeypatch.setattr(modem, "_write_command", lambda cmd: "OK")
+    modem.reread_sim()
+    assert modem.last_signal["level"] == "unknown"
+
+
 # ---- create_modem 厂商工厂 ----
 
 def test_create_modem_defaults_to_quectel():

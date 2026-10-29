@@ -156,6 +156,53 @@ def test_dashboard_listener_recovers_suspended_web_audio():
     assert "void resumeAndPlayPcm(int16, kind);" in text
 
 
+def test_listen_anchor_navigates_highlights_without_audio_and_respects_unsaved_changes():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 执行真实前端锚点函数")
+    text = INDEX.read_text(encoding="utf-8")
+    assert 'id="listen"' in text
+    assert 'window.addEventListener("hashchange", focusListenAnchor);' in text
+    assert '.listen-btn.listen-target { outline: 3px solid var(--blue)' in text
+    assert '$("listenBtn").addEventListener("click", () => $("listenBtn").classList.remove("listen-target"));' in text
+    start = text.index("async function focusListenAnchor()")
+    end = text.index('\nwindow.addEventListener("hashchange"', start)
+    result = subprocess.run([node, "-e", text[start:end] + '''
+const assert = require('node:assert/strict');
+const location = {hash: '#listen'};
+let currentPage = 'settings', allowNavigation = true;
+const events = [];
+async function navTo(name) { if (allowNavigation) currentPage = name; }
+function $(id) {
+  return {scrollIntoView: () => events.push('scroll:' + id),
+          focus: () => events.push('focus:' + id),
+          classList: {add: name => events.push(name)}};
+}
+(async () => {
+  await focusListenAnchor();
+  assert.equal(currentPage, 'live');
+  assert.deepEqual(events, ['scroll:listen', 'listen-target', 'focus:listenBtn']);
+  events.length = 0;
+  currentPage = 'settings'; allowNavigation = false;
+  await focusListenAnchor();
+  assert.deepEqual(events, []);
+  location.hash = '#metrics'; allowNavigation = true;
+  await focusListenAnchor();
+  assert.equal(currentPage, 'settings');
+  assert.deepEqual(events, []);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''], capture_output=True, text=True, encoding="utf-8", timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_settings_restart_entry_uses_existing_api_and_confirmation():
+    text = INDEX.read_text(encoding="utf-8")
+    assert 'id="restartBtn"' in text
+    assert '$("restartBtn").addEventListener("click", confirmRestart)' in text
+    assert 'if (choice === "ok") restartService();' in text
+    assert 'postJson("/api/restart", {})' in text
+
+
 def test_dashboard_listener_resets_only_downlink_timeline_on_rate_change():
     text = INDEX.read_text(encoding="utf-8")
 
