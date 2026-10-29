@@ -9,6 +9,51 @@ pytest.importorskip("fcntl", reason="EC20 PTY bridge is POSIX-only")
 from scripts import ec20_usb_pty
 
 
+def _flush_rescue_pty(fd):
+    """救援口可能已被子进程关闭 master 挂断；清理不能覆盖原始测试结果。"""
+    import errno
+    import termios
+
+    try:
+        termios.tcflush(fd, termios.TCIOFLUSH)
+    except (OSError, termios.error) as exc:
+        if exc.args[0] not in (errno.EIO, errno.EBADF):
+            raise
+
+
+@pytest.mark.parametrize("error", [ec20_usb_pty.termios.error, OSError])
+@pytest.mark.parametrize("code", [ec20_usb_pty.errno.EIO, ec20_usb_pty.errno.EBADF])
+def test_rescue_flush_tolerates_closed_pty(monkeypatch, error, code):
+    def flush(fd, mode):
+        raise error(code, "closed PTY")
+
+    monkeypatch.setattr(ec20_usb_pty.termios, "tcflush", flush)
+    _flush_rescue_pty(123)
+
+
+def test_real_pty_flush_before_close_and_linux_hangup():
+    """两端仍打开时可正常 flush；Linux master 关闭后 slave 的 EIO 仅属于救援路径。"""
+    import errno
+    import os
+    import sys
+    import termios
+
+    master, slave = os.openpty()
+    try:
+        termios.tcflush(master, termios.TCIOFLUSH)
+        termios.tcflush(slave, termios.TCIOFLUSH)
+    finally:
+        os.close(master)
+        try:
+            if sys.platform == "linux":
+                with pytest.raises(termios.error) as caught:
+                    termios.tcflush(slave, termios.TCIOFLUSH)
+                assert caught.value.args[0] == errno.EIO
+            _flush_rescue_pty(slave)
+        finally:
+            os.close(slave)
+
+
 @pytest.fixture
 def real_pty_usb_block(monkeypatch, tmp_path):
     """仅替换 USB，用真实 PTY 和大数据块覆盖缓冲满及部分写入。"""
@@ -145,6 +190,24 @@ def test_close_joins_then_flushes_before_closing(monkeypatch):
     assert len(calls) == 6
 
 
+@pytest.mark.parametrize("code", [ec20_usb_pty.errno.EIO, ec20_usb_pty.errno.EINVAL])
+def test_close_refuses_unexpected_flush_failure(monkeypatch, code):
+    import threading
+
+    handle = ec20_usb_pty.BridgeHandle(
+        None, ec20_usb_pty.UsbPort(2, 1, 2, 512), "/nonexistent/test-link", 10, 11, threading.Event(),
+    )
+
+    def flush(fd, mode):
+        raise ec20_usb_pty.termios.error(code, "unexpected flush failure")
+
+    monkeypatch.setattr(ec20_usb_pty.termios, "tcflush", flush)
+    monkeypatch.setattr(ec20_usb_pty.os, "close", lambda fd: pytest.fail("flush 失败时不得冒险关闭"))
+    with pytest.raises(ec20_usb_pty.BridgeShutdownError):
+        handle.close()
+    assert not handle.closed
+
+
 def test_shutdown_timeout_stops_all_bridges_and_is_fatal(monkeypatch):
     import threading
     from types import SimpleNamespace
@@ -177,7 +240,6 @@ def test_full_real_pty_keeps_usb_reader_running_and_closes_within_two_seconds(tm
     import os
     import subprocess
     import sys
-    import termios
     import textwrap
     import time
     from pathlib import Path
@@ -236,7 +298,7 @@ def test_full_real_pty_keeps_usb_reader_running_and_closes_within_two_seconds(tm
             # 只在被测流程超时之后救援，不能提前排空从而掩盖回归。
             deadline = time.monotonic() + 3
             while proc.poll() is None and time.monotonic() < deadline:
-                termios.tcflush(slave, termios.TCIOFLUSH)
+                _flush_rescue_pty(slave)
                 try:
                     os.read(slave, 65536)
                 except OSError:
@@ -246,8 +308,10 @@ def test_full_real_pty_keeps_usb_reader_running_and_closes_within_two_seconds(tm
                 proc.kill()
             stdout, stderr = proc.communicate(timeout=3)
     finally:
-        termios.tcflush(slave, termios.TCIOFLUSH)
-        os.close(slave)
+        try:
+            _flush_rescue_pty(slave)
+        finally:
+            os.close(slave)
     observations = [json.loads(line) for line in stdout.splitlines()]
     assert not timed_out, f"PTY close blocked; rescued child: {observations}; {stderr}"
     assert proc.returncode == 0, stderr

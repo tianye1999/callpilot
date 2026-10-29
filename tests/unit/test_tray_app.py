@@ -39,7 +39,10 @@ def test_early_window_spawn_failure_does_not_prevent_tray_startup(monkeypatch, c
     assert "test spawn failure" in caplog.text
 
 
-@pytest.mark.parametrize("entry", ["service", "bridge"])
+@pytest.mark.parametrize("entry", [
+    "service",
+    pytest.param("bridge", marks=pytest.mark.skipif(sys.platform == "win32", reason="PTY 桥仅支持 POSIX")),
+])
 def test_bundled_entry_logging_replaces_existing_handler_and_writes_file(tmp_path, entry):
     result = subprocess.run([sys.executable, "-c", '''
 import logging, logging.handlers, sys
@@ -74,7 +77,8 @@ logging.getLogger("test").warning("file logging marker")
 handlers = [h for h in logging.getLogger().handlers if isinstance(h, logging.handlers.RotatingFileHandler)]
 assert len(handlers) == 1
 assert handlers[0].maxBytes == 5 * 1024 * 1024 and handlers[0].backupCount == 3
-assert "file logging marker" in path.read_text()
+assert handlers[0].encoding == "utf-8"
+assert "file logging marker" in path.read_text(encoding="utf-8")
 ''', entry, str(tmp_path)], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
 

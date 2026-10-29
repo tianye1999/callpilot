@@ -55,8 +55,8 @@ assert received == [{'open'}], received
 def test_diagnostics_reads_service_and_bridge_file_logs(tmp_path):
     layout = macos_launchd.make_layout(tmp_path / "CallPilot", uid=123, support_dir=tmp_path)
     layout.log_dir.mkdir()
-    (layout.log_dir / "app.log").write_text("Address already in use\n")
-    (layout.log_dir / "modem_usb_pty.log").write_text("USBError: disconnected\n")
+    (layout.log_dir / "app.log").write_text("Address already in use\n", encoding="utf-8")
+    (layout.log_dir / "modem_usb_pty.log").write_text("USBError: disconnected\n", encoding="utf-8")
     reason, report = macos_shell.collect_diagnostics(
         layout, {}, runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, "", ""), lang="en",
     )
@@ -105,7 +105,7 @@ raise RuntimeError("main exception marker")
     files = list(tmp_path.glob("window.log*"))
     assert 1 < len(files) <= 3
     assert all(path.stat().st_size <= 2048 for path in files)
-    content = "".join(path.read_text() for path in files)
+    content = "".join(path.read_text(encoding="utf-8") for path in files)
     assert content.count("unique marker") == 1
     assert "RuntimeError: worker exception marker" in content
     assert "RuntimeError: main exception marker" in content
@@ -198,7 +198,7 @@ def test_geometry_roundtrip_and_missing_monitor(tmp_path):
     assert macos_shell.restore_geometry(path, screens) == (0, 0, 1440, 900)
     macos_shell.save_geometry(path, (30, 40, 900, 700))
     assert macos_shell.restore_geometry(path, screens) == (30, 40, 900, 700)
-    path.write_text(json.dumps([None, "bad", 1, 2]))
+    path.write_text(json.dumps([None, "bad", 1, 2]), encoding="utf-8")
     assert macos_shell.restore_geometry(path, screens) == default
 
 
@@ -266,7 +266,9 @@ def test_collect_diagnostics_is_bounded_and_sanitized(tmp_path):
     (executable.parent.parent / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "0.6.0"}))
     layout = macos_launchd.make_layout(executable, uid=123, support_dir=tmp_path / "support")
     layout.log_dir.mkdir(parents=True)
-    (layout.log_dir / "launchd-app.err.log").write_text("secret\n" * 10000 + "Address already in use")
+    (layout.log_dir / "launchd-app.err.log").write_text(
+        "secret\n" * 10000 + "Address already in use", encoding="utf-8",
+    )
     calls = []
 
     def runner(cmd, **kwargs):

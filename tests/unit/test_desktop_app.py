@@ -49,18 +49,21 @@ def test_native_startup_precedes_webview_import(monkeypatch, tmp_path):
 @pytest.mark.skipif(sys.platform != "darwin", reason="需要真实 macOS Cocoa 窗口")
 def test_native_startup_handoff_has_one_visible_window_and_preserves_geometry(tmp_path):
     result = subprocess.run([sys.executable, "-c", '''
-import sys
+import json, sys
 from pathlib import Path
-from AppKit import NSApplication, NSMakeRect
+from AppKit import NSApplication, NSMakeRect, NSScreen
 from PyObjCTools import AppHelper
 import desktop_app
 from agentcall import macos_launchd, macos_shell
+if not NSScreen.screens():
+    sys.exit(77)
 support = Path(sys.argv[1])
 layout = macos_launchd.make_layout(sys.executable, uid=123, support_dir=support)
 macos_launchd.make_layout = lambda *args, **kwargs: layout
 desktop_app.BundledStartup.run = lambda self: None
 original = desktop_app._install_window_hooks
 checks = []
+expected_geometry = []
 def install(window, support, splash):
     assert splash.native.isVisible()
     original(window, support, splash)
@@ -71,13 +74,20 @@ def install(window, support, splash):
         visible = [w for w in NSApplication.sharedApplication().windows() if w.isVisible()]
         checks.append(len(visible) == 1)
         native.setFrame_display_(NSMakeRect(30, 40, 900, 700), True)
+        # Cocoa 可按真实屏幕调整 frame；这里只验证关闭时保存了实际窗口几何。
+        frame = native.frame()
+        expected_geometry.extend(int(v) for v in (
+            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+        ))
         native.performClose_(None)
     window.events.shown += lambda: AppHelper.callAfter(check)
 desktop_app._install_window_hooks = install
 desktop_app._bundled_main(None, 'http://unused.invalid')
 assert checks == [True, True], checks
-assert macos_shell.restore_geometry(support / 'window.json', [(0, 0, 1440, 900)]) == (30, 40, 900, 700)
+assert json.loads((support / 'window.json').read_text(encoding='utf-8')) == expected_geometry
 ''', str(tmp_path)], capture_output=True, text=True, timeout=20)
+    if result.returncode == 77:
+        pytest.skip("当前 macOS 会话没有可用屏幕；固定屏幕几何由纯逻辑测试覆盖")
     assert result.returncode == 0, result.stdout + result.stderr
 
 
