@@ -62,13 +62,11 @@ def default_reset_after_call() -> bool:
 
 
 def default_parallel_agent_connect() -> bool:
-    """Off on every platform until #130 item 2 passes real-device acceptance.
+    """physical-sim owner 已决定三平台默认开启；发包前真机验收仍是闸门。
 
-    The parallel startup path (and the native modem greeting that rides on it) is
-    merged but not yet accepted on hardware; opt in per device via .env. After
-    acceptance this becomes ``IS_LINUX`` again.
+    显式设置 PARALLEL_AGENT_CONNECT=false 可恢复原串行路径。
     """
-    return False
+    return True
 
 
 def default_modem_answer_greeting() -> str:

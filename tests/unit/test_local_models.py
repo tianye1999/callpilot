@@ -170,14 +170,14 @@ def test_aishell3_manifest_and_fst_order_without_far_or_speaker_table(monkeypatc
                                      for rule in ("phone", "number", "new_heteronym"))
 
 
-def test_aishell3_env_recommendations_do_not_change_defaults():
+def test_aishell3_owner_defaults_keep_peak_optional():
     example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(encoding="utf-8")
     assert "vits-icefall-zh-aishell3" in example
-    assert "男声建议 LOCAL_TTS_SPEAKER_ID=25" in example
-    assert "建议同时设 LOCAL_TTS_PEAK=0.9" in example
-    assert "LOCAL_TTS_SPEAKER_ID=0" in example
-    assert config.get_spec("LOCAL_TTS_SPEAKER_ID").default == "0"
-    assert config.get_spec("LOCAL_TTS_MODEL").default == "vits-piper-zh_CN-chaowen-medium-int8"
+    assert "owner 10-24 已选定 aishell3 男声 #25" in example
+    assert "按需设 LOCAL_TTS_PEAK=0.9" in example
+    assert "LOCAL_TTS_SPEAKER_ID=25" in example
+    assert config.get_spec("LOCAL_TTS_SPEAKER_ID").default == "25"
+    assert config.get_spec("LOCAL_TTS_MODEL").default == "vits-icefall-zh-aishell3"
     assert config.get_spec("LOCAL_TTS_PEAK").default == ""
 
 

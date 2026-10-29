@@ -95,6 +95,8 @@ def apply_pcm_gain(pcm: bytes, gain: float) -> bytes:
 class AgentPcm(bytes):
     """PCM eligible for AI playout observation; ordinary bytes include DTMF."""
 
+    on_written: Callable[[], None] | None = None
+
 
 class PrebufferedPcm(bytes):
     """Historical uplink, not evidence of a live interruption of the AI opening."""
@@ -104,7 +106,7 @@ class _OutputObserver:
     """Opt-in source spans follow queued bytes, including drops and partial writes."""
 
     _output_observer: Callable[[bytes], None] | None = None
-    _output_ranges: tuple[tuple[int, int], ...] = ()
+    _output_ranges: tuple[tuple[int, int, Callable[[], None] | None], ...] = ()
     _output_progress = 0
 
     def set_output_observer(self, observer: Callable[[bytes], None]) -> None:
@@ -113,7 +115,7 @@ class _OutputObserver:
         This is a local output boundary, not confirmation of far-end audibility.
         """
         self._output_observer = observer
-        self._output_spans: deque[tuple[int, bool]] = deque()
+        self._output_spans: deque[tuple[int, bool, Callable[[], None] | None]] = deque()
         self._output_progress = 0
 
     def output_progress_bytes(self) -> int:
@@ -126,32 +128,37 @@ class _OutputObserver:
 
     def _queue_output_span(self, chunk: bytes) -> None:
         if self._output_observer is not None and chunk:
-            self._output_spans.append((len(chunk), isinstance(chunk, AgentPcm)))
+            self._output_spans.append((len(chunk), isinstance(chunk, AgentPcm),
+                                       getattr(chunk, "on_written", None)))
 
-    def _take_output_ranges(self, count: int) -> tuple[tuple[int, int], ...]:
+    def _take_output_ranges(self, count: int) -> tuple[tuple[int, int, Callable[[], None] | None], ...]:
         if self._output_observer is None:
             return ()
         offset = 0
         ranges = []
         while count and self._output_spans:
-            length, agent_audio = self._output_spans.popleft()
+            length, agent_audio, on_written = self._output_spans.popleft()
             take = min(count, length)
             if agent_audio:
-                ranges.append((offset, offset + take))
+                ranges.append((offset, offset + take, on_written))
             if take < length:
-                self._output_spans.appendleft((length - take, agent_audio))
+                self._output_spans.appendleft((length - take, agent_audio, on_written))
             offset += take
             count -= take
         return tuple(ranges)
 
-    def _notify_output(self, payload: bytes, ranges: tuple[tuple[int, int], ...]) -> None:
+    def _notify_output(
+        self, payload: bytes, ranges: tuple[tuple[int, int, Callable[[], None] | None], ...],
+    ) -> None:
         observer = self._output_observer
         if observer is None:
             return
-        for start, end in ranges:
+        for start, end, on_written in ranges:
             pcm = payload[start:end]
             if pcm:
                 try:
+                    if on_written is not None:
+                        on_written()
                     observer(pcm)
                 except Exception:  # noqa: BLE001
                     logger.warning("下行写出观测失败（不影响播放）", exc_info=True)
@@ -224,7 +231,7 @@ class ModemAudioBridge(_OutputObserver):
                 self._output_stream.write(chunk)
                 self._note_output_progress(len(chunk))
                 if isinstance(chunk, AgentPcm):
-                    self._notify_output(chunk, ((0, len(chunk)),))
+                    self._notify_output(chunk, ((0, len(chunk), chunk.on_written),))
 
     @staticmethod
     def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:

@@ -49,6 +49,34 @@ def events(base):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+def test_product_defaults_local_parallel_startup_and_cleanup(setup_call, monkeypatch, product_latency_defaults):
+    from test_local_segmented import SegmentedPipeline
+
+    from agentcall import config
+    from agentcall.agents.local_agent import LocalPipelineAgent
+
+    session, _modem, bridge, _agent, base = setup_call
+    agents = []
+
+    class Local(LocalPipelineAgent):
+        def __init__(self):
+            super().__init__(pipeline_factory=SegmentedPipeline,
+                             llm_chat=lambda *a: {"role": "assistant", "content": "您好。"})
+            agents.append(self)
+
+    monkeypatch.setattr("agentcall.call_agent.LocalPipelineAgent", Local)
+    session.provider = "local"
+    assert config.get_bool("PARALLEL_AGENT_CONNECT")
+    asyncio.run(session._handle_call())
+    assert len(agents) == 1 and not agents[0]._running
+    assert session._local_prepared_agent is None and session._local_prepare_task is None
+    assert bridge.started and bridge.stopped
+    snapshot = next(e for e in events(base) if e["type"] == "config_snapshot")
+    assert snapshot["parallel_agent_connect"] is True
+    assert snapshot["local_tts_streaming"] and snapshot["local_asr_segmented"]
+    assert snapshot["local_fast_opening"] and snapshot["local_speculative_llm"]
+
+
 @pytest.fixture
 def native_call(setup_call, monkeypatch):
     session, _old_modem, bridge, agent, base = setup_call

@@ -19,6 +19,7 @@ from typing import Awaitable, Callable
 from . import call_playbooks, config, modem_hardware, platforms
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
+from .agents.local_agent import LocalPipelineAgent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
 from .audio_bridge import (
     MODEM_RATE,
@@ -280,6 +281,8 @@ class CallSession:
         self._prompt_gen_timed_out = False
         self._prompt_gen_generation = 0
         self._prompt_gen_opening = ""
+        self._local_prepared_agent: LocalPipelineAgent | None = None
+        self._local_prepare_task: asyncio.Task | None = None
         self._prompt_gen_opening_mode = "say"
         self._prompt_gen_dtmf_spoken_followup = False
         self._result_verification_mode = "none"
@@ -607,6 +610,7 @@ class CallSession:
                     return
             else:
                 logger.info("开始处理来电...")
+                self._start_local_preparation("inbound")
                 self.modem.answer()
 
             self._publish(
@@ -637,7 +641,7 @@ class CallSession:
                 pcm_baudrate=self.pcm_baudrate,
                 tx_gain=self.tx_gain,
             )
-            agent = create_agent(self.provider)
+            agent = self._local_prepared_agent or create_agent(self.provider)
             self._configure_call_agent(agent, lambda: bridge, record, transcripts, direction, number, session_t0)
             bridge.start()
             mark("bridge_started")
@@ -679,6 +683,7 @@ class CallSession:
             status = "failed"
             raise
         finally:
+            await self._finish_local_preparation()
             if isinstance(self.modem, BluetoothModem):
                 self._bluetooth_cleanup_started = True
                 if self._phone_audio_lost:
@@ -718,6 +723,18 @@ class CallSession:
             self._active_tools = tools
         agent.set_tools(tools)
         bridge = get_bridge()
+        if isinstance(agent, LocalPipelineAgent) and config.get_bool("LOCAL_LATENCY_METRICS"):
+            if record is not None:
+                def local_event(fields: dict) -> None:
+                    fields = dict(fields)
+                    event_type = fields.pop("type")
+                    at = fields.pop("at", None)
+                    if at is not None:
+                        fields["t_ms"] = round((at - session_t0) * 1000, 1)
+                    record.log_event(event_type, **fields)
+                agent.set_turn_event_handler(local_event)
+            if bridge is not None and not self._parallel_agent_connect:
+                bridge.set_output_observer(lambda pcm: None)
         if isinstance(bridge, SerialPcmAudioBridge):
             bridge.set_ready_check(self.modem.pcm_ready)
         self._barge_in = config.get_bool("BARGE_IN_ENABLED")
@@ -740,6 +757,14 @@ class CallSession:
                     recording_enabled=getattr(record, "recording_enabled", False),
                     audio_mode=self.audio_mode, modem_vendor=config.get_str("MODEM_VENDOR"),
                     **({"parallel_agent_connect": True} if self._parallel_agent_connect else {}),
+                    **({
+                        "local_fast_opening": config.get_bool("LOCAL_FAST_OPENING"),
+                        "local_llm_prewarm": config.get_bool("LOCAL_LLM_PREWARM"),
+                        "local_speculative_llm": config.get_bool("LOCAL_SPECULATIVE_LLM"),
+                        "local_asr_segmented": config.get_bool("LOCAL_ASR_SEGMENTED"),
+                        "local_turn_silence": config.get_float("LOCAL_TURN_SILENCE"),
+                        "local_tts_streaming": config.get_bool("LOCAL_TTS_STREAMING"),
+                    } if isinstance(agent, LocalPipelineAgent) and config.get_bool("LOCAL_LATENCY_METRICS") else {}),
                 )
             except Exception:  # noqa: BLE001
                 logger.warning("配置快照落盘失败（不影响通话）", exc_info=True)
@@ -910,7 +935,9 @@ class CallSession:
             if self._outbound_number and not await self._connect_outbound(mark, threaded=True):
                 hangup_owned = False
                 return False
-            agent = create_agent(self.provider)
+            if not self._outbound_number:
+                self._start_local_preparation("inbound")
+            agent = self._local_prepared_agent or create_agent(self.provider)
             self._configure_call_agent(agent, lambda: bridge, record, transcripts, direction, number, session_t0)
             if not self._outbound_number:
                 logger.info("开始处理来电（并行准备）...")
@@ -988,6 +1015,7 @@ class CallSession:
         else:
             self.modem.dial(number)
         mark("dialing", number=number)
+        self._start_local_preparation("outbound")
         self._publish(
             {"type": "call", "status": "dialing", "caller": self.current_caller}
         )
@@ -1009,6 +1037,51 @@ class CallSession:
             return False
         mark("connected")
         return True
+
+    def _start_local_preparation(self, direction: str) -> None:
+        """拨号后启动准备；不提前启动桥、输出音频或开放工具。"""
+        if ((self.provider or config.get_str("AGENT_PROVIDER")) != "local"
+                or not (config.get_bool("LOCAL_FAST_OPENING") or config.get_bool("LOCAL_LLM_PREWARM"))):
+            return
+        agent = LocalPipelineAgent()
+        self._local_prepared_agent = agent
+        agent.start_connection_warmup()
+        if not config.get_bool("LOCAL_FAST_OPENING"):
+            return
+
+        async def prepare() -> None:
+            # 等动态任务就绪再读开场策略；接通流程不等待这个后台任务。
+            while (direction == "outbound" and self._prompt_gen_thread is not None
+                   and not self._prompt_gen_done.is_set()):
+                if agent._opening_cancelled.is_set():
+                    return
+                await asyncio.sleep(0.02)
+            if agent._opening_cancelled.is_set():
+                return
+            agent.set_session_instructions(self._build_agent_instructions(direction))
+            if direction == "outbound" and self._prompt_gen_opening_mode == "wait":
+                logger.info("[local_opening] skipped mode=wait")
+                return
+            work = asyncio.create_task(asyncio.to_thread(
+                agent.prepare_opening, self._opening_instructions(direction),
+                phrase=config.get_str("LOCAL_INBOUND_GREETING") if direction == "inbound" else "",
+            ))
+            try:
+                await asyncio.shield(work)
+            finally:
+                await asyncio.gather(work, return_exceptions=True)
+
+        self._local_prepare_task = asyncio.create_task(prepare())
+
+    async def _finish_local_preparation(self) -> None:
+        agent, task = self._local_prepared_agent, self._local_prepare_task
+        self._local_prepared_agent = None
+        self._local_prepare_task = None
+        if agent is not None:
+            await agent.stop()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def _make_transcript_handler(
         self,
@@ -1190,7 +1263,12 @@ class CallSession:
                                 "[timing] 端到端轮次延迟(本地音尾→首音频): %.0fms",
                                 e2e * 1000,
                             )
-                self._outgoing_audio.put(AgentPcm(pcm_8k) if record_at_playout else pcm_8k)
+                on_written = getattr(pcm_agent, "on_written", None)
+                if record_at_playout or on_written is not None:
+                    tagged = AgentPcm(pcm_8k)
+                    tagged.on_written = on_written
+                    pcm_8k = tagged
+                self._outgoing_audio.put(pcm_8k)
 
         return on_agent_audio
 

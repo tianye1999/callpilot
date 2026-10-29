@@ -81,6 +81,48 @@ def test_agents_reuse_resident_models_but_not_vad(sherpa):
     assert len(sherpa.decoded) == 2
 
 
+def test_default_aishell3_downloads_missing_assets_and_uses_owner_speaker(
+    sherpa, monkeypatch, product_latency_defaults,
+):
+    selected = local_models.selected_assets()
+    assert "vits-icefall-zh-aishell3" in selected[-1].url
+    assert "chaowen" not in selected[-1].url
+    downloaded = []
+    monkeypatch.setattr(local_models, "missing_assets", lambda: [selected[-1]])
+    monkeypatch.setattr(local_models, "ensure_asset", lambda asset: downloaded.append(asset))
+    agent = local_agent.LocalPipelineAgent(llm_chat=lambda *a: {})
+    asyncio.run(agent.start(lambda pcm: None))
+    try:
+        assert downloaded == [selected[-1]]
+        assert agent.output_rate == 8000
+        assert sherpa.generated and all(speaker == 25 for _, speaker in sherpa.generated)
+        assert not agent.fatal
+    finally:
+        asyncio.run(agent.stop())
+
+
+def test_default_model_download_failure_is_explicit_not_silent_voice_fallback(
+    sherpa, monkeypatch, product_latency_defaults,
+):
+    monkeypatch.setattr(local_models, "missing_assets", lambda: [local_models.selected_assets()[-1]])
+
+    def unavailable(asset):
+        raise OSError("download unavailable")
+
+    monkeypatch.setattr(local_models, "ensure_asset", unavailable)
+    statuses = []
+    agent = local_agent.LocalPipelineAgent(llm_chat=lambda *a: {})
+    agent.set_status_handler(statuses.append)
+    try:
+        with pytest.raises(OSError, match="download unavailable"):
+            asyncio.run(agent.start(lambda pcm: None))
+        assert agent.fatal and agent._brain_thread is None
+        assert any("初始化失败" in status for status in statuses)
+        assert not sherpa.generated
+    finally:
+        asyncio.run(agent.stop())
+
+
 @pytest.mark.parametrize("key,value", [
     ("LOCAL_MODELS_DIR", "/different-model-root"),
     ("LOCAL_TTS_MODEL", "matcha-icefall-zh-baker"),

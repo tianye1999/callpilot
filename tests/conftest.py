@@ -9,6 +9,28 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+_SPEED_SWITCHES = (
+    "LOCAL_TTS_STREAMING", "LOCAL_ASR_SEGMENTED", "LOCAL_FAST_OPENING", "LOCAL_LLM_PREWARM",
+    "LOCAL_SPECULATIVE_LLM", "LOCAL_LATENCY_METRICS", "PARALLEL_AGENT_CONNECT",
+)
+
+
+@pytest.fixture(autouse=True)
+def _explicit_legacy_latency_mode(monkeypatch):
+    """旧行为回归显式关闭；不让新默认提前触发真实 LLM/模型加载。
+
+    功能专项测试可单独开启；产品默认集成测试必须用 product_latency_defaults 清除覆盖。
+    """
+    for key in _SPEED_SWITCHES:
+        monkeypatch.setenv(key, "false")
+
+
+@pytest.fixture
+def product_latency_defaults(monkeypatch, _explicit_legacy_latency_mode):
+    """验证实际注册表默认值，而非测试隔离层的旧行为设置。"""
+    for key in (*_SPEED_SWITCHES, "LOCAL_TTS_MODEL", "LOCAL_TTS_SPEAKER_ID", "LOCAL_TURN_SILENCE"):
+        monkeypatch.delenv(key, raising=False)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_side_effects(tmp_path, monkeypatch):

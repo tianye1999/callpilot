@@ -64,6 +64,23 @@ def _build(events, **kwargs):
 # ---- 契约基本面 ----
 
 
+def test_local_turn_metrics_keep_identity_negative_overlap_and_missing_stages():
+    events = [
+        {"type": "local_turn", "turn_id": 1, "stage": "endpoint", "t_ms": 1000, "ms": 0},
+        {"type": "local_turn", "turn_id": 1, "stage": "llm_first_token", "t_ms": 900, "ms": -100},
+        {"type": "local_turn", "turn_id": 2, "stage": "endpoint", "t_ms": 2000, "ms": 0},
+        {"type": "local_turn", "turn_id": 1, "stage": "first_pcm_written", "t_ms": 2100, "ms": 1100},
+        {"type": "local_opening", "hit": True, "prepare_ms": 987},
+    ]
+    local = _build(events)["local_pipeline"]
+    assert local["opening"] == {"hit": True, "prepare_ms": 987}
+    first, second = local["turns"]
+    assert first["stages"]["llm_first_token"]["ms"] == -100
+    assert first["stages"]["first_pcm_written"]["ms"] == 1100
+    assert "first_pcm_written" not in second["stages"]
+    assert "local_pipeline" not in _build([])
+
+
 def test_schema_version_and_meta_always_present():
     metrics = _build([])
     assert metrics["schema_version"] == SCHEMA_VERSION

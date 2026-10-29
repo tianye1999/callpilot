@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import threading
 import wave
 from pathlib import Path
 
@@ -131,3 +132,69 @@ def test_segmented_cli_opts_in_and_prints_tail(monkeypatch, capsys):
     assert bench.main(["fake.wav", "--segmented"]) == 0
     output = capsys.readouterr().out
     assert "asr_tail" in output and "120.0" in output
+
+
+def test_segmented_bench_empty_tail_does_not_cancel_measurement(tmp_path, monkeypatch):
+    bench = load_bench()
+    tail = threading.Event()
+
+    class Pipeline:
+        sample_rate = 8000
+        count = 0
+
+        def vad_push(self, pcm):
+            self.count += 1
+            if self.count == 1:
+                return [b"first"]
+            if self.count == 21:
+                tail.set()
+                return [b"empty"]
+            return []
+
+        def is_speech_detected(self):
+            return self.count == 20
+
+        def vad_flush(self):
+            return []
+
+        def transcribe(self, pcm):
+            return "测试" if pcm == b"first" else ""
+
+        def synthesize(self, text):
+            return b"\1\0" * 10
+
+    sleep = asyncio.sleep
+
+    async def no_wait(seconds):
+        await sleep(0)
+
+    def chat(*args):
+        assert tail.wait(1)
+        return {"role": "assistant", "content": "好的。"}
+
+    monkeypatch.setenv("LOCAL_ASR_SEGMENTED", "true")
+    monkeypatch.setenv("LOCAL_TTS_STREAMING", "true")
+    monkeypatch.setenv("LOCAL_LLM_PROVIDER", "dashscope")
+    monkeypatch.setattr(bench, "_SherpaPipeline", lambda **kw: Pipeline())
+    monkeypatch.setattr(bench, "_default_llm_chat", chat)
+    monkeypatch.setattr(bench.asyncio, "sleep", no_wait)
+    source, output = tmp_path / "in.wav", tmp_path / "out.wav"
+    with wave.open(str(source), "wb") as wav:
+        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        wav.writeframes(b"\1\0" * 16000)
+    rows = asyncio.run(bench.run_benchmark(source, output, "test"))
+    assert "tts_first_audio" in dict(rows)
+
+
+def test_opening_cli_repeats_and_reports_median_and_range(monkeypatch, capsys):
+    bench = load_bench()
+    samples = iter([10.0, 30.0, 20.0])
+
+    async def run(source, output, instructions, scenario, barge_in):
+        assert scenario == "opening" and not barge_in
+        return [("answered_to_first_audio", next(samples))]
+
+    monkeypatch.setattr(bench, "run_benchmark", run)
+    monkeypatch.setattr(bench, "load_dotenv", lambda *a: None)
+    assert bench.main(["fake.wav", "--scenario", "opening", "--runs", "3"]) == 0
+    assert "median=20.0 min=10.0 max=30.0" in capsys.readouterr().out

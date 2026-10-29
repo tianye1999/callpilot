@@ -129,6 +129,22 @@ def test_serial_output_observer_tracks_only_written_agent_audio(monkeypatch):
     assert writes == [b"tonevoic", b"e!\x00\x00\x00\x00\x00\x00", b"\x00" * 8]
 
 
+def test_turn_callback_follows_written_spans_not_dropped_or_short_suffix():
+    from agentcall.audio_bridge import AgentPcm, SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("unused", write_size=8, write_interval=0)
+    bridge.set_output_observer(lambda pcm: None)
+    written = []
+    first, second = AgentPcm(b"one!"), AgentPcm(b"two!")
+    first.on_written = lambda: written.append(1)
+    second.on_written = lambda: written.append(2)
+    bridge._queue_output_span(first)
+    bridge._queue_output_span(second)
+    ranges = bridge._take_output_ranges(8)
+    bridge._notify_output(b"one", ranges)
+    assert written == [1]
+
+
 def test_serial_output_observer_ignores_timeout_and_discarded_audio():
     import serial
 

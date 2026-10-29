@@ -123,6 +123,9 @@ class FakeConnection:
     def request(self, method, path, body, headers):
         self.requests.append((method, path, json.loads(body), headers))
 
+    def connect(self):
+        pass
+
     def getresponse(self):
         response = io.BytesIO(sse({"content": "您好。"}))
         response.status = 200
@@ -130,6 +133,117 @@ class FakeConnection:
 
     def close(self):
         self.closed = True
+
+
+def test_prewarm_connects_without_request_reuses_and_refreshes_idle(monkeypatch):
+    from agentcall.agents import local_llm
+
+    created = []
+
+    class Connection(FakeConnection):
+        def connect(self):
+            self.connected = True
+
+    def connect(*a, **kw):
+        conn = Connection()
+        created.append(conn)
+        return conn
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake")
+    monkeypatch.setattr(local_llm.http.client, "HTTPSConnection", connect)
+    client = DeepSeekChat()
+    try:
+        assert client.prewarm(1, idle_seconds=10)
+        assert len(created) == 1 and created[0].requests == []
+        assert not client.prewarm(1, idle_seconds=10)
+        client.chat([], None, 1, lambda _: None)
+        assert len(created) == 1 and len(created[0].requests) == 1
+        client._last_used -= 11
+        assert client.prewarm(1, idle_seconds=10)
+        assert created[0].closed and created[1].requests == []
+        with client._lock:
+            assert not client.prewarm(1, idle_seconds=0)
+    finally:
+        client.close()
+    assert not client.prewarm(1, idle_seconds=0)
+
+
+def test_cancel_waiting_request_does_not_abort_active_socket_and_joins(monkeypatch):
+    from agentcall.agents import local_llm
+
+    entered, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+    results, failures = [], []
+
+    class Connection(FakeConnection):
+        def getresponse(self):
+            entered.set()
+            assert release.wait(2)
+            return super().getresponse()
+
+    conn = Connection()
+    monkeypatch.setenv("LOCAL_SPECULATIVE_LLM", "true")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake")
+    monkeypatch.setattr(local_llm.http.client, "HTTPSConnection", lambda *a, **kw: conn)
+    client = DeepSeekChat()
+    active = threading.Thread(target=lambda: results.append(client.chat([], None, 3, lambda _: None)))
+    active.start()
+    assert entered.wait(1)
+
+    def pending():
+        try:
+            client.chat([], None, 3, lambda _: None, cancelled)
+        except InterruptedError:
+            failures.append("cancelled")
+
+    waiting = threading.Thread(target=pending)
+    waiting.start()
+    cancelled.set()
+    try:
+        waiting.join(1)
+        assert not waiting.is_alive() and failures == ["cancelled"]
+        assert not conn.closed
+    finally:
+        release.set()
+        active.join(2)
+        client.close()
+    assert results and not active.is_alive()
+
+
+def test_cancel_during_connect_joins_before_return_and_never_posts(monkeypatch):
+    from agentcall.agents import local_llm
+
+    entered, release, cancelled, finished = (threading.Event() for _ in range(4))
+
+    class Connection(FakeConnection):
+        def connect(self):
+            assert self.timeout <= 3
+            entered.set()
+            assert release.wait(1)
+
+    conn = Connection()
+    monkeypatch.setenv("LOCAL_SPECULATIVE_LLM", "true")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake")
+    monkeypatch.setattr(local_llm.http.client, "HTTPSConnection", lambda *a, **kw: conn)
+    client = DeepSeekChat()
+
+    def run():
+        with pytest.raises(InterruptedError):
+            client.chat([], None, 20, lambda _: None, cancelled)
+        finished.set()
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert entered.wait(1)
+    cancelled.set()
+    try:
+        assert not finished.wait(0.03)
+        release.set()
+        assert finished.wait(1)
+        worker.join(1)
+        assert conn.requests == [] and conn.closed
+    finally:
+        release.set()
+        client.close()
 
 
 def test_disabled_transport_does_not_add_reasoning_to_history_or_request(monkeypatch):

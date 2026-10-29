@@ -179,9 +179,21 @@ def build_call_metrics(
     hold_seconds_total = 0.0
     hold_periods = 0
     wrap_up_judge_on: bool | None = None
+    local_turns: dict[int, dict[str, Any]] = {}
+    local_opening: dict[str, Any] | None = None
 
     for event in events:
         etype = event.get("type")
+        if etype == "local_turn" and isinstance(event.get("turn_id"), int):
+            turn_id = event["turn_id"]
+            turn = local_turns.setdefault(turn_id, {"turn_id": turn_id, "stages": {}})
+            stage = event.get("stage")
+            if isinstance(stage, str):
+                turn["stages"].setdefault(stage, {
+                    k: event[k] for k in ("t_ms", "ms", "kind") if k in event
+                })
+        elif etype == "local_opening":
+            local_opening = {k: event[k] for k in ("hit", "prepare_ms") if k in event}
         if etype in {
             "answered", "pcm_ready", "bridge_started", "agent_connect_started", "agent_connected",
             "greeting_requested", "agent_audio_received", "first_audio", "module_greeting",
@@ -478,4 +490,7 @@ def build_call_metrics(
         "pcm_enable_attempts": None if pcm_enable is None else pcm_enable["attempts"],
         "unavailable": unavailable,
     }
+    # 关闭埋点时不改变旧 metrics 结构；每轮缺失阶段保留缺失，不伪造零延迟。
+    if local_turns or local_opening is not None:
+        metrics["local_pipeline"] = {"turns": list(local_turns.values()), "opening": local_opening}
     return metrics

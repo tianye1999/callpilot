@@ -238,8 +238,8 @@ def test_parallel_agent_connect_platform_default(monkeypatch, platform):
     monkeypatch.setattr(platforms, "IS_LINUX", platform == "linux")
     monkeypatch.setattr(platforms, "IS_MACOS", platform == "macos")
     monkeypatch.setattr(platforms, "IS_WINDOWS", platform == "windows")
-    # Off everywhere until #130 item 2 passes real-device acceptance.
-    assert platforms.default_parallel_agent_connect() is False
+    # owner 决定三平台默认开启；真机验收是发包闸门，不是启用闸门。
+    assert platforms.default_parallel_agent_connect() is True
 
 
 def test_parallel_agent_connect_config_follows_platform_and_allows_override(monkeypatch):
@@ -249,6 +249,13 @@ def test_parallel_agent_connect_config_follows_platform_and_allows_override(monk
     for value in ("true", "false"):
         monkeypatch.setenv("PARALLEL_AGENT_CONNECT", value)
         assert get_bool("PARALLEL_AGENT_CONNECT") is (value == "true")
+
+
+def test_linux_install_example_keeps_owner_parallel_default():
+    from dotenv import dotenv_values
+
+    example = Path(__file__).resolve().parents[2] / "scripts/linux/.env.example"
+    assert dotenv_values(example)["PARALLEL_AGENT_CONNECT"] == "true"
 
 
 @pytest.mark.parametrize("platform", ["linux", "macos", "windows"])

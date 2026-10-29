@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
+import logging
 import socket
 import ssl
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 from urllib.parse import urlsplit
 
 from .. import config
+
+logger = logging.getLogger(__name__)
 
 
 def deepseek_body(messages: list[dict], tools: list[dict] | None) -> dict[str, Any]:
@@ -102,6 +106,52 @@ class DeepSeekChat:
         self._endpoint = ""
         self._lock = threading.Lock()
         self._closed = threading.Event()
+        self._last_used = 0.0
+        self._join_cancelled = config.get_bool("LOCAL_SPECULATIVE_LLM") or config.get_bool("LOCAL_FAST_OPENING")
+
+    @contextlib.contextmanager
+    def _request_slot(self, inactive: Callable[[], bool]) -> Iterator[bool]:
+        # 等待连接的取消者不能关闭另一条请求；也不能永远堵在它的锁后面。
+        while not self._lock.acquire(timeout=0.02):
+            if inactive():
+                yield False
+                return
+        try:
+            yield True
+        finally:
+            self._lock.release()
+
+    def prewarm(self, timeout: float, *, idle_seconds: float) -> bool:
+        """只建立 TCP/TLS；空闲后换新连接，不发送 HTTP 或计费 token。"""
+        if self._closed.is_set() or not self._lock.acquire(blocking=False):
+            return False
+        try:
+            endpoint = config.get_str("LOCAL_LLM_BASE_URL").rstrip("/")
+            if (self._connection is not None and self._endpoint == endpoint
+                    and time.monotonic() - self._last_used < idle_seconds):
+                return False
+            url = urlsplit(endpoint)
+            if (url.scheme not in {"http", "https"} or not url.hostname
+                    or url.username or url.query or url.fragment):
+                raise ValueError("LOCAL_LLM_BASE_URL 必须为 HTTP(S) API 根地址")
+            self._abort()
+            cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+            connection = cls(url.hostname, port=url.port, timeout=timeout)
+            self._connection, self._endpoint = connection, endpoint
+            started = time.monotonic()
+            connection.connect()
+            if self._closed.is_set():
+                self._discard_connection(connection)
+                return False
+            self._last_used = time.monotonic()
+            logger.info("[local_prewarm] connected duration_ms=%.1f billed_tokens=0",
+                        (self._last_used - started) * 1000)
+            return True
+        except Exception:
+            self._abort()
+            raise
+        finally:
+            self._lock.release()
 
     def _abort(self) -> None:
         connection, self._connection = self._connection, None
@@ -171,7 +221,10 @@ class DeepSeekChat:
                     yield line
 
             # Socket cleanup must finish before another request acquires this lock.
-            with self._lock:
+            with self._request_slot(inactive) as acquired:
+                if not acquired:
+                    done.set()
+                    return
                 try:
                     reused = self._connection is not None and self._endpoint == endpoint
                     for attempt in range(2):
@@ -189,6 +242,14 @@ class DeepSeekChat:
                                 self._connection = connection_type(hostname, port=url.port, timeout=remaining)
                                 self._endpoint = endpoint
                             connection = self._connection
+                            box["connection"] = connection
+                            if self._join_cancelled and connection.sock is None:
+                                # 低延迟模式单独限制建连预算；SSE 读取仍使用本轮剩余时间。
+                                connection.timeout = min(3.0, remaining)
+                                connection.connect()
+                                if inactive():
+                                    raise InterruptedError("local LLM 建连期间已取消")
+                                remaining = max(0.001, deadline - time.monotonic())
                             connection.timeout = remaining
                             if connection.sock is not None:
                                 connection.sock.settimeout(remaining)
@@ -207,6 +268,7 @@ class DeepSeekChat:
                             if getattr(response, "will_close", False):
                                 self._discard_connection(connection)
                             box["result"] = result
+                            self._last_used = time.monotonic()
                             return
                         except (ConnectionError, http.client.IncompleteRead, ssl.SSLEOFError) as exc:
                             if connection is not None:
@@ -237,7 +299,17 @@ class DeepSeekChat:
         while not done.wait(min(0.02, max(0, deadline - time.monotonic()))):
             if inactive() or time.monotonic() >= deadline:
                 abandoned.set()
-                self._abort()
+                # 仅中止本请求拥有的 socket，排队中的取消绝不影响正在生成的回复。
+                owned = box.get("connection")
+                if owned is not None:
+                    if owned.sock is not None:
+                        try:
+                            owned.sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                    owned.close()
+                if self._join_cancelled:
+                    thread.join()
                 if self._closed.is_set() or (cancelled is not None and cancelled.is_set()):
                     raise InterruptedError("local LLM 轮次已取消")
                 raise RuntimeError(f"LLM 请求超时（>{timeout:g}s）")

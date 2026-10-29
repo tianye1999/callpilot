@@ -118,6 +118,21 @@ def test_default_turn_ends_after_035_seconds_following_segment():
         agent._running = False
 
 
+@pytest.mark.parametrize("silence", [0.45, 0.5])
+def test_lower_silence_ends_earlier_without_changing_segment_gate(monkeypatch, silence):
+    monkeypatch.setenv("LOCAL_TURN_SILENCE", str(silence))
+    agent = local_agent.LocalPipelineAgent(pipeline_factory=SegmentedPipeline, llm_chat=lambda *a: {})
+    agent._pipeline, agent._running = SegmentedPipeline(), True
+    try:
+        feed(agent, 2)
+        feed(agent, 0, silence - 0.25 - 0.01)
+        assert agent._turn is None
+        feed(agent, 0, 0.01)
+        assert agent._turn is not None
+    finally:
+        agent._running = False
+
+
 @pytest.mark.parametrize("turn_silence", ["0.25", "0.2", "0", "-0.1"])
 def test_turn_at_or_below_segment_silence_warns_once_and_ends_on_delivery(monkeypatch, caplog, turn_silence):
     monkeypatch.setenv("LOCAL_TURN_SILENCE", turn_silence)

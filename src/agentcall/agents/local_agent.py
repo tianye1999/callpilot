@@ -34,6 +34,7 @@ from typing import Any, Callable, Protocol
 from weakref import WeakSet
 
 from .. import config
+from ..audio_bridge import AgentPcm
 from ..prompts import agent_language, repeat_nudge_instructions
 from ..repeat_suppression import RepeatSuppressor
 from .base import VoiceAgent
@@ -85,6 +86,7 @@ class _SayRequest:
 @dataclass(eq=False)
 class _Turn:
     ended_at: float | None
+    sequence: int = 0
     cancelled: threading.Event = field(default_factory=threading.Event)
     stages: set[str] = field(default_factory=set)
 
@@ -104,6 +106,15 @@ class _RecognizedSpeech:
 @dataclass
 class _AsrEnd:
     turn: _Turn
+
+
+@dataclass
+class _Speculation:
+    messages: list[dict[str, Any]]
+    claimed: bool = False
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    events: Queue[tuple[str, Any]] = field(default_factory=Queue)
+    thread: threading.Thread | None = None
 
 
 @dataclass
@@ -414,9 +425,213 @@ class LocalPipelineAgent(VoiceAgent):
         self._llm_failures = 0
         self._suppressor = RepeatSuppressor()
         self._last_nudge_at = 0.0
+        self._opening_lock = threading.Lock()
+        self._opening_cancelled = threading.Event()
+        self._opening: tuple[str, str, str, bytes] | None = None
+        self._warm_stop = threading.Event()
+        self._warm_thread: threading.Thread | None = None
+        self._speculative = config.get_bool("LOCAL_SPECULATIVE_LLM") and self._segmented_asr
+        self._speculation: _Speculation | None = None
+        self._spec_jobs: Queue[tuple[_Speculation, Callable[[], None]]] = Queue(maxsize=1)
+        self._spec_thread: threading.Thread | None = None
+        self._spec_lock = threading.RLock()
+        self._speech_revision = 0
+        self._metrics = config.get_bool("LOCAL_LATENCY_METRICS")
+        self._turn_sequence = 0
+        self._on_turn_event: Callable[[dict[str, Any]], None] | None = None
+        self._opening_duration_ms: float | None = None
+
+    def set_turn_event_handler(self, handler: Callable[[dict[str, Any]], None]) -> None:
+        self._on_turn_event = handler
+
+    def _turn_event(self, **fields: Any) -> None:
+        if self._metrics and self._on_turn_event is not None:
+            try:
+                self._on_turn_event(fields)
+            except Exception:  # noqa: BLE001 - 埋点不能影响语音
+                logger.debug("local 逐轮埋点失败", exc_info=True)
+
+    def _output_pcm(self, pcm: bytes, turn: _Turn) -> None:
+        if self._on_audio_out is None:
+            return
+        if self._metrics:
+            tagged = AgentPcm(pcm)
+            tagged.on_written = lambda: self._mark_latency(turn, "first_pcm_written")
+            pcm = tagged
+        self._on_audio_out(pcm)
+
+    def _cancel_speculation(self) -> None:
+        with self._spec_lock:
+            if self._speculation is not None:
+                self._speculation.cancelled.set()
+
+    def _start_speculation(self, text: str, revision: int) -> None:
+        # 仅可取消的 DeepSeek 传输支持抢跑；旧同步回调保持原路径。
+        if not self._speculative or self._deepseek is None or not text:
+            return
+        with self._spec_lock:
+            previous = self._speculation
+            if previous is not None:
+                previous.cancelled.set()
+        with self._spec_lock:
+            if not self._running or revision != self._speech_revision or self._vad_speaking:
+                return
+            # 已确认但还在等旧连接清理的任务不可被下一段抢跑挤掉。
+            try:
+                obsolete, runner = self._spec_jobs.get_nowait()
+                self._spec_jobs.task_done()
+                if obsolete.claimed:
+                    self._spec_jobs.put_nowait((obsolete, runner))
+                    return
+                obsolete.cancelled.set()
+            except Empty:
+                pass
+            with self._messages_lock:
+                messages = [*self._messages, {"role": "user", "content": text}]
+            job = _Speculation(messages)
+            self._speculation = job
+            tools = self._tools.specs() if self._tools and self._tools.has_tools() else None
+
+            def generate() -> None:
+                assert self._deepseek is not None
+                splitter = ClauseSplitter()
+
+                def buffer(delta: str) -> None:
+                    at = time.monotonic()
+                    if self._streaming and splitter.feed(delta):
+                        job.events.put(("clause_ready", at))
+                    job.events.put(("content", (delta, at)))
+
+                try:
+                    result = self._deepseek.chat(
+                        messages, tools, config.get_float("LOCAL_LLM_TIMEOUT"),
+                        buffer,
+                        job.cancelled, on_tools=lambda: job.events.put(("tools", None)),
+                    )
+                    if self._streaming and splitter.finish():
+                        job.events.put(("clause_ready", time.monotonic()))
+                    job.events.put(("result", result))
+                except Exception as exc:  # noqa: BLE001 - 由确认后的消费方回退
+                    job.events.put(("error", exc))
+
+            # 固定一个生成 worker、最多一项待执行任务；网络取消不能阻塞 ASR。
+            job.thread = self._spec_thread
+            self._spec_jobs.put_nowait((job, generate))
+            logger.info("[local_speculative] started revision=%d", revision)
+
+    def _spec_worker(self) -> None:
+        while self._running:
+            try:
+                job, generate = self._spec_jobs.get(timeout=0.1)
+            except Empty:
+                continue
+            try:
+                if not job.cancelled.is_set():
+                    generate()
+            finally:
+                self._spec_jobs.task_done()
+
+    def _consume_speculation(
+        self, messages: list[dict], turn: _Turn, batch: _SpeechBatch, on_content: Callable[[str], None],
+    ) -> dict[str, Any] | None:
+        with self._spec_lock:
+            job, self._speculation = self._speculation, None
+            if job is not None:
+                job.claimed = True
+        if job is None:
+            return None
+        try:
+            if job.cancelled.is_set() or job.messages != messages:
+                logger.info("[local_speculative] miss reason=changed")
+                return None
+            logger.info("[local_speculative] hit")
+            while self._running and not turn.cancelled.is_set():
+                if job.cancelled.is_set():
+                    raise InterruptedError("抢跑任务已取消")
+                try:
+                    kind, value = job.events.get(timeout=0.02)
+                except Empty:
+                    continue
+                if kind == "content":
+                    delta, at = value
+                    self._mark_latency(turn, "llm_first_token", at=at)
+                    on_content(delta)
+                elif kind == "tools":
+                    self._discard_batch(batch)
+                elif kind == "clause_ready":
+                    self._mark_latency(turn, "first_clause_ready", at=value)
+                elif kind == "result":
+                    return dict(value)
+                else:
+                    raise value
+            raise InterruptedError("抢跑轮次已取消")
+        finally:
+            job.cancelled.set()
+
+    def start_connection_warmup(self) -> None:
+        if (not config.get_bool("LOCAL_LLM_PREWARM") or self._deepseek is None
+                or self._warm_thread is not None):
+            return
+        idle = _positive_seconds("LOCAL_LLM_PREWARM_IDLE")
+
+        def warm() -> None:
+            assert self._deepseek is not None
+            while not self._warm_stop.is_set():
+                try:
+                    self._deepseek.prewarm(min(3.0, config.get_float("LOCAL_LLM_TIMEOUT")), idle_seconds=idle)
+                except Exception as exc:  # noqa: BLE001 - 首轮请求仍可正常重试
+                    logger.warning("[local_prewarm] fallback error=%s", type(exc).__name__)
+                self._warm_stop.wait(min(1.0, idle))
+
+        self._warm_thread = threading.Thread(target=warm, name="local-prewarm", daemon=True)
+        self._warm_thread.start()
+
+    def prepare_opening(self, instructions: str, *, phrase: str = "") -> None:
+        """振铃期间只生成文本和 PCM，不写历史、不播放、不执行工具。"""
+        if not config.get_bool("LOCAL_FAST_OPENING") or self._opening_cancelled.is_set():
+            return
+        started = time.monotonic()
+        system = self._session_instructions or ""
+        try:
+            if phrase:
+                text = phrase
+            else:
+                messages = [
+                    {"role": "system", "content": system},
+                    self._say_message(instructions),
+                ]
+                timeout = config.get_float("LOCAL_LLM_TIMEOUT")
+                if self._deepseek is not None:
+                    message = self._deepseek.chat(messages, None, timeout, lambda text: None,
+                                                  self._opening_cancelled)
+                elif self._llm_stream is not None:
+                    message = self._llm_stream(messages, None, timeout, lambda text: None)
+                else:
+                    message = self._llm_chat(messages, None, timeout)
+                if message.get("tool_calls"):
+                    raise ValueError("开场预合成不接受工具调用")
+                text = str(message.get("content") or "").strip()
+            if not text or self._opening_cancelled.is_set():
+                return
+            pipeline = self._pipeline or self._pipeline_factory()
+            raw_peak = config.get_str("LOCAL_TTS_PEAK").strip()
+            pcm = normalize_peak(pipeline.synthesize(text), float(raw_peak) if raw_peak else None)
+            with self._opening_lock:
+                if pcm and not self._opening_cancelled.is_set():
+                    self._opening = (instructions, system, text, pcm)
+            logger.info("[local_opening] prepared duration_ms=%.1f", (time.monotonic() - started) * 1000)
+            self._opening_duration_ms = round((time.monotonic() - started) * 1000, 1)
+        except Exception as exc:  # noqa: BLE001 - 预合成失败不影响原开场
+            logger.warning("[local_opening] fallback error=%s", type(exc).__name__)
+
+    @staticmethod
+    def _say_message(instructions: str) -> dict[str, Any]:
+        return {"role": "user", "content": f"[系统指令，对方听不到这句] {instructions}\n"
+                "请直接输出你要对对方说的话本身，不要解释。"}
 
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
         self._on_audio_out = on_audio_out
+        self.start_connection_warmup()
         if self._segmented_asr and self._turn_silence_samples <= self._segment_silence_samples:
             logger.warning(
                 "LOCAL_TURN_SILENCE (%gs) <= LOCAL_ASR_SEGMENT_SILENCE (%gs)：吐段即判停",
@@ -466,6 +681,9 @@ class LocalPipelineAgent(VoiceAgent):
                 {"role": "system", "content": self._session_instructions or ""}
             ]
         self._running = True
+        if self._speculative and self._deepseek is not None:
+            self._spec_thread = threading.Thread(target=self._spec_worker, name="local-speculative", daemon=True)
+            self._spec_thread.start()
         self._vad_thread = threading.Thread(
             target=self._vad_worker, name="local-vad", daemon=True
         )
@@ -492,6 +710,24 @@ class LocalPipelineAgent(VoiceAgent):
 
     async def say(self, instructions: str) -> None:
         if self._running:
+            if config.get_bool("LOCAL_FAST_OPENING") and not self._opening_cancelled.is_set():
+                with self._opening_lock:
+                    self._opening_cancelled.set()
+                    opening, self._opening = self._opening, None
+                hit = (opening is not None and opening[0] == instructions
+                       and opening[1] == (self._session_instructions or ""))
+                logger.info("[local_opening] hit=%s", hit)
+                self._turn_event(type="local_opening", hit=hit, prepare_ms=self._opening_duration_ms)
+                if hit and opening is not None:
+                    _, _, text, pcm = opening
+                    with self._messages_lock:
+                        self._messages.extend([self._say_message(instructions),
+                                               {"role": "assistant", "content": text}])
+                    self._emit_transcript("agent", text)
+                    turn = self._new_turn(None)
+                    self._mark_latency(turn, "tts_first_audio")
+                    self._output_pcm(pcm, turn)
+                    return
             self._brain_queue.put(_SayRequest(instructions))
 
     async def external_tool_result(
@@ -520,13 +756,16 @@ class LocalPipelineAgent(VoiceAgent):
         return True
 
     async def stop(self) -> None:
+        self._opening_cancelled.set()
+        self._warm_stop.set()
+        self._cancel_speculation()
         with self._turn_lock:
             self._running = False
             self._cancel_turn()
         if self._deepseek is not None:
             self._deepseek.close()
         # Never block the event loop while a model kernel / network call finishes.
-        for thread in (self._vad_thread, self._asr_thread, self._brain_thread, self._tts_thread):
+        for thread in (self._vad_thread, self._asr_thread, self._brain_thread, self._tts_thread, self._warm_thread):
             if thread is not None:
                 await asyncio.to_thread(thread.join, 3)
         self._vad_thread = None
@@ -534,6 +773,8 @@ class LocalPipelineAgent(VoiceAgent):
         self._brain_thread = None
         self._tts_thread = None
         self._pipeline = None
+        if self._spec_thread is not None:
+            await asyncio.to_thread(self._spec_thread.join)
         logger.info("local 三段式 Agent 已停止")
 
     # ---- worker 线程 ----
@@ -557,6 +798,10 @@ class LocalPipelineAgent(VoiceAgent):
         segments = pipeline.vad_flush() if flush else pipeline.vad_push(pcm)
         detector = getattr(pipeline, "is_speech_detected", None)
         speaking = bool(detector()) if (self._streaming or self._segmented_asr) and detector else False
+        if self._speculative and speaking and not self._vad_speaking:
+            with self._spec_lock:
+                self._speech_revision += 1
+                self._cancel_speculation()
         if self._streaming and not self._vad_speaking and (speaking or segments):
             # Cancellation belongs to responses, never to unsubmitted ASR input.
             with self._turn_lock:
@@ -604,13 +849,17 @@ class LocalPipelineAgent(VoiceAgent):
                 continue
             try:
                 if isinstance(item, bytes):
+                    revision = self._speech_revision
                     try:
                         texts.append(pipeline.transcribe(item))
                     except Exception as exc:  # noqa: BLE001 - do not submit a partial amount/menu
                         failed = True
+                        self._cancel_speculation()
                         logger.warning("ASR 小段识别失败（跳过本轮）: %s", exc)
                     finally:
                         completed_at = time.monotonic()
+                    if not failed:
+                        self._start_speculation("".join(texts), revision)
                 else:
                     # The FIFO marker is a barrier after the last segment. If ASR
                     # finished during speech, tail is zero, not marker scheduling time.
@@ -667,6 +916,8 @@ class LocalPipelineAgent(VoiceAgent):
         pipeline = self._pipeline
         assert pipeline is not None
         text = pipeline.transcribe(segment)
+        if self._metrics:
+            self._mark_latency(turn, "asr_tail")
         if not text or turn.cancelled.is_set() or not self._running:
             return
         self._handle_user_text(text, turn)
@@ -686,13 +937,7 @@ class LocalPipelineAgent(VoiceAgent):
         # say 语义（开场白/收尾道别/复读提示）：临时把指令并进本轮请求，
         # 产出的话进入正式对话历史，保持后续上下文连贯。
         with self._messages_lock:
-            self._messages.append(
-                {
-                    "role": "user",
-                    "content": f"[系统指令，对方听不到这句] {instructions}\n"
-                    "请直接输出你要对对方说的话本身，不要解释。",
-                }
-            )
+            self._messages.append(self._say_message(instructions))
         self._respond(self._new_turn(None))
 
     def _respond(self, turn: _Turn) -> None:
@@ -750,7 +995,10 @@ class LocalPipelineAgent(VoiceAgent):
             with self._messages_lock:
                 messages = list(self._messages)
             try:
-                if self._deepseek is not None:
+                speculative = self._consume_speculation(messages, turn, batch, on_content) if _round == 0 else None
+                if speculative is not None:
+                    message = speculative
+                elif self._deepseek is not None:
                     message = self._deepseek.chat(
                         messages, tools, timeout, on_content, turn.cancelled,
                         on_tools=lambda: self._discard_batch(batch),
@@ -826,13 +1074,22 @@ class LocalPipelineAgent(VoiceAgent):
 
     def _new_turn(self, ended_at: float | None) -> _Turn:
         with self._turn_lock:
-            self._turn = _Turn(ended_at)
+            self._turn_sequence += 1
+            opening = ended_at is None
+            if self._metrics and ended_at is None:
+                ended_at = time.monotonic()
+            self._turn = _Turn(ended_at, self._turn_sequence)
             self._turns.add(self._turn)
+            self._turn_event(type="local_turn", turn_id=self._turn.sequence, stage="endpoint",
+                             at=ended_at, ms=0.0, kind="say" if opening else "user")
             return self._turn
 
     def _cancel_turn(self) -> None:
         with self._turn_lock:
             for turn in list(self._turns):
+                if not turn.cancelled.is_set():
+                    self._turn_event(type="local_turn", turn_id=turn.sequence, stage="cancelled",
+                                     at=time.monotonic())
                 turn.cancelled.set()
             while True:
                 try:
@@ -843,10 +1100,14 @@ class LocalPipelineAgent(VoiceAgent):
 
     def _mark_latency(self, turn: _Turn, stage: str, *, at: float | None = None) -> None:
         with self._turn_lock:
-            if turn.ended_at is None or stage in turn.stages or turn.cancelled.is_set():
+            if (turn.ended_at is None or stage in turn.stages
+                    or turn.cancelled.is_set() and stage != "first_pcm_written"):
                 return
             turn.stages.add(stage)
-            elapsed = (time.monotonic() if at is None else at) - turn.ended_at
+            measured_at = time.monotonic() if at is None else at
+            elapsed = measured_at - turn.ended_at
+            self._turn_event(type="local_turn", turn_id=turn.sequence, stage=stage,
+                             at=measured_at, ms=round(elapsed * 1000, 1))
             self._emit_latency(stage, round(max(0.0, elapsed) * 1000, 1))
 
     def _discard_batch(self, batch: _SpeechBatch) -> None:
@@ -893,4 +1154,4 @@ class LocalPipelineAgent(VoiceAgent):
             if pcm and self._running and not batch.cancelled.is_set() and not batch.turn.cancelled.is_set():
                 self._mark_latency(batch.turn, "tts_first_audio")
                 batch.audio_emitted = True
-                self._on_audio_out(pcm)
+                self._output_pcm(pcm, batch.turn)
