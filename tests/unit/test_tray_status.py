@@ -9,7 +9,7 @@ def ready_meta():
     return {
         "hardware": {"usb_online": True, "modem_connected": True, "signal": {"level": "excellent"}},
         "sim": {"present": True, "network_attached": True, "registered": True, "carrier": "Example"},
-        "credentials": {"ok": True}, "version": "0.6.0",
+        "credentials": {"ok": True}, "version": "26.10.1",
     }
 
 
@@ -85,8 +85,8 @@ def test_tray_detail_signal_and_lte(level, zh, en):
     meta = ready_meta()
     meta["hardware"]["signal"]["level"] = level
     meta["sim"].update(registered=False, eps_registered=True)
-    for lang, expected in [("zh", f"Example · 仅 LTE 已注册 · {zh} · 0.6.0"),
-                           ("en", f"Example · LTE registered only · {en} · 0.6.0")]:
+    for lang, expected in [("zh", f"Example · 仅 LTE 已注册 · {zh} · 26.10.1"),
+                           ("en", f"Example · LTE registered only · {en} · 26.10.1")]:
         assert macos_shell.tray_status(meta, uptime=100, now=1000, lang=lang).detail == expected
 
 

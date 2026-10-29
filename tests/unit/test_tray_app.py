@@ -262,15 +262,17 @@ def test_background_install_publishes_failure_and_clears_on_retry(monkeypatch, t
 
 @pytest.mark.parametrize("user_initiated", [False, True])
 def test_ensure_launchd_forwards_user_launch_flag(monkeypatch, tmp_path, user_initiated):
-    from agentcall import macos_launchd
+    from agentcall import macos_launchd, macos_upgrade
 
     calls = []
     monkeypatch.setattr(tray_app, "_is_frozen", lambda: True)
     monkeypatch.setattr(tray_app.sys, "platform", "darwin")
     monkeypatch.setattr(macos_launchd, "make_layout", lambda *args, **kwargs: tmp_path)
-    monkeypatch.setattr(macos_launchd, "install_launch_agents", lambda *args, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(macos_upgrade, "reconcile", lambda *args, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(macos_upgrade, "_lease_request", lambda *args: {})
     tray_app._ensure_launchd_installed(user_initiated=user_initiated)
-    assert calls == [{"no_restart_labels": {macos_launchd.TRAY_LABEL}, "user_initiated": user_initiated}]
+    assert calls[0]["user_initiated"] is user_initiated
+    assert callable(calls[0]["acquire"])
 
 
 @pytest.fixture(params=[False, True], ids=["foreground", "login"])
@@ -815,13 +817,68 @@ def test_bundled_second_instance_forwards_user_open_only(monkeypatch, login, exp
     from agentcall import macos_shell
 
     calls = []
+    installs = []
+    monkeypatch.setattr(tray_app, "_start_background_services", lambda **kw: installs.append(kw))
     monkeypatch.setattr(tray_app, "_bundled_macos", lambda: True)
     monkeypatch.setattr(tray_app, "_acquire_tray_singleton_lock", lambda: None)
     monkeypatch.setattr(tray_app.sys, "argv", ["CallPilot"] + (["--login"] if login else []))
     monkeypatch.setattr(macos_shell, "send_command", calls.append)
+    monkeypatch.setattr(tray_app, "_handoff_previous_tray", lambda: (calls.append("open"), None)[1])
     monkeypatch.setattr(tray_app, "_import_rumps", lambda: pytest.fail("第二实例不得启动 GUI"))
     tray_app.main()
     assert calls == expected
+    assert installs == ([] if login else [{"user_initiated": True}])
+
+
+def test_bridge_only_records_version_after_acquiring_instance_lock(monkeypatch, tmp_path):
+    from agentcall import macos_launchd, macos_upgrade
+    from scripts import ec20_usb_pty
+
+    monkeypatch.setattr(tray_app, "_bundled_macos", lambda: True)
+    monkeypatch.setattr(tray_app, "_prepend_runtime_paths", lambda: None)
+    monkeypatch.setattr(macos_launchd, "app_support_dir", lambda: tmp_path)
+    recorded = []
+    monkeypatch.setattr(macos_upgrade, "record_bridge_version", lambda *args: recorded.append(True))
+    def busy():
+        raise RuntimeError("Another bridge holds the lock")
+    monkeypatch.setattr(ec20_usb_pty, "acquire_instance_lock", busy)
+    monkeypatch.setattr(ec20_usb_pty, "main", lambda: ec20_usb_pty.acquire_instance_lock())
+    with pytest.raises(RuntimeError):
+        tray_app._run_bridge(["--auto"])
+    assert not recorded
+    assert ec20_usb_pty.acquire_instance_lock is busy
+
+
+def test_previous_tray_handoff_releases_only_ui_singleton(monkeypatch, tmp_path):
+    import json
+
+    from agentcall import macos_launchd, macos_shell
+
+    (tmp_path / "tray-version.json").write_text(json.dumps({"version": "26.9.1", "handoff": True}))
+    monkeypatch.setattr(macos_launchd, "app_support_dir", lambda: tmp_path)
+    commands, lock = [], object()
+    monkeypatch.setattr(macos_shell, "send_command", commands.append)
+    waits = []
+    locks = iter([None] * 100 + [lock])
+    monkeypatch.setattr(tray_app, "_acquire_tray_singleton_lock", lambda: next(locks))
+    monkeypatch.setattr(tray_app.time, "sleep", waits.append)
+    assert tray_app._handoff_previous_tray() is lock
+    assert commands == ["replace"]
+    assert len(waits) == 100  # Ten seconds must not abandon the successor.
+
+
+def test_same_generation_reopen_does_not_replace_tray(monkeypatch, tmp_path):
+    import json
+
+    from agentcall import macos_launchd, macos_shell
+    from agentcall.app_version import VERSION
+
+    (tmp_path / "tray-version.json").write_text(json.dumps({"version": VERSION, "executable": sys.executable}))
+    monkeypatch.setattr(macos_launchd, "app_support_dir", lambda: tmp_path)
+    commands = []
+    monkeypatch.setattr(macos_shell, "send_command", commands.append)
+    assert tray_app._handoff_previous_tray() is None
+    assert commands == ["open"]
 
 
 def test_reopen_callback_forwards_to_same_open_action(monkeypatch):

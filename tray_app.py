@@ -194,13 +194,16 @@ def _ensure_launchd_installed(user_initiated: bool = False):
         from agentcall.macos_launchd import LaunchdInstallResult
 
         return LaunchdInstallResult(changed=[], failures=[], warnings=[])
-    from agentcall import macos_launchd
+    from agentcall import macos_launchd, macos_shell, macos_upgrade
 
     layout = macos_launchd.make_layout(sys.executable, resources_dir=_resources_dir())
+    macos_upgrade._lease_request(web_url(), "check", {})
     # tray 单元由本进程自装：声明 no_restart 防止 bootout 杀掉自己（见函数 docstring）。
-    return macos_launchd.install_launch_agents(
-        layout, no_restart_labels={macos_launchd.TRAY_LABEL}, user_initiated=user_initiated,
+    result = macos_upgrade.reconcile(
+        layout, lambda: macos_shell.fetch_meta(web_url(), tray=True), user_initiated=user_initiated,
+        acquire=lambda: macos_upgrade.acquire_lease(web_url()),
     )
+    return result
 
 
 def _uninstall_launchd() -> list[str]:
@@ -223,11 +226,23 @@ def _run_bridge(argv: list[str]) -> int:
     from scripts import ec20_usb_pty
 
     original_argv = sys.argv[:]
+    acquire = ec20_usb_pty.acquire_instance_lock
+    if _bundled_macos():
+        def acquire_and_record():
+            from agentcall.macos_launchd import app_support_dir
+            from agentcall.macos_upgrade import record_bridge_version
+
+            lock = acquire()
+            record_bridge_version(sys.executable, app_support_dir())
+            return lock
+
+        ec20_usb_pty.acquire_instance_lock = acquire_and_record
     try:
         sys.argv = [original_argv[0], *argv]
         return ec20_usb_pty.main()
     finally:
         sys.argv = original_argv
+        ec20_usb_pty.acquire_instance_lock = acquire
 
 
 def dashboard_command(python_exe: str | None = None, frozen: bool | None = None) -> list[str]:
@@ -418,10 +433,46 @@ def _start_background_services(user_initiated: bool = False) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.exception("launchd 自装失败")
         if support is not None:
+            from agentcall.macos_upgrade import LegacyUpgradeRequired
+
+            if isinstance(exc, LegacyUpgradeRequired):
+                macos_shell.write_startup_failure(support, str(exc))
+                return
             macos_shell.write_startup_failure(support, macos_shell.ui_text(
                 f"后台服务无法启动（{type(exc).__name__}）。请重试。",
                 f"Background services could not start ({type(exc).__name__}). Please retry.", lang,
             ))
+
+
+def _handoff_previous_tray():
+    from agentcall import macos_launchd, macos_shell
+    from agentcall.app_version import VERSION
+
+    support = macos_launchd.app_support_dir()
+    try:
+        previous = json.loads((support / "tray-version.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = {}
+    if previous.get("version") == VERSION and previous.get("executable") == sys.executable:
+        macos_shell.send_command("open")
+        return None
+    if previous.get("handoff") is True:
+        macos_shell.send_command("replace")
+        # The incumbent may still be installing or closing its window. Keep the
+        # successor alive until it owns the lock; a timeout can leave both trays exited.
+        while True:
+            lock = _acquire_tray_singleton_lock()
+            if lock is not None:
+                return lock
+            time.sleep(0.1)
+    # Pre-WP6 shells cannot cooperate in a generation handoff. Do not send 'open':
+    # their reopen callback reinstalls old plists. The existing window can close normally.
+    from desktop_app import close_bundled_window
+
+    close_bundled_window(support)
+    open_or_focus_dashboard(None)
+    logger.warning("Legacy tray remains loaded; quit and reopen once to activate the new tray")
+    return None
 
 
 def main() -> None:
@@ -452,11 +503,13 @@ def main() -> None:
     singleton_lock = _acquire_tray_singleton_lock()
     if singleton_lock is None:
         if _bundled_macos() and "--login" not in sys.argv:
-            from agentcall.macos_shell import send_command
-
-            send_command("open")
-        logger.info("已有 CallPilot 菜单栏实例在运行，本实例让位退出")
-        return
+            # The incumbent tray may still be old code from before an overwrite.
+            # Reconcile in this new executable, not only via the old tray's reopen callback.
+            _start_background_services(user_initiated=True)
+            singleton_lock = _handoff_previous_tray()
+        if singleton_lock is None:
+            logger.info("已有 CallPilot 菜单栏实例在运行，本实例让位退出")
+            return
     bundled = _bundled_macos()
     # 主动启动先拉窗口，连 rumps 导入和菜单构造都不挡住首屏。
     early_window = None
@@ -470,6 +523,14 @@ def main() -> None:
 
     lang = ui_language()
     version = bundled_version(sys.executable) if bundled else ""
+    if bundled:
+        from agentcall.app_version import VERSION
+        from agentcall.macos_launchd import app_support_dir
+
+        support = app_support_dir()
+        support.mkdir(parents=True, exist_ok=True)
+        (support / "tray-version.json").write_text(json.dumps(
+            {"version": VERSION, "executable": sys.executable, "handoff": True}), encoding="utf-8")
     if not bundled:
         _start_background_services()
         maybe_autoopen_dashboard(
@@ -488,6 +549,7 @@ def main() -> None:
             self._install_thread: threading.Thread | None = None
             self._enable_requested = False
             self._quitting = False
+            self._replace_requested = False
             self._probe_thread: threading.Thread | None = None
             self._last_probe_started: float | None = None
             self._started_at = time.monotonic()
@@ -503,6 +565,8 @@ def main() -> None:
             self._setup_required = True
             self._status_item = rumps.MenuItem(status_label(False, lang))
             self._detail_item = rumps.MenuItem("")
+            self._update_item = rumps.MenuItem("", callback=self._open)
+            self._update_version = ""
             self._action_items = {
                 key: rumps.MenuItem(menu_label(key, lang), callback=callback)
                 for key, callback in (("hangup", self._hangup), ("listen", self._listen),
@@ -521,7 +585,7 @@ def main() -> None:
                 from dotenv import dotenv_values
 
                 from agentcall import macos_launchd, macos_shell
-                from agentcall.macos_notification_sender import TrayNotifications, make_native_sender
+                from agentcall.macos_notification_sender import TrayNotifications, claim_update, make_native_sender
                 from agentcall.notification_events import SETTING_KEYS
 
                 layout = macos_launchd.make_layout(sys.executable)
@@ -530,7 +594,10 @@ def main() -> None:
                 if sender is not None:
                     settings = {key: str(env.get(key, "true")).lower() in {"1", "true", "yes"}
                                 for key in SETTING_KEYS}
-                    self._notifications = TrayNotifications(sender, settings)
+                    self._notifications = TrayNotifications(
+                        sender, settings, claim_update=lambda v: claim_update(web_url(), v),
+                        busy=lambda: self._meta.get("call_active") is not False,
+                    )
                 setup = str(env.get("SETUP_DONE", "")).lower() not in {"1", "true", "yes"}
                 self._setup_required = setup
                 self._render_status()
@@ -547,6 +614,9 @@ def main() -> None:
                 self._refresh(None)
 
         def _start_services(self, user_initiated: bool = True) -> None:
+            if bundled_version(sys.executable) != version:
+                subprocess.Popen([sys.executable], start_new_session=True)
+                return
             if self._install_thread is None or not self._install_thread.is_alive():
                 self._enable_requested = False
                 self._install_thread = threading.Thread(
@@ -559,6 +629,9 @@ def main() -> None:
 
         def _reopen(self) -> None:
             if not self._quitting:
+                if bundled_version(sys.executable) != version:
+                    subprocess.Popen([sys.executable], start_new_session=True)
+                    return
                 self._open(None)
                 self._start_services()
 
@@ -579,6 +652,17 @@ def main() -> None:
                     except OSError:
                         logger.exception("打开通知目标失败")
             commands = take_commands()
+            self._replace_requested = self._replace_requested or "replace" in commands
+            if self._replace_requested:
+                if self._install_thread is not None and self._install_thread.is_alive():
+                    return
+                from agentcall.macos_launchd import app_support_dir
+                from desktop_app import close_bundled_window
+
+                close_bundled_window(app_support_dir())
+                self._quitting = True
+                rumps.quit_application()
+                return
             if "quit" in commands:
                 self._quit(None)
                 return
@@ -623,14 +707,23 @@ def main() -> None:
                 uptime=now - self._started_at, now=time.time(), lang=lang,
                 connecting_for=now - self._connecting_since if self._connecting_since is not None else 0,
             )
+            update = self._meta.get("update") or {}
+            update_version = str(update.get("version") or "")
+            if update_version != self._update_version:
+                self._update_version = update_version
+                from agentcall.macos_shell import ui_text
+
+                self._update_item.title = ui_text(f"有新版本 {update_version}",
+                                                  f"New version {update_version}", lang)
+                rebuild_menu = True
             if "setup_required" in self._meta:
                 self._setup_required = self._meta["setup_required"]
             if self._notifications is not None:
                 self._notifications.status(status.state, status.title, suppress=self._setup_required)
             if self._status_item.title != status.title:
                 self._status_item.title = status.title
-            if self._detail_item.title != status.detail:
-                self._detail_item.title = status.detail
+            if self._detail_item.title != (status.detail or version):
+                self._detail_item.title = status.detail or version
             if status.state != self._displayed_state:
                 update_status_icon(self, status.state)
             # 开菜单或进出通话时重建；秒数变化仅改标题，不抖动图标和菜单。
@@ -641,7 +734,9 @@ def main() -> None:
                 # rumps 的回调注册表强持有菜单项，复用实例避免每通累积对象。
                 keys = (["hangup", "listen"] if status.state == "in_call" else [])
                 keys += ["open_app", "uninstall", "quit"]
-                self.menu = [self._status_item, self._detail_item, *[self._action_items[key] for key in keys]]
+                updates = [self._update_item] if update_version else []
+                self.menu = [self._status_item, self._detail_item, *updates,
+                             *[self._action_items[key] for key in keys]]
             self._displayed_state = status.state
 
         @rumps.timer(5)
@@ -663,7 +758,7 @@ def main() -> None:
                         if self._notifications is not None:
                             from agentcall.macos_notification_sender import fetch_feed
 
-                            result = fetch_feed(web_url(), self._notifications.seq)
+                            result = fetch_feed(web_url(), self._notifications.seq, self._notifications.epoch)
                             if result is not None:
                                 self._notification_results.put(result)
 

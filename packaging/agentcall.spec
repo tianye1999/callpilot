@@ -29,6 +29,7 @@ sys.path.insert(0, str(project_root / "src"))
 from agentcall.platforms import IS_MACOS, IS_WINDOWS
 
 datas = []
+datas.append((str(project_root / "pyproject.toml"), "."))
 binaries = []
 hiddenimports = [
     "webview",

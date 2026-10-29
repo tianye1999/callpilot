@@ -416,3 +416,27 @@ def test_install_no_restart_labels_still_bootstraps_when_not_loaded(tmp_path):
         "gui/123",
         str(layout.launch_agents_dir / "com.agentcall.tray.plist"),
     ] in calls
+
+
+def test_force_pair_restart_stops_both_before_starting_either(tmp_path):
+    layout = macos_launchd.make_layout(tmp_path / "CallPilot", uid=123,
+                                      support_dir=tmp_path / "support", launch_dir=tmp_path / "agents")
+    calls, loaded = [], set(macos_launchd.LAUNCH_LABELS)
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        label = cmd[-1].rsplit("/", 1)[-1].removesuffix(".plist")
+        if cmd[1] == "print":
+            return subprocess.CompletedProcess(cmd, 0 if label in loaded else 1, "", "")
+        if cmd[1] == "bootout":
+            loaded.discard(label)
+        if cmd[1] == "bootstrap":
+            loaded.add(label)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    pair = {macos_launchd.APP_LABEL, macos_launchd.BRIDGE_LABEL}
+    result = macos_launchd.install_launch_agents(layout, runner=runner, force_restart_labels=pair,
+                                                no_restart_labels={macos_launchd.TRAY_LABEL})
+    assert not result.failures
+    stops = [cmd[-1].rsplit("/", 1)[-1] for cmd in calls if cmd[1] == "bootout"]
+    assert stops == [macos_launchd.APP_LABEL, macos_launchd.BRIDGE_LABEL]
+    first_start = next(i for i, cmd in enumerate(calls) if cmd[1] == "bootstrap")
+    assert all(cmd[1] != "bootout" for cmd in calls[first_start:])

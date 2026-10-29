@@ -9,6 +9,7 @@ import time
 import urllib.request
 from functools import lru_cache
 from typing import Callable
+from urllib.parse import urlencode
 
 from .macos_notifications import available
 from .notification_events import SETTING_KEYS, valid_target
@@ -17,9 +18,10 @@ logger = logging.getLogger(__name__)
 CONFIRM_PREFIX = "callpilot.confirm."
 
 
-def fetch_feed(url: str, after: int) -> dict | None:
+def fetch_feed(url: str, after: int, epoch: str | None = None) -> dict | None:
     try:
-        with urllib.request.urlopen(f"{url.rstrip('/')}/api/notify/feed?after={after}", timeout=0.5) as response:
+        query = urlencode({"after": after, "epoch": epoch or ""})
+        with urllib.request.urlopen(f"{url.rstrip('/')}/api/notify/feed?{query}", timeout=0.5) as response:
             data = json.loads(response.read(1024 * 1024))
         if (isinstance(data, dict) and isinstance(data.get("epoch"), str)
                 and type(data.get("seq")) is int and isinstance(data.get("events"), list)
@@ -30,8 +32,20 @@ def fetch_feed(url: str, after: int) -> dict | None:
     return None
 
 
+def claim_update(url: str, version: str) -> bool | None:
+    request = urllib.request.Request(f"{url.rstrip('/')}/api/updates/claim-notification",
+                                     data=json.dumps({"version": version}).encode(),
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=0.5) as response:
+            result = json.loads(response.read(4096))
+            return None if result.get("retry") else result.get("ok") is True
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 class TrayNotifications:
-    def __init__(self, sender, settings: dict | None = None):
+    def __init__(self, sender, settings: dict | None = None, *, claim_update=None, busy=lambda: False):
         self.sender = sender
         self.settings = {key: True for key in SETTING_KEYS} if settings is None else settings
         self.seq = 0
@@ -39,6 +53,9 @@ class TrayNotifications:
         self._confirmations: dict[str, float] = {}
         self._red_reasons: set[str] = set()
         sender.enabled = self._enabled
+        self._claim_update = claim_update
+        self._busy = busy
+        self._pending_updates: dict[str, dict] = {}
 
     def _enabled(self, tier: str) -> bool:
         return bool(self.settings.get("MAC_NOTIFICATIONS_ENABLED")
@@ -49,6 +66,7 @@ class TrayNotifications:
         if first:
             self.sender.remove(list(self._confirmations))
             self._confirmations.clear()
+            self._pending_updates.clear()
         self.epoch = data["epoch"]
         self.settings = data["settings"]
         current = {CONFIRM_PREFIX + c["id"]: c["deadline"] for c in data["confirmations"]}
@@ -67,10 +85,23 @@ class TrayNotifications:
                 ))
         self._confirmations = current
         # 首次接入只取游标，不把服务内旧短信/摘要整批弹出。
-        if not first:
-            for event in data["events"]:
+        for event in data["events"]:
+            if event.get("kind", "").startswith("update:"):
+                version = event["kind"].removeprefix("update:")
+                self._pending_updates[version] = event
+            elif not first:
                 if event["seq"] > self.seq and event["tier"] == "info" and self._enabled("info"):
                     self.sender.send(f"callpilot.{self.epoch}.{event['seq']}", event)
+        if self._enabled("info") and not self._busy() and self._claim_update is not None:
+            for version, event in list(self._pending_updates.items()):
+                def claim(version=version):
+                    if self._busy():
+                        return False
+                    claimed = self._claim_update(version)
+                    if claimed is not None:
+                        self._pending_updates.pop(version, None)
+                    return claimed is True
+                self.sender.send(f"callpilot.update.{version}", {**event, "claim": claim})
         self.seq = data["seq"]
         self.expire()
 
@@ -130,6 +161,9 @@ class NativeSender:
                 )
 
                 content = UNMutableNotificationContent.alloc().init()
+                if event.get("claim") is not None and not event["claim"]():
+                    self._inflight.pop(identifier, None)
+                    return
                 content.setTitle_(event["title"])
                 content.setBody_(event["body"])
                 content.setUserInfo_({"target": event["target"], "tier": event["tier"]})

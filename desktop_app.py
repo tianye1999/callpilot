@@ -443,6 +443,21 @@ class BundledStartup:
         send_command("retry", self.layout.support_dir)
         self.retry_requested.set()
 
+    def download_update(self):
+        import webbrowser
+
+        from agentcall.app_updates import https_url
+        from agentcall.macos_shell import fetch_meta
+
+        current, trusted = urlsplit(self.window.get_current_url() or ""), urlsplit(self.url)
+        if (trusted.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or (current.scheme, current.netloc) != (trusted.scheme, trusted.netloc)):
+            return False
+        # The renderer cannot supply an arbitrary URL to the native bridge.
+        meta = fetch_meta(self.url, tray=True)
+        url = (meta.get("update") or {}).get("downloadUrl")
+        return bool(https_url(url) and webbrowser.open(url))
+
     def copy_diagnostics(self):
         from AppKit import NSPasteboard, NSPasteboardTypeString
         from PyObjCTools import AppHelper
@@ -577,7 +592,7 @@ def _bundled_main(webview, web_url: str) -> None:
         from agentcall.macos_notifications import NotificationBridge
 
         notifications = NotificationBridge(window.get_current_url, web_url)
-        window.expose(startup.retry, startup.copy_diagnostics,
+        window.expose(startup.retry, startup.copy_diagnostics, startup.download_update,
                       notifications.notification_status, notifications.request_notifications,
                       notifications.open_notification_settings)
         window.events.closed += startup.closed.set

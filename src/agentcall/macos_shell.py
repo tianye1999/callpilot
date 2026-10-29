@@ -323,7 +323,7 @@ def take_notification_target(support: Path) -> str | None:
 
 
 def send_command(command: str, support: Path | None = None) -> None:
-    if command not in {"open", "quit", "retry"}:
+    if command not in {"open", "quit", "retry", "replace"}:
         raise ValueError("未知外壳命令")
     directory = (support or macos_launchd.app_support_dir()) / "shell-requests"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -366,7 +366,7 @@ def observe_commands(callback, support: Path | None = None):
 def take_commands(support: Path | None = None) -> set[str]:
     directory = (support or macos_launchd.app_support_dir()) / "shell-requests"
     commands = set()
-    for command in ("open", "quit", "retry"):
+    for command in ("open", "quit", "retry", "replace"):
         path = directory / command
         try:
             fresh = time.time() - path.stat().st_mtime < 60

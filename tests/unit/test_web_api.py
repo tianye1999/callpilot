@@ -148,6 +148,90 @@ def api(app, fn):
 # ---- /api/config ----
 
 
+def test_meta_version_notes_update_and_persistent_dismiss(monkeypatch, tmp_path):
+    from agentcall.app_updates import UpdateChecker
+
+    app = make_app(FakeService())
+    app["updates"] = UpdateChecker(tmp_path / "updates.json")
+    monkeypatch.setattr(server, "_updates_enabled", lambda: True)
+    async def fn(client):
+        app["updates"].latest = dict(version="26.11.1", notes={"zh": "说明", "en": "Notes"},
+                                     downloadUrl="https://example.test/app.dmg")
+        result = await (await client.get("/api/meta?tray=1")).json()
+        assert result["version"] == "26.10.1"
+        assert result["release_notes"]["en"]
+        assert result["update"]["dismissed"] is False
+        response = await client.post("/api/updates/dismiss", json={"version": "26.11.1"})
+        assert response.status == 200
+        result = await (await client.get("/api/meta?tray=1")).json()
+        assert result["update"]["dismissed"] is True
+        response = await client.post("/api/updates/dismiss", json={"version": "26.11.1"},
+                                     headers={"Origin": "https://evil.test"})
+        assert response.status == 403
+    api(app, fn)
+    assert UpdateChecker(tmp_path / "updates.json").settings["dismissed"] == ["26.11.1"]
+
+
+def test_update_notification_waits_for_tray_epoch_and_idle(monkeypatch, tmp_path):
+    from agentcall import notification_events
+    from agentcall.app_updates import UpdateChecker
+
+    feed = notification_events.NotificationFeed()
+    monkeypatch.setattr(notification_events, "feed", feed)
+    monkeypatch.setattr(server, "_updates_enabled", lambda: True)
+    service = FakeService()
+    app = make_app(service)
+    app["updates"] = UpdateChecker(tmp_path / "updates.json")
+    async def fn(client):
+        app["updates"].latest = {"version": "26.11.1"}
+        result = await (await client.get("/api/notify/feed?after=0")).json()
+        assert not result["events"]
+        service.line_busy = lambda: True
+        path = "/api/notify/feed?after=0&epoch=" + result["epoch"]
+        assert not (await (await client.get(path)).json())["events"]
+        service.line_busy = lambda: False
+        result = await (await client.get(path)).json()
+        assert len(result["events"]) == 1
+        assert result["events"][0]["kind"] == "update:26.11.1"
+        assert result["events"][0]["tier"] == "info"
+        assert len((await (await client.get(path)).json())["events"]) == 1
+    api(app, fn)
+
+
+def test_upgrade_lease_uses_idle_gate_and_cleanup_releases_it(monkeypatch):
+    import threading
+
+    released = threading.Event()
+    service = FakeService()
+    def reserve(action):
+        try:
+            action()
+            return True
+        finally:
+            released.set()
+    service.run_idle_hardware = reserve
+    monkeypatch.setattr(server, "_macos_shell_available", lambda: True)
+    app = make_app(service)
+    async def fn(client):
+        result = await client.post("/api/updates/prepare", json={})
+        assert result.status == 200
+        assert (await result.json())["token"]
+        assert not released.is_set()
+        assert (await client.post("/api/updates/prepare", json={})).status == 409
+        assert (await client.post("/api/updates/resume", json={"token": "wrong"})).status == 403
+    api(app, fn)
+    assert released.is_set()
+
+
+def test_upgrade_lease_refused_during_call(monkeypatch):
+    service = FakeService()
+    service.run_idle_hardware = lambda action: False
+    monkeypatch.setattr(server, "_macos_shell_available", lambda: True)
+    async def fn(client):
+        assert (await client.post("/api/updates/prepare", json={})).status == 409
+    api(make_app(service), fn)
+
+
 def test_macos_autostart_only_packaged_and_validated(monkeypatch):
     from agentcall import macos_launchd
 

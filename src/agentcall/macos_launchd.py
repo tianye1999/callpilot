@@ -13,6 +13,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .app_version import VERSION
+
 BRIDGE_LABEL = "com.agentcall.bridge"
 APP_LABEL = "com.agentcall.app"
 TRAY_LABEL = "com.agentcall.tray"
@@ -149,6 +151,7 @@ def _environment(layout: LaunchdLayout) -> dict[str, str]:
         "AGENTCALL_ENV_FILE": str(layout.env_file),
         "AGENTCALL_DATA_DIR": str(layout.data_dir),
         "CALL_LOG_DIR": str(layout.data_dir / "recordings"),
+        "CALLPILOT_BUNDLE_VERSION": VERSION,
     }
     env["DYLD_LIBRARY_PATH"] = str(lib_dir)
     return env
@@ -348,6 +351,9 @@ def install_launch_agents(
     bootstrap_attempts: int = 3,
     bootstrap_retry_seconds: float = 2.0,
     no_restart_labels: frozenset[str] | set[str] = frozenset(),
+    force_restart_labels: frozenset[str] | set[str] = frozenset(),
+    before_restart: Callable[[], None] | None = None,
+    verify_bridge: Callable[[], bool] | None = None,
     user_initiated: bool = False,
 ) -> LaunchdInstallResult:
     """Write missing/stale plists and bootstrap changed agents.
@@ -379,11 +385,30 @@ def install_launch_agents(
     enabled = autostart_enabled(layout)
     plist_dir = layout.launch_agents_dir if enabled else layout.support_dir / "LaunchAgents"
     plist_dir.mkdir(parents=True, exist_ok=True)
+    # A replacement is one generation: stop the service before its bridge,
+    # then bootstrap bridge -> service. Never leave a new bridge under old code.
+    stopped = set()
+    if force_restart_labels and before_restart is not None:
+        before_restart()
+    for label in reversed(LAUNCH_LABELS):
+        if label not in force_restart_labels or label in no_restart_labels:
+            continue
+        result = _run_launchctl(["bootout", f"{layout.gui_domain}/{label}"], runner)
+        if result.returncode:
+            warnings.append(_failure(label, "bootout", result))
+        if not _wait_until_unloaded(label, layout, runner, timeout=unload_timeout,
+                                    interval=unload_interval, sleep=sleep):
+            failures.append(LaunchctlFailure(label, "wait-unloaded", tuple(result.args), 1,
+                                             stderr="Previous service generation is still loaded"))
+            return LaunchdInstallResult(changed, failures, warnings)
+        stopped.add(label)
     for label, data in build_plists(layout).items():
+        if failures and force_restart_labels:
+            break
         if not enabled:
             (layout.launch_agents_dir / f"{label}.plist").unlink(missing_ok=True)
         path = plist_dir / f"{label}.plist"
-        if not plist_needs_update(path, data):
+        if not plist_needs_update(path, data) and label not in stopped:
             if not agent_loaded(label, layout, runner):
                 failure = _bootstrap_with_retry(
                     label,
@@ -416,6 +441,20 @@ def install_launch_agents(
                     failures.append(failure)
                     continue
             changed.append(label)
+            continue
+        if label in stopped:
+            path.write_bytes(plist_bytes(data))
+            failure = _bootstrap_with_retry(
+                label, path, layout, runner, attempts=bootstrap_attempts,
+                retry_seconds=bootstrap_retry_seconds, sleep=sleep,
+            )
+            if failure is not None:
+                failures.append(failure)
+            else:
+                changed.append(label)
+                if label == BRIDGE_LABEL and verify_bridge is not None and not verify_bridge():
+                    failures.append(LaunchctlFailure(label, "verify-version", (), 1,
+                                                     stderr="New bridge did not acquire its instance lock"))
             continue
         bootout = _run_launchctl(["bootout", f"{layout.gui_domain}/{label}"], runner)
         if bootout.returncode != 0:

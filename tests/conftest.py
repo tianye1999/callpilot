@@ -46,6 +46,7 @@ def _isolate_side_effects(tmp_path, monkeypatch):
     monkeypatch.setenv("CALL_PLAYBOOKS_FILE", str(tmp_path / "call_playbooks.json"))
     monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "false")
     monkeypatch.setenv("SUMMARY_ENABLED", "false")
+    monkeypatch.setenv("UPDATE_CHECK_ENABLED", "false")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-dashscope-key")
     # API 测试也会走 USB 检测；默认假后端，专项测试再自行注入设备。
     import usb.core

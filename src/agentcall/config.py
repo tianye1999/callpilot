@@ -249,6 +249,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("MAC_NOTIFY_CONFIRM", "AI 确认提醒", "bool", "true"),
     ConfigSpec("MAC_NOTIFY_INFO", "来电、摘要和短信提醒", "bool", "true"),
     ConfigSpec("MAC_NOTIFY_ALERT", "设备或配置异常提醒", "bool", "true"),
+    ConfigSpec("UPDATE_CHECK_ENABLED", "检查新版本", "bool", "true"),
+    ConfigSpec("UPDATE_CHECK_URL", "版本检查地址", "str",
+               "https://api-beta.bondings.ai/v1/releases/latest?product=physical-sim&platform=macos"),
     # Path B「我来说」（WIL-120 四期）：三方并入时拨给机主的第二号码
     # （不能是本机 SIM 自己的号）。留空 = Path B 不可用，确认卡按钮保持置灰。
     ConfigSpec("OWNER_SECOND_PHONE", "机主第二号码（三方并入用）", "str", ""),

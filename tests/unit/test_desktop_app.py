@@ -852,3 +852,23 @@ def test_activate_hook_registers_injected_action_on_window_shown():
     assert len(callbacks) == 1
     callbacks[0]()
     assert activated == [True]
+
+
+@pytest.mark.parametrize("download,origin,expected", [
+    ("https://example.test/app.dmg", "http://127.0.0.1:47100/", True),
+    ("http://example.test/app.dmg", "http://127.0.0.1:47100/", False),
+    ("https://example.test/app.dmg", "https://evil.test/", False),
+])
+def test_update_download_uses_default_browser_and_trusted_meta(monkeypatch, download, origin, expected):
+    import types
+    import webbrowser
+
+    from agentcall import macos_shell
+
+    opened = []
+    monkeypatch.setattr(macos_shell, "fetch_meta", lambda *a, **kw: {"update": {"downloadUrl": download}})
+    monkeypatch.setattr(webbrowser, "open", lambda url: (opened.append(url), True)[1])
+    startup = desktop_app.BundledStartup(types.SimpleNamespace(get_current_url=lambda: origin),
+                                        "http://127.0.0.1:47100", None)
+    assert startup.download_update() is expected
+    assert opened == ([download] if expected else [])

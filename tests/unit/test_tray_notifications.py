@@ -244,3 +244,34 @@ def test_delegate_click_routes_and_foreground_sound_with_fakes(monkeypatch):
         assert options == [7] * 4
     finally:
         notifications._delegate_class.cache_clear()
+
+
+def test_update_replays_first_poll_and_defers_until_native_callback_is_idle(monkeypatch):
+    center, sent, _, callbacks = fake_native(monkeypatch, defer=True)
+    center.getDeliveredNotificationsWithCompletionHandler_ = lambda callback: callback([])
+    busy, claimed = [False], []
+    sender = notifications.NativeSender(center)
+    tray = notifications.TrayNotifications(sender, claim_update=lambda version: (claimed.append(version), True)[1],
+                                            busy=lambda: busy[0])
+    feed = NotificationFeed()
+    feed.info("update:26.11.1", "New version", "Notes", "#settings")
+    tray.consume(feed.read(0))
+    busy[0] = True
+    callbacks.pop()(SimpleNamespace(authorizationStatus=lambda: 2))
+    assert not sent and not claimed
+    busy[0] = False
+    tray.consume(feed.read(tray.seq))
+    callbacks.pop()(SimpleNamespace(authorizationStatus=lambda: 2))
+    assert claimed == ["26.11.1"] and len(sent) == 1
+    assert sent[0][0] == "callpilot.update.26.11.1"
+    tray.consume(feed.read(tray.seq))
+    assert not callbacks
+
+
+def test_denied_notification_does_not_claim_update(monkeypatch):
+    center, sent, _, _ = fake_native(monkeypatch, status=1)
+    claimed = []
+    sender = notifications.NativeSender(center)
+    sender.send("update", dict(tier="info", title="Update", body="Notes", target="#settings",
+                               claim=lambda: claimed.append(True)))
+    assert not sent and not claimed

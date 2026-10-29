@@ -40,6 +40,7 @@
     background-attachment: fixed;
     -webkit-font-smoothing: antialiased;
     overflow: hidden;
+    display: flex; flex-direction: column;
   }
 
   /* ========= 顶部全局状态条 ========= */
@@ -197,6 +198,7 @@
   /* ========= 主区：分面板 ========= */
   main {
     height: calc(100vh - 57px);
+    flex: 1; min-height: 0;
     overflow: hidden; position: relative; z-index: 1;
   }
   .panel-page {
@@ -862,6 +864,22 @@
   }
   .lang-menu button:hover { background: var(--blue-dim); }
   .lang-menu button .check { color: var(--blue); font-weight: 700; }
+  .update-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+    padding: 8px 24px; background: var(--blue-dim); border-bottom: 1px solid var(--border); }
+  .update-banner[hidden] { display: none; }
+  .update-banner button, .version-footer button { color: var(--text); font: inherit;
+    border: 0; padding: 2px 4px; background: none; cursor: pointer; }
+  .update-banner a { color: var(--text); }
+  #dismissUpdate { margin-left: auto; width: 28px; height: 28px; font-size: 20px; }
+  .version-footer { flex: none; text-align: center; font-size: 11px; color: var(--muted);
+    height: 24px; background: var(--bg); z-index: 31; }
+  .dock { bottom: 30px; }
+  #releaseDialog { width: min(600px, calc(100vw - 32px)); max-height: calc(100vh - 48px);
+    padding: 24px; border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); background: var(--bg); }
+  #releaseDialog::backdrop { background: rgba(0,0,0,.6); }
+  #releaseDialog h2 { font-size: 20px; }
+  #releaseDialog p { white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -899,6 +917,12 @@
     </div>
   </header>
 
+  <aside id="updateBanner" class="update-banner" hidden aria-live="polite">
+    <span id="updateTitle"></span>
+    <button id="updateNotes" data-i18n="update_notes"></button>
+    <a id="updateDownload" target="_blank" rel="noopener noreferrer" data-i18n="update_download"></a>
+    <button id="dismissUpdate" title="Close" aria-label="Close">×</button>
+  </aside>
   <main>
     <!-- 电话（主页，poc 双卡） -->
     <div class="panel-page active" id="page-phone">
@@ -1189,6 +1213,12 @@
       </div>
     </div>
   </main>
+  <footer class="version-footer">CallPilot <span id="appVersion"></span> ·
+    <button id="aboutApp" data-i18n="about_app"></button></footer>
+  <dialog id="releaseDialog" aria-labelledby="releaseTitle">
+    <h2 id="releaseTitle"></h2><p id="releaseNotes"></p>
+    <form method="dialog"><button class="btn sm" data-i18n="release_close"></button></form>
+  </dialog>
 
   <!-- 底部胶囊 dock -->
   <nav class="dock" id="dock">
@@ -1394,6 +1424,8 @@ const I18N = {
     phone_on: "Phone connected", phone_off: "Phone disconnected", phone_line: "Bluetooth phone",
     phone_signal: "Phone signal", phone_sms_unavailable: "SMS is unavailable on this Bluetooth line. Use the phone.",
     modem_resetting: "Modem restarting (about 30 seconds)",
+    about_app: "About", update_available: "New version", update_notes: "Release notes",
+    update_download: "Download", release_close: "Close",
     keypad: "Keys", hangup: "Hang up",
     dial_label: "MAKE A CALL", preset_label: "PRESET TASK", preset_custom: "Custom (manual input)",
     dial: "Call", ph_number: "Phone number", remote_pair: "Pair phone", remote_invite: "Temporary link",
@@ -1679,6 +1711,7 @@ const I18N = {
       RECORDING_ENABLED: "Call recording", RECORDING_RETENTION_DAYS: "Recording retention (days)",
       MAC_NOTIFICATIONS_ENABLED: "Mac notifications", MAC_NOTIFY_CONFIRM: "AI confirmation alerts",
       MAC_NOTIFY_INFO: "Incoming calls, summaries and SMS", MAC_NOTIFY_ALERT: "Device and configuration alerts",
+      UPDATE_CHECK_ENABLED: "Check for updates", UPDATE_CHECK_URL: "Release check URL",
       SUMMARY_ENABLED: "Call summary", SUMMARY_MODEL: "Summary model",
       MONITOR_AI_PLAYBACK: "Monitor on this Mac", MONITOR_OUTPUT_DEVICE: "Monitor output device",
       MONITOR_AI_GAIN: "Monitor gain (AI)", MONITOR_UPLINK_GAIN: "Monitor gain (caller)",
@@ -1774,6 +1807,8 @@ const I18N = {
     batch_title: "开始批量外呼？",
     batch_msg: (n) => `将逐个拨打 ${n} 个号码。`,
     batch_ok: "开始拨打",
+    about_app: "关于", update_available: "有新版本", update_notes: "查看更新说明",
+    update_download: "下载", release_close: "关闭",
     restart_title: "正在重启服务…",
     restart_msg: "正在应用需要重启的设置，请稍候几秒。",
     restart_timeout: "重启耗时较长，请手动刷新页面。",
@@ -2147,6 +2182,7 @@ function setCall(status, caller) {
   _renderStateText(status);
   $("stateNum").textContent = status === "idle" ? "" : (caller || "");
   callActive = (status === "ringing" || status === "dialing" || status === "answered");
+  renderRelease();
   // 从空闲跳到活跃 = 一通新通话开始：在实时转写里插入分割线（与上一通隔开）
   if (callActive && !wasActive) insertCallDivider(caller);
   $("quickActs").classList.toggle("show", callActive);
@@ -2537,6 +2573,7 @@ async function loadMeta() {
   try {
     const m = await (await fetch("/api/meta")).json();
     lastMeta = m;
+    renderRelease();
     $("macosAutostartRow").hidden = typeof m.macos_autostart !== "boolean";
     if (!$("macosAutostart").disabled) $("macosAutostart").checked = m.macos_autostart === true;
     if (m.hardware && statusRevision === modemStatusRevision) {
@@ -2565,6 +2602,50 @@ async function loadMeta() {
     }
   } catch (e) { console.warn("[meta] 加载运行信息失败", e); }
 }
+
+function renderRelease() {
+  const meta = lastMeta || {};
+  $("appVersion").textContent = meta.version || "";
+  const update = meta.update;
+  let url;
+  try { url = new URL(update?.downloadUrl); } catch (_) { /* absent release */ }
+  const available = !!(update?.version && url?.protocol === "https:" && !url.username && !url.password);
+  $("updateBanner").hidden = !available || update.dismissed || callActive || !!meta.call_active;
+  $("updateTitle").textContent = available ? `${t("update_available")} ${update.version}` : "";
+  if (available) $("updateDownload").href = url.href;
+  else $("updateDownload").removeAttribute("href");
+  $("dismissUpdate").title = t("release_close");
+  $("dismissUpdate").setAttribute("aria-label", t("release_close"));
+  if ((callActive || meta.call_active) && $("releaseDialog").open) $("releaseDialog").close();
+}
+function showRelease(about) {
+  if (callActive || lastMeta?.call_active) return;
+  const release = about ? {version: lastMeta?.version, notes: lastMeta?.release_notes} : lastMeta?.update;
+  if (!release) return;
+  $("releaseTitle").textContent = `${about ? "CallPilot" : t("update_available")} ${release.version || ""}`;
+  $("releaseNotes").textContent = release.notes?.[LANG === "zh" ? "zh" : "en"] || "";
+  $("releaseDialog").showModal();
+}
+$("aboutApp").addEventListener("click", () => showRelease(true));
+$("updateNotes").addEventListener("click", () => showRelease(false));
+$("updateDownload").addEventListener("click", (event) => {
+  if (window.pywebview?.api?.download_update) {
+    event.preventDefault();
+    void window.pywebview.api.download_update();
+  }
+});
+$("dismissUpdate").addEventListener("click", async () => {
+  const version = lastMeta?.update?.version;
+  if (!version) return;
+  $("dismissUpdate").disabled = true;
+  try {
+    const response = await fetch("/api/updates/dismiss", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({version})});
+    if (response.ok && lastMeta?.update?.version === version) lastMeta.update.dismissed = true;
+    renderRelease();
+  } catch (_) { /* Keep the banner until dismissal has been saved. */ }
+  finally { $("dismissUpdate").disabled = false; }
+});
 
 $("macosAutostart").addEventListener("change", async (event) => {
   const input = event.target;
@@ -4588,6 +4669,7 @@ function setLang(code) {
   LANG = code;
   localStorage.setItem("cp_lang", LANG);
   applyI18n();
+  renderRelease();
   loadHistory().then(loadRecent);  // 重渲染带翻译的动态列表
   loadConfig();
   refreshQueue();
@@ -4607,6 +4689,7 @@ document.addEventListener("click", (e) => {
 applyI18n();
 setModem(false);   // 默认显示模组未连接，连上后由 modem_status 事件翻绿
 loadMeta();
+setInterval(() => void loadMeta(), 30000);
 connect();
 loadHistory().then(loadRecent);
 refreshQueue();

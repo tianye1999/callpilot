@@ -237,7 +237,7 @@ def test_geometry_roundtrip_and_missing_monitor(tmp_path):
 
 def test_diagnostics_never_copy_raw_secrets():
     report = macos_shell.diagnostic_report(
-        "0.6.0", "15.0", {"app": "state = running\nAPI_KEY=secret-one"},
+        "26.10.1", "15.0", {"app": "state = running\nAPI_KEY=secret-one"},
         {"app": "Authorization: Bearer secret-two\nAddress already in use\nsecret-three"},
         {"hardware": {"usb_online": True, "api_key": "secret-four"}, "setup_sms_token": "secret-five"},
     )
@@ -296,7 +296,7 @@ def test_collect_diagnostics_is_bounded_and_sanitized(tmp_path):
 
     executable = tmp_path / "CallPilot.app" / "Contents" / "MacOS" / "CallPilot"
     executable.parent.mkdir(parents=True)
-    (executable.parent.parent / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "0.6.0"}))
+    (executable.parent.parent / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "26.10.1"}))
     layout = macos_launchd.make_layout(executable, uid=123, support_dir=tmp_path / "support")
     layout.log_dir.mkdir(parents=True)
     (layout.log_dir / "launchd-app.err.log").write_text(
@@ -313,5 +313,5 @@ def test_collect_diagnostics_is_bounded_and_sanitized(tmp_path):
     assert len(calls) == 3
     assert "端口" in reason
     assert "secret" not in report
-    assert json.loads(report)["app_version"] == "0.6.0"
+    assert json.loads(report)["app_version"] == "26.10.1"
     assert len(json.loads(report)["recent_log_tail_sanitized"]["launchd-app.err.log"]) == 30

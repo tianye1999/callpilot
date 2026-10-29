@@ -12,6 +12,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import wave
 from contextlib import suppress
@@ -284,6 +285,13 @@ def build_app(
     app["modem"] = modem
     app["service"] = service
     app["meta"] = meta or {}
+    from ..app_updates import UpdateChecker, watch_updates
+    from ..app_version import RELEASE_NOTES, VERSION
+
+    app["version"] = VERSION
+    app["release_notes"] = RELEASE_NOTES
+    app["updates"] = UpdateChecker(config.data_dir() / "updates.json")
+    app.cleanup_ctx.append(watch_updates)
     app["tray_usb"] = {"task": None, "online": None, "checked": -float("inf")}
     # 由 app.py 传入的 threading.Event；置位后主循环停止、清理并按运行方式重启。
     app["restart_event"] = restart_event
@@ -308,6 +316,11 @@ def build_app(
     app.router.add_get("/callpilot-192.png", _remote_dialer_asset)
     app.router.add_get("/callpilot-512.png", _remote_dialer_asset)
     app.router.add_get("/api/meta", _meta)
+    app.router.add_post("/api/updates/dismiss", _dismiss_update)
+    app.router.add_post("/api/updates/claim-notification", _claim_update_notification)
+    app.router.add_post("/api/updates/check", _check_update)
+    app.router.add_post("/api/updates/prepare", _prepare_update)
+    app.router.add_post("/api/updates/resume", _resume_update)
     app.router.add_get("/api/notify/feed", _notification_feed)
     app.router.add_post("/api/macos/autostart", _macos_autostart)
     app.router.add_get("/ws", _websocket)
@@ -368,7 +381,7 @@ async def _index(request: web.Request) -> web.StreamResponse:
     )
 
 
-async def _notification_feed(request: web.Request) -> web.Response:
+def _require_local(request: web.Request) -> None:
     # 不信任代理转发头；同时检查真实对端、Host 和 Origin，防止局域网访问和 DNS 重绑定。
     try:
         local = ipaddress.ip_address(request.remote or "").is_loopback
@@ -380,6 +393,86 @@ async def _notification_feed(request: web.Request) -> web.Response:
             or (origin and origin != f"{request.scheme}://{request.host}")
             or request.headers.get("Sec-Fetch-Site") == "cross-site"):
         raise web.HTTPForbidden()
+
+
+def _updates_enabled() -> bool:
+    return platforms.IS_MACOS and config.get_bool("UPDATE_CHECK_ENABLED")
+
+
+async def _dismiss_update(request: web.Request) -> web.Response:
+    _require_local(request)
+    data = await request.json()
+    if not isinstance(data, dict) or not isinstance(data.get("version"), str):
+        raise web.HTTPBadRequest()
+    request.app["updates"].dismiss(data["version"])
+    return web.json_response({"ok": True})
+
+
+async def _claim_update_notification(request: web.Request) -> web.Response:
+    _require_local(request)
+    data = await request.json()
+    if not isinstance(data, dict) or not isinstance(data.get("version"), str):
+        raise web.HTTPBadRequest()
+    busy = _line_busy(request.app)
+    claimed = _updates_enabled() and request.app["updates"].claim_notification(data["version"], busy=busy)
+    return web.json_response({"ok": claimed, "retry": busy})
+
+
+async def _check_update(request: web.Request) -> web.Response:
+    _require_local(request)
+    request.app["update_wake"].set()
+    return web.json_response({"ok": True})
+
+
+async def _prepare_update(request: web.Request) -> web.Response:
+    _require_local(request)
+    service = request.app.get("service")
+    reserve = getattr(service, "run_idle_hardware", None)
+    if not _macos_shell_available() or not callable(reserve):
+        raise web.HTTPNotFound()
+    existing = request.app.get("upgrade_lease")
+    if existing and not existing["task"].done():
+        raise web.HTTPConflict()
+    queue_status: dict = getattr(service, "dial_queue_status", lambda: {})()
+    if (queue_status.get("active") or queue_status.get("pending") or queue_status.get("current") is not None):
+        raise web.HTTPConflict()
+    loop = asyncio.get_running_loop()
+    ready: asyncio.Future[bool] = loop.create_future()
+    released = threading.Event()
+
+    def action():
+        loop.call_soon_threadsafe(ready.set_result, True)
+        # Existing maintenance gate excludes new incoming/outgoing calls atomically.
+        # If the shell crashes, the gate releases automatically rather than wedging the line.
+        released.wait(60)
+
+    async def hold():
+        try:
+            await asyncio.to_thread(reserve, action)
+        finally:
+            if not ready.done():
+                ready.set_result(False)
+
+    lease = {"token": secrets.token_urlsafe(24), "release": released, "task": asyncio.create_task(hold())}
+    request.app["upgrade_lease"] = lease
+    if not await ready:
+        raise web.HTTPConflict()
+    return web.json_response({"token": lease["token"]})
+
+
+async def _resume_update(request: web.Request) -> web.Response:
+    _require_local(request)
+    data = await request.json()
+    lease = request.app.get("upgrade_lease")
+    if not isinstance(data, dict) or not lease or data.get("token") != lease["token"]:
+        raise web.HTTPForbidden()
+    lease["release"].set()
+    await lease["task"]
+    return web.json_response({"ok": True})
+
+
+async def _notification_feed(request: web.Request) -> web.Response:
+    _require_local(request)
     try:
         after = int(request.query.get("after", "0"))
         if after < 0:
@@ -388,6 +481,9 @@ async def _notification_feed(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="after 必须为非负整数") from None
     from ..notification_events import feed
 
+    # First poll establishes WP5's cursor. Publish only after the tray knows this epoch.
+    if _updates_enabled() and request.query.get("epoch") == feed.read(after)["epoch"]:
+        request.app["updates"].notify(feed, busy=_line_busy(request.app))
     return web.json_response(feed.read(after), headers={"Cache-Control": "no-store"})
 
 
@@ -495,6 +591,12 @@ def _tray_usb_online(app: web.Application, source: str = "tray") -> bool | None:
 
 async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
+    meta["version"] = request.app["version"]
+    meta["release_notes"] = request.app["release_notes"]
+    meta["update"] = request.app["updates"].snapshot() if _updates_enabled() else None
+    meta["executable"] = sys.executable
+    meta["upgrade_guard"] = _macos_shell_available() and callable(
+        getattr(request.app.get("service"), "run_idle_hardware", None))
     if _macos_shell_available():
         from .. import macos_launchd
 
