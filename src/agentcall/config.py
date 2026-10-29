@@ -361,6 +361,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("MODEM_PCM_BAUD", "PCM 串口波特率", "int", "921600",
                requires_restart=True),
     ConfigSpec("MODEM_PCM_UPLINK_PREBUFFER", "PCM 开场上行预缓冲", "bool", "false"),
+    ConfigSpec("MODEM_LOG_RELEASE_CAUSE", "记录通话释放原因", "bool", "true"),
     ConfigSpec("MODEM_PCM_UPLINK_HOLD_MS", "SIM7600 先读后写实验等待毫秒", "int", "0"),
     ConfigSpec("MODEM_PCM_PIN_8K", "SIM7600 PCM 固定 8kHz", "bool",
                str(platforms.default_pcm_pin_8k()).lower(), editable=False, hidden=True),

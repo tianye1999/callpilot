@@ -493,4 +493,10 @@ def build_call_metrics(
     # 关闭埋点时不改变旧 metrics 结构；每轮缺失阶段保留缺失，不伪造零延迟。
     if local_turns or local_opening is not None:
         metrics["local_pipeline"] = {"turns": list(local_turns.values()), "opening": local_opening}
+    release_causes = [
+        {key: event[key] for key in ("raw", "source", "cause") if key in event}
+        for event in events if event.get("type") == "release_cause"
+    ]
+    if release_causes:
+        metrics["release_causes"] = release_causes
     return metrics

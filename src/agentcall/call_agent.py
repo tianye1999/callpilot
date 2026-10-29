@@ -543,6 +543,12 @@ class CallSession:
         session_t0 = time.monotonic()
         direction = "outbound" if self._outbound_number else "inbound"
         number = self._outbound_number or self.current_caller
+        release_report = (
+            self.modem.begin_release_capture()
+            if config.get_bool("MODEM_LOG_RELEASE_CAUSE") and isinstance(self.modem, SerialModem)
+            and not isinstance(self.modem, BluetoothModem)
+            else None
+        )
         record = self._begin_record(direction, number)
         self._record = record
         if self._wrap_up_carrier_sms_enabled and record is not None:
@@ -715,6 +721,13 @@ class CallSession:
             self._stop_triage_judge()
             self._end_takeover_context("CALL_ENDED")
             mark("ended", status=status)
+            if release_report is not None:
+                causes = await asyncio.to_thread(self.modem.complete_release_capture, release_report)
+                for cause in causes:
+                    if record is not None:
+                        record.log_event("release_cause", **cause)
+                    if status == "not_connected":
+                        logger.info("外呼未接通，通话释放原因: %s", cause["raw"])
             self._finalize_record(record, status, transcripts, direction, number)
             self._call_task = None
 

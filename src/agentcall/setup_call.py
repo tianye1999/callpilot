@@ -16,6 +16,8 @@ from . import config
 from .agents.factory import create_agent
 from .agents.local_agent import LocalPipelineAgent
 from .audio_bridge import AgentPcm, create_audio_bridge
+from .bluetooth_modem import BluetoothModem
+from .modem import SerialModem
 
 if TYPE_CHECKING:
     from .call_agent import CallSession
@@ -70,6 +72,12 @@ async def run_setup_call(session: CallSession) -> None:
     accepting_output = threading.Event()
     accepting_output.set()
     queued_bytes = 0
+    release_report = (
+        session.modem.begin_release_capture()
+        if config.get_bool("MODEM_LOG_RELEASE_CAUSE") and isinstance(session.modem, SerialModem)
+        and not isinstance(session.modem, BluetoothModem)
+        else None
+    )
     task = TEST_TASK + f"\n通话语言：{config.get_str('AGENT_LANGUAGE')}。"
 
     def deadline() -> None:
@@ -213,6 +221,11 @@ async def run_setup_call(session: CallSession) -> None:
                 logger.warning("向导自测音频桥清理失败")
             evidence.write_errors = getattr(bridge, "output_write_errors", 0)
         result = {"state": "done", "status": status, "number": session._outbound_number, **evidence.result()}
+        if release_report is not None:
+            causes = await asyncio.to_thread(session.modem.complete_release_capture, release_report)
+            if record is not None:
+                for cause in causes:
+                    record.log_event("release_cause", **cause)
         if record is not None:
             try:
                 record.log_event("setup_test", **result)

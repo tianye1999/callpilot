@@ -21,10 +21,13 @@ from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterable, Protocol
 from urllib.parse import urlparse
 
+from . import config
 from .audio_bridge import MODEM_RATE, create_audio_bridge
+from .bluetooth_modem import BluetoothModem
 from .call_log import CallLogger, CallRecord
 from .dial_guard import DialGuardFailure
 from .dtmf import dtmf_tone
+from .modem import SerialModem
 from .pcm_stats import PcmFlowStats
 
 logger = logging.getLogger(__name__)
@@ -535,6 +538,7 @@ class RemoteWebDialerCoordinator:
         finish_status = "failed"
         finish_reason = "edge_error"
         finish_code: str | None = None
+        release_report = None
         try:
             reserve_error = self._reserve_line(self)
             if reserve_error:
@@ -577,6 +581,9 @@ class RemoteWebDialerCoordinator:
             if record is not None:
                 record.log_event("remote_session", source=REMOTE_CALL_SOURCE)
 
+            if (config.get_bool("MODEM_LOG_RELEASE_CAUSE") and isinstance(self.modem, SerialModem)
+                    and not isinstance(self.modem, BluetoothModem)):
+                release_report = self.modem.begin_release_capture()
             self.modem.dial(number)
             await self._send_status("dialing")
             self._publish({"type": "remote_call", "status": "dialing"})
@@ -699,6 +706,11 @@ class RemoteWebDialerCoordinator:
                     self.modem.hangup()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("远程通话挂断模组失败: %s", type(exc).__name__)
+            if release_report is not None and isinstance(self.modem, SerialModem):
+                causes = await asyncio.to_thread(self.modem.complete_release_capture, release_report)
+                if record is not None:
+                    for cause in causes:
+                        record.log_event("release_cause", **cause)
             if record is not None:
                 try:
                     record.finish(finish_status)

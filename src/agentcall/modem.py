@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Queue
 from typing import Any, Callable
@@ -25,6 +26,24 @@ from .sim_identity import (
 )
 
 logger = logging.getLogger(__name__)
+
+CEND_PATTERN = re.compile(r"\+CEND:[^\r\n]*(?=\r?\n)")
+
+
+@dataclass
+class _ReleaseReport:
+    """每通独立的诊断快照，后台结果不能写入下一通。"""
+
+    causes: list[dict[str, str]] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    done: threading.Event = field(default_factory=threading.Event)
+    requested: bool = False
+    pending: bool = False
+    deferred: bool = False
+    started: bool = False
+    hung_up: bool = False
+    before_reset: bool = False
+    after_query: Callable[[], None] | None = None
 
 RING_PATTERN = re.compile(r"(?:^|\r\n)RING(?:\r\n|$)", re.MULTILINE)
 CLIP_PATTERN = re.compile(r'\+CLIP:\s*"([^"]+)"')
@@ -236,6 +255,7 @@ class SerialModem:
         # 防止 stop 与后台 supervisor 首连之间的"资源复活"竞态。
         self._closed = False
         self._serial_lock = threading.RLock()
+        self._release_report = _ReleaseReport()
         # 串口重连串行化：多线程（读循环/CLCC 轮询/发送）可能同时发现断连，
         # 所有获取都遵循 _serial_lock -> _reconnect_lock，禁止反向锁序。
         self._reconnect_lock = threading.Lock()
@@ -800,7 +820,12 @@ class SerialModem:
             self._poll_thread.join(timeout=2)
 
     def answer(self) -> None:
-        self._send("ATA")
+        if config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
+            with self._serial_lock:
+                self._start_release_call()
+                self._send("ATA")
+        else:
+            self._send("ATA")
         # 置「通话在线」：让来电同样受 CLCC 消失判定保护（串口死亡场景）。
         self._call_connected_event.set()
         logger.info("已发送 ATA 接听来电")
@@ -816,6 +841,8 @@ class SerialModem:
         with self._serial_lock:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("拨号期限已过，未发出 ATD")
+            if config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
+                self._start_release_call()
             self._call_connected_event.clear()
             self._connected_call_ids.clear()
             self._clcc_absent_count = 0
@@ -917,18 +944,163 @@ class SerialModem:
         return "ATH"
 
     def hangup(self) -> None:
+        report = self._release_report if config.get_bool("MODEM_LOG_RELEASE_CAUSE") else None
+        # 仅在已成功挂断且诊断进行中去重；查询后仍允许原有的挂断重试。
+        if report is not None and report.hung_up and report.requested and not report.done.is_set():
+            return
         # 挂断与关闭语音通道及状态清理须原子：否则 CLCC 轮询线程可能插进挂断与
         # 关闭语音通道之间，扰乱指令/响应配对。_pcm_ready_event.set() 只置位
         # 不等待，持锁调用无死锁风险。
         with self._serial_lock:
-            self._send(self._hangup_command())
+            response = self._send(self._hangup_command())
             self._disable_voice_channel()
             self._pcm_ready_event.set()
             self._call_connected_event.clear()
             self._connected_call_ids.clear()
             self._clcc_absent_count = 0
             self._clcc_fail_count = 0
+            if report is not None:
+                report.hung_up = "OK" in response.split()
         logger.info("已挂断并关闭语音 PCM 通道")
+        self._request_release_cause()
+
+    def begin_release_capture(self) -> _ReleaseReport:
+        """会话拥有物理收尾时，先固定本通快照，禁止 URC 抢先查询。"""
+        with self._serial_lock:
+            self._release_report = _ReleaseReport(deferred=True)
+            return self._release_report
+
+    def _start_release_call(self) -> None:
+        if not self._release_report.deferred or self._release_report.started:
+            self._release_report = _ReleaseReport()
+        self._release_report.started = True
+
+    def complete_release_capture(self, report: _ReleaseReport) -> list[dict[str, str]]:
+        """物理收尾完成后才允许查询；调用者持有本通句柄，不读取下一通状态。"""
+        with report.lock:
+            report.deferred = False
+        if not config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
+            if not report.requested:
+                self._run_release_callback(report)
+            return []
+        if report.pending:
+            self._request_release_cause(report)
+        return self.wait_release_causes(report)
+
+    def _capture_cend(self, text: str, report: _ReleaseReport | None = None) -> None:
+        if not config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
+            return
+        report = report or self._release_report
+        for match in CEND_PATTERN.finditer(text):
+            raw = match.group(0)
+            fields = raw.partition(":")[2].split(",")
+            if len(fields) < 4 or not fields[3].strip():
+                continue
+            cause = {"raw": raw, "source": "cend", "cause": fields[3].strip()}
+            with report.lock:
+                if cause in report.causes:
+                    continue
+                report.causes.append(cause)
+            logger.info("通话释放原因: %s", raw)
+
+    def _request_release_cause(self, report: _ReleaseReport | None = None) -> None:
+        if not config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
+            if report is not None and not report.requested:
+                report.done.set()
+                self._run_release_callback(report)
+            return
+        report = report or self._release_report
+        with report.lock:
+            report.pending = True
+            if report.requested or report.deferred:
+                return
+            report.requested = True
+        # 没有传输就没有可查询的释放报告，也不应延后原有重启回调。
+        if self._ser is None:
+            report.done.set()
+            self._run_release_callback(report)
+            return
+        deadline = time.monotonic() + 2.0
+        threading.Thread(
+            target=self._query_release_cause, args=(report, deadline),
+            name="modem-release-cause", daemon=True,
+        ).start()
+
+    def _query_release_cause(self, report: _ReleaseReport, deadline: float) -> None:
+        """复用 AT 事务锁；锁等待、写入与读取共享 2 秒预算，不重连、不重试。"""
+        acquired = False
+        response = ""
+        try:
+            acquired = self._serial_lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+            if (not acquired or report is not self._release_report or self._closed
+                    or not config.get_bool("MODEM_LOG_RELEASE_CAUSE")
+                    or (self.transport_paused and not report.before_reset)):
+                return
+            ser = self._ser
+            remaining = deadline - time.monotonic()
+            if ser is None or not ser.is_open or remaining <= 0:
+                return
+            # 查询期间缩短串口超时，避免单次空读或阻塞写突破总期限。
+            old_timeout = getattr(ser, "timeout", 0.2)
+            old_write_timeout = getattr(ser, "write_timeout", 2.0)
+            try:
+                ser.write_timeout = remaining
+                ser.write(b"AT+CEER\r")
+                chunks: list[str] = []
+                while (remaining := deadline - time.monotonic()) > 0:
+                    ser.timeout = min(0.05, remaining)
+                    raw = ser.read(ser.in_waiting or 1)
+                    if not raw:
+                        time.sleep(min(0.005, remaining))
+                        continue
+                    chunks.append(raw.decode("ascii", errors="replace"))
+                    response = "".join(chunks)
+                    if re.search(r"(?:^|\r?\n)(?:OK|ERROR|\+CME ERROR:[^\r\n]*)(?:\r?\n)", response):
+                        break
+                response = "".join(chunks)
+            finally:
+                ser.timeout, ser.write_timeout = old_timeout, old_write_timeout
+            if response:
+                self._capture_cend(response, report)
+                self._scan_pcm_flow(response)
+                with report.lock:
+                    report.causes.append({"raw": response, "source": "ceer"})
+                logger.info("通话释放原因: %s", response)
+            else:
+                logger.info("通话释放原因查询超时（AT+CEER 无返回）")
+        except (serial.SerialException, OSError, RuntimeError) as exc:
+            logger.warning("通话释放原因查询失败: %s", exc)
+        finally:
+            if acquired:
+                self._serial_lock.release()
+            report.done.set()
+            try:
+                # 短信 URC 可能继续做串口 IO，必须在诊断预算和完成信号之外处理。
+                sms_urcs = "\r\n".join(match.group(0) for match in CMTI_PATTERN.finditer(response))
+                if sms_urcs:
+                    self._process_response_urcs(sms_urcs, report)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("处理释放报告中的短信通知失败: %s", exc)
+            finally:
+                self._run_release_callback(report)
+
+    @staticmethod
+    def _run_release_callback(report: _ReleaseReport) -> None:
+        # 热关闭诊断、查询结束和记录收尾可能竞争；重启回调只能结算一次。
+        with report.lock:
+            callback, report.after_query = report.after_query, None
+        if callback is not None:
+            callback()
+
+    def wait_release_causes(self, report: _ReleaseReport | None = None) -> list[dict[str, str]]:
+        """仅供挂断后的记录收尾线程等待，不在读循环或挂断事务中调用。"""
+        if not config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
+            return []
+        report = report or self._release_report
+        if report.requested:
+            report.done.wait(2.0)
+        with report.lock:
+            return [cause.copy() for cause in report.causes]
 
     def close(self) -> None:
         self._closed = True  # 终态：阻止后续 start_listener/_reconnect 复活
@@ -1122,7 +1294,10 @@ class SerialModem:
         """厂商带内 PCM 上行流控 URC 解析钩子；基类默认无（无带内流控的模组不覆写，
         ``_pcm_ready_event`` 保持初始置位，``pcm_ready`` 恒为 True）。"""
 
-    def _process_response_urcs(self, text: str) -> None:
+    def _process_response_urcs(self, text: str, report: _ReleaseReport | None = None) -> None:
+        self._capture_cend(text, report)
+        if "NO CARRIER" in text or CEND_PATTERN.search(text):
+            self._request_release_cause(report)
         self._scan_pcm_flow(text)
         if self._processing_response_cmti:
             return
@@ -1155,6 +1330,9 @@ class SerialModem:
                 continue
 
             if RING_PATTERN.search(self._buffer):
+                if (config.get_bool("MODEM_LOG_RELEASE_CAUSE")
+                        and self._release_report.requested):
+                    self._release_report = _ReleaseReport()
                 logger.info("检测到来电 RING, 号码=%s", self._last_caller)
                 if self._on_ring:
                     self._on_ring(self._last_caller)
@@ -1162,15 +1340,24 @@ class SerialModem:
                 continue
 
             if "NO CARRIER" in self._buffer or "+CEND:" in self._buffer:
+                partial_cend = ""
+                if config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
+                    # 等完整 CEND 行，避免分片把最后的 cause 截掉。
+                    if "+CEND:" in self._buffer and not CEND_PATTERN.search(self._buffer):
+                        if "NO CARRIER" not in self._buffer:
+                            return
+                        partial_cend = self._buffer[self._buffer.index("+CEND:"):]
+                    self._capture_cend(self._buffer)
                 trigger = "NO CARRIER" if "NO CARRIER" in self._buffer else "+CEND:"
                 logger.info("通话已结束 (触发=%s)", trigger)
-                self._buffer = ""
+                self._buffer = partial_cend
                 # 通话结束即清来电号码：隐藏号码来电的 +CLIP 是空引号、匹配不到，
                 # 不清的话下一通会把**上一通**的号码当成本通来电（转告短信会把
                 # 错误的回拨号码写给机主，review finding #8）。None = 如实的未知。
                 self._last_caller = None
                 if self._on_hangup:
                     self._on_hangup()
+                self._request_release_cause()
                 return
 
             if len(self._buffer) > 4096:
@@ -1590,7 +1777,11 @@ class Sim7600Modem(SerialModem):
     def hangup(self) -> None:
         if self._on_post_call_reset is None:
             return super().hangup()
+        if (config.get_bool("MODEM_LOG_RELEASE_CAUSE") and self._release_report.hung_up
+                and self._release_report.requested and not self._release_report.done.is_set()):
+            return
         callback = None
+        query_report = None
         with self._serial_lock:
             if self._reset_in_progress:
                 return
@@ -1605,6 +1796,17 @@ class Sim7600Modem(SerialModem):
                     self._sim_refresh_generation += 1
                     self._sim_refresh_requested_generation = None
                 callback = self._on_post_call_reset
+                if config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
+                    self._release_report.before_reset = True
+                    if not self._release_report.done.is_set():
+                        self._release_report.after_query = callback
+                        callback = None
+                        # 已取得重启所有权，不再依赖上层资源清理成功才执行诊断和重启。
+                        query_report = self._release_report
+        if query_report is not None:
+            with query_report.lock:
+                query_report.deferred = False
+            self._request_release_cause(query_report)
         if callback is not None:
             callback()
 
