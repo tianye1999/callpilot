@@ -120,6 +120,26 @@ def test_disabled_opening_never_prepares(monkeypatch):
     agent.prepare_opening("开场")
 
 
+@pytest.mark.parametrize("reply, spoken", [("（等待）", []), ("您好（停顿）请讲。", ["您好请讲。"])])
+def test_prepared_opening_filters_stage_directions_but_keeps_original(monkeypatch, reply, spoken):
+    monkeypatch.setenv("LOCAL_FAST_OPENING", "true")
+    pipeline, requests, transcripts, audio = FakePipeline(), [], [], []
+    agent = LocalPipelineAgent(pipeline_factory=lambda: pipeline,
+                               llm_chat=lambda *a: requests.append(True) or {"content": reply})
+    agent.set_transcript_handler(lambda r, t: transcripts.append((r, t)))
+    agent.prepare_opening("开场")
+    asyncio.run(agent.start(audio.append))
+    try:
+        asyncio.run(agent.say("开场"))
+        assert pipeline.synthesized == spoken
+        assert bool(audio) == bool(spoken)
+        assert len(requests) == 1
+        assert agent._messages[-1]["content"] == reply
+        assert transcripts == [("agent", reply)]
+    finally:
+        asyncio.run(agent.stop())
+
+
 def test_inbound_configured_phrase_avoids_llm(monkeypatch):
     monkeypatch.setenv("LOCAL_FAST_OPENING", "true")
     monkeypatch.setenv("LOCAL_TTS_CACHE_PHRASES", "您好。")

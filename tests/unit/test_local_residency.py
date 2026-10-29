@@ -81,6 +81,22 @@ def test_agents_reuse_resident_models_but_not_vad(sherpa):
     assert len(sherpa.decoded) == 2
 
 
+def test_slow_filler_is_precached_once_across_calls(sherpa, monkeypatch):
+    monkeypatch.setenv("LOCAL_SLOW_REPLY_FILLER_SECONDS", "2.5")
+    monkeypatch.setenv("LOCAL_SLOW_REPLY_FILLER", "嗯，您稍等。")
+    for _ in range(2):
+        agent = local_agent.LocalPipelineAgent(llm_chat=lambda *a: {})
+        asyncio.run(agent.start(lambda _: None))
+        try:
+            assert agent._tts_cache["嗯，您稍等。"]
+        finally:
+            asyncio.run(agent.stop())
+    assert sherpa.generated.count(("嗯，您稍等。", 25)) == 1
+    monkeypatch.setenv("LOCAL_SLOW_REPLY_FILLER", "请稍候。")
+    local_agent._get_shared_models()
+    assert ("请稍候。", 25) in sherpa.generated
+
+
 def test_default_aishell3_downloads_missing_assets_and_uses_owner_speaker(
     sherpa, monkeypatch, product_latency_defaults,
 ):

@@ -23,12 +23,14 @@ def _explicit_legacy_latency_mode(monkeypatch):
     """
     for key in _SPEED_SWITCHES:
         monkeypatch.setenv(key, "false")
+    monkeypatch.setenv("LOCAL_SLOW_REPLY_FILLER_SECONDS", "0")
 
 
 @pytest.fixture
 def product_latency_defaults(monkeypatch, _explicit_legacy_latency_mode):
     """验证实际注册表默认值，而非测试隔离层的旧行为设置。"""
-    for key in (*_SPEED_SWITCHES, "LOCAL_TTS_MODEL", "LOCAL_TTS_SPEAKER_ID", "LOCAL_TURN_SILENCE"):
+    for key in (*_SPEED_SWITCHES, "LOCAL_TTS_MODEL", "LOCAL_TTS_SPEAKER_ID", "LOCAL_TURN_SILENCE",
+                "LOCAL_SLOW_REPLY_FILLER_SECONDS", "LOCAL_SLOW_REPLY_FILLER"):
         monkeypatch.delenv(key, raising=False)
 
 

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from test_local_agent import FakePipeline
 
 
 def load_bench():
@@ -65,6 +66,21 @@ def test_bench_rejects_empty_audio(tmp_path):
         wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
     with pytest.raises(ValueError, match="empty"):
         bench.read_wav(source)
+
+
+def test_opening_bench_reports_turn_without_assuming_opening_event_has_turn_id(tmp_path, monkeypatch, capsys):
+    bench = load_bench()
+    monkeypatch.setenv("LOCAL_FAST_OPENING", "true")
+    monkeypatch.setenv("LOCAL_LLM_PROVIDER", "dashscope")
+    monkeypatch.setattr(bench, "_SherpaPipeline", lambda **kw: FakePipeline())
+    monkeypatch.setattr(bench, "_default_llm_chat", lambda *a: {"content": "您好。"})
+    source, output = tmp_path / "in.wav", tmp_path / "out.wav"
+    with wave.open(str(source), "wb") as wav:
+        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        wav.writeframes(b"\1\0" * 1600)
+    rows = asyncio.run(bench.run_benchmark(source, output, "问候", "opening"))
+    assert "first_pcm_written" in dict(rows)
+    assert "turn=1 slow_filler=no filler_at=- first_audio=" in capsys.readouterr().out
 
 
 def test_segmented_bench_reuses_runtime_asr_and_reports_tail(tmp_path, monkeypatch):
@@ -190,11 +206,48 @@ def test_opening_cli_repeats_and_reports_median_and_range(monkeypatch, capsys):
     bench = load_bench()
     samples = iter([10.0, 30.0, 20.0])
 
-    async def run(source, output, instructions, scenario, barge_in):
+    async def run(source, output, instructions, scenario, barge_in, llm_delay_ms):
         assert scenario == "opening" and not barge_in
+        assert llm_delay_ms == 0
         return [("answered_to_first_audio", next(samples))]
 
     monkeypatch.setattr(bench, "run_benchmark", run)
     monkeypatch.setattr(bench, "load_dotenv", lambda *a: None)
     assert bench.main(["fake.wav", "--scenario", "opening", "--runs", "3"]) == 0
     assert "median=20.0 min=10.0 max=30.0" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("option", ["-1", "nan", "inf"])
+def test_bench_rejects_invalid_llm_delay(option):
+    with pytest.raises(SystemExit):
+        load_bench().main(["fake.wav", "--llm-delay-ms", option])
+
+
+def test_bench_cli_passes_llm_delay(monkeypatch, capsys):
+    bench = load_bench()
+
+    async def run(source, output, instructions, scenario, barge_in, llm_delay_ms):
+        assert llm_delay_ms == 4000
+        return []
+
+    monkeypatch.setattr(bench, "run_benchmark", run)
+    monkeypatch.setattr(bench, "load_dotenv", lambda *a: None)
+    assert bench.main(["fake.wav", "--llm-delay-ms", "4000"]) == 0
+    assert "llm_delay_ms=4000" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("signal", ["turn", "stop"])
+def test_bench_llm_delay_is_cancellable(signal):
+    bench = load_bench()
+    cancelled, stopped, done = threading.Event(), threading.Event(), threading.Event()
+
+    def wait():
+        with pytest.raises(InterruptedError):
+            bench.wait_llm_delay(4000, cancelled, stopped)
+        done.set()
+
+    worker = threading.Thread(target=wait)
+    worker.start()
+    (cancelled if signal == "turn" else stopped).set()
+    worker.join(1)
+    assert not worker.is_alive() and done.is_set()

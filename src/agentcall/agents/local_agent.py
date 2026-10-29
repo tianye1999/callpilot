@@ -39,7 +39,7 @@ from ..prompts import agent_language, repeat_nudge_instructions
 from ..repeat_suppression import RepeatSuppressor
 from .base import VoiceAgent
 from .local_llm import DeepSeekChat
-from .local_speech import ClauseSplitter, normalize_peak
+from .local_speech import ClauseSplitter, normalize_peak, speech_text
 from .tools import SILENT_AFTER_TOOLS, TERMINAL_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,13 @@ def _positive_seconds(key: str) -> float:
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError(f"{key} 必须是有限正数")
     return seconds
+
+
+def _cache_phrases() -> str:
+    phrases = config.get_str("LOCAL_TTS_CACHE_PHRASES").split("|")
+    if config.get_float("LOCAL_SLOW_REPLY_FILLER_SECONDS") > 0:
+        phrases.append(config.get_str("LOCAL_SLOW_REPLY_FILLER"))
+    return "|".join(dict.fromkeys(speech_text(phrase) for phrase in phrases))
 
 
 class SpeechPipeline(Protocol):
@@ -89,6 +96,8 @@ class _Turn:
     sequence: int = 0
     cancelled: threading.Event = field(default_factory=threading.Event)
     stages: set[str] = field(default_factory=set)
+    is_user: bool = True
+    reply_started: bool = False
 
 
 @dataclass
@@ -215,7 +224,7 @@ def _get_shared_models(on_progress: Callable[[str], None] | None = None) -> _Sha
     global _SHARED_MODELS
     key = (
         str(local_models.models_dir().resolve()), config.get_str("LOCAL_TTS_MODEL"),
-        config.get_int("LOCAL_TTS_SPEAKER_ID"), config.get_str("LOCAL_TTS_CACHE_PHRASES"),
+        config.get_int("LOCAL_TTS_SPEAKER_ID"), _cache_phrases(),
     )
     if on_progress is not None and (_SHARED_MODELS is None or _SHARED_MODELS[0] != key):
         on_progress("正在加载本地语音模型…")
@@ -393,6 +402,15 @@ class LocalPipelineAgent(VoiceAgent):
         self._deepseek = (DeepSeekChat() if llm_chat is None and llm_stream is None
                           and config.get_str("LOCAL_LLM_PROVIDER") == "deepseek" else None)
         self._streaming = config.get_bool("LOCAL_TTS_STREAMING")
+        self._slow_filler_seconds = config.get_float("LOCAL_SLOW_REPLY_FILLER_SECONDS")
+        if not math.isfinite(self._slow_filler_seconds) or self._slow_filler_seconds < 0:
+            raise ValueError("LOCAL_SLOW_REPLY_FILLER_SECONDS 必须是有限非负数")
+        self._slow_filler = (speech_text(config.get_str("LOCAL_SLOW_REPLY_FILLER"))
+                             if self._slow_filler_seconds else "")
+        self._waiting_batch: _SpeechBatch | None = None
+        self._last_slow_filler_at = float("-inf")
+        self._filler_stop = threading.Event()
+        self._filler_thread: threading.Thread | None = None
         self._segmented_asr = config.get_bool("LOCAL_ASR_SEGMENTED")
         turn_silence = config.get_float("LOCAL_TURN_SILENCE") if self._segmented_asr else 0.0
         if not math.isfinite(turn_silence):
@@ -613,11 +631,13 @@ class LocalPipelineAgent(VoiceAgent):
                 text = str(message.get("content") or "").strip()
             if not text or self._opening_cancelled.is_set():
                 return
+            spoken = speech_text(text)
             pipeline = self._pipeline or self._pipeline_factory()
             raw_peak = config.get_str("LOCAL_TTS_PEAK").strip()
-            pcm = normalize_peak(pipeline.synthesize(text), float(raw_peak) if raw_peak else None)
+            pcm = (normalize_peak(pipeline.synthesize(spoken), float(raw_peak) if raw_peak else None)
+                   if spoken else b"")
             with self._opening_lock:
-                if pcm and not self._opening_cancelled.is_set():
+                if (pcm or not spoken) and not self._opening_cancelled.is_set():
                     self._opening = (instructions, system, text, pcm)
             logger.info("[local_opening] prepared duration_ms=%.1f", (time.monotonic() - started) * 1000)
             self._opening_duration_ms = round((time.monotonic() - started) * 1000, 1)
@@ -651,7 +671,7 @@ class LocalPipelineAgent(VoiceAgent):
                 pipeline = self._pipeline_factory()
             if self._segmented_asr and not callable(getattr(pipeline, "is_speech_detected", None)):
                 raise ValueError("分段识别管线需要 is_speech_detected()")
-            for phrase in config.get_str("LOCAL_TTS_CACHE_PHRASES").split("|"):
+            for phrase in _cache_phrases().split("|"):
                 if phrase.strip() and phrase not in self._tts_cache:
                     self._tts_cache[phrase] = normalize_peak(pipeline.synthesize(phrase), self._peak)
             return pipeline
@@ -698,6 +718,9 @@ class LocalPipelineAgent(VoiceAgent):
         if self._streaming:
             self._tts_thread = threading.Thread(target=self._tts_worker, name="local-tts", daemon=True)
             self._tts_thread.start()
+        if self._slow_filler_seconds:
+            self._filler_thread = threading.Thread(target=self._filler_worker, name="local-slow-filler", daemon=True)
+            self._filler_thread.start()
         logger.info(
             "local 三段式 Agent 已启动（LLM=%s, TTS %dHz）",
             config.get_str("LOCAL_LLM_MODEL"),
@@ -725,8 +748,9 @@ class LocalPipelineAgent(VoiceAgent):
                                                {"role": "assistant", "content": text}])
                     self._emit_transcript("agent", text)
                     turn = self._new_turn(None)
-                    self._mark_latency(turn, "tts_first_audio")
-                    self._output_pcm(pcm, turn)
+                    if pcm:
+                        self._mark_latency(turn, "tts_first_audio")
+                        self._output_pcm(pcm, turn)
                     return
             self._brain_queue.put(_SayRequest(instructions))
 
@@ -758,6 +782,7 @@ class LocalPipelineAgent(VoiceAgent):
     async def stop(self) -> None:
         self._opening_cancelled.set()
         self._warm_stop.set()
+        self._filler_stop.set()
         self._cancel_speculation()
         with self._turn_lock:
             self._running = False
@@ -768,6 +793,9 @@ class LocalPipelineAgent(VoiceAgent):
         for thread in (self._vad_thread, self._asr_thread, self._brain_thread, self._tts_thread, self._warm_thread):
             if thread is not None:
                 await asyncio.to_thread(thread.join, 3)
+        if self._filler_thread is not None:
+            await asyncio.to_thread(self._filler_thread.join)
+            self._filler_thread = None
         self._vad_thread = None
         self._asr_thread = None
         self._brain_thread = None
@@ -797,12 +825,13 @@ class LocalPipelineAgent(VoiceAgent):
         assert pipeline is not None
         segments = pipeline.vad_flush() if flush else pipeline.vad_push(pcm)
         detector = getattr(pipeline, "is_speech_detected", None)
-        speaking = bool(detector()) if (self._streaming or self._segmented_asr) and detector else False
+        speaking = bool(detector()) if (self._streaming or self._segmented_asr
+                                       or self._slow_filler_seconds) and detector else False
         if self._speculative and speaking and not self._vad_speaking:
             with self._spec_lock:
                 self._speech_revision += 1
                 self._cancel_speculation()
-        if self._streaming and not self._vad_speaking and (speaking or segments):
+        if (self._streaming or self._slow_filler_seconds) and not self._vad_speaking and (speaking or segments):
             # Cancellation belongs to responses, never to unsubmitted ASR input.
             with self._turn_lock:
                 if self._on_user_interrupt is None or self._emit_user_interrupt():
@@ -958,7 +987,6 @@ class LocalPipelineAgent(VoiceAgent):
             for clause in batch.splitter.finish():
                 self._queue_clause(clause, batch)
         else:
-            self._mark_latency(turn, "first_clause_ready")
             self._speak(reply, batch)
 
     def _nudge_after_suppressed(self) -> None:
@@ -994,6 +1022,9 @@ class LocalPipelineAgent(VoiceAgent):
 
             with self._messages_lock:
                 messages = list(self._messages)
+            with self._turn_lock:
+                if _round == 0 and turn.is_user and self._slow_filler_seconds:
+                    self._waiting_batch = batch
             try:
                 speculative = self._consume_speculation(messages, turn, batch, on_content) if _round == 0 else None
                 if speculative is not None:
@@ -1022,6 +1053,10 @@ class LocalPipelineAgent(VoiceAgent):
                     logger.error("LLM 连续失败，标记会话不可恢复")
                     self.fatal = True
                 return None
+            finally:
+                with self._turn_lock:
+                    if self._waiting_batch is batch:
+                        self._waiting_batch = None
             if turn.cancelled.is_set() or not self._running:
                 self._discard_batch(batch)
                 return None
@@ -1078,7 +1113,7 @@ class LocalPipelineAgent(VoiceAgent):
             opening = ended_at is None
             if self._metrics and ended_at is None:
                 ended_at = time.monotonic()
-            self._turn = _Turn(ended_at, self._turn_sequence)
+            self._turn = _Turn(ended_at, self._turn_sequence, is_user=not opening)
             self._turns.add(self._turn)
             self._turn_event(type="local_turn", turn_id=self._turn.sequence, stage="endpoint",
                              at=ended_at, ms=0.0, kind="say" if opening else "user")
@@ -1112,6 +1147,8 @@ class LocalPipelineAgent(VoiceAgent):
 
     def _discard_batch(self, batch: _SpeechBatch) -> None:
         with self._turn_lock:
+            if self._waiting_batch is batch:
+                self._waiting_batch = None
             batch.cancelled.set()
             if batch.audio_emitted and not batch.turn.cancelled.is_set() and self._running:
                 self._emit_late_cut()
@@ -1120,6 +1157,7 @@ class LocalPipelineAgent(VoiceAgent):
         with self._turn_lock:
             if not self._running or batch.turn.cancelled.is_set() or batch.cancelled.is_set():
                 return
+            batch.turn.reply_started = True
             self._mark_latency(batch.turn, "first_clause_ready")
             self._tts_queue.put(_TtsRequest(text, batch))
 
@@ -1136,18 +1174,54 @@ class LocalPipelineAgent(VoiceAgent):
             finally:
                 self._tts_queue.task_done()
 
-    def _speak(self, text: str, batch: _SpeechBatch) -> None:
+    def _filler_worker(self) -> None:
+        # 每通仅一个计时 worker，避免上一轮不可取消的合成拖住兜底；停机时 join。
+        while not self._filler_stop.wait(0.02):
+            try:
+                self._maybe_slow_filler()
+            except Exception:  # noqa: BLE001 - 输出回调失败不能杀死后续轮次的兜底
+                logger.warning("[local_slow_filler] 输出失败", exc_info=True)
+
+    def _maybe_slow_filler(self) -> None:
+        # 与取消/正常分句共用锁，锁内只走已预合成的缓存输出。
+        with self._turn_lock:
+            batch = self._waiting_batch
+            if not self._slow_filler_seconds or batch is None:
+                return
+            turn = batch.turn
+            now = time.monotonic()
+            if (not self._running or turn.cancelled.is_set()
+                    or batch.cancelled.is_set() or turn.reply_started or turn.ended_at is None
+                    or now - turn.ended_at < self._slow_filler_seconds
+                    or now - self._last_slow_filler_at < 8.0
+                    or not self._tts_cache.get(self._slow_filler)):
+                return
+            # 这里只播放预合成 PCM，绝不在锁内运行模型，也不写 LLM 历史。
+            if self._speak(self._slow_filler, batch):
+                self._last_slow_filler_at = now
+                self._emit_transcript("agent", self._slow_filler)
+                self._mark_latency(turn, "slow_filler", at=now)
+                logger.info("[local_slow_filler] played turn=%d waited_ms=%.0f",
+                            turn.sequence, (now - turn.ended_at) * 1000)
+
+    def _speak(self, text: str, batch: _SpeechBatch) -> bool:
+        text = speech_text(text)
+        if not text:
+            return False
         pipeline = self._pipeline
         if (pipeline is None or self._on_audio_out is None or not self._running
                 or batch.cancelled.is_set() or batch.turn.cancelled.is_set()):
-            return
+            return False
+        with self._turn_lock:
+            batch.turn.reply_started = True
+            self._mark_latency(batch.turn, "first_clause_ready")
         try:
             pcm = self._tts_cache.get(text)
             if pcm is None:
                 pcm = normalize_peak(pipeline.synthesize(text), self._peak)
         except Exception as exc:  # noqa: BLE001
             logger.warning("TTS 合成失败: %s", exc)
-            return
+            return False
         # Generation may finish after stop / a new utterance. Check under the same
         # lock as cancellation so no stale output can cross the cancellation edge.
         with self._turn_lock:
@@ -1155,3 +1229,5 @@ class LocalPipelineAgent(VoiceAgent):
                 self._mark_latency(batch.turn, "tts_first_audio")
                 batch.audio_emitted = True
                 self._output_pcm(pcm, batch.turn)
+                return True
+        return False

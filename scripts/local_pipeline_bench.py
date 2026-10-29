@@ -18,6 +18,7 @@ import os
 import platform
 import statistics
 import sys
+import threading
 import time
 import wave
 from pathlib import Path
@@ -81,8 +82,36 @@ class TimedPipeline:
         return self._timed("tts_compute", self.pipeline.synthesize, text)
 
 
+def wait_llm_delay(delay_ms, cancelled, stopped):
+    """请求前注入慢网；轮次取消或停机均可立即结束等待。"""
+    deadline = time.monotonic() + delay_ms / 1000
+    while True:
+        if cancelled.is_set() or stopped.is_set():
+            raise InterruptedError("基准慢网等待已取消")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        cancelled.wait(min(0.02, remaining))
+
+
+class TimedDeepSeekChat(DeepSeekChat):
+    def __init__(self, rows, delay_ms):
+        super().__init__()
+        self.rows = rows
+        self.delay_ms = delay_ms
+
+    def chat(self, messages, tools, timeout, on_content, cancelled=None, on_tools=None):
+        start = time.monotonic()
+        try:
+            wait_llm_delay(self.delay_ms, cancelled or threading.Event(), self._closed)
+            return super().chat(messages, tools, timeout, on_content, cancelled, on_tools)
+        finally:
+            self.rows.append(("llm_total", (time.monotonic() - start) * 1000))
+
+
 async def run_benchmark(
     source: Path, output: Path, instructions: str, scenario: str = "turn", barge_in: bool = False,
+    llm_delay_ms: float = 0,
 ) -> list[tuple[str, float]]:
     if source.resolve() == output.resolve():
         raise ValueError("Output must not overwrite the input WAV")
@@ -92,13 +121,19 @@ async def run_benchmark(
         raise ValueError("; ".join(errors))
     rows: list[tuple[str, float]] = []
     chunks: list[bytes] = []
+    events: list[dict] = []
     opening_at: float | None = None
 
     def audio_out(pcm: bytes) -> None:
         if not chunks and opening_at is not None:
             rows.append(("answered_to_first_audio", (time.monotonic() - opening_at) * 1000))
         chunks.append(pcm)
-    client = DeepSeekChat() if config.get_str("LOCAL_LLM_PROVIDER") == "deepseek" else None
+        # 此处确认的是内存音频收集，不代表真实电话 PCM 写入。
+        if getattr(pcm, "on_written", None) is not None:
+            pcm.on_written()
+    client = (TimedDeepSeekChat(rows, llm_delay_ms)
+              if config.get_str("LOCAL_LLM_PROVIDER") == "deepseek" else None)
+    stopped = threading.Event()
 
     def build(**kwargs):
         return TimedPipeline(_SherpaPipeline(**kwargs), rows)
@@ -108,6 +143,8 @@ async def run_benchmark(
         try:
             if client is not None:
                 return client.chat(messages, tools, timeout, on_content)
+            turn = agent._turn
+            wait_llm_delay(llm_delay_ms, turn.cancelled if turn else stopped, stopped)
             return _default_llm_chat(messages, tools, timeout)
         finally:
             rows.append(("llm_total", (time.monotonic() - start) * 1000))
@@ -120,6 +157,8 @@ async def run_benchmark(
     # 无设备基准默认禁用打断；这不是 CallSession 半双工调度的端到端模拟。
     agent.set_user_interrupt_handler(lambda: barge_in)
     agent.set_latency_handler(lambda stage, ms: rows.append((stage, ms)))
+    agent._metrics = True
+    agent.set_turn_event_handler(events.append)
     agent.set_transcript_handler(lambda role, text: print(f"{role}: {text}"))
     start = time.monotonic()
     try:
@@ -185,8 +224,17 @@ async def run_benchmark(
             wav.setframerate(agent.output_rate)
             wav.writeframes(b"".join(chunks))
         rows.append(("total_without_startup", (time.monotonic() - ready_at) * 1000))
+        for turn_id in dict.fromkeys(event["turn_id"] for event in events if "turn_id" in event):
+            stages = {event["stage"]: event for event in events if event.get("turn_id") == turn_id}
+            filler = stages.get("slow_filler")
+            first = stages.get("first_pcm_written")
+            filler_at = f"{filler['ms']:.1f} ms" if filler else "-"
+            first_at = f"{first['ms']:.1f} ms" if first else "-"
+            print(f"turn={turn_id} slow_filler={'yes' if filler else 'no'} "
+                  f"filler_at={filler_at} first_audio={first_at}")
         return rows
     finally:
+        stopped.set()
         await agent.stop()
         if client is not None:
             client.close()
@@ -201,12 +249,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", choices=("turn", "opening"), default="turn")
     parser.add_argument("--speculative", action="store_true", help="Enable segmented speculative DeepSeek")
     parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--llm-delay-ms", type=float, default=0,
+                        help="Inject cancellable delay before each LLM request")
     parser.add_argument("--turn-silence", type=float, help="Override segmented endpoint silence for this process")
     parser.add_argument("--barge-in", action="store_true", help="Allow resumed VAD to cancel pending replies")
     parser.add_argument("--instructions", default="你是电话助理。请用简短、自然的中文回答对方。")
     args = parser.parse_args(argv)
     if args.runs < 1:
         parser.error("--runs must be positive")
+    if not math.isfinite(args.llm_delay_ms) or args.llm_delay_ms < 0:
+        parser.error("--llm-delay-ms must be finite and nonnegative")
     if args.turn_silence is not None:
         if not math.isfinite(args.turn_silence) or args.turn_silence <= 0:
             parser.error("--turn-silence must be finite and positive")
@@ -223,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     output = args.output or args.wav.with_name(args.wav.stem + ".local-reply.wav")
     print("Uses configured LLM API credits; no SIM, Edge or audio device is used.")
     print(f"Architecture={platform.machine()} scenario={args.scenario} runs={args.runs}")
+    print(f"llm_delay_ms={args.llm_delay_ms:g}")
     print(f"LLM={config.get_str('LOCAL_LLM_PROVIDER')}/{config.get_str('LOCAL_LLM_MODEL')} "
           f"TTS={config.get_str('LOCAL_TTS_MODEL')} streaming={config.get_bool('LOCAL_TTS_STREAMING')} "
           f"segmented={config.get_bool('LOCAL_ASR_SEGMENTED')}")
@@ -233,8 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         rows = []
         for _ in range(args.runs):
             arguments = (args.wav, output, args.instructions)
-            rows.extend(asyncio.run(run_benchmark(*arguments, args.scenario, args.barge_in))
-                        if args.scenario != "turn" or args.barge_in
+            rows.extend(asyncio.run(run_benchmark(*arguments, args.scenario, args.barge_in, args.llm_delay_ms))
+                        if args.scenario != "turn" or args.barge_in or args.llm_delay_ms
                         else asyncio.run(run_benchmark(*arguments)))
     except (ValueError, RuntimeError, OSError, wave.Error) as exc:
         print(f"FAILED: {exc}", file=sys.stderr)

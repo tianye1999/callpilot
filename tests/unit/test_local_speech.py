@@ -50,6 +50,21 @@ def test_finish_does_not_synthesize_punctuation_only_tail():
     assert splitter.finish() == []
 
 
+@pytest.mark.parametrize("parts, expected", [
+    (["（保", "持等待）"], ""),
+    (["(保", "持等待)"], ""),
+    (["好的（停顿）我帮您查"], "好的我帮您查"),
+    (["好的（等待，", "再等。" * 20, "）请讲。"], "好的请讲。"),
+    (["（外层(内层)继续）？！"], ""),
+    (["好的（未闭合"], "好的"),
+    (["！" * 40], ""),
+])
+def test_stage_directions_are_statefully_removed_before_splitting(parts, expected):
+    splitter = ClauseSplitter()
+    clauses = [clause for part in parts for clause in splitter.feed(part)]
+    assert "".join(clauses + splitter.finish()) == expected
+
+
 @pytest.mark.parametrize("text", [
     "余额为84.31元", "现在时间21:26", "余额为1,000元",
     "余额为８４．３１元", "现在时间２１：２６", "共19元。",

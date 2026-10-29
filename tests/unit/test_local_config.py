@@ -20,6 +20,8 @@ from agentcall import config
     ("LOCAL_TTS_SPEAKER_ID", "25"),
     ("LOCAL_TTS_STREAMING", "true"),
     ("LOCAL_TTS_CACHE_PHRASES", ""),
+    ("LOCAL_SLOW_REPLY_FILLER_SECONDS", "2.5"),
+    ("LOCAL_SLOW_REPLY_FILLER", "嗯，您稍等。"),
     ("LOCAL_TTS_PEAK", ""),
     ("LOCAL_FAST_OPENING", "true"),
     ("LOCAL_INBOUND_GREETING", ""),
@@ -35,6 +37,9 @@ def test_local_config_defaults_and_env_sync(monkeypatch, key, default):
     assert config.get_str(key) == default
     example = dotenv_values(Path(__file__).resolve().parents[2] / ".env.example")
     assert example[key] == default
+    if key.startswith("LOCAL_SLOW_REPLY_FILLER"):
+        linux = dotenv_values(Path(__file__).resolve().parents[2] / "scripts/linux/.env.example")
+        assert linux[key] == default
 
 
 @pytest.mark.parametrize("key", [

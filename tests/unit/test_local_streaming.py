@@ -11,6 +11,37 @@ from agentcall.agents.local_agent import LocalPipelineAgent
 from agentcall.agents.tools import HANGUP_SPEC, SEND_DTMF_SPEC, SEND_SMS_SPEC, ToolRegistry
 
 
+@pytest.mark.parametrize("streaming", ["true", "false"])
+@pytest.mark.parametrize("parts, spoken", [
+    (["（保", "持等待）"], []),
+    (["(保", "持等待)"], []),
+    (["好的（停顿）我帮您查"], ["好的我帮您查"]),
+    (["（等待菜单）？！"], []),
+])
+def test_stage_directions_only_change_tts_not_history_or_transcript(monkeypatch, caplog, streaming, parts, spoken):
+    monkeypatch.setenv("LOCAL_TTS_STREAMING", streaming)
+    pipeline, transcripts = FakePipeline(), []
+
+    def stream(messages, tools, timeout, on_content):
+        for part in parts:
+            on_content(part)
+        return {"role": "assistant", "content": "".join(parts)}
+
+    agent = LocalPipelineAgent(pipeline_factory=lambda: pipeline, llm_stream=stream)
+    agent.set_transcript_handler(lambda r, t: transcripts.append((r, t)))
+    with caplog.at_level("INFO"):
+        asyncio.run(agent.start(lambda _: None))
+        try:
+            agent._handle_user_text("测试", agent._new_turn(0.0))
+            agent._tts_queue.join()
+            assert pipeline.synthesized == spoken
+            assert agent._messages[-1]["content"] == "".join(parts)
+            assert transcripts[-1] == ("agent", "".join(parts))
+            assert "[local_stage_direction] suppressed text=" in caplog.text
+        finally:
+            asyncio.run(agent.stop())
+
+
 def test_first_audio_precedes_llm_end_and_transcript_is_whole(monkeypatch):
     monkeypatch.setenv("LOCAL_TTS_STREAMING", "true")
     first_audio, finish_llm = threading.Event(), threading.Event()
