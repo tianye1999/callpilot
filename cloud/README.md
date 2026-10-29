@@ -98,6 +98,84 @@ Turning the flag off stops new registration and delivery. Authenticated token
 removal, device unpairing, and Edge-side device revocation still delete stored
 tokens while delivery is disabled.
 
+## Physical-SIM app releases
+
+`GET /v1/releases/latest?product=physical-sim&platform=macos` is public and
+read-only. It does not read identity headers, authenticate a device, or write
+audit/content records. There is no release write endpoint.
+
+Both parameters are required, must occur exactly once, and accept 1-64 lowercase
+ASCII letters/digits with single internal hyphens (for example `physical-sim`
+and `macos`). Unknown parameters are rejected. Valid combinations without a row
+return 404. A successful response is:
+
+```json
+{
+  "product": "physical-sim",
+  "platform": "macos",
+  "version": "26.10.1",
+  "publishedAt": 1793232000000,
+  "notes": { "zh": "REPLACE_WITH_ZH_NOTES", "en": "REPLACE_WITH_EN_NOTES" },
+  "downloadUrl": "https://downloads.example.com/REPLACE_WITH_ARTIFACT.dmg"
+}
+```
+
+The latest row is selected by `published_at` (epoch milliseconds), not semantic
+version order; equal timestamps use descending lexical `version` order as a
+stable tie-breaker. Insert only published releases, not scheduled future rows.
+Successful responses include `Cache-Control: public, max-age=300`. Errors retain
+`Cache-Control: no-store` and the existing
+`{"error":{"code":"...","message":"...","requestId":"req_..."}}` shape:
+400 `VALIDATION_ERROR`, 404 `NOT_FOUND`, 405 `METHOD_NOT_ALLOWED` with `Allow: GET`,
+or 500 `INTERNAL_ERROR` for storage failures or an invalid stored download URL.
+Only HTTPS download URLs are returned. The migration rejects non-`https://`
+prefixes; the reader additionally validates the full URL and fails closed.
+
+### Owner-operated deployment
+
+This is the shared US-line Worker, not a separate Physical-SIM backend. The
+following are future operator steps, not part of local verification. The owner
+must authorize deployment and log in with `npx wrangler login` if required.
+
+1. From `cloud/`, run `npx wrangler deployments list` **before migrations or
+   deployment**. Record the active deployment/version IDs and match them to the
+   source commit in the deployment record. Confirm the local candidate is that
+   deployed source plus only the approved release API changes. A deployment list
+   alone does not prove source equality: stop if the commit mapping is missing,
+   there is unexplained drift, or unrelated local cloud changes would be shipped.
+   Preserve the previous version ID for rollback.
+2. Run `npm run check` and `npx wrangler deploy --dry-run`. Inspect
+   `npx wrangler d1 migrations list callpilot-cloud-beta --remote`; confirm
+   migrations 0001-0008 are already applied and only the reviewed 0009 is pending.
+   Stop on unexpected pending migrations. Apply the additive table/index first:
+   `npx wrangler d1 migrations apply callpilot-cloud-beta --remote`.
+3. Run `npx wrangler deploy` only after migration success. Verify the deployment
+   ID, `/healthz`, the new endpoint (404 is expected before seeding), and the
+   existing US-line enrollment/pairing/call flow using its approved acceptance
+   procedure. Local tests do not replace that production acceptance gate.
+4. Insert the approved release row using the example below, then GET the exact
+   product/platform combination and check every field and the cache header.
+
+Maintainers write release data directly to D1. Replace every `REPLACE_WITH_*`
+value; timestamps must be unquoted epoch-millisecond integers. Use an approved,
+public HTTPS artifact URL without credentials or expiring access tokens. Notes
+are public, must not contain personal data, and must be SQL-escaped (a single
+quote becomes two single quotes); also quote shell metacharacters safely. Do not
+paste untrusted notes directly into a shell command.
+
+```bash
+npx wrangler d1 execute callpilot-cloud-beta --remote --command "INSERT INTO app_releases (product, platform, version, published_at, notes_zh, notes_en, download_url, created_at) VALUES ('physical-sim', 'macos', 'REPLACE_WITH_VERSION', REPLACE_WITH_PUBLISHED_AT_MS, 'REPLACE_WITH_ZH_NOTES', 'REPLACE_WITH_EN_NOTES', 'https://downloads.example.com/REPLACE_WITH_ARTIFACT.dmg', REPLACE_WITH_CREATED_AT_MS)"
+```
+
+The `(product, platform, version)` primary key rejects duplicate versions; this
+example deliberately does not overwrite an existing row. A corrected/new row
+can take up to 300 seconds to appear to clients with cached responses. HTTPS is
+not an artifact authenticity check: the maintainer must verify the host, file,
+and signing before publishing. If the shared Worker regresses, the owner should
+roll back to the recorded previous Worker version using the normal deployment
+procedure; leave the additive `app_releases` table in place. No existing tables,
+credentials, feature flags, routes, or observability settings need changing.
+
 ## Rollback
 
 The hosted mode is independently gated by `REMOTE_CLOUD_ENABLED=false`. Turning

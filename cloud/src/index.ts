@@ -31,7 +31,9 @@ import {
   createCallSchema,
   createEnrollmentInviteSchema,
   createPairingSchema,
-  registerVoipTokenSchema
+  latestReleaseSchema,
+  registerVoipTokenSchema,
+  releaseDownloadUrlSchema
 } from "./schemas";
 import { constantTimeEqual, randomId, randomPairingCode, randomSecret, sha256 } from "./security";
 import type { CallRecord, DeviceRecord, Env, InboundOfferRecord } from "./types";
@@ -71,6 +73,12 @@ async function route(request: Request, env: Env, requestId: string): Promise<Res
   const path = url.pathname.replace(/\/$/, "") || "/";
 
   if (path === "/healthz" && request.method === "GET") return json({ ok: true });
+  if (path === "/v1/releases/latest") {
+    if (request.method !== "GET") {
+      throw new HttpError("METHOD_NOT_ALLOWED", "Only GET is allowed", 405, { Allow: "GET" });
+    }
+    return getLatestRelease(url, env);
+  }
   if (path === "/v1/admin/enrollment-invites" && request.method === "POST") {
     return createEnrollmentInvite(request, env);
   }
@@ -134,6 +142,39 @@ async function route(request: Request, env: Env, requestId: string): Promise<Res
     return error("NOT_FOUND", "Resource not found", 404, requestId);
   }
   return secureAsset(await env.ASSETS.fetch(request), env);
+}
+
+async function getLatestRelease(url: URL, env: Env): Promise<Response> {
+  for (const key of url.searchParams.keys()) {
+    if (url.searchParams.getAll(key).length !== 1) {
+      throw new HttpError("VALIDATION_ERROR", "Request fields are invalid", 400);
+    }
+  }
+  const input = latestReleaseSchema.parse(Object.fromEntries(url.searchParams));
+  const release = await env.DB.prepare(
+    "SELECT product, platform, version, published_at, notes_zh, notes_en, download_url FROM app_releases WHERE product = ?1 AND platform = ?2 ORDER BY published_at DESC, version DESC LIMIT 1"
+  ).bind(input.product, input.platform).first<{
+    product: string;
+    platform: string;
+    version: string;
+    published_at: number;
+    notes_zh: string;
+    notes_en: string;
+    download_url: string;
+  }>();
+  if (!release) throw new HttpError("NOT_FOUND", "Release not found", 404);
+  // Maintainers write rows directly; never expose a malformed download URL.
+  if (!releaseDownloadUrlSchema.safeParse(release.download_url).success) {
+    throw new HttpError("INTERNAL_ERROR", "The request could not be completed", 500);
+  }
+  return json({
+    product: release.product,
+    platform: release.platform,
+    version: release.version,
+    publishedAt: release.published_at,
+    notes: { zh: release.notes_zh, en: release.notes_en },
+    downloadUrl: release.download_url
+  }, 200, { "Cache-Control": "public, max-age=300" });
 }
 
 async function createEnrollmentInvite(request: Request, env: Env): Promise<Response> {

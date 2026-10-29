@@ -4,6 +4,15 @@ import { dataResponseSchema } from "./content-sync";
 
 const opaqueId = z.string().regex(/^[a-z]+_[A-Za-z0-9_-]{12,80}$/);
 
+const releaseIdentifier = z.string().min(1).max(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+
+export const latestReleaseSchema = z.object({
+  product: releaseIdentifier,
+  platform: releaseIdentifier
+}).strict();
+
+export const releaseDownloadUrlSchema = z.url({ protocol: /^https$/ });
+
 export const createEnrollmentInviteSchema = z.object({
   ttlSeconds: z.number().int().min(60).max(86400).default(3600)
 }).strict();

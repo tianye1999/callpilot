@@ -35,11 +35,47 @@ const migration = spawnSync(
 );
 if (migration.status !== 0) throw new Error(migration.stderr || migration.stdout);
 
+// Seed and check constraints before opening HTTP connections: spawnSync blocks
+// socket-close processing and can leave fetch with stale keep-alive connections.
+// Use a unique product so repeated local runs do not overwrite release data.
+const releaseProduct = `physical-sim-integration-${process.pid}-${Date.now()}`;
+d1Rows(`INSERT INTO app_releases
+  (product, platform, version, published_at, notes_zh, notes_en, download_url, created_at) VALUES
+  ('${releaseProduct}', 'macos', '9.0.0', 1000, 'Older zh', 'Older en', 'https://example.test/old.dmg', 1000),
+  ('${releaseProduct}', 'macos', '0.9.0', 2000, 'Tied zh', 'Tied en', 'https://example.test/tied.dmg', 2000),
+  ('${releaseProduct}', 'macos', '1.0.0', 2000, 'Latest zh', 'Latest en', 'https://example.test/latest.dmg', 2000),
+  ('${releaseProduct}', 'windows', '2.0.0', 3000, '', '', 'https://example.test/app.exe', 3000),
+  ('${releaseProduct}-other', 'macos', '3.0.0', 4000, '', '', 'https://example.test/other.dmg', 4000)`);
+assert.throws(() => d1Rows(`INSERT INTO app_releases
+  (product, platform, version, published_at, notes_zh, notes_en, download_url, created_at)
+  VALUES ('${releaseProduct}', 'macos', '1.0.0', 5000, '', '', 'https://example.test/duplicate.dmg', 5000)`),
+/UNIQUE constraint failed/);
+assert.throws(() => d1Rows(`INSERT INTO app_releases
+  (product, platform, version, published_at, notes_zh, notes_en, download_url, created_at)
+  VALUES ('${releaseProduct}', 'macos', 'insecure', 5000, '', '', 'http://example.test/app.dmg', 5000)`),
+/CHECK constraint failed/);
+
 let workerOutput = "";
 let worker = startWorker(false);
 
 try {
   await waitForHealth();
+
+  const releasePath = `/v1/releases/latest?product=${releaseProduct}&platform=macos`;
+  const missingRelease = await fetch(`${base}/v1/releases/latest?product=${releaseProduct}-missing&platform=macos`);
+  assert.equal(missingRelease.status, 404);
+  assert.equal((await missingRelease.json()).error.code, "NOT_FOUND");
+  const latestRelease = await fetch(base + releasePath);
+  assert.equal(latestRelease.status, 200);
+  assert.equal(latestRelease.headers.get("cache-control"), "public, max-age=300");
+  assert.deepEqual(await latestRelease.json(), {
+    product: releaseProduct,
+    platform: "macos",
+    version: "1.0.0",
+    publishedAt: 2000,
+    notes: { zh: "Latest zh", en: "Latest en" },
+    downloadUrl: "https://example.test/latest.dmg"
+  });
 
   const pageResponse = await fetch(`${base}/`);
   assert.equal(pageResponse.status, 200);
