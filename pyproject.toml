@@ -21,6 +21,7 @@ dependencies = [
     "cryptography>=43,<50",
     "rumps>=0.4.0; sys_platform == 'darwin'",
     "pyobjc-framework-UserNotifications>=10; sys_platform == 'darwin'",
+    "pyobjc-framework-ServiceManagement>=10; sys_platform == 'darwin'",
 ]
 
 [project.urls]

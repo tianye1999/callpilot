@@ -12,7 +12,7 @@ from agentcall import macos_upgrade as upgrade
 
 @pytest.fixture(autouse=True)
 def fake_locks(monkeypatch):
-    monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace(flock=lambda *args: None, LOCK_EX=1))
+    monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace(flock=lambda *args: None, LOCK_EX=1, LOCK_NB=2))
     monkeypatch.setattr(upgrade, "_bridge_running", lambda pid: True)
 
 
@@ -43,6 +43,46 @@ def test_version_mismatch_restarts_pair_after_call_and_queue_end(tmp_path):
                       sleep=waits.append)
     assert waits == [1, 1]
     assert installs[0]["force_restart_labels"] == {launchd.APP_LABEL, launchd.BRIDGE_LABEL}
+
+
+def test_sm_login_bootstrapped_idle_jobs_do_not_block_reconcile(monkeypatch, tmp_path):
+    from agentcall import macos_service_management as sm
+
+    layout = layout_at(tmp_path)
+    monkeypatch.setattr(sm, "uses_service_management", lambda _: True)
+    monkeypatch.setattr(sm, "agent_running", lambda *args: False)
+    installs = []
+    upgrade.reconcile(layout, lambda: {}, install=lambda *a, **kw: installs.append(kw),
+                      sleep=lambda _: pytest.fail("Dormant registered jobs must not block login"))
+    assert installs[0]["force_restart_labels"] == {launchd.APP_LABEL, launchd.BRIDGE_LABEL}
+
+
+def test_background_recovery_defers_busy_without_leaving_install_thread_waiting(tmp_path):
+    result = upgrade.reconcile(layout_at(tmp_path), lambda: {"call_active": True}, wait_when_busy=False,
+                               install=lambda *a, **kw: pytest.fail("busy must not install"),
+                               sleep=lambda _: pytest.fail("background poll must return, not wait"))
+    assert result.changed == [] and result.failures == []
+
+
+def test_background_recovery_defers_lease_race(tmp_path):
+    def install(*args, **kwargs):
+        kwargs["before_restart"]()
+        pytest.fail("lease was not granted")
+    result = upgrade.reconcile(layout_at(tmp_path), lambda: {"call_active": False, "upgrade_guard": True},
+                               wait_when_busy=False, acquire=lambda: None, install=install,
+                               sleep=lambda _: pytest.fail("lease contention must return to tray"))
+    assert result.changed == [] and result.failures == []
+
+
+def test_background_recovery_does_not_wait_for_another_upgrade(monkeypatch, tmp_path):
+    def busy_lock(fd, flags):
+        assert flags == 3
+        raise BlockingIOError()
+
+    monkeypatch.setattr(sys.modules["fcntl"], "flock", busy_lock)
+    result = upgrade.reconcile(layout_at(tmp_path), lambda: pytest.fail("must not inspect during other upgrade"),
+                               wait_when_busy=False)
+    assert result.changed == [] and result.failures == []
 
 
 def test_matching_runtime_does_not_restart(tmp_path):

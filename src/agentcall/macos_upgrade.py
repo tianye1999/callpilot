@@ -67,6 +67,10 @@ def _needs_restart(layout: launchd.LaunchdLayout, meta: dict) -> bool:
         return True
     if not bridge_current(layout):
         return True
+    from . import macos_service_management as sm
+
+    if sm.uses_service_management(layout):
+        return any(list(sm.legacy_paths(layout, label)) for label in SERVICE_LABELS)
     directory = (layout.launch_agents_dir if launchd.autostart_enabled(layout)
                  else layout.support_dir / "LaunchAgents")
     return any(launchd.plist_needs_update(directory / f"{label}.plist", data)
@@ -92,19 +96,29 @@ def acquire_lease(url: str):
 
 
 def reconcile(layout, fetch_meta, *, user_initiated=False, install=None, loaded=None,
-              sleep=time.sleep, acquire=None):
+              sleep=time.sleep, acquire=None, wait_when_busy=True):
     import fcntl
 
+    from . import macos_service_management as sm
+
     install = install or launchd.install_launch_agents
-    loaded = loaded or launchd.agent_loaded
+    loaded = loaded or (sm.agent_running if sm.uses_service_management(layout) else launchd.agent_loaded)
     layout.support_dir.mkdir(parents=True, exist_ok=True)
     # Double-clicks and an existing tray can both reconcile; only one may replace services.
     with (layout.support_dir / "upgrade.lock").open("a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            flags = fcntl.LOCK_EX if wait_when_busy else fcntl.LOCK_EX | fcntl.LOCK_NB
+            fcntl.flock(lock.fileno(), flags)
+        except BlockingIOError:
+            return launchd.LaunchdInstallResult([], [], [])
         while True:
+            if getattr(sys, "frozen", False) and not layout.executable.is_file():
+                raise RuntimeError("CallPilot bundle was removed; refusing to restart services")
             meta = fetch_meta()
             if (meta and (meta.get("call_active") is not False or meta.get("dial_queue_busy"))
                     or not meta and loaded(launchd.APP_LABEL, layout)):
+                if not wait_when_busy:
+                    return launchd.LaunchdInstallResult([], [], [])
                 sleep(1)
                 continue
             restart = SERVICE_LABELS if _needs_restart(layout, meta) else set()
@@ -133,6 +147,8 @@ def reconcile(layout, fetch_meta, *, user_initiated=False, install=None, loaded=
                                force_restart_labels=restart, user_initiated=user_initiated,
                                before_restart=before_restart, verify_bridge=verify_bridge)
             except UpgradeBusy:
+                if not wait_when_busy:
+                    return launchd.LaunchdInstallResult([], [], [])
                 sleep(1)
             finally:
                 if release is not None:

@@ -7,6 +7,7 @@
 """
 
 import os
+import plistlib
 import sys
 import tomllib
 from pathlib import Path
@@ -99,8 +100,9 @@ if libusb_path:
 # pywebview 的平台后端不同，按平台收集对应运行时
 if IS_MACOS:
     # mac 后端 = cocoa（pyobjc 系列）+ rumps 菜单栏
-    hiddenimports += ["webview.platforms.cocoa", "objc", "Foundation", "AppKit", "WebKit", "rumps", "UserNotifications"]
-    gui_packages = ("webview", "objc", "Foundation", "AppKit", "WebKit", "rumps", "UserNotifications")
+    hiddenimports += ["webview.platforms.cocoa", "objc", "Foundation", "AppKit", "WebKit", "rumps", "UserNotifications",
+                      "ServiceManagement"]
+    gui_packages = ("webview", "objc", "Foundation", "AppKit", "WebKit", "rumps", "UserNotifications", "ServiceManagement")
 elif IS_WINDOWS:
     # Windows 后端 = WinForms + EdgeChromium(WebView2)，经 pythonnet 的 clr 加载；
     # pythonnet/clr 的打包细节由 pyinstaller-hooks-contrib 兜底。【待硬件验证】
@@ -153,9 +155,18 @@ if IS_MACOS:
         info_plist={
             "CFBundleDisplayName": "CallPilot",
             "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
+            "LSMinimumSystemVersion": "13.0",
             "NSMicrophoneUsageDescription": "CallPilot 需要采集通话对方的语音，供 AI 实时应答。",
             "NSHighResolutionCapable": True,
             # 菜单栏保持 accessory；--window 运行时切换 regular，关窗后 Dock 图标消失。
             "LSUIElement": True,
         },
     )
+    # Install before signing; never mutate these plists at runtime.
+    from agentcall.macos_service_management import bundled_plists
+
+    agent_dir = Path(app.name) / "Contents" / "Library" / "LaunchAgents"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    for label, data in bundled_plists().items():
+        (agent_dir / f"{label}.plist").write_bytes(plistlib.dumps(data, sort_keys=True))

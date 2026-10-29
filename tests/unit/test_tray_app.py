@@ -396,7 +396,7 @@ def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, bundled_tr
     assert len(ticks) == 6
     assert app.icon_updates == ["transient", "ready"]
     assert app._status_item.titles == [tray_app.status_label(False), "正在启动…", "可以接打电话"]
-    assert [item.title for item in app.menu][2:] == ["打开 CallPilot", "卸载常驻", "退出 CallPilot"]
+    assert [item.title for item in app.menu][2:] == ["打开 CallPilot", "退出 CallPilot"]
     assert app.menu[0].callback is None and app.menu[1].callback is None
 
     now[0] = 1.0
@@ -420,7 +420,7 @@ def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, bundled_tr
     app._meta = {**meta, "call_active": True, "call": {"number_suffix": "1234", "started_at": 100}}
     monkeypatch.setattr(tray_app.time, "time", lambda: 183)
     app._render_status()
-    assert [item.title for item in app.menu][2:] == ["挂断", "旁听", "打开 CallPilot", "卸载常驻", "退出 CallPilot"]
+    assert [item.title for item in app.menu][2:] == ["挂断", "旁听", "打开 CallPilot", "退出 CallPilot"]
     assert app._status_item.title == "通话中 · 尾号 1234 · 01:23"
     monkeypatch.setattr(tray_app.time, "time", lambda: 184)
     before = len(app.icon_updates)
@@ -874,12 +874,48 @@ def test_same_generation_reopen_does_not_replace_tray(monkeypatch, tmp_path):
     from agentcall import macos_launchd, macos_shell
     from agentcall.app_version import VERSION
 
-    (tmp_path / "tray-version.json").write_text(json.dumps({"version": VERSION, "executable": sys.executable}))
+    (tmp_path / "tray-version.json").write_text(json.dumps(
+        {"version": VERSION, "executable": sys.executable, "lifecycle": "smappservice-v1"}))
     monkeypatch.setattr(macos_launchd, "app_support_dir", lambda: tmp_path)
+    monkeypatch.setattr(macos_launchd, "make_layout", lambda _: macos_launchd.LaunchdLayout(
+        tmp_path / "CallPilot", tmp_path, tmp_path, tmp_path / "agents", 123))
     commands = []
     monkeypatch.setattr(macos_shell, "send_command", commands.append)
     assert tray_app._handoff_previous_tray() is None
     assert commands == ["open"]
+
+
+def test_same_version_wp6_tray_still_hands_off(monkeypatch, tmp_path):
+    import json
+
+    from agentcall import macos_launchd, macos_shell
+    from agentcall.app_version import VERSION
+
+    (tmp_path / "tray-version.json").write_text(json.dumps(
+        {"version": VERSION, "executable": sys.executable, "handoff": True}))
+    monkeypatch.setattr(macos_launchd, "app_support_dir", lambda: tmp_path)
+    commands, lock = [], object()
+    monkeypatch.setattr(macos_shell, "send_command", commands.append)
+    monkeypatch.setattr(tray_app, "_acquire_tray_singleton_lock", lambda: lock)
+    assert tray_app._handoff_previous_tray() is lock
+    assert commands == ["replace"]
+
+
+def test_uninstall_timeout_resume_wins_over_unconsumed_pause(monkeypatch, bundled_tray):
+    from agentcall import macos_shell
+
+    monkeypatch.setattr(macos_shell, "take_commands", lambda: {"pause", "resume"})
+    bundled_tray.app._requests(None)
+    assert bundled_tray.app._uninstall_pending is False
+
+
+def test_non_crash_exit_recovery_uses_guarded_reconciler(bundled_tray):
+    env = bundled_tray
+    env.now[0] = 31
+    env.app._requests(None)
+    assert env.app._install_thread is not None
+    env.app._install_thread.finish()
+    assert env.installs[-1] == {"user_initiated": False}
 
 
 def test_reopen_callback_forwards_to_same_open_action(monkeypatch):

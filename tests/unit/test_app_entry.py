@@ -158,6 +158,22 @@ def test_restart_after_cleanup_exits_for_launchd_managed_service(monkeypatch):
     assert calls == []
 
 
+def test_sm_configuration_restart_notifies_tray_instead_of_exec_new_bundle(monkeypatch, tmp_path):
+    from agentcall import macos_launchd, macos_service_management, macos_shell
+
+    layout = macos_launchd.make_layout(tmp_path / "CallPilot", uid=123, support_dir=tmp_path)
+    monkeypatch.setattr(macos_launchd, "make_layout", lambda _: layout)
+    monkeypatch.setattr(macos_service_management, "uses_service_management", lambda _: True)
+    monkeypatch.setattr(app.sys, "platform", "darwin")
+    monkeypatch.setenv("XPC_SERVICE_NAME", "com.agentcall.app")
+    monkeypatch.setattr(app.config, "_is_frozen", lambda: True)
+    calls = []
+    monkeypatch.setattr(macos_shell, "send_command", lambda *args: calls.append(args))
+    monkeypatch.setattr(app.os, "execv", lambda *args: pytest.fail("must not exec new code outside reconcile"))
+    app._restart_after_cleanup()
+    assert calls == [("retry", tmp_path)]
+
+
 def test_restart_after_cleanup_execs_manual_process_without_duplicate_argv0(monkeypatch):
     calls = []
     monkeypatch.setattr(app.sys, "platform", "darwin")

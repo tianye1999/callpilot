@@ -1201,6 +1201,10 @@
               </label>
             </div>
             <span id="macosAutostartStatus" role="status"></span>
+            <button class="btn ghost sm" id="macosLoginSettings" type="button" hidden
+                    data-i18n="macos_login_settings"></button>
+            <button class="btn danger sm" id="macosUninstall" type="button" hidden
+                    data-i18n="macos_uninstall"></button>
           </div>
           <div id="configForm"><div class="empty" data-i18n="cfg_loading"></div></div>
           <div class="cfg-save">
@@ -1600,6 +1604,8 @@ const I18N = {
       not_connected: "No answer", dtmf: "DTMF keys", transcript_user: "Caller said", transcript_agent: "AI said" },
     settings_title: "Settings", cfg_loading: "Loading…", cfg_save: "Save",
     macos_autostart: "Start CallPilot at login",
+    macos_login_settings: "Login Items…",
+    macos_uninstall: "Uninstall CallPilot…",
     restart_btn: "Restart service",
     restart_confirm_title: "Restart the service?",
     restart_confirm_msg: "The service will restart to reconnect the modem and apply settings. Any call in progress will end.",
@@ -1925,6 +1931,8 @@ const I18N = {
       not_connected: "未接通", dtmf: "发送按键", transcript_user: "对方说", transcript_agent: "分身说" },
     settings_title: "系统设置", cfg_loading: "正在加载配置…", cfg_save: "保存设置",
     macos_autostart: "登录时自动启动 CallPilot",
+    macos_login_settings: "登录项设置…",
+    macos_uninstall: "卸载 CallPilot…",
     restart_btn: "重启服务",
     restart_confirm_title: "重启服务？",
     restart_confirm_msg: "服务将重启以重连模组并应用设置，进行中的通话会中断。",
@@ -4177,7 +4185,16 @@ $("setupAllowNotifications").addEventListener("click", async () => {
   }
 });
 $("setupNotificationSettings").addEventListener("click", () => window.pywebview.api.open_notification_settings());
-window.addEventListener("pywebviewready", () => { if (setupStep === 5) void refreshSetupNotifications(); });
+window.addEventListener("pywebviewready", () => {
+  if (setupStep === 5) void refreshSetupNotifications();
+  $("macosUninstall").hidden = !window.pywebview?.api?.uninstall_callpilot;
+  $("macosLoginSettings").hidden = !window.pywebview?.api?.open_login_settings;
+});
+$("macosUninstall").addEventListener("click", async () => {
+  try { await window.pywebview.api.uninstall_callpilot(); }
+  catch (error) { setToast("configToast", "err", String(error)); }
+});
+$("macosLoginSettings").addEventListener("click", () => window.pywebview.api.open_login_settings());
 window.addEventListener("focus", () => { if (setupStep === 5) void refreshSetupNotifications(); });
 
 function renderSetupRecordingDetails() {

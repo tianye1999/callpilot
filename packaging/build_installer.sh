@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build standalone CallPilot.app and CallPilot.dmg for macOS.
+# Build standalone CallPilot.app and CallPilot-<version>.dmg for macOS.
 # Usage:
 #   Unsigned local package:
 #     ./packaging/build_installer.sh
@@ -14,8 +14,7 @@ DIST_DIR="$ROOT/dist"
 BUILD_DIR="$ROOT/build/pyinstaller"
 ARM_VENV="$ROOT/build/packaging-venv-arm64"
 APP_PATH="$DIST_DIR/CallPilot.app"
-DMG_PATH="$DIST_DIR/CallPilot.dmg"
-DMG_STAGE="$ROOT/build/dmg/CallPilot"
+DMG_STAGE="$ROOT/build/dmg"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 2; }
 info() { printf '[build_installer] %s\n' "$*" >&2; }
@@ -43,12 +42,12 @@ ensure_build_python() {
     fi
     # 含 sherpa_onnx 判定：local provider（三段式）要求它进包，否则打包版
     # AGENT_PROVIDER=local 会 ImportError（v0.5.0 发布缺陷的根因）。
-    if ! "$ARM_VENV/bin/python" -c "import PyInstaller, aiohttp, rumps, sherpa_onnx, UserNotifications" >/dev/null 2>&1; then
+    if ! "$ARM_VENV/bin/python" -c "import PyInstaller, aiohttp, rumps, sherpa_onnx, UserNotifications, ServiceManagement, dmgbuild" >/dev/null 2>&1; then
         info "installing packaging dependencies into arm64 venv（含 [local] 三段式依赖）"
         "$ARM_VENV/bin/python" -m pip install --upgrade pip >/dev/null
         # [local] 把 sherpa-onnx 装进打包 venv，供 PyInstaller 收进 bundle；
         # 默认模型由 spec 的 required_files 清单收包，缺失时构建失败。
-        "$ARM_VENV/bin/python" -m pip install -e "$ROOT[local]" pyinstaller >/dev/null
+        "$ARM_VENV/bin/python" -m pip install -e "$ROOT[local]" pyinstaller 'dmgbuild>=1.6,<2' >/dev/null
     fi
     printf '%s\n' "$ARM_VENV/bin/python"
 }
@@ -127,6 +126,7 @@ verify_artifacts() {
     fi
 
     if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+        xcrun stapler validate "$APP_PATH" || die "app staple validation failed"
         if ! xcrun stapler validate "$DMG_PATH"; then
             die "DMG staple validation failed: $DMG_PATH"
         fi
@@ -150,10 +150,18 @@ verify_artifacts() {
 }
 
 [[ "$(uname -s)" == "Darwin" ]] || die "macOS is required"
+[[ -z "${NOTARY_PROFILE:-}" || -n "${CODESIGN_IDENTITY:-}" ]] || die "NOTARY_PROFILE requires CODESIGN_IDENTITY"
+if [[ "${RELEASE:-0}" == "1" ]]; then
+    [[ -n "${CODESIGN_IDENTITY:-}" && -n "${NOTARY_PROFILE:-}" ]] || die "RELEASE=1 requires signing and notarization"
+fi
 PYTHON="$(ensure_build_python)"
 [[ -x "$PYTHON" ]] || die "Python not found: $PYTHON"
 [[ "$(python_arch "$PYTHON")" == "arm64" ]] || die "Python must be arm64 for this installer: $PYTHON ($(python_arch "$PYTHON"))"
 "$PYTHON" -c "import PyInstaller" 2>/dev/null || die "missing PyInstaller: $PYTHON -m pip install pyinstaller"
+"$PYTHON" -c "import ServiceManagement, dmgbuild" 2>/dev/null || die "install project dependencies and dmgbuild into $PYTHON"
+VERSION="$("$PYTHON" -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$ROOT/pyproject.toml")"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid package version"
+DMG_PATH="$DIST_DIR/CallPilot-$VERSION.dmg"
 
 FFMPEG_BIN="$(resolve_ffmpeg)"
 [[ -n "$FFMPEG_BIN" && -x "$FFMPEG_BIN" ]] || die "ffmpeg not found; set FFMPEG_PATH or install ffmpeg for the build machine"
@@ -176,6 +184,7 @@ info "building PyInstaller app"
 
 [[ -d "$APP_PATH" ]] || die "PyInstaller did not create $APP_PATH"
 chmod +x "$APP_PATH/Contents/Resources/bin/$(basename "$FFMPEG_BIN")" 2>/dev/null || true
+"$PYTHON" "$ROOT/packaging/verify_bundle.py" "$APP_PATH"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
     info "codesigning with identity: $CODESIGN_IDENTITY"
@@ -186,29 +195,32 @@ else
     info "CODESIGN_IDENTITY not set; leaving app unsigned"
 fi
 
+# This entry point imports and checks models only: no services, USB or login items.
+info "running packaged --selftest"
+"$APP_PATH/Contents/MacOS/CallPilot" --selftest
+
+if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    info "notarizing app using maintainer-provided keychain profile"
+    xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null || \
+      die "keychain profile unavailable; configure with notarytool store-credentials locally"
+    ditto -c -k --keepParent "$APP_PATH" "$DMG_STAGE/CallPilot-notary.zip"
+    xcrun notarytool submit "$DMG_STAGE/CallPilot-notary.zip" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$APP_PATH"
+    xcrun stapler validate "$APP_PATH"
+fi
+
 info "creating DMG"
-cp -R "$APP_PATH" "$DMG_STAGE/CallPilot.app"
-ln -s /Applications "$DMG_STAGE/Applications"
-hdiutil create -volname "CallPilot" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH" >/dev/null
+sips -z 420 660 "$ROOT/packaging/dmg-background.png" --out "$DMG_STAGE/background.png" >/dev/null
+export CALLPILOT_DMG_APP="$APP_PATH"
+export CALLPILOT_DMG_BACKGROUND="$DMG_STAGE/background.png"
+# dmgbuild owns hdiutil create/attach/detach and writes .DS_Store without Finder automation.
+"$PYTHON" -m dmgbuild -s "$ROOT/packaging/dmg-settings.py" "CallPilot $VERSION" "$DMG_PATH"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
     codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG_PATH"
 fi
 
 if [[ -n "${NOTARY_PROFILE:-}" ]]; then
-    [[ -n "${CODESIGN_IDENTITY:-}" ]] || die "NOTARY_PROFILE requires CODESIGN_IDENTITY"
-    # 公证凭证在 macOS login keychain 里偶发丢失（2026-07-10 踩过，Apple 论坛
-    # 亦有同类报告）。提交前先自愈：profile 不可用且有备份恢复脚本就自动重建，
-    # 避免打到最后一步才因凭证丢失前功尽弃。
-    if ! xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
-        _restore="$HOME/.callpilot-notary-backup/restore-notary-credential.sh"
-        if [[ -x "$_restore" ]]; then
-            info "公证凭证 $NOTARY_PROFILE 缺失，尝试从备份自动恢复…"
-            "$_restore" || die "公证凭证恢复失败：手动跑 $_restore（或去 appleid.apple.com 重生成 App 专用密码）"
-        else
-            die "公证凭证 $NOTARY_PROFILE 不可用，且无备份恢复脚本；请先配置：xcrun notarytool store-credentials $NOTARY_PROFILE --apple-id support@bondings.ai --team-id 34KBLZ6RX3"
-        fi
-    fi
     info "submitting DMG for notarization with keychain profile: $NOTARY_PROFILE"
     xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
     xcrun stapler staple "$DMG_PATH"

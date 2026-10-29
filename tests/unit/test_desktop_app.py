@@ -16,6 +16,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import desktop_app
 
 
+@pytest.mark.parametrize("current, trusted, allowed", [
+    ("http://127.0.0.1:47100/", "http://127.0.0.1:47100", True),
+    ("https://untrusted.invalid/", "http://127.0.0.1:47100", False),
+    ("http://127.0.0.1:47101/", "http://127.0.0.1:47100", False),
+    ("https://untrusted.invalid/", "https://untrusted.invalid", False),
+])
+def test_uninstall_native_bridge_restricts_to_current_local_origin(monkeypatch, current, trusted, allowed):
+    from agentcall import macos_uninstall
+
+    startup = object.__new__(desktop_app.BundledStartup)
+    startup.window = types.SimpleNamespace(get_current_url=lambda: current)
+    startup.url = trusted
+    startup.layout = object()
+    launches = []
+    monkeypatch.setattr(macos_uninstall, "launch", launches.append)
+    assert startup.uninstall_callpilot() is allowed
+    assert launches == ([startup.layout] if allowed else [])
+
+
 def test_native_startup_precedes_webview_import(monkeypatch, tmp_path):
     import io
 

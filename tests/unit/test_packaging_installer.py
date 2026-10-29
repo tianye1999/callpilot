@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BUILD_SCRIPT = PROJECT_ROOT / "packaging" / "build_installer.sh"
 PACKAGING_README = PROJECT_ROOT / "packaging" / "README.md"
@@ -16,12 +18,18 @@ def test_build_installer_script_exists_and_builds_app_and_dmg():
 
     assert "PyInstaller" in text
     assert "CallPilot.app" in text
-    assert "CallPilot.dmg" in text
+    assert "CallPilot-$VERSION.dmg" in text
     assert "hdiutil create" in text
     assert "AGENTCALL_FFMPEG_PATH" in text
     assert "AGENTCALL_LIBUSB_PATH" in text
     assert "CODESIGN_IDENTITY" in text
     assert "NOTARY_PROFILE" in text
+    assert '"$APP_PATH/Contents/MacOS/CallPilot" --selftest' in text
+    assert "verify_bundle.py" in text
+    assert 'stapler validate "$APP_PATH"' in text
+    assert 'stapler validate "$DMG_PATH"' in text
+    assert "RELEASE=1 requires signing and notarization" in text
+    assert "dmg-settings.py" in text
 
 
 def test_packaging_files_have_no_local_user_paths():
@@ -71,3 +79,63 @@ def test_build_installer_codesigns_app_with_audio_input_entitlement_only():
     assert app_sign not in text
     dmg_sign = 'codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG_PATH"'
     assert dmg_sign in text
+
+
+@pytest.fixture
+def bundle(tmp_path):
+    import plistlib
+    import runpy
+    import tomllib
+
+    from agentcall.local_models import bundled_assets
+    from agentcall.macos_service_management import bundled_plists
+
+    app = tmp_path / "CallPilot.app"
+    resources = app / "Contents/Resources"
+    resources.mkdir(parents=True)
+    project = (PROJECT_ROOT / "pyproject.toml").read_bytes()
+    (resources / "pyproject.toml").write_bytes(project)
+    version = tomllib.loads(project.decode())["project"]["version"]
+    (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+        "CFBundleShortVersionString": version, "CFBundleVersion": version, "LSMinimumSystemVersion": "13.0"}))
+    for asset in bundled_assets():
+        for relative in asset.required_files:
+            path = resources / "models" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"test-model")
+        for relative in asset.required_dirs:
+            (resources / "models" / relative).mkdir(parents=True, exist_ok=True)
+    agents = app / "Contents/Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    for label, data in bundled_plists().items():
+        (agents / f"{label}.plist").write_bytes(plistlib.dumps(data))
+    verify = runpy.run_path(str(PROJECT_ROOT / "packaging/verify_bundle.py"))["verify"]
+    return app, verify
+
+
+def test_bundle_verifier_accepts_complete_artifact(bundle):
+    app, verify = bundle
+    verify(app)
+
+
+def test_bundle_verifier_rejects_version_drift(bundle):
+    app, verify = bundle
+    (app / "Contents/Resources/pyproject.toml").write_text('[project]\nversion="0.0.0"\n')
+    with pytest.raises(ValueError, match="version"):
+        verify(app)
+
+
+def test_bundle_verifier_rejects_missing_model(bundle):
+    app, verify = bundle
+    (app / "Contents/Resources/models/silero_vad.onnx").unlink()
+    with pytest.raises(ValueError, match="Missing bundled model"):
+        verify(app)
+
+
+def test_bundle_verifier_rejects_changed_agent(bundle):
+    import plistlib
+
+    app, verify = bundle
+    (app / "Contents/Library/LaunchAgents/com.agentcall.app.plist").write_bytes(plistlib.dumps({}))
+    with pytest.raises(ValueError, match="Invalid embedded agent"):
+        verify(app)

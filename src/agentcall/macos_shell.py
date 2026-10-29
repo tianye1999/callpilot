@@ -323,7 +323,7 @@ def take_notification_target(support: Path) -> str | None:
 
 
 def send_command(command: str, support: Path | None = None) -> None:
-    if command not in {"open", "quit", "retry", "replace"}:
+    if command not in {"open", "quit", "retry", "replace", "pause", "resume"}:
         raise ValueError("未知外壳命令")
     directory = (support or macos_launchd.app_support_dir()) / "shell-requests"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -366,7 +366,7 @@ def observe_commands(callback, support: Path | None = None):
 def take_commands(support: Path | None = None) -> set[str]:
     directory = (support or macos_launchd.app_support_dir()) / "shell-requests"
     commands = set()
-    for command in ("open", "quit", "retry", "replace"):
+    for command in ("open", "quit", "retry", "replace", "pause", "resume"):
         path = directory / command
         try:
             fresh = time.time() - path.stat().st_mtime < 60
@@ -530,7 +530,7 @@ def collect_diagnostics(
             states[label] = ""
     logs = {}
     for name in ("launchd-app.err.log", "launchd-app.out.log", "launchd-bridge.err.log", "modem_usb_pty.log",
-                 "launchd-tray.err.log", "app.log", "tray.log", "window.log"):
+                 "launchd-tray.err.log", "app.log", "service.log", "bridge.log", "tray.log", "window.log"):
         try:
             with (layout.log_dir / name).open("rb") as stream:
                 stream.seek(0, os.SEEK_END)

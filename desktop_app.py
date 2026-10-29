@@ -322,7 +322,8 @@ def startup_html(reason: str | None = None, lang: str | None = None) -> str:
     buttons = f"""<p><button onclick="pywebview.api.retry()">{ui_text('重试', 'Retry', lang)}</button>
         <button onclick="pywebview.api.copy_diagnostics().then(() => {{
           document.getElementById('copied').textContent = '{ui_text('诊断信息已复制', 'Diagnostics copied', lang)}';
-        }})">{ui_text('复制诊断信息', 'Copy diagnostics', lang)}</button></p>
+        }})">{ui_text('复制诊断信息', 'Copy diagnostics', lang)}</button>
+        <button onclick="pywebview.api.open_login_settings()">{ui_text('登录项设置', 'Login Items', lang)}</button></p>
         <p id="copied" role="status"></p>""" if reason else ""
     message = html_escape.escape(reason or ui_text(
         '正在连接电话服务，请稍候。', 'Connecting to the phone service. Please wait.', lang,
@@ -457,6 +458,22 @@ class BundledStartup:
         meta = fetch_meta(self.url, tray=True)
         url = (meta.get("update") or {}).get("downloadUrl")
         return bool(https_url(url) and webbrowser.open(url))
+
+    def uninstall_callpilot(self):
+        from agentcall.macos_uninstall import launch
+
+        current, trusted = urlsplit(self.window.get_current_url() or ""), urlsplit(self.url)
+        if (trusted.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or (current.scheme, current.netloc) != (trusted.scheme, trusted.netloc)):
+            return False
+        # The independent native instance owns confirmation and the unchecked option.
+        launch(self.layout)
+        return True
+
+    def open_login_settings(self):
+        from agentcall.macos_service_management import NativeServices
+
+        NativeServices().open_settings()
 
     def copy_diagnostics(self):
         from AppKit import NSPasteboard, NSPasteboardTypeString
@@ -593,6 +610,7 @@ def _bundled_main(webview, web_url: str) -> None:
 
         notifications = NotificationBridge(window.get_current_url, web_url)
         window.expose(startup.retry, startup.copy_diagnostics, startup.download_update,
+                      startup.uninstall_callpilot, startup.open_login_settings,
                       notifications.notification_status, notifications.request_notifications,
                       notifications.open_notification_settings)
         window.events.closed += startup.closed.set

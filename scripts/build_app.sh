@@ -27,6 +27,8 @@ export AGENTCALL_BUILD_ROOT_FILE="$ROOT_FILE"
 
 codesign --force --deep --sign - "$APP_PATH"
 codesign --verify --deep --strict "$APP_PATH"
+"$PYTHON" "$ROOT/packaging/verify_bundle.py" "$APP_PATH"
+"$APP_PATH/Contents/MacOS/CallPilot" --selftest
 
 echo "APP_PATH=$APP_PATH"
 # 实测产物大小留给构建者验收，不能用源码目录大小冒充 App 大小。

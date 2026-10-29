@@ -202,15 +202,9 @@ def _ensure_launchd_installed(user_initiated: bool = False):
     result = macos_upgrade.reconcile(
         layout, lambda: macos_shell.fetch_meta(web_url(), tray=True), user_initiated=user_initiated,
         acquire=lambda: macos_upgrade.acquire_lease(web_url()),
+        wait_when_busy=user_initiated,
     )
     return result
-
-
-def _uninstall_launchd() -> list[str]:
-    from agentcall import macos_launchd
-
-    layout = macos_launchd.make_layout(sys.executable, resources_dir=_resources_dir())
-    return macos_launchd.uninstall_launch_agents(layout)
 
 
 def _run_service() -> None:
@@ -447,13 +441,16 @@ def _start_background_services(user_initiated: bool = False) -> None:
 def _handoff_previous_tray():
     from agentcall import macos_launchd, macos_shell
     from agentcall.app_version import VERSION
+    from agentcall.macos_service_management import legacy_paths
 
     support = macos_launchd.app_support_dir()
     try:
         previous = json.loads((support / "tray-version.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         previous = {}
-    if previous.get("version") == VERSION and previous.get("executable") == sys.executable:
+    if (previous.get("version") == VERSION and previous.get("executable") == sys.executable
+            and previous.get("lifecycle") == "smappservice-v1"
+            and not list(legacy_paths(macos_launchd.make_layout(sys.executable), macos_launchd.TRAY_LABEL))):
         macos_shell.send_command("open")
         return None
     if previous.get("handoff") is True:
@@ -481,6 +478,22 @@ def main() -> None:
         # 打包后 import 自检（不起服务/不装 launchd）：验证关键模块真进了 bundle。
         import app
         raise SystemExit(app._selftest())
+    if "--uninstall-worker" in sys.argv[1:] and _bundled_macos():
+        from agentcall.macos_uninstall import worker_main
+        from desktop_app import close_bundled_window
+
+        worker_main(web_url(), close_bundled_window, _acquire_tray_singleton_lock)
+        return
+    if _bundled_macos() and any(arg in sys.argv for arg in ("--service", "--bridge")):
+        from agentcall.macos_launchd import make_layout
+        from agentcall.macos_shell import configure_shell_logging
+
+        layout = make_layout(sys.executable)
+        layout.support_dir.mkdir(parents=True, exist_ok=True)
+        os.chdir(layout.support_dir)
+        configure_shell_logging("service" if "--service" in sys.argv else "bridge", layout.log_dir)
+        # The registered executable remains CallPilot; caffeinate only watches it.
+        subprocess.Popen(["/usr/bin/caffeinate", "-s", "-w", str(os.getpid())])
     if "--service" in sys.argv[1:]:
         _run_service()
         return
@@ -498,6 +511,13 @@ def main() -> None:
         from agentcall.macos_shell import configure_shell_logging
 
         configure_shell_logging("tray")
+        from agentcall import macos_launchd, macos_service_management
+
+        layout = macos_launchd.make_layout(sys.executable)
+        if macos_service_management.uses_service_management(layout):
+            if macos_service_management.prepare_legacy_tray(layout, login="--login" in sys.argv):
+                return
+    login = "--login" in sys.argv or "--migrated-login" in sys.argv
     # 单例：launchd 常驻实例已在跑时，双击再启的实例让位退出（码 0，见函数注释）。
     # 句柄须持有到进程结束，锁才不失效。
     singleton_lock = _acquire_tray_singleton_lock()
@@ -505,15 +525,18 @@ def main() -> None:
         if _bundled_macos() and "--login" not in sys.argv:
             # The incumbent tray may still be old code from before an overwrite.
             # Reconcile in this new executable, not only via the old tray's reopen callback.
-            _start_background_services(user_initiated=True)
+            _start_background_services(user_initiated=not login)
             singleton_lock = _handoff_previous_tray()
         if singleton_lock is None:
             logger.info("已有 CallPilot 菜单栏实例在运行，本实例让位退出")
             return
     bundled = _bundled_macos()
+    if _is_frozen() and sys.platform == "darwin" and macos_service_management.uses_service_management(layout):
+        # Singleton ownership proves the previous tray completed the WP6 handoff.
+        macos_service_management.cleanup_legacy(layout, labels={macos_launchd.TRAY_LABEL})
     # 主动启动先拉窗口，连 rumps 导入和菜单构造都不挡住首屏。
     early_window = None
-    if bundled and "--login" not in sys.argv:
+    if bundled and not login:
         try:
             early_window = open_or_focus_dashboard(None)
         except OSError:
@@ -530,7 +553,8 @@ def main() -> None:
         support = app_support_dir()
         support.mkdir(parents=True, exist_ok=True)
         (support / "tray-version.json").write_text(json.dumps(
-            {"version": VERSION, "executable": sys.executable, "handoff": True}), encoding="utf-8")
+            {"version": VERSION, "executable": sys.executable, "handoff": True,
+             "lifecycle": "smappservice-v1"}), encoding="utf-8")
     if not bundled:
         _start_background_services()
         maybe_autoopen_dashboard(
@@ -550,9 +574,11 @@ def main() -> None:
             self._enable_requested = False
             self._quitting = False
             self._replace_requested = False
+            self._uninstall_pending = False
             self._probe_thread: threading.Thread | None = None
             self._last_probe_started: float | None = None
             self._started_at = time.monotonic()
+            self._last_reconcile_at = self._started_at
             self._meta: dict = {}
             self._connecting_since: float | None = None
             self._displayed_state: str | None = None
@@ -570,14 +596,13 @@ def main() -> None:
             self._action_items = {
                 key: rumps.MenuItem(menu_label(key, lang), callback=callback)
                 for key, callback in (("hangup", self._hangup), ("listen", self._listen),
-                                      ("open_app", self._open), ("uninstall", self._uninstall), ("quit", self._quit))
+                                      ("open_app", self._open), ("quit", self._quit))
             } if bundled else {}
             self.menu = [self._status_item, self._detail_item] if bundled else [
                 self._status_item,
                 None,
                 rumps.MenuItem(menu_label("open", lang), callback=self._open),
                 rumps.MenuItem(menu_label("restart", lang), callback=self._restart),
-                rumps.MenuItem(menu_label("uninstall", lang), callback=self._uninstall),
                 None,
                 rumps.MenuItem(menu_label("quit", lang), callback=self._quit),
             ]
@@ -602,10 +627,10 @@ def main() -> None:
                 self._setup_required = setup
                 self._render_status()
                 macos_shell.write_startup_failure(layout.support_dir, "")
-                if early_window is None and macos_shell.should_open_window("--login" in sys.argv, setup):
+                if early_window is None and macos_shell.should_open_window(login, setup):
                     self._open(None)
                 # 先开本地窗口，再后台安装；不让 launchctl/健康轮询挡住 Cocoa 主循环。
-                self._start_services(user_initiated="--login" not in sys.argv)
+                self._start_services(user_initiated=not login)
                 _install_reopen_handler(self._reopen)
                 self._request_observer = macos_shell.observe_commands(lambda: self._requests(None))
                 # before_start 时 rumps 的原生定时器和菜单才全部就绪。
@@ -614,8 +639,14 @@ def main() -> None:
                 self._refresh(None)
 
         def _start_services(self, user_initiated: bool = True) -> None:
+            if self._uninstall_pending:
+                return
             if bundled_version(sys.executable) != version:
-                subprocess.Popen([sys.executable], start_new_session=True)
+                if not user_initiated:
+                    return  # An overwritten app is activated by the user's next open.
+                from agentcall.macos_launchd import bundle_root_for_executable
+
+                subprocess.Popen(["/usr/bin/open", "-n", str(bundle_root_for_executable(sys.executable))])
                 return
             if self._install_thread is None or not self._install_thread.is_alive():
                 self._enable_requested = False
@@ -630,7 +661,9 @@ def main() -> None:
         def _reopen(self) -> None:
             if not self._quitting:
                 if bundled_version(sys.executable) != version:
-                    subprocess.Popen([sys.executable], start_new_session=True)
+                    from agentcall.macos_launchd import bundle_root_for_executable
+
+                    subprocess.Popen(["/usr/bin/open", "-n", str(bundle_root_for_executable(sys.executable))])
                     return
                 self._open(None)
                 self._start_services()
@@ -652,6 +685,16 @@ def main() -> None:
                     except OSError:
                         logger.exception("打开通知目标失败")
             commands = take_commands()
+            if "pause" in commands:
+                self._uninstall_pending = True
+            if "resume" in commands:
+                self._uninstall_pending = False
+            if self._uninstall_pending and "replace" not in commands:
+                if self._install_thread is None or not self._install_thread.is_alive():
+                    from agentcall.macos_launchd import app_support_dir
+
+                    (app_support_dir() / "uninstall-ready").touch(mode=0o600)
+                return
             self._replace_requested = self._replace_requested or "replace" in commands
             if self._replace_requested:
                 if self._install_thread is not None and self._install_thread.is_alive():
@@ -672,6 +715,11 @@ def main() -> None:
                 self._start_services()
             if self._enable_requested and self._install_thread is not None and not self._install_thread.is_alive():
                 self._start_services()
+            if time.monotonic() - self._last_reconcile_at >= 30:
+                # Recover non-crash exits through the same busy/lease/version guard.
+                self._last_reconcile_at = time.monotonic()
+                if self._install_thread is None or not self._install_thread.is_alive():
+                    self._start_services(user_initiated=False)
             self._refresh(None)
             self._render_status()
             if self._hangup_result is not None:
@@ -733,7 +781,7 @@ def main() -> None:
                 self.menu.clear()
                 # rumps 的回调注册表强持有菜单项，复用实例避免每通累积对象。
                 keys = (["hangup", "listen"] if status.state == "in_call" else [])
-                keys += ["open_app", "uninstall", "quit"]
+                keys += ["open_app", "quit"]
                 updates = [self._update_item] if update_version else []
                 self.menu = [self._status_item, self._detail_item, *updates,
                              *[self._action_items[key] for key in keys]]
@@ -796,13 +844,6 @@ def main() -> None:
                 self._window_proc = open_listen_dashboard(self._window_proc)
             except OSError:
                 logger.exception("打开旁听位置失败")
-
-        def _uninstall(self, _sender) -> None:
-            try:
-                removed = _uninstall_launchd()
-                logger.info("launchd agents removed: %s", ", ".join(removed) or "none")
-            except Exception as exc:  # noqa: BLE001
-                logger.error("卸载常驻失败: %s", exc)
 
         def _quit(self, _sender) -> None:
             if not bundled:

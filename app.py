@@ -40,18 +40,26 @@ def _open_browser_later(url: str, delay: float = 1.0) -> threading.Timer | None:
 
 
 def _restart_after_cleanup() -> None:
-    """Restart manually-run services in place; let launchd restart its own job.
+    """Restart manual services in place; let managed jobs re-enter their supervisor.
 
-    Re-executing the frozen child underneath ``caffeinate`` can race a second
-    launchd instance for the listening port.  A launchd-managed service instead
-    exits only after cleanup has released its sockets; ``KeepAlive`` then starts
-    one fresh job with the persisted environment file.
+    Legacy launchd uses KeepAlive after socket cleanup. SMAppService jobs ask
+    the tray to reconcile instead: exec of an overwritten bundle could otherwise
+    put new service code beside an old bridge.
     """
     if sys.platform == "darwin":
         from agentcall.macos_launchd import APP_LABEL
 
         if os.environ.get("XPC_SERVICE_NAME") == APP_LABEL:
-            logging.getLogger("app").info("清理完成，退出并交由 launchd 重新启动服务…")
+            from agentcall import macos_launchd, macos_service_management
+
+            if config._is_frozen():
+                layout = macos_launchd.make_layout(sys.executable)
+                if macos_service_management.uses_service_management(layout):
+                    from agentcall.macos_shell import send_command
+
+                    # Never exec an overwritten bundle beside an old bridge.
+                    send_command("retry", layout.support_dir)
+            logging.getLogger("app").info("清理完成，退出并交由外壳重新启动服务…")
             return
     argv = (
         [sys.executable, *sys.argv[1:]]
@@ -367,7 +375,7 @@ def _selftest() -> int:
     bundled_mac = sys.platform == "darwin" and getattr(sys, "frozen", False)
     optional = set() if bundled_mac else {"sherpa_onnx"}
     if bundled_mac:
-        modules.extend(["sherpa_onnx", "UserNotifications"])
+        modules.extend(["sherpa_onnx", "UserNotifications", "ServiceManagement"])
     ok = True
     for name in modules + list(optional):
         try:

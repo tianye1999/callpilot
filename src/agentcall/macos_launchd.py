@@ -260,14 +260,19 @@ def _serialized_settings(function):
 @_serialized_settings
 def set_autostart(layout: LaunchdLayout, enabled: bool) -> None:
     """只改变下次登录：移除登录扫描目录的 plist 不会卸载已加载的任务。"""
+    from . import macos_service_management as sm
+
     layout.support_dir.mkdir(parents=True, exist_ok=True)
-    layout.launch_agents_dir.mkdir(parents=True, exist_ok=True)
-    for label, data in build_plists(layout).items():
-        path = layout.launch_agents_dir / f"{label}.plist"
-        if enabled:
-            path.write_bytes(plist_bytes(data))
-        else:
-            path.unlink(missing_ok=True)
+    if sm.uses_service_management(layout):
+        sm.set_login_enabled(layout, enabled)
+    else:
+        layout.launch_agents_dir.mkdir(parents=True, exist_ok=True)
+        for label, data in build_plists(layout).items():
+            path = layout.launch_agents_dir / f"{label}.plist"
+            if enabled:
+                path.write_bytes(plist_bytes(data))
+            else:
+                path.unlink(missing_ok=True)
     path = layout.support_dir / "startup.json"
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps({"enabled": enabled}), encoding="utf-8")
@@ -368,9 +373,16 @@ def install_launch_agents(
     layout.support_dir.mkdir(parents=True, exist_ok=True)
     layout.data_dir.mkdir(parents=True, exist_ok=True)
     layout.log_dir.mkdir(parents=True, exist_ok=True)
-    layout.launch_agents_dir.mkdir(parents=True, exist_ok=True)
     if not layout.env_file.exists():
         layout.env_file.touch(mode=0o600)
+
+    from . import macos_service_management as sm
+
+    if sm.uses_service_management(layout):
+        return sm.install(layout, runner, sleep=sleep, no_restart_labels=no_restart_labels,
+                          force_restart_labels=force_restart_labels, before_restart=before_restart,
+                          verify_bridge=verify_bridge, user_initiated=user_initiated)
+    layout.launch_agents_dir.mkdir(parents=True, exist_ok=True)
 
     changed: list[str] = []
     failures: list[LaunchctlFailure] = []
