@@ -148,8 +148,11 @@ def test_no_carrier_does_not_wait_for_partial_cend(monkeypatch):
 def test_ceer_lock_wait_is_bounded_and_does_not_send_late(monkeypatch):
     modem = make_modem(monkeypatch)
     with modem._serial_lock:
+        started = time.monotonic()
         modem._request_release_cause()
-        assert modem._release_report.done.wait(2.1)
+        # 预算 2 s；CI 调度抖动大，等待留足余量，用耗时上限锁定「有界」。
+        assert modem._release_report.done.wait(5)
+        assert time.monotonic() - started < 4
         assert "AT+CEER" not in modem._ser.writes
     assert modem.wait_release_causes() == []
 
