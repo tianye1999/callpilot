@@ -830,6 +830,7 @@ def test_bundled_second_instance_forwards_user_open_only(monkeypatch, login, exp
     assert installs == ([] if login else [{"user_initiated": True}])
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY 桥仅支持 POSIX（需 fcntl）")
 def test_bridge_only_records_version_after_acquiring_instance_lock(monkeypatch, tmp_path):
     from agentcall import macos_launchd, macos_upgrade
     from scripts import ec20_usb_pty
