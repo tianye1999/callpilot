@@ -115,6 +115,20 @@ def test_identify_volte_only_keeps_cs_semantics_and_exports_eps():
     }
 
 
+def test_with_eps_registration_preserves_sim_identity_fields():
+    from agentcall.sim_identity import with_eps_registration
+
+    sim = identify("460110123456789\r\nOK", "+CREG: 0,3", "+CEREG: 0,2")
+
+    updated = with_eps_registration(sim, "+CEREG: 1")
+
+    assert updated.as_dict() == {
+        **sim.as_dict(),
+        "eps_registered": True, "eps_status": "已注册", "network_attached": True,
+    }
+    assert sim.eps_status == "搜网中"
+
+
 def test_identity_defaults_eps_to_unknown_without_changing_cs():
     sim = identify("460000123456789\r\nOK", "+CREG: 0,1")
     assert sim.network_attached is True
@@ -304,6 +318,94 @@ def test_creg_urc_updates_registration_without_losing_carrier():
     assert len(events) == 1
 
 
+@pytest.mark.parametrize("raw", [
+    "+CEREG: 1\r\n",
+    '+CEREG: 1,"1234","01234567",7\r\n',
+])
+def test_cereg_urc_updates_only_eps_and_can_lose_registration(raw):
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("unused")
+    initial = identify("460110123456789\r\nOK", "+CREG: 0,3", "+CEREG: 0,2")
+    modem._sim_identity = initial
+    modem._buffer = raw
+    modem._process_buffer()
+
+    assert modem.sim_identity.as_dict() == {
+        **initial.as_dict(),
+        "eps_registered": True, "eps_status": "已注册", "network_attached": True,
+    }
+    assert modem._buffer.strip() == ""
+
+    modem._buffer += "+CEREG: 2\r\n"
+    modem._process_buffer()
+
+    assert modem.sim_identity == initial
+    assert modem._buffer.strip() == ""
+
+
+@pytest.mark.parametrize("raw", [
+    "+CEREG: 1\r\n",
+    '+CEREG: 1,"1234","01234567",7\r\n',
+])
+def test_cereg_urc_preserves_every_fragment_until_line_complete(raw):
+    from agentcall.modem import Eg25Modem
+
+    for split in range(1, len(raw)):
+        modem = Eg25Modem("unused")
+        initial = identify("460110123456789\r\nOK", "+CREG: 0,3", "+CEREG: 0,2")
+        modem._sim_identity = initial
+        events = []
+        modem.on_sim_identity(events.append)
+        modem._buffer = raw[:split]
+        modem._process_buffer()
+
+        assert modem.sim_identity == initial, split
+        assert modem._buffer == raw[:split], split
+        assert events == [], split
+
+        modem._buffer += raw[split:]
+        modem._process_buffer()
+
+        assert modem.sim_identity.eps_registered is True, split
+        assert modem.sim_identity.reg_status == "注册被拒", split
+        assert len(events) == 1, split
+        assert modem._buffer.strip() == "", split
+
+
+def test_creg_and_cereg_urcs_update_separate_domains_in_order():
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("unused")
+    modem._sim_identity = identify("460110123456789\r\nOK", "+CREG: 0,1", "+CEREG: 0,2")
+    events = []
+    modem.on_sim_identity(events.append)
+    modem._buffer = "\r\n+CREG: 3\r\n+CEREG: 1\r\n"
+    modem._process_buffer()
+
+    assert [(s.reg_status, s.eps_status) for s in events] == [
+        ("注册被拒", "搜网中"), ("注册被拒", "已注册"),
+    ]
+    assert modem.sim_identity.registered is False
+    assert modem.sim_identity.network_attached is True
+    assert modem._buffer.strip() == ""
+
+
+@pytest.mark.parametrize("removal_first", [False, True])
+def test_cereg_and_qsimstat_urcs_are_consumed_in_order(removal_first):
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("unused")
+    modem._sim_identity = identify("460110123456789\r\nOK", "+CREG: 0,3", "+CEREG: 0,2")
+    urcs = ["+CEREG: 1\r\n", "+QSIMSTAT: 1,0\r\n"]
+    modem._buffer = "".join(reversed(urcs) if removal_first else urcs)
+    modem._process_buffer()
+
+    assert modem.sim_identity.present is False
+    assert modem.sim_identity.eps_registered is removal_first
+    assert modem._buffer.strip() == ""
+
+
 def test_qsimstat_removal_is_immediate_and_does_not_refresh_inline(monkeypatch):
     from agentcall.modem import Eg25Modem
 
@@ -376,11 +478,15 @@ def test_qsimstat_remove_then_insert_during_debounce_keeps_latest_refresh(monkey
     assert modem.sim_identity.carrier == "中国移动"
 
 
-def test_open_serial_enables_sim_and_registration_urcs_before_identity_refresh(monkeypatch):
+@pytest.mark.parametrize("cereg_response", ["OK", "ERROR"])
+@pytest.mark.parametrize("modem_class", ["Eg25Modem", "Sim7600Modem"])
+def test_open_serial_enables_sim_and_registration_urcs_before_identity_refresh(
+    monkeypatch, cereg_response, modem_class,
+):
     from agentcall import modem as modem_mod
-    from agentcall.modem import Eg25Modem
+    from agentcall.dial_guard import check_dial_guard
 
-    modem = Eg25Modem("unused")
+    modem = getattr(modem_mod, modem_class)("unused")
     commands: list[str] = []
     monkeypatch.setattr(modem_mod.serial, "Serial", lambda **_kwargs: object())
     monkeypatch.setattr(modem_mod.time, "sleep", lambda _seconds: None)
@@ -388,19 +494,42 @@ def test_open_serial_enables_sim_and_registration_urcs_before_identity_refresh(m
 
     def send(command: str) -> str:
         commands.append(command)
+        if command == "AT+CEREG=1":
+            return cereg_response
         if command == "AT+CIMI":
-            return "460000123456789\r\nOK"
+            return "460110123456789\r\nOK"
         if command == "AT+CREG?":
-            return "+CREG: 0,1\r\nOK"
+            return "+CREG: 0,3\r\nOK"
+        if command == "AT+CEREG?":
+            return "+CEREG: 0,2\r\nOK"
         return "OK"
 
     monkeypatch.setattr(modem, "_send", send)
     monkeypatch.setattr(modem, "_init_sms", lambda: None)
 
-    modem._open_serial()
+    modem.connect()
 
+    assert modem.is_connected()
     assert commands.index("AT+QSIMSTAT=1") < commands.index("AT+CIMI")
     assert commands.index("AT+CREG=1") < commands.index("AT+CIMI")
+    assert commands.index("AT+CEREG=1") == commands.index("AT+CREG=1") + 1
+    assert commands.index("AT+CEREG=1") < commands.index("AT+CIMI")
+
+    failure = check_dial_guard(
+        modem_online=modem.is_connected(), sim_identity=modem.sim_identity, number="10000",
+    )
+    assert failure is not None and failure.code == "SIM_NOT_REGISTERED"
+
+    modem._buffer = "\r\n+CEREG: 1\r\n"
+    modem._process_buffer()
+
+    assert modem.sim_identity.carrier == "中国电信"
+    assert modem.sim_identity.service_number == "10000"
+    assert modem.sim_identity.reg_status == "注册被拒"
+    assert modem.sim_identity.eps_status == "已注册"
+    assert check_dial_guard(
+        modem_online=modem.is_connected(), sim_identity=modem.sim_identity, number="10000",
+    ) is None
 
 
 # ---- 国家级兜底：非大陆卡也要识别出免费客服号（WIL-133）----

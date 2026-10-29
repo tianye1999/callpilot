@@ -19,6 +19,7 @@ from .sim_identity import (
     UNKNOWN_SIM,
     SimIdentity,
     identify,
+    with_eps_registration,
     with_registration,
     with_service_number_override,
 )
@@ -34,6 +35,8 @@ CLCC_PATTERN = re.compile(
 QPCMV_PATTERN = re.compile(r"\+QPCMV:\s*(\d+),(\d+)")
 CMTI_PATTERN = re.compile(r'\+CMTI:\s*"([^"]*)",\s*(\d+)')
 CREG_PATTERN = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?\d+(?=\s|$)")
+# 等完整行到达再消费,避免分片中的状态或位置字段被提前截断。
+CEREG_PATTERN = re.compile(r"\+CEREG:[ \t]*\d+(?:[ \t]*,[^\r\n]*)?[ \t]*(?=\r?\n)")
 QSIMSTAT_PATTERN = re.compile(r"\+QSIMSTAT:\s*(\d+)\s*,\s*(\d+)")
 
 # GSM 03.38 默认字符表（基础表，用于 7-bit 短信解码）
@@ -298,9 +301,9 @@ class SerialModem:
         可选 CEREG 失败只降级 EPS 为未知。connect/重连(``_open_serial``,已持串口锁)自动调用,
         换卡经拔插重连天然刷新;也可被上层主动调用重刷。
 
-        已知限制(follow-up):不拔卡热换 SIM、注册状态后续变化不会自动上报刷新
-        (需 +QSIMSTAT / +CREG=1 URC,列入 #88 follow-up)。CIMI 上电延迟已由
-        本方法内短重试覆盖。
+        CS/EPS 注册状态后续分别跟随 +CREG/+CEREG URC 更新;支持 +QSIMSTAT 的
+        模组也会在插卡时刷新身份。不支持相应 URC 的固件、不产生拔插通知的热换 SIM
+        仍需重连或主动刷新。CIMI 上电延迟已由本方法内短重试覆盖。
         """
         imsi_raw = ""
         for attempt in range(self._SIM_READ_RETRIES):
@@ -413,6 +416,7 @@ class SerialModem:
                 self._init_sms()
                 self._send("AT+QSIMSTAT=1")
                 self._send("AT+CREG=1")
+                self._send("AT+CEREG=1")
                 self.refresh_sim_identity(notify=False)
                 self._init_answer_greeting()
             finally:
@@ -1067,14 +1071,18 @@ class SerialModem:
         """Consume SIM/registration URCs without doing serial I/O on the reader."""
         while True:
             creg = CREG_PATTERN.search(self._buffer)
+            cereg = CEREG_PATTERN.search(self._buffer)
             qsim = QSIMSTAT_PATTERN.search(self._buffer)
-            matches = [match for match in (creg, qsim) if match is not None]
+            matches = [match for match in (creg, cereg, qsim) if match is not None]
             if not matches:
                 return
             match = min(matches, key=lambda item: item.start())
             self._buffer = self._buffer[:match.start()] + self._buffer[match.end():]
             if match.re is CREG_PATTERN:
                 self._set_sim_identity(with_registration(self._sim_identity, match.group(0)))
+                continue
+            if match.re is CEREG_PATTERN:
+                self._set_sim_identity(with_eps_registration(self._sim_identity, match.group(0)))
                 continue
 
             enabled, inserted = match.group(1), match.group(2)

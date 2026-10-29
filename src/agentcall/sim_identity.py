@@ -228,3 +228,9 @@ def with_registration(identity: SimIdentity, creg_raw: str) -> SimIdentity:
     """Return ``identity`` with only its cached CREG state updated."""
     registered, reg_status = parse_creg(creg_raw)
     return replace(identity, registered=registered, reg_status=reg_status)
+
+
+def with_eps_registration(identity: SimIdentity, raw: str) -> SimIdentity:
+    """仅更新缓存的 EPS 注册状态,保留 SIM 身份与 CS 状态。"""
+    eps_registered, eps_status = parse_eps_registration(raw)
+    return replace(identity, eps_registered=eps_registered, eps_status=eps_status)

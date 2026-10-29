@@ -66,7 +66,7 @@ def test_greeting_init_disabled_preserves_commands(modem, monkeypatch, disabled)
     sent = []
     fake_open(monkeypatch, modem, lambda cmd: sent.append(cmd) or "OK")
     modem.connect()
-    assert sent == ["AT", "ATE0", "AT+CLIP=1", "AT+QSIMSTAT=1", "AT+CREG=1"]
+    assert sent == ["AT", "ATE0", "AT+CLIP=1", "AT+QSIMSTAT=1", "AT+CREG=1", "AT+CEREG=1"]
 
 
 @pytest.mark.parametrize("params", ["", '2,2,0,1,1,0\rATD123;', "invalid"])
