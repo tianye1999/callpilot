@@ -39,7 +39,7 @@ class ModemPreset:
     at_port: str
     pcm_port: str | None
     audio_mode: str
-    reset_on_start: bool = False
+    reset_on_start: bool = False  # 仅控制首次启动；快速失败恢复由桥入口单独决定
     recover_alt_pid: int | None = None
     recovery_request_path: str | None = None
 
@@ -58,7 +58,8 @@ PRESETS = (
                 "/tmp/ec20-at", None, "uac_ffmpeg"),
     ModemPreset("simcom", "SIM7600", SIM7600_VID, SIM7600_PID, tuple(SIM7600_MAPS),
                 SIM7600_MAPS[0].split(":", 1)[1], SIM7600_MAPS[1].split(":", 1)[1],
-                "nmea", True, SIM7600_ALT_PID, RECOVERY_REQUEST_PATH),
+                # 启动复位会导致首通 PCM 数据面起不来，默认仅快速失败后复位。
+                "nmea", False, SIM7600_ALT_PID, RECOVERY_REQUEST_PATH),
 )
 
 

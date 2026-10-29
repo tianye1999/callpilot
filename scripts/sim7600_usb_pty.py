@@ -8,6 +8,8 @@
 SIM7600 在语音通话建立瞬间会重枚举 USB，旧句柄失效——``ec20_usb_pty`` 的
 等待-重连循环（run/wait_for_device + run_bridges_once(reset_first=…)）会自动
 重建 PTY（symlink 指向新 slave），故通话中掉线可自愈。
+首次启动默认不复位，避免首通 PCM 数据面起不来；CALLPILOT_BRIDGE_RESET_ON_START=1
+可恢复首次复位（0 或未设置时关闭），快速失败后重连的复位始终保留。
 
 用法：
     DYLD_LIBRARY_PATH=/opt/homebrew/lib \\
@@ -20,6 +22,7 @@ SIM7600 在语音通话建立瞬间会重枚举 USB，旧句柄失效——``ec2
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -49,7 +52,7 @@ def main() -> int:
         default_maps=DEFAULT_MAPS,
         prog="sim7600_usb_pty",
         description="SIM7600 USB vendor serial PTY bridge for macOS",
-        reset_on_start=True,  # SIM7600 对 USB 故障敏感，首次桥接前先复位清 stall
+        reset_on_start=os.environ.get("CALLPILOT_BRIDGE_RESET_ON_START") == "1",
         # PCM 子系统卡死时自动切到 9011 组合再切回（真机唯一有效的软件恢复手段，
         # CRESET/CFUN 均无效，见 WIL-109）。免去人工物理拔插。
         recover_alt_pid=SIM7600_ALT_PID,

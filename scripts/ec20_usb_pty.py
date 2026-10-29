@@ -634,11 +634,8 @@ def run_bridges_once(
 
     reset_first=True 时先 dev.reset()：macOS 睡眠/重枚举后 bulk 端点常处于 stall，
     不复位则重连后每次 read 立即 [Errno 5] 死循环（见 docs/roadmap.md USB 排查）。
+    是否复位由入口决定，此处不读取启动开关，以免屏蔽快速失败后的恢复复位。
     """
-    if reset_first:
-        if os.environ.get("CALLPILOT_BRIDGE_RESET_ON_START") == "0":
-            logger.info("启动不复位（实验开关） CALLPILOT_BRIDGE_RESET_ON_START=0")
-            reset_first = False
     if reset_first:
         try:
             dev.reset()
@@ -740,10 +737,18 @@ def run_auto(stop: threading.Event, *, once: bool = False, poll_seconds: float =
                 last_write = time.monotonic()
 
         logger.info("自动识别模组: %s (%04x:%04x)", preset.model, preset.vid, preset.pid)
-        reset_first = preset.reset_on_start and (first_selection or failures > 0)
-        if os.environ.get("CALLPILOT_BRIDGE_RESET_ON_START") == "0":
-            reset_first = False
-            logger.info("启动不复位（实验开关） CALLPILOT_BRIDGE_RESET_ON_START=0")
+        sim7600 = preset.vendor == "simcom"
+        reset_on_start = preset.reset_on_start or (
+            sim7600 and os.environ.get("CALLPILOT_BRIDGE_RESET_ON_START") == "1"
+        )
+        # SIM7600 首次默认不复位，避免首通 PCM 起不来；恢复复位不受启动开关影响。
+        # EC20/EG25 自动入口保持原有策略，不因 SIM7600 的调整引入复位。
+        reset_on_failure = sim7600 or preset.reset_on_start
+        if first_selection:
+            logger.info("首次启动复位模式：%s；快速失败后复位：%s",
+                        "开启" if reset_on_start else "关闭",
+                        "开启" if reset_on_failure else "关闭")
+        reset_first = (first_selection and reset_on_start) or (failures > 0 and reset_on_failure)
         started = time.monotonic()
         degraded = False
         try:
@@ -807,7 +812,7 @@ def main(
     )
     parser.add_argument(
         "--reset-on-start", action="store_true",
-        help="首次桥接前先 dev.reset() 清除 stall 端点（SIM7600 对 USB 故障敏感，推荐开）",
+        help="显式开启首次桥接前 dev.reset()（SIM7600 默认关闭，避免首通 PCM 数据面起不来）",
     )
     parser.add_argument(
         "--recover-alt-pid", type=lambda s: int(s, 16),
@@ -879,6 +884,8 @@ def main(
     if args.auto:
         return run_auto(stop, once=args.once)
 
+    logger.info("首次启动复位模式：%s；快速失败后复位：开启",
+                "开启" if reset_on_start else "关闭")
     # 连续快速失败计数：超阈值则 sys.exit 交 launchd 冷启（含全新 libusb 上下文），
     # 比原地自旋更可能复位；手动运行（无 launchd）时同样退出，避免抖动风暴。
     consecutive_fast_fail = 0
@@ -890,8 +897,7 @@ def main(
         if dev is None:
             break
         started_at = time.monotonic()
-        # 非首轮（重连）先复位设备清 stall 端点；reset_on_start 时首轮也复位
-        # （SIM7600 对 USB 故障敏感，残留 stall 会让首次桥接直接 EIO）。
+        # 仅快速失败后复位清 stall；正常掉线不复位，首轮由启动开关决定。
         reset_first = consecutive_fast_fail > 0 or (first_run and reset_on_start)
         first_run = False
         degraded = False

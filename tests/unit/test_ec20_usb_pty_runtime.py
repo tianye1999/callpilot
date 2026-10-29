@@ -350,7 +350,7 @@ def test_auto_bridge_reselects_after_unplug(monkeypatch, tmp_path):
         kwargs["heartbeat"]()
         seen.append(hardware.read_state()["vendor"])
         if len(seen) == 2:
-            assert kwargs["reset_first"] is True
+            assert kwargs["reset_first"] is False
             assert str(kwargs["recovery_request"]) == hardware.RECOVERY_REQUEST_PATH
             stop.set()
         return False
@@ -380,7 +380,7 @@ def test_auto_waits_without_device_and_does_not_reset_normal_reconnect(monkeypat
         return False
     monkeypatch.setattr(ec20_usb_pty, "run_bridges_once", bridge)
     assert ec20_usb_pty.run_auto(stop, poll_seconds=0) == 0
-    assert resets == [True, False]
+    assert resets == [False, False]
 
 
 def test_explicit_bridge_cli_keeps_maps_and_defaults(monkeypatch):

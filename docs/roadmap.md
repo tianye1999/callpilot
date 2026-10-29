@@ -304,9 +304,18 @@ provider 外呼静默失效、WS 推送偶发丢事件、hangup 无锁等）→ 
     endpoint 进入 stall；旧版桥从不调 `dev.reset()`，只能反复重开-秒挂，产生符号链接
     删建风暴（实测峰值 177 次/分钟），且桥与 app 两层自愈互相打架。
   - **已落地缓解（v0.1）**：① launchd plist 用 `caffeinate -s` 包裹两个进程，阻止系统
-    睡眠（首要诱因）；② 桥重连前先 `dev.reset()` 清 stall；③ 桥重试指数退避（1→30s），
+    睡眠（首要诱因）；② 显式入口在快速失败后的重连前 `dev.reset()` 清 stall；③ 桥重试指数退避（1→30s），
     连续快速失败（存活 <5s）达阈值（`EC20_BRIDGE_FAIL_THRESHOLD`，默认 6）即 exit(3)
     交给 launchd 冷重启；④ 桥单实例文件锁，防双桥抢设备。
+  - **SIM7600 启动策略（2026-10-29）**：启动复位会导致首通 PCM 数据面起不来，因此
+    `--auto` 首次选中 SIM7600 和旧 `sim7600_usb_pty.py` 首轮均默认不复位。
+    正式开关 `CALLPILOT_BRIDGE_RESET_ON_START=1` 恢复首次复位，`0` 或未设置时不复位；
+    两条入口在快速失败（存活 <5s）后重连仍复位，不受此开关影响，以保留睡眠/重枚举后的 stall 恢复。
+    旧显式入口的 `--reset-on-start` 仍可主动开启首次复位。EC20/EG25 的 preset
+    `reset_on_start=False` 及两条入口原有行为不变（自动入口不复位，显式入口快速失败后复位）；
+    `CALLPILOT_BRIDGE_HOLD_ON_PCM_STALL` 等其他诊断开关默认不变。
+    打包版由 `macos_launchd.py` 生成 `CallPilot --bridge --auto`，经 `tray_app.py` 进入
+    `ec20_usb_pty.main()`，使用上述自动识别策略，而非旧 SIM7600 脚本入口。
   - 长期项（物理层：换供电/线材、USB 集线器隔离）挂 P3 观察。
   - **新证据（2026-07-08 05:23）**：caffeinate 生效期间、通话进行中仍发生掉线
     （语音 UAC 流 + AT 串口并发时段）——睡眠不是唯一诱因，**物理层嫌疑加重**

@@ -98,8 +98,8 @@ def test_stats_five_second_active_summary_and_ten_second_ring(monkeypatch, caplo
     assert snapshot["total"]["out_max_ms"] == 2.5
 
 
-@pytest.mark.parametrize("setting,reset", [(None, True), ("0", False), ("1", True)])
-def test_auto_reset_experiment_overrides_sim7600_preset(monkeypatch, tmp_path, caplog, setting, reset):
+@pytest.mark.parametrize("setting,reset", [(None, False), ("0", False), ("1", True)])
+def test_auto_sim7600_startup_reset_mode(monkeypatch, tmp_path, caplog, setting, reset):
     from dataclasses import replace
 
     preset = replace(bridge.modem_hardware.PRESETS[1], recovery_request_path=str(tmp_path / "request"))
@@ -113,7 +113,59 @@ def test_auto_reset_experiment_overrides_sim7600_preset(monkeypatch, tmp_path, c
     with caplog.at_level("INFO"):
         assert bridge.run_auto(threading.Event(), once=True) == 0
     assert calls[0]["reset_first"] is reset
-    assert ("启动不复位（实验开关）" in caplog.text) is (setting == "0")
+    assert ("首次启动复位模式：开启" if reset else "首次启动复位模式：关闭") in caplog.text
+    assert "实验" not in caplog.text
+
+
+@pytest.mark.parametrize("entry", ["auto_sim7600", "sim7600", "auto_ec20", "ec20"])
+@pytest.mark.parametrize("setting", [None, "0", "1"])
+def test_bridge_entry_reset_policy_on_start_fast_failure_and_normal_reconnect(
+    monkeypatch, tmp_path, caplog, entry, setting,
+):
+    """只运行入口策略；假 USB、时钟和临时请求文件隔离正在运行的桥。"""
+    from dataclasses import replace
+
+    from scripts import sim7600_usb_pty
+
+    sim7600 = entry.endswith("sim7600")
+    preset = replace(bridge.modem_hardware.PRESETS[int(sim7600)],
+                     recovery_request_path=str(tmp_path / "request") if sim7600 else None)
+    assert preset.reset_on_start is False
+    monkeypatch.setattr(sim7600_usb_pty, "RECOVERY_REQUEST_PATH", str(tmp_path / "request"))
+    if setting is not None:
+        monkeypatch.setenv("CALLPILOT_BRIDGE_RESET_ON_START", setting)
+    monkeypatch.setattr(bridge, "find_auto_device", lambda: (object(), preset))
+    monkeypatch.setattr(bridge, "wait_for_device", lambda *args, **kwargs: object())
+    monkeypatch.setattr(bridge, "acquire_instance_lock", lambda: object())
+    monkeypatch.setattr(bridge.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(threading.Event, "wait", lambda *args: False)
+    clock = [100.0]
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    resets = []
+
+    def run(dev, maps, stop, **kwargs):
+        resets.append(kwargs["reset_first"])
+        if len(resets) == 1:
+            raise bridge.usb.core.USBError("fake stalled endpoint", errno=bridge.errno.EIO)
+        clock[0] += 10
+        if len(resets) == 3:
+            stop.set()
+        return False
+
+    monkeypatch.setattr(bridge, "run_bridges_once", run)
+    with caplog.at_level("INFO"):
+        if entry.startswith("auto"):
+            monkeypatch.setattr(sys, "argv", ["bridge", "--auto"])
+            assert bridge.main() == 0
+        elif sim7600:
+            monkeypatch.setattr(sys, "argv", ["sim7600_usb_pty"])
+            assert sim7600_usb_pty.main() == 0
+        else:
+            monkeypatch.setattr(sys, "argv", ["bridge", "--map", "2:/fake-at"])
+            assert bridge.main() == 0
+    # EC20 的自动入口原本不复位；旧入口仍保留快速失败复位。
+    assert resets == [sim7600 and setting == "1", entry != "auto_ec20", False]
+    assert "实验" not in caplog.text
 
 
 @pytest.mark.parametrize("hold", [False, True])
@@ -204,8 +256,11 @@ def test_usb_non_timeout_error_does_not_increment_timeout_count():
     assert total["out_timeouts"] == 0
 
 
-@pytest.mark.parametrize("setting", [None, "0"])
-def test_reset_override_keeps_default_sequence_and_log(monkeypatch, caplog, setting):
+@pytest.mark.parametrize("setting", [None, "0", "1"])
+@pytest.mark.parametrize("reset_first", [False, True])
+def test_run_bridges_once_honors_reset_decision_regardless_of_env(
+    monkeypatch, caplog, setting, reset_first,
+):
     monkeypatch.delenv("CALLPILOT_BRIDGE_RESET_ON_START", raising=False)
     if setting is not None:
         monkeypatch.setenv("CALLPILOT_BRIDGE_RESET_ON_START", setting)
@@ -217,9 +272,8 @@ def test_reset_override_keeps_default_sequence_and_log(monkeypatch, caplog, sett
     stop = threading.Event()
     stop.set()
     with caplog.at_level("INFO"):
-        assert bridge.run_bridges_once(dev, [], stop, reset_first=True) is False
-    assert calls == (["reset", ("sleep", 1.0)] if setting is None else []) + ["discover", "dispose"]
-    assert [r.message for r in caplog.records] == [
-        "已复位 USB 设备（清除 stall 端点）" if setting is None
-        else "启动不复位（实验开关） CALLPILOT_BRIDGE_RESET_ON_START=0"
-    ]
+        assert bridge.run_bridges_once(dev, [], stop, reset_first=reset_first) is False
+    assert calls == (["reset", ("sleep", 1.0)] if reset_first else []) + ["discover", "dispose"]
+    assert [r.message for r in caplog.records] == (
+        ["已复位 USB 设备（清除 stall 端点）"] if reset_first else []
+    )
