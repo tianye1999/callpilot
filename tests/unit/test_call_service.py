@@ -825,8 +825,12 @@ def test_outbound_call_uses_digital_twin_prompt(monkeypatch):
     assert "查询本机套餐和剩余流量" in agent.said[0]
 
 
-def test_duplicate_sms_not_republished_or_reforwarded():
+def test_duplicate_sms_not_republished_or_reforwarded(monkeypatch):
     """补收/重复上报同一短信：去重后不重复入库、不重复转发邮件（#SMS 补收）。"""
+    from agentcall import notification_events
+
+    feed = notification_events.NotificationFeed()
+    monkeypatch.setattr(notification_events, "feed", feed)
     modem = FakeModem()
     hub = make_hub()
     forwarder = FakeSmsEmailForwarder(hub)
@@ -838,6 +842,11 @@ def test_duplicate_sms_not_republished_or_reforwarded():
     sms_in = [e for e in hub.history() if e.get("type") == "sms_in"]
     assert len(sms_in) == 1                     # 只入库一次
     assert forwarder.enqueued == [("10086", "余额100元")]  # 只转发一次
+    assert len(feed.read(0)["events"]) == 1
+    with notification_events.sms_backfill():
+        modem.trigger_sms("+12025550123", "历史补收", "26/07/01,14:00:00")
+    assert len(feed.read(0)["events"]) == 1
+    assert len(forwarder.enqueued) == 2
 
 
 def test_same_text_different_timestamp_both_delivered():

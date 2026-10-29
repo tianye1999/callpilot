@@ -293,6 +293,35 @@ def should_open_window(login: bool, setup_required: bool) -> bool:
     return not login or setup_required
 
 
+def write_notification_target(support: Path, target: str) -> None:
+    from .notification_events import valid_target
+
+    if not valid_target(target):
+        raise ValueError("无效通知目标")
+    support.mkdir(parents=True, exist_ok=True)
+    path = support / "notification-window"
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        os.chmod(temporary, 0o600)
+        stream.write(target)
+    temporary.replace(path)
+
+
+def take_notification_target(support: Path) -> str | None:
+    from .notification_events import valid_target
+
+    path = support / "notification-window"
+    try:
+        fresh = time.time() - path.stat().st_mtime < 300
+        target = path.read_text(encoding="utf-8")
+        path.unlink(missing_ok=True)
+        if fresh and valid_target(target):
+            return target
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def send_command(command: str, support: Path | None = None) -> None:
     if command not in {"open", "quit", "retry"}:
         raise ValueError("未知外壳命令")

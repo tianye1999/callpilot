@@ -1677,6 +1677,8 @@ const I18N = {
       HALF_DUPLEX_HANGOVER_SECONDS: "Half-duplex hangover (s)",
       HANGUP_TOOL_DELAY_SECONDS: "Hangup tool delay (s)",
       RECORDING_ENABLED: "Call recording", RECORDING_RETENTION_DAYS: "Recording retention (days)",
+      MAC_NOTIFICATIONS_ENABLED: "Mac notifications", MAC_NOTIFY_CONFIRM: "AI confirmation alerts",
+      MAC_NOTIFY_INFO: "Incoming calls, summaries and SMS", MAC_NOTIFY_ALERT: "Device and configuration alerts",
       SUMMARY_ENABLED: "Call summary", SUMMARY_MODEL: "Summary model",
       MONITOR_AI_PLAYBACK: "Monitor on this Mac", MONITOR_OUTPUT_DEVICE: "Monitor output device",
       MONITOR_AI_GAIN: "Monitor gain (AI)", MONITOR_UPLINK_GAIN: "Monitor gain (caller)",
@@ -2254,6 +2256,8 @@ function handleEvent(ev) {
   } else if (ev.type === "owner_confirm_request") {
     showConfirmCard(ev);
   } else if (ev.type === "owner_confirm_closed") {
+    closedConfirmIds.add(ev.id);
+    if (closedConfirmIds.size > 64) closedConfirmIds.delete(closedConfirmIds.values().next().value);
     hideConfirmCard(ev.id);
   }
 }
@@ -2278,6 +2282,7 @@ function setHoldBadge(active) {
 }
 
 let confirmCardState = null;  // { id, deadline, timerId, overlay }
+const closedConfirmIds = new Set();
 function hideConfirmCard(id) {
   if (!confirmCardState) return;
   if (id && confirmCardState.id !== id) return;
@@ -2294,6 +2299,10 @@ async function answerConfirmCard(choice) {
   hideConfirmCard(id);
 }
 function showConfirmCard(ev) {
+  const deadline = ev.deadline ? Number(ev.deadline) * 1000
+    : (ev.ts ? Number(ev.ts) * 1000 : Date.now()) + Number(ev.timeout_s || 60) * 1000;
+  if (deadline <= Date.now() || closedConfirmIds.has(ev.id)) return;
+  if (confirmCardState?.id === ev.id) return;
   hideConfirmCard();  // 同屏只留最新一张（工具层同时只会有一个在等）
   const overlay = el("div", "confirm-overlay show");
   const card = el("div", "confirm-card");
@@ -2314,7 +2323,6 @@ function showConfirmCard(ev) {
   card.appendChild(el("div", "cc-note", t("confirm_note")));
   overlay.appendChild(card);
   document.body.appendChild(overlay);
-  const deadline = Date.now() + Number(ev.timeout_s || 60) * 1000;
   const tick = () => {
     const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
     count.textContent = metFmt("confirm_countdown", { s: left });
@@ -3356,8 +3364,17 @@ async function toggleHistItem(item, id) {
 async function fetchHistory() {
   const r = await fetch("/api/history?limit=50");
   if (!r.ok) return [];
-  historyCache = await r.json();
-  return historyCache;
+  const calls = await r.json();
+  const match = location.hash.match(/^#history\/([A-Za-z0-9_+-]+)$/);
+  if (match && !calls.some((call) => call.id === match[1])) {
+    const response = await fetch(`/api/history/${encodeURIComponent(match[1])}`);
+    if (response.ok) {
+      const call = await response.json();
+      if (!call.active) calls.unshift(call);
+    }
+  }
+  historyCache = calls;
+  return calls;
 }
 async function loadHistory() {
   try {
@@ -3367,6 +3384,7 @@ async function loadHistory() {
     if (!calls.length) { list.appendChild(el("div", "empty", t("empty_history"))); return; }
     for (const c of calls) {
       const item = el("div", "hist-item");
+      item.dataset.callId = c.id;
       const head1 = el("div", "head");
       head1.appendChild(el("span", "num", c.number || t("unknown_number")));
       const right = el("span");
@@ -4608,6 +4626,37 @@ async function focusListenAnchor() {
   button.focus({preventScroll: true});
 }
 window.addEventListener("hashchange", focusListenAnchor);
+async function focusNotificationAnchor() {
+  const target = location.hash;
+  if (target === "#sms" || target === "#settings" || target === "#live") {
+    await navTo(target.slice(1));
+    return;
+  }
+  const confirm = target.match(/^#confirm\/([A-Za-z0-9_-]+)$/);
+  const call = target.match(/^#history\/([A-Za-z0-9_+-]+)$/);
+  try {
+    if (confirm) {
+      const response = await fetch("/api/notify/feed");
+      if (!response.ok || location.hash !== target) return;
+      const data = await response.json();
+      const pending = data.confirmations.find((entry) => entry.id === confirm[1]);
+      if (pending) showConfirmCard(pending);
+      else hideConfirmCard(confirm[1]);
+    } else if (call) {
+      const response = await fetch(`/api/history/${encodeURIComponent(call[1])}`);
+      const record = response.ok ? await response.json() : null;
+      if (location.hash !== target) return;
+      if (record?.active) { await navTo("live"); return; }
+      openCalls.add(call[1]);
+      await navTo("history");
+      if (currentPage !== "history") return;
+      await loadHistory();
+      document.querySelector(`[data-call-id="${call[1]}"]`)?.scrollIntoView({ block: "center" });
+    } else if (target === "#history") await navTo("history");
+  } catch (error) { console.warn("[notification] 打开目标失败", error); }
+}
+window.addEventListener("hashchange", focusNotificationAnchor);
+focusNotificationAnchor();
 $("listenBtn").addEventListener("click", () => $("listenBtn").classList.remove("listen-target"));
 focusListenAnchor();
 </script>

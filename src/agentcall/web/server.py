@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from contextlib import suppress
 from functools import partial
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
 from aiohttp.web_log import AccessLogger
@@ -53,7 +55,7 @@ _REMOTE_DIALER_CSP = (
 )
 
 # 通话 ID 白名单字符（call_log 生成的目录名），防路径穿越。
-_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_+-]+$")
 _REMOTE_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 
@@ -306,6 +308,7 @@ def build_app(
     app.router.add_get("/callpilot-192.png", _remote_dialer_asset)
     app.router.add_get("/callpilot-512.png", _remote_dialer_asset)
     app.router.add_get("/api/meta", _meta)
+    app.router.add_get("/api/notify/feed", _notification_feed)
     app.router.add_post("/api/macos/autostart", _macos_autostart)
     app.router.add_get("/ws", _websocket)
     app.router.add_get("/ws/audio", _audio_websocket)
@@ -334,6 +337,7 @@ def build_app(
     app.router.add_patch("/api/number_profiles/{profile_id}", _number_profiles_update)
     app.router.add_delete("/api/number_profiles/{profile_id}", _number_profiles_delete)
     app.router.add_get("/api/history", _history)
+    app.router.add_get("/api/history/{call_id}", _history_one)
     app.router.add_delete("/api/history", _history_clear)
     app.router.add_post("/api/history/{call_id}", _history_delete)
     app.router.add_delete("/api/history/{call_id}", _history_delete)
@@ -362,6 +366,29 @@ async def _index(request: web.Request) -> web.StreamResponse:
         index_file,
         headers={"Cache-Control": "no-cache, must-revalidate"},
     )
+
+
+async def _notification_feed(request: web.Request) -> web.Response:
+    # 不信任代理转发头；同时检查真实对端、Host 和 Origin，防止局域网访问和 DNS 重绑定。
+    try:
+        local = ipaddress.ip_address(request.remote or "").is_loopback
+        host = urlsplit(f"//{request.host}").hostname
+    except ValueError:
+        local, host = False, None
+    origin = request.headers.get("Origin")
+    if (not local or host not in {"localhost", "127.0.0.1", "::1"}
+            or (origin and origin != f"{request.scheme}://{request.host}")
+            or request.headers.get("Sec-Fetch-Site") == "cross-site"):
+        raise web.HTTPForbidden()
+    try:
+        after = int(request.query.get("after", "0"))
+        if after < 0:
+            raise ValueError
+    except ValueError:
+        raise web.HTTPBadRequest(text="after 必须为非负整数") from None
+    from ..notification_events import feed
+
+    return web.json_response(feed.read(after), headers={"Cache-Control": "no-store"})
 
 
 async def _metrics_page(request: web.Request) -> web.StreamResponse:
@@ -1133,6 +1160,39 @@ async def _history(request: web.Request) -> web.Response:
     loop = asyncio.get_running_loop()
     calls = await loop.run_in_executor(None, service.call_logger.list_calls, limit)
     return web.json_response(calls)
+
+
+async def _history_one(request: web.Request) -> web.Response:
+    # 通知可能在最近 50 通之外；按已有产物读取，不改变通话记录的写入时机。
+    service = require_call_logger(request)
+    call_id = request.match_info["call_id"]
+    if not _CALL_ID_RE.fullmatch(call_id):
+        raise web.HTTPBadRequest()
+    if call_id in _active_call_ids(service):
+        return web.json_response({"id": call_id, "active": True})
+    path = _call_artifact_path(service.call_logger.base_dir, call_id, "meta.json")
+    summary_path = _call_artifact_path(service.call_logger.base_dir, call_id, "summary.json")
+    if path is None or summary_path is None:
+        raise web.HTTPNotFound()
+
+    def read():
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                return None
+            value["id"] = call_id
+            try:
+                value["summary"] = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+            return value
+        except (OSError, ValueError):
+            return None
+
+    result = await asyncio.to_thread(read)
+    if result is None:
+        raise web.HTTPNotFound()
+    return web.json_response(result)
 
 
 def _active_call_ids(service) -> set[str]:

@@ -273,6 +273,41 @@ def test_listen_request_survives_startup_and_reuses_loaded_page(monkeypatch, tmp
     assert "toggleListen" not in scripts[0]
 
 
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.parametrize("target", ["#confirm/abc", "#history/call_abc", "#sms"])
+def test_notification_target_cold_and_existing_window(monkeypatch, tmp_path, initial, target):
+    import threading
+
+    from agentcall import macos_shell
+
+    loaded, focused = threading.Event(), threading.Event()
+    urls, scripts = [], []
+    window = types.SimpleNamespace(
+        load_url=lambda url: (urls.append(url), loaded.set()),
+        evaluate_js=lambda script: (scripts.append(script), focused.set()),
+        get_current_url=lambda: "http://test/",
+        restore=lambda: None, show=lambda: None,
+    )
+    if initial:
+        macos_shell.write_notification_target(tmp_path, target)
+    startup = desktop_app.BundledStartup(window, "http://test", types.SimpleNamespace(support_dir=tmp_path))
+    monkeypatch.setattr(macos_shell, "fetch_meta", lambda url: {"setup_required": False, "hardware": {}})
+    worker = threading.Thread(target=startup.run)
+    worker.start()
+    try:
+        assert loaded.wait(2)
+        assert urls == ["http://test/" + target if initial else "http://test"]
+        macos_shell.write_notification_target(tmp_path, target)
+        assert focused.wait(2)
+    finally:
+        startup.closed.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert target in scripts[0]
+    assert "hashchange" in scripts[0]
+    assert macos_shell.take_notification_target(tmp_path) is None
+
+
 @pytest.mark.parametrize("late_failure", [False, True])
 def test_launchctl_failure_shown_immediately_and_retry_recovers(monkeypatch, tmp_path, late_failure):
     import threading

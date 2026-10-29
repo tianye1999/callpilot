@@ -379,6 +379,11 @@ class CallSession:
         self._agent_output_rate = 24000
 
     def _publish(self, event: dict) -> None:
+        if event.get("type") == "call" and event.get("status") == "answered" and not self._outbound_number:
+            from .notification_events import publish_notification
+
+            target = f"#history/{self._record.id}" if self._record is not None else "#live"
+            publish_notification("info", "incoming", "AI 已接听来电", str(event.get("caller") or "未知号码"), target)
         if self.hub:
             self.hub.publish(event)
 
@@ -4386,6 +4391,9 @@ class CallAgentService:
                 )
             if not is_new:
                 return
+            from .notification_events import publish_notification
+
+            publish_notification("sms_received", sender, text)
             try:
                 self.sms_email_forwarder.enqueue(sender, text)
             except Exception as exc:  # noqa: BLE001 - 转发失败不能中断模组监听。

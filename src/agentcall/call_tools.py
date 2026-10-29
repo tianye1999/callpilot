@@ -460,6 +460,9 @@ class CallTools:
         confirm_id = uuid.uuid4().hex
         if self._hub is None:
             return {"success": False, "message": "确认通道不可用"}
+        from .notification_events import publish_notification
+
+        publish_notification("confirm_requested", confirm_id, question, timeout)
         self._hub.publish(
             {
                 "type": "owner_confirm_request",
@@ -484,6 +487,7 @@ class CallTools:
                 else "declined"
             )
         # 关闭事件：无论怎么结束都发，UI 据此收卡（含另一个标签页里超时的卡）。
+        publish_notification("confirm_closed", confirm_id)
         self._hub.publish(
             {
                 "type": "owner_confirm_closed",

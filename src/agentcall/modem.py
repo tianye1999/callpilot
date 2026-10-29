@@ -670,7 +670,10 @@ class SerialModem:
             delivered = False
             if self._on_sms:
                 try:
-                    self._on_sms(sender, body, timestamp)
+                    from .notification_events import sms_backfill
+
+                    with sms_backfill():
+                        self._on_sms(sender, body, timestamp)
                     delivered = True
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("补收短信回调异常: error_type=%s", type(exc).__name__)

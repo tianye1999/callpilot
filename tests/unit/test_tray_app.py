@@ -585,6 +585,19 @@ def test_open_listen_reuses_window_and_queues_anchor(monkeypatch, tmp_path):
     assert (tmp_path / "focus-window").exists()
 
 
+def test_open_notification_reuses_window_and_queues_validated_target(monkeypatch, tmp_path):
+    from agentcall.macos_shell import take_notification_target
+
+    proc = _FakeProc(123, True)
+    monkeypatch.setattr(tray_app, "open_or_focus_dashboard", lambda current: current)
+    assert tray_app.open_notification_dashboard(proc, "#confirm/abc", tmp_path) is proc
+    assert (tmp_path / "focus-window").exists()
+    assert take_notification_target(tmp_path) == "#confirm/abc"
+    assert take_notification_target(tmp_path) is None
+    with pytest.raises(ValueError):
+        tray_app.open_notification_dashboard(proc, "https://evil.example", tmp_path)
+
+
 @pytest.mark.parametrize("payload,success", [(b'{"ok":true}', True), (b'{"ok":false}', False),
                                             (b'bad', False)])
 def test_request_hangup_posts_existing_endpoint(monkeypatch, payload, success):

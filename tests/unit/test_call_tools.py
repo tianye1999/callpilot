@@ -608,6 +608,10 @@ def test_ask_owner_registered_only_for_outbound():
 
 
 def test_ask_owner_approved_and_declined(monkeypatch):
+    from agentcall import notification_events
+
+    feed = notification_events.NotificationFeed()
+    monkeypatch.setattr(notification_events, "feed", feed)
     monkeypatch.setenv("OWNER_CONFIRM_TIMEOUT_SECONDS", "5")
     hub = make_hub()
     record = SpyRecord()
@@ -661,9 +665,15 @@ def test_ask_owner_approved_and_declined(monkeypatch):
     audits = [f for (etype, f) in record.events if etype == "tool_call"
               and f.get("tool") == "ask_owner"]
     assert audits and all("55" not in str(f) for f in audits)
+    assert [e["kind"] for e in feed.read(0)["events"]] == ["confirm", "confirm_closed"] * 2
+    assert feed.read(0)["confirmations"] == []
 
 
 def test_ask_owner_timeout_is_declined_fail_closed(monkeypatch):
+    from agentcall import notification_events
+
+    feed = notification_events.NotificationFeed()
+    monkeypatch.setattr(notification_events, "feed", feed)
     monkeypatch.setenv("OWNER_CONFIRM_TIMEOUT_SECONDS", "1")
     hub = make_hub()
     tools, _, _ = make_tools(hub=hub, direction="outbound")
@@ -671,6 +681,8 @@ def test_ask_owner_timeout_is_declined_fail_closed(monkeypatch):
     result = tools.register().dispatch("ask_owner", {"question": "x"})
     assert time.monotonic() - started >= 0.9
     assert result["success"] is True and result["decision"] == "timeout"
+    assert [e["kind"] for e in feed.read(0)["events"]] == ["confirm", "confirm_closed"]
+    assert feed.read(0)["confirmations"] == []
 
 
 def test_ask_owner_rejects_empty_question():

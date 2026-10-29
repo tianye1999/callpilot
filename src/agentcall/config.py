@@ -245,6 +245,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 机主确认环（WIL-120 二期 Path A）：ask_owner 工具等 Web 确认卡答复的
     # 窗口；超时=拒绝（fail-closed，机主没看到不等于同意）。
     ConfigSpec("OWNER_CONFIRM_TIMEOUT_SECONDS", "机主确认等待窗口（秒）", "int", "60"),
+    ConfigSpec("MAC_NOTIFICATIONS_ENABLED", "Mac 系统通知", "bool", "true"),
+    ConfigSpec("MAC_NOTIFY_CONFIRM", "AI 确认提醒", "bool", "true"),
+    ConfigSpec("MAC_NOTIFY_INFO", "来电、摘要和短信提醒", "bool", "true"),
+    ConfigSpec("MAC_NOTIFY_ALERT", "设备或配置异常提醒", "bool", "true"),
     # Path B「我来说」（WIL-120 四期）：三方并入时拨给机主的第二号码
     # （不能是本机 SIM 自己的号）。留空 = Path B 不可用，确认卡按钮保持置灰。
     ConfigSpec("OWNER_SECOND_PHONE", "机主第二号码（三方并入用）", "str", ""),

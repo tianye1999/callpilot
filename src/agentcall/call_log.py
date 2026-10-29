@@ -246,6 +246,9 @@ class CallRecord:
                 )
                 summary_state = self._summary_state
             self._update_content_meta(content_updated_at, summary_state)
+        from .notification_events import publish_notification
+
+        publish_notification("summary_written", self.id, self.number, summary)
 
     def mark_summary_pending(self) -> None:
         """Persist that a summary worker was actually scheduled for this call."""

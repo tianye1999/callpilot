@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -322,6 +323,17 @@ def open_listen_dashboard(current_proc, support: Path | None = None):
     return proc
 
 
+def open_notification_dashboard(current_proc, target: str, support: Path | None = None):
+    from agentcall.macos_launchd import app_support_dir
+    from agentcall.macos_shell import write_notification_target
+
+    directory = support if support is not None else app_support_dir()
+    write_notification_target(directory, target)
+    proc = open_or_focus_dashboard(current_proc)
+    (directory / "focus-window").touch(mode=0o600)
+    return proc
+
+
 # ---- rumps 菜单栏胶水（薄层，惰性导入，仅 macOS）----
 
 def _acquire_tray_singleton_lock(lock_path: Path | None = None) -> "IO[str] | object | None":
@@ -485,6 +497,10 @@ def main() -> None:
             self._menu_open = False
             self._hangup_thread: threading.Thread | None = None
             self._hangup_result: bool | None = None
+            self._notifications = None
+            self._notification_clicks: queue.SimpleQueue[str] = queue.SimpleQueue()
+            self._notification_results: queue.SimpleQueue[dict] = queue.SimpleQueue()
+            self._setup_required = True
             self._status_item = rumps.MenuItem(status_label(False, lang))
             self._detail_item = rumps.MenuItem("")
             self._action_items = {
@@ -505,11 +521,20 @@ def main() -> None:
                 from dotenv import dotenv_values
 
                 from agentcall import macos_launchd, macos_shell
+                from agentcall.macos_notification_sender import TrayNotifications, make_native_sender
+                from agentcall.notification_events import SETTING_KEYS
 
                 layout = macos_launchd.make_layout(sys.executable)
+                env = dotenv_values(layout.env_file)
+                sender = make_native_sender(self._notification_clicks.put)
+                if sender is not None:
+                    settings = {key: str(env.get(key, "true")).lower() in {"1", "true", "yes"}
+                                for key in SETTING_KEYS}
+                    self._notifications = TrayNotifications(sender, settings)
+                setup = str(env.get("SETUP_DONE", "")).lower() not in {"1", "true", "yes"}
+                self._setup_required = setup
                 self._render_status()
                 macos_shell.write_startup_failure(layout.support_dir, "")
-                setup = str(dotenv_values(layout.env_file).get("SETUP_DONE", "")).lower() not in {"1", "true", "yes"}
                 if early_window is None and macos_shell.should_open_window("--login" in sys.argv, setup):
                     self._open(None)
                 # 先开本地窗口，再后台安装；不让 launchctl/健康轮询挡住 Cocoa 主循环。
@@ -543,6 +568,16 @@ def main() -> None:
                 return
             from agentcall.macos_shell import take_commands
 
+            if self._notifications is not None:
+                while not self._notification_results.empty():
+                    self._notifications.consume(self._notification_results.get_nowait())
+                self._notifications.expire()
+                while not self._notification_clicks.empty():
+                    target = self._notification_clicks.get_nowait()
+                    try:
+                        self._window_proc = open_notification_dashboard(self._window_proc, target)
+                    except OSError:
+                        logger.exception("打开通知目标失败")
             commands = take_commands()
             if "quit" in commands:
                 self._quit(None)
@@ -588,6 +623,10 @@ def main() -> None:
                 uptime=now - self._started_at, now=time.time(), lang=lang,
                 connecting_for=now - self._connecting_since if self._connecting_since is not None else 0,
             )
+            if "setup_required" in self._meta:
+                self._setup_required = self._meta["setup_required"]
+            if self._notifications is not None:
+                self._notifications.status(status.state, status.title, suppress=self._setup_required)
             if self._status_item.title != status.title:
                 self._status_item.title = status.title
             if self._detail_item.title != status.detail:
@@ -621,6 +660,12 @@ def main() -> None:
                         from agentcall.macos_shell import fetch_meta
 
                         self._meta = fetch_meta(web_url(), tray=True)
+                        if self._notifications is not None:
+                            from agentcall.macos_notification_sender import fetch_feed
+
+                            result = fetch_feed(web_url(), self._notifications.seq)
+                            if result is not None:
+                                self._notification_results.put(result)
 
                     self._probe_thread = threading.Thread(target=probe, daemon=True)
                     self._last_probe_started = now

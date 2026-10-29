@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import html as html_escape
+import json
 import logging
 import os
 import queue
@@ -42,6 +43,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +495,18 @@ class BundledStartup:
                 pass
             if not waiting:
                 if not startup_failure:
+                    target = macos_shell.take_notification_target(self.layout.support_dir)
+                    if target is not None:
+                        current = urlsplit(self.window.get_current_url() or "")
+                        trusted = urlsplit(self.url)
+                        if (current.scheme, current.netloc) != (trusted.scheme, trusted.netloc):
+                            self.window.load_url(self.url.rstrip("/") + "/" + target)
+                        else:
+                            self.window.evaluate_js(
+                                f"if (location.hash !== {json.dumps(target)}) {{ "
+                                f"location.hash = {json.dumps(target)}; }} "
+                                "else { window.dispatchEvent(new Event('hashchange')); }"
+                            )
                     if listen_request.exists():
                         # 重复点击仍定位；只改锚点，不刷新页面或触发音频播放。
                         self.window.evaluate_js(
@@ -510,6 +524,9 @@ class BundledStartup:
                 if listen_request.exists():
                     target = self.url.rstrip("/") + "/#listen"
                     listen_request.unlink(missing_ok=True)
+                notification_target = macos_shell.take_notification_target(self.layout.support_dir)
+                if notification_target is not None:
+                    target = self.url.rstrip("/") + "/" + notification_target
                 self.window.load_url(target)
                 waiting = False
             elif (startup_failure or time.monotonic() >= deadline) and not diagnosing:
