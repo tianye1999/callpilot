@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from queue import Empty, Full, Queue
 from typing import Awaitable, Callable
 
-from . import call_playbooks, config, platforms
+from . import call_playbooks, config, modem_hardware, platforms
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
@@ -4030,7 +4030,13 @@ class CallAgentService:
         vendor: str = "quectel",
     ) -> None:
         # modem/call_logger 参数供测试注入；默认按串口/环境配置自建。
+        self._auto_modem = vendor.strip().lower() == "auto"
+        vendor, modem_port, audio_mode, pcm_port = modem_hardware.resolve_settings(
+            vendor, modem_port, audio_mode, pcm_port,
+        )
         self.modem = modem or create_modem(modem_port, baudrate, vendor)
+        self._modem_vendor = getattr(self.modem, "vendor", vendor)
+        self._hardware_maintenance = False
         self.audio_keyword = audio_keyword
         self.provider = provider
         self.audio_mode = audio_mode
@@ -4087,6 +4093,8 @@ class CallAgentService:
             takeover_endpoint_factory=self._build_takeover_endpoint,
         )
         self._setup_callbacks()
+        if isinstance(self.modem, SerialModem):
+            self.modem.run_idle_hardware = self.run_idle_hardware
         if isinstance(self.modem, Sim7600Modem) and config.get_bool("MODEM_RESET_AFTER_CALL"):
             self._sim7600_reset = Sim7600CallReset(
                 self.modem, audio_mode, pcm_port, self._set_modem_connected,
@@ -4106,6 +4114,54 @@ class CallAgentService:
         )
         monitor.start()
         return monitor
+
+    def run_idle_hardware(self, action: Callable[[], None], *, hold: bool = False) -> bool:
+        """与来电/外呼共用占线锁；AT 工作在锁外运行，避免回调反向取锁。"""
+        with contextlib.ExitStack() as locks:
+            # 维护是可延后的工作；远程建会话可能持锁数秒，不能卡住 Web/CLCC。
+            for lock in (self._remote_setup_lock, self._ring_lock):
+                if not lock.acquire(blocking=False):
+                    return False
+                locks.callback(lock.release)
+            worker = self._remote_worker
+            if (self._hardware_maintenance or self.session.is_busy
+                    or self._remote_call_owner is not None or (worker and worker.is_running)
+                    or getattr(self.modem, "recovery_in_progress", False)
+                    or (isinstance(self.modem, SerialModem) and self.modem.is_connected()
+                        and self.modem._hardware_call_present)):
+                return False
+            self._hardware_maintenance = True
+        succeeded = False
+        try:
+            action()
+            succeeded = True
+            return True
+        finally:
+            if not hold or not succeeded:
+                with self._ring_lock:
+                    self._hardware_maintenance = False
+
+    def check_modem_vendor(self, restart: Callable[[], None]) -> bool:
+        if not self._auto_modem:
+            return False
+        state = modem_hardware.read_state()
+        if state is None or state["vendor"] == self._modem_vendor:
+            return False
+
+        def request() -> None:
+            logger.info("模组厂商变更 %s -> %s，线路空闲，重启服务", self._modem_vendor, state["vendor"])
+            restart()
+        return self.run_idle_hardware(request, hold=True)
+
+    def reread_sim(self) -> tuple[bool, str | None]:
+        if not isinstance(self.modem, SerialModem) or isinstance(self.modem, BluetoothModem):
+            return False, "unsupported_line"
+        try:
+            if not self.run_idle_hardware(self.modem.reread_sim):
+                return False, "line_busy"
+        except ValueError as exc:
+            return False, str(exc)
+        return True, None
 
     @staticmethod
     def _create_uplink_monitor() -> MonitorPlayback | None:
@@ -4178,6 +4234,8 @@ class CallAgentService:
             # 同一通来电会被 RING 主动上报和 CLCC 轮询重复触发，需去重：
             # 已有会话进行中时直接忽略，避免重复接听 / 抢占 PCM 串口导致崩溃。
             with self._ring_lock:
+                if self._hardware_maintenance or getattr(self.modem, "recovery_in_progress", False):
+                    return
                 if self._sim7600_reset is not None and (
                     self.modem.recovery_in_progress or not self.modem_connected
                 ):
@@ -4310,6 +4368,8 @@ class CallAgentService:
             return False, message
         self._remember_outbound_task(task)
         with self._ring_lock:
+            if self._hardware_maintenance or getattr(self.modem, "recovery_in_progress", False):
+                return False, "模组维护中，请稍后再拨"
             if self._sim7600_reset is not None:
                 guard_failure = self._dial_guard(number)
                 if guard_failure is not None:
@@ -4709,6 +4769,8 @@ class CallAgentService:
         return None
 
     def _dial_guard(self, number: str | None) -> DialGuardFailure | None:
+        if self._hardware_maintenance or getattr(self.modem, "recovery_in_progress", False):
+            return DialGuardFailure("MODEM_OFFLINE", "模组维护中，请稍后再拨")
         if isinstance(self.modem, BluetoothModem) and not self.modem.is_connected():
             return DialGuardFailure("MODEM_OFFLINE", "手机未连接，请检查手机蓝牙与 HFP 连接")
         return check_dial_guard(

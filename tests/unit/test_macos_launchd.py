@@ -49,7 +49,9 @@ def test_build_plists_use_current_bundle_and_application_support_paths(tmp_path)
         str(exe.resolve()),
         "--bridge",
     ]
-    assert bridge["ProgramArguments"][-1] == str(support / "logs" / "ec20_usb_pty.log")
+    assert bridge["ProgramArguments"][4:] == [
+        "--auto", "--log-file", str(support / "logs" / "modem_usb_pty.log"),
+    ]
     assert app["WorkingDirectory"] == str(support)
     assert app["StandardOutPath"] == str(support / "logs" / "launchd-app.out.log")
     env = app["EnvironmentVariables"]

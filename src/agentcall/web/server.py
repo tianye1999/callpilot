@@ -12,18 +12,19 @@ import secrets
 import subprocess
 import sys
 import wave
+from contextlib import suppress
 from functools import partial
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
 from serial.tools import list_ports
 
-from .. import config, metrics_report, platforms
+from .. import config, metrics_report, modem_hardware, platforms
 from ..audio_bridge import apply_pcm_gain
 from ..call_playbooks import list_playbooks, playbooks_enabled
 from ..contacts import is_reply_target_allowed
 from ..events import EventHub
-from ..modem import SerialModem, Sim7600Modem
+from ..modem import SerialModem
 from ..number_profiles import (
     ProfileConflictError,
     ProfileNotFoundError,
@@ -34,12 +35,12 @@ from ..number_profiles import (
     list_profiles,
     update_profile,
 )
-from ..port_detect import QUECTEL_VID
 from ..rate_limit import acquire_sms_send_slot
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+MODEM_VIDS = {preset.vid for preset in modem_hardware.PRESETS}
 _REMOTE_DIALER_CSP = (
     "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; "
     "style-src 'self'; connect-src 'self' wss:; media-src blob:; worker-src 'self' blob:; "
@@ -125,10 +126,9 @@ def _detect_quectel_usb_pyusb() -> bool:
         return False
     try:
         return any(
-            True
+            _dev.idVendor in MODEM_VIDS
             for _dev in usb.core.find(
                 find_all=True,
-                idVendor=QUECTEL_VID,
                 backend=_pyusb_backend(),
             )
         )
@@ -141,9 +141,9 @@ def _usb_tree_has_quectel(node) -> bool:
     if isinstance(node, dict):
         for key, value in node.items():
             if key == "vendor_id":
-                if isinstance(value, int) and value == QUECTEL_VID:
+                if isinstance(value, int) and value in MODEM_VIDS:
                     return True
-                if isinstance(value, str) and "0x2c7c" in value.lower():
+                if isinstance(value, str) and any(f"0x{vid:04x}" in value.lower() for vid in MODEM_VIDS):
                     return True
             if _usb_tree_has_quectel(value):
                 return True
@@ -176,13 +176,13 @@ def _detect_quectel_usb_system_profiler() -> bool:
 
 
 def detect_quectel_usb_online() -> bool:
-    """Best-effort EC20/EG25 USB VID presence check for the setup wizard."""
+    """兼容旧调用名；检测所有已知模组，而非仅 Quectel。"""
     if platforms.IS_MACOS:
         if _detect_quectel_usb_pyusb():
             return True
         return _detect_quectel_usb_system_profiler()
     try:
-        return any(getattr(port, "vid", None) == QUECTEL_VID for port in list_ports.comports())
+        return any(getattr(port, "vid", None) in MODEM_VIDS for port in list_ports.comports())
     except Exception as exc:  # noqa: BLE001
         logger.debug("Quectel USB scan failed: %s", exc)
         return False
@@ -280,6 +280,8 @@ def build_app(
     app["remote_cloud_api"] = remote_cloud_api
     app["remote_cloud_store"] = remote_cloud_store
     app["remote_cloud_client"] = remote_cloud_client
+    if restart_event is not None and getattr(service, "_auto_modem", False):
+        app.cleanup_ctx.append(_watch_modem_vendor)
 
     app.router.add_get("/", _index)
     app.router.add_get("/remote-dialer", _remote_dialer_redirect)
@@ -335,6 +337,7 @@ def build_app(
     app.router.add_post("/api/setup/complete", _setup_complete)
     app.router.add_post("/api/setup/test_sms", _setup_test_sms)
     app.router.add_post("/api/restart", _restart)
+    app.router.add_post("/api/modem/reread_sim", _reread_sim)
     app.router.add_static("/static/", STATIC_DIR)
     return app
 
@@ -405,11 +408,16 @@ async def _meta(request: web.Request) -> web.Response:
     meta["hardware"] = {
         "usb_online": detect_quectel_usb_online(),
         "modem_connected": bool(getattr(service, "modem_connected", False)),
-        "modem_resetting": isinstance(modem, Sim7600Modem) and modem.recovery_in_progress,
+        "modem_resetting": isinstance(modem, SerialModem) and modem.recovery_in_progress,
         "port": meta.get("port") or config.get_str("MODEM_PORT"),
+        "vendor": getattr(modem, "vendor", ""),
+        "model": getattr(modem, "model", ""),
+        "firmware": getattr(modem, "firmware", ""),
+        "signal": getattr(modem, "signal", {"csq": None, "level": "unknown", "updated_at": None}),
     }
     bluetooth = getattr(modem, "line_kind", "") == "bluetooth"
     if bluetooth and modem is not None:
+        meta["hardware"]["vendor"] = "bluetooth"
         meta["hardware"]["line_kind"] = "bluetooth"
         meta["capabilities"] = {"sms": False, "auto_answer": config.get_str("INBOUND_AI_ANSWER_MODE")
                                 in {"allowlist", "unanswered"}}
@@ -1282,10 +1290,34 @@ async def _restart(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": "当前运行方式不支持自动重启"}, status=501
         )
-    restart_event.set()
-    loop = asyncio.get_running_loop()
-    loop.call_later(0.4, loop.stop)
+    _request_restart(request.app)
     return web.json_response({"ok": True})
+
+
+def _request_restart(app: web.Application) -> None:
+    app["restart_event"].set()
+    asyncio.get_running_loop().call_later(0.4, asyncio.get_running_loop().stop)
+
+
+async def _watch_modem_vendor(app: web.Application):
+    async def watch() -> None:
+        while True:
+            await asyncio.sleep(2)
+            try:
+                app["service"].check_modem_vendor(lambda: _request_restart(app))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("模组变更检测失败: %s", type(exc).__name__)
+    task = asyncio.create_task(watch())
+    yield
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+async def _reread_sim(request: web.Request) -> web.Response:
+    service = require_service(request)
+    ok, reason = await asyncio.to_thread(service.reread_sim)
+    return web.json_response({"ok": ok, "error": reason}, status=200 if ok else 409)
 
 
 async def _post_config(request: web.Request) -> web.Response:

@@ -15,10 +15,12 @@ import re
 
 from serial.tools import list_ports
 
+from .modem_hardware import PRESETS
+
 logger = logging.getLogger(__name__)
 
 # Quectel 的 USB Vendor ID（EC20/EG25 全系共用）。
-QUECTEL_VID = 0x2C7C
+QUECTEL_VID = PRESETS[0].vid
 
 # 官方驱动四口惯例顺序 DM/NMEA/AT/PPP，AT 口是第 3 个（下标 2）。
 _AT_INTERFACE_INDEX = 2
@@ -35,13 +37,13 @@ def _device_order_key(device: str) -> tuple[str, int]:
     return device[: match.start()], int(match.group(1))
 
 
-def detect_at_port() -> str | None:
+def detect_at_port(*, vid: int = QUECTEL_VID) -> str | None:
     """扫描 Quectel 设备并返回 AT 口设备名；找不到返回 ``None``。
 
     优先取 description 含独立单词 "AT" 的口；没有则按接口顺序惯例
     取第 3 个 Quectel 口回退；无 Quectel 设备或口数不足时返回 ``None``。
     """
-    quectel = [p for p in list_ports.comports() if p.vid == QUECTEL_VID]
+    quectel = [p for p in list_ports.comports() if p.vid == vid]
     if not quectel:
         logger.info("未扫描到 Quectel 设备 (VID=0x%04X)", QUECTEL_VID)
         return None

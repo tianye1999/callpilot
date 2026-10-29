@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 import serial
 
-from . import config, platforms, port_detect
+from . import config, modem_hardware, platforms, port_detect
 from .sim_identity import (
     UNKNOWN_SIM,
     SimIdentity,
@@ -197,6 +197,14 @@ def _looks_like_pdu(body: str) -> bool:
     return len(compact) >= 20 and bool(re.fullmatch(r"[0-9A-Fa-f]+", compact))
 
 
+def parse_csq(response: str) -> tuple[int | None, str]:
+    match = re.search(r"\+CSQ:\s*(\d+)\s*,\s*\d+", response)
+    csq = int(match.group(1)) if match else None
+    if csq is None or not 0 <= csq <= 31:
+        return csq, "unknown"
+    return csq, "weak" if csq < 10 else "fair" if csq < 15 else "good" if csq < 20 else "excellent"
+
+
 class SerialModem:
     """串口 AT 模组基类：来电监听、接听、挂断、收发短信、SIM 身份等厂商无关逻辑。
 
@@ -209,6 +217,13 @@ class SerialModem:
     def __init__(self, port: str, baudrate: int = 115200) -> None:
         self.port = port
         self.baudrate = baudrate
+        self.model = ""
+        self.firmware = ""
+        self.signal: dict[str, Any] = {"csq": None, "level": "unknown", "updated_at": None}
+        self._last_signal_poll = 0.0
+        self._sim_reread_until = 0.0
+        self._hardware_call_present = False
+        self.run_idle_hardware: Callable[[Callable[[], None]], bool] | None = None
         # port 为 auto 哨兵时每次打开都重新探测，这里存本次解析出的实际端口（供日志）。
         self._active_port: str | None = None
         # SIM 身份缓存(#88):连接/重连后读一次 CIMI/CREG/CEREG;换卡靠重插/重连触发刷新。
@@ -274,6 +289,86 @@ class SerialModem:
         self._emit_connection_state(True)
         self._emit_current_sim_identity()
         logger.info("模组已连接: %s", self._active_port)
+
+    @property
+    def vendor(self) -> str:
+        return "quectel"
+
+    def refresh_hardware_info(self) -> None:
+        for attr, command in (("model", "AT+CGMM"), ("firmware", "AT+CGMR")):
+            value = ""
+            try:
+                response = self._write_command(command)
+                if "OK" in response and "ERROR" not in response:
+                    prefix = command.removeprefix("AT") + ":"
+                    lines = []
+                    for line in response.splitlines():
+                        line = line.strip()
+                        if line.startswith(prefix):
+                            line = line.removeprefix(prefix).strip()
+                        elif line in {command, "OK"} or line.startswith("+"):
+                            continue
+                        if line:
+                            lines.append(line)
+                    value = " ".join(lines)
+            except Exception:  # noqa: BLE001
+                pass
+            setattr(self, attr, value)
+
+    def poll_signal(self) -> None:
+        interval = config.get_int("MODEM_SIGNAL_POLL_SECONDS")
+        if interval <= 0 or time.monotonic() - self._last_signal_poll < interval:
+            return
+
+        def poll() -> None:
+            with self._serial_lock:
+                if (not self.is_connected() or self.recovery_in_progress or self._opening
+                        or self._hardware_call_present or self._call_connected_event.is_set()):
+                    return
+                self._last_signal_poll = time.monotonic()
+                try:
+                    # 可选观测失败不触发重连，更不能重发并干扰通话链路。
+                    csq, level = parse_csq(self._write_command("AT+CSQ"))
+                    if csq is not None:
+                        self.signal = {"csq": csq, "level": level, "updated_at": time.time()}
+                except Exception:  # noqa: BLE001
+                    pass
+        if self.run_idle_hardware is not None:
+            self.run_idle_hardware(poll)
+        else:
+            poll()
+
+    def reread_sim(self) -> None:
+        """只重启未就绪的 SIM；不重试 CFUN，防止重枚举后再次重启。"""
+        with self._serial_lock:
+            if not self.is_connected() or self.recovery_in_progress:
+                raise ValueError("modem_unavailable")
+            if self.sim_identity.present:
+                raise ValueError("sim_already_ready")
+            calls = self._write_command("AT+CLCC")
+            if "OK" not in calls or parse_clcc_lines(calls) or self._call_connected_event.is_set():
+                raise ValueError("line_busy")
+            try:
+                response = self._write_command("AT+CFUN=1,1")
+                if "ERROR" in response:
+                    raise ValueError("sim_reset_rejected")
+            except (serial.SerialException, OSError):
+                # USB 可能先于 OK 消失；交回现有重连线程确认结果，不重发。
+                pass
+            self._sim_reread_until = time.monotonic() + 8
+            self._maintenance_generation += 1
+            with self._sim_refresh_lock:
+                self._sim_refresh_generation += 1
+                self._sim_refresh_requested_generation = None
+            self._buffer = ""
+            self._set_sim_identity(UNKNOWN_SIM, notify=False)
+            self.signal = {"csq": None, "level": "unknown", "updated_at": None}
+            try:
+                if self._ser:
+                    self._ser.close()
+            finally:
+                self._ser = None
+        self._emit_connection_state(False)
 
     def send_command(self, command: str) -> str:
         """发送一条原始 AT 指令，返回模组原始响应文本（最底层原子能力）。
@@ -389,7 +484,8 @@ class SerialModem:
         """
         if self.port != platforms.AUTO_PORT:
             return self.port
-        detected = port_detect.detect_at_port()
+        detected = (port_detect.detect_at_port(vid=modem_hardware.SIM7600_VID)
+                    if self.vendor == "simcom" else port_detect.detect_at_port())
         if detected is None:
             raise serial.SerialException("MODEM_PORT=auto 未探测到 Quectel AT 串口")
         return detected
@@ -412,6 +508,9 @@ class SerialModem:
                 self._drain()
                 self._send("AT")
                 self._send("ATE0")
+                # 型号/固件与信号轮询共用硬件展示开关，默认关闭时保持原连接指令序列。
+                if config.get_int("MODEM_SIGNAL_POLL_SECONDS") > 0:
+                    self.refresh_hardware_info()
                 self._send("AT+CLIP=1")
                 self._init_sms()
                 self._send("AT+QSIMSTAT=1")
@@ -639,6 +738,10 @@ class SerialModem:
         self._on_sim_identity = callback
 
     def _emit_connection_state(self, online: bool) -> None:
+        if not online:
+            # 断线后旧 CLCC 不再代表占线；是否仍有会话由服务的占线锁判断。
+            self._hardware_call_present = False
+            self.signal = {"csq": None, "level": "unknown", "updated_at": None}
         recovery_seconds: float | None = None
         now = time.time()
         with self._connection_state_lock:
@@ -999,11 +1102,11 @@ class SerialModem:
 
     @property
     def recovery_in_progress(self) -> bool:
-        return False
+        return time.monotonic() < self._sim_reread_until
 
     @property
     def transport_paused(self) -> bool:
-        return False
+        return time.monotonic() < self._sim_reread_until
 
     def pcm_ready(self) -> bool:
         return self._pcm_ready_event.is_set()
@@ -1171,6 +1274,8 @@ class SerialModem:
             if generation != self._maintenance_generation:
                 continue
             self._process_clcc_response(response)
+            self._hardware_call_present = bool(parse_clcc_lines(response)) or "OK" not in response
+            self.poll_signal()
             time.sleep(2)
 
     def _process_clcc_response(self, response: str) -> None:
@@ -1397,7 +1502,7 @@ class Sim7600Modem(SerialModem):
     _DEGRADED_ENABLE_ATTEMPTS = 2
     # 通话结束后写这个哨兵文件，由 USB 桥进程读到后执行组合切换自愈（WIL-109）。
     # 只报告不自己动手：桥才是 USB 设备的持有者。
-    RECOVERY_REQUEST_PATH = "/tmp/sim7600-recover-request"
+    RECOVERY_REQUEST_PATH = modem_hardware.RECOVERY_REQUEST_PATH
 
     # 刚接通瞬间 CPCMREG=1 偶发未就绪（真机实测：同样接通，有时首发 OK、有时 ERROR）。
     # 音频桥一旦 start() 就持续往 iface4 写 PCM，若此刻 CPCMREG 未生效、模组不排空该
@@ -1426,12 +1531,18 @@ class Sim7600Modem(SerialModem):
         return self._reset_in_progress
 
     @property
+    def vendor(self) -> str:
+        return "simcom"
+
+    @property
     def recovery_in_progress(self) -> bool:
-        return self._reset_in_progress
+        return self._reset_in_progress or super().recovery_in_progress
 
     @property
     def transport_paused(self) -> bool:
-        return self._reset_in_progress and not getattr(self._reset_access, "allowed", False)
+        return super().transport_paused or (
+            self._reset_in_progress and not getattr(self._reset_access, "allowed", False)
+        )
 
     def is_connected(self) -> bool:
         return not self._reset_in_progress and super().is_connected()
@@ -1669,6 +1780,10 @@ def create_modem(
     回退 quectel 并告警，保证现网行为不变。
     """
     normalized = (vendor or "quectel").strip().lower()
+    if normalized == "auto":
+        normalized, port, _, _ = modem_hardware.resolve_settings(
+            normalized, port, config.get_str("MODEM_AUDIO_MODE"), None,
+        )
     if normalized in ("quectel", "ec20", "eg25"):
         return Eg25Modem(port, baudrate)
     if normalized in ("simcom", "sim7600", "sim7600g"):

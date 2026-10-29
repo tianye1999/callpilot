@@ -110,8 +110,12 @@ def test_setup_hardware_shows_lte_registration_for_volte_only_sim():
     text = INDEX.read_text(encoding="utf-8")
 
     assert "!sim.registered && sim.eps_registered" in text
-    assert "网络已接入 · LTE ${sim.eps_status}" in text
+    assert 't("setup_network_lte")' in text
     assert "${sim.carrier} · ${simRegistration}" in text
+    assert 'sim.network_attached ? "ready"' in text
+    assert 'hw.port || "-"' not in text
+    assert 'postJson("/api/modem/reread_sim", {})' in text
+    assert 'setup_hint_denied:' in text
 
 
 def test_dashboard_listener_recovers_suspended_web_audio():

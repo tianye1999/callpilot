@@ -284,6 +284,8 @@ def test_meta_includes_setup_and_hardware_status(monkeypatch):
         "modem_connected": False,
         "modem_resetting": False,
         "port": "/tmp/ec20-at",
+        "vendor": "", "model": "", "firmware": "",
+        "signal": {"csq": None, "level": "unknown", "updated_at": None},
     }
     assert meta["setup_sms_token"]
 
@@ -397,10 +399,70 @@ def test_quectel_usb_detection_on_non_macos_keeps_serial_scan(monkeypatch):
     monkeypatch.setattr(
         server.list_ports,
         "comports",
-        lambda: [SimpleNamespace(vid=server.QUECTEL_VID)],
+        lambda: [SimpleNamespace(vid=0x2C7C)],
     )
 
     assert server.detect_quectel_usb_online() is True
+
+
+def test_sim7600_usb_detection_on_both_scan_paths(monkeypatch):
+    import usb.core
+
+    monkeypatch.setattr(server.list_ports, "comports", lambda: [SimpleNamespace(vid=0x1E0E)])
+    monkeypatch.setattr(platforms, "IS_MACOS", False)
+    assert server.detect_quectel_usb_online()
+    monkeypatch.setattr(platforms, "IS_MACOS", True)
+    monkeypatch.setattr(usb.core, "find", lambda **kw: [SimpleNamespace(idVendor=0x1E0E)])
+    monkeypatch.setattr(server, "_pyusb_backend", lambda: None)
+    assert server.detect_quectel_usb_online()
+    assert server._usb_tree_has_quectel({"items": [{"vendor_id": "0x1e0e (SIMCom)"}]})
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_reread_sim_api_requires_auth_and_idle_line(monkeypatch, busy):
+    from agentcall.call_agent import CallAgentService
+    from agentcall.modem import Sim7600Modem
+
+    modem = Sim7600Modem("unused")
+    modem._connection_online = True
+    sent = []
+    monkeypatch.setattr(modem, "_write_command", lambda cmd: sent.append(cmd) or "OK")
+    service = CallAgentService("unused", "unused", modem=modem)
+    service.session._active = busy
+    app = build_app(hub=None, modem=modem, service=service, auth_token="test-token")
+
+    async def fn(client):
+        denied = await client.post("/api/modem/reread_sim", json={})
+        assert denied.status == 401
+        assert sent == []
+        response = await client.post("/api/modem/reread_sim", json={}, headers={"Authorization": "Bearer test-token"})
+        assert response.status == (409 if busy else 200)
+        return await response.json()
+    try:
+        result = api(app, fn)
+        assert result == {"ok": not busy, "error": "line_busy" if busy else None}
+        assert sent == ([] if busy else ["AT+CLCC", "AT+CFUN=1,1"])
+    finally:
+        service.session._active = False
+        service.stop_service()
+
+
+def test_meta_exposes_cached_modem_info_and_signal(monkeypatch):
+    from agentcall.modem import Sim7600Modem
+
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+    modem = Sim7600Modem("unused")
+    modem.model = "TEST-MODEL"
+    modem.firmware = "TEST-FIRMWARE"
+    modem.signal = {"csq": 19, "level": "good", "updated_at": 123.0}
+    service = FakeService()
+    service.modem = modem
+    async def fn(client):
+        return await (await client.get("/api/meta")).json()
+    hw = api(build_app(hub=None, modem=modem, service=service), fn)["hardware"]
+    assert hw["vendor"] == "simcom"
+    assert hw["model"] == "TEST-MODEL" and hw["firmware"] == "TEST-FIRMWARE"
+    assert hw["signal"] == modem.signal
 
 
 def test_validate_key_endpoint_valid_invalid_and_network(monkeypatch):
@@ -1120,7 +1182,9 @@ def test_meta_returns_injected_metadata(monkeypatch):
     assert meta["model"] == "qwen-x"
     assert meta["credentials"]["ok"] is False
     assert meta["setup_required"] is True
-    assert set(meta["hardware"]) == {"usb_online", "modem_connected", "modem_resetting", "port"}
+    assert set(meta["hardware"]) == {
+        "usb_online", "modem_connected", "modem_resetting", "port", "vendor", "model", "firmware", "signal",
+    }
 
 
 @pytest.mark.parametrize("simcom", [False, True])

@@ -23,6 +23,113 @@ def make_modem() -> Eg25Modem:
     return Eg25Modem(port="/dev/null-not-used")
 
 
+@pytest.mark.parametrize("csq,level", [
+    (0, "weak"), (9, "weak"), (10, "fair"), (14, "fair"),
+    (15, "good"), (19, "good"), (20, "excellent"), (31, "excellent"),
+    (99, "unknown"), (32, "unknown"),
+])
+def test_csq_signal_levels(csq, level):
+    from agentcall.modem import parse_csq
+
+    assert parse_csq(f"\r\n+CSQ: {csq},99\r\nOK\r\n")[1] == level
+    assert parse_csq("ERROR") == (None, "unknown")
+
+
+@pytest.mark.parametrize("blocked", ["call", "reset", "disconnected", "disabled", "none"])
+def test_signal_poll_only_when_idle(monkeypatch, blocked):
+    modem = make_sim7600()
+    monkeypatch.setenv("MODEM_SIGNAL_POLL_SECONDS", "0" if blocked == "disabled" else "60")
+    modem._connection_online = blocked != "disconnected"
+    modem._reset_in_progress = blocked == "reset"
+    if blocked == "call":
+        modem._call_connected_event.set()
+    sent = []
+    monkeypatch.setattr(modem, "_write_command", lambda cmd: sent.append(cmd) or "+CSQ: 20,99\r\nOK")
+    modem.poll_signal()
+    assert sent == (["AT+CSQ"] if blocked == "none" else [])
+    if blocked == "none":
+        assert modem.signal["level"] == "excellent"
+        modem.poll_signal()
+        assert sent == ["AT+CSQ"]
+
+
+@pytest.mark.parametrize("response", ["TEST-MODEL\r\nOK", "AT+CGMM\r\n+CGMM: TEST-MODEL\r\nOK"])
+def test_modem_info_failure_is_optional(monkeypatch, response):
+    modem = make_modem()
+    monkeypatch.setattr(modem, "_write_command", lambda cmd: response if cmd == "AT+CGMM" else "ERROR")
+    modem.refresh_hardware_info()
+    assert modem.model == "TEST-MODEL"
+    assert modem.firmware == ""
+
+
+@pytest.mark.parametrize("poll_seconds", [0, 60])
+def test_open_serial_hardware_info_follows_signal_poll_switch(monkeypatch, poll_seconds):
+    from types import SimpleNamespace
+
+    modem = make_modem()
+    monkeypatch.setenv("MODEM_SIGNAL_POLL_SECONDS", str(poll_seconds))
+    monkeypatch.setattr(serial, "Serial", lambda **kwargs: SimpleNamespace(reset_input_buffer=lambda: None))
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    sent = []
+    monkeypatch.setattr(modem, "_write_command", lambda command: sent.append(command) or "OK")
+
+    modem._open_serial()
+
+    # 关闭硬件状态展示时，完整连接指令序列保持原样；开启仅增加型号和固件查询。
+    expected = ["AT", "ATE0"]
+    if poll_seconds > 0:
+        expected += ["AT+CGMM", "AT+CGMR"]
+    expected += [
+        "AT+CLIP=1", "AT+CMGF=1", 'AT+CPMS="SM","SM","SM"',
+        "AT+CNMI=2,1,0,0,0", 'AT+CMGL="ALL"', "AT+QSIMSTAT=1",
+        "AT+CREG=1", "AT+CEREG=1", "AT+CIMI", "AT+CIMI", "AT+CIMI",
+        "AT+CREG?", "AT+CEREG?",
+    ]
+    assert sent == expected
+
+
+def test_reread_sim_sends_reset_once_and_pauses_transport(monkeypatch):
+    modem = make_sim7600()
+    modem._connection_online = True
+    sent = []
+    monkeypatch.setattr(modem, "_write_command", lambda cmd: sent.append(cmd) or "OK")
+    modem.reread_sim()
+    assert sent == ["AT+CLCC", "AT+CFUN=1,1"]
+    assert modem.recovery_in_progress
+    assert modem.transport_paused
+    assert modem._maintenance_generation == 1
+    assert modem._sim_refresh_generation == 1
+
+
+def test_reread_sim_rejects_physical_call_and_ready_sim(monkeypatch):
+    from dataclasses import replace
+
+    modem = make_sim7600()
+    modem._connection_online = True
+    sent = []
+    monkeypatch.setattr(modem, "_write_command", lambda cmd: sent.append(cmd) or "+CLCC: 1,0,0,0,0\r\nOK")
+    with pytest.raises(ValueError, match="line_busy"):
+        modem.reread_sim()
+    assert sent == ["AT+CLCC"]
+    modem._sim_identity = replace(modem.sim_identity, present=True)
+    sent.clear()
+    with pytest.raises(ValueError, match="sim_already_ready"):
+        modem.reread_sim()
+    assert sent == []
+
+
+def test_signal_failure_preserves_cache_without_reconnect(monkeypatch):
+    modem = make_modem()
+    modem._connection_online = True
+    monkeypatch.setenv("MODEM_SIGNAL_POLL_SECONDS", "60")
+    def fail(command):
+        raise OSError("optional read failed")
+    monkeypatch.setattr(modem, "_write_command", fail)
+    old = modem.signal.copy()
+    modem.poll_signal()
+    assert modem.signal == old
+
+
 # ---- create_modem 厂商工厂 ----
 
 def test_create_modem_defaults_to_quectel():

@@ -17,6 +17,16 @@ IS_LINUX = sys.platform == "linux"
 AUTO_PORT = "auto"
 
 
+def default_modem_vendor() -> str:
+    """只有打包版 macOS 自动识别；源码与其他平台保持原默认值。"""
+    frozen = bool(getattr(sys, "frozen", False) or getattr(sys, "_MEIPASS", None))
+    return "auto" if IS_MACOS and frozen else "quectel"
+
+
+def default_signal_poll_seconds() -> int:
+    return 60 if default_modem_vendor() == "auto" else 0
+
+
 def default_modem_port() -> str:
     """按平台给 MODEM_PORT 默认值。
 

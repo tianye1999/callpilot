@@ -219,7 +219,7 @@ def main() -> None:
     meta = config.runtime_meta(
         provider=provider,
         model=config.get_str(model_name_keys.get(provider, "AGENT_MODEL_NAME")),
-        port=modem_port,
+        port=getattr(service.modem, "port", modem_port),
     )
 
     # 韧性启动：模组连接交给后台 supervisor 反复重试，Web 服务不因模组缺席而退出。

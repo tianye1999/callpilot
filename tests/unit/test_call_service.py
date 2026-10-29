@@ -40,6 +40,67 @@ def make_hub() -> EventHub:
     return EventHub(asyncio.new_event_loop())
 
 
+@pytest.mark.parametrize("busy,auto,expected", [(False, True, True), (True, True, False), (False, False, False)])
+def test_vendor_change_restarts_only_auto_idle(monkeypatch, busy, auto, expected):
+    from agentcall import modem_hardware
+
+    service = make_service(FakeModem())
+    service._auto_modem = auto
+    service.session._active = busy
+    monkeypatch.setattr(modem_hardware, "read_state", lambda: {"vendor": "simcom"})
+    restarts = []
+    try:
+        assert service.check_modem_vendor(lambda: restarts.append(True)) is expected
+        assert restarts == ([True] if expected else [])
+        assert service._hardware_maintenance is expected
+    finally:
+        service.stop_service()
+
+
+def test_idle_hardware_reservation_rejects_new_dial(monkeypatch):
+    service = make_service(FakeModem())
+    try:
+        def action():
+            assert service._dial_guard(None) is not None
+            assert not service.run_idle_hardware(lambda: None)
+        assert service.run_idle_hardware(action)
+        assert not service._hardware_maintenance
+    finally:
+        service.stop_service()
+
+
+def test_vendor_swap_after_call_disconnect_drops_stale_clcc(monkeypatch):
+    from agentcall import modem_hardware
+    from agentcall.modem import Eg25Modem
+
+    modem = Eg25Modem("unused")
+    service = CallAgentService("unused", "unused", modem=modem)
+    service._auto_modem = True
+    modem._hardware_call_present = True
+    modem._emit_connection_state(False)
+    modem._hardware_call_present = True  # 模拟断线后旧 CLCC 才落地。
+    monkeypatch.setattr(modem_hardware, "read_state", lambda: {"vendor": "simcom"})
+    try:
+        service.session._active = True
+        assert not service.check_modem_vendor(lambda: None)
+        service.session._active = False
+        assert service.check_modem_vendor(lambda: None)
+    finally:
+        service.stop_service()
+
+
+@pytest.mark.parametrize("lock_name", ["_ring_lock", "_remote_setup_lock"])
+def test_optional_hardware_work_never_waits_for_line_locks(lock_name):
+    service = make_service(FakeModem())
+    try:
+        lock = getattr(service, lock_name)
+        with lock:
+            assert not service.run_idle_hardware(lambda: None)
+        assert service.run_idle_hardware(lambda: None)
+    finally:
+        service.stop_service()
+
+
 class FakeSmsEmailForwarder:
     def __init__(self, hub: EventHub | None = None) -> None:
         self.hub = hub

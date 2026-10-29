@@ -329,8 +329,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 模组 ----
     # 模组厂商：quectel=EC20/EG25（UAC/QPCMV 音频）；simcom=SIM7600（CPCMREG
     # PCM-over-USB 音频，须配 MODEM_AUDIO_MODE=nmea 走串口 PCM 桥）。
-    ConfigSpec("MODEM_VENDOR", "模组厂商", "select", "quectel",
-               choices=("quectel", "simcom", "bluetooth"), requires_restart=True),
+    ConfigSpec("MODEM_VENDOR", "模组厂商", "select", platforms.default_modem_vendor(),
+               choices=("auto", "quectel", "simcom", "bluetooth"), requires_restart=True),
+    ConfigSpec("MODEM_SIGNAL_POLL_SECONDS", "信号轮询间隔（秒，0 关闭）", "int",
+               str(platforms.default_signal_poll_seconds())),
     ConfigSpec("BLUETOOTH_PHONE_ADDRESS", "手机蓝牙地址", "str", "",
                help="仅 Linux 蓝牙手机线路；只填本地 .env，不上传手机地址。",
                secret=True, editable=False, hidden=True, requires_restart=True),
@@ -577,6 +579,11 @@ def get_spec(key: str) -> ConfigSpec:
 
 
 # ---- 类型化读取（读 os.environ，缺省回落注册表默认值）----
+
+
+def is_explicit(key: str) -> bool:
+    """.env 已由入口加载到环境；键存在即显式设置，空值也不被预设覆盖。"""
+    return key in os.environ
 
 
 def get_str(key: str) -> str:

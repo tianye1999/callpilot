@@ -27,16 +27,19 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from agentcall.modem_hardware import (  # noqa: E402
+    RECOVERY_REQUEST_PATH,
+    SIM7600_ALT_PID,
+    SIM7600_PID,
+    SIM7600_VID,
+)
+from agentcall.modem_hardware import (  # noqa: E402
+    SIM7600_MAPS as DEFAULT_MAPS,
+)
 from scripts import ec20_usb_pty  # noqa: E402  # 需先补 sys.path
-
-SIM7600_VID = 0x1E0E
-SIM7600_PID = 0x9001
-# 恢复用的备用 USB 组合（切到它再切回可触发重枚举，等效物理断电重插）。
-SIM7600_ALT_PID = 0x9011
-DEFAULT_MAPS = ["2:/tmp/sim7600-at", "4:/tmp/sim7600-pcm"]
-# 与 agentcall.modem.Sim7600Modem.RECOVERY_REQUEST_PATH 约定一致。
-RECOVERY_REQUEST_PATH = "/tmp/sim7600-recover-request"
 
 
 def main() -> int:

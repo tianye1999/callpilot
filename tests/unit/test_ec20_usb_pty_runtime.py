@@ -9,6 +9,82 @@ pytest.importorskip("fcntl", reason="EC20 PTY bridge is POSIX-only")
 from scripts import ec20_usb_pty
 
 
+def test_auto_bridge_reselects_after_unplug(monkeypatch, tmp_path):
+    import threading
+
+    from agentcall import modem_hardware as hardware
+
+    monkeypatch.setattr(hardware, "STATE_PATH", tmp_path / "state.json")
+    stop = threading.Event()
+    devices = iter([(object(), hardware.PRESETS[0]), (object(), hardware.PRESETS[1])])
+    monkeypatch.setattr(ec20_usb_pty, "find_auto_device", lambda: next(devices))
+    seen = []
+    def bridge(dev, maps, stop, **kwargs):
+        kwargs["heartbeat"]()
+        seen.append(hardware.read_state()["vendor"])
+        if len(seen) == 2:
+            assert kwargs["reset_first"] is True
+            assert str(kwargs["recovery_request"]) == hardware.RECOVERY_REQUEST_PATH
+            stop.set()
+        return False
+    monkeypatch.setattr(ec20_usb_pty, "run_bridges_once", bridge)
+    assert ec20_usb_pty.run_auto(stop, poll_seconds=0) == 0
+    assert seen == ["quectel", "simcom"]
+    assert hardware.read_state() is None
+
+
+def test_auto_waits_without_device_and_does_not_reset_normal_reconnect(monkeypatch, tmp_path):
+    import threading
+
+    from agentcall import modem_hardware as hardware
+
+    monkeypatch.setattr(hardware, "STATE_PATH", tmp_path / "state.json")
+    stop = threading.Event()
+    devices = iter([None, (object(), hardware.PRESETS[1]), None, (object(), hardware.PRESETS[1])])
+    monkeypatch.setattr(ec20_usb_pty, "find_auto_device", lambda: next(devices))
+    clock = [100.0]
+    monkeypatch.setattr(ec20_usb_pty.time, "monotonic", lambda: clock[0])
+    resets = []
+    def bridge(dev, maps, stop, **kwargs):
+        resets.append(kwargs["reset_first"])
+        clock[0] += 10
+        if len(resets) == 2:
+            stop.set()
+        return False
+    monkeypatch.setattr(ec20_usb_pty, "run_bridges_once", bridge)
+    assert ec20_usb_pty.run_auto(stop, poll_seconds=0) == 0
+    assert resets == [True, False]
+
+
+def test_explicit_bridge_cli_keeps_maps_and_defaults(monkeypatch):
+    seen = []
+    monkeypatch.setattr(ec20_usb_pty.sys, "argv", ["bridge", "--vid", "0x1234", "--pid", "0x5678",
+                                                "--map", "2:/tmp/test-at", "--once"])
+    monkeypatch.setattr(ec20_usb_pty, "acquire_instance_lock", lambda: object())
+    monkeypatch.setattr(ec20_usb_pty.signal, "signal", lambda *args: None)
+    def wait(stop, **kwargs):
+        assert kwargs == {"vid": 0x1234, "pid": 0x5678}
+        return object()
+    monkeypatch.setattr(ec20_usb_pty, "wait_for_device", wait)
+    monkeypatch.setattr(ec20_usb_pty, "run_bridges_once",
+                        lambda dev, maps, stop, **kw: seen.append((maps, kw)) or False)
+    assert ec20_usb_pty.main() == 0
+    assert seen == [([(2, "/tmp/test-at")], {"reset_first": False, "recovery_request": None})]
+
+
+@pytest.mark.parametrize("script", ["ec20_usb_pty.py", "sim7600_usb_pty.py"])
+def test_bridge_standalone_help(script, tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    path = Path(ec20_usb_pty.__file__).with_name(script)
+    result = subprocess.run([sys.executable, "-I", str(path), "--help"], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert "--auto" in result.stdout and "--map" in result.stdout
+
+
 def test_bundled_libusb_path_uses_pyinstaller_resources(tmp_path, monkeypatch):
     lib = tmp_path / "lib" / "libusb-1.0.0.dylib"
     lib.parent.mkdir()

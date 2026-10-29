@@ -189,6 +189,7 @@ def _run_service() -> None:
 
 
 def _run_bridge(argv: list[str]) -> int:
+    """透传 --auto 或旧的显式桥参数，开发入口不自动改写。"""
     _prepend_runtime_paths()
     from scripts import ec20_usb_pty
 

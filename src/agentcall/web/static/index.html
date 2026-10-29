@@ -825,6 +825,7 @@
     background: var(--well); color: var(--muted); font-size: 12px; overflow-wrap: anywhere;
   }
   .setup-summary b { display: block; color: var(--text); font-size: 13px; margin-bottom: 2px; }
+  #setupRereadSim { margin-top: 12px; }
   @media (max-width: 720px) {
     .setup-card { width: 100%; max-height: 92vh; }
     .setup-head { padding: 16px 16px 12px; }
@@ -1227,6 +1228,7 @@
           <p class="hint" data-i18n="setup_hw_hint"></p>
           <div class="setup-summary" id="setupHardware"></div>
           <div class="setup-status" id="setupHwStatus"></div>
+          <button class="btn ghost sm" id="setupRereadSim" hidden data-i18n="setup_reread_sim"></button>
         </section>
         <section class="setup-pane" data-step="1">
           <h3 data-i18n="setup_key_title"></h3>
@@ -1535,7 +1537,22 @@ const I18N = {
     setup_subtitle: "Connect the modem, add a provider key, and personalize the assistant.",
     setup_skip_all: "Skip setup", setup_skip_step: "Skip step", setup_back: "Back", setup_next: "Next",
     setup_finish: "Finish", setup_steps: ["Hardware", "API Key", "Personalize", "Recording", "Self-test", "Done"],
-    setup_hw_title: "Hardware check", setup_hw_hint: "Plug in the EC20/EG25 module and keep the AT port connected. This check does not block setup.",
+    setup_hw_title: "Hardware check", setup_hw_hint: "Connect a 4G modem (SIM7600 or EC20/EG25).",
+    setup_model: "Modem", setup_firmware: "Firmware", setup_network: "Network", setup_signal: "Signal",
+    setup_signal_unknown: "Unknown", setup_signal_weak: "Weak", setup_signal_fair: "Fair",
+    setup_signal_good: "Good", setup_signal_excellent: "Excellent",
+    setup_network_registered: "Registered", setup_network_lte: "LTE registered only",
+    setup_network_searching: "Searching", setup_network_denied: "Registration denied",
+    setup_sim_missing: "Not detected / not ready",
+    setup_hint_usb: "Check the USB cable and try another USB port, preferably directly on the computer.",
+    setup_hint_connect: "Connecting. If it is still not connected after one minute, unplug and reconnect USB once.",
+    setup_hint_reset: "The modem is recovering. Allow about 30 seconds.",
+    setup_hint_sim: "This modem does not support inserting a SIM while powered on. Insert the card, then select Read SIM again.",
+    setup_hint_search: "Searching for a network. This usually takes less than 30 seconds.",
+    setup_hint_denied: "Check that the SIM is activated and the account has sufficient credit.",
+    setup_hint_ready: "Ready to make and receive calls.",
+    setup_reread_sim: "Read SIM again", setup_reread_busy: "The line is busy. Try again after the call.",
+    setup_reread_failed: "Could not restart the modem. Check the connection and try again.",
     setup_usb: "USB module", setup_at: "AT port", setup_port: "Port", setup_sim: "SIM",
     setup_hw_ok: "Hardware looks ready.", setup_hw_wait: "Hardware is not fully ready yet. You can continue and retry after plugging it in.",
     setup_key_title: "Provider API key", setup_key_hint: "Qwen and OpenAI keys are validated online before saving. The key is never echoed back.",
@@ -1806,7 +1823,22 @@ const I18N = {
     setup_subtitle: "连接模组、填写 provider Key，并设定你的 AI 助理。",
     setup_skip_all: "跳过向导", setup_skip_step: "跳过本步", setup_back: "上一步", setup_next: "下一步",
     setup_finish: "完成", setup_steps: ["硬件", "API Key", "个性化", "通话录音", "自测", "完成"],
-    setup_hw_title: "硬件检测", setup_hw_hint: "请插入 EC20/EG25 模组并保持 AT 口连接。本检测不阻塞后续配置。",
+    setup_hw_title: "硬件检测", setup_hw_hint: "请连接 4G 模组（SIM7600 或 EC20/EG25）。",
+    setup_model: "模组型号", setup_firmware: "固件", setup_network: "网络", setup_signal: "信号",
+    setup_signal_unknown: "未知", setup_signal_weak: "弱", setup_signal_fair: "一般",
+    setup_signal_good: "良好", setup_signal_excellent: "很好",
+    setup_network_registered: "已注册", setup_network_lte: "仅 LTE 已注册",
+    setup_network_searching: "搜网中", setup_network_denied: "注册被拒",
+    setup_sim_missing: "未检测到 / 未就绪",
+    setup_hint_usb: "请检查 USB 线，换一个 USB 口，建议直插电脑。",
+    setup_hint_connect: "正在连接；超过 1 分钟仍未连接，请拔插一次 USB。",
+    setup_hint_reset: "模组恢复中，预计约 30 秒。",
+    setup_hint_sim: "这块模组不支持通电热插卡：插好卡后，请点「重新读卡」。",
+    setup_hint_search: "正在搜网，一般 30 秒内完成。",
+    setup_hint_denied: "请确认 SIM 卡已开通、未欠费。",
+    setup_hint_ready: "已就绪，可以接打电话。",
+    setup_reread_sim: "重新读卡", setup_reread_busy: "线路正在使用，请等通话结束后重试。",
+    setup_reread_failed: "模组重启失败，请检查连接后重试。",
     setup_usb: "USB 模组", setup_at: "AT 口", setup_port: "端口", setup_sim: "SIM 卡",
     setup_hw_ok: "硬件状态看起来已就绪。", setup_hw_wait: "硬件暂未完全就绪。你可以继续配置，插好后再重试。",
     setup_key_title: "Provider API Key", setup_key_hint: "Qwen 与 OpenAI 会先在线校验再保存；Key 不会被回显。",
@@ -3749,20 +3781,65 @@ function renderSetupHardware() {
   const simText = sim.present
     ? `${sim.carrier} · ${simRegistration}` + (sim.service_number ? ` · 客服 ${sim.service_number}` : "")
     : "-";
-  for (const [label, value] of [
+  const networkDenied = !sim.network_attached && (sim.reg_status === "注册被拒" || sim.eps_status === "注册被拒");
+  const network = sim.registered ? t("setup_network_registered")
+    : sim.eps_registered ? t("setup_network_lte")
+    : networkDenied ? t("setup_network_denied") : t("setup_network_searching");
+  const rows = phoneLine ? [
     [phoneLine ? t("phone_line") : t("setup_usb"), statusWord(phoneLine ? !!hw.phone_connected : !!hw.usb_online)],
     [t("setup_at"), statusWord(!!hw.modem_connected)],
-    [phoneLine ? t("phone_signal") : t("setup_port"), phoneLine ? (hw.signal_strength == null ? "-" : `${hw.signal_strength}%`) : hw.port || "-"],
+    [t("phone_signal"), hw.signal_strength == null ? "-" : `${hw.signal_strength}%`],
     [t("setup_sim"), simText],
-  ]) {
+  ] : [
+    [t("setup_usb"), statusWord(!!hw.usb_online)],
+    [t("setup_at"), statusWord(!!hw.modem_connected)],
+    [t("setup_model"), hw.model || "-"],
+    [t("setup_firmware"), hw.firmware || "-"],
+    [t("setup_sim"), sim.present ? sim.carrier || t("setup_ready_yes") : t("setup_sim_missing")],
+    [t("setup_network"), sim.present ? network : "-"],
+    [t("setup_signal"), t("setup_signal_" + (hw.signal?.level || "unknown"))],
+  ];
+  for (const [label, value] of rows) {
     const row = el("div", "line");
     row.appendChild(el("b", "", label));
     row.appendChild(el("span", "", value));
     box.appendChild(row);
   }
-  const ready = (phoneLine || !!hw.usb_online) && !!hw.modem_connected;
-  setupStatus("setupHwStatus", ready ? "ok" : "err", ready ? t("setup_hw_ok") : t("setup_hw_wait"));
+  const reread = $("setupRereadSim");
+  reread.hidden = phoneLine || !hw.usb_online || !hw.modem_connected || hw.modem_resetting || !!sim.present;
+  reread.disabled = !!meta.call_active || !!meta.dial_queue_busy || rereadSimPending;
+  if (phoneLine) {
+    setupStatus("setupHwStatus", hw.modem_connected ? "ok" : "err", t(hw.modem_connected ? "setup_hw_ok" : "setup_hw_wait"));
+    return;
+  }
+  const hint = hw.modem_resetting ? "reset" : !hw.usb_online ? "usb"
+    : !hw.modem_connected ? "connect" : !sim.present ? "sim"
+    : sim.network_attached ? "ready" : networkDenied ? "denied" : "search";
+  setupStatus("setupHwStatus", hint === "ready" ? "ok" : "err", t("setup_hint_" + hint));
 }
+
+let rereadSimPending = false;
+$("setupRereadSim").onclick = async () => {
+  if (rereadSimPending) return;
+  rereadSimPending = true;
+  renderSetupHardware();
+  try {
+    const { httpOk, res } = await postJson("/api/modem/reread_sim", {});
+    if (!httpOk || !res.ok) {
+      setupStatus("setupHwStatus", "err", t(res.error === "line_busy" ? "setup_reread_busy" : "setup_reread_failed"));
+    } else {
+      await loadMeta();
+    }
+  } catch {
+    setupStatus("setupHwStatus", "err", t("setup_reread_failed"));
+  } finally {
+    rereadSimPending = false;
+    $("setupRereadSim").disabled = !!lastMeta?.call_active || !!lastMeta?.dial_queue_busy;
+  }
+};
+setInterval(() => {
+  if ($("setupWizard").classList.contains("show")) void loadMeta();
+}, 5000);
 
 function renderSetupReadySummary() {
   const meta = lastMeta || {};

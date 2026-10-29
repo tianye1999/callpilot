@@ -22,15 +22,22 @@ import time
 import tty
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import usb.backend.libusb1
 import usb.core
 import usb.util
 
+# 独立脚本不要求 editable 安装；打包版继续使用 bundle 内的模块。
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from agentcall import modem_hardware  # noqa: E402
+
 logger = logging.getLogger("ec20_usb_pty")
 
-VID = 0x2C7C
-PID = 0x0125
+VID = modem_hardware.PRESETS[0].vid
+PID = modem_hardware.PRESETS[0].pid
 
 # 连续写超时容忍上限：≤此值视作瞬时忙丢帧继续，超过判定设备掉线拆桥重连。
 PTY_WRITE_TIMEOUT_TOLERANCE = 3
@@ -477,6 +484,7 @@ def run_bridges_once(
     stop: threading.Event,
     reset_first: bool = False,
     recovery_request: Path | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> bool:
     """建立全部桥并阻塞运行，直到 stop 置位或任一桥断开（如设备被拔出）。
 
@@ -502,6 +510,8 @@ def run_bridges_once(
 
         requested = False
         while not stop.is_set() and all(not handle.stop.is_set() for handle in handles):
+            if heartbeat is not None:
+                heartbeat()
             # app 侧检测到「CPCMREG 启用需重试」= 模组已劣化，通话结束后写此文件请求
             # 自愈。它覆盖「模组收数据但播放卡」这一形态——那种形态不产生写超时，
             # 光靠桥自己发现不了（真机 2026-08-12）。
@@ -517,6 +527,73 @@ def run_bridges_once(
         usb.util.dispose_resources(dev)
 
 
+def find_auto_device() -> tuple[usb.core.Device, modem_hardware.ModemPreset] | None:
+    devices = list(usb.core.find(find_all=True, backend=libusb_backend()))
+    preset = modem_hardware.select_preset([(d.idVendor, d.idProduct) for d in devices])
+    if preset is None:
+        return None
+    return next(d for d in devices if (d.idVendor, d.idProduct) == (preset.vid, preset.pid)), preset
+
+
+def run_auto(stop: threading.Event, *, once: bool = False, poll_seconds: float = 2) -> int:
+    """每次拆桥都重新选预设；在线心跳过期后，崩溃残留不会误报在线。"""
+    modem_hardware.STATE_PATH.unlink(missing_ok=True)
+    failures = 0
+    selected_vendor: str | None = None
+    while not stop.is_set():
+        try:
+            found = find_auto_device()
+        except usb.core.USBError as exc:
+            logger.warning("USB 自动扫描失败: %s", exc)
+            found = None
+        if found is None:
+            failures = 0
+            stop.wait(poll_seconds)
+            continue
+        dev, preset = found
+        first_selection = selected_vendor != preset.vendor
+        if first_selection:
+            failures = 0
+        selected_vendor = preset.vendor
+        request = Path(preset.recovery_request_path) if preset.recovery_request_path else None
+        if request is not None:
+            request.unlink(missing_ok=True)
+        last_write = 0.0
+
+        def heartbeat() -> None:
+            nonlocal last_write
+            if time.monotonic() - last_write >= 3:
+                modem_hardware.write_state(preset, online=True)
+                last_write = time.monotonic()
+
+        logger.info("自动识别模组: %s (%04x:%04x)", preset.model, preset.vid, preset.pid)
+        started = time.monotonic()
+        degraded = False
+        try:
+            degraded = run_bridges_once(
+                dev, [parse_map(m) for m in preset.maps], stop,
+                reset_first=preset.reset_on_start and (first_selection or failures > 0),
+                recovery_request=request, heartbeat=heartbeat,
+            )
+        except (RuntimeError, usb.core.USBError) as exc:
+            logger.warning("自动桥接失败: %s", exc)
+            if once:
+                return 1
+        finally:
+            modem_hardware.write_state(preset, online=False)
+        if once or stop.is_set():
+            break
+        if degraded and preset.recover_alt_pid is not None:
+            usb_composition_recovery(preset.vid, preset.pid, preset.recover_alt_pid)
+            if request is not None:
+                request.unlink(missing_ok=True)
+        failures = failures + 1 if time.monotonic() - started < 5 else 0
+        if failures >= int(os.environ.get("EC20_BRIDGE_FAIL_THRESHOLD", "6")):
+            return 3
+        stop.wait(min(poll_seconds * 2 ** failures, 30))
+    return 0
+
+
 def main(
     default_vid: int = VID,
     default_pid: int = PID,
@@ -528,6 +605,7 @@ def main(
     recovery_request_path: str | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(prog=prog, description=description)
+    parser.add_argument("--auto", action="store_true", help="自动识别已知模组并选择桥接预设")
     parser.add_argument("--list", action="store_true", help="列出 USB bulk 接口后退出")
     parser.add_argument("--probe", action="store_true", help="对每个 bulk 接口发送 AT 探测后退出")
     parser.add_argument(
@@ -604,7 +682,7 @@ def main(
             print(f"interface {port.interface}: {response or '(no response)'}")
         return 0
 
-    if not args.map:
+    if not args.map and not args.auto:
         parser.error("需要 --list、--probe 或至少一个 --map IFACE:LINK")
 
     stop = threading.Event()
@@ -614,6 +692,9 @@ def main(
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    if args.auto:
+        return run_auto(stop, once=args.once)
 
     # 连续快速失败计数：超阈值则 sys.exit 交 launchd 冷启（含全新 libusb 上下文），
     # 比原地自旋更可能复位；手动运行（无 launchd）时同样退出，避免抖动风暴。
