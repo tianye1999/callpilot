@@ -3,6 +3,8 @@
 产品架构：桥+服务由系统常驻机制（macOS launchd / Windows 计划任务）托管，
 本窗口只是查看入口，关窗不影响服务。
 启动流程：
+    打包版 macOS：立即显示本地启动页，后台等待 launchd；失败页可重试和复制脱敏诊断。
+    其他运行方式保留以下流程：
     1. 探测 ``<AGENTCALL_WEB_URL>/api/meta`` 判断服务是否已在运行；
     2. 在跑 → 直接开窗指向服务地址；
     3. 没跑 → 打包版 macOS 等待 launchd 拉起；其他运行方式用项目 venv 的
@@ -31,8 +33,10 @@ from __future__ import annotations
 import html as html_escape
 import logging
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -269,7 +273,12 @@ def activate_macos_app() -> bool:
     try:
         from AppKit import NSApplication
 
-        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        application = NSApplication.sharedApplication()
+        if _bundled_macos_service_is_system_managed():
+            from AppKit import NSApplicationActivationPolicyRegular
+
+            application.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+        application.activateIgnoringOtherApps_(True)
         return True
     except Exception as exc:  # noqa: BLE001 - AppKit may be absent in tests/Linux builds
         logger.warning("激活桌面窗口失败: %s", exc)
@@ -302,14 +311,265 @@ def _import_webview():
     return webview
 
 
+def startup_html(reason: str | None = None, lang: str | None = None) -> str:
+    from agentcall.macos_shell import ui_language, ui_text
+
+    lang = lang or ui_language()
+    title = (ui_text("服务未能启动", "Service could not start", lang) if reason
+             else ui_text("正在启动…", "Starting…", lang))
+    buttons = f"""<p><button onclick="pywebview.api.retry()">{ui_text('重试', 'Retry', lang)}</button>
+        <button onclick="pywebview.api.copy_diagnostics().then(() => {{
+          document.getElementById('copied').textContent = '{ui_text('诊断信息已复制', 'Diagnostics copied', lang)}';
+        }})">{ui_text('复制诊断信息', 'Copy diagnostics', lang)}</button></p>
+        <p id="copied" role="status"></p>""" if reason else ""
+    message = html_escape.escape(reason or ui_text(
+        '正在连接电话服务，请稍候。', 'Connecting to the phone service. Please wait.', lang,
+    ))
+    return f"""<!doctype html><html lang="{lang}"><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>CallPilot</title><style>
+      body {{font:16px -apple-system,'PingFang SC',sans-serif;color:#242424;background:#fafafa;
+             max-width:640px;margin:80px auto;padding:24px}}
+      h1 {{font-size:28px}} h2 {{font-size:20px}} p {{line-height:1.6}}
+      button {{font:inherit;padding:10px 16px;margin:8px 8px 0 0;border:1px solid #aaa;
+               border-radius:6px;background:white;cursor:pointer}}
+      </style><h1>CallPilot</h1><h2>{title}</h2>
+      <p>{message}</p>{buttons}</html>"""
+
+
+def _window_lock(support: Path):
+    from tray_app import _acquire_tray_singleton_lock
+
+    support.mkdir(parents=True, exist_ok=True)
+    return _acquire_tray_singleton_lock(support / "window.lock")
+
+
+def close_bundled_window(support: Path) -> None:
+    """让窗口正常关闭以保存几何；持锁到进程收尾，避免退出后遗留 Dock 图标。"""
+    lock = _window_lock(support)
+    if lock is not None:
+        lock.close()
+        return
+    (support / "close-window").touch(mode=0o600)
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        lock = _window_lock(support)
+        if lock is not None:
+            lock.close()
+            return
+        time.sleep(0.05)
+    from agentcall.macos_shell import ui_text
+
+    raise RuntimeError(ui_text(
+        "窗口尚未关闭，请重试退出。", "The window has not closed yet. Please try quitting again.",
+    ))
+
+
+def _install_window_hooks(window, support: Path, splash=None) -> None:
+    import objc
+    from AppKit import NSApplication, NSApplicationActivationPolicyRegular, NSMakeRect, NSScreen
+    from PyObjCTools import AppHelper
+
+    # 部分 PyObjC 版本把此枚举标成 unsigned int；在 Cocoa delegate 创建前修正为 NSUInteger。
+    objc.registerMetaDataForSelector(b"NSObject", b"applicationShouldTerminate:", {"retval": {"type": b"Q"}})
+    from webview.platforms.cocoa import BrowserView
+
+    from agentcall import macos_shell
+
+    def applicationShouldTerminate_(self, application):
+        macos_shell.send_command("quit", support)
+        return 0  # NSTerminateCancel：由菜单栏确认并停止服务后再正常关窗。
+
+    objc.classAddMethods(BrowserView.AppDelegate, [objc.selector(
+        # 后端若已被其他代码导入，必须匹配已注册的 ABI，不能原地把 I 替换为 Q。
+        applicationShouldTerminate_, signature=BrowserView.AppDelegate.applicationShouldTerminate_.signature,
+    )])
+    path = support / "window.json"
+
+    def rect_tuple(rect):
+        return tuple(int(v) for v in (rect.origin.x, rect.origin.y, rect.size.width, rect.size.height))
+
+    def restore():
+        native = BrowserView.instances[window.uid].window
+        if splash is not None and splash.closed:
+            native.close()
+            return
+        screens = [rect_tuple(screen.visibleFrame()) for screen in NSScreen.screens()]
+        x, y, w, h = macos_shell.restore_geometry(path, screens)
+        if splash is not None:
+            x, y, w, h = rect_tuple(splash.native.frame())
+        # 使用 Cocoa 全局坐标保存/恢复，避免 pywebview 多屏坐标转换不一致。
+        native.setFrame_display_(NSMakeRect(x, y, w, h), True)
+        app = NSApplication.sharedApplication()
+        app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+        if splash is not None:
+            splash.native.orderOut_(None)
+        native.makeKeyAndOrderFront_(None)
+        app.activateIgnoringOtherApps_(True)
+
+    def shown():
+        AppHelper.callAfter(restore)
+
+    def closing():
+        native = BrowserView.instances[window.uid].window
+        macos_shell.save_geometry(path, rect_tuple(native.frame()))
+
+    window.events.shown += shown
+    window.events.closing += closing
+
+
+class BundledStartup:
+    """后台等待服务；本地页面立即显示，重试与关闭不阻塞 Cocoa。"""
+
+    def __init__(self, window, url: str, layout) -> None:
+        from agentcall.macos_shell import ui_language
+
+        self.lang = ui_language()
+        self.window = window
+        self.url = url
+        self.layout = layout
+        self.closed = threading.Event()
+        self.retry_requested = threading.Event()
+        self.diagnostics = ""
+        self.diagnostic_results: queue.Queue = queue.Queue()
+        self.generation = 0
+
+    def retry(self):
+        from agentcall.macos_shell import send_command, write_startup_failure
+
+        write_startup_failure(self.layout.support_dir, "")
+        send_command("retry", self.layout.support_dir)
+        self.retry_requested.set()
+
+    def copy_diagnostics(self):
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+        from PyObjCTools import AppHelper
+
+        def copy():
+            pasteboard = NSPasteboard.generalPasteboard()
+            pasteboard.clearContents()
+            pasteboard.setString_forType_(self.diagnostics, NSPasteboardTypeString)
+
+        AppHelper.callAfter(copy)
+
+    def run(self):
+        from agentcall import macos_shell
+
+        deadline = time.monotonic() + 30
+        waiting = True
+        diagnosing = False
+        displayed_failure = ""
+        close_request = self.layout.support_dir / "close-window"
+        focus_request = self.layout.support_dir / "focus-window"
+        while not self.closed.wait(0.1):
+            if close_request.exists():
+                close_request.unlink(missing_ok=True)
+                self.window.destroy()
+                return
+            if focus_request.exists():
+                focus_request.unlink(missing_ok=True)
+                self.window.restore()
+                self.window.show()
+            if self.retry_requested.is_set():
+                self.retry_requested.clear()
+                self.window.load_html(startup_html(lang=self.lang))
+                deadline = time.monotonic() + 30
+                waiting = True
+                diagnosing = False
+                displayed_failure = ""
+                self.generation += 1
+            startup_failure = macos_shell.read_startup_failure(self.layout.support_dir)
+            if startup_failure and startup_failure != displayed_failure:
+                # 安装结果可能晚于超时诊断；具体错误始终优先，不能被 diagnosing 挡住。
+                self.window.load_html(startup_html(startup_failure, self.lang))
+                displayed_failure = startup_failure
+            try:
+                generation, reason, diagnostics = self.diagnostic_results.get_nowait()
+                if generation == self.generation and waiting:
+                    self.diagnostics = diagnostics
+                    self.window.load_html(startup_html(startup_failure or reason, self.lang))
+            except queue.Empty:
+                pass
+            if not waiting:
+                if not startup_failure:
+                    continue
+                # app 可能先健康、tray 稍后安装失败；进入管理页后仍接收最终失败结果。
+                waiting = True
+                diagnosing = False
+            meta = macos_shell.fetch_meta(self.url)
+            if meta and not startup_failure:
+                self.window.load_url(self.url)
+                waiting = False
+            elif (startup_failure or time.monotonic() >= deadline) and not diagnosing:
+                diagnosing = True
+                # launchctl 诊断再慢也不能挡住关窗或重试；过期结果不覆盖新一轮启动。
+                def diagnose(generation, startup_failure):
+                    try:
+                        reason, report = macos_shell.collect_diagnostics(self.layout, {}, lang=self.lang)
+                    except Exception:  # noqa: BLE001
+                        reason = macos_shell.failure_reason("", self.lang)
+                        report = macos_shell.ui_text("诊断信息暂时无法读取", "Diagnostics are unavailable", self.lang)
+                    self.diagnostic_results.put((generation, startup_failure or reason, report))
+
+                threading.Thread(target=diagnose, args=(self.generation, startup_failure), daemon=True).start()
+
+
+def _bundled_main(webview, web_url: str) -> None:
+    from agentcall import macos_launchd
+    from tray_app import _bring_window_to_front
+
+    layout = macos_launchd.make_layout(sys.executable)
+    lock = _window_lock(layout.support_dir)
+    if lock is None:
+        try:
+            pid = int((layout.support_dir / "window.lock").read_text())
+            _bring_window_to_front(pid)
+        except (OSError, ValueError):
+            pass
+        return
+    splash = None
+    try:
+        lock.seek(0)
+        lock.truncate()
+        lock.write(str(os.getpid()))
+        lock.flush()
+        (layout.support_dir / "close-window").unlink(missing_ok=True)
+        if webview is None:
+            from agentcall.macos_window import show_startup_window
+
+            splash = show_startup_window(layout.support_dir)
+            webview = _import_webview()
+            if splash.closed:
+                return
+        window = webview.create_window(
+            WINDOW_TITLE, html=startup_html(), width=1100, height=780, **({"hidden": True} if splash else {}),
+        )
+        startup = BundledStartup(window, web_url, layout)
+        window.expose(startup.retry, startup.copy_diagnostics)
+        window.events.closed += startup.closed.set
+        _install_window_hooks(window, layout.support_dir, splash)
+        webview.start(lambda: threading.Thread(target=startup.run, daemon=True).start())
+        startup.closed.set()
+    finally:
+        if splash is not None:
+            splash.close()
+        lock.close()
+
+
 def main() -> None:
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        from agentcall.macos_shell import configure_shell_logging
+
+        configure_shell_logging("window")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    webview = _import_webview()
-
     web_url = os.getenv("AGENTCALL_WEB_URL", DEFAULT_WEB_URL).rstrip("/")
+    if _bundled_macos_service_is_system_managed():
+        _bundled_main(None, web_url)
+        return
+    webview = _import_webview()
     meta_url = f"{web_url}/api/meta"
     width = _env_int("AGENTCALL_WINDOW_WIDTH", 1100)
     height = _env_int("AGENTCALL_WINDOW_HEIGHT", 780)

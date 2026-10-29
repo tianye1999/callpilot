@@ -148,6 +148,33 @@ def api(app, fn):
 # ---- /api/config ----
 
 
+def test_macos_autostart_only_packaged_and_validated(monkeypatch):
+    from agentcall import macos_launchd
+
+    calls = []
+    monkeypatch.setattr(macos_launchd, "make_layout", lambda exe: "layout")
+    monkeypatch.setattr(macos_launchd, "set_autostart", lambda layout, enabled: calls.append((layout, enabled)))
+
+    async def fn(client):
+        monkeypatch.setattr(server, "_macos_shell_available", lambda: False)
+        response = await client.post("/api/macos/autostart", json={"enabled": False})
+        assert response.status == 404
+        monkeypatch.setattr(server, "_macos_shell_available", lambda: True)
+        response = await client.post("/api/macos/autostart", json={"enabled": "false"})
+        assert response.status == 400
+        response = await client.post("/api/macos/autostart", json={"enabled": False}, headers={"Origin": "https://evil.test"})
+        assert response.status == 403
+        response = await client.post("/api/macos/autostart", data='{"enabled":false}')
+        assert response.status == 415
+        assert calls == []
+        response = await client.post("/api/macos/autostart", json={"enabled": False})
+        assert response.status == 200
+        assert await response.json() == {"ok": True, "enabled": False}
+        assert calls == [("layout", False)]
+
+    api(build_app(None, None), fn)
+
+
 @pytest.mark.parametrize("active", [False, True])
 def test_meta_reports_current_call_state(active, monkeypatch):
     monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import urllib.error
 from pathlib import Path
@@ -11,6 +12,89 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import tray_app
+
+
+@pytest.fixture(autouse=True)
+def _forbid_unmocked_dashboard_spawn(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("托盘单测必须显式注入窗口启动桩，不允许派生真实桌面或服务进程")
+    monkeypatch.setitem(tray_app.open_or_focus_dashboard.__kwdefaults__, "popen", forbidden)
+
+
+def test_early_window_spawn_failure_does_not_prevent_tray_startup(monkeypatch, caplog):
+    monkeypatch.setattr(tray_app.sys, "argv", ["CallPilot"])
+    monkeypatch.setattr(tray_app, "_bundled_macos", lambda: True)
+    monkeypatch.setattr(tray_app, "_acquire_tray_singleton_lock", object)
+
+    def fail_open(proc):
+        raise OSError("test spawn failure")
+
+    def reached_tray():
+        raise RuntimeError("reached tray initialization")
+
+    monkeypatch.setattr(tray_app, "open_or_focus_dashboard", fail_open)
+    monkeypatch.setattr(tray_app, "_import_rumps", reached_tray)
+    with pytest.raises(RuntimeError, match="reached tray initialization"):
+        tray_app.main()
+    assert "test spawn failure" in caplog.text
+
+
+@pytest.mark.parametrize("entry", ["service", "bridge"])
+def test_bundled_entry_logging_replaces_existing_handler_and_writes_file(tmp_path, entry):
+    result = subprocess.run([sys.executable, "-c", '''
+import logging, logging.handlers, sys
+from pathlib import Path
+logging.basicConfig(level=logging.INFO)
+directory = Path(sys.argv[2])
+if sys.argv[1] == "service":
+    import app
+    app.load_dotenv = lambda *args: None
+    app._force_utf8 = lambda: None
+    app.config.log_dir = lambda: directory
+    def stop(*args):
+        raise RuntimeError("stop before service initialization")
+    app.config.get_str = stop
+    run = app.main
+    path = directory / "app.log"
+else:
+    sys.path.insert(0, str(Path.cwd() / "scripts"))
+    import ec20_usb_pty
+    def stop():
+        raise RuntimeError("stop before USB or instance lock")
+    ec20_usb_pty.acquire_instance_lock = stop
+    path = directory / "modem_usb_pty.log"
+    sys.argv = ["bridge", "--log-file", str(path)]
+    run = ec20_usb_pty.main
+sys.frozen = True
+try:
+    run()
+except RuntimeError:
+    pass
+logging.getLogger("test").warning("file logging marker")
+handlers = [h for h in logging.getLogger().handlers if isinstance(h, logging.handlers.RotatingFileHandler)]
+assert len(handlers) == 1
+assert handlers[0].maxBytes == 5 * 1024 * 1024 and handlers[0].backupCount == 3
+assert "file logging marker" in path.read_text()
+''', entry, str(tmp_path)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="需要真实 macOS Cocoa/PyObjC")
+def test_real_rumps_reopen_hook_installs_with_bool_signature():
+    result = subprocess.run([sys.executable, "-c", '''
+import objc
+from rumps.rumps import NSApp
+import tray_app
+calls = []
+tray_app._install_reopen_handler(lambda: calls.append("open"))
+method = NSApp.applicationShouldHandleReopen_hasVisibleWindows_
+assert method.signature == b"Z@:@Z", method.signature
+delegate = NSApp.alloc().init()
+assert method(delegate, None, False) is False
+assert method(delegate, None, True) is False
+assert calls == ["open", "open"]
+'''], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class MetaResponse:
@@ -54,7 +138,7 @@ def test_status_and_menu_labels_bilingual():
     assert tray_app.menu_label("open", "en") == "Open dashboard"
     assert tray_app.menu_label("restart", "zh") == "重启服务"
     assert tray_app.menu_label("uninstall", "zh") == "卸载常驻"
-    assert tray_app.menu_label("quit", "en") == "Quit"
+    assert tray_app.menu_label("quit", "en") == "Quit CallPilot"
     # 未知语言回退中文
     assert tray_app.status_label(True, "fr") == "服务：运行中"
 
@@ -140,6 +224,186 @@ def test_probe_online_true_false(monkeypatch):
         raise urllib.error.URLError("refused")
     monkeypatch.setattr(tray_app.urllib.request, "urlopen", boom)
     assert tray_app.probe_online("http://x") is False
+
+
+@pytest.mark.parametrize("user_initiated", [False, True])
+def test_background_install_publishes_failure_and_clears_on_retry(monkeypatch, tmp_path, user_initiated):
+    from agentcall import macos_launchd, macos_shell
+
+    monkeypatch.setattr(macos_shell, "ui_language", lambda: "zh")
+
+    calls = []
+    failure = macos_launchd.LaunchctlFailure(
+        macos_launchd.APP_LABEL, "bootstrap", (), 5, stderr="Bootstrap failed: 5: Input/output error\nextra",
+    )
+    results = iter([
+        macos_launchd.LaunchdInstallResult([], [failure], []), macos_launchd.LaunchdInstallResult([], [], []),
+    ])
+
+    def install(**kwargs):
+        calls.append(kwargs)
+        return next(results)
+
+    monkeypatch.setattr(tray_app, "_bundled_macos", lambda: True)
+    monkeypatch.setattr(macos_launchd, "app_support_dir", lambda: tmp_path)
+    monkeypatch.setattr(tray_app, "_ensure_launchd_installed", install)
+    tray_app._start_background_services(user_initiated=user_initiated)
+    reason = macos_shell.read_startup_failure(tmp_path)
+    assert "后台服务无法启动" in reason and "退出码 5" in reason
+    assert "Input/output error" in reason and "extra" not in reason
+    tray_app._start_background_services(user_initiated=True)
+    assert macos_shell.read_startup_failure(tmp_path) == ""
+    assert calls == [{"user_initiated": user_initiated}, {"user_initiated": True}]
+
+
+@pytest.mark.parametrize("user_initiated", [False, True])
+def test_ensure_launchd_forwards_user_launch_flag(monkeypatch, tmp_path, user_initiated):
+    from agentcall import macos_launchd
+
+    calls = []
+    monkeypatch.setattr(tray_app, "_is_frozen", lambda: True)
+    monkeypatch.setattr(tray_app.sys, "platform", "darwin")
+    monkeypatch.setattr(macos_launchd, "make_layout", lambda *args, **kwargs: tmp_path)
+    monkeypatch.setattr(macos_launchd, "install_launch_agents", lambda *args, **kwargs: calls.append(kwargs))
+    tray_app._ensure_launchd_installed(user_initiated=user_initiated)
+    assert calls == [{"no_restart_labels": {macos_launchd.TRAY_LABEL}, "user_initiated": user_initiated}]
+
+
+@pytest.mark.parametrize("login", [False, True])
+def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, tmp_path, login):
+    import types
+
+    from agentcall import macos_launchd, macos_shell
+
+    now = [0.0]
+    instances = []
+    threads = []
+    probes = []
+    ticks = []
+    installs = []
+    startup_order = []
+    reopen_callbacks = []
+
+    class FakeMenuItem:
+        def __init__(self, title, **kwargs):
+            self.titles = [title]
+
+        @property
+        def title(self):
+            return self.titles[-1]
+
+        @title.setter
+        def title(self, value):
+            self.titles.append(value)
+
+    class FakeApp:
+        def __init__(self, *args, **kwargs):
+            instances.append(self)
+            self.icon_updates = []
+
+        @property
+        def icon(self):
+            return self.icon_updates[-1]
+
+        @icon.setter
+        def icon(self, value):
+            self.icon_updates.append(value)
+
+        def run(self):
+            pass
+
+    class FakeThread:
+        def __init__(self, *, target, daemon):
+            assert daemon
+            self.target = target
+            self.alive = False
+            threads.append(self)
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def finish(self):
+            self.target()
+            self.alive = False
+
+    monkeypatch.setattr(tray_app, "_bundled_macos", lambda: True)
+    monkeypatch.setattr(tray_app, "_acquire_tray_singleton_lock", object)
+    monkeypatch.setattr(tray_app, "open_or_focus_dashboard",
+                        lambda proc: startup_order.append("window") or _FakeProc(123, True))
+    monkeypatch.setattr(macos_shell, "observe_commands", lambda callback: None)
+    monkeypatch.setattr(macos_shell, "ui_language", lambda: "zh")
+    monkeypatch.setattr(tray_app, "_install_reopen_handler", reopen_callbacks.append)
+    monkeypatch.setattr(tray_app.sys, "argv", ["CallPilot"] + (["--login"] if login else []))
+    monkeypatch.setattr(tray_app, "_start_background_services", lambda **kwargs: installs.append(kwargs))
+    monkeypatch.setattr(tray_app.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(tray_app.threading, "Thread", FakeThread)
+    monkeypatch.setattr(tray_app, "probe_online", lambda url: probes.append(now[0]) or True)
+    monkeypatch.setattr(
+        macos_launchd, "make_layout",
+        lambda executable: types.SimpleNamespace(env_file=tmp_path / ".env", support_dir=tmp_path),
+    )
+    monkeypatch.setattr(macos_shell, "should_open_window", lambda *args: False)
+    monkeypatch.setattr(macos_shell, "take_commands", lambda: ticks.append(now[0]) or set())
+    monkeypatch.setattr(tray_app, "_import_rumps", lambda: startup_order.append("rumps") or types.SimpleNamespace(
+        App=FakeApp, MenuItem=FakeMenuItem,
+        timer=lambda interval: lambda fn: fn,
+    ))
+    tray_app.main()
+    assert startup_order == (["rumps"] if login else ["window", "rumps"])
+    app = instances[0]
+    threads[0].finish()
+    assert installs == [{"user_initiated": not login}]
+    threads.clear()  # 安装目标已打桩；后面只统计健康探测线程。
+
+    app._requests(None)
+    assert len(threads) == 1
+    assert probes == []  # 主线程只启动工作线程，不执行 HTTP 探测。
+    threads[-1].finish()
+    for now[0] in (0.2, 0.4, 1.0, 2.8, 2.999):
+        app._requests(None)
+        app._refresh(None)  # 旧的五秒定时入口也不能绕过节流。
+    assert probes == [0.0]
+    assert len(threads) == 1
+    assert len(ticks) == 6
+    assert app.icon == tray_app.icon_path(True)
+    assert app.icon_updates == [tray_app.icon_path(True)]
+    assert app._status_item.titles == [tray_app.status_label(False), tray_app.status_label(True)]
+
+    now[0] = 3.0
+    app._requests(None)
+    assert len(threads) == 2
+    now[0] = 6.0
+    app._requests(None)
+    assert len(threads) == 2  # 慢探测仍在运行时不重叠启动。
+    threads[-1].finish()
+    now[0] = 6.2
+    app._requests(None)
+    assert len(threads) == 3  # 间隔从启动而非结束时间计算。
+    app._online = False
+    app._requests(None)
+    app._requests(None)
+    assert app.icon_updates == [tray_app.icon_path(True), tray_app.icon_path(False)]
+    assert app._status_item.titles == [
+        tray_app.status_label(False), tray_app.status_label(True), tray_app.status_label(False),
+    ]
+
+    app._start_services()
+    pending_install = threads[-1]
+    app._start_services()  # 安装仍在运行时，主动请求不能丢失。
+    assert threads[-1] is pending_install
+    pending_install.finish()
+    app._requests(None)
+    assert threads[-1] is not pending_install
+    threads[-1].finish()
+    assert installs[-2:] == [{"user_initiated": True}, {"user_initiated": True}]
+    actions = []
+    monkeypatch.setattr(app, "_open", lambda sender: actions.append("window"))
+    monkeypatch.setattr(app, "_start_services", lambda: actions.append("services"))
+    reopen_callbacks[0]()  # Cocoa reopen 直接处理，不等下一次 tick。
+    assert actions == ["window", "services"]
 
 
 def test_fetch_setup_required_true_false(monkeypatch):
@@ -326,3 +590,46 @@ def test_main_yields_quietly_when_singleton_lock_held(monkeypatch):
     monkeypatch.setattr(tray_app, "_import_rumps", _fail_import)
 
     tray_app.main()  # 已有实例在跑：应静默返回（进程退出码 0 语义）
+
+
+@pytest.mark.parametrize("login,expected", [(False, ["open"]), (True, [])])
+def test_bundled_second_instance_forwards_user_open_only(monkeypatch, login, expected):
+    from agentcall import macos_shell
+
+    calls = []
+    monkeypatch.setattr(tray_app, "_bundled_macos", lambda: True)
+    monkeypatch.setattr(tray_app, "_acquire_tray_singleton_lock", lambda: None)
+    monkeypatch.setattr(tray_app.sys, "argv", ["CallPilot"] + (["--login"] if login else []))
+    monkeypatch.setattr(macos_shell, "send_command", calls.append)
+    monkeypatch.setattr(tray_app, "_import_rumps", lambda: pytest.fail("第二实例不得启动 GUI"))
+    tray_app.main()
+    assert calls == expected
+
+
+def test_reopen_callback_forwards_to_same_open_action(monkeypatch):
+    import types
+
+    methods = []
+    calls = []
+    monkeypatch.setitem(sys.modules, "objc", types.SimpleNamespace(
+        selector=lambda fn, **kw: fn, classAddMethods=lambda cls, items: methods.extend(items),
+    ))
+    monkeypatch.setitem(sys.modules, "rumps.rumps", types.SimpleNamespace(NSApp=object))
+    tray_app._install_reopen_handler(lambda: calls.append("open"))
+    assert methods[0](None, None, False) is False
+    assert methods[0](None, None, True) is False
+    assert calls == ["open", "open"]
+
+
+def test_foreground_uses_running_application_not_automation(monkeypatch):
+    import types
+
+    calls = []
+    application = types.SimpleNamespace(activateWithOptions_=lambda options: calls.append(options))
+    running = types.SimpleNamespace(runningApplicationWithProcessIdentifier_=lambda pid: application)
+    monkeypatch.setattr(tray_app.sys, "platform", "darwin")
+    monkeypatch.setitem(sys.modules, "AppKit", types.SimpleNamespace(
+        NSRunningApplication=running, NSApplicationActivateAllWindows=1, NSApplicationActivateIgnoringOtherApps=2,
+    ))
+    tray_app._bring_window_to_front(123)
+    assert calls == [3]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import types
 import urllib.error
@@ -13,6 +14,133 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import desktop_app
+
+
+def test_native_startup_precedes_webview_import(monkeypatch, tmp_path):
+    import io
+
+    from agentcall import macos_launchd, macos_window
+
+    calls = []
+    splash = types.SimpleNamespace(closed=False, close=lambda: calls.append("splash-close"))
+    monkeypatch.setattr(macos_window, "show_startup_window", lambda support: calls.append("native-visible") or splash)
+    layout = macos_launchd.make_layout(tmp_path / "CallPilot", uid=123, support_dir=tmp_path)
+    monkeypatch.setattr(macos_launchd, "make_layout", lambda exe: layout)
+    monkeypatch.setattr(desktop_app, "_window_lock", lambda support: io.StringIO())
+    window = types.SimpleNamespace(expose=lambda *args: None, events=types.SimpleNamespace(closed=[]))
+
+    class Event:
+        def __iadd__(self, callback):
+            return self
+    window.events.closed = Event()
+
+    def create_window(*args, **kwargs):
+        assert kwargs["hidden"] is True
+        calls.append("webview-create")
+        return window
+
+    webview = types.SimpleNamespace(create_window=create_window, start=lambda fn: calls.append("runloop"))
+    monkeypatch.setattr(desktop_app, "_import_webview", lambda: calls.append("webview-import") or webview)
+    monkeypatch.setattr(desktop_app, "_install_window_hooks", lambda *args: calls.append("hooks"))
+    desktop_app._bundled_main(None, "http://unused.invalid")
+    assert calls == ["native-visible", "webview-import", "webview-create", "hooks", "runloop", "splash-close"]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="需要真实 macOS Cocoa 窗口")
+def test_native_startup_handoff_has_one_visible_window_and_preserves_geometry(tmp_path):
+    result = subprocess.run([sys.executable, "-c", '''
+import sys
+from pathlib import Path
+from AppKit import NSApplication, NSMakeRect
+from PyObjCTools import AppHelper
+import desktop_app
+from agentcall import macos_launchd, macos_shell
+support = Path(sys.argv[1])
+layout = macos_launchd.make_layout(sys.executable, uid=123, support_dir=support)
+macos_launchd.make_layout = lambda *args, **kwargs: layout
+desktop_app.BundledStartup.run = lambda self: None
+original = desktop_app._install_window_hooks
+checks = []
+def install(window, support, splash):
+    assert splash.native.isVisible()
+    original(window, support, splash)
+    def check():
+        from webview.platforms.cocoa import BrowserView
+        native = BrowserView.instances[window.uid].window
+        checks.append(not splash.native.isVisible() and native.isVisible())
+        visible = [w for w in NSApplication.sharedApplication().windows() if w.isVisible()]
+        checks.append(len(visible) == 1)
+        native.setFrame_display_(NSMakeRect(30, 40, 900, 700), True)
+        native.performClose_(None)
+    window.events.shown += lambda: AppHelper.callAfter(check)
+desktop_app._install_window_hooks = install
+desktop_app._bundled_main(None, 'http://unused.invalid')
+assert checks == [True, True], checks
+assert macos_shell.restore_geometry(support / 'window.json', [(0, 0, 1440, 900)]) == (30, 40, 900, 700)
+''', str(tmp_path)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="需要真实 macOS Cocoa 窗口")
+def test_native_startup_close_and_quit_before_handoff(tmp_path):
+    result = subprocess.run([sys.executable, "-c", '''
+import sys
+from pathlib import Path
+import desktop_app
+from agentcall import macos_launchd, macos_shell, macos_window
+support = Path(sys.argv[1])
+layout = macos_launchd.make_layout(sys.executable, uid=123, support_dir=support)
+macos_launchd.make_layout = lambda *args, **kwargs: layout
+original = macos_window.show_startup_window
+def show(support):
+    splash = original(support)
+    assert splash.delegate.applicationShouldTerminate_(None) == 0
+    assert macos_shell.take_commands(support) == {'quit'}
+    splash.native.performClose_(None)
+    assert splash.closed
+    return splash
+macos_window.show_startup_window = show
+desktop_app._import_webview = object
+desktop_app._bundled_main(None, 'http://unused.invalid')
+lock = desktop_app._window_lock(support)
+assert lock is not None
+lock.close()
+''', str(tmp_path)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("lang,starting,retry", [("zh", "正在启动", "重试"), ("en", "Starting", "Retry")])
+def test_startup_and_failure_pages_follow_ui_language(lang, starting, retry):
+    assert starting in desktop_app.startup_html(lang=lang)
+    page = desktop_app.startup_html("<error>", lang=lang)
+    assert retry in page and "&lt;error&gt;" in page
+    assert f'lang="{lang}"' in page
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="需要真实 macOS Cocoa/PyObjC")
+@pytest.mark.parametrize("preloaded", [False, True])
+def test_real_cocoa_window_hooks_install_without_bad_prototype(tmp_path, preloaded):
+    # 子进程隔离真实 ObjC 类修改，不启动窗口或事件循环。
+    result = subprocess.run([sys.executable, "-c", '''
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from webview.event import Event
+if sys.argv[2] == "True":
+    from webview.platforms.cocoa import BrowserView
+    expected = BrowserView.AppDelegate.applicationShouldTerminate_.signature
+else:
+    expected = b"Q@:@"
+import desktop_app
+window = SimpleNamespace(events=SimpleNamespace(shown=Event(None), closing=Event(None)))
+desktop_app._install_window_hooks(window, Path(sys.argv[1]))
+from webview.platforms.cocoa import BrowserView
+method = BrowserView.AppDelegate.applicationShouldTerminate_
+assert method.signature == expected, method.signature
+assert method(BrowserView.AppDelegate.alloc().init(), None) == 0
+assert (Path(sys.argv[1]) / "shell-requests" / "quit").exists()
+''', str(tmp_path), str(preloaded)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 _ENV_VARS = [
     "AGENTCALL_WEB_URL",
@@ -27,9 +155,269 @@ _ENV_VARS = [
 ]
 
 
+def test_bundled_window_is_created_before_any_health_probe(monkeypatch, tmp_path):
+    import io
+
+    from agentcall import macos_launchd
+
+    calls = []
+
+    class Event:
+        def __iadd__(self, callback):
+            return self
+
+    window = types.SimpleNamespace(
+        expose=lambda *methods: calls.append("expose"), events=types.SimpleNamespace(closed=Event()),
+    )
+
+    def create_window(title, **kwargs):
+        assert "正在启动" in kwargs["html"]
+        calls.append("window")
+        return window
+
+    layout = macos_launchd.make_layout(tmp_path / "CallPilot", uid=123, support_dir=tmp_path)
+    monkeypatch.setattr(macos_launchd, "make_layout", lambda exe: layout)
+    monkeypatch.setattr(desktop_app, "_window_lock", lambda support: io.StringIO())
+    monkeypatch.setattr(desktop_app, "_install_window_hooks", lambda *args: calls.append("hooks"))
+    monkeypatch.setattr(desktop_app, "ensure_service_running", lambda *a: pytest.fail("开窗前不得等待服务"))
+    webview = types.SimpleNamespace(create_window=create_window, start=lambda fn: calls.append("runloop"))
+    desktop_app._bundled_main(webview, "http://localhost")
+    assert calls == ["window", "expose", "hooks", "runloop"]
+
+
+def test_bundled_second_window_focuses_existing_pid(monkeypatch, tmp_path):
+    import tray_app
+    from agentcall import macos_launchd
+
+    calls = []
+    layout = macos_launchd.make_layout(tmp_path / "CallPilot", uid=123, support_dir=tmp_path)
+    (tmp_path / "window.lock").write_text("123")
+    monkeypatch.setattr(macos_launchd, "make_layout", lambda exe: layout)
+    monkeypatch.setattr(desktop_app, "_window_lock", lambda support: None)
+    monkeypatch.setattr(tray_app, "_bring_window_to_front", calls.append)
+    desktop_app._bundled_main(None, "http://localhost")
+    assert calls == [123]
+
+
+def test_startup_retry_and_ready_transition(monkeypatch, tmp_path):
+    import threading
+
+    from agentcall import macos_shell
+
+    loaded = threading.Event()
+    calls = []
+    window = types.SimpleNamespace(
+        load_html=lambda html: calls.append("loading"),
+        load_url=lambda url: (calls.append(url), loaded.set()),
+    )
+    startup = desktop_app.BundledStartup(window, "http://test", types.SimpleNamespace(support_dir=tmp_path))
+    monkeypatch.setattr(macos_shell, "fetch_meta", lambda url: {"setup_required": True, "hardware": {}})
+    startup.retry()
+    assert macos_shell.take_commands(tmp_path) == {"retry"}
+    worker = threading.Thread(target=startup.run)
+    worker.start()
+    try:
+        assert loaded.wait(2)
+    finally:
+        startup.closed.set()
+        worker.join(2)
+    assert calls == ["loading", "http://test"]
+    assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("late_failure", [False, True])
+def test_launchctl_failure_shown_immediately_and_retry_recovers(monkeypatch, tmp_path, late_failure):
+    import threading
+
+    from agentcall import macos_shell
+
+    failed = threading.Event()
+    ready = threading.Event()
+    pages = []
+
+    def load_html(html):
+        pages.append(html)
+        if "退出码 5" in html:
+            failed.set()
+
+    window = types.SimpleNamespace(load_html=load_html, load_url=lambda url: ready.set())
+    startup = desktop_app.BundledStartup(window, "http://test", types.SimpleNamespace(support_dir=tmp_path))
+    # app 已健康也不能掩盖 bridge/tray 的安装失败。
+    monkeypatch.setattr(macos_shell, "fetch_meta", lambda url: {"setup_required": True, "hardware": {}})
+    monkeypatch.setattr(macos_shell, "collect_diagnostics", lambda *args: ("其他原因", "安全诊断"))
+    reason = "后台服务无法启动。launchctl bootstrap 退出码 5，Input/output error"
+    if not late_failure:
+        macos_shell.write_startup_failure(tmp_path, reason)
+    worker = threading.Thread(target=startup.run)
+    worker.start()
+    try:
+        if late_failure:
+            assert ready.wait(1)
+            ready.clear()
+            macos_shell.write_startup_failure(tmp_path, reason)
+        assert failed.wait(1)
+        assert not ready.is_set()
+        assert "重试" in pages[-1] and "Input/output error" in pages[-1]
+        startup.retry()
+        assert macos_shell.read_startup_failure(tmp_path) == ""
+        assert macos_shell.take_commands(tmp_path) == {"retry"}
+        assert ready.wait(1)
+    finally:
+        startup.closed.set()
+        worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_late_launchctl_failure_overrides_timeout_diagnosis(monkeypatch, tmp_path):
+    import threading
+
+    from agentcall import macos_shell
+
+    diagnosing = threading.Event()
+    release = threading.Event()
+    failed = threading.Event()
+    updated = threading.Event()
+    pages = []
+
+    def diagnose(*args, **kwargs):
+        diagnosing.set()
+        release.wait(2)
+        return "泛化超时原因", "安全诊断"
+
+    def load_html(html):
+        pages.append(html)
+        if "退出码 5" in html:
+            failed.set()
+            if len(pages) > 1:
+                updated.set()
+
+    startup = desktop_app.BundledStartup(
+        types.SimpleNamespace(load_html=load_html), "http://test", types.SimpleNamespace(support_dir=tmp_path),
+    )
+    clock = iter([0, 31])
+    monkeypatch.setattr(desktop_app.time, "monotonic", lambda: next(clock, 31))
+    monkeypatch.setattr(macos_shell, "fetch_meta", lambda url: {})
+    monkeypatch.setattr(macos_shell, "collect_diagnostics", diagnose)
+    worker = threading.Thread(target=startup.run)
+    worker.start()
+    try:
+        assert diagnosing.wait(1)
+        macos_shell.write_startup_failure(tmp_path, "后台服务无法启动。退出码 5，Input/output error")
+        assert failed.wait(1)
+        release.set()
+        # 模拟稍后返回的泛化诊断，不能覆盖具体 launchctl 原因。
+        startup.diagnostic_results.put((0, "泛化超时原因", "安全诊断"))
+        assert updated.wait(1)
+        assert all("泛化超时原因" not in page for page in pages)
+    finally:
+        release.set()
+        startup.closed.set()
+        worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_slow_diagnostics_do_not_block_window_close(monkeypatch, tmp_path):
+    import threading
+
+    from agentcall import macos_shell
+
+    diagnosing = threading.Event()
+    release = threading.Event()
+    destroyed = threading.Event()
+    window = types.SimpleNamespace(destroy=destroyed.set, load_html=lambda html: None)
+    startup = desktop_app.BundledStartup(window, "http://test", types.SimpleNamespace(support_dir=tmp_path))
+    clock = iter([0, 31, 31, 31, 31])
+    monkeypatch.setattr(desktop_app.time, "monotonic", lambda: next(clock, 31))
+    monkeypatch.setattr(macos_shell, "fetch_meta", lambda url: {})
+
+    def diagnose(*args, **kwargs):
+        diagnosing.set()
+        release.wait(3)
+        return "failed", "safe"
+
+    monkeypatch.setattr(macos_shell, "collect_diagnostics", diagnose)
+    worker = threading.Thread(target=startup.run)
+    worker.start()
+    try:
+        assert diagnosing.wait(1)
+        (tmp_path / "close-window").touch()
+        assert destroyed.wait(1)
+    finally:
+        release.set()
+        startup.closed.set()
+        worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_startup_html_has_retry_copy_and_no_developer_commands():
+    html = desktop_app.startup_html("<test>")
+    assert "&lt;test&gt;" in html
+    assert "重试" in html and "复制诊断信息" in html
+    assert "app.py" not in html and "cd " not in html
+
+
+def test_cocoa_hooks_route_cmd_q_restore_and_save_geometry(monkeypatch, tmp_path):
+    from agentcall import macos_shell
+
+    calls = []
+    selectors = []
+
+    class Event:
+        def __init__(self):
+            self.callbacks = []
+
+        def __iadd__(self, callback):
+            self.callbacks.append(callback)
+            return self
+
+    def rect(x, y, width, height):
+        return types.SimpleNamespace(origin=types.SimpleNamespace(x=x, y=y),
+                                     size=types.SimpleNamespace(width=width, height=height))
+
+    native = types.SimpleNamespace(
+        setFrame_display_=lambda frame, display: calls.append(("frame", frame)),
+        makeKeyAndOrderFront_=lambda sender: calls.append("front"), frame=lambda: rect(30, 40, 900, 700),
+    )
+    app = types.SimpleNamespace(
+        setActivationPolicy_=lambda policy: calls.append(("policy", policy)),
+        activateIgnoringOtherApps_=lambda flag: calls.append("active"),
+    )
+    monkeypatch.setitem(sys.modules, "AppKit", types.SimpleNamespace(
+        NSApplication=types.SimpleNamespace(sharedApplication=lambda: app), NSApplicationActivationPolicyRegular=0,
+        NSMakeRect=lambda *args: args,
+        NSScreen=types.SimpleNamespace(screens=lambda: [
+            types.SimpleNamespace(visibleFrame=lambda: rect(0, 0, 1440, 900)),
+        ]),
+    ))
+    monkeypatch.setitem(sys.modules, "objc", types.SimpleNamespace(
+        selector=lambda fn, **kw: fn, classAddMethods=lambda cls, items: selectors.extend(items),
+        registerMetaDataForSelector=lambda *args: None,
+    ))
+    monkeypatch.setitem(sys.modules, "PyObjCTools", types.SimpleNamespace(
+        AppHelper=types.SimpleNamespace(callAfter=lambda callback: callback()),
+    ))
+    monkeypatch.setitem(sys.modules, "webview.platforms.cocoa", types.SimpleNamespace(
+        BrowserView=types.SimpleNamespace(
+            AppDelegate=types.SimpleNamespace(applicationShouldTerminate_=types.SimpleNamespace(signature=b"Q@:@")),
+            instances={"window": types.SimpleNamespace(window=native)},
+        ),
+    ))
+    window = types.SimpleNamespace(uid="window", events=types.SimpleNamespace(shown=Event(), closing=Event()))
+    desktop_app._install_window_hooks(window, tmp_path)
+    window.events.shown.callbacks[0]()
+    assert calls == [("frame", (170, 60, 1100, 780)), ("policy", 0), "front", "active"]
+    assert selectors[0](None, None) == 0
+    assert macos_shell.take_commands(tmp_path) == {"quit"}
+    window.events.closing.callbacks[0]()
+    assert macos_shell.restore_geometry(tmp_path / "window.json", [(0, 0, 1440, 900)]) == (30, 40, 900, 700)
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """清掉宿主环境可能带入的 AGENTCALL_* 变量，保证测试确定性。"""
+    from agentcall import macos_shell
+
+    monkeypatch.setattr(macos_shell, "ui_language", lambda: "zh")
     for name in _ENV_VARS:
         monkeypatch.delenv(name, raising=False)
 

@@ -295,6 +295,7 @@ def build_app(
     app.router.add_get("/callpilot-192.png", _remote_dialer_asset)
     app.router.add_get("/callpilot-512.png", _remote_dialer_asset)
     app.router.add_get("/api/meta", _meta)
+    app.router.add_post("/api/macos/autostart", _macos_autostart)
     app.router.add_get("/ws", _websocket)
     app.router.add_get("/ws/audio", _audio_websocket)
     app.router.add_post("/api/sms/send", _send_sms)
@@ -391,6 +392,10 @@ async def _remote_dialer_asset(request: web.Request) -> web.StreamResponse:
 
 async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
+    if _macos_shell_available():
+        from .. import macos_launchd
+
+        meta["macos_autostart"] = macos_launchd.autostart_enabled(macos_launchd.make_layout(sys.executable))
     service = request.app.get("service")
     modem = getattr(service, "modem", None)
     line_busy = getattr(service, "line_busy", None)
@@ -437,6 +442,30 @@ async def _meta(request: web.Request) -> web.Response:
     if setup_sms_token:
         meta["setup_sms_token"] = setup_sms_token
     return web.json_response(meta)
+
+
+def _macos_shell_available() -> bool:
+    return platforms.IS_MACOS and bool(getattr(sys, "frozen", False))
+
+
+async def _macos_autostart(request: web.Request) -> web.Response:
+    if not _macos_shell_available():
+        raise web.HTTPNotFound()
+    # 此接口可写登录项；仅接受同源 JSON，不允许第三方网页用普通表单触发。
+    if request.content_type != "application/json":
+        raise web.HTTPUnsupportedMediaType()
+    origin = request.headers.get("Origin")
+    if origin and origin != f"{request.scheme}://{request.host}":
+        raise web.HTTPForbidden()
+    data = await read_json(request)
+    if not isinstance(data, dict) or type(data.get("enabled")) is not bool:
+        raise web.HTTPBadRequest(text="enabled 必须为布尔值")
+    from .. import macos_launchd
+
+    await asyncio.to_thread(
+        macos_launchd.set_autostart, macos_launchd.make_layout(sys.executable), data["enabled"],
+    )
+    return web.json_response({"ok": True, "enabled": data["enabled"]})
 
 
 async def _websocket(request: web.Request) -> web.WebSocketResponse:

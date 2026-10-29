@@ -9,7 +9,7 @@
     打开控制台             （开 pywebview 面板窗口，即 desktop_app.py 子进程）
     重启服务               （POST /api/restart，按当前运行方式重启后端）
     ——
-    退出                   （仅退出托盘；后端服务仍由 launchd 常驻）
+    退出 CallPilot         （打包版确认后停止服务与桥，再退出托盘）
 
 用法：
     .venv/bin/python tray_app.py
@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_WEB_URL = "http://127.0.0.1:47100"
+HEALTH_PROBE_INTERVAL = 3.0
 
 
 def icon_path(online: bool) -> str:
@@ -59,13 +61,13 @@ _MENU_LABELS = {
         "open": "Open dashboard",
         "restart": "Restart service",
         "uninstall": "Uninstall background services",
-        "quit": "Quit",
+        "quit": "Quit CallPilot",
     },
     "zh": {
         "open": "打开控制台",
         "restart": "重启服务",
         "uninstall": "卸载常驻",
-        "quit": "退出",
+        "quit": "退出 CallPilot",
     },
 }
 
@@ -160,7 +162,7 @@ def _prepend_runtime_paths() -> None:
     os.environ.setdefault("DYLD_LIBRARY_PATH", str(lib_dir))
 
 
-def _ensure_launchd_installed():
+def _ensure_launchd_installed(user_initiated: bool = False):
     if not _is_frozen() or sys.platform != "darwin":
         from agentcall.macos_launchd import LaunchdInstallResult
 
@@ -170,7 +172,7 @@ def _ensure_launchd_installed():
     layout = macos_launchd.make_layout(sys.executable, resources_dir=_resources_dir())
     # tray 单元由本进程自装：声明 no_restart 防止 bootout 杀掉自己（见函数 docstring）。
     return macos_launchd.install_launch_agents(
-        layout, no_restart_labels={macos_launchd.TRAY_LABEL}
+        layout, no_restart_labels={macos_launchd.TRAY_LABEL}, user_initiated=user_initiated,
     )
 
 
@@ -252,23 +254,16 @@ def maybe_autoopen_dashboard(
 
 
 def _bring_window_to_front(pid: int) -> None:
-    """把指定 pid 的控制台窗口进程拉到前台（仅 macOS）；失败只记日志不抛。
-
-    需要「辅助功能 / 自动化」权限控制 System Events；未授权时激活失败，
-    退化为「窗口仍在后台」——仍好于每次点击都新开一个窗口。
-    """
+    """AppKit 按 pid 激活窗口，不发送 Apple Events、无需自动化授权。"""
     if sys.platform != "darwin":
         return
-    script = (
-        "tell application \"System Events\" to set frontmost of "
-        f"(first process whose unix id is {pid}) to true"
-    )
     try:
-        subprocess.run(
-            ["osascript", "-e", script],
-            check=False, capture_output=True, timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+        from AppKit import NSApplicationActivateAllWindows, NSApplicationActivateIgnoringOtherApps, NSRunningApplication
+
+        application = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        if application is not None:
+            application.activateWithOptions_(NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps)
+    except Exception as exc:  # noqa: BLE001
         logger.warning("激活控制台窗口失败: %s", exc)
 
 
@@ -329,8 +324,46 @@ def _import_rumps():
     return rumps
 
 
+def _install_reopen_handler(callback) -> None:
+    import objc
+    from rumps.rumps import NSApp
+
+    def applicationShouldHandleReopen_hasVisibleWindows_(self, application, visible):
+        callback()
+        return False
+
+    objc.classAddMethods(NSApp, [objc.selector(
+        applicationShouldHandleReopen_hasVisibleWindows_, signature=b"Z@:@Z",
+    )])
+
+
+def _bundled_macos() -> bool:
+    return sys.platform == "darwin" and _is_frozen()
+
+
+def _start_background_services(user_initiated: bool = False) -> None:
+    from agentcall import macos_launchd, macos_shell
+
+    support = macos_launchd.app_support_dir() if _bundled_macos() else None
+    lang = macos_shell.ui_language() if support is not None else "en"
+    try:
+        if support is not None:
+            macos_shell.write_startup_failure(support, "")
+        result = _ensure_launchd_installed(user_initiated=user_initiated)
+        if result.failures:
+            logger.error("launchd 自装失败: %s", result.failure_summary())
+            if support is not None:
+                macos_shell.write_startup_failure(support, macos_shell.launchd_failure_reason(result, lang))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("launchd 自装失败")
+        if support is not None:
+            macos_shell.write_startup_failure(support, macos_shell.ui_text(
+                f"后台服务无法启动（{type(exc).__name__}）。请重试。",
+                f"Background services could not start ({type(exc).__name__}). Please retry.", lang,
+            ))
+
+
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     _prepend_runtime_paths()
     if "--selftest" in sys.argv[1:]:
         # 打包后 import 自检（不起服务/不装 launchd）：验证关键模块真进了 bundle。
@@ -348,31 +381,39 @@ def main() -> None:
         import desktop_app
         desktop_app.main()
         return
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    if _is_frozen() and sys.platform == "darwin":
+        from agentcall.macos_shell import configure_shell_logging
+
+        configure_shell_logging("tray")
     # 单例：launchd 常驻实例已在跑时，双击再启的实例让位退出（码 0，见函数注释）。
     # 句柄须持有到进程结束，锁才不失效。
     singleton_lock = _acquire_tray_singleton_lock()
     if singleton_lock is None:
+        if _bundled_macos() and "--login" not in sys.argv:
+            from agentcall.macos_shell import send_command
+
+            send_command("open")
         logger.info("已有 CallPilot 菜单栏实例在运行，本实例让位退出")
         return
+    bundled = _bundled_macos()
+    # 主动启动先拉窗口，连 rumps 导入和菜单构造都不挡住首屏。
+    early_window = None
+    if bundled and "--login" not in sys.argv:
+        try:
+            early_window = open_or_focus_dashboard(None)
+        except OSError:
+            logger.exception("提前打开控制台失败，将由菜单栏重试")
     rumps = _import_rumps()
-    lang = "en" if os.getenv("AGENT_LANGUAGE", "zh").strip().lower() == "en" else "zh"
-    try:
-        install_result = _ensure_launchd_installed()
-        if install_result.changed:
-            logger.info("launchd agents installed/updated: %s", ", ".join(install_result.changed))
-        if install_result.failures:
-            summary = install_result.failure_summary()
-            logger.error("launchd 自装失败: %s", summary)
-            rumps.notification("CallPilot", "Background services failed", summary)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("launchd 自装失败: %s", exc)
-        rumps.notification("CallPilot", "Background services failed", str(exc))
+    from agentcall.macos_shell import ui_language
 
-    maybe_autoopen_dashboard(
-        web_url(),
-        wait=_env_float("AGENTCALL_TRAY_STARTUP_WAIT", 15.0),
-        poll_interval=_env_float("AGENTCALL_TRAY_POLL_INTERVAL", 0.5),
-    )
+    lang = ui_language()
+    if not bundled:
+        _start_background_services()
+        maybe_autoopen_dashboard(
+            web_url(), wait=_env_float("AGENTCALL_TRAY_STARTUP_WAIT", 15.0),
+            poll_interval=_env_float("AGENTCALL_TRAY_POLL_INTERVAL", 0.5),
+        )
 
     class CallPilotTray(rumps.App):
         def __init__(self) -> None:
@@ -381,7 +422,14 @@ def main() -> None:
                 "CallPilot", title=None, icon=icon_path(False),
                 template=False, quit_button=None,
             )
-            self._window_proc: subprocess.Popen | None = None
+            self._window_proc: subprocess.Popen | None = early_window
+            self._install_thread: threading.Thread | None = None
+            self._enable_requested = False
+            self._quitting = False
+            self._probe_thread: threading.Thread | None = None
+            self._last_probe_started: float | None = None
+            self._online = False
+            self._displayed_online = False
             self._status_item = rumps.MenuItem(status_label(False, lang))
             self.menu = [
                 self._status_item,
@@ -392,10 +440,76 @@ def main() -> None:
                 None,
                 rumps.MenuItem(menu_label("quit", lang), callback=self._quit),
             ]
+            if bundled:
+                from dotenv import dotenv_values
+
+                from agentcall import macos_launchd, macos_shell
+
+                layout = macos_launchd.make_layout(sys.executable)
+                macos_shell.write_startup_failure(layout.support_dir, "")
+                setup = str(dotenv_values(layout.env_file).get("SETUP_DONE", "")).lower() not in {"1", "true", "yes"}
+                if early_window is None and macos_shell.should_open_window("--login" in sys.argv, setup):
+                    self._open(None)
+                # 先开本地窗口，再后台安装；不让 launchctl/健康轮询挡住 Cocoa 主循环。
+                self._start_services(user_initiated="--login" not in sys.argv)
+                _install_reopen_handler(self._reopen)
+                self._request_observer = macos_shell.observe_commands(lambda: self._requests(None))
+            else:
+                self._refresh(None)
+
+        def _start_services(self, user_initiated: bool = True) -> None:
+            if self._install_thread is None or not self._install_thread.is_alive():
+                self._enable_requested = False
+                self._install_thread = threading.Thread(
+                    target=lambda: _start_background_services(user_initiated=user_initiated), daemon=True,
+                )
+                self._install_thread.start()
+            elif user_initiated:
+                # 登录安装尚未结束时收到主动打开，保留 enable 请求供下一轮消费。
+                self._enable_requested = True
+
+        def _reopen(self) -> None:
+            if not self._quitting:
+                self._open(None)
+                self._start_services()
+
+        @rumps.timer(0.2)
+        def _requests(self, _sender) -> None:
+            if not bundled or self._quitting:
+                return
+            from agentcall.macos_shell import take_commands
+
+            commands = take_commands()
+            if "quit" in commands:
+                self._quit(None)
+                return
+            elif "open" in commands:
+                self._reopen()
+            if "retry" in commands:
+                self._start_services()
+            if self._enable_requested and self._install_thread is not None and not self._install_thread.is_alive():
+                self._start_services()
             self._refresh(None)
+            online = self._online
+            if online != self._displayed_online:
+                self.icon = icon_path(online)
+                self._status_item.title = status_label(online, lang)
+                self._displayed_online = online
 
         @rumps.timer(5)
         def _refresh(self, _sender) -> None:
+            if bundled:
+                now = time.monotonic()
+                if self._last_probe_started is not None and now - self._last_probe_started < HEALTH_PROBE_INTERVAL:
+                    return
+                if self._probe_thread is None or not self._probe_thread.is_alive():
+                    def probe():
+                        self._online = probe_online(web_url())
+
+                    self._probe_thread = threading.Thread(target=probe, daemon=True)
+                    self._last_probe_started = now
+                    self._probe_thread.start()
+                return
             online = probe_online(web_url())
             self.icon = icon_path(online)
             self._status_item.title = status_label(online, lang)
@@ -403,6 +517,10 @@ def main() -> None:
         def _open(self, _sender) -> None:
             try:
                 self._window_proc = open_or_focus_dashboard(self._window_proc)
+                if bundled:
+                    from agentcall.macos_launchd import app_support_dir
+
+                    (app_support_dir() / "focus-window").touch(mode=0o600)
             except OSError as exc:
                 logger.error("打开控制台失败: %s", exc)
 
@@ -417,7 +535,48 @@ def main() -> None:
                 logger.error("卸载常驻失败: %s", exc)
 
         def _quit(self, _sender) -> None:
-            rumps.quit_application()
+            if not bundled:
+                rumps.quit_application()
+                return
+            from agentcall import macos_launchd, macos_shell
+
+            if self._quitting:
+                return
+            from AppKit import NSApplication
+
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            meta = macos_shell.fetch_meta(web_url())
+            confirmed = rumps.alert(
+                title=macos_shell.ui_text("退出 CallPilot？", "Quit CallPilot?", lang),
+                message=macos_shell.quit_message(meta, lang),
+                ok=menu_label("quit", lang), cancel=macos_shell.ui_text("取消", "Cancel", lang),
+            ) == 1
+            if not confirmed:
+                return
+            self._quitting = True
+            try:
+                # 等待正在进行的安装完成，防止 bootout 后被安装线程再次 bootstrap。
+                if self._install_thread is not None:
+                    self._install_thread.join(timeout=1)
+                    if self._install_thread.is_alive():
+                        raise RuntimeError(macos_shell.ui_text(
+                            "后台服务正在启动，请稍后再退出。",
+                            "Background services are starting. Please try quitting again shortly.",
+                            lang,
+                        ))
+                layout = macos_launchd.make_layout(sys.executable)
+
+                def close_window():
+                    from desktop_app import close_bundled_window
+
+                    close_bundled_window(layout.support_dir)
+
+                macos_shell.quit_services(True, layout, close_window, rumps.quit_application, lang=lang)
+            except Exception as exc:  # noqa: BLE001
+                rumps.alert(title=macos_shell.ui_text("尚未退出", "Could not quit", lang), message=str(exc),
+                            ok=macos_shell.ui_text("知道了", "OK", lang))
+            finally:
+                self._quitting = False
 
     CallPilotTray().run()
 

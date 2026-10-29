@@ -11,6 +11,7 @@ import argparse
 import errno
 import fcntl
 import logging
+import logging.handlers
 import os
 import pty
 import select
@@ -20,7 +21,7 @@ import termios
 import threading
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -41,8 +42,14 @@ PID = modem_hardware.PRESETS[0].pid
 
 # 连续写超时容忍上限：≤此值视作瞬时忙丢帧继续，超过判定设备掉线拆桥重连。
 PTY_WRITE_TIMEOUT_TOLERANCE = 3
+# USB→PTY 每块数据的总背压预算，容忍服务短暂调度迟滞但不无限等待。
+USB_TO_PTY_WRITE_TIMEOUT = 0.5
 
 LOCK_PATH = Path("/tmp/ec20-usb-pty.lock")
+
+
+class BridgeShutdownError(Exception):
+    """无法安全关闭时必须退出进程，不允许外层带着活动线程原地重连。"""
 
 
 def bundled_libusb_path() -> Path | None:
@@ -107,12 +114,26 @@ class BridgeHandle:
     # 因「模组持续不排空端点」而拆桥（区别于真拔线）：置位后主循环会先跑
     # USB 组合切换恢复再重连，见 usb_composition_recovery。
     degraded: bool = False
+    threads: list[threading.Thread] = field(default_factory=list)
 
     def close(self) -> None:
         if self.closed:
             return
-        self.closed = True
         self.stop.set()
+        # 先停生产者，避免 flush 后又写入；USB 调用自身带 100/1000ms 超时。
+        deadline = time.monotonic() + 1.5
+        for thread in self.threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in self.threads):
+            # 不能与仍使用 fd/libusb 的线程竞态 close；交给进程退出回收。
+            raise BridgeShutdownError(f"interface {self.port.interface} 桥线程未按时退出，拒绝关闭活动 PTY")
+        # macOS close 会等待 tty 待发数据排空；无读者时必须先丢弃两个方向的队列。
+        for fd in (self.master_fd, self.slave_fd):
+            try:
+                termios.tcflush(fd, termios.TCIOFLUSH)
+            except (OSError, termios.error) as exc:
+                if exc.args[0] != errno.EBADF:
+                    raise BridgeShutdownError("PTY 清空失败，拒绝执行可能阻塞的 close") from exc
         try:
             usb.util.release_interface(self.dev, self.port.interface)
         except Exception:
@@ -125,6 +146,7 @@ class BridgeHandle:
         path = Path(self.link)
         if path.is_symlink():
             path.unlink()
+        self.closed = True
 
 
 def find_device(vid: int = VID, pid: int = PID) -> usb.core.Device:
@@ -353,6 +375,27 @@ def link_pty(slave_name: str, link: str) -> None:
     path.symlink_to(slave_name)
 
 
+def write_pty_bounded(master_fd: int, data: bytes, stop: threading.Event) -> int:
+    """在总时限内补齐部分写入，返回超时或停止时尚未写出的字节数。"""
+    remaining = memoryview(data)
+    deadline = time.monotonic() + USB_TO_PTY_WRITE_TIMEOUT
+    while remaining and not stop.is_set():
+        if time.monotonic() >= deadline:
+            break
+        try:
+            written = os.write(master_fd, remaining)
+        except BlockingIOError:
+            written = 0
+        if written:
+            remaining = remaining[written:]
+            continue
+        # 分段等待让关闭能及时响应；部分写入和再次 EAGAIN 都不重置截止时间。
+        wait = min(0.05, deadline - time.monotonic())
+        if wait > 0:
+            select.select([], [master_fd], [], wait)
+    return len(remaining)
+
+
 def bridge_port(
     dev: usb.core.Device,
     port: UsbPort,
@@ -364,6 +407,7 @@ def bridge_port(
     try:
         # Keep the slave side open so the master does not see EIO before a client opens it.
         make_raw(slave_fd)
+        os.set_blocking(master_fd, False)
         slave_name = os.ttyname(slave_fd)
         try:
             usb.util.claim_interface(dev, port.interface)
@@ -382,6 +426,7 @@ def bridge_port(
     )
 
     def usb_to_pty() -> None:
+        last_drop_log = float("-inf")
         while not stop.is_set():
             try:
                 data = dev.read(port.bulk_in, port.max_packet, timeout=100)
@@ -392,14 +437,20 @@ def bridge_port(
                     logger.error("interface %d USB read failed: %s", port.interface, exc)
                 stop.set()
                 return
+            if stop.is_set():
+                return
             if data:
                 try:
-                    os.write(master_fd, bytes(data))
+                    dropped = write_pty_bounded(master_fd, bytes(data), stop)
                 except OSError as exc:
                     if not stop.is_set():
                         logger.error("interface %d PTY write failed: %s", port.interface, exc)
                     stop.set()
                     return
+                # 短暂迟滞保留数据；PCM/AT 持续无读者才丢弃，不能拖死整座桥。
+                if dropped and not stop.is_set() and time.monotonic() - last_drop_log >= 5.0:
+                    logger.warning("interface %d PTY 缓冲满，丢弃 %d 字节", port.interface, dropped)
+                    last_drop_log = time.monotonic()
 
     def pty_to_usb() -> None:
         consecutive_timeouts = 0
@@ -409,6 +460,8 @@ def bridge_port(
                 if not ready:
                     continue
                 data = os.read(master_fd, port.max_packet)
+            except BlockingIOError:
+                continue
             except OSError as exc:
                 if not stop.is_set():
                     logger.error("interface %d PTY read failed: %s", port.interface, exc)
@@ -443,8 +496,12 @@ def bridge_port(
                     stop.set()
                     return
 
-    threading.Thread(target=usb_to_pty, name=f"ec20-usb-to-pty-{port.interface}", daemon=True).start()
-    threading.Thread(target=pty_to_usb, name=f"ec20-pty-to-usb-{port.interface}", daemon=True).start()
+    handle.threads = [
+        threading.Thread(target=usb_to_pty, name=f"ec20-usb-to-pty-{port.interface}", daemon=True),
+        threading.Thread(target=pty_to_usb, name=f"ec20-pty-to-usb-{port.interface}", daemon=True),
+    ]
+    for thread in handle.threads:
+        thread.start()
     return handle
 
 
@@ -522,8 +579,17 @@ def run_bridges_once(
             time.sleep(0.2)
         return requested or any(handle.degraded for handle in handles)
     finally:
+        # 先通知全部桥，不能因第一个桥关闭失败而让其余生产者继续运行。
         for handle in handles:
-            handle.close()
+            handle.stop.set()
+        shutdown_error = None
+        for handle in handles:
+            try:
+                handle.close()
+            except BridgeShutdownError as exc:
+                shutdown_error = exc
+        if shutdown_error is not None:
+            raise shutdown_error
         usb.util.dispose_resources(dev)
 
 
@@ -654,11 +720,17 @@ def main(
 
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if args.log_file:
-        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                args.log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+            ) if getattr(sys, "frozen", False) else logging.FileHandler(args.log_file, encoding="utf-8")
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=handlers,
+        # 打包入口的已有 handler 不能让桥的文件日志配置失效。
+        force=bool(getattr(sys, "frozen", False)),
     )
 
     _lock = acquire_instance_lock()  # noqa: F841  # 持有到进程退出

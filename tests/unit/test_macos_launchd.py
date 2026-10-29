@@ -11,6 +11,42 @@ import pytest
 from agentcall import macos_launchd
 
 
+@pytest.mark.parametrize("user_initiated", [False, True])
+def test_user_launch_enables_only_own_labels_before_bootstrap(tmp_path, user_initiated):
+    layout = macos_launchd.make_layout(
+        tmp_path / "CallPilot", uid=123, support_dir=tmp_path / "support", launch_dir=tmp_path / "agents",
+    )
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 1 if cmd[1] == "print" else 0, "", "")
+
+    result = macos_launchd.install_launch_agents(layout, runner=runner, user_initiated=user_initiated)
+    assert not result.failures
+    enables = [cmd for cmd in calls if cmd[1] == "enable"]
+    assert enables == ([
+        ["launchctl", "enable", f"gui/123/{label}"] for label in macos_launchd.LAUNCH_LABELS
+    ] if user_initiated else [])
+    if user_initiated:
+        first_bootstrap = next(i for i, cmd in enumerate(calls) if cmd[1] == "bootstrap")
+        assert max(calls.index(cmd) for cmd in enables) < first_bootstrap
+
+
+def test_user_launch_enable_failures_are_reported(tmp_path):
+    layout = macos_launchd.make_layout(
+        tmp_path / "CallPilot", uid=123, support_dir=tmp_path / "support", launch_dir=tmp_path / "agents",
+    )
+
+    def runner(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 5, "", "Input/output error\nMore details")
+
+    result = macos_launchd.install_launch_agents(layout, runner=runner, user_initiated=True, sleep=lambda _: None)
+    failures = [f for f in result.failures if f.action == "enable"]
+    assert [f.label for f in failures] == list(macos_launchd.LAUNCH_LABELS)
+    assert all(f.returncode == 5 for f in failures)
+
+
 def test_bundle_root_and_resources_resolve_from_app_executable():
     exe = Path("/Applications/CallPilot.app/Contents/MacOS/CallPilot")
     expected_root = exe.resolve().parents[2]
@@ -307,8 +343,8 @@ def test_build_plists_tray_unit_keepalive_and_no_caffeinate(tmp_path):
 
     tray = macos_launchd.build_plists(layout)["com.agentcall.tray"]
 
-    # 无参数入口=菜单栏；UI 进程不裹 caffeinate（防睡眠由 --service 承担）。
-    assert tray["ProgramArguments"] == [str(exe.resolve())]
+    # 登录启动显式带来源标记；UI 进程不裹 caffeinate（防睡眠由 --service 承担）。
+    assert tray["ProgramArguments"] == [str(exe.resolve()), "--login"]
     # 崩溃（非零退出）自动拉起；单例让位/主动退出（码 0）不拉起——防重启风暴。
     assert tray["KeepAlive"] == {"SuccessfulExit": False}
     assert tray["RunAtLoad"] is True

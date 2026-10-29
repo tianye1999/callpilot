@@ -149,9 +149,8 @@ if IS_MACOS:
             "CFBundleDisplayName": "CallPilot",
             "CFBundleShortVersionString": APP_VERSION,
             "NSMicrophoneUsageDescription": "CallPilot 需要采集通话对方的语音，供 AI 实时应答。",
-            "NSAppleEventsUsageDescription": "CallPilot 需要发送系统事件（如唤起菜单栏控制台、打开浏览器界面）以完成首启向导与日常操作。",
             "NSHighResolutionCapable": True,
-            # 菜单栏 App：不在 Dock 显示图标、无主窗口（LSUIElement）
+            # 菜单栏保持 accessory；--window 运行时切换 regular，关窗后 Dock 图标消失。
             "LSUIElement": True,
         },
     )

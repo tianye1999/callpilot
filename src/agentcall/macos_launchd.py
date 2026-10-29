@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import plistlib
 import subprocess
 import time
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -154,6 +156,7 @@ def _environment(layout: LaunchdLayout) -> dict[str, str]:
 
 def build_plists(layout: LaunchdLayout) -> dict[str, dict]:
     common = {
+        "AssociatedBundleIdentifiers": ["ai.bondings.callpilot"],
         "KeepAlive": True,
         "RunAtLoad": True,
         "ThrottleInterval": 10,
@@ -193,7 +196,7 @@ def build_plists(layout: LaunchdLayout) -> dict[str, dict]:
         "Label": TRAY_LABEL,
         # 菜单栏 UI 进程（无参数入口）。不裹 caffeinate——防睡眠由 --service
         # 单元承担，UI 进程不该额外持系统断言。
-        "ProgramArguments": [str(layout.executable)],
+        "ProgramArguments": [str(layout.executable), "--login"],
         # KeepAlive 用 SuccessfulExit=False：崩溃（非零退出）自动拉起；
         # 单例让位/用户主动退出（退出码 0）不再拉起——否则双击实例与
         # launchd 实例互踢会形成 ThrottleInterval 周期的重启风暴。
@@ -225,7 +228,47 @@ def _run_launchctl(
     *,
     check: bool = False,
 ) -> subprocess.CompletedProcess:
-    return runner(["launchctl", *args], capture_output=True, text=True, check=check)
+    return runner(["launchctl", *args], capture_output=True, text=True, check=check, timeout=5)
+
+
+def autostart_enabled(layout: LaunchdLayout) -> bool:
+    try:
+        value = json.loads((layout.support_dir / "startup.json").read_text())
+        return value.get("enabled", True) is not False
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+def _serialized_settings(function):
+    """托盘安装与服务写设置共用锁，避免关闭自启后安装线程又写回登录项。"""
+    @wraps(function)
+    def wrapped(layout, *args, **kwargs):
+        layout.support_dir.mkdir(parents=True, exist_ok=True)
+        with (layout.support_dir / "startup.lock").open("a") as lock:
+            try:
+                import fcntl
+            except ImportError:
+                return function(layout, *args, **kwargs)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            return function(layout, *args, **kwargs)
+    return wrapped
+
+
+@_serialized_settings
+def set_autostart(layout: LaunchdLayout, enabled: bool) -> None:
+    """只改变下次登录：移除登录扫描目录的 plist 不会卸载已加载的任务。"""
+    layout.support_dir.mkdir(parents=True, exist_ok=True)
+    layout.launch_agents_dir.mkdir(parents=True, exist_ok=True)
+    for label, data in build_plists(layout).items():
+        path = layout.launch_agents_dir / f"{label}.plist"
+        if enabled:
+            path.write_bytes(plist_bytes(data))
+        else:
+            path.unlink(missing_ok=True)
+    path = layout.support_dir / "startup.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"enabled": enabled}), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _bootout(label: str, layout: LaunchdLayout, runner: Callable[..., subprocess.CompletedProcess]) -> None:
@@ -294,6 +337,7 @@ def _bootstrap_with_retry(
     return last_failure
 
 
+@_serialized_settings
 def install_launch_agents(
     layout: LaunchdLayout,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
@@ -304,6 +348,7 @@ def install_launch_agents(
     bootstrap_attempts: int = 3,
     bootstrap_retry_seconds: float = 2.0,
     no_restart_labels: frozenset[str] | set[str] = frozenset(),
+    user_initiated: bool = False,
 ) -> LaunchdInstallResult:
     """Write missing/stale plists and bootstrap changed agents.
 
@@ -324,8 +369,20 @@ def install_launch_agents(
     changed: list[str] = []
     failures: list[LaunchctlFailure] = []
     warnings: list[LaunchctlFailure] = []
+    if user_initiated:
+        # 只在用户主动启动时清除本 App 的历史 disabled 状态，登录启动不改变用户域设置。
+        for label in LAUNCH_LABELS:
+            result = _run_launchctl(["enable", f"{layout.gui_domain}/{label}"], runner)
+            if result.returncode:
+                failures.append(_failure(label, "enable", result))
+    # 关闭自启仍可手动 bootstrap；运行期 plist 不放在登录扫描目录。
+    enabled = autostart_enabled(layout)
+    plist_dir = layout.launch_agents_dir if enabled else layout.support_dir / "LaunchAgents"
+    plist_dir.mkdir(parents=True, exist_ok=True)
     for label, data in build_plists(layout).items():
-        path = layout.launch_agents_dir / f"{label}.plist"
+        if not enabled:
+            (layout.launch_agents_dir / f"{label}.plist").unlink(missing_ok=True)
+        path = plist_dir / f"{label}.plist"
         if not plist_needs_update(path, data):
             if not agent_loaded(label, layout, runner):
                 failure = _bootstrap_with_retry(

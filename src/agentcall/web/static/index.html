@@ -543,6 +543,10 @@
   .switch input:checked + .knob { background: #34c759; }
   .switch input:checked + .knob::after { transform: translateX(20px); }
   .switch input:disabled + .knob { opacity: .4; cursor: default; }
+  #macosAutostartRow { padding: 0 20px 10px; }
+  #macosAutostartRow label.switch { flex: 0 0 auto; width: 48px; height: 28px; }
+  #macosAutostart { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; z-index: 1; cursor: pointer; }
+  #macosAutostart:focus-visible + .knob { outline: 2px solid var(--blue); outline-offset: 3px; }
   .cfg-save { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
 
   /* ========= 预设任务库管理 ========= */
@@ -1162,6 +1166,16 @@
       <div class="wrap">
         <section class="card">
           <h2><span data-i18n="settings_title"></span><span class="sub" id="portSub"></span></h2>
+          <div id="macosAutostartRow" hidden>
+            <div class="cfg-row">
+              <label for="macosAutostart" id="macosAutostartLabel" data-i18n="macos_autostart"></label>
+              <label class="switch">
+                <input type="checkbox" role="switch" id="macosAutostart" aria-labelledby="macosAutostartLabel">
+                <span class="knob" aria-hidden="true"></span>
+              </label>
+            </div>
+            <span id="macosAutostartStatus" role="status"></span>
+          </div>
           <div id="configForm"><div class="empty" data-i18n="cfg_loading"></div></div>
           <div class="cfg-save">
             <button class="btn primary sm" id="configSave" data-i18n="cfg_save"></button>
@@ -1523,6 +1537,7 @@ const I18N = {
       latency: "Latency", summary: "Summary", ended: "Wrap-up", call_finished: "Call finished",
       not_connected: "No answer", dtmf: "DTMF keys", transcript_user: "Caller said", transcript_agent: "AI said" },
     settings_title: "Settings", cfg_loading: "Loading…", cfg_save: "Save",
+    macos_autostart: "Start CallPilot at login",
     restart_btn: "Restart service",
     restart_confirm_title: "Restart the service?",
     restart_confirm_msg: "The service will restart to reconnect the modem and apply settings. Any call in progress will end.",
@@ -1809,6 +1824,7 @@ const I18N = {
       latency: "延迟打点", summary: "生成摘要", ended: "会话收尾", call_finished: "通话结束",
       not_connected: "未接通", dtmf: "发送按键", transcript_user: "对方说", transcript_agent: "分身说" },
     settings_title: "系统设置", cfg_loading: "正在加载配置…", cfg_save: "保存设置",
+    macos_autostart: "登录时自动启动 CallPilot",
     restart_btn: "重启服务",
     restart_confirm_title: "重启服务？",
     restart_confirm_msg: "服务将重启以重连模组并应用设置，进行中的通话会中断。",
@@ -1872,7 +1888,11 @@ const I18N = {
     cfg: {},  // 中文用后端 label
   },
 };
-let LANG = localStorage.getItem("cp_lang") || "en";
+function initialUiLanguage(saved, languages) {
+  if (saved === "zh" || saved === "en") return saved;
+  return languages.some(language => String(language).toLowerCase().startsWith("zh")) ? "zh" : "en";
+}
+let LANG = initialUiLanguage(localStorage.getItem("cp_lang"), [...(navigator.languages || []), navigator.language || ""]);
 const t = (key) => {
   const v = I18N[LANG][key] !== undefined ? I18N[LANG][key] : I18N.en[key];
   return v !== undefined ? v : key;
@@ -2413,6 +2433,8 @@ async function loadMeta() {
   try {
     const m = await (await fetch("/api/meta")).json();
     lastMeta = m;
+    $("macosAutostartRow").hidden = typeof m.macos_autostart !== "boolean";
+    if (!$("macosAutostart").disabled) $("macosAutostart").checked = m.macos_autostart === true;
     if (m.hardware && statusRevision === modemStatusRevision) {
       setModem(!!m.hardware.modem_connected, !!m.hardware.modem_resetting);
     }
@@ -2438,6 +2460,23 @@ async function loadMeta() {
     }
   } catch (e) { console.warn("[meta] 加载运行信息失败", e); }
 }
+
+$("macosAutostart").addEventListener("change", async (event) => {
+  const input = event.target;
+  const enabled = input.checked;
+  input.disabled = true;
+  $("macosAutostartStatus").textContent = "";
+  try {
+    const response = await fetch("/api/macos/autostart", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({enabled}),
+    });
+    if (!response.ok) throw new Error("save failed");
+    input.checked = (await response.json()).enabled;
+  } catch (error) {
+    input.checked = !enabled;
+    $("macosAutostartStatus").textContent = t("req_error");
+  } finally { input.disabled = false; }
+});
 
 /* ========= 实时旁听：Web Audio 播放下行 PCM（走浏览器→系统音频，绕开 native）========= */
 // 下行(AI)与上行(对方)各一条播放时间线，按帧首字节的方向标记分流，两路同时出声。

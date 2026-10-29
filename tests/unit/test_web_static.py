@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 INDEX = Path(__file__).resolve().parents[2] / "src" / "agentcall" / "web" / "static" / "index.html"
 REMOTE_HTML = INDEX.with_name("remote_dialer.html")
@@ -10,6 +14,29 @@ REMOTE_JS = INDEX.with_name("remote_dialer.js")
 REMOTE_CSS = INDEX.with_name("remote_dialer.css")
 REMOTE_MANIFEST = INDEX.with_name("manifest.webmanifest")
 REMOTE_SW = INDEX.with_name("remote_dialer_sw.js")
+
+
+def test_browser_language_defaults_and_saved_override():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 执行真实前端语言选择函数")
+    text = INDEX.read_text(encoding="utf-8")
+    start = text.index("function initialUiLanguage(")
+    end = text.index("\nlet LANG =", start)
+    source = text[start:end]
+    result = subprocess.run([node, "-e", source + '''
+const assert = require('node:assert/strict');
+assert.equal(initialUiLanguage(null, ['zh-CN']), 'zh');
+assert.equal(initialUiLanguage(null, ['zh-Hant-TW']), 'zh');
+assert.equal(initialUiLanguage(null, ['en-US', 'zh-CN']), 'zh');
+assert.equal(initialUiLanguage(null, ['ja-JP']), 'en');
+assert.equal(initialUiLanguage(null, []), 'en');
+assert.equal(initialUiLanguage('en', ['zh-CN']), 'en');
+assert.equal(initialUiLanguage('zh', ['en-US']), 'zh');
+assert.equal(initialUiLanguage('invalid', ['zh-CN']), 'zh');
+'''], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'navigator.languages || []' in text and 'navigator.language || ""' in text
 
 
 def test_index_does_not_use_html_injection_apis():

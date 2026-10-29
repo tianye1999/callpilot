@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import sys
 import threading
@@ -126,7 +127,10 @@ def main() -> None:
     log_dir = config.log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "app.log"
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler = (
+        logging.handlers.RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        if config._is_frozen() else logging.FileHandler(log_file, encoding="utf-8")
+    )
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     )
@@ -134,6 +138,8 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler(), file_handler],
+        # 冻结入口或依赖可能已配置 root logger；服务必须接管自己的文件 handler。
+        force=config._is_frozen(),
     )
     logger.info("日志文件: %s", log_file)
 
