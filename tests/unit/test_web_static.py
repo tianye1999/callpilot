@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+# Windows CI 上 Node 冷启动可能超过 10 秒（3.12 腿实测超时），放宽到 60 秒避免偶发红。
+NODE_TIMEOUT = 60
+
 INDEX = Path(__file__).resolve().parents[2] / "src" / "agentcall" / "web" / "static" / "index.html"
 REMOTE_HTML = INDEX.with_name("remote_dialer.html")
 REMOTE_JS = INDEX.with_name("remote_dialer.js")
@@ -34,7 +37,7 @@ assert.equal(initialUiLanguage(null, []), 'en');
 assert.equal(initialUiLanguage('en', ['zh-CN']), 'en');
 assert.equal(initialUiLanguage('zh', ['en-US']), 'zh');
 assert.equal(initialUiLanguage('invalid', ['zh-CN']), 'zh');
-'''], capture_output=True, text=True, timeout=10)
+'''], capture_output=True, text=True, timeout=NODE_TIMEOUT)
     assert result.returncode == 0, result.stderr
     assert 'navigator.languages || []' in text and 'navigator.language || ""' in text
 
@@ -191,7 +194,7 @@ function $(id) {
   assert.equal(currentPage, 'settings');
   assert.deepEqual(events, []);
 })().catch(error => { console.error(error); process.exitCode = 1; });
-'''], capture_output=True, text=True, encoding="utf-8", timeout=10)
+'''], capture_output=True, text=True, encoding="utf-8", timeout=NODE_TIMEOUT)
     assert result.returncode == 0, result.stderr
 
 
