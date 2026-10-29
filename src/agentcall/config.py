@@ -11,6 +11,7 @@ roadmap P2-2/P2-5/P2-6 的地基：
 from __future__ import annotations
 
 import codecs
+import json
 import logging
 import os
 import re
@@ -116,13 +117,13 @@ class ConfigSpec:
 @dataclass(frozen=True)
 class KeyValidationResult:
     ok: bool
-    status: Literal["valid", "invalid", "network", "unsupported"]
+    status: Literal["valid", "invalid", "network", "unsupported", "format", "balance"]
     message: str = ""
 
 
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- Agent ----
-    ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "qwen",
+    ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "local",
                choices=("qwen", "doubao", "openai", "local"), requires_restart=True,
                choice_labels={"doubao": "doubao (experimental)",
                               "local": "local (三段式，音频不出本机)"}),
@@ -289,13 +290,13 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("CALL_PLAYBOOKS_FILE", "呼叫情报库文件", "str", ""),
     ConfigSpec("CALL_PLAYBOOKS_MIN_EVIDENCE_CALLS", "情报必填项最少独立通话证据", "int", "2"),
     # ---- 本地三段式（AGENT_PROVIDER=local）----
-    ConfigSpec("LOCAL_LLM_PROVIDER", "三段式 LLM 提供方", "select", "dashscope",
+    ConfigSpec("LOCAL_LLM_PROVIDER", "三段式 LLM 提供方", "select", "deepseek",
                choices=("dashscope", "deepseek"), requires_restart=True),
     ConfigSpec("LOCAL_LLM_BASE_URL", "三段式 DeepSeek API 地址", "str", "https://api.deepseek.com",
                requires_restart=True),
     ConfigSpec("DEEPSEEK_API_KEY", "DeepSeek API Key", "str", "",
                secret=True, requires_restart=True),
-    ConfigSpec("LOCAL_LLM_MODEL", "三段式 LLM 模型", "str", "qwen-plus",
+    ConfigSpec("LOCAL_LLM_MODEL", "三段式 LLM 模型", "str", "deepseek-flash",
                requires_restart=True),
     ConfigSpec("LOCAL_LLM_THINKING", "三段式 DeepSeek 思考模式", "select", "disabled",
                choices=("disabled", "low", "high"), requires_restart=True),
@@ -576,7 +577,7 @@ PROVIDER_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "qwen": ("DASHSCOPE_API_KEY",),
     "doubao": ("DOUBAO_APP_ID", "DOUBAO_ACCESS_KEY"),
     "openai": ("OPENAI_API_KEY",),
-    # 三段式的默认 LLM 脑是 dashscope 文本模型（qwen-plus），复用同一凭证。
+    # 本地三段式按文本提供方检查凭证，不能把 DashScope Key 当成 DeepSeek Key。
     "local": ("DASHSCOPE_API_KEY",),
 }
 
@@ -600,6 +601,8 @@ def is_explicit(key: str) -> bool:
 def get_str(key: str) -> str:
     """读取字符串配置（select 项同样用本函数读取）。"""
     spec = get_spec(key)
+    if key == "LOCAL_LLM_MODEL" and key not in os.environ and get_str("LOCAL_LLM_PROVIDER") == "dashscope":
+        return "qwen-plus"
     return os.environ.get(key, spec.default)
 
 
@@ -718,9 +721,21 @@ def validate_provider_key_online(
     """Lightweight online provider credential check without persisting the secret."""
     provider = provider.strip().lower()
     secret = secret.strip()
+    if provider == "deepseek" and (not secret.startswith("sk-") or len(secret) <= 3):
+        return KeyValidationResult(False, "format")
     if not secret:
         return KeyValidationResult(False, "invalid", "empty key")
     try:
+        if provider == "deepseek":
+            status, body = _http_request_json(
+                get_str("LOCAL_LLM_BASE_URL").rstrip("/") + "/user/balance",
+                headers={"Authorization": f"Bearer {secret}"}, timeout=timeout,
+            )
+            balance = json.loads(body)
+            available = balance.get("is_available") if isinstance(balance, dict) else None
+            if status != 200 or not isinstance(available, bool):
+                return KeyValidationResult(False, "network")
+            return KeyValidationResult(available, "valid" if available else "balance")
         if provider == "openai":
             _http_request_json(
                 "https://api.openai.com/v1/models",
@@ -748,8 +763,8 @@ def validate_provider_key_online(
         if exc.code in (401, 403):
             return KeyValidationResult(False, "invalid", f"HTTP {exc.code}")
         return KeyValidationResult(False, "network", f"HTTP {exc.code}")
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return KeyValidationResult(False, "network", str(exc))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return KeyValidationResult(False, "network")
     return KeyValidationResult(False, "unsupported", provider)
 
 
@@ -769,7 +784,7 @@ def read_panel_values() -> list[dict]:
         if spec.secret:
             value = "已设置" if os.environ.get(spec.key, "").strip() else "未设置"
         else:
-            value = os.environ.get(spec.key, spec.default)
+            value = get_str(spec.key)
         rows.append({
             "key": spec.key,
             "label": spec.label,

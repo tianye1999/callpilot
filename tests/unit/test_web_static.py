@@ -109,6 +109,97 @@ def test_setup_prefill_finishes_before_wizard_accepts_input():
     assert "await prefillSetupFields();" in text
 
 
+def test_setup_local_defaults_voices_key_and_call_results_in_node():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 执行真实向导函数")
+    text = INDEX.read_text(encoding="utf-8")
+    advanced = text[text.index('<details id="setupAdvanced">'):]
+    advanced = advanced[:advanced.index("</details>")]
+    assert " open" not in advanced.split(">", 1)[0]
+    assert all(f'value="{provider}"' in advanced for provider in ("qwen", "openai", "doubao"))
+    source = text[text.index("let setupStep = 0;"):text.index("const truthy =")]
+    harness = r'''
+const assert = require('node:assert/strict');
+class Element {
+  constructor() { this.value = ''; this.style = {}; this.dataset = {}; this.children = [];
+    this.classList = { toggle() {}, add() {}, remove() {}, contains() { return false; } }; }
+  set textContent(v) { this.text = v; this.children = []; }
+  get textContent() { return this.text || ''; }
+  appendChild(v) { this.children.push(v); }
+  addEventListener() {}
+}
+const elements = new Map();
+const $ = id => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
+const document = { querySelectorAll: () => [], createElement: () => new Element(), createTextNode: text => ({text}) };
+const window = { addEventListener() {} };
+const el = (tag, cls, text) => { const node = new Element(); node.textContent = text; return node; };
+const t = key => key === 'setup_call_target' ? number => number : key;
+const setInterval = () => 0;
+const CFG_SUGGEST = { QWEN_VOICE: ['Cherry'], OPENAI_VOICE: ['alloy'] };
+let cfgSpecs = [];
+let lastMeta = {};
+let callActive = false;
+const boolChecked = value => value === 'true';
+const loadMeta = async () => {};
+const buildRecPlayers = id => ({recording: id});
+const posts = [];
+const postJson = async (url, data) => {
+  posts.push({url,data}); return {httpOk: true, res: {ok: true, status: 'valid'}};
+};
+'''
+    assertions = r'''
+(async () => {
+  cfgSpecs = [{key: 'OWNER_NAME', value: 'Alex'}];
+  await prefillSetupFields();
+  assert.equal($('setupProvider').value, 'local');
+  assert.equal($('setupAdvanced').open, false);
+  assert.equal($('setupApiKeyLabel').textContent, 'DeepSeek API Key');
+  assert.equal($('setupDeepseekKeyHelp').hidden, false);
+  assert.equal($('setupVoice').hidden, true);
+  assert.equal($('setupLocalVoice').hidden, false);
+  await saveSetupPersonal();
+  assert.equal(posts.at(-1).data.LOCAL_TTS_SPEAKER_ID, 25);
+  $('setupLocalVoice').value = 'vits-piper-zh_CN-chaowen-medium-int8';
+  await saveSetupPersonal();
+  assert.equal(posts.at(-1).data.LOCAL_TTS_SPEAKER_ID, 0);
+  $('setupApiKey').value = 'sk-fake';
+  assert.equal(await validateSetupKey(), true);
+  assert.deepEqual(posts.at(-2).data, {provider: 'deepseek', api_key: 'sk-fake'});
+  assert.deepEqual(posts.at(-1).data, {DEEPSEEK_API_KEY: 'sk-fake'});
+  cfgSpecs = [{key: 'AGENT_PROVIDER', value: 'openai'}];
+  await prefillSetupFields();
+  assert.equal($('setupProvider').value, 'openai');
+  assert.equal($('setupAdvanced').open, true);
+  assert.equal($('setupLocalVoice').hidden, true);
+  lastMeta = {sim: {service_number: '611'}, setup_call: {state: 'running'}};
+  renderSetupCall();
+  assert.equal($('setupStartCall').disabled, true);
+  lastMeta.setup_call = {state: 'done', status: 'completed', call_id: 'test',
+    received: {ok: true, reason: 'energy'}, sent: {ok: false, reason: 'no_write'}};
+  renderSetupCall();
+  assert.equal($('setupStartCall').disabled, false);
+  assert.equal($('setupCallResults').children.length, 2);
+  assert.match($('setupCallResults').children[0].children[1].textContent, /setup_call_pass/);
+  assert.match($('setupCallResults').children[1].children[1].textContent, /setup_call_fail/);
+  assert.equal($('setupCallPlayback').children[0].recording, 'test');
+  const player = $('setupCallPlayback').children[0];
+  renderSetupCall();
+  assert.equal($('setupCallPlayback').children[0], player);
+  lastMeta.setup_call.recording_error = true;
+  delete lastMeta.setup_call.call_id;
+  renderSetupCall();
+  assert.equal($('setupCallResults').children.at(-1).textContent, 'setup_call_recording_error');
+  assert.equal($('setupCallPlayback').children.length, 0);
+  await refreshSetupNotifications();
+  assert.equal($('setupNotifications').hidden, true);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+    result = subprocess.run([node, "-e", harness + source + assertions],
+                            capture_output=True, text=True, encoding="utf-8", timeout=NODE_TIMEOUT)
+    assert result.returncode == 0, result.stderr
+
+
 def test_websocket_reconnect_clears_stale_call_and_recording_state():
     text = INDEX.read_text(encoding="utf-8")
 

@@ -95,8 +95,9 @@ WEB_PORT=47100
 ```
 
 这份覆盖清单也位于 [`scripts/linux/.env.example`](../scripts/linux/.env.example)，安装结束会打印。
-现有 provider 凭证、通话策略、云功能配置仍按需保留；例如默认 `AGENT_PROVIDER=qwen` 时需填写
-`DASHSCOPE_API_KEY`。云连接为可选，不必为了本地来电验收打开 `REMOTE_CLOUD_ENABLED`。
+现有 provider 凭证、通话策略、云功能配置仍按需保留；本产品分支默认 `AGENT_PROVIDER=local`、
+`LOCAL_LLM_PROVIDER=deepseek`，需自行填写 `DEEPSEEK_API_KEY`。显式选用 Qwen 时填写
+`DASHSCOPE_API_KEY`。树莓派仍需下载本地语音模型。云连接为可选，不必为了来电验收打开 `REMOTE_CLOUD_ENABLED`。
 不要将 `.env`、凭证、录音、完整日志或身份信息加入仓库或报告。
 
 `MODEM_PCM_BAUD=115200` 只是此 Linux 配置的覆盖，项目原默认 `921600` 不变；Linux USB tty 的

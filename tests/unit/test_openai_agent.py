@@ -100,6 +100,16 @@ async def _drain() -> None:
         await asyncio.sleep(0)
 
 
+@pytest.mark.parametrize("status,failed", [("completed", False), ("incomplete", True), ("failed", True)])
+def test_output_completion_reports_response_failure(status, failed):
+    agent = _make_agent()
+    completed = []
+    agent.set_output_complete_handler(lambda: completed.append(True))
+    agent._handle_event({"type": "response.done", "response": {"status": status}})
+    assert completed == [True]
+    assert agent.output_failed is failed
+
+
 def test_parallel_response_owner_reserves_until_done_and_coalesces_vad(monkeypatch):
     monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
     monkeypatch.setenv("MANUAL_RESPONSE_CONTROL", "false")

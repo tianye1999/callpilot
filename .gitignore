@@ -50,3 +50,6 @@ ios/build/
 ios/**/xcuserdata/
 ios/*.ipa
 ios/Pods/
+
+# 浏览器自动化截图等临时产物（曾有截图带真实号码误提交）
+output/

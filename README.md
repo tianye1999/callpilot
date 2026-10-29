@@ -54,8 +54,8 @@ Phone call → EC20 modem ──(AT: RING/ATA/CLCC)── CallPilot
              EventHub → web dashboard (served as a desktop app or browser)
 ```
 
-- **AI brain:** cloud realtime speech-to-speech (Alibaba **Qwen Omni** by default,
-  ByteDance **Doubao** or **OpenAI Realtime** optional). No local ML models to install.
+- **AI brain:** this physical-SIM product branch defaults to local speech models +
+  **DeepSeek**. Qwen Omni, OpenAI Realtime and experimental Doubao remain optional.
 - **Telephony:** hardware AT events from an EC20/EG25 modem — clean `RING → ATA`,
   not screen automation.
 - **Features:** auto-answer, outbound dialing (single + batch with whitelist),
@@ -65,10 +65,11 @@ Phone call → EC20 modem ──(AT: RING/ATA/CLCC)── CallPilot
 
 **Local three-stage provider** (`AGENT_PROVIDER=local`, added in v0.5.0):
 on-device VAD → STT → text LLM → on-device TTS. Audio never leaves your
-machine; only the transcript goes to the text brain (default `qwen-plus`,
-same DashScope key, an order of magnitude cheaper than realtime audio).
+machine; only the transcript goes to the text brain (default `deepseek-flash`,
+using your own `DEEPSEEK_API_KEY`). Explicit provider/model settings are preserved.
 Setup: `pip install 'callpilot[local]'` then
-`python -m agentcall.local_models` (one-time ~300 MB model download).
+`python -m agentcall.local_models` for source installations. The Mac app bundles
+the default speech assets, including aishell3 #25 and chaowen; no first-run download is needed.
 Tools, transcripts, summaries and presets all work the same.
 
 v0.4.0 adds several call-quality controls for outbound work:
@@ -387,8 +388,8 @@ CallPilot 把 4G 模组接到云端实时语音大模型，让 AI「助理」替
 Quectel EC20/EG25，来电自动接听并与对方对话，可外呼、收发短信、按 IVR 菜单键、
 每通电话录音+延迟打点+AI 摘要——全部跑在你自己的硬件和 API Key 上。
 
-- **AI 大脑**：云端端到端实时语音（默认阿里 **Qwen Omni**，可选字节 **Doubao** 或
-  **OpenAI Realtime**），无需安装本地模型。
+- **AI 大脑**：本实体卡产品分支默认本地语音模型 + **DeepSeek**；高级选项保留
+  **Qwen Omni**、**OpenAI Realtime** 和实验性 **Doubao**。
 - **电话通道**：EC20/EG25 模组的硬件 AT 事件（`RING → ATA`），非屏幕自动化。
 - **能力**：自动接听、外呼（单个+批量带白名单）、中文短信收发、AI 工具调用
   （发短信/挂断/查验证码/**DTMF 按键**）、通话录音+摘要、实时转写、本机监听、
@@ -396,9 +397,10 @@ Quectel EC20/EG25，来电自动接听并与对方对话，可外呼、收发短
 
 **本地三段式 provider**（`AGENT_PROVIDER=local`，v0.5.0 引入）：本地 VAD →
 本地转写 → 云端文本模型 → 本地合成。音频不出本机，只有转写文本上云（默认
-`qwen-plus`，同一个 DashScope key，比 realtime 音频便宜一个量级）。启用：
+`deepseek-flash`，由员工自行填写 `DEEPSEEK_API_KEY`，保留已显式配置的提供方和模型）。源码版：
 `pip install 'callpilot[local]'` 后运行 `python -m agentcall.local_models`
-一次性下载 ~300MB 模型。工具调用/转写/摘要/预设库全部照常。
+一次性下载模型。Mac 包内置默认语音资产及 aishell3 #25、chaowen，无需首启下载。
+工具调用/转写/摘要/预设库全部照常。向导验收说明见 [实体卡设置向导](docs/physical-sim-setup.md)。
 
 v0.4.0 增加了几项面向外呼质量的控制：
 

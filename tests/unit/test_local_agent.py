@@ -64,6 +64,25 @@ def _make_agent(replies):
     return agent, pipeline, seen_requests
 
 
+def test_output_complete_follows_all_synthesized_pcm():
+    agent, _, _ = _make_agent([{"role": "assistant", "content": "线路测试。"}])
+    events = []
+    completed = threading.Event()
+    def done():
+        events.append("done")
+        completed.set()
+    agent.set_output_complete_handler(done)
+    async def run():
+        await agent.start(lambda pcm: events.append("pcm"))
+        try:
+            await agent.say("只说一句线路测试说明")
+            assert await asyncio.to_thread(completed.wait, 2)
+            assert events == ["pcm", "done"]
+        finally:
+            await agent.stop()
+    asyncio.run(run())
+
+
 def test_parallel_cancel_joins_model_loader_before_return(monkeypatch):
     monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "true")
     entered = threading.Event()

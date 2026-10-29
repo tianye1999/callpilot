@@ -805,7 +805,7 @@ class SerialModem:
         self._call_connected_event.set()
         logger.info("已发送 ATA 接听来电")
 
-    def dial(self, number: str) -> str:
+    def dial(self, number: str, *, retry: bool = True, deadline: float | None = None) -> str:
         """拨打语音电话（ATD<number>; 末尾分号表示语音呼叫）。"""
         number = (number or "").strip()
         if not number:
@@ -814,12 +814,15 @@ class SerialModem:
         # 之间 set 事件/加 call_id，导致 _wait_connected 永远等不到接通而误判未接。
         # _serial_lock 是 RLock，_send 内部再取同锁可重入。
         with self._serial_lock:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("拨号期限已过，未发出 ATD")
             self._call_connected_event.clear()
             self._connected_call_ids.clear()
             self._clcc_absent_count = 0
             self._clcc_fail_count = 0
             self._last_dialed = number
-            response = self._send(f"ATD{number};")
+            # 自测禁止串口重连后的隐式重拨；普通通话沿用原有重试。
+            response = self._send(f"ATD{number};") if retry else self._write_command(f"ATD{number};")
         logger.info("已拨号 -> %s", number)
         return response
 
@@ -1577,12 +1580,12 @@ class Sim7600Modem(SerialModem):
             self._arm_voice_call()
             super().answer()
 
-    def dial(self, number: str) -> str:
+    def dial(self, number: str, *, retry: bool = True, deadline: float | None = None) -> str:
         if self._on_post_call_reset is None:
-            return super().dial(number)
+            return super().dial(number, retry=retry, deadline=deadline)
         with self._serial_lock:
             self._arm_voice_call()
-            return super().dial(number)
+            return super().dial(number, retry=retry, deadline=deadline)
 
     def hangup(self) -> None:
         if self._on_post_call_reset is None:

@@ -27,7 +27,8 @@ def test_native_startup_precedes_webview_import(monkeypatch, tmp_path):
     layout = macos_launchd.make_layout(tmp_path / "CallPilot", uid=123, support_dir=tmp_path)
     monkeypatch.setattr(macos_launchd, "make_layout", lambda exe: layout)
     monkeypatch.setattr(desktop_app, "_window_lock", lambda support: io.StringIO())
-    window = types.SimpleNamespace(expose=lambda *args: None, events=types.SimpleNamespace(closed=[]))
+    window = types.SimpleNamespace(expose=lambda *args: None, events=types.SimpleNamespace(closed=[]),
+                                   get_current_url=lambda: None)
 
     class Event:
         def __iadd__(self, callback):
@@ -178,6 +179,7 @@ def test_bundled_window_is_created_before_any_health_probe(monkeypatch, tmp_path
 
     window = types.SimpleNamespace(
         expose=lambda *methods: calls.append("expose"), events=types.SimpleNamespace(closed=Event()),
+        get_current_url=lambda: None,
     )
 
     def create_window(title, **kwargs):

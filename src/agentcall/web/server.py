@@ -91,8 +91,8 @@ def _call_artifact_path(base_dir: str | Path, call_id: str, *parts: str) -> Path
     return candidate
 
 
-def _ensure_setup_sms_token(app: web.Application) -> str | None:
-    token_box = app.get("setup_sms_token")
+def _ensure_setup_sms_token(app: web.Application, key: str = "setup_sms_token") -> str | None:
+    token_box = app.get(key)
     if not token_box:
         return None
     if not token_box[0]:
@@ -286,6 +286,7 @@ def build_app(
     # 由 app.py 传入的 threading.Event；置位后主循环停止、清理并按运行方式重启。
     app["restart_event"] = restart_event
     app["setup_sms_token"] = [secrets.token_urlsafe(24)]
+    app["setup_call_token"] = [secrets.token_urlsafe(24)]
     app["remote_pairing_store"] = remote_pairing_store
     app["remote_cloud_api"] = remote_cloud_api
     app["remote_cloud_store"] = remote_cloud_store
@@ -347,6 +348,7 @@ def build_app(
     app.router.add_post("/api/config/validate_key", _validate_key)
     app.router.add_post("/api/setup/complete", _setup_complete)
     app.router.add_post("/api/setup/test_sms", _setup_test_sms)
+    app.router.add_post("/api/setup/test_call", _setup_test_call)
     app.router.add_post("/api/restart", _restart)
     app.router.add_post("/api/modem/reread_sim", _reread_sim)
     app.router.add_static("/static/", STATIC_DIR)
@@ -538,6 +540,8 @@ async def _meta(request: web.Request) -> web.Response:
     setup_sms_token = _ensure_setup_sms_token(request.app)
     if setup_sms_token:
         meta["setup_sms_token"] = setup_sms_token
+    meta["setup_call_token"] = _ensure_setup_sms_token(request.app, "setup_call_token")
+    meta["setup_call"] = getattr(getattr(service, "session", None), "setup_test_result", None)
     return web.json_response(meta)
 
 
@@ -1314,7 +1318,7 @@ async def _validate_key(request: web.Request) -> web.Response:
         )
     provider = str(data.get("provider") or "").strip().lower()
     api_key = str(data.get("api_key") or "").strip()
-    if provider not in {"qwen", "openai"}:
+    if provider not in {"qwen", "openai", "deepseek"}:
         return web.json_response(
             {"ok": False, "status": "unsupported", "error": "当前 provider 不支持在线校验"},
             status=400,
@@ -1352,6 +1356,8 @@ async def _setup_complete(request: web.Request) -> web.Response:
     except ValueError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=400)
     request.app["setup_sms_token"][0] = None
+    if request.app.get("setup_call_token"):
+        request.app["setup_call_token"][0] = None
     return web.json_response({"ok": True, "updated": updated})
 
 
@@ -1402,6 +1408,23 @@ async def _setup_test_sms(request: web.Request) -> web.Response:
         )
     token_box[0] = None
     return web.json_response({"ok": bool(ok)})
+
+
+async def _setup_test_call(request: web.Request) -> web.Response:
+    """令牌在任何异步操作前消费，重复点击/网络重放都不能拨第二通。"""
+    data = await read_json(request)
+    if not isinstance(data, dict):
+        return web.json_response({"ok": False, "error": "invalid_request"}, status=400)
+    token_box = request.app.get("setup_call_token") or [None]
+    token = str(data.get("token") or "")
+    if not token_box[0] or not secrets.compare_digest(token, token_box[0]):
+        return web.json_response({"ok": False, "error": "invalid_token"}, status=403)
+    token_box[0] = None
+    service = request.app.get("service")
+    if service is None:
+        return web.json_response({"ok": False, "error": "modem_unavailable"}, status=409)
+    ok, error = service.start_setup_test()
+    return web.json_response({"ok": ok, "error": error}, status=202 if ok else 409)
 
 
 async def _restart(request: web.Request) -> web.Response:

@@ -25,6 +25,19 @@ class VoiceAgent(ABC):
     _on_latency: "Callable[[str, float], None] | None" = None
     _tools: "ToolRegistry | None" = None
     _session_instructions: str | None = None
+    _on_output_complete: Callable[[], None] | None = None
+    # 单句自测不播放额外的慢网占位语；普通通话保持原行为。
+    single_utterance: bool = False
+    output_failed: bool = False
+
+    def set_output_complete_handler(self, handler: Callable[[], None]) -> None:
+        """可选观测：本轮生成与音频回调全部结束，不代表硬件已播完。"""
+        self._on_output_complete = handler
+
+    def _emit_output_complete(self, *, success: bool = True) -> None:
+        if self._on_output_complete is not None:
+            self.output_failed = self.output_failed or not success
+            self._on_output_complete()
 
     def set_transcript_handler(
         self, handler: "Callable[[str, str], None] | None"

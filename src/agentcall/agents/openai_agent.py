@@ -1165,6 +1165,7 @@ class OpenAIVoiceAgent(VoiceAgent):
                 # 轮次是否正常收尾是关键证据，debug 级在现场日志里看不见。
                 logger.info("OpenAI 回复轮次完成 (status=%s)", status)
             self._on_response_done()
+            self._emit_output_complete(success=status not in {"failed", "incomplete", "cancelled"})
         elif event_type == "error":
             code = (event.get("error") or {}).get("code")
             if code == "response_cancel_not_active":

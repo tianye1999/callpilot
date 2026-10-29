@@ -418,7 +418,10 @@ class BluetoothModem(SerialModem):
                 return False
             return self.audio_bridge.accept_fd(fd, codec)
 
-    def dial(self, number: str) -> str:
+    def dial(self, number: str, *, retry: bool = True, deadline: float | None = None) -> str:
+        # 实体卡单次自测不支持蓝牙；普通调用保持原有参数和行为。
+        if not retry or deadline is not None:
+            raise RuntimeError("蓝牙线路不支持实体卡自测")
         with self._owner_lock:
             if not self.is_connected():
                 raise RuntimeError("手机未连接，请检查手机蓝牙与 HFP 连接")

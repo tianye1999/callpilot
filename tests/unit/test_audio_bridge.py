@@ -129,6 +129,25 @@ def test_serial_output_observer_tracks_only_written_agent_audio(monkeypatch):
     assert writes == [b"tonevoic", b"e!\x00\x00\x00\x00\x00\x00", b"\x00" * 8]
 
 
+def test_uac_observer_counts_failure_after_successful_write():
+    from types import SimpleNamespace
+
+    from agentcall.audio_bridge import AgentPcm, ModemAudioBridge
+
+    bridge = object.__new__(ModemAudioBridge)
+    observed = []
+    bridge.set_output_observer(observed.append)
+    def write(chunk):
+        if chunk == b"bad!":
+            raise OSError("输出设备断开")
+    bridge._output_stream = SimpleNamespace(write=write)
+    bridge.write_modem_chunks([AgentPcm(b"good")])
+    with pytest.raises(OSError):
+        bridge.write_modem_chunks([AgentPcm(b"bad!")])
+    assert observed == [b"good"]
+    assert bridge.output_write_errors == 1
+
+
 def test_turn_callback_follows_written_spans_not_dropped_or_short_suffix():
     from agentcall.audio_bridge import AgentPcm, SerialPcmAudioBridge
 

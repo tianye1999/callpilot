@@ -751,6 +751,7 @@ class LocalPipelineAgent(VoiceAgent):
                     if pcm:
                         self._mark_latency(turn, "tts_first_audio")
                         self._output_pcm(pcm, turn)
+                    self._emit_output_complete()
                     return
             self._brain_queue.put(_SayRequest(instructions))
 
@@ -792,7 +793,8 @@ class LocalPipelineAgent(VoiceAgent):
         # Never block the event loop while a model kernel / network call finishes.
         for thread in (self._vad_thread, self._asr_thread, self._brain_thread, self._tts_thread, self._warm_thread):
             if thread is not None:
-                await asyncio.to_thread(thread.join, 3)
+                # 单句自测已先挂断，保留占线直到模型线程彻底退出，避免跨通迟到回调。
+                await asyncio.to_thread(thread.join, None if self.single_utterance else 3)
         if self._filler_thread is not None:
             await asyncio.to_thread(self._filler_thread.join)
             self._filler_thread = None
@@ -968,6 +970,10 @@ class LocalPipelineAgent(VoiceAgent):
         with self._messages_lock:
             self._messages.append(self._say_message(instructions))
         self._respond(self._new_turn(None))
+        if self._on_output_complete is not None:
+            # 自测需要完整句子，等流式 TTS 队列全部输出后再通知，普通通话不等待。
+            self._tts_queue.join()
+            self._emit_output_complete()
 
     def _respond(self, turn: _Turn) -> None:
         response = self._chat_with_tools(turn)
@@ -1170,6 +1176,8 @@ class LocalPipelineAgent(VoiceAgent):
             try:
                 self._speak(request.text, request.batch)
             except Exception as exc:  # noqa: BLE001 - keep the dedicated worker alive
+                if self._on_output_complete is not None:
+                    self.output_failed = True
                 logger.warning("TTS 输出失败: %s", exc)
             finally:
                 self._tts_queue.task_done()
@@ -1186,7 +1194,7 @@ class LocalPipelineAgent(VoiceAgent):
         # 与取消/正常分句共用锁，锁内只走已预合成的缓存输出。
         with self._turn_lock:
             batch = self._waiting_batch
-            if not self._slow_filler_seconds or batch is None:
+            if self.single_utterance or not self._slow_filler_seconds or batch is None:
                 return
             turn = batch.turn
             now = time.monotonic()

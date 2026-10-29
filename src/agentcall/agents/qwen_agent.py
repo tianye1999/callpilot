@@ -229,6 +229,12 @@ class _QwenCallback(OmniRealtimeCallback):
             if self._agent:
                 self._agent._audio_gate.complete_response(_response_id(response))  # noqa: SLF001
                 self._agent._on_response_done()  # noqa: SLF001
+                if self._agent._on_output_complete is not None:  # noqa: SLF001
+                    status = (response.get("response") or {}).get("status")
+                    if status in {"failed", "incomplete", "cancelled"}:
+                        self._agent.output_failed = True
+                    # 标记排在本轮 PCM 后面，由同一个输出线程消费。
+                    self._audio_queue.put(b"")
             logger.debug("千问回复轮次完成")
         elif event_type == "session.updated":
             session = response.get("session")
@@ -897,5 +903,8 @@ class QwenVoiceAgent(VoiceAgent):
                 continue
             if chunk is None:
                 break
+            if chunk == b"" and self._on_output_complete is not None:
+                self._emit_output_complete()
+                continue
             if self._on_audio_out:
                 self._on_audio_out(chunk)

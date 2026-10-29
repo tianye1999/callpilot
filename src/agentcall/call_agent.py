@@ -222,6 +222,8 @@ class CallSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._active = False
+        self._setup_test = False
+        self.setup_test_result: dict | None = None
         self._parallel_agent_connect = False
         self._last_downlink_play_at = 0.0
         self._active_lock = threading.Lock()
@@ -412,17 +414,19 @@ class CallSession:
         preset_id: str | None = None,
         *,
         inbound_record: CallRecord | None = None,
+        setup_test: bool = False,
     ) -> None:
         if self.is_busy:
             logger.warning("已有通话进行中，忽略新的呼叫请求")
             return
         self._outbound_number = outbound_number
+        self._setup_test = setup_test
         self._inbound_record = inbound_record
         self._phone_owner_took_over = False
         self._phone_audio_lost = False
         self._resources_released = False
         self._bluetooth_cleanup_started = False
-        self._parallel_agent_connect = config.get_bool("PARALLEL_AGENT_CONNECT")
+        self._parallel_agent_connect = setup_test or config.get_bool("PARALLEL_AGENT_CONNECT")
         self._outbound_task_value = task
         self._preset_hint = preset_hint
         self._preset_id = preset_id
@@ -500,7 +504,12 @@ class CallSession:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         try:
-            self._loop.run_until_complete(self._handle_call())
+            if self._setup_test:
+                from .setup_call import run_setup_call
+
+                self._loop.run_until_complete(run_setup_call(self))
+            else:
+                self._loop.run_until_complete(self._handle_call())
         except Exception as exc:  # noqa: BLE001
             logger.exception("通话处理异常: %s", exc)
         finally:
@@ -4417,6 +4426,35 @@ class CallAgentService:
                     record.finish(event["outcome"])
                 self._bluetooth_incoming_records.pop(path, None)
         self._publish(event)
+
+    def start_setup_test(self) -> tuple[bool, str | None]:
+        """只用当前 SIM 身份拨一次；不记住任务、不走重试队列。"""
+        with self._remote_setup_lock, self._ring_lock:
+            queue = self.dial_queue_status()
+            if (self.session.is_busy or self._remote_call_owner is not None
+                    or (self._remote_worker is not None and self._remote_worker.is_running)
+                    or self._hardware_maintenance
+                    or queue.get("active") or queue.get("pending") or queue.get("current") is not None):
+                return False, "line_busy"
+            sim = getattr(self.modem, "sim_identity", None)
+            number = str(getattr(sim, "service_number", "") or "")
+            if isinstance(self.modem, BluetoothModem) or not getattr(sim, "present", False) or not number:
+                return False, "unknown_carrier"
+            if not re.fullmatch(r"\+?[0-9]{1,32}", number):
+                return False, "unknown_carrier"
+            # 豆包现有实现尚无 say/生成完成协议，不能拨出后让用户等无声超时。
+            if config.get_str("AGENT_PROVIDER") == "doubao":
+                return False, "provider_unsupported"
+            if self._dial_guard(number) is not None:
+                return False, "modem_unavailable"
+            if config.validate_provider_credentials(config.get_str("AGENT_PROVIDER")):
+                return False, "credentials"
+            if self.call_logger is None:
+                return False, "recording_unavailable"
+            self.session.setup_test_result = {"state": "running", "number": number}
+            self.session.current_caller = number
+            self.session.start(outbound_number=number, setup_test=True)
+        return True, None
 
     def dial(
         self,

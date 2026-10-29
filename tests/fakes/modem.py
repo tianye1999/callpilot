@@ -38,7 +38,7 @@ class FakeModem:
     def answer(self) -> None:
         self.calls.append(("answer", ()))
 
-    def dial(self, number: str) -> str:
+    def dial(self, number: str, *, retry: bool = True, deadline: float | None = None) -> str:
         self.connected_flag.clear()
         self.calls.append(("dial", (number,)))
         return "OK"

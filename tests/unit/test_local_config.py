@@ -9,7 +9,8 @@ from agentcall import config
 
 
 @pytest.mark.parametrize(("key", "default"), [
-    ("LOCAL_LLM_PROVIDER", "dashscope"),
+    ("LOCAL_LLM_PROVIDER", "deepseek"),
+    ("LOCAL_LLM_MODEL", "deepseek-flash"),
     ("LOCAL_LLM_BASE_URL", "https://api.deepseek.com"),
     ("DEEPSEEK_API_KEY", ""),
     ("LOCAL_LLM_THINKING", "disabled"),
@@ -37,7 +38,7 @@ def test_local_config_defaults_and_env_sync(monkeypatch, key, default):
     assert config.get_str(key) == default
     example = dotenv_values(Path(__file__).resolve().parents[2] / ".env.example")
     assert example[key] == default
-    if key.startswith("LOCAL_SLOW_REPLY_FILLER"):
+    if key.startswith("LOCAL_SLOW_REPLY_FILLER") or key in {"LOCAL_LLM_PROVIDER", "LOCAL_LLM_MODEL"}:
         linux = dotenv_values(Path(__file__).resolve().parents[2] / "scripts/linux/.env.example")
         assert linux[key] == default
 

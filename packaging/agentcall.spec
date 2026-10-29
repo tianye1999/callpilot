@@ -39,6 +39,10 @@ hiddenimports = [
 ]
 hiddenimports += collect_submodules("agentcall")
 datas += collect_data_files("agentcall")
+if IS_MACOS:
+    from agentcall.local_models import bundle_data_files
+
+    datas += bundle_data_files(Path(os.environ.get("AGENTCALL_BUILD_MODELS", project_root / "data/models")))
 
 # Remote Web Dialer uses two distributions sharing the ``livekit`` namespace.
 # Collect each contribution explicitly; rtc also carries a platform-specific FFI
@@ -94,8 +98,8 @@ if libusb_path:
 # pywebview 的平台后端不同，按平台收集对应运行时
 if IS_MACOS:
     # mac 后端 = cocoa（pyobjc 系列）+ rumps 菜单栏
-    hiddenimports += ["webview.platforms.cocoa", "objc", "Foundation", "AppKit", "WebKit", "rumps"]
-    gui_packages = ("webview", "objc", "Foundation", "AppKit", "WebKit", "rumps")
+    hiddenimports += ["webview.platforms.cocoa", "objc", "Foundation", "AppKit", "WebKit", "rumps", "UserNotifications"]
+    gui_packages = ("webview", "objc", "Foundation", "AppKit", "WebKit", "rumps", "UserNotifications")
 elif IS_WINDOWS:
     # Windows 后端 = WinForms + EdgeChromium(WebView2)，经 pythonnet 的 clr 加载；
     # pythonnet/clr 的打包细节由 pyinstaller-hooks-contrib 兜底。【待硬件验证】

@@ -30,7 +30,7 @@ def _capture(monkeypatch) -> dict[str, str]:
     [
         ("qwen", "qwen"),
         ("doubao", "qwen"),  # 非 openai 的实时 provider 统一回落 qwen 文本后端
-        ("local", "qwen"),
+        ("local", "deepseek"),
         ("openai", "openai"),  # 既有 OpenAI 部署行为不得回归
     ],
 )

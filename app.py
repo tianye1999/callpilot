@@ -364,7 +364,10 @@ def _selftest() -> int:
         "keyring",
         "cryptography.hazmat.primitives.asymmetric.ed25519",
     ]
-    optional = {"sherpa_onnx"}
+    bundled_mac = sys.platform == "darwin" and getattr(sys, "frozen", False)
+    optional = set() if bundled_mac else {"sherpa_onnx"}
+    if bundled_mac:
+        modules.extend(["sherpa_onnx", "UserNotifications"])
     ok = True
     for name in modules + list(optional):
         try:
@@ -375,6 +378,14 @@ def _selftest() -> int:
             if name not in optional:
                 ok = False
             print(f"{marker} {name}: {type(exc).__name__}: {exc}")
+    if bundled_mac:
+        from agentcall import local_models
+
+        root = local_models.bundled_models_dir()
+        for asset in local_models.bundled_assets():
+            ready = root is not None and local_models.asset_ready(asset, root)
+            print(f"{'OK' if ready else 'FAIL'} bundled model: {asset.description}")
+            ok = ok and ready
     return 0 if ok else 1
 
 

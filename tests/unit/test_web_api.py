@@ -1482,6 +1482,7 @@ def test_endpoints_without_service_return_500():
 
 
 def test_meta_returns_injected_metadata(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("SETUP_DONE", raising=False)
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.delenv("DOUBAO_APP_ID", raising=False)

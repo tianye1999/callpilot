@@ -817,6 +817,7 @@
   }
   .setup-status.ok { color: var(--ok); border-color: rgba(48,209,88,.36); background: var(--ok-dim); }
   .setup-status.err { color: var(--err); border-color: rgba(255,69,58,.36); background: var(--err-dim); }
+  .setup-status:empty { display: none; }
   .setup-actions {
     padding: 14px 24px 20px; display: flex; gap: 10px; justify-content: flex-end;
     border-top: 1px solid var(--border);
@@ -1248,15 +1249,21 @@
         <section class="setup-pane" data-step="1">
           <h3 data-i18n="setup_key_title"></h3>
           <p class="hint" data-i18n="setup_key_hint"></p>
-          <div class="setup-grid">
+          <label><input type="radio" id="setupLocalMode" name="setupModelMode" checked />
+            <span data-i18n="setup_local_model"></span></label>
+          <details id="setupAdvanced">
+            <summary data-i18n="setup_advanced"></summary>
             <div class="setup-field">
               <label for="setupProvider" data-i18n="setup_provider"></label>
               <select id="setupProvider">
+                <option value="local" data-i18n="setup_local_model"></option>
                 <option value="qwen">Qwen</option>
                 <option value="openai">OpenAI</option>
                 <option value="doubao">Doubao (experimental)</option>
               </select>
             </div>
+          </details>
+          <div class="setup-grid">
             <div class="setup-field setup-key-field">
               <label for="setupApiKey" id="setupApiKeyLabel"></label>
               <input id="setupApiKey" type="password" autocomplete="off" spellcheck="false" />
@@ -1271,6 +1278,9 @@
             </div>
           </div>
           <p class="setup-key-help" id="setupQwenKeyHelp"></p>
+          <p class="setup-key-help" id="setupDeepseekKeyHelp">
+            <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener noreferrer" data-i18n="setup_deepseek_apply"></a>
+          </p>
           <div style="margin-top:12px">
             <button class="btn ghost sm" id="setupValidateKey" data-i18n="setup_validate"></button>
           </div>
@@ -1296,9 +1306,13 @@
               </select>
             </div>
             <div class="setup-field">
-              <label for="setupVoice" data-i18n="setup_voice"></label>
+              <label id="setupVoiceLabel" for="setupVoice" data-i18n="setup_voice"></label>
               <input id="setupVoice" type="text" list="setupVoiceList" />
               <datalist id="setupVoiceList"></datalist>
+              <select id="setupLocalVoice" aria-label="Local voice">
+                <option value="vits-icefall-zh-aishell3" data-i18n="setup_voice_male"></option>
+                <option value="vits-piper-zh_CN-chaowen-medium-int8">chaowen</option>
+              </select>
             </div>
           </div>
           <div class="setup-status" id="setupPersonStatus"></div>
@@ -1323,6 +1337,14 @@
           <h3 data-i18n="setup_test_title"></h3>
           <p class="hint" data-i18n="setup_test_hint"></p>
           <div class="setup-summary" id="setupReadySummary"></div>
+          <p class="hint" data-i18n="setup_call_recording"></p>
+          <p id="setupCallNumber"></p>
+          <button class="btn primary" id="setupStartCall" data-i18n="setup_call_start"></button>
+          <div id="setupCallStatus" class="setup-status" role="status"></div>
+          <div id="setupCallResults" class="setup-summary"></div>
+          <div id="setupCallPlayback"></div>
+          <details>
+          <summary data-i18n="setup_send_sms"></summary>
           <div class="setup-grid" style="margin-top:14px">
             <div class="setup-field">
               <label for="setupSmsNumber" data-i18n="setup_sms_number"></label>
@@ -1337,10 +1359,17 @@
             <button class="btn ghost sm" id="setupSendSms" data-i18n="setup_send_sms"></button>
           </div>
           <div class="setup-status" id="setupTestStatus"></div>
+          </details>
         </section>
         <section class="setup-pane" data-step="5">
           <h3 data-i18n="setup_done_title"></h3>
           <p class="hint" data-i18n="setup_done_hint"></p>
+          <div id="setupNotifications" hidden>
+            <p class="hint" data-i18n="setup_notifications_hint"></p>
+            <button class="btn primary" id="setupAllowNotifications" data-i18n="setup_notifications_allow"></button>
+            <p id="setupNotificationStatus" role="status"></p>
+            <button class="btn ghost" id="setupNotificationSettings" data-i18n="setup_notifications_settings"></button>
+          </div>
           <div class="setup-status ok" id="setupDoneStatus" data-i18n="setup_done_status"></div>
         </section>
       </div>
@@ -1550,9 +1579,42 @@ const I18N = {
     sms_email_privacy: "When enabled, SMS content will be sent to the configured email address.",
     modem_prefix: "Modem ", setup_rerun: "Run setup",
     setup_kicker: "FIRST RUN", setup_title: "Set up CallPilot",
-    setup_subtitle: "Connect the modem, add a provider key, and personalize the assistant.",
+    setup_subtitle: "Connect the modem, add your model key, and personalize the assistant.",
     setup_skip_all: "Skip setup", setup_skip_step: "Skip step", setup_back: "Back", setup_next: "Next",
-    setup_finish: "Finish", setup_steps: ["Hardware", "API Key", "Personalize", "Recording", "Self-test", "Done"],
+    setup_finish: "Finish", setup_steps: ["Hardware", "Model", "Personalize", "Recording", "Self-test", "Done"],
+    setup_local_model: "Local speech pipeline (recommended)", setup_advanced: "Advanced",
+    setup_deepseek_apply: "Create your own DeepSeek API key",
+    setup_voice_male: "Male (aishell3 #25, default)",
+    setup_key_format: "The key format is wrong. It should start with sk-.",
+    setup_key_balance: "Your DeepSeek balance is too low. Add credit and try again.",
+    setup_deepseek_network: "Cannot connect to DeepSeek. Check your network and try again.",
+    setup_call_recording: "This self-test will be recorded for playback. It makes one call, with no automatic retries, and hangs up within 45 seconds.",
+    setup_call_start: "Start self-test", setup_call_running: "Self-test in progress…", setup_call_done: "Self-test ended.",
+    setup_call_target: (number) => `Your SIM's free customer service number: ${number}`,
+    setup_call_received: "Their voice received", setup_call_sent: "Our voice sent",
+    setup_call_pass: "Pass", setup_call_fail: "Fail",
+    setup_call_asr: "Heard the other side speaking.", setup_call_energy: "Heard sound from the other side.",
+    setup_call_no_audio: "Heard nothing from the other side.",
+    setup_call_written: "The AI's voice reached the phone line.",
+    setup_call_no_write: "The AI's voice did not reach the phone line.", setup_call_no_uplink: "The modem's audio channel did not start, so no sound could go out. Replug the modem and try again.",
+    setup_call_write_error: "Sending audio failed: the modem did not accept it in time.",
+    setup_call_unknown_carrier: "Could not identify this SIM's free service number. You can skip this step.",
+    setup_call_line_busy: "The line is busy. No test call was placed.",
+    setup_call_modem_unavailable: "The modem or SIM is not ready. You can skip this step.",
+    setup_call_credentials: "Finish model credentials first, or skip this step.",
+    setup_call_provider_unsupported: "Doubao does not yet support the single-sentence self-test. Choose another model or skip this step.",
+    setup_call_recording_unavailable: "Recording storage is unavailable. No call was placed.",
+    setup_call_recording_error: "The recording could not be saved. Check free disk space and folder permissions.",
+    setup_call_invalid_token: "This test request has expired. Refresh the status before starting again.",
+    setup_call_error: "Could not start the test. Check the status before trying again.",
+    setup_call_timeout: "The 45-second limit was reached and hangup was requested.",
+    setup_call_hangup_failed: "Hangup failed. Check the modem immediately.",
+    setup_call_not_connected: "The call was not connected. No retry was made.",
+    setup_call_failed: "The test could not finish. Check the modem and model settings.",
+    setup_notifications_hint: "Get notified when AI needs your confirmation or answers an incoming call.",
+    setup_notifications_allow: "Allow notifications", setup_notifications_allowed: "Allowed",
+    setup_notifications_denied: "Not allowed", setup_notifications_unknown: "Could not read notification status.",
+    setup_notifications_settings: "Open notification settings",
     setup_hw_title: "Hardware check", setup_hw_hint: "Connect a 4G modem (SIM7600 or EC20/EG25).",
     setup_model: "Modem", setup_firmware: "Firmware", setup_network: "Network", setup_signal: "Signal",
     setup_signal_unknown: "Unknown", setup_signal_weak: "Weak", setup_signal_fair: "Fair",
@@ -1571,14 +1633,14 @@ const I18N = {
     setup_reread_failed: "Could not restart the modem. Check the connection and try again.",
     setup_usb: "USB module", setup_at: "AT port", setup_port: "Port", setup_sim: "SIM",
     setup_hw_ok: "Hardware looks ready.", setup_hw_wait: "Hardware is not fully ready yet. You can continue and retry after plugging it in.",
-    setup_key_title: "Provider API key", setup_key_hint: "Qwen and OpenAI keys are validated online before saving. The key is never echoed back.",
+    setup_key_title: "Model", setup_key_hint: "Enter your own DeepSeek key. Validation only checks your balance and costs nothing.",
     setup_qwen_key_help: {
       before: "Qwen / DashScope API Key can be created for free in ",
       link: "Alibaba Cloud Model Studio",
       after: ". New users usually receive a free usage quota; after it expires or is exhausted, calls are billed at Alibaba Cloud pricing.",
     },
     setup_provider: "Provider", setup_validate: "Validate key", setup_need_key: "Enter a key first.",
-    setup_validating: "Validating…", setup_key_valid: "Key is valid.", setup_key_invalid: "Key is invalid.",
+    setup_validating: "Validating…", setup_key_valid: "Key is valid.", setup_key_invalid: "Key is invalid. Check that you copied all of it, or create a new one in the provider console.",
     setup_key_network: "Network unavailable or provider timed out.", setup_key_unsupported: "Online validation is not available for this provider.",
     setup_key_saved: "Provider settings saved.", setup_doubao_note: "Doubao is experimental. App ID and Access Key will be saved without online validation.",
     setup_person_title: "Personalize", setup_person_hint: "These values shape how the assistant introduces itself and which language it uses in calls.",
@@ -1590,10 +1652,10 @@ const I18N = {
     setup_recording_days: (days) => `${days} days`, setup_recording_choose: "Choose on or off to continue.",
     setup_recording_saved: "Recording preference saved.", recording_active: "Call recording is active",
     recording_details: (path, days) => `Files are stored in ${path} and kept for ${days} days.`,
-    setup_test_title: "Self-test", setup_test_hint: "Review readiness and optionally send one test SMS to a phone number you can receive on.",
+    setup_test_title: "Self-test", setup_test_hint: "Test the line with your SIM's free customer service number. You can also send a test SMS to a phone number you can receive on.",
     setup_sms_number: "Phone number to receive the test SMS", setup_sms_text: "Message", setup_send_sms: "Send test SMS",
     setup_sms_default: "CallPilot setup test.", setup_sms_sent: "Test SMS sent. It is listed in the SMS tab.", setup_sms_fail: "Test SMS failed: ",
-    setup_ready_creds: "Provider credentials", setup_ready_modem: "Modem", setup_ready_yes: "Ready", setup_ready_no: "Not ready",
+    setup_ready_creds: "Model key", setup_ready_modem: "Modem", setup_ready_yes: "Ready", setup_ready_no: "Not ready",
     setup_done_title: "Ready to start", setup_done_hint: "Finish setup to enter the main interface.",
     setup_done_status: "Setup will be marked complete on this Mac.",
     setup_complete_fail: "Could not finish setup: ",
@@ -1837,9 +1899,42 @@ const I18N = {
     sms_email_privacy: "开启后，短信内容将发送到你配置的收件邮箱。",
     modem_prefix: "模组 ", setup_rerun: "重新运行向导",
     setup_kicker: "首次启动", setup_title: "配置 CallPilot",
-    setup_subtitle: "连接模组、填写 provider Key，并设定你的 AI 助理。",
+    setup_subtitle: "连接模组、填写模型 Key，并设定你的 AI 助理。",
     setup_skip_all: "跳过向导", setup_skip_step: "跳过本步", setup_back: "上一步", setup_next: "下一步",
-    setup_finish: "完成", setup_steps: ["硬件", "API Key", "个性化", "通话录音", "自测", "完成"],
+    setup_finish: "完成", setup_steps: ["硬件", "模型", "个性化", "通话录音", "自测", "完成"],
+    setup_local_model: "本地三段式（推荐）", setup_advanced: "高级",
+    setup_deepseek_apply: "申请你自己的 DeepSeek Key",
+    setup_voice_male: "男声（aishell3 #25，默认）",
+    setup_key_format: "Key 格式不对，应当以 sk- 开头。",
+    setup_key_balance: "DeepSeek 余额不足，请充值后再试。",
+    setup_deepseek_network: "连不上 DeepSeek，请检查网络后再试。",
+    setup_call_recording: "本次自测会录音以便回放。只拨一通，不自动重试，最长 45 秒挂断。",
+    setup_call_start: "开始自测", setup_call_running: "自测进行中…", setup_call_done: "自测已结束。",
+    setup_call_target: (number) => `本卡运营商免费客服号：${number}`,
+    setup_call_received: "对方声音收到", setup_call_sent: "我们的声音发出",
+    setup_call_pass: "通过", setup_call_fail: "不通过",
+    setup_call_asr: "听到了对方说话。", setup_call_energy: "听到了对方的声音。",
+    setup_call_no_audio: "没有听到对方的声音。",
+    setup_call_written: "AI 的声音已经送进电话线路。",
+    setup_call_no_write: "AI 的声音没有送进电话线路。", setup_call_no_uplink: "模组的声音通道没有建立起来，声音发不出去。可以重新插拔模组后再试。",
+    setup_call_write_error: "送出声音时出错（模组没有及时接收）。",
+    setup_call_unknown_carrier: "未识别出本卡运营商的免费客服号，可以跳过本步。",
+    setup_call_line_busy: "线路正在使用，未拨出自测电话。",
+    setup_call_modem_unavailable: "模组或 SIM 尚未就绪，可以跳过本步。",
+    setup_call_credentials: "请先完成模型凭证配置，也可以跳过本步。",
+    setup_call_provider_unsupported: "豆包暂不支持单句线路自测，请换用其他模型或跳过本步。",
+    setup_call_recording_unavailable: "录音存储不可用，未拨出电话。",
+    setup_call_recording_error: "录音未能保存，请检查磁盘空间和目录权限。",
+    setup_call_invalid_token: "本次测试请求已失效，请刷新状态后重新开始。",
+    setup_call_error: "未能开始自测，请确认状态后再试。",
+    setup_call_timeout: "已到 45 秒上限，已请求挂断。",
+    setup_call_hangup_failed: "挂断失败，请立即检查模组。",
+    setup_call_not_connected: "电话未接通，没有重试。",
+    setup_call_failed: "自测未能完成，请检查模组与模型配置。",
+    setup_notifications_hint: "AI 需要你确认时、来电被接听时提醒你。",
+    setup_notifications_allow: "允许通知", setup_notifications_allowed: "已允许",
+    setup_notifications_denied: "未允许", setup_notifications_unknown: "暂时无法读取通知权限状态。",
+    setup_notifications_settings: "去系统设置打开",
     setup_hw_title: "硬件检测", setup_hw_hint: "请连接 4G 模组（SIM7600 或 EC20/EG25）。",
     setup_model: "模组型号", setup_firmware: "固件", setup_network: "网络", setup_signal: "信号",
     setup_signal_unknown: "未知", setup_signal_weak: "弱", setup_signal_fair: "一般",
@@ -1858,14 +1953,14 @@ const I18N = {
     setup_reread_failed: "模组重启失败，请检查连接后重试。",
     setup_usb: "USB 模组", setup_at: "AT 口", setup_port: "端口", setup_sim: "SIM 卡",
     setup_hw_ok: "硬件状态看起来已就绪。", setup_hw_wait: "硬件暂未完全就绪。你可以继续配置，插好后再重试。",
-    setup_key_title: "Provider API Key", setup_key_hint: "Qwen 与 OpenAI 会先在线校验再保存；Key 不会被回显。",
+    setup_key_title: "模型", setup_key_hint: "请填写你自己的 DeepSeek Key。验证只查一下余额，不产生费用。",
     setup_qwen_key_help: {
       before: "Qwen / DashScope API Key：前往",
       link: "阿里云百炼",
       after: "免费创建；新用户通常有免费调用额度，额度用完或过期后将按阿里云价格计费。",
     },
     setup_provider: "Provider", setup_validate: "校验 Key", setup_need_key: "请先填写 Key。",
-    setup_validating: "正在校验…", setup_key_valid: "Key 有效。", setup_key_invalid: "Key 无效。",
+    setup_validating: "正在校验…", setup_key_valid: "Key 有效。", setup_key_invalid: "Key 无效，请检查是否复制完整，或到对应平台后台重新生成一个。",
     setup_key_network: "网络不通或 provider 超时。", setup_key_unsupported: "该 provider 暂不支持在线校验。",
     setup_key_saved: "Provider 设置已保存。", setup_doubao_note: "Doubao 仍为实验支持，将保存 App ID 和 Access Key，但不做在线校验。",
     setup_person_title: "个性化", setup_person_hint: "这些信息会影响 AI 如何介绍自己，以及通话时使用的语言。",
@@ -1877,10 +1972,10 @@ const I18N = {
     setup_recording_days: (days) => `${days} 天`, setup_recording_choose: "请选择开启或关闭后继续。",
     setup_recording_saved: "录音选择已保存。", recording_active: "通话录音已开启",
     recording_details: (path, days) => `录音保存在 ${path}，保留 ${days} 天。`,
-    setup_test_title: "自测", setup_test_hint: "检查模组与凭证状态，也可以向你能接收短信的手机号发送一条测试短信。",
+    setup_test_title: "自测", setup_test_hint: "拨本卡运营商免费客服号测试线路，也可以向你能接收短信的手机号发送一条测试短信。",
     setup_sms_number: "接收测试短信的手机号", setup_sms_text: "短信内容", setup_send_sms: "发送测试短信",
     setup_sms_default: "CallPilot 配置测试。", setup_sms_sent: "测试短信已发送，可在短信页查看。", setup_sms_fail: "测试短信失败：",
-    setup_ready_creds: "Provider 凭证", setup_ready_modem: "模组", setup_ready_yes: "就绪", setup_ready_no: "未就绪",
+    setup_ready_creds: "模型 Key", setup_ready_modem: "模组", setup_ready_yes: "就绪", setup_ready_no: "未就绪",
     setup_done_title: "可以开始了", setup_done_hint: "完成向导后会进入主界面。",
     setup_done_status: "本机将记录首次启动向导已完成。",
     setup_complete_fail: "完成向导失败：",
@@ -2455,6 +2550,7 @@ async function loadMeta() {
     }
     if (!smsAvailable) setupStatus("setupTestStatus", "", t("phone_sms_unavailable"));
     renderSetupHardware();
+    renderSetupCall();
     syncRecordingUi();
     if (m.setup_required && !$("setupWizard").classList.contains("show")) {
       showSetupWizard(false, m);
@@ -3712,7 +3808,7 @@ let setupRecordingConfirmed = false;
 let setupRecordingSaved = false;
 let recordingEnabled = false;
 const QWEN_API_KEY_URL = "https://bailian.console.aliyun.com/?tab=api#/api-key";
-const setupProviderKey = (provider) => provider === "openai" ? "OPENAI_API_KEY" : "DASHSCOPE_API_KEY";
+const setupProviderKey = (provider) => provider === "local" ? "DEEPSEEK_API_KEY" : provider === "openai" ? "OPENAI_API_KEY" : "DASHSCOPE_API_KEY";
 const setupVoiceKey = (provider) => provider === "openai" ? "OPENAI_VOICE" : "QWEN_VOICE";
 const cfgVal = (key) => (cfgSpecs.find((c) => c.key === key) || {}).value || "";
 const recordingSpec = () => cfgSpecs.find((c) => c.key === "RECORDING_ENABLED") || {};
@@ -3751,6 +3847,8 @@ function renderSetupWizard() {
   renderSetupHardware();
   renderSetupRecordingDetails();
   renderSetupReadySummary();
+  renderSetupCall();
+  if (setupStep === 5) void refreshSetupNotifications();
 }
 
 async function ensureConfigSpecs() {
@@ -3763,7 +3861,9 @@ async function ensureConfigSpecs() {
 
 async function prefillSetupFields() {
   await ensureConfigSpecs();
-  $("setupProvider").value = cfgVal("AGENT_PROVIDER") || "qwen";
+  $("setupProvider").value = cfgVal("AGENT_PROVIDER") || "local";
+  $("setupAdvanced").open = $("setupProvider").value !== "local";
+  $("setupLocalVoice").value = cfgVal("LOCAL_TTS_MODEL") || "vits-icefall-zh-aishell3";
   $("setupOwner").value = cfgVal("OWNER_NAME");
   $("setupPersona").value = cfgVal("AGENT_PERSONA");
   $("setupLang").value = cfgVal("AGENT_LANGUAGE") || "zh";
@@ -3899,6 +3999,88 @@ function renderSetupReadySummary() {
   }
 }
 
+let setupCallPending = false;
+let setupCallPlaybackId = "";
+function renderSetupCall() {
+  const meta = lastMeta || {};
+  const result = meta.setup_call;
+  const running = setupCallPending || result?.state === "running";
+  const number = meta.sim?.service_number || "";
+  $("setupCallNumber").textContent = number ? t("setup_call_target")(number) : t("setup_call_unknown_carrier");
+  $("setupStartCall").disabled = running || !!meta.call_active || !!meta.dial_queue_busy || !number;
+  $("setupStartCall").textContent = t(running ? "setup_call_running" : "setup_call_start");
+  if (running) setupStatus("setupCallStatus", "", t("setup_call_running"));
+  const box = $("setupCallResults");
+  box.textContent = "";
+  if (!running && result?.state === "done") {
+    const statusKey = "setup_call_" + result.status;
+    setupStatus("setupCallStatus", result.status === "completed" ? "" : "err",
+      t(result.status === "completed" ? "setup_call_done" : statusKey));
+    for (const key of ["received", "sent"]) {
+      const item = result[key] || { ok: false, reason: key === "received" ? "no_audio" : "no_write" };
+      const row = el("div", "line");
+      row.appendChild(el("b", "", t("setup_call_" + key)));
+      row.appendChild(el("span", item.ok ? "ok" : "err", t(item.ok ? "setup_call_pass" : "setup_call_fail") + ": " + t("setup_call_" + item.reason)));
+      box.appendChild(row);
+    }
+    if (result.recording_error) box.appendChild(el("p", "err", t("setup_call_recording_error")));
+  }
+  const recordingId = !running && result?.state === "done" ? result.call_id || "" : "";
+  if (setupCallPlaybackId !== recordingId) {
+    setupCallPlaybackId = recordingId;
+    $("setupCallPlayback").textContent = "";
+    if (recordingId) $("setupCallPlayback").appendChild(buildRecPlayers(recordingId));
+  }
+}
+
+$("setupStartCall").addEventListener("click", async () => {
+  if ($("setupStartCall").disabled || setupCallPending) return;
+  setupCallPending = true;
+  renderSetupCall();
+  let error = "";
+  try {
+    const { httpOk, res } = await postJson("/api/setup/test_call", { token: lastMeta?.setup_call_token || "" });
+    if (!httpOk || !res.ok) error = res.error || "error";
+  } catch {
+    error = "error";
+  } finally {
+    // 只刷新状态，网络错误绝不自动重新提交拨号。
+    await loadMeta();
+    setupCallPending = false;
+    renderSetupCall();
+    if (error) setupStatus("setupCallStatus", "err", t("setup_call_" + error));
+  }
+});
+
+async function refreshSetupNotifications() {
+  const api = window.pywebview?.api;
+  $("setupNotifications").hidden = !api?.notification_status;
+  if (!api?.notification_status) return;
+  try {
+    const result = await api.notification_status();
+    $("setupNotifications").hidden = !result.available;
+    const allowed = result.status === "allowed";
+    $("setupNotificationStatus").textContent = t(allowed ? "setup_notifications_allowed"
+      : result.status === "unknown" ? "setup_notifications_unknown" : "setup_notifications_denied");
+    $("setupAllowNotifications").hidden = allowed;
+    $("setupNotificationSettings").hidden = allowed;
+  } catch {
+    $("setupNotificationStatus").textContent = t("setup_notifications_unknown");
+  }
+}
+$("setupAllowNotifications").addEventListener("click", async () => {
+  $("setupAllowNotifications").disabled = true;
+  try {
+    await window.pywebview.api.request_notifications();
+  } finally {
+    $("setupAllowNotifications").disabled = false;
+    await refreshSetupNotifications();
+  }
+});
+$("setupNotificationSettings").addEventListener("click", () => window.pywebview.api.open_notification_settings());
+window.addEventListener("pywebviewready", () => { if (setupStep === 5) void refreshSetupNotifications(); });
+window.addEventListener("focus", () => { if (setupStep === 5) void refreshSetupNotifications(); });
+
 function renderSetupRecordingDetails() {
   const box = $("setupRecordingDetails");
   if (!box) return;
@@ -3919,11 +4101,17 @@ function renderSetupRecordingDetails() {
 function renderSetupProviderFields() {
   const provider = $("setupProvider").value;
   const doubao = provider === "doubao";
+  const local = provider === "local";
+  $("setupLocalMode").checked = local;
+  $("setupDeepseekKeyHelp").hidden = !local;
+  $("setupLocalVoice").hidden = !local;
+  $("setupVoice").hidden = local;
+  $("setupVoiceLabel").htmlFor = local ? "setupLocalVoice" : "setupVoice";
   document.querySelectorAll(".setup-doubao-field").forEach((node) => { node.style.display = doubao ? "" : "none"; });
   document.querySelectorAll(".setup-key-field").forEach((node) => { node.style.display = doubao ? "none" : ""; });
   $("setupValidateKey").style.display = doubao ? "none" : "";
   renderSetupQwenKeyHelp(provider);
-  $("setupApiKeyLabel").textContent = provider === "openai" ? "OpenAI API Key" : "DashScope API Key";
+  $("setupApiKeyLabel").textContent = local ? "DeepSeek API Key" : provider === "openai" ? "OpenAI API Key" : "DashScope API Key";
   const key = setupVoiceKey(provider);
   const choices = CFG_SUGGEST[key] || [];
   const list = $("setupVoiceList");
@@ -3968,17 +4156,28 @@ async function validateSetupKey() {
   }
   setupStatus("setupKeyStatus", "", t("setup_validating"));
   try {
-    const { httpOk, res } = await postJson("/api/config/validate_key", { provider, api_key: key });
+    const { httpOk, res } = await postJson("/api/config/validate_key", { provider: provider === "local" ? "deepseek" : provider, api_key: key });
+    if ($("setupProvider").value !== provider || $("setupApiKey").value.trim() !== key) return false;
     setupValidated = !!(httpOk && res.ok);
     const msg = res.status === "valid" ? t("setup_key_valid")
       : res.status === "invalid" ? t("setup_key_invalid")
-      : res.status === "network" ? t("setup_key_network")
+      : res.status === "format" ? t("setup_key_format")
+      : res.status === "balance" ? t("setup_key_balance")
+      : res.status === "network" ? t(provider === "local" ? "setup_deepseek_network" : "setup_key_network")
       : t("setup_key_unsupported");
+    if (setupValidated && provider === "local") {
+      const saved = await postJson("/api/config", { DEEPSEEK_API_KEY: key });
+      if (!saved.httpOk || !saved.res.ok) {
+        setupValidated = false;
+        setupStatus("setupKeyStatus", "err", t("cfg_savefail"));
+        return false;
+      }
+    }
     setupStatus("setupKeyStatus", setupValidated ? "ok" : "err", msg);
     return setupValidated;
   } catch (e) {
     setupValidated = false;
-    setupStatus("setupKeyStatus", "err", t("setup_key_network"));
+    setupStatus("setupKeyStatus", "err", t(provider === "local" ? "setup_deepseek_network" : "setup_key_network"));
     return false;
   }
 }
@@ -3986,6 +4185,10 @@ async function validateSetupKey() {
 async function saveSetupApi() {
   const provider = $("setupProvider").value;
   const updates = { AGENT_PROVIDER: provider };
+  if (provider === "local") {
+    updates.LOCAL_LLM_PROVIDER = "deepseek";
+    if (cfgVal("LOCAL_LLM_PROVIDER") !== "deepseek") updates.LOCAL_LLM_MODEL = "deepseek-flash";
+  }
   if (provider === "doubao") {
     const appId = $("setupDoubaoAppId").value.trim();
     const accessKey = $("setupDoubaoAccessKey").value.trim();
@@ -4018,7 +4221,10 @@ async function saveSetupPersonal() {
     AGENT_LANGUAGE: $("setupLang").value,
   };
   const voice = $("setupVoice").value.trim();
-  if (voice && provider !== "doubao") updates[setupVoiceKey(provider)] = voice;
+  if (provider === "local") {
+    updates.LOCAL_TTS_MODEL = $("setupLocalVoice").value;
+    updates.LOCAL_TTS_SPEAKER_ID = updates.LOCAL_TTS_MODEL === "vits-icefall-zh-aishell3" ? 25 : 0;
+  } else if (voice && provider !== "doubao") updates[setupVoiceKey(provider)] = voice;
   const { httpOk, res } = await postJson("/api/config", updates);
   if (!httpOk) {
     setupStatus("setupPersonStatus", "err", t("cfg_savefail") + (res.error || ""));
@@ -4097,10 +4303,17 @@ async function skipSetupStep() {
 
 $("setupProvider").addEventListener("change", () => {
   setupValidated = false;
+  $("setupApiKey").value = "";
   $("setupVoice").value = cfgVal(setupVoiceKey($("setupProvider").value));
   $("setupKeyStatus").className = "setup-status";
   $("setupKeyStatus").textContent = "";
   renderSetupProviderFields();
+});
+$("setupLocalMode").addEventListener("click", () => {
+  if ($("setupProvider").value !== "local") {
+    $("setupProvider").value = "local";
+    $("setupProvider").dispatchEvent(new Event("change"));
+  }
 });
 $("setupApiKey").addEventListener("input", () => { setupValidated = false; });
 document.querySelectorAll('input[name="setupRecording"]').forEach((radio) => {

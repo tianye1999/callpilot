@@ -43,11 +43,11 @@ ensure_build_python() {
     fi
     # 含 sherpa_onnx 判定：local provider（三段式）要求它进包，否则打包版
     # AGENT_PROVIDER=local 会 ImportError（v0.5.0 发布缺陷的根因）。
-    if ! "$ARM_VENV/bin/python" -c "import PyInstaller, aiohttp, rumps, sherpa_onnx" >/dev/null 2>&1; then
+    if ! "$ARM_VENV/bin/python" -c "import PyInstaller, aiohttp, rumps, sherpa_onnx, UserNotifications" >/dev/null 2>&1; then
         info "installing packaging dependencies into arm64 venv（含 [local] 三段式依赖）"
         "$ARM_VENV/bin/python" -m pip install --upgrade pip >/dev/null
         # [local] 把 sherpa-onnx 装进打包 venv，供 PyInstaller 收进 bundle；
-        # 模型资产不进包，首次用 local 时由 app 自动下载。
+        # 默认模型由 spec 的 required_files 清单收包，缺失时构建失败。
         "$ARM_VENV/bin/python" -m pip install -e "$ROOT[local]" pyinstaller >/dev/null
     fi
     printf '%s\n' "$ARM_VENV/bin/python"

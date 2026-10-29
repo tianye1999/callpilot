@@ -557,7 +557,12 @@ def _bundled_main(webview, web_url: str) -> None:
             WINDOW_TITLE, html=startup_html(), width=1100, height=780, **({"hidden": True} if splash else {}),
         )
         startup = BundledStartup(window, web_url, layout)
-        window.expose(startup.retry, startup.copy_diagnostics)
+        from agentcall.macos_notifications import NotificationBridge
+
+        notifications = NotificationBridge(window.get_current_url, web_url)
+        window.expose(startup.retry, startup.copy_diagnostics,
+                      notifications.notification_status, notifications.request_notifications,
+                      notifications.open_notification_settings)
         window.events.closed += startup.closed.set
         _install_window_hooks(window, layout.support_dir, splash)
         webview.start(lambda: threading.Thread(target=startup.run, daemon=True).start())

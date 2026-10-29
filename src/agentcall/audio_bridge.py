@@ -108,6 +108,7 @@ class _OutputObserver:
     _output_observer: Callable[[bytes], None] | None = None
     _output_ranges: tuple[tuple[int, int, Callable[[], None] | None], ...] = ()
     _output_progress = 0
+    output_write_errors = 0
 
     def set_output_observer(self, observer: Callable[[bytes], None]) -> None:
         """Before start(), observe successfully written AI bytes, excluding filler/DTMF.
@@ -117,6 +118,7 @@ class _OutputObserver:
         self._output_observer = observer
         self._output_spans: deque[tuple[int, bool, Callable[[], None] | None]] = deque()
         self._output_progress = 0
+        self.output_write_errors = 0
 
     def output_progress_bytes(self) -> int:
         """Confirmed non-filler writes, including DTMF; dequeues/drops aren't progress."""
@@ -228,7 +230,12 @@ class ModemAudioBridge(_OutputObserver):
             return
         for chunk in chunks:
             if chunk:
-                self._output_stream.write(chunk)
+                try:
+                    self._output_stream.write(chunk)
+                except Exception:
+                    if self._output_observer is not None:
+                        self.output_write_errors += 1
+                    raise
                 self._note_output_progress(len(chunk))
                 if isinstance(chunk, AgentPcm):
                     self._notify_output(chunk, ((0, len(chunk), chunk.on_written),))
@@ -634,6 +641,8 @@ class SerialPcmAudioBridge(_OutputObserver):
                                     now, (now - self._pcm_enabled_at) * 1000,
                                     "first_downlink" if self._first_downlink.is_set() else "deadline")
                     written = self._ser.write(payload)
+                    if self._output_observer is not None and written != len(payload):
+                        self.output_write_errors += 1
                     if written:
                         self._note_output_progress(min(written, self._output_real_bytes))
                         self._notify_output(payload[:written], self._output_ranges)
@@ -641,6 +650,8 @@ class SerialPcmAudioBridge(_OutputObserver):
                     self._write_timeouts = 0
                     self._log_write_stats()
             except serial.SerialTimeoutException:
+                if self._output_observer is not None:
+                    self.output_write_errors += 1
                 # 单帧写超时（模组侧瞬时忙/流控）：丢弃本帧并继续，绝不终止音频线程。
                 # 否则写线程一旦退出，下行永远没声音，且 tx_buffer 排不空会永久屏蔽上行。
                 self._write_timeouts += 1
@@ -654,6 +665,8 @@ class SerialPcmAudioBridge(_OutputObserver):
                 except Exception:
                     pass
             except serial.SerialException as exc:
+                if self._output_observer is not None:
+                    self.output_write_errors += 1
                 logger.error("写入 NMEA PCM 失败: %s", exc)
                 self._running = False
                 break
@@ -986,6 +999,8 @@ class FfmpegAudioBridge(_OutputObserver):
             # 进程刚退出时 write 仍可能把数据塞进管道缓冲而“看似成功”，
             # 会误清重启计数、导致无限重试刷屏（曾整通每 0.5s 重启上百次）。
             if self._play is None or self._play.poll() is not None:
+                if self._output_observer is not None:
+                    self.output_write_errors += 1
                 if not self._restart_play("进程退出"):
                     return
                 next_write_at = time.monotonic()
@@ -994,6 +1009,8 @@ class FfmpegAudioBridge(_OutputObserver):
             play = self._play
             wrote_full_payload = self._write_play_payload(payload)
             if not wrote_full_payload or play is None or play.poll() is not None:
+                if self._output_observer is not None:
+                    self.output_write_errors += 1
                 if not self._running or not self._restart_play("写入僵死/管道断开"):
                     return
                 next_write_at = time.monotonic()

@@ -1,8 +1,8 @@
 """本地三段式（local provider）的模型资产管理：manifest + 下载 + 校验。
 
 设计迁移自 iphone-call-ai-poc 的 ``models.toml`` 模式：机器可读的资产清单 +
-幂等的 prepare 命令。模型**不进打包 DMG**（体积数百 MB），首次启用 local
-provider 时下载到用户数据目录；重复执行只补缺失文件。
+幂等的 prepare 命令。Mac 产品包内置默认模型，只读使用；开发版或额外音色
+缺失时下载到用户数据目录，重复执行只补缺失文件。
 
 三件资产（sherpa-onnx 全家桶，无 torch 依赖）：
 - VAD：silero-vad v5 onnx（~2MB）
@@ -187,11 +187,39 @@ def build_tts_config(sherpa: Any, root: Path, name: str | None = None) -> Any:
 
 
 def models_dir() -> Path:
-    """模型根目录：``LOCAL_MODELS_DIR`` 覆盖，否则数据目录下 ``models/``。"""
+    """覆盖目录 > 完整用户模型 > 完整只读包内模型 > 用户目录下载兜底。"""
     override = config.get_str("LOCAL_MODELS_DIR").strip()
     if override:
         return Path(override).expanduser()
-    return config.data_dir() / "models"
+    writable = config.data_dir() / "models"
+    if all(asset_ready(asset, writable) for asset in selected_assets()):
+        return writable
+    bundled = bundled_models_dir()
+    if bundled is not None and all(asset_ready(asset, bundled) for asset in selected_assets()):
+        return bundled
+    return writable
+
+
+def bundled_models_dir() -> Path | None:
+    """PyInstaller 将数据放在 Resources，并在 _MEIPASS 下提供链接。"""
+    base = getattr(sys, "_MEIPASS", None)
+    return Path(base) / "models" if base and getattr(sys, "frozen", False) else None
+
+
+def bundled_assets() -> tuple[ModelAsset, ...]:
+    return MODEL_ASSETS + TTS_MODELS[_AISHELL3].assets
+
+
+def bundle_data_files(root: Path) -> list[tuple[str, str]]:
+    """构建时只收清单文件；缺失即失败，不下载、不夹带浮点大模型。"""
+    files = []
+    for asset in bundled_assets():
+        for rel in asset.required_files:
+            path = root / rel
+            if not path.is_file():
+                raise RuntimeError(f"打包模型缺失: {path}")
+            files.append((str(path), str(Path("models") / Path(rel).parent)))
+    return files
 
 
 def asset_paths(asset: ModelAsset, base: Path | None = None) -> dict[str, Path]:
@@ -247,6 +275,9 @@ def ensure_asset(asset: ModelAsset, base: Path | None = None) -> bool:
     root = base if base is not None else models_dir()
     if asset_ready(asset, root):
         return False
+    bundled = bundled_models_dir()
+    if bundled is not None and root.resolve().is_relative_to(bundled.resolve()):
+        raise RuntimeError("包内模型目录只读，请在用户数据目录准备缺失模型")
     if not asset.archive:
         _download(asset.url, root / asset.required_files[0])
     else:
