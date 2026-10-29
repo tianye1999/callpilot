@@ -1696,9 +1696,11 @@ class Sim7600Modem(SerialModem):
                 logger.warning(
                     "AT+CPCMBANDWIDTH=1,1 失败 (%s)，继续尝试 CPCMREG", type(exc).__name__,
                 )
+        hold_uplink = audio_mode.lower() == "nmea" and config.get_int("MODEM_PCM_UPLINK_HOLD_MS") > 0
         for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
             attempt_started = time.monotonic()
             ok = "OK" in self._send("AT+CPCMREG=1")
+            enabled_mono = time.monotonic() if ok and hold_uplink else None
             logger.info(
                 "[timing] CPCMREG 第 %d 次耗时 %.2fs -> %s",
                 i + 1, time.monotonic() - attempt_started, "OK" if ok else "ERROR",
@@ -1727,6 +1729,8 @@ class Sim7600Modem(SerialModem):
                     "attempts": attempts,
                     "degraded": self._pcm_degraded,
                 }
+                if enabled_mono is not None:
+                    self.last_voice_enable["enabled_mono"] = enabled_mono
                 return
             if i < self._CPCMREG_ENABLE_ATTEMPTS - 1:
                 time.sleep(self._CPCMREG_ENABLE_RETRY_DELAY)

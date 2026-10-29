@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import errno
 import fcntl
+import json
 import logging
 import logging.handlers
 import os
@@ -21,6 +22,7 @@ import termios
 import threading
 import time
 import tty
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -44,12 +46,89 @@ PID = modem_hardware.PRESETS[0].pid
 PTY_WRITE_TIMEOUT_TOLERANCE = 3
 # USB→PTY 每块数据的总背压预算，容忍服务短暂调度迟滞但不无限等待。
 USB_TO_PTY_WRITE_TIMEOUT = 0.5
+PTY_TO_USB_WRITE_TIMEOUT = 1.0
 
 LOCK_PATH = Path("/tmp/ec20-usb-pty.lock")
 
 
 class BridgeShutdownError(Exception):
     """无法安全关闭时必须退出进程，不允许外层带着活动线程原地重连。"""
+
+
+class InterfaceStats:
+    """只保留计数，不保存音频；两个方向共用有界逐秒环形缓冲。"""
+
+    def __init__(self, interface: int) -> None:
+        self.interface = interface
+        self._lock = threading.Lock()
+        self._total = self._empty()
+        self._period = self._empty()
+        self._seconds: deque[dict] = deque(maxlen=11)
+        self._logged_at = time.monotonic()
+        self._first_timeout = False
+
+    @staticmethod
+    def _empty() -> dict:
+        return dict(in_bytes=0, in_calls=0, out_bytes=0, out_calls=0,
+                    out_short=0, out_timeouts=0, pty_dropped=0, out_max_ms=0.0)
+
+    def _prune(self, now: float) -> None:
+        while self._seconds and self._seconds[0]["mono_second"] < int(now) - 10:
+            self._seconds.popleft()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            self._prune(time.monotonic())
+            return {"total": self._total.copy(), "seconds": [row.copy() for row in self._seconds]}
+
+    def record(self, **values: float) -> None:
+        summary = snapshot = None
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            if not self._seconds or self._seconds[-1]["mono_second"] != int(now):
+                self._seconds.append({"mono_second": int(now), **self._empty()})
+            for target in (self._total, self._period, self._seconds[-1]):
+                for key, value in values.items():
+                    target[key] = max(target[key], value) if key == "out_max_ms" else target[key] + value
+            if values.get("out_timeouts") and not self._first_timeout:
+                self._first_timeout = True
+                snapshot = {"total": self._total.copy(), "seconds": [row.copy() for row in self._seconds]}
+            if now - self._logged_at >= 5:
+                # 空闲 IN 超时轮询不算流量；OUT 尝试即使零写也要可见。
+                if any(self._period[k] for k in ("in_bytes", "out_calls", "pty_dropped")):
+                    summary = self._period
+                self._period = self._empty()
+                self._logged_at = now
+        if summary is not None:
+            logger.info("USB_IO interface=%d mono=%.6f %s", self.interface, now,
+                        " ".join(f"{key}={value}" for key, value in summary.items()))
+        if snapshot is not None:
+            logger.warning("USB_OUT_FIRST_TIMEOUT interface=%d mono=%.6f snapshot=%s",
+                           self.interface, now, json.dumps(snapshot, ensure_ascii=False))
+
+
+def write_usb_bounded(dev, endpoint: int, data: bytes, stop: threading.Event, stats: InterfaceStats) -> bool:
+    """短写只续写剩余部分；整块共享时限，零写不冒充 USBTimeoutError。"""
+    offset = 0
+    deadline = time.monotonic() + PTY_TO_USB_WRITE_TIMEOUT
+    while offset < len(data) and not stop.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        started = time.monotonic()
+        try:
+            written = dev.write(endpoint, data[offset:], timeout=max(1, round(remaining * 1000)))
+        except usb.core.USBError as exc:
+            timeout = isinstance(exc, usb.core.USBTimeoutError) or exc.errno == errno.ETIMEDOUT
+            stats.record(out_calls=1, out_timeouts=int(timeout), out_max_ms=(time.monotonic() - started) * 1000)
+            raise
+        stats.record(out_calls=1, out_bytes=written, out_short=int(written < len(data) - offset),
+                     out_max_ms=(time.monotonic() - started) * 1000)
+        offset += written
+        if written == 0:
+            stop.wait(min(0.005, max(0, deadline - time.monotonic())))
+    return offset == len(data)
 
 
 def bundled_libusb_path() -> Path | None:
@@ -78,7 +157,7 @@ def acquire_instance_lock() -> object:
 
     返回持有的文件对象（进程退出自动释放）；已有实例时报错。
     """
-    lock_file = LOCK_PATH.open("a+")
+    lock_file = LOCK_PATH.open("a+", encoding="utf-8")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -115,6 +194,7 @@ class BridgeHandle:
     # USB 组合切换恢复再重连，见 usb_composition_recovery。
     degraded: bool = False
     threads: list[threading.Thread] = field(default_factory=list)
+    stats: InterfaceStats | None = None
 
     def close(self) -> None:
         if self.closed:
@@ -404,6 +484,7 @@ def bridge_port(
     master_fd, slave_fd = pty.openpty()
     stop = threading.Event()
     handle = BridgeHandle(dev, port, link, master_fd, slave_fd, stop)
+    stats = handle.stats = InterfaceStats(port.interface)
     try:
         # Keep the slave side open so the master does not see EIO before a client opens it.
         make_raw(slave_fd)
@@ -431,12 +512,15 @@ def bridge_port(
             try:
                 data = dev.read(port.bulk_in, port.max_packet, timeout=100)
             except usb.core.USBTimeoutError:
+                stats.record(in_calls=1)
                 continue
             except Exception as exc:  # noqa: BLE001
+                stats.record(in_calls=1)
                 if not stop.is_set():
                     logger.error("interface %d USB read failed: %s", port.interface, exc)
                 stop.set()
                 return
+            stats.record(in_calls=1, in_bytes=len(data))
             if stop.is_set():
                 return
             if data:
@@ -447,6 +531,7 @@ def bridge_port(
                         logger.error("interface %d PTY write failed: %s", port.interface, exc)
                     stop.set()
                     return
+                stats.record(pty_dropped=dropped)
                 # 短暂迟滞保留数据；PCM/AT 持续无读者才丢弃，不能拖死整座桥。
                 if dropped and not stop.is_set() and time.monotonic() - last_drop_log >= 5.0:
                     logger.warning("interface %d PTY 缓冲满，丢弃 %d 字节", port.interface, dropped)
@@ -469,8 +554,8 @@ def bridge_port(
                 return
             if data:
                 try:
-                    dev.write(port.bulk_out, data, timeout=1000)
-                    consecutive_timeouts = 0
+                    if write_usb_bounded(dev, port.bulk_out, data, stop, stats):
+                        consecutive_timeouts = 0
                 except usb.core.USBError as exc:
                     if isinstance(exc, usb.core.USBTimeoutError) or exc.errno == errno.ETIMEDOUT:
                         # 瞬时写超时（模组侧忙/端点暂 NAK）：丢帧继续，不因单帧超时拆桥
@@ -551,6 +636,10 @@ def run_bridges_once(
     不复位则重连后每次 read 立即 [Errno 5] 死循环（见 docs/roadmap.md USB 排查）。
     """
     if reset_first:
+        if os.environ.get("CALLPILOT_BRIDGE_RESET_ON_START") == "0":
+            logger.info("启动不复位（实验开关） CALLPILOT_BRIDGE_RESET_ON_START=0")
+            reset_first = False
+    if reset_first:
         try:
             dev.reset()
             logger.info("已复位 USB 设备（清除 stall 端点）")
@@ -566,18 +655,36 @@ def run_bridges_once(
             handles.append(bridge_port(dev, ports[iface], link))
 
         requested = False
-        while not stop.is_set() and all(not handle.stop.is_set() for handle in handles):
+        held = False
+        hold_pcm = (os.environ.get("CALLPILOT_BRIDGE_HOLD_ON_PCM_STALL") == "1"
+                    and getattr(dev, "idVendor", None) == modem_hardware.SIM7600_VID
+                    and getattr(dev, "idProduct", None) == modem_hardware.SIM7600_PID)
+        while not stop.is_set():
+            failed = [handle for handle in handles if handle.stop.is_set() and not handle.closed]
+            if hold_pcm and not held and any(h.port.interface == 4 and h.degraded for h in failed):
+                # 不发 AT、不枚举、不释放整个设备，只停 PCM 并冻结计数现场。
+                pcm = next(h for h in failed if h.port.interface == 4)
+                pcm.close()
+                held = True
+                snapshot = [{"interface": h.port.interface, "stopped": h.stop.is_set(),
+                             "closed": h.closed, "degraded": h.degraded,
+                             "threads_alive": [t.name for t in h.threads if t.is_alive()],
+                             "stats": h.stats.snapshot() if h.stats is not None else None} for h in handles]
+                logger.warning("PCM_STALL_HOLD PCM 卡死取证：保留 AT 桥，暂停组合切换 snapshot=%s",
+                               json.dumps(snapshot, ensure_ascii=False))
+            if any(h.stop.is_set() and not (held and h.port.interface == 4) for h in handles):
+                break
             if heartbeat is not None:
                 heartbeat()
             # app 侧检测到「CPCMREG 启用需重试」= 模组已劣化，通话结束后写此文件请求
             # 自愈。它覆盖「模组收数据但播放卡」这一形态——那种形态不产生写超时，
             # 光靠桥自己发现不了（真机 2026-08-12）。
-            if recovery_request is not None and recovery_request.exists():
+            if not held and recovery_request is not None and recovery_request.exists():
                 logger.warning("收到 app 的自愈请求（%s），拆桥执行组合切换", recovery_request)
                 requested = True
                 break
             time.sleep(0.2)
-        return requested or any(handle.degraded for handle in handles)
+        return not held and (requested or any(handle.degraded for handle in handles))
     finally:
         # 先通知全部桥，不能因第一个桥关闭失败而让其余生产者继续运行。
         for handle in handles:
@@ -633,12 +740,16 @@ def run_auto(stop: threading.Event, *, once: bool = False, poll_seconds: float =
                 last_write = time.monotonic()
 
         logger.info("自动识别模组: %s (%04x:%04x)", preset.model, preset.vid, preset.pid)
+        reset_first = preset.reset_on_start and (first_selection or failures > 0)
+        if os.environ.get("CALLPILOT_BRIDGE_RESET_ON_START") == "0":
+            reset_first = False
+            logger.info("启动不复位（实验开关） CALLPILOT_BRIDGE_RESET_ON_START=0")
         started = time.monotonic()
         degraded = False
         try:
             degraded = run_bridges_once(
                 dev, [parse_map(m) for m in preset.maps], stop,
-                reset_first=preset.reset_on_start and (first_selection or failures > 0),
+                reset_first=reset_first,
                 recovery_request=request, heartbeat=heartbeat,
             )
         except (RuntimeError, usb.core.USBError) as exc:

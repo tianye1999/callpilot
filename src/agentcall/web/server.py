@@ -16,8 +16,10 @@ import wave
 from contextlib import suppress
 from functools import partial
 from pathlib import Path
+from typing import Callable
 
 from aiohttp import WSMsgType, web
+from aiohttp.web_log import AccessLogger
 from serial.tools import list_ports
 
 from .. import config, metrics_report, modem_hardware, platforms
@@ -42,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 MODEM_VIDS = {preset.vid for preset in modem_hardware.PRESETS}
+_USB_SCAN_LOCK = modem_hardware.USB_SCAN_LOCK
+_USB_CACHE_SECONDS = 10.0
 _REMOTE_DIALER_CSP = (
     "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; "
     "style-src 'self'; connect-src 'self' wss:; media-src blob:; worker-src 'self' blob:; "
@@ -176,11 +180,15 @@ def _detect_quectel_usb_system_profiler() -> bool:
     return _usb_tree_has_quectel(data)
 
 
-def detect_quectel_usb_online() -> bool:
+def detect_quectel_usb_online(*, busy: Callable[[], bool] = lambda: False) -> bool | None:
     """兼容旧调用名；检测所有已知模组，而非仅 Quectel。"""
+    if busy():
+        return None
     if platforms.IS_MACOS:
         if _detect_quectel_usb_pyusb():
             return True
+        if busy():
+            return None
         return _detect_quectel_usb_system_profiler()
     try:
         return any(getattr(port, "vid", None) in MODEM_VIDS for port in list_ports.comports())
@@ -392,8 +400,46 @@ async def _remote_dialer_asset(request: web.Request) -> web.StreamResponse:
     )
 
 
-def _tray_usb_online(app: web.Application) -> bool | None:
-    """托盘读缓存；慢速 USB 枚举离开事件循环，扫描不重叠、完成后缓存 10 秒。"""
+class TrayAccessLogger(AccessLogger):
+    """仅忽略托盘探测，普通请求保留 aiohttp 的原始访问日志。"""
+
+    def log(self, request, response, time: float) -> None:
+        if request.path == "/api/meta" and request.query.get("tray") == "1":
+            return
+        super().log(request, response, time)
+
+
+def _line_busy(app: web.Application) -> bool:
+    service = app.get("service")
+    busy = getattr(service, "line_busy", None)
+    return bool(busy()) if callable(busy) else bool(getattr(getattr(service, "session", None), "is_active", False))
+
+
+def _scan_usb(source: str, busy: Callable[[], bool]) -> bool | None:
+    """所有观测扫描共用进程锁；排队者复用在途结果，不再补扫一次。"""
+    if not _USB_SCAN_LOCK.acquire(blocking=False):
+        with _USB_SCAN_LOCK:
+            return modem_hardware.USB_SCAN_ONLINE
+    try:
+        # 后台任务可能排队到通话开始后才执行，必须在实际扫描前再检查。
+        if busy():
+            return None
+        started = time.monotonic()
+        result = None
+        try:
+            result = detect_quectel_usb_online(busy=busy)
+            return result
+        finally:
+            ended = time.monotonic()
+            modem_hardware.USB_SCAN_ONLINE = result
+            logger.info("USB_SCAN source=%s start_mono=%.6f end_mono=%.6f duration_ms=%.3f result=%s",
+                        source, started, ended, (ended - started) * 1000, result)
+    finally:
+        _USB_SCAN_LOCK.release()
+
+
+def _tray_usb_online(app: web.Application, source: str = "tray") -> bool | None:
+    """两条 meta 路径共用缓存；占线只读有效心跳或近期结果，不发起枚举。"""
     cache = app["tray_usb"]
     task = cache["task"]
     if task is not None and task.done():
@@ -402,10 +448,19 @@ def _tray_usb_online(app: web.Application) -> bool | None:
         except Exception:  # noqa: BLE001
             logger.exception("托盘 USB 扫描失败")
             cache["online"] = None
-        cache["checked"] = time.monotonic()
         cache["task"] = task = None
-    if task is None and time.monotonic() - cache["checked"] >= 10:
-        cache["task"] = asyncio.create_task(asyncio.to_thread(detect_quectel_usb_online))
+    age = time.monotonic() - cache["checked"]
+    if _line_busy(app):
+        if platforms.IS_MACOS and modem_hardware.read_state() is not None:
+            return True
+        return cache["online"] if age < _USB_CACHE_SECONDS else None
+    if task is None and age >= _USB_CACHE_SECONDS:
+        async def scan() -> bool | None:
+            result = await asyncio.to_thread(_scan_usb, source, lambda: _line_busy(app))
+            cache["checked"] = time.monotonic()
+            return result
+
+        cache["task"] = asyncio.create_task(scan())
     return cache["online"]
 
 
@@ -442,9 +497,14 @@ async def _meta(request: web.Request) -> web.Response:
     )
     meta["credentials"] = config.credential_status(meta.get("provider"))
     meta["setup_required"] = config.setup_required()
+    tray = request.query.get("tray") == "1"
+    usb_online = _tray_usb_online(request.app, "tray" if tray else "meta")
+    task = request.app["tray_usb"]["task"]
+    if not tray and not _line_busy(request.app) and task is not None:
+        await asyncio.shield(task)
+        usb_online = _tray_usb_online(request.app, "meta")
     meta["hardware"] = {
-        "usb_online": _tray_usb_online(request.app) if request.query.get("tray") == "1"
-                      else detect_quectel_usb_online(),
+        "usb_online": usb_online,
         "modem_connected": bool(getattr(service, "modem_connected", False)),
         "modem_resetting": isinstance(modem, SerialModem) and modem.recovery_in_progress,
         "port": meta.get("port") or config.get_str("MODEM_PORT"),

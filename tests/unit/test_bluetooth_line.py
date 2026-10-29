@@ -399,7 +399,7 @@ def test_hfp_api_meta_and_sms_degradation(tmp_path, monkeypatch):
     async def check():
         hub = EventHub(asyncio.get_running_loop())
         service = make_service(modem, tmp_path, hub)
-        monkeypatch.setattr("agentcall.web.server.detect_quectel_usb_online", lambda: False)
+        monkeypatch.setattr("agentcall.web.server.detect_quectel_usb_online", lambda **kwargs: False)
         app = build_app(hub, modem, service, {"provider": "qwen", "port": "unused"})
         async with TestClient(TestServer(app)) as client:
             response = await client.get("/api/meta")

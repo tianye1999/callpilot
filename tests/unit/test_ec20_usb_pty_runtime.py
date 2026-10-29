@@ -9,6 +9,19 @@ pytest.importorskip("fcntl", reason="EC20 PTY bridge is POSIX-only")
 from scripts import ec20_usb_pty
 
 
+@pytest.fixture(autouse=True)
+def isolate_recovery_request(monkeypatch, tmp_path):
+    """自动识别测试不能清除真实桥正在等待的恢复哨兵。"""
+    from dataclasses import replace
+
+    hardware = ec20_usb_pty.modem_hardware
+    request = str(tmp_path / "recover-request")
+    monkeypatch.setattr(hardware, "RECOVERY_REQUEST_PATH", request)
+    monkeypatch.setattr(hardware, "PRESETS", tuple(
+        replace(p, recovery_request_path=request) if p.recovery_request_path else p for p in hardware.PRESETS
+    ))
+
+
 def _flush_rescue_pty(fd):
     """救援口可能已被子进程关闭 master 挂断；清理不能覆盖原始测试结果。"""
     import errno
@@ -115,6 +128,8 @@ def test_real_pty_delayed_reader_receives_complete_block(real_pty_usb_block, cap
     assert completed.wait(1)
     assert timings[1] - timings[0] >= 0.18
     assert "丢弃" not in caplog.text
+    assert handle.stats.snapshot()["total"]["in_bytes"] == len(payload)
+    assert handle.stats.snapshot()["total"]["pty_dropped"] == 0
 
 
 def test_real_pty_without_reader_drops_block_after_bounded_wait(real_pty_usb_block, caplog):
@@ -124,6 +139,8 @@ def test_real_pty_without_reader_drops_block_after_bounded_wait(real_pty_usb_blo
     assert 0.45 <= elapsed < 1.0, f"应等待约 0.5 秒再丢弃，实际 {elapsed:.3f} 秒"
     assert not handle.stop.is_set()
     assert "丢弃" in caplog.text
+    assert handle.stats.snapshot()["total"]["in_bytes"] == len(_payload)
+    assert 0 < handle.stats.snapshot()["total"]["pty_dropped"] <= len(_payload)
 
 
 def test_real_pty_stop_interrupts_backpressure_wait(real_pty_usb_block, caplog):

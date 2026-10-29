@@ -177,7 +177,7 @@ def test_macos_autostart_only_packaged_and_validated(monkeypatch):
 
 @pytest.mark.parametrize("active", [False, True])
 def test_meta_reports_current_call_state(active, monkeypatch):
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
     service = FakeService(session=_SessionStub(is_active=active))
 
     async def fn(client):
@@ -193,7 +193,7 @@ def test_meta_reports_current_call_state(active, monkeypatch):
 
 @pytest.mark.parametrize("active,outbound", [(False, False), (True, False), (True, True)])
 def test_meta_call_details_only_expose_suffix(active, outbound, monkeypatch):
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: True)
     session = SimpleNamespace(is_active=active, current_caller="+12025551234",
                               _outbound_number="+12025555678" if outbound else None,
                               call_started_at=1234.5)
@@ -212,7 +212,7 @@ def test_meta_call_details_only_expose_suffix(active, outbound, monkeypatch):
 
 
 def test_meta_other_line_owner_never_reuses_previous_call(monkeypatch):
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: True)
     service = FakeService(session=SimpleNamespace(is_active=False, current_caller="+12025551234",
                                                   _outbound_number="+12025555678", call_started_at=1234))
     service.remote_status["active"] = True
@@ -227,7 +227,7 @@ def test_tray_meta_usb_scan_is_background_cached_and_nonoverlapping(monkeypatch)
     scans = []
     now = [0.0]
     monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: now[0]))
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: scans.append(True) or True)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: scans.append(True) or True)
 
     async def fn(client):
         response = await client.get("/api/meta?tray=1")
@@ -257,8 +257,194 @@ def test_tray_meta_usb_scan_is_background_cached_and_nonoverlapping(monkeypatch)
     api(make_app(FakeService()), fn)
 
 
+@pytest.mark.parametrize("path", ["/api/meta", "/api/meta?tray=1"])
+@pytest.mark.parametrize("fresh", [False, True])
+def test_busy_meta_never_scans_and_expires_heartbeat(path, fresh, monkeypatch, tmp_path):
+    from agentcall import modem_hardware
+
+    monkeypatch.setattr(platforms, "IS_MACOS", True)
+    monkeypatch.setattr(modem_hardware, "STATE_PATH", tmp_path / "state.json")
+    modem_hardware.write_state(modem_hardware.PRESETS[1], online=True)
+    if not fresh:
+        state = json.loads(modem_hardware.STATE_PATH.read_text(encoding="utf-8"))
+        state["updated_at"] -= 60
+        modem_hardware.STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: pytest.fail("占线期间不能扫描"))
+    service = FakeService()
+    service.remote_status["active"] = True
+
+    async def fn(client):
+        return await (await client.get(path)).json()
+
+    assert api(make_app(service), fn)["hardware"]["usb_online"] is (True if fresh else None)
+
+
+def test_meta_and_tray_share_inflight_scan(monkeypatch):
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    scans = []
+
+    def scan(**kwargs):
+        scans.append(1)
+        entered.set()
+        assert release.wait(2)
+        return True
+
+    monkeypatch.setattr(server, "detect_quectel_usb_online", scan)
+
+    async def fn(client):
+        await client.get("/api/meta?tray=1")
+        assert await asyncio.to_thread(entered.wait, 1)
+        requests = [asyncio.create_task(client.get("/api/meta")) for _ in range(3)]
+        await asyncio.sleep(0.02)
+        release.set()
+        for response in await asyncio.gather(*requests):
+            assert (await response.json())["hardware"]["usb_online"] is True
+        assert scans == [1]
+
+    try:
+        api(make_app(FakeService()), fn)
+    finally:
+        release.set()
+
+
+def test_usb_scan_log_fields(monkeypatch, caplog):
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: True)
+    with caplog.at_level("INFO"):
+        assert server._scan_usb("setup", lambda: False) is True
+    line = next(r.message for r in caplog.records if "USB_SCAN" in r.message)
+    for field in ("source=setup", "start_mono=", "end_mono=", "duration_ms=", "result=True"):
+        assert field in line
+
+
+def test_setup_scan_shares_lock_and_log_fields(monkeypatch, caplog):
+    hardware = server.modem_hardware
+    assert server._USB_SCAN_LOCK is hardware.USB_SCAN_LOCK
+
+    def scan():
+        assert hardware.USB_SCAN_LOCK.locked()
+        return hardware.PRESETS[1]
+
+    monkeypatch.setattr(hardware, "_scan_preset", scan)
+    with caplog.at_level("INFO"):
+        assert hardware.scan_preset().vendor == "simcom"
+    line = next(r.message for r in caplog.records if "USB_SCAN" in r.message)
+    for field in ("source=setup", "start_mono=", "end_mono=", "duration_ms=", "result=simcom"):
+        assert field in line
+
+
+def test_access_logger_suppresses_only_tray_probe(monkeypatch):
+    from aiohttp.web_log import AccessLogger
+
+    seen = []
+    monkeypatch.setattr(AccessLogger, "log", lambda self, request, response, elapsed: seen.append(request.path_qs))
+    log = server.TrayAccessLogger(__import__("logging").getLogger("test"), "%r")
+    for path in ("/api/meta?tray=1", "/api/meta", "/api/meta?tray=0", "/api/other?tray=1"):
+        log.log(make_mocked_request("GET", path), None, 0.1)
+    assert seen == ["/api/meta", "/api/meta?tray=0", "/api/other?tray=1"]
+
+
+@pytest.mark.parametrize("source", ["tray", "setup"])
+def test_scan_global_single_flight_across_apps(monkeypatch, source):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered, release, joined = threading.Event(), threading.Event(), threading.Event()
+    scans = []
+    lock = threading.Lock()
+
+    class ObservedLock:
+        def acquire(self, blocking=True):
+            acquired = lock.acquire(blocking=blocking)
+            if not acquired:
+                joined.set()
+            return acquired
+
+        def release(self):
+            lock.release()
+
+        def __enter__(self):
+            lock.acquire()
+
+        def __exit__(self, *args):
+            lock.release()
+
+    def scan(**kwargs):
+        scans.append(1)
+        entered.set()
+        assert release.wait(2)
+        return True
+
+    def setup_scan():
+        scan()
+        return None
+
+    observed = ObservedLock()
+    monkeypatch.setattr(server, "_USB_SCAN_LOCK", observed)
+    monkeypatch.setattr(server.modem_hardware, "USB_SCAN_LOCK", observed)
+    monkeypatch.setattr(server.modem_hardware, "USB_SCAN_ONLINE", True)
+    monkeypatch.setattr(server.modem_hardware, "_scan_preset", setup_scan)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", scan)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            first = (pool.submit(server._scan_usb, "tray", lambda: False) if source == "tray"
+                     else pool.submit(server.modem_hardware.scan_preset))
+            assert entered.wait(1)
+            second = pool.submit(server._scan_usb, "meta", lambda: False)
+            assert joined.wait(1)
+        finally:
+            release.set()
+        assert first.result() is (True if source == "tray" else None)
+        assert second.result() is (source == "tray")
+        assert scans == [1]
+
+
+def test_queued_scan_rechecks_busy_and_busy_cache_expires(monkeypatch):
+    service = FakeService()
+    monkeypatch.setattr(platforms, "IS_MACOS", False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: pytest.fail("不能扫描"))
+    now = [100.0]
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    async def check():
+        app = make_app(service)
+        server._tray_usb_online(app)
+        task = app["tray_usb"]["task"]
+        service.remote_status["active"] = True
+        await task
+        assert server._tray_usb_online(app) is None
+        app["tray_usb"].update(online=True, checked=100)
+        assert server._tray_usb_online(app) is True
+        now[0] = 110
+        assert server._tray_usb_online(app) is None
+        assert app["tray_usb"]["task"] is None
+
+    asyncio.run(check())
+
+
+def test_tray_access_log_integration(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
+
+    async def check():
+        test_server = TestServer(make_app(FakeService()))
+        await test_server.start_server(access_log_class=server.TrayAccessLogger,
+                                       access_log=logging.getLogger("test.tray.access"))
+        async with TestClient(test_server) as client:
+            for path in ("/api/meta?tray=1", "/api/meta"):
+                await (await client.get(path)).read()
+
+    with caplog.at_level(logging.INFO, logger="test.tray.access"):
+        asyncio.run(check())
+    messages = [r.message for r in caplog.records if r.name == "test.tray.access"]
+    assert len(messages) == 1
+    assert "GET /api/meta " in messages[0]
+
+
 def test_meta_uses_line_owner_state_even_without_active_local_session(monkeypatch):
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
     service = FakeService(session=_SessionStub(is_active=False))
     monkeypatch.setattr(service, "line_busy", lambda: True)
 
@@ -274,7 +460,7 @@ def test_meta_uses_line_owner_state_even_without_active_local_session(monkeypatc
     {"active": False, "pending": [], "current": "test"},
 ])
 def test_meta_reports_dial_queue_busy(queue, monkeypatch):
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
     service = FakeService()
     service.queue = queue
 
@@ -288,7 +474,7 @@ def test_meta_reports_dial_queue_busy(queue, monkeypatch):
 
 
 def test_meta_without_service_reports_no_calls_or_queue(monkeypatch):
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
 
     async def fn(client):
         response = await client.get("/api/meta")
@@ -329,7 +515,7 @@ def test_local_meta_displays_actual_model_combination(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
     monkeypatch.setenv("DTMF_JUDGE_MODE", "shadow")
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
     app = build_app(
         hub=None, modem=None, service=FakeService(),
         meta=config.runtime_meta(provider="local", model="Qwen3.5-Omni", port="unused"),
@@ -355,7 +541,7 @@ def test_meta_includes_setup_and_hardware_status(monkeypatch):
     monkeypatch.delenv("DOUBAO_APP_ID", raising=False)
     monkeypatch.delenv("DOUBAO_ACCESS_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: True)
     service = FakeService()
     service.modem_connected = False
     app = build_app(
@@ -482,6 +668,19 @@ def test_quectel_usb_detection_on_macos_falls_back_to_system_profiler(monkeypatc
     assert server.detect_quectel_usb_online() is True
 
 
+def test_usb_fallback_rechecks_line_busy(monkeypatch):
+    busy = [False]
+    monkeypatch.setattr(platforms, "IS_MACOS", True)
+
+    def scan():
+        busy[0] = True
+        return False
+
+    monkeypatch.setattr(server, "_detect_quectel_usb_pyusb", scan)
+    monkeypatch.setattr(server, "_detect_quectel_usb_system_profiler", lambda: pytest.fail("占线不能补扫"))
+    assert server._scan_usb("meta", lambda: busy[0]) is None
+
+
 def test_quectel_usb_detection_on_non_macos_keeps_serial_scan(monkeypatch):
     monkeypatch.setattr(platforms, "IS_MACOS", False)
 
@@ -543,7 +742,7 @@ def test_reread_sim_api_requires_auth_and_idle_line(monkeypatch, busy):
 def test_meta_exposes_cached_modem_info_and_signal(monkeypatch):
     from agentcall.modem import Sim7600Modem
 
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: True)
     modem = Sim7600Modem("unused")
     modem.model = "TEST-MODEL"
     modem.firmware = "TEST-FIRMWARE"
@@ -572,7 +771,7 @@ def test_meta_retains_last_signal_only_during_call(monkeypatch, active, tray):
     modem._emit_connection_state(False)
     service = FakeService(session=_SessionStub(is_active=active))
     service.modem = modem
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: True)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: True)
 
     async def fn(client):
         return await (await client.get("/api/meta?tray=1" if tray else "/api/meta")).json()
@@ -1308,7 +1507,7 @@ def test_meta_returns_injected_metadata(monkeypatch):
 def test_meta_tracks_modem_reset_lifecycle_without_hardware(monkeypatch, simcom):
     from agentcall.modem import Eg25Modem, Sim7600Modem
 
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
     modem = (Sim7600Modem if simcom else Eg25Modem)("unused-fake-port")
     service = FakeService()
     service.modem = modem

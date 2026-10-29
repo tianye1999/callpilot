@@ -245,10 +245,17 @@ class SerialPcmAudioBridge(_OutputObserver):
         tx_gain: float = 1.0,
         write_size: int = SERIAL_PCM_WRITE_SIZE,
         write_interval: float = SERIAL_PCM_WRITE_INTERVAL_SECONDS,
+        uplink_hold_ms: int = 0,
+        pcm_enabled_at: float | None = None,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
         self.tx_gain = tx_gain
+        self._uplink_hold_ms = uplink_hold_ms
+        self._pcm_enabled_at = pcm_enabled_at
+        self._first_downlink = threading.Event()
+        self._first_downlink_bytes = 0
+        self._uplink_started = False
         # 下行帧大小/节流：小帧稳定进送，避免模组播放缓冲在帧间饿死（真机调参点）。
         self._write_size = write_size
         self._write_interval = write_interval
@@ -303,7 +310,13 @@ class SerialPcmAudioBridge(_OutputObserver):
         self._queued_bytes = 0
         self._write_timeouts = 0
         self._last_stats_at = time.monotonic()
+        self._first_downlink.clear()
+        self._first_downlink_bytes = 0
+        self._uplink_started = False
         self._prebuffer_enabled = config.get_bool("MODEM_PCM_UPLINK_PREBUFFER")
+        if self._uplink_hold_ms > 0:
+            # 复用已有单读者预缓冲，不能等 Agent 连接后才开始读首帧。
+            self._prebuffer_enabled = True
         if self._prebuffer_enabled:
             self._prebuffer.clear()
             self._prebuffer_dropped = 0
@@ -466,7 +479,16 @@ class SerialPcmAudioBridge(_OutputObserver):
                 self._inwaiting_sum = 0
                 self._inwaiting_n = 0
                 self._inwaiting_logged_at = now
-        return self._ser.read(NMEA_READ_SIZE)
+        data = self._ser.read(NMEA_READ_SIZE)
+        if self._uplink_hold_ms > 0 and not self._first_downlink.is_set():
+            self._first_downlink_bytes += len(data)
+            if self._first_downlink_bytes >= 2:
+                now = time.monotonic()
+                assert self._pcm_enabled_at is not None
+                logger.info("PCM_UPLINK_HOLD 首帧下行到达耗时 elapsed_ms=%.3f mono=%.6f",
+                            (now - self._pcm_enabled_at) * 1000, now)
+                self._first_downlink.set()
+        return data
 
     def _probe_alignment(self, data: bytes) -> None:
         """用相邻样本相关性判断上行是否整体错位 1 字节。
@@ -574,6 +596,14 @@ class SerialPcmAudioBridge(_OutputObserver):
             logger.debug("已缓存 Agent 下行 PCM: %s bytes", appended)
 
     def _write_loop(self) -> None:
+        if self._uplink_hold_ms > 0:
+            assert self._pcm_enabled_at is not None
+            deadline = self._pcm_enabled_at + self._uplink_hold_ms / 1000
+            while self._running and not self._first_downlink.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._first_downlink.wait(min(0.02, remaining))
         next_write_at = time.monotonic()
         silence = b"\x00" * self._write_size
         while self._running:
@@ -590,6 +620,12 @@ class SerialPcmAudioBridge(_OutputObserver):
             payload = self._next_write_payload(silence)
             try:
                 if self._ser and self._ser.is_open:
+                    if self._uplink_hold_ms > 0 and not self._uplink_started:
+                        self._uplink_started = True
+                        assert self._pcm_enabled_at is not None
+                        logger.info("PCM_UPLINK_HOLD 开始上行时刻 mono=%.6f elapsed_ms=%.3f reason=%s",
+                                    now, (now - self._pcm_enabled_at) * 1000,
+                                    "first_downlink" if self._first_downlink.is_set() else "deadline")
                     written = self._ser.write(payload)
                     if written:
                         self._note_output_progress(min(written, self._output_real_bytes))
@@ -1027,5 +1063,10 @@ def create_audio_bridge(
     if selected == "nmea":
         if not pcm_port:
             raise RuntimeError("NMEA PCM 模式需要配置 MODEM_PCM_PORT")
+        hold_ms = config.get_int("MODEM_PCM_UPLINK_HOLD_MS") if getattr(modem, "vendor", "") == "simcom" else 0
+        enable = getattr(modem, "last_voice_enable", None) or {}
+        if hold_ms > 0 and enable.get("ok") and enable.get("enabled_mono") is not None:
+            return SerialPcmAudioBridge(pcm_port, pcm_baudrate, tx_gain=tx_gain,
+                                        uplink_hold_ms=hold_ms, pcm_enabled_at=enable["enabled_mono"])
         return SerialPcmAudioBridge(pcm_port, pcm_baudrate, tx_gain=tx_gain)
     raise ValueError("MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg（仅 macOS）或 nmea")

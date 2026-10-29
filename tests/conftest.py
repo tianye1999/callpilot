@@ -23,6 +23,20 @@ def _isolate_side_effects(tmp_path, monkeypatch):
     monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "false")
     monkeypatch.setenv("SUMMARY_ENABLED", "false")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-dashscope-key")
+    # API 测试也会走 USB 检测；默认假后端，专项测试再自行注入设备。
+    import usb.core
+    from serial.tools import list_ports
+
+    from agentcall import modem_hardware
+    from agentcall.web import server
+
+    monkeypatch.setattr(usb.core, "find", lambda **kwargs: [] if kwargs.get("find_all") else None)
+    monkeypatch.setattr(list_ports, "comports", lambda: [])
+    monkeypatch.setattr(server, "_detect_quectel_usb_system_profiler", lambda: False)
+    monkeypatch.setattr(modem_hardware, "STATE_PATH", tmp_path / "modem-state.json")
+    for key in ("CALLPILOT_BRIDGE_RESET_ON_START", "CALLPILOT_BRIDGE_HOLD_ON_PCM_STALL",
+                "MODEM_PCM_UPLINK_HOLD_MS"):
+        monkeypatch.delenv(key, raising=False)
     from agentcall.agents.local_agent import reset_shared_speech_models
     from agentcall.rate_limit import reset_sms_rate_limit_state
 

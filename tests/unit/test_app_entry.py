@@ -79,7 +79,7 @@ def test_main_serves_meta_while_local_models_preload(monkeypatch, tmp_path, prov
     monkeypatch.setattr(app.logging, "FileHandler", lambda *a, **kw: app.logging.NullHandler())
     monkeypatch.setattr(app.number_profiles, "ensure_seeded", lambda: None)
     monkeypatch.setattr(app.call_playbooks, "ensure_seeded", lambda: None)
-    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda: False)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
     monkeypatch.setattr(app, "CallAgentService", lambda **kw: SimpleNamespace(
         modem=None, monitor=None, uplink_monitor=None, start=lambda: None, stop_service=lambda: None,
     ))

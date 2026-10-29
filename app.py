@@ -26,7 +26,7 @@ from agentcall.content_sync import ContentSyncRepository
 from agentcall.events import EventHub
 from agentcall.remote_pairing import RemotePairingStore
 from agentcall.web.remote_gateway import build_remote_gateway
-from agentcall.web.server import build_app
+from agentcall.web.server import TrayAccessLogger, build_app
 
 logger = logging.getLogger("app")
 
@@ -273,7 +273,7 @@ def main() -> None:
         remote_cloud_store=cloud_store,
         remote_cloud_client=cloud_client,
     )
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log_class=TrayAccessLogger)
     loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, host, port)
     loop.run_until_complete(site.start())

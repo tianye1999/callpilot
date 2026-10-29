@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,9 @@ SIM7600_MAPS = ["2:/tmp/sim7600-at", "4:/tmp/sim7600-pcm"]
 RECOVERY_REQUEST_PATH = "/tmp/sim7600-recover-request"
 STATE_PATH = Path("/tmp/callpilot-modem.json")
 STATE_MAX_AGE = 15.0
+# 服务初始化识别与 meta 观测扫描互斥，不能同时枚举同一设备。
+USB_SCAN_LOCK = threading.Lock()
+USB_SCAN_ONLINE: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -67,7 +71,7 @@ def write_state(preset: ModemPreset, *, online: bool) -> None:
     # 同目录临时文件 + replace，读方只会见到完整的一版；不跟随目标符号链接。
     fd, name = tempfile.mkstemp(prefix=".callpilot-modem-", dir=STATE_PATH.parent)
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(data, stream)
         os.replace(name, STATE_PATH)
     finally:
@@ -76,7 +80,7 @@ def write_state(preset: ModemPreset, *, online: bool) -> None:
 
 def read_state() -> dict | None:
     try:
-        data = json.loads(STATE_PATH.read_text())
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("online") is not True:
             return None
         age = time.time() - float(data["updated_at"])
@@ -97,6 +101,23 @@ def read_state() -> dict | None:
 
 
 def scan_preset() -> ModemPreset | None:
+    global USB_SCAN_ONLINE
+    with USB_SCAN_LOCK:
+        started = time.monotonic()
+        result = None
+        online = None
+        try:
+            result = _scan_preset()
+            online = result is not None
+            return result
+        finally:
+            USB_SCAN_ONLINE = online
+            ended = time.monotonic()
+            logger.info("USB_SCAN source=setup start_mono=%.6f end_mono=%.6f duration_ms=%.3f result=%s",
+                        started, ended, (ended - started) * 1000, result.vendor if result else None)
+
+
+def _scan_preset() -> ModemPreset | None:
     if platforms.IS_MACOS:
         import usb.backend.libusb1
         import usb.core
