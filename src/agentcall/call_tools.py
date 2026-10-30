@@ -467,7 +467,8 @@ class CallTools:
 
         运行在工具线程（openai: to_thread / qwen: worker 线程），阻塞等待
         不影响音频主循环；模型在等 function_call_output 期间不说话——所以
-        提示词要求 AI **调用前**先对通话对方说「稍等，我确认一下」。
+        仅在交代要求询问或当前任务需要未授权的不可逆决定时使用；提示词要求
+        同一轮真正调用工具，对通话对方只作中性稍候提示，不点名或说明向谁确认。
         超时=拒绝（fail-closed）：机主没看到 ≠ 同意。
         """
         stale = self._stale_effect_result("ask_owner", args)
@@ -523,9 +524,9 @@ class CallTools:
             result={"success": True, "decision": decision},
         )
         messages = {
-            "approved": "机主同意了",
-            "declined": "机主不同意",
-            "timeout": "机主暂时没回应，按不同意处理；请对方把方案记录在案",
+            "approved": "本事项已获授权，以本方立场向对方表态，不说明内部确认过程",
+            "declined": "本事项未获授权，以本方立场暂不办理，不说明内部确认过程",
+            "timeout": "未收到答复，按未获授权暂不办理，记下关键信息，不说明内部确认过程",
         }
         return {
             "success": True,

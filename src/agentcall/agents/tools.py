@@ -125,13 +125,15 @@ ASK_OWNER_SPEC: dict[str, Any] = {
     "function": {
         "name": "ask_owner",
         "description": (
-            "把一个需要机主拿主意的决定推送给机主确认，等机主答复（约一分钟）。"
-            "仅在对方给出的方案/报价超出你被授权的范围、或事情确实必须机主本人"
-            "决定时调用；调用前先对通话对方说明「稍等，我跟机主确认一下」。"
-            "question 里把要决定的事说完整（方案内容、价格、期限等关键数字），"
-            "机主看到的就是这段文字。返回机主的决定：approved（同意）、"
-            "declined（不同意）或 timeout（没回应——按不同意处理，并请对方"
-            "把方案记录在案以便后续跟进）。"
+            "把待决事项推送给机主并等待答复（约一分钟）。只有交代内容明确要求拿不准就问机主，"
+            "或当前任务确实需要作出不可逆的决定而交代里没有授权时，才调用。"
+            "咨询中对方额外提出的办理建议不构成调用理由；交代范围内的事直接以机主一方的名义表态和决定。"
+            "需要调用时，先对通话对方只作一句中性的稍候提示，不点名机主、不说在跟谁确认，"
+            "并在同一轮真正调用 ask_owner，绝不允许只说要确认却不调用工具。"
+            "question 里把待决事项说完整，包含方案内容、价格、期限等关键数字；机主看到的就是这段文字。"
+            "返回决定为 approved（同意）、declined（不同意）或 timeout（没回应）。"
+            "按实际答复以本方立场处理，不向对方复述内部确认过程；"
+            "declined 或 timeout 都按暂不办理处理，并请对方把方案记录在案。"
         ),
         "parameters": {
             "type": "object",
@@ -229,15 +231,17 @@ _EN_TEXT: dict[tuple[str, str | None], str] = {
         "Hand the live call over to the owner's phone."
     ),
     ("ask_owner", None): (
-        "Push a decision to the owner and wait (about a minute) for their "
-        "answer. Call it only when an offer or decision exceeds what you are "
-        "authorized to accept, or truly needs the owner personally; tell the "
-        "other party \"one moment, let me check with the account holder\" "
-        "BEFORE calling. Put the full decision in `question` (plan, price, "
-        "term — the key numbers); that text is exactly what the owner sees. "
-        "Returns the owner's decision: approved, declined, or timeout (treat "
-        "timeout as declined and ask the rep to note the offer on the account "
-        "for follow-up)."
+        "Send a pending decision to the owner and wait about a minute for a response. "
+        "Call only when the brief explicitly requires asking the owner if unsure, or the current task "
+        "genuinely requires an irreversible decision that the brief has not authorized. "
+        "An extra proposal to proceed during an inquiry is not a reason to call; within the brief, "
+        "speak and decide directly on the owner's behalf. When a call is necessary, first give the "
+        "other party only one neutral request to wait, without naming the owner or saying whom you are consulting, "
+        "and actually call ask_owner in that same turn. Never announce a check without calling the tool. "
+        "Put the full decision in `question`, including the plan, price, term, and key numbers; "
+        "that text is exactly what the owner sees. Returns approved, declined, or timeout (no response). "
+        "Act on the actual response from your side, without recounting the internal consultation. "
+        "For declined or timeout, do not proceed and ask the other party to record the offer."
     ),
     ("ask_owner", "question"): (
         "The decision for the owner, complete in one passage with the key "

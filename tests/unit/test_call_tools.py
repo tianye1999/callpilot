@@ -10,6 +10,7 @@ import asyncio
 import logging
 import time
 
+import pytest
 from fakes import FakeModem
 
 from agentcall.agents.tools import SEND_DTMF_SPEC
@@ -607,6 +608,43 @@ def test_ask_owner_registered_only_for_outbound():
     assert "ask_owner" not in inbound.register()._tools
 
 
+@pytest.mark.parametrize("lang,required,forbidden,question_description", [
+    ("zh", (
+        "交代内容明确要求拿不准就问机主", "不可逆的决定而交代里没有授权",
+        "咨询中对方额外提出的办理建议不构成调用理由", "一句中性的稍候提示",
+        "不点名机主、不说在跟谁确认", "同一轮真正调用 ask_owner",
+        "question 里把待决事项说完整", "方案内容、价格、期限等关键数字",
+        "declined 或 timeout 都按暂不办理处理，并请对方把方案记录在案",
+    ), ("稍等，我跟机主确认一下", "仅在对方给出的方案/报价超出"),
+     "要机主决定的事项，含关键数字与条款，一段话说完整。"),
+    ("en", (
+        "brief explicitly requires asking the owner if unsure", "irreversible decision",
+        "brief has not authorized", "An extra proposal to proceed during an inquiry is not a reason",
+        "one neutral request to wait", "without naming the owner or saying whom you are consulting",
+        "actually call ask_owner in that same turn", "full decision in `question`",
+        "plan, price, term, and key numbers", "For declined or timeout, do not proceed",
+        "ask the other party to record the offer",
+    ), ("let me check with the account holder", "one moment", "offer or decision exceeds"),
+     "The decision for the owner, complete in one passage with the key numbers and terms."),
+], ids=["zh", "en"])
+def test_ask_owner_registered_description_matches_authority_rules(
+    monkeypatch, lang, required, forbidden, question_description,
+):
+    """检查真正下发的本地化描述，避免系统提示词修好后仍被工具旧话术抵消。"""
+    monkeypatch.setenv("AGENT_LANGUAGE", lang)
+    tools, _, _ = make_tools(direction="outbound")
+    spec = next(spec for spec in tools.register().specs() if spec["function"]["name"] == "ask_owner")
+    description = spec["function"]["description"]
+    assert all(fragment in description for fragment in required)
+    assert all(fragment not in description for fragment in forbidden)
+    assert spec["type"] == "function"
+    assert spec["function"]["parameters"] == {
+        "type": "object",
+        "properties": {"question": {"type": "string", "description": question_description}},
+        "required": ["question"],
+    }
+
+
 def test_ask_owner_approved_and_declined(monkeypatch):
     from agentcall import notification_events
 
@@ -652,11 +690,13 @@ def test_ask_owner_approved_and_declined(monkeypatch):
     result = registry.dispatch("ask_owner", {"question": "月费 55 刀方案，接受吗？"})
     t.join()
     assert result["success"] is True and result["decision"] == "approved"
+    assert "已获授权" in result["message"] and "机主" not in result["message"]
 
     t = answer("decline")
     result = registry.dispatch("ask_owner", {"question": "月费 70 刀方案，接受吗？"})
     t.join()
     assert result["decision"] == "declined"
+    assert "暂不办理" in result["message"] and "机主" not in result["message"]
 
     # 关闭事件总会广播（UI 据此收卡）。
     closed = [e for e in hub.history() if e.get("type") == "owner_confirm_closed"]
@@ -681,6 +721,7 @@ def test_ask_owner_timeout_is_declined_fail_closed(monkeypatch):
     result = tools.register().dispatch("ask_owner", {"question": "x"})
     assert time.monotonic() - started >= 0.9
     assert result["success"] is True and result["decision"] == "timeout"
+    assert "暂不办理" in result["message"] and "机主" not in result["message"]
     assert [e["kind"] for e in feed.read(0)["events"]] == ["confirm", "confirm_closed"]
     assert feed.read(0)["confirmations"] == []
 

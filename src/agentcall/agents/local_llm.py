@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import http.client
+import io
 import json
 import logging
 import socket
@@ -11,12 +12,20 @@ import ssl
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from .. import config
 
 logger = logging.getLogger(__name__)
+
+
+class _FirstByteTimeout(TimeoutError):
+    """仅表示 HTTP 首字节未到；状态行或 SSE 读取超时不进入此分支。"""
+
+    def __init__(self, waited_ms: float) -> None:
+        super().__init__("LLM 首响应超时")
+        self.waited_ms = waited_ms
 
 
 def deepseek_body(messages: list[dict], tools: list[dict] | None) -> dict[str, Any]:
@@ -192,6 +201,7 @@ class DeepSeekChat:
         abandoned, done = threading.Event(), threading.Event()
         box: dict[str, Any] = {}
         deadline = time.monotonic() + timeout
+        first_byte_timeout = config.get_float("LOCAL_LLM_FIRST_BYTE_TIMEOUT")
         sensitive_texts = (key, body.decode("utf-8"), *(
             message[field] for message in messages for field in ("content", "reasoning_content")
             if isinstance(message.get(field), str)
@@ -212,6 +222,31 @@ class DeepSeekChat:
         def worker() -> None:
             connection: http.client.HTTPConnection | None = None
             received_sse = False
+            received_response = False
+
+            class FirstByteResponse(http.client.HTTPResponse):
+                def begin(response_self) -> None:
+                    nonlocal received_response
+                    assert connection is not None and connection.sock is not None
+                    sock = connection.sock
+                    started = time.monotonic()
+                    remaining = deadline - started
+                    if inactive():
+                        raise InterruptedError("local LLM 轮次已取消")
+                    if remaining <= 0:
+                        raise TimeoutError(f"LLM 请求超时（>{timeout:g}s）")
+                    sock.settimeout(min(first_byte_timeout, remaining))
+                    try:
+                        # 标准 HTTPResponse 的 fp 是 socket.makefile 返回的缓冲读流。
+                        # peek 只等任意一个响应字节，不消耗数据，也不等状态行结束。
+                        received_response = bool(cast(io.BufferedReader, response_self.fp).peek(1))
+                    except TimeoutError as exc:
+                        raise _FirstByteTimeout((time.monotonic() - started) * 1000) from exc
+                    if inactive():
+                        raise InterruptedError("local LLM 轮次已取消")
+                    # 首字节一到就解除短预算；状态行、响应头、SSE 共用整轮剩余时间。
+                    sock.settimeout(max(0.001, deadline - time.monotonic()))
+                    super().begin()
 
             def response_lines(response: Iterable[bytes]) -> Iterable[bytes]:
                 nonlocal received_sse
@@ -257,7 +292,16 @@ class DeepSeekChat:
                                 "Authorization": f"Bearer {key}", "Content-Type": "application/json",
                                 "Accept": "text/event-stream",
                             })
-                            response = connection.getresponse()
+                            if first_byte_timeout > 0:
+                                original_response_class = connection.response_class
+                                connection.response_class = FirstByteResponse
+                                try:
+                                    response = connection.getresponse()
+                                finally:
+                                    # 保活连接的下一轮可能关闭此功能，不留下本轮闭包。
+                                    connection.response_class = original_response_class
+                            else:
+                                response = connection.getresponse()
                             if response.status != 200:
                                 raise RuntimeError(f"DeepSeek HTTP {response.status}")
                             result = read_sse(response_lines(response), content, tool_event,
@@ -270,6 +314,15 @@ class DeepSeekChat:
                             box["result"] = result
                             self._last_used = time.monotonic()
                             return
+                        except _FirstByteTimeout as exc:
+                            # 当前仍持有请求槽，先中止旧 socket，再允许下一次建连。
+                            self._abort()
+                            if inactive():
+                                raise InterruptedError("local LLM 轮次已取消") from exc
+                            logger.warning("[local_llm] 首响应超时 attempt=%d waited_ms=%.1f",
+                                           attempt + 1, exc.waited_ms)
+                            if attempt or received_sse or time.monotonic() >= deadline:
+                                raise TimeoutError(f"LLM 请求超时（>{timeout:g}s）") from exc
                         except (ConnectionError, http.client.IncompleteRead, ssl.SSLEOFError) as exc:
                             if connection is not None:
                                 self._discard_connection(connection)
@@ -280,7 +333,7 @@ class DeepSeekChat:
                             # Never replay fresh requests or a partially received
                             # stream (including reasoning / tools / keepalives).
                             partial_sse = isinstance(exc, http.client.IncompleteRead) and bool(exc.partial)
-                            if attempt or not reused or received_sse or partial_sse:
+                            if attempt or not reused or received_sse or partial_sse or received_response:
                                 raise
                         finally:
                             if response is not None:

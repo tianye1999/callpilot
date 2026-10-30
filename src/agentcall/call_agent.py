@@ -50,6 +50,7 @@ from .number_profiles import lookup_profile, lookup_profile_by_id
 from .pcm_stats import PcmFlowStats
 from .prompt_gen import generate_prompt_scenario
 from .prompts import (
+    _OWNER_FALLBACK,
     agent_language,
     agent_persona,
     build_instructions,
@@ -2743,7 +2744,7 @@ class CallSession:
         )
         return build_instructions(
             direction,
-            owner_name(lang),
+            _OWNER_FALLBACK[lang] if direction == "inbound" else owner_name(lang),
             agent_persona(lang),
             self._outbound_task(lang),
             lang,
@@ -2763,7 +2764,7 @@ class CallSession:
         lang = agent_language()
         return opening_instructions(
             direction,
-            owner_name(lang),
+            _OWNER_FALLBACK[lang] if direction == "inbound" else owner_name(lang),
             agent_persona(lang),
             self._outbound_task(lang),
             lang,

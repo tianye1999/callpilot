@@ -313,6 +313,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                choices=("disabled", "low", "high"), requires_restart=True),
     ConfigSpec("LOCAL_LLM_TIMEOUT", "三段式 LLM 超时（秒）", "float", "20.0",
                editable=False, hidden=True),
+    ConfigSpec("LOCAL_LLM_FIRST_BYTE_TIMEOUT", "三段式 LLM 首响应超时（秒）", "float", "0",
+               help="0 关闭；1–20 秒无响应字节时换连接重试一次，仍受整轮超时限制。"),
     ConfigSpec("LOCAL_MODELS_DIR", "三段式模型目录", "str", "",
                editable=False, hidden=True, requires_restart=True),
     # physical-sim owner 决定提速默认开启；发包前仍须完成真机验收。
@@ -638,6 +640,8 @@ def get_float(key: str) -> float:
     spec = get_spec(key)
     raw = os.environ.get(key, spec.default)
     try:
+        if key == "LOCAL_LLM_FIRST_BYTE_TIMEOUT":
+            _check_value(spec, raw)
         return float(raw.strip())
     except ValueError:
         logger.warning("配置 %s 的值 %r 不是合法浮点数，回落默认值 %s", key, raw, spec.default)
@@ -859,6 +863,10 @@ def _check_value(spec: ConfigSpec, value: str) -> None:
             float(value.strip())
         except ValueError:
             raise ValueError(f"配置 {spec.key} 需要数字，收到 {value!r}") from None
+        if spec.key == "LOCAL_LLM_FIRST_BYTE_TIMEOUT":
+            number = float(value.strip())
+            if not (number == 0 or 1 <= number <= 20):
+                raise ValueError(f"配置 {spec.key} 需为 0 或 1–20 秒，收到 {value!r}")
     if spec.kind == "bool" and value.strip().lower() not in _BOOL_WRITABLE:
         raise ValueError(
             f"配置 {spec.key} 需要布尔值（true/false/1/0/yes/no），收到 {value!r}"

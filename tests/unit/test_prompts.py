@@ -586,3 +586,31 @@ def test_outbound_voice_menu_role_discipline_present():
     en = build_instructions("outbound", "Alex", "AI assistant", "check plan", "en")
     assert "the roles are flipped" in en
     assert "say only what it can understand" in en
+
+
+def test_outbound_owner_authority_and_inquiry_completion():
+    zh = build_instructions("outbound", "李明", "AI 助理", "咨询套餐", "zh",
+                            task_package={"preauth": {"月费上限": "70"}})
+    en = build_instructions("outbound", "Alex", "AI assistant", "inquire about a plan", "en",
+                            task_package={"preauth": {"monthly limit": "70"}})
+    for fragment in ("直接以机主一方的名义表态和决定", "本次先了解、暂不办理",
+                     "同一轮真正调用 ask_owner", "简短复述关键点向对方核对一次",
+                     "绝不允许只说要确认却不调用工具"):
+        assert fragment in zh
+    for fragment in ("decide directly on the owner's behalf", "information only, without proceeding",
+                     "actually call ask_owner in that same turn", "briefly recap the key points",
+                     "Never announce a check without calling the tool"):
+        assert fragment in en
+    assert "稍等，我跟" not in zh
+    assert "只有确实得李明本人拿主意" not in zh
+    assert "任何一项超出，必须先 ask_owner" not in zh
+    assert "one moment, let me check with" not in en
+    assert "only defer to Alex" not in en
+    assert "Anything beyond any item: call ask_owner first" not in en
+
+
+def test_inbound_owner_identity_is_not_impersonated_or_named():
+    zh = build_instructions("inbound", "机主", "AI 助理", "", "zh")
+    en = build_instructions("inbound", "the owner", "AI assistant", "", "en")
+    assert "绝不自称机主本人，也不说出机主的姓名" in zh
+    assert "Never claim to be the owner or disclose the owner's name" in en
