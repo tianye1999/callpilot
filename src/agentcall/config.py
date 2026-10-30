@@ -334,7 +334,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("LOCAL_TTS_CACHE_PHRASES", "三段式 TTS 缓存短句", "str", "", requires_restart=True),
     ConfigSpec("LOCAL_SLOW_REPLY_FILLER_SECONDS", "三段式慢回复兜底等待秒数（0 关闭）", "float", "2.5",
                requires_restart=True),
-    ConfigSpec("LOCAL_SLOW_REPLY_FILLER", "三段式慢回复兜底短句", "str", "嗯，您稍等。", requires_restart=True),
+    ConfigSpec("LOCAL_SLOW_REPLY_FILLER", "三段式慢回复兜底短句", "str", "嗯。", requires_restart=True),
     ConfigSpec("LOCAL_TTS_PEAK", "三段式 TTS 目标峰值（空为关闭）", "str", "", requires_restart=True),
     ConfigSpec("MANUAL_RESPONSE_CONTROL", "手动应答控制", "bool", "false"),
     # barge-in：对端开口即打断 AI（掐生成+清积压），代替半双工丢上行。开启前提：

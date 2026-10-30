@@ -10,7 +10,7 @@ from test_local_agent import FakePipeline, _wait_until
 from agentcall.agents import local_agent
 from agentcall.agents.local_agent import LocalPipelineAgent
 
-FILLER = "嗯，您稍等。"
+FILLER = "嗯。"
 
 
 @pytest.fixture
