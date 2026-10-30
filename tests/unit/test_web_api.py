@@ -427,8 +427,9 @@ def test_access_logger_suppresses_only_successful_local_polls(monkeypatch, remot
     seen = []
     monkeypatch.setattr(AccessLogger, "log", lambda self, request, response, elapsed: seen.append(request.path_qs))
     log = server.TrayAccessLogger(__import__("logging").getLogger("test"), "%r")
-    polls = ["/api/meta?tray=1", "/api/meta", "/api/meta?tray=0", "/api/notify/feed?after=1&epoch=test"]
-    others = ["/api/other?tray=1", "/api/updates/check", "/api/notify/feed/other"]
+    polls = ["/api/meta?tray=1", "/api/meta", "/api/meta?tray=0", "/api/notify/feed?after=1&epoch=test",
+             "/api/call/queue"]
+    others = ["/api/other?tray=1", "/api/updates/check", "/api/notify/feed/other", "/api/call/queue/other"]
     for path in polls + others:
         request = make_mocked_request(method, path).clone(remote=remote)
         log.log(request, SimpleNamespace(status=status), 0.1)

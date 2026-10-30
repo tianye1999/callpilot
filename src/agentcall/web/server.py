@@ -531,7 +531,7 @@ class TrayAccessLogger(AccessLogger):
     def log(self, request, response, time: float) -> None:
         if (request.method == "GET" and response.status < 400
                 and config.is_loopback_host(request.remote or "")
-                and request.path in {"/api/meta", "/api/notify/feed"}):
+                and request.path in {"/api/meta", "/api/notify/feed", "/api/call/queue"}):
             return
         super().log(request, response, time)
 
