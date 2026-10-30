@@ -339,7 +339,7 @@ def test_launchctl_failure_shown_immediately_and_retry_recovers(monkeypatch, tmp
 
     def load_html(html):
         pages.append(html)
-        if "退出码 5" in html:
+        if "后台服务无法启动" in html:
             failed.set()
 
     window = types.SimpleNamespace(load_html=load_html, load_url=lambda url: ready.set())
@@ -347,7 +347,7 @@ def test_launchctl_failure_shown_immediately_and_retry_recovers(monkeypatch, tmp
     # app 已健康也不能掩盖 bridge/tray 的安装失败。
     monkeypatch.setattr(macos_shell, "fetch_meta", lambda url: {"setup_required": True, "hardware": {}})
     monkeypatch.setattr(macos_shell, "collect_diagnostics", lambda *args: ("其他原因", "安全诊断"))
-    reason = "后台服务无法启动。launchctl bootstrap 退出码 5，Input/output error"
+    reason = "后台服务无法启动。请点重试；仍失败请点「复制诊断信息」发给管理员。"
     if not late_failure:
         macos_shell.write_startup_failure(tmp_path, reason)
     worker = threading.Thread(target=startup.run)
@@ -359,7 +359,8 @@ def test_launchctl_failure_shown_immediately_and_retry_recovers(monkeypatch, tmp
             macos_shell.write_startup_failure(tmp_path, reason)
         assert failed.wait(1)
         assert not ready.is_set()
-        assert "重试" in pages[-1] and "Input/output error" in pages[-1]
+        assert "重试" in pages[-1] and "复制诊断信息" in pages[-1]
+        assert "launchctl" not in pages[-1] and "Error Domain" not in pages[-1]
         startup.retry()
         assert macos_shell.read_startup_failure(tmp_path) == ""
         assert macos_shell.take_commands(tmp_path) == {"retry"}
@@ -388,7 +389,7 @@ def test_late_launchctl_failure_overrides_timeout_diagnosis(monkeypatch, tmp_pat
 
     def load_html(html):
         pages.append(html)
-        if "退出码 5" in html:
+        if "后台服务无法启动" in html:
             failed.set()
             if len(pages) > 1:
                 updated.set()
@@ -404,7 +405,7 @@ def test_late_launchctl_failure_overrides_timeout_diagnosis(monkeypatch, tmp_pat
     worker.start()
     try:
         assert diagnosing.wait(1)
-        macos_shell.write_startup_failure(tmp_path, "后台服务无法启动。退出码 5，Input/output error")
+        macos_shell.write_startup_failure(tmp_path, "后台服务无法启动。请点重试。")
         assert failed.wait(1)
         release.set()
         # 模拟稍后返回的泛化诊断，不能覆盖具体 launchctl 原因。
@@ -416,6 +417,34 @@ def test_late_launchctl_failure_overrides_timeout_diagnosis(monkeypatch, tmp_pat
         startup.closed.set()
         worker.join(2)
     assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("report", ["", "sanitized log report"])
+def test_copy_diagnostics_keeps_install_error_even_before_background_report(monkeypatch, tmp_path, report):
+    from agentcall import macos_launchd, macos_shell
+
+    copied = []
+    pasteboard = types.SimpleNamespace(
+        clearContents=lambda: None, setString_forType_=lambda text, kind: copied.append(text),
+    )
+    monkeypatch.setitem(sys.modules, "AppKit", types.SimpleNamespace(
+        NSPasteboard=types.SimpleNamespace(generalPasteboard=lambda: pasteboard), NSPasteboardTypeString="text",
+    ))
+    monkeypatch.setitem(sys.modules, "PyObjCTools", types.SimpleNamespace(
+        AppHelper=types.SimpleNamespace(callAfter=lambda callback: callback()),
+    ))
+    error = 'SMAppService Error Domain=SMAppServiceErrorDomain Code=1 "Operation not permitted"'
+    result = macos_launchd.LaunchdInstallResult([], [macos_launchd.LaunchctlFailure(
+        macos_launchd.APP_LABEL, "unregister", (), 1, stderr=error,
+    )], [])
+    macos_shell.write_startup_failure(
+        tmp_path, macos_shell.launchd_failure_reason(result), diagnostics=result.failure_summary(),
+    )
+    startup = desktop_app.BundledStartup(None, "http://test", types.SimpleNamespace(support_dir=tmp_path))
+    startup.diagnostics = report
+    startup.copy_diagnostics()
+    assert error in copied[0] and report in copied[0]
+    assert "com.agentcall.app" in copied[0] and "unregister" in copied[0] and "exit 1" in copied[0]
 
 
 def test_slow_diagnostics_do_not_block_window_close(monkeypatch, tmp_path):

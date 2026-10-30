@@ -158,7 +158,7 @@ def test_meta_version_notes_update_and_persistent_dismiss(monkeypatch, tmp_path)
         app["updates"].latest = dict(version="26.11.1", notes={"zh": "说明", "en": "Notes"},
                                      downloadUrl="https://example.test/app.dmg")
         result = await (await client.get("/api/meta?tray=1")).json()
-        assert result["version"] == "26.10.1"
+        assert result["version"] == "26.10.2"
         assert result["release_notes"]["en"]
         assert result["update"]["dismissed"] is False
         response = await client.post("/api/updates/dismiss", json={"version": "26.11.1"})

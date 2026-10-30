@@ -22,7 +22,7 @@ class Services:
         self.events.append(("unregister", label))
         self.registered.discard(label)
 
-    def check_approval(self):
+    def check_approval(self, **kwargs):
         pass
 
 
@@ -104,8 +104,8 @@ def test_legacy_cleanup_allowlist_idempotence_and_log(tmp_path, caplog):
     for label in (*ld.LAUNCH_LABELS, "com.agentcall.other", "com.other.app"):
         (layout.launch_agents_dir / f"{label}.plist").write_bytes(plistlib.dumps({"Label": label}))
     with caplog.at_level("INFO"):
-        sm.cleanup_legacy(layout, runner)
-        sm.cleanup_legacy(layout, runner)
+        assert sm.cleanup_legacy(layout, runner) is True
+        assert sm.cleanup_legacy(layout, runner) is False
     assert len([e for e in events if e[0] == "bootout"]) == 3
     assert (layout.launch_agents_dir / "com.agentcall.other.plist").exists()
     assert "Removed legacy" in caplog.text
@@ -168,3 +168,159 @@ def test_native_approval_never_registers_or_unregisters_behind_user_back(monkeyp
     monkeypatch.setattr(native, "_service", lambda label: Service())
     with pytest.raises(sm.ApprovalRequired, match="Login Items"):
         native.register(ld.APP_LABEL)
+
+
+class NativeService:
+    def __init__(self, status):
+        self.state = status
+        self.calls = []
+
+    def status(self):
+        return self.state
+
+    def registerAndReturnError_(self, error):
+        self.calls.append("register")
+        self.state = 1
+        return True, None
+
+    def unregisterAndReturnError_(self, error):
+        self.calls.append("unregister")
+        self.state = 0
+        return True, None
+
+
+@pytest.mark.parametrize("status", [0, 3])
+def test_native_absent_service_skips_unregister_and_can_register(monkeypatch, status):
+    native = object.__new__(sm.NativeServices)
+    service = NativeService(status)
+    monkeypatch.setattr(native, "_service", lambda label: service)
+    native.unregister(ld.APP_LABEL)
+    assert service.calls == []
+    native.register(ld.APP_LABEL)
+    assert service.calls == ["register"]
+    assert service.state == 1
+
+
+@pytest.mark.parametrize("status", [0, 1, 3])
+def test_native_approval_accepts_nonblocked_status_without_wait(monkeypatch, status):
+    native = object.__new__(sm.NativeServices)
+    monkeypatch.setattr(native, "_service", lambda label: NativeService(status))
+    native.check_approval(sleep=lambda _: pytest.fail("No approval wait needed"))
+
+
+def test_native_approval_without_cleanup_fails_immediately(monkeypatch):
+    native = object.__new__(sm.NativeServices)
+    checks = []
+
+    def service(label):
+        checks.append(label)
+        return NativeService(2)
+
+    monkeypatch.setattr(native, "_service", service)
+    with pytest.raises(sm.ApprovalRequired):
+        native.check_approval(sleep=lambda _: pytest.fail("Must not wait without legacy cleanup"))
+    assert len(checks) == 1
+
+
+def test_native_approval_timeout_is_bounded_and_actionable(monkeypatch):
+    native = object.__new__(sm.NativeServices)
+    service = NativeService(2)
+    monkeypatch.setattr(native, "_service", lambda label: service)
+    waits = []
+    with pytest.raises(sm.ApprovalRequired) as error:
+        native.check_approval(wait=True, sleep=waits.append)
+    assert waits == [0.5] * 20
+    assert "登录项与扩展" in str(error.value)
+    assert "Login Items & Extensions" in str(error.value)
+    assert "caffeinate" in str(error.value)
+    assert "重试" in str(error.value) and "retry" in str(error.value)
+    assert service.calls == []
+
+
+@pytest.mark.parametrize("cleared_status", [0, 3])
+@pytest.mark.parametrize("loaded_idle", [False, True])
+def test_install_cleans_idle_legacy_before_waiting_for_btm(monkeypatch, tmp_path, cleared_status, loaded_idle):
+    layout, events, absent_runner, _ = fixture(tmp_path)
+    paths = []
+    for directory in (layout.launch_agents_dir, layout.support_dir / "LaunchAgents"):
+        directory.mkdir(parents=True)
+        for label in ld.LAUNCH_LABELS:
+            path = directory / f"{label}.plist"
+            path.write_bytes(plistlib.dumps({"Label": label}))
+            if label != ld.TRAY_LABEL:
+                paths.append(path)
+    idle = {ld.APP_LABEL, ld.BRIDGE_LABEL} if loaded_idle else set()
+
+    def runner(cmd, **kwargs):
+        label = cmd[-1].split("/")[-1]
+        if cmd[1] == "print" and label in idle:
+            return subprocess.CompletedProcess(cmd, 0, "state = not running", "")
+        if cmd[1] == "bootout":
+            idle.discard(label)
+            if not loaded_idle:
+                return subprocess.CompletedProcess(cmd, 3, "", "No such process")
+        return absent_runner(cmd, **kwargs)
+
+    native = object.__new__(sm.NativeServices)
+    agents = {label: NativeService(2) for label in ld.LAUNCH_LABELS}
+
+    def service(label):
+        assert all(not path.exists() for path in paths), "Approval checked before legacy cleanup"
+        return agents[label]
+
+    monkeypatch.setattr(native, "_service", service)
+    waits = []
+
+    def sleep(delay):
+        waits.append(delay)
+        for agent in agents.values():
+            agent.state = cleared_status
+
+    result = sm.install(layout, runner, services=native, sleep=sleep)
+    assert not result.failures
+    assert waits == [0.5]
+    assert all(agent.calls == ["register"] for agent in agents.values())
+    assert ("bootout", ld.TRAY_LABEL) not in events
+    assert (layout.launch_agents_dir / f"{ld.TRAY_LABEL}.plist").exists()
+
+
+def test_install_without_legacy_cleanup_does_not_wait_for_approval(monkeypatch, tmp_path):
+    layout, _, runner, _ = fixture(tmp_path)
+    native = object.__new__(sm.NativeServices)
+    monkeypatch.setattr(native, "_service", lambda label: NativeService(2))
+    result = sm.install(layout, runner, services=native,
+                        sleep=lambda _: pytest.fail("Must not wait without legacy cleanup"))
+    assert result.failures[0].action == "approval-required"
+
+
+def test_install_does_not_preclean_running_legacy_job(monkeypatch, tmp_path):
+    layout, events, absent_runner, _ = fixture(tmp_path)
+    layout.launch_agents_dir.mkdir()
+    path = layout.launch_agents_dir / f"{ld.APP_LABEL}.plist"
+    path.write_bytes(plistlib.dumps({"Label": ld.APP_LABEL}))
+
+    def runner(cmd, **kwargs):
+        if cmd[1] == "print" and cmd[-1].endswith(ld.APP_LABEL):
+            return subprocess.CompletedProcess(cmd, 0, "state = running\npid = 42", "")
+        return absent_runner(cmd, **kwargs)
+
+    native = object.__new__(sm.NativeServices)
+    monkeypatch.setattr(native, "_service", lambda label: NativeService(2))
+    result = sm.install(layout, runner, services=native,
+                        sleep=lambda _: pytest.fail("Running legacy job was not cleaned; must not wait"))
+    assert result.failures and "caffeinate" in result.failures[0].stderr
+    assert result.failures[0].action == "approval-required"
+    assert path.exists()
+    assert not any(action == "bootout" for action, _ in events)
+
+
+def test_nonapproval_check_error_is_not_classified_as_approval(tmp_path):
+    layout, _, runner, services = fixture(tmp_path)
+
+    def broken_check(**kwargs):
+        raise RuntimeError("native status lookup failed")
+
+    services.check_approval = broken_check
+    result = sm.install(layout, runner, services=services)
+    assert result.failures[0].action != "approval-required"
+    assert "native status lookup failed" in result.failures[0].stderr

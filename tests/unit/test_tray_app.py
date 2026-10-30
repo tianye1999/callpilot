@@ -253,10 +253,13 @@ def test_background_install_publishes_failure_and_clears_on_retry(monkeypatch, t
     monkeypatch.setattr(tray_app, "_ensure_launchd_installed", install)
     tray_app._start_background_services(user_initiated=user_initiated)
     reason = macos_shell.read_startup_failure(tmp_path)
-    assert "后台服务无法启动" in reason and "退出码 5" in reason
-    assert "Input/output error" in reason and "extra" not in reason
+    assert "后台服务无法启动" in reason and "复制诊断信息" in reason
+    assert "Input/output error" not in reason and "launchctl" not in reason
+    details = macos_shell.read_startup_failure(tmp_path, field="diagnostics")
+    assert failure.message == details
     tray_app._start_background_services(user_initiated=True)
     assert macos_shell.read_startup_failure(tmp_path) == ""
+    assert macos_shell.read_startup_failure(tmp_path, field="diagnostics") == ""
     assert calls == [{"user_initiated": user_initiated}, {"user_initiated": True}]
 
 

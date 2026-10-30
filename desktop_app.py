@@ -479,10 +479,16 @@ class BundledStartup:
         from AppKit import NSPasteboard, NSPasteboardTypeString
         from PyObjCTools import AppHelper
 
+        from agentcall.macos_shell import read_startup_failure
+
+        # Preserve the install error even if the asynchronous log report is not ready.
+        details = read_startup_failure(self.layout.support_dir, field="diagnostics")
+        report = "\n\n".join(part for part in (self.diagnostics, details) if part)
+
         def copy():
             pasteboard = NSPasteboard.generalPasteboard()
             pasteboard.clearContents()
-            pasteboard.setString_forType_(self.diagnostics, NSPasteboardTypeString)
+            pasteboard.setString_forType_(report, NSPasteboardTypeString)
 
         AppHelper.callAfter(copy)
 

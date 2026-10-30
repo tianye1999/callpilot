@@ -17,7 +17,7 @@ NOTARY_PROFILE="<keychain-profile>" \
 bash packaging/build_installer.sh
 ```
 
-产物：`dist/CallPilot.app`、`dist/CallPilot-26.10.1.dmg`。文件名版本动态读取
+产物：`dist/CallPilot.app`、`dist/CallPilot-26.10.2.dmg`。文件名版本动态读取
 `pyproject.toml`，不是脚本内写死的版本号。`scripts/build_app.sh` 只产出本地 ad-hoc
 签名 App，也运行包检查和 `--selftest`，不作为发布替代入口。
 
@@ -131,7 +131,7 @@ plist 只放在 `CallPilot.app/Contents/Library/LaunchAgents/`，通过
 2. 本机五门：`pytest -q`、`ruff check .`、`mypy`、`mypy --platform win32`、
    `mypy --platform linux`，使用项目 `.venv/bin/`。完成下方签名真机清单。
 3. 从 pyproject 读取版本，确认产物版本一致；经 owner 授权后在已验收提交上创建 annotated
-   tag `sim-v<版本>`（本版 `sim-v26.10.1`），再由 Claude 推送 tag，禁止重打已有 tag。
+   tag `sim-v<版本>`（本版 `sim-v26.10.2`），再由 Claude 推送 tag，禁止重打已有 tag。
 4. 在维护者本机用上面的 `RELEASE=1` 命令构建签名、公证包。检查 `--selftest`、模型/版本、
    签名、App 与 DMG staple、SHA256 和大小的记录；挂载的 App 也要验签与 staple。
 5. 上传至 **内部分发位置（见维护者本地说明）**，保留所有历史版本，不覆盖旧文件。

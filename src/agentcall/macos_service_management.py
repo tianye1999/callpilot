@@ -13,11 +13,24 @@ from . import macos_launchd as ld
 
 logger = logging.getLogger(__name__)
 
+SM_STATUS_NOT_REGISTERED = 0
+SM_STATUS_ENABLED = 1
+SM_STATUS_REQUIRES_APPROVAL = 2
+SM_STATUS_NOT_FOUND = 3
+
+APPROVAL_REQUIRED_ZH = (
+    "请在 系统设置 → 通用 → 登录项与扩展 中打开 CallPilot 的后台开关"
+    "（旧版可能显示为 caffeinate），然后点重试。"
+)
+APPROVAL_REQUIRED_EN = (
+    "Turn on CallPilot's background switch in System Settings > General > Login Items & Extensions "
+    "(older versions may appear as caffeinate), then click retry."
+)
+
 
 class ApprovalRequired(RuntimeError):
     def __init__(self):
-        super().__init__("请在系统设置 → 通用 → 登录项中允许 CallPilot 后重试。\n"
-                         "Allow CallPilot in System Settings > General > Login Items, then retry.")
+        super().__init__(f"{APPROVAL_REQUIRED_ZH}\n{APPROVAL_REQUIRED_EN}")
 
 
 def bundled_plists() -> dict[str, dict]:
@@ -60,19 +73,23 @@ class NativeServices:
 
     def register(self, label):
         service = self._service(label)
-        if service.status() == 2:  # SMAppServiceStatusRequiresApproval
+        status = service.status()
+        if status == SM_STATUS_REQUIRES_APPROVAL:
             raise ApprovalRequired()
-        if service.status() == 1:  # SMAppServiceStatusEnabled
+        if status == SM_STATUS_ENABLED:
             return
+        # Both notRegistered and notFound need registration on first install.
         ok, error = service.registerAndReturnError_(None)
-        if service.status() == 2:
+        status = service.status()
+        if status == SM_STATUS_REQUIRES_APPROVAL:
             raise ApprovalRequired()
-        if not ok or service.status() != 1:
+        if not ok or status != SM_STATUS_ENABLED:
             raise RuntimeError(f"SMAppService register {label}: {error}")
 
     def unregister(self, label):
         service = self._service(label)
-        if service.status() == 0:  # not registered; may still be a legacy job
+        if service.status() in (SM_STATUS_NOT_REGISTERED, SM_STATUS_NOT_FOUND):
+            # No bundle-owned registration; a legacy launchd job may still exist.
             return
         ok, error = service.unregisterAndReturnError_(None)
         if not ok:
@@ -81,9 +98,17 @@ class NativeServices:
     def open_settings(self):
         self.api.openSystemSettingsLoginItems()
 
-    def check_approval(self):
-        if any(self._service(label).status() == 2 for label in ld.LAUNCH_LABELS):
-            raise ApprovalRequired()
+    def check_approval(self, *, wait=False, sleep=time.sleep):
+        # BTM removes disabled legacy records asynchronously after plist cleanup.
+        # Only that migration needs up to 20 half-second waits; otherwise fail promptly.
+        retries = 20 if wait else 0
+        for attempt in range(retries + 1):
+            if not any(self._service(label).status() == SM_STATUS_REQUIRES_APPROVAL
+                       for label in ld.LAUNCH_LABELS):
+                return
+            if attempt == retries:
+                raise ApprovalRequired()
+            sleep(0.5)
 
 
 def set_login_enabled(layout, enabled, runner=subprocess.run):
@@ -145,7 +170,8 @@ def legacy_paths(layout, label):
             yield path
 
 
-def cleanup_legacy(layout, runner=subprocess.run, *, labels=None, sleep=time.sleep):
+def cleanup_legacy(layout, runner=subprocess.run, *, labels=None, sleep=time.sleep) -> bool:
+    removed = False
     allowed = set(ld.LAUNCH_LABELS if labels is None else labels)
     if not allowed.issubset(ld.LAUNCH_LABELS):
         raise ValueError("Unknown CallPilot agent")
@@ -158,7 +184,9 @@ def cleanup_legacy(layout, runner=subprocess.run, *, labels=None, sleep=time.sle
             wait_unloaded(label, layout, runner, sleep=sleep)
             for path in paths:
                 path.unlink()
+                removed = True
                 logger.info("Removed legacy CallPilot agent %s: %s", label, path)
+    return removed
 
 
 def install(layout, runner=subprocess.run, *, services=None, sleep=time.sleep,
@@ -171,7 +199,15 @@ def install(layout, runner=subprocess.run, *, services=None, sleep=time.sleep,
     if force_restart_labels and before_restart is not None:
         before_restart()
     try:
-        services.check_approval()
+        # Disabled legacy caffeinate items can block the same bundle-owned label.
+        # Only preclean idle jobs; running legacy services remain reconcile-owned.
+        cleaned_legacy = False
+        for label in (ld.APP_LABEL, ld.BRIDGE_LABEL):
+            if list(legacy_paths(layout, label)) and not agent_running(label, layout, runner):
+                action = "cleanup-legacy"
+                cleaned_legacy = cleanup_legacy(layout, runner, labels={label}, sleep=sleep) or cleaned_legacy
+        action = "check-approval"
+        services.check_approval(wait=cleaned_legacy, sleep=sleep)
         for label in (ld.APP_LABEL, ld.BRIDGE_LABEL, ld.TRAY_LABEL):
             if label in force_restart_labels and label not in no_restart_labels:
                 action = "unregister"
@@ -182,10 +218,11 @@ def install(layout, runner=subprocess.run, *, services=None, sleep=time.sleep,
         if user_initiated:
             set_login_enabled(layout, True, runner)
         for label in ld.LAUNCH_LABELS:
-            action = "register"
             if job_state(label, layout, runner) is None:
                 # SM may still remember a job removed by the normal quit path.
+                action = "unregister"
                 services.unregister(label)
+                action = "register"
                 services.register(label)
                 changed.append(label)
             if label != ld.TRAY_LABEL:
@@ -200,6 +237,8 @@ def install(layout, runner=subprocess.run, *, services=None, sleep=time.sleep,
         return ld.LaunchdInstallResult(changed, [], [])
     except (RuntimeError, OSError, ValueError) as exc:
         logger.exception("SMAppService installation failed")
+        if isinstance(exc, ApprovalRequired):
+            action = "approval-required"
         return ld.LaunchdInstallResult(changed, [ld.LaunchctlFailure(label, action, (), 1, stderr=str(exc))], [])
     finally:
         if not ld.autostart_enabled(layout):

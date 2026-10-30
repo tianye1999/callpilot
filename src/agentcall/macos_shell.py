@@ -252,20 +252,20 @@ def configure_shell_logging(
 
 
 def launchd_failure_reason(result: macos_launchd.LaunchdInstallResult, lang: str = "zh") -> str:
-    details = []
-    for failure in result.failures:
-        first_line = (failure.stderr or failure.stdout).strip().splitlines()
-        details.append(
-            f"{failure.label}: launchctl {failure.action} "
-            + ui_text("退出码", "exit code", lang) + f" {failure.returncode}: "
-            + (first_line[0][:500] if first_line else ui_text("未提供错误详情", "No error details provided", lang))
-        )
-    return ui_text("后台服务无法启动。请重试。", "Background services could not start. Please retry.", lang) + (
-        "\n" + "\n".join(details)
-    ) if details else ""
+    from .macos_service_management import APPROVAL_REQUIRED_EN, APPROVAL_REQUIRED_ZH
+
+    if not result.failures:
+        return ""
+    if any(failure.action == "approval-required" for failure in result.failures):
+        return ui_text(APPROVAL_REQUIRED_ZH, APPROVAL_REQUIRED_EN, lang)
+    return ui_text(
+        "后台服务无法启动。请点重试；仍失败请点「复制诊断信息」发给管理员。",
+        'Background services could not start. Click Retry; if it still fails, click "Copy diagnostics" '
+        "and send the information to your administrator.", lang,
+    )
 
 
-def write_startup_failure(support: Path, reason: str) -> None:
+def write_startup_failure(support: Path, reason: str, *, diagnostics: str = "") -> None:
     path = support / "startup-failure.json"
     if not reason:
         path.unlink(missing_ok=True)
@@ -274,15 +274,15 @@ def write_startup_failure(support: Path, reason: str) -> None:
     temporary = path.with_suffix(".tmp")
     with temporary.open("w", encoding="utf-8") as stream:
         os.chmod(temporary, 0o600)
-        json.dump({"reason": reason, "time": time.time()}, stream, ensure_ascii=False)
+        json.dump({"reason": reason, "diagnostics": diagnostics, "time": time.time()}, stream, ensure_ascii=False)
     temporary.replace(path)
 
 
-def read_startup_failure(support: Path) -> str:
+def read_startup_failure(support: Path, *, field: str = "reason") -> str:
     try:
         value = json.loads((support / "startup-failure.json").read_text(encoding="utf-8"))
         if isinstance(value, dict):
-            reason = value.get("reason", "")
+            reason = value.get(field, "")
             return reason if isinstance(reason, str) else ""
     except (OSError, ValueError, TypeError):
         pass

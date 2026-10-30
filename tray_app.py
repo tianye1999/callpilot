@@ -423,7 +423,9 @@ def _start_background_services(user_initiated: bool = False) -> None:
         if result.failures:
             logger.error("launchd 自装失败: %s", result.failure_summary())
             if support is not None:
-                macos_shell.write_startup_failure(support, macos_shell.launchd_failure_reason(result, lang))
+                macos_shell.write_startup_failure(
+                    support, macos_shell.launchd_failure_reason(result, lang), diagnostics=result.failure_summary(),
+                )
     except Exception as exc:  # noqa: BLE001
         logger.exception("launchd 自装失败")
         if support is not None:

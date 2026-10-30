@@ -98,18 +98,39 @@ def test_diagnostics_reads_service_and_bridge_file_logs(tmp_path):
     assert logs["app.log"] and logs["modem_usb_pty.log"]
 
 
-def test_launchd_failure_page_preserves_exit_code_and_first_line(tmp_path):
+@pytest.mark.parametrize("lang", ["zh", "en"])
+def test_launchd_failure_page_hides_details_but_preserves_diagnostics(tmp_path, lang):
+    error = 'SMAppService Error Domain=SMAppServiceErrorDomain Code=1 "Operation not permitted"\nDetails'
     result = macos_launchd.LaunchdInstallResult([], [macos_launchd.LaunchctlFailure(
-        macos_launchd.APP_LABEL, "bootstrap", (), 5, stderr="Bootstrap failed: 5: Input/output error\nDetails",
+        macos_launchd.APP_LABEL, "unregister", (), 1, stderr=error,
     )], [])
-    reason = macos_shell.launchd_failure_reason(result)
-    macos_shell.write_startup_failure(tmp_path, reason)
+    reason = macos_shell.launchd_failure_reason(result, lang)
+    macos_shell.write_startup_failure(tmp_path, reason, diagnostics=result.failure_summary())
     assert macos_shell.read_startup_failure(tmp_path) == reason
-    assert "后台服务无法启动" in reason
-    assert "退出码 5" in reason and "Bootstrap failed: 5: Input/output error" in reason
-    assert "Details" not in reason
+    assert ("复制诊断信息" if lang == "zh" else "Copy diagnostics") in reason
+    assert "launchctl" not in reason and "Error Domain" not in reason
+    assert macos_launchd.APP_LABEL not in reason
+    details = macos_shell.read_startup_failure(tmp_path, field="diagnostics")
+    assert error in details
+    assert macos_launchd.APP_LABEL in details and "unregister" in details and "exit 1" in details
     macos_shell.write_startup_failure(tmp_path, "")
     assert macos_shell.read_startup_failure(tmp_path) == ""
+    assert macos_shell.read_startup_failure(tmp_path, field="diagnostics") == ""
+
+
+@pytest.mark.parametrize("lang", ["zh", "en"])
+def test_launchd_approval_failure_page_uses_localized_settings_guidance(lang):
+    from agentcall import macos_service_management as sm
+
+    result = macos_launchd.LaunchdInstallResult([], [macos_launchd.LaunchctlFailure(
+        macos_launchd.APP_LABEL, "approval-required", (), 1, stderr=str(sm.ApprovalRequired()),
+    )], [])
+    reason = macos_shell.launchd_failure_reason(result, lang)
+    assert "caffeinate" in reason
+    assert ("登录项与扩展" if lang == "zh" else "Login Items & Extensions") in reason
+    assert ("重试" if lang == "zh" else "retry") in reason
+    assert ("Login Items" if lang == "zh" else "系统设置") not in reason
+    assert "launchctl" not in reason and "Error Domain" not in reason
 
 
 def test_shell_logging_rotates_and_captures_uncaught_exceptions(tmp_path):

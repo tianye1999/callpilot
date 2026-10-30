@@ -27,7 +27,7 @@ def prepare(layout):
         (layout.launch_agents_dir / f"{label}.plist").write_bytes(launchd.plist_bytes(data))
     layout.support_dir.mkdir(exist_ok=True)
     (layout.support_dir / "bridge-version.json").write_text(json.dumps(
-        {"version": "26.10.1", "executable": str(layout.executable)}))
+        {"version": "26.10.2", "executable": str(layout.executable)}))
 
 
 def test_version_mismatch_restarts_pair_after_call_and_queue_end(tmp_path):
@@ -89,7 +89,7 @@ def test_matching_runtime_does_not_restart(tmp_path):
     layout = layout_at(tmp_path)
     prepare(layout)
     installs = []
-    upgrade.reconcile(layout, lambda: {"version": "26.10.1", "call_active": False,
+    upgrade.reconcile(layout, lambda: {"version": "26.10.2", "call_active": False,
                                        "executable": str(layout.executable)},
                       install=lambda *a, **kw: installs.append(kw))
     assert not installs[0]["force_restart_labels"]
@@ -110,7 +110,7 @@ def test_changed_bridge_or_program_path_restarts_pair(tmp_path):
     prepare(layout)
     (layout.support_dir / "bridge-version.json").write_text('{"version":"26.9.1"}')
     installs = []
-    upgrade.reconcile(layout, lambda: {"version": "26.10.1", "call_active": False, "upgrade_guard": True},
+    upgrade.reconcile(layout, lambda: {"version": "26.10.2", "call_active": False, "upgrade_guard": True},
                       install=lambda *a, **kw: installs.append(kw))
     assert installs[0]["force_restart_labels"] == {launchd.APP_LABEL, launchd.BRIDGE_LABEL}
 
@@ -119,6 +119,25 @@ def test_legacy_service_fails_closed_without_installing(tmp_path):
     with pytest.raises(upgrade.LegacyUpgradeRequired):
         upgrade.reconcile(layout_at(tmp_path), lambda: {"call_active": False},
                           install=lambda *a, **kw: pytest.fail("Legacy service must not be stopped"))
+
+
+def test_running_bundle_upgrade_preserves_legacy_plists(tmp_path):
+    from agentcall import macos_service_management as sm
+
+    layout = launchd.make_layout(tmp_path / "CallPilot.app/Contents/MacOS/CallPilot", uid=123,
+                                 support_dir=tmp_path / "support", launch_dir=tmp_path / "agents")
+    sm.embedded_directory(layout).mkdir(parents=True)
+    layout.launch_agents_dir.mkdir()
+    paths = []
+    for label in (launchd.APP_LABEL, launchd.BRIDGE_LABEL):
+        path = layout.launch_agents_dir / f"{label}.plist"
+        path.write_bytes(launchd.plist_bytes({"Label": label}))
+        paths.append(path)
+    with pytest.raises(upgrade.LegacyUpgradeRequired):
+        upgrade.reconcile(layout, lambda: {"version": "0.6", "call_active": False},
+                          loaded=lambda *a: True,
+                          install=lambda *a, **kw: pytest.fail("Running legacy jobs must not be cleaned"))
+    assert all(path.exists() for path in paths)
 
 
 def test_busy_lease_retries_and_releases_after_install_failure(tmp_path):
