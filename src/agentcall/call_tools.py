@@ -342,8 +342,21 @@ class CallTools:
                 result={"success": False},
             )
             return result
+        message_id = "msg_" + uuid.uuid4().hex
+        hub = self._hub
+
+        def publish_queue(event: dict) -> None:
+            # 回调只捕获本条短信和 hub，不保留已经结束的 CallTools/通话会话。
+            if hub is not None:
+                hub.publish({**event, "number": number, "text": content})
+
         try:
-            ok = self._modem.send_sms(number, content)
+            send_status = getattr(self._modem, "send_sms_status", None)
+            if callable(send_status):
+                status = send_status(number, content, message_id=message_id, on_queue_result=publish_queue)
+            else:
+                status = "sent" if self._modem.send_sms(number, content) else "failed"
+            ok = status != "failed"
         except Exception as exc:  # noqa: BLE001
             logger.warning("工具发送短信失败: error_type=%s", type(exc).__name__)
             self._audit_tool(
@@ -352,13 +365,14 @@ class CallTools:
                 result={"success": False},
             )
             return {"success": False, "message": f"发送失败: {exc}"}
-        if ok:
+        if status == "sent":
             self._publish(
                 {
                     "type": "sms_out",
                     "number": number,
                     "text": content,
                     "status": "sent",
+                    "message_id": message_id,
                 }
             )
         result = {
@@ -369,10 +383,17 @@ class CallTools:
             "content": content,
             "message": "短信已发送" if ok else "短信发送失败",
         }
+        if status == "queued":
+            settle = config.get_float("SMS_CALL_SETTLE_SECONDS")
+            result.update({
+                "queued": True, "message_id": message_id,
+                "message": f"短信较长或受通话限制，暂时无法发出，已排队，挂断后约 {settle:g} 秒自动发送",
+            })
         self._audit_tool(
             "send_sms",
             args={"to": number, "content_length": len(content)},
-            result={"success": bool(ok)},
+            result={"success": bool(ok), **({"queued": True, "message_id": message_id}
+                                            if status == "queued" else {})},
         )
         return result
 

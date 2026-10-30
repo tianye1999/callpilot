@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Queue
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import serial
 
@@ -24,10 +26,26 @@ from .sim_identity import (
     with_registration,
     with_service_number_override,
 )
+from .sms_concat import SmsConcat, SmsDelivery
+from .sms_pdu import SmsDeliver, SubmitPdu, decode_deliver, encode_submit
 
 logger = logging.getLogger(__name__)
 
 CEND_PATTERN = re.compile(r"\+CEND:[^\r\n]*(?=\r?\n)")
+
+
+@dataclass
+class _SmsJob:
+    """只在内存保留已编码短信，重试从失败段继续，避免重发成功段。"""
+
+    number: str
+    characters: int
+    parts: list[SubmitPdu]
+    message_id: str = field(default_factory=lambda: "msg_" + secrets.token_urlsafe(18))
+    on_queue_result: Callable[[dict[str, Any]], None] | None = None
+    next_part: int = 0
+    failures: int = 0
+    retry_at: float = 0.0
 
 
 @dataclass
@@ -58,131 +76,12 @@ CREG_PATTERN = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?\d+(?=\s|$)")
 CEREG_PATTERN = re.compile(r"\+CEREG:[ \t]*\d+(?:[ \t]*,[^\r\n]*)?[ \t]*(?=\r?\n)")
 QSIMSTAT_PATTERN = re.compile(r"\+QSIMSTAT:\s*(\d+)\s*,\s*(\d+)")
 
-# GSM 03.38 默认字符表（基础表，用于 7-bit 短信解码）
-GSM7_BASIC = (
-    "@\u00a3$\u00a5\u00e8\u00e9\u00f9\u00ec\u00f2\u00c7\n\u00d8\u00f8\r\u00c5\u00e5"
-    "\u0394_\u03a6\u0393\u039b\u03a9\u03a0\u03a8\u03a3\u0398\u039e\x1b\u00c6\u00e6\u00df\u00c9"
-    " !\"#\u00a4%&'()*+,-./0123456789:;<=>?"
-    "\u00a1ABCDEFGHIJKLMNOPQRSTUVWXYZ\u00c4\u00d6\u00d1\u00dc\u00a7"
-    "\u00bfabcdefghijklmnopqrstuvwxyz\u00e4\u00f6\u00f1\u00fc\u00e0"
-)
-
-
-def _swap_nibbles(hex_str: str) -> str:
-    out: list[str] = []
-    for i in range(0, len(hex_str) - 1, 2):
-        out.append(hex_str[i + 1])
-        out.append(hex_str[i])
-    return "".join(out)
-
-
-def _decode_pdu_address(digits_hex: str, addr_type: int, digit_count: int) -> str:
-    """解码 PDU 地址字段（发件号码）。"""
-    # 0x50 掩码表示 Alphanumeric（字母数字发件人，如运营商名）
-    if (addr_type & 0x70) == 0x50:
-        try:
-            septets = _unpack_gsm7(bytes.fromhex(digits_hex), (len(digits_hex) * 4) // 7)
-            return _map_gsm7(septets)
-        except Exception:  # noqa: BLE001
-            return ""
-    swapped = _swap_nibbles(digits_hex)
-    number = swapped[:digit_count].replace("F", "").replace("f", "")
-    if addr_type == 0x91:  # 国际号码
-        number = "+" + number
-    return number
-
-
-def _decode_pdu_scts(scts_hex: str) -> str:
-    """解码 PDU 时间戳 (7 字节, 半字节交换)。"""
-    try:
-        d = _swap_nibbles(scts_hex)
-        yy, mm, dd, hh, mi, ss = d[0:2], d[2:4], d[4:6], d[6:8], d[8:10], d[10:12]
-        return f"{yy}/{mm}/{dd},{hh}:{mi}:{ss}"
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def _unpack_gsm7(data: bytes, septet_count: int) -> list[int]:
-    res: list[int] = []
-    buf = 0
-    bits = 0
-    for b in data:
-        buf |= b << bits
-        bits += 8
-        while bits >= 7 and len(res) < septet_count:
-            res.append(buf & 0x7F)
-            buf >>= 7
-            bits -= 7
-    return res
-
-
-def _map_gsm7(septets: list[int]) -> str:
-    chars: list[str] = []
-    skip = False
-    for code in septets:
-        if skip:
-            skip = False
-            continue
-        if code == 0x1B:  # 扩展转义，简化处理直接跳过下一字符
-            skip = True
-            continue
-        if 0 <= code < len(GSM7_BASIC):
-            chars.append(GSM7_BASIC[code])
-    return "".join(chars)
-
-
 def parse_sms_pdu(pdu: str) -> tuple[str | None, str, str] | None:
-    """解析一条 SMS-DELIVER PDU，返回 (发件号码, 时间戳, 正文)。失败返回 None。"""
-    try:
-        pdu = re.sub(r"\s+", "", pdu)
-        pos = 0
-
-        def take(n: int) -> str:
-            nonlocal pos
-            s = pdu[pos:pos + n]
-            pos += n
-            return s
-
-        smsc_len = int(take(2), 16)
-        take(smsc_len * 2)  # 跳过短信中心号码
-        first_octet = int(take(2), 16)
-        udhi = bool(first_octet & 0x40)
-
-        oa_len = int(take(2), 16)  # 发件号码位数
-        oa_type = int(take(2), 16)
-        oa_octets = (oa_len + 1) // 2
-        oa_digits = take(oa_octets * 2)
-        sender = _decode_pdu_address(oa_digits, oa_type, oa_len) or None
-
-        take(2)  # TP-PID
-        dcs = int(take(2), 16)
-        scts = take(14)
-        timestamp = _decode_pdu_scts(scts)
-
-        udl = int(take(2), 16)
-        ud_hex = pdu[pos:]
-        ud = bytes.fromhex(ud_hex) if ud_hex else b""
-
-        udh_bytes = 0
-        if udhi and ud:
-            udh_bytes = ud[0] + 1
-
-        coding = dcs & 0x0C
-        if coding == 0x08:  # UCS2 (中文)
-            body = ud[udh_bytes:].decode("utf-16-be", errors="replace")
-        elif coding == 0x04:  # 8-bit
-            body = ud[udh_bytes:].decode("latin-1", errors="replace")
-        else:  # 7-bit GSM
-            if udhi:
-                header_septets = (udh_bytes * 8 + 6) // 7
-                septets = _unpack_gsm7(ud, udl)[header_septets:]
-            else:
-                septets = _unpack_gsm7(ud, udl)
-            body = _map_gsm7(septets)
-
-        return sender, timestamp, body
-    except Exception:  # noqa: BLE001
+    """保留 events.py 使用的旧接口；分段元数据由接收链路直接读取。"""
+    message = decode_deliver(pdu)
+    if message is None:
         return None
+    return message.sender, message.timestamp, message.body
 
 
 # CLCC stat 码 → 可读状态（3GPP TS 27.007）；未知码原样数字化，不猜。
@@ -295,6 +194,18 @@ class SerialModem:
         # 接听（ATA）时置位。除 _wait_connected 外，还是 CLCC「通话消失」
         # 判定的前提（见 _process_clcc_response）。
         self._call_connected_event = threading.Event()
+        self._sms_concat = SmsConcat()
+        self._sms_condition = threading.Condition()
+        self._sms_queue: deque[_SmsJob] = deque()
+        self._sms_delivery_queue: list[SmsDelivery] = []
+        self._sms_read_queue: deque[tuple[str, str]] = deque()
+        self._sms_dispatch_lock = threading.Lock()
+        self._sms_invalid_slots: set[tuple[str, str]] = set()
+        self._sms_thread: threading.Thread | None = None
+        self._sms_reference = 0
+        self._sms_prompt_response = ""
+        self._sms_call_was_present = False
+        self._sms_settle_until = 0.0
         self._fast_poll_until = 0.0
         self._poll_wakeup = threading.Event()
         # CLCC 消失/失联计数：通话在线期间，有效 CLCC 连续无活跃通话、或
@@ -638,89 +549,137 @@ class SerialModem:
                 self._reconnect_complete.set()
 
     def _init_sms(self) -> None:
-        """开启短信文本模式并让模组主动上报新短信 (+CMTI)。"""
-        self._send("AT+CMGF=1")
+        """收发统一 PDU；字符集固定 GSM，避免影响 CLIP/CLCC 号码。"""
+        self._send("AT+CMGF=0")
+        self._send('AT+CSCS="GSM"')
         self._send('AT+CPMS="SM","SM","SM"')
         self._send("AT+CNMI=2,1,0,0,0")
-        logger.info("短信接收已启用 (文本模式, +CMTI 上报)")
+        logger.info("短信接收已启用 (PDU 模式, +CMTI 上报)")
         self._dump_stored_sms()
 
     def _dump_stored_sms(self) -> None:
-        """启动时读取模组/SIM 已存短信并补收（走 on_sms）。
+        """补收 SIM 残段；交付成功前不删除，重启后可从 SIM 免费恢复重组。"""
+        with self._serial_lock:
+            try:
+                selected = self._send('AT+CPMS="SM"')
+                if "OK" not in selected or "ERROR" in selected:
+                    raise RuntimeError("选择短信存储区失败")
+                response = self._send("AT+CMGL=4")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("读取已存短信失败: error_type=%s", type(exc).__name__)
+                return
+            entries = self._parse_cmgl(response)
+            logger.info("模组内已存短信 %d 条，补收（重复自动去重）", len(entries))
+            for index, message in entries:
+                self._ingest_sms(message, storage=("SM", index), backfill=True)
+        self._drain_sms_work()
 
-        +CMTI 实时上报只覆盖服务运行期间新到达的短信；服务重启间隙、或
-        CNMI 上报被打断而遗漏的短信，会一直躺在 SIM 里进不了 app。启动时
-        全量读一遍补收，重复的靠 EventHub 短信指纹去重（sender+时间戳+正文），
-        不会重复入库或重复转发邮件。
-        """
+    def _deliver_sms(self, message: SmsDeliver, *, backfill: bool = False) -> bool:
+        logger.info("[短信] 来自=%s 时间=%s 字符数=%d",
+                    message.sender or "未知", message.timestamp, len(message.body))
+        if self._on_sms is None:
+            return False
         try:
-            response = self._send('AT+CMGL="ALL"')
+            from .notification_events import sms_backfill
+
+            if backfill:
+                with sms_backfill():
+                    self._on_sms(message.sender, message.body, message.timestamp)
+            else:
+                self._on_sms(message.sender, message.body, message.timestamp)
+            return True
         except Exception as exc:  # noqa: BLE001
-            logger.warning("读取已存短信失败: error_type=%s", type(exc).__name__)
+            logger.warning("短信回调异常: error_type=%s", type(exc).__name__)
+            return False
+
+    def _ingest_sms(
+        self, message: SmsDeliver, *, storage: tuple[str, str] | None = None, backfill: bool = False,
+    ) -> bool:
+        complete = self._sms_concat.add(message, time.monotonic(), storage=storage, backfill=backfill)
+        if complete is not None:
+            with self._sms_condition:
+                if not any(item is complete for item in self._sms_delivery_queue):
+                    self._sms_delivery_queue.append(complete)
+        return True
+
+    def _drain_sms_work(self) -> None:
+        """嵌套 AT/初始化持锁时仅积累工作，由锁外入口或周期维护交付。"""
+        with self._sms_condition:
+            if not self._sms_read_queue and not self._sms_delivery_queue:
+                return
+        # CPython 的 RLock 所有权检查在 Windows/macOS 一致，不能只退出内层 with。
+        # 测量锁等包装若未暴露所有权接口，保守延后，不能误在外层锁内回调。
+        is_owned = getattr(self._serial_lock, "_is_owned", None)
+        if is_owned is None or is_owned():
             return
-
-        entries = self._parse_cmgl(response)
-        if not entries:
-            logger.info("模组内暂无已存短信")
+        if not self._sms_dispatch_lock.acquire(blocking=False):
             return
-        logger.info("模组内已存短信 %d 条，补收（重复自动去重）", len(entries))
-        delete_after = config.get_bool("SMS_DELETE_AFTER_INGEST")
-        for index, sender, timestamp, body in entries:
-            logger.info(
-                "[补收短信] 来自=%s 时间=%s 字符数=%d", sender or "未知", timestamp, len(body)
-            )
-            delivered = False
-            if self._on_sms:
-                try:
-                    from .notification_events import sms_backfill
-
-                    with sms_backfill():
-                        self._on_sms(sender, body, timestamp)
-                    delivered = True
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("补收短信回调异常: error_type=%s", type(exc).__name__)
-            # 补收进 app（含去重跳过=已在 app）后删 SIM 上这条，腾存储防满。
-            if delivered and index and delete_after:
-                self._delete_stored_sms(index)
-
-    def _delete_stored_sms(self, index: str) -> None:
-        """删除 SIM/模组存储位上的一条短信（AT+CMGD）；失败只告警不影响流程。
-
-        SIM 短信存储容量有限（常 ~20-50 条），满了新短信收不进来。短信补收/
-        实时读入 app 后即删，保证存储不堆满、+CMTI 实时上报持续可用。
-        """
         try:
-            self._send(f"AT+CMGD={index}")
+            with self._sms_condition:
+                reads = list(self._sms_read_queue)
+                self._sms_read_queue.clear()
+            for mem, index in reads:
+                self._read_sms(mem, index)
+            with self._sms_condition:
+                deliveries, self._sms_delivery_queue = self._sms_delivery_queue, []
+            for delivery in deliveries:
+                if not delivery.delivered:
+                    delivery.delivered = self._deliver_sms(delivery.message, backfill=delivery.backfill)
+                if delivery.delivered:
+                    self._delete_sms_delivery(delivery)
+                if not delivery.delivered or delivery.storage:
+                    with self._sms_condition:
+                        self._sms_delivery_queue.append(delivery)
+        finally:
+            self._sms_dispatch_lock.release()
+
+    def _delete_sms_delivery(self, delivery: SmsDelivery) -> None:
+        if not config.get_bool("SMS_DELETE_AFTER_INGEST"):
+            delivery.storage.clear()
+            return
+        # 回调完全结束后才短暂取锁；每个位置重选存储区，不依赖之前的 CPMS 状态。
+        for mem, index in list(delivery.storage):
+            with self._serial_lock:
+                try:
+                    response = self._send(f'AT+CPMS="{mem}"')
+                    if "OK" not in response or "ERROR" in response:
+                        raise RuntimeError("选择短信存储区失败")
+                    if self._delete_stored_sms(index):
+                        delivery.storage.discard((mem, index))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("清理短信副本失败 index=%s error_type=%s", index, type(exc).__name__)
+
+    def _delete_stored_sms(self, index: str) -> bool:
+        """成功交付后删副本；失败保留交付凭据供下一轮仅重试删除。"""
+        try:
+            response = self._send(f"AT+CMGD={index}")
+            if "OK" not in response or "ERROR" in response:
+                raise RuntimeError("删除短信失败")
             logger.debug("已删除 SIM 存储短信 index=%s", index)
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("删除已存短信失败 (index=%s): error_type=%s", index, type(exc).__name__)
+            return False
 
-    def _parse_cmgl(self, response: str) -> list[tuple[str, str | None, str, str]]:
-        """解析 ``AT+CMGL`` 响应为 ``(存储索引, 发件方, 时间戳, 正文)`` 列表。
+    def _warn_invalid_sms(self, mem: str, index: str) -> None:
+        slot = (mem, index)
+        if slot not in self._sms_invalid_slots:
+            self._sms_invalid_slots.add(slot)
+            logger.warning("短信 PDU 无效或编码不支持，保留副本 mem=%s index=%s", mem, index)
 
-        索引供补收后 ``AT+CMGD`` 删除该条、腾出 SIM 存储（防满导致新短信收不到）。
-        """
+    def _parse_cmgl(self, response: str) -> list[tuple[str, SmsDeliver]]:
+        """PDU 模式的数字状态头之后紧跟一行 PDU，忽略夹带的 URC。"""
+        entries = []
         lines = response.splitlines()
-        entries: list[tuple[str, str | None, str, str]] = []
-        idx = 0
-        while idx < len(lines):
-            if not lines[idx].strip().startswith("+CMGL:"):
-                idx += 1
-                continue
-            header_line = lines[idx]
-            index_match = re.match(r"\+CMGL:\s*(\d+)", header_line.strip())
-            index = index_match.group(1) if index_match else ""
-            body_lines: list[str] = []
-            idx += 1
-            while idx < len(lines):
-                stripped = lines[idx].strip()
-                if stripped.startswith("+CMGL:") or stripped in ("OK", "ERROR"):
-                    break
-                body_lines.append(lines[idx])
-                idx += 1
-            raw_body = "\n".join(body_lines).strip()
-            sender, timestamp, body = self._interpret_sms(header_line, raw_body)
-            entries.append((index, sender, timestamp, body))
+        for index, line in enumerate(lines[:-1]):
+            match = re.match(r"\+CMGL:\s*(\d+),\s*\d+,", line.strip())
+            if match:
+                message = decode_deliver(lines[index + 1].strip())
+                if message is not None:
+                    self._sms_invalid_slots.discard(("SM", match.group(1)))
+                    entries.append((match.group(1), message))
+                else:
+                    self._warn_invalid_sms("SM", match.group(1))
         return entries
 
     # 接听后到启用语音通道之间的静置时间（厂商可覆写）。历史上写死 1.0s，
@@ -1113,6 +1072,12 @@ class SerialModem:
 
     def close(self) -> None:
         self._closed = True  # 终态：阻止后续 start_listener/_reconnect 复活
+        with self._sms_condition:
+            if self._sms_queue:
+                logger.warning("退出时仍有未发送短信 %d 条，不持久化", len(self._sms_queue))
+            self._sms_condition.notify_all()
+        if self._sms_thread and self._sms_thread is not threading.current_thread():
+            self._sms_thread.join(timeout=21)
         with self._sim_refresh_lock:
             self._sim_refresh_generation += 1
             self._sim_refresh_requested_generation = None
@@ -1124,50 +1089,196 @@ class SerialModem:
         self._ser = None
 
     def send_sms(self, number: str, text: str) -> bool:
-        """发送短信。中文自动走 UCS2 编码，英文/数字走普通 GSM 文本。"""
+        """兼容旧调用方：已发送、已排队均为 True。"""
+        return self.send_sms_status(number, text) != "failed"
+
+    def send_sms_status(
+        self, number: str, text: str, *, message_id: str | None = None,
+        on_queue_result: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Literal["sent", "queued", "failed"]:
+        """三态发送；每条独立回调按 queued → sent/failed 发布，不绑定会话生命周期。"""
+        if self._closed:
+            return "failed"
         if not self._ser:
             raise RuntimeError("模组未连接")
         number = (number or "").strip()
-        if not number:
-            logger.warning("发送短信失败: 号码为空")
+        try:
+            with self._sms_condition:
+                parts = encode_submit(number, text, self._sms_reference)
+                if len(parts) > 1:
+                    self._sms_reference = (self._sms_reference + 1) % 256
+        except (ValueError, UnicodeError):
+            logger.warning("短信编码失败 -> %s 字符数=%d", number, len(text))
+            return "failed"
+        job = _SmsJob(number, len(text), parts)
+        if message_id is not None:
+            job.message_id = message_id
+        job.on_queue_result = on_queue_result
+        while job.next_part < len(parts):
+            # 多段间让出串口；新通话出现时将剩余段交给挂断后调度。
+            ok = self._send_sms_part(job)
+            if ok is None:
+                return "queued" if self._enqueue_sms(job) else "failed"
+            if not ok:
+                with self._sms_condition:
+                    now = time.monotonic()
+                    busy = self._sms_observe_call(now) or now < self._sms_settle_until
+                if len(parts) == 1 and busy:
+                    return "queued" if self._enqueue_sms(job) else "failed"
+                return "failed"
+            job.next_part += 1
+            if job.next_part < len(parts):
+                time.sleep(0.01)
+        logger.info("短信已发送 -> %s 字符数=%d 段数=%d", number, len(text), len(parts))
+        return "sent"
+
+    _SMS_RETRY_SECONDS = 3.0
+
+    def _sms_observe_call(self, now: float) -> bool:
+        """由短信条件锁保护；接通、拨号、来电及保持都算占用通话资源。"""
+        present = self._call_connected_event.is_set() or self._hardware_call_present
+        if present:
+            self._sms_call_was_present = True
+        elif self._sms_call_was_present:
+            self._sms_call_was_present = False
+            self._sms_settle_until = now + max(0.0, config.get_float("SMS_CALL_SETTLE_SECONDS"))
+        return present
+
+    def sms_queue_status(self) -> list[dict[str, object]]:
+        """只返回队列元数据，不泄露正文或编码后的 PDU。"""
+        with self._sms_condition:
+            return [
+                {"message_id": job.message_id, "number": job.number,
+                 "characters": job.characters, "segments": len(job.parts),
+                 "sent_segments": job.next_part, "failures": job.failures}
+                for job in self._sms_queue
+            ]
+
+    def _enqueue_sms(self, job: _SmsJob) -> bool:
+        if self._closed:
             return False
+        # 先发布 queued，再让后台看到任务，避免静置为零时终态抢在入队事件之前。
+        self._notify_sms_queue(job, "queued")
+        with self._sms_condition:
+            if self._closed:
+                self._notify_sms_queue(job, "failed")
+                return False
+            self._sms_queue.append(job)
+            if self._sms_thread is None or not self._sms_thread.is_alive():
+                self._sms_thread = threading.Thread(target=self._sms_send_loop, name="sms-send", daemon=True)
+                self._sms_thread.start()
+            self._sms_condition.notify_all()
+        logger.info("短信已排队，挂断后发送 -> %s 字符数=%d 段数=%d",
+                    job.number, job.characters, len(job.parts))
+        return True
 
-        use_ucs2 = not text.isascii()
-        with self._serial_lock:
+    @staticmethod
+    def _notify_sms_queue(job: _SmsJob, status: str) -> None:
+        if job.on_queue_result is not None:
             try:
-                self._send("AT+CMGF=1")
-                if use_ucs2:
-                    self._send('AT+CSCS="UCS2"')
-                    self._send("AT+CSMP=17,167,0,8")
-                    addr = number.encode("utf-16-be").hex().upper()
-                    payload = text.encode("utf-16-be").hex().upper()
-                else:
-                    self._send('AT+CSCS="GSM"')
-                    self._send("AT+CSMP=17,167,0,0")
-                    addr = number
-                    payload = text
-                ok = self._send_sms_payload(addr, payload)
-            finally:
-                # 恢复默认字符集，避免影响来电号码解析。
-                self._send('AT+CSCS="GSM"')
+                job.on_queue_result({"type": "sms_out", "message_id": job.message_id, "status": status})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("短信队列状态回调失败: error_type=%s", type(exc).__name__)
 
-        if ok:
-            logger.info("短信已发送 -> %s 字符数=%d", number, len(text))
-        else:
-            logger.warning("短信发送失败 -> %s", number)
+    def _send_sms_part(self, job: _SmsJob, *, queued: bool = False) -> bool | None:
+        # 先检查通话，避免入队也阻塞在其它 AT 指令持有的串口锁上。
+        with self._sms_condition:
+            now = time.monotonic()
+            present = self._sms_observe_call(now)
+            if (queued or len(job.parts) > 1) and (
+                present or now < self._sms_settle_until or (self._sms_queue and not queued)
+            ):
+                return None
+        with self._serial_lock:
+            with self._sms_condition:
+                now = time.monotonic()
+                present = self._sms_observe_call(now)
+                if self._closed:
+                    return False
+                if (queued or len(job.parts) > 1) and (present or now < self._sms_settle_until):
+                    return None
+            if self.transport_paused:
+                return None
+            part = job.parts[job.next_part]
+            try:
+                # 不在此触发漫长重连；恢复由既有读循环负责，队列仅有限重试。
+                mode = self._write_command("AT+CMGF=0")
+                ok = "OK" in mode and "ERROR" not in mode and self._send_sms_payload(part.tpdu_length, part.pdu)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("短信发送异常: error_type=%s", type(exc).__name__)
+                ok = False
+        self._drain_sms_work()
+        if not ok:
+            logger.warning("短信发送失败 -> %s 字符数=%d 第%d/%d段",
+                           job.number, job.characters, job.next_part + 1, len(job.parts))
         return ok
 
-    def _send_sms_payload(self, addr: str, payload: str) -> bool:
+    def _sms_send_loop(self) -> None:
+        while True:
+            with self._sms_condition:
+                if self._closed:
+                    return
+                if not self._sms_queue:
+                    self._sms_condition.wait()
+                    continue
+                now = time.monotonic()
+                present = self._sms_observe_call(now)
+                if (present or now < self._sms_settle_until
+                        or now < self._sms_queue[0].retry_at or self.transport_paused):
+                    self._sms_condition.wait(timeout=0.1)
+                    continue
+                job = self._sms_queue[0]
+            ok = self._send_sms_part(job, queued=True)
+            terminal = ""
+            with self._sms_condition:
+                if self._closed:
+                    return
+                if ok:
+                    job.next_part += 1
+                    if job.next_part == len(job.parts):
+                        self._sms_queue.popleft()
+                        terminal = "sent"
+                        logger.info("排队短信已发送 -> %s 字符数=%d 段数=%d",
+                                    job.number, job.characters, len(job.parts))
+                elif ok is False:
+                    job.failures += 1
+                    if job.failures >= 2:
+                        self._sms_queue.popleft()
+                        terminal = "failed"
+                        logger.warning("排队短信重试后仍失败 -> %s 第%d/%d段",
+                                       job.number, job.next_part + 1, len(job.parts))
+                    else:
+                        job.retry_at = time.monotonic() + self._SMS_RETRY_SECONDS
+            if terminal:
+                self._notify_sms_queue(job, terminal)
+            with self._sms_condition:
+                # 每段释放串口锁并主动让出执行，不能连续占住 CLCC/接听指令。
+                self._sms_condition.wait(timeout=0.01)
+
+    def _sms_maintenance(self) -> None:
+        """周期检查重组超时并唤醒发送线程，所有消费者回调均在串口锁外。"""
+        now = time.monotonic()
+        with self._sms_condition:
+            self._sms_observe_call(now)
+            self._sms_condition.notify_all()
+            self._sms_delivery_queue.extend(self._sms_concat.flush_expired(now))
+        self._drain_sms_work()
+
+    def _send_sms_payload(self, length: int, payload: str) -> bool:
         assert self._ser is not None
-        self._ser.reset_input_buffer()
-        self._ser.write(f'AT+CMGS="{addr}"\r'.encode("ascii"))
+        self._sms_prompt_response = ""
+        self._ser.write(f"AT+CMGS={length}\r".encode("ascii"))
         if not self._wait_for_prompt(timeout=5):
             logger.warning("未收到短信输入提示符 '>'")
             self._ser.write(b"\x1b")  # ESC 取消
+            self._process_response_urcs(self._sms_prompt_response)
             return False
-        self._ser.write(payload.encode("ascii") + b"\x1a")  # 正文 + Ctrl-Z
+        self._ser.write(payload.encode("ascii") + b"\x1a")
         response = self._read_response(timeout=12)
-        return "+CMGS:" in response or "OK" in response
+        # 输入 PDU 期间不能插入 CMGR，必须提交结束后再消费提示符前的 CMTI。
+        prompt_response, self._sms_prompt_response = self._sms_prompt_response, ""
+        self._process_response_urcs(prompt_response + response)
+        return "+CMGS:" in response and "OK" in response and "ERROR" not in response
 
     def _wait_for_prompt(self, timeout: float = 5) -> bool:
         assert self._ser is not None
@@ -1177,6 +1288,7 @@ class SerialModem:
             raw = self._ser.read(self._ser.in_waiting or 1)
             if raw:
                 buf += raw.decode("ascii", errors="ignore")
+                self._sms_prompt_response = buf
                 if ">" in buf:
                     return True
                 if "ERROR" in buf:
@@ -1216,7 +1328,8 @@ class SerialModem:
             response = self._read_response(timeout=3)
             if not cmd.strip().upper().startswith("AT+CLCC"):
                 self._process_response_urcs(response)
-            return response
+        self._drain_sms_work()
+        return response
 
     def _read_response(self, timeout: float = 2) -> str:
         if not self._ser:
@@ -1308,17 +1421,15 @@ class SerialModem:
         if "NO CARRIER" in text or CEND_PATTERN.search(text):
             self._request_release_cause(report)
         self._scan_pcm_flow(text)
-        if self._processing_response_cmti:
-            return
         matches = list(CMTI_PATTERN.finditer(text))
         if not matches:
             return
-        self._processing_response_cmti = True
-        try:
+        with self._sms_condition:
             for match in matches:
-                self._read_sms(match.group(1), match.group(2))
-        finally:
-            self._processing_response_cmti = False
+                slot = (match.group(1), match.group(2))
+                if slot not in self._sms_read_queue:
+                    self._sms_read_queue.append(slot)
+        self._drain_sms_work()
 
     def _process_buffer(self) -> None:
         if self.transport_paused:
@@ -1458,6 +1569,7 @@ class SerialModem:
 
     def _poll_call_status(self) -> None:
         while self._running:
+            self._sms_maintenance()
             if self.transport_paused:
                 time.sleep(0.2)
                 continue
@@ -1489,6 +1601,7 @@ class SerialModem:
                 continue
             self._process_clcc_response(response)
             self._hardware_call_present = bool(parse_clcc_lines(response)) or "OK" not in response
+            self._sms_maintenance()
             if self._clcc_poll_interval() == 2.0:
                 self.poll_signal()
             self._poll_wakeup.wait(self._clcc_poll_interval())
@@ -1564,36 +1677,29 @@ class SerialModem:
                 self._on_hangup()
 
     def _read_sms(self, mem: str, index: str) -> None:
-        """收到 +CMTI 后，按存储位读取短信并解析内容。"""
-        try:
-            if mem:
-                self._send(f'AT+CPMS="{mem}"')
-            response = self._send(f"AT+CMGR={index}")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("读取短信失败 (index=%s): error_type=%s", index, type(exc).__name__)
-            return
-
-        cmgr_line = next(
-            (line for line in response.splitlines() if line.strip().startswith("+CMGR:")),
-            "",
-        )
-        sender, timestamp, body = self._interpret_sms(
-            cmgr_line, self._extract_cmgr_body(response)
-        )
-
-        logger.info(
-            "[短信] 来自=%s 时间=%s 字符数=%d", sender or "未知", timestamp, len(body)
-        )
-        delivered = False
-        if self._on_sms:
+        """锁内选择存储区、读取、解码和重组；锁外交付，再重选存储区删除。"""
+        mem = mem or "SM"
+        with self._serial_lock:
             try:
-                self._on_sms(sender, body, timestamp)
-                delivered = True
+                selected = self._send(f'AT+CPMS="{mem}"')
+                if "OK" not in selected or "ERROR" in selected:
+                    raise RuntimeError("选择短信存储区失败")
+                response = self._send(f"AT+CMGR={index}")
             except Exception as exc:  # noqa: BLE001
-                logger.warning("短信回调异常: error_type=%s", type(exc).__name__)
-        # 实时短信读入 app 后删 SIM 上这条，防存储堆满（默认开，可配关）。
-        if delivered and index and config.get_bool("SMS_DELETE_AFTER_INGEST"):
-            self._delete_stored_sms(index)
+                logger.warning("读取短信失败 (index=%s): error_type=%s", index, type(exc).__name__)
+                return
+            lines = response.splitlines()
+            message = None
+            for offset, line in enumerate(lines[:-1]):
+                if re.match(r"\+CMGR:\s*\d+,", line.strip()):
+                    message = decode_deliver(lines[offset + 1].strip())
+                    break
+            if message is None:
+                self._warn_invalid_sms(mem, index)
+                return
+            self._sms_invalid_slots.discard((mem, index))
+            self._ingest_sms(message, storage=(mem, index))
+        self._drain_sms_work()
 
     def _interpret_sms(
         self, header_line: str, raw_body: str

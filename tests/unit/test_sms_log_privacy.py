@@ -6,11 +6,13 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from test_sms_pdu import as_deliver
 
 from agentcall.modem import Eg25Modem, Sim7600Modem
+from agentcall.sms_pdu import encode_submit
 
 SECRET = "OTP-private-849251\nsecond-private-line"
-TIMESTAMP = "26/10/21,12:30:00+32"
+TIMESTAMP = "26/10/30,12:00:00"
 
 
 def assert_private(caplog):
@@ -29,10 +31,9 @@ def test_received_sms_only_logs_metadata(monkeypatch, caplog, factory, stored, c
     modem = factory("unused-fake-port")
     sent = []
     modem._ser = SimpleNamespace(is_open=True, write=lambda data: sent.append(data.decode("ascii").strip()))
-    header = f'+CMGL: 5,"REC READ","10086",,"{TIMESTAMP}"' if stored else (
-        f'+CMGR: "REC UNREAD","10086",,"{TIMESTAMP}"'
-    )
-    raw = f"\r\n{header}\r\n{SECRET}\r\nOK\r\n"
+    pdu = as_deliver(encode_submit("10086", SECRET)[0])
+    header = f'+CMGL: 5,1,,{len(pdu) // 2 - 1}' if stored else f'+CMGR: 0,,{len(pdu) // 2 - 1}'
+    raw = f"\r\n{header}\r\n{pdu}\r\nOK\r\n"
     monkeypatch.setattr(modem, "_read_response", lambda **kwargs: raw if sent[-1].startswith(
         ("AT+CMGR", "AT+CMGL")
     ) else "OK")
@@ -55,6 +56,7 @@ def test_received_sms_only_logs_metadata(monkeypatch, caplog, factory, stored, c
     assert "10086" in caplog.text and TIMESTAMP in caplog.text
     assert f"字符数={len(SECRET)}" in caplog.text
     assert_private(caplog)
+    assert pdu not in caplog.text
 
 
 @pytest.mark.parametrize("operation", ["stored", "realtime", "delete"])
@@ -81,11 +83,11 @@ def test_sent_sms_does_not_log_body_or_encoded_payload(monkeypatch, caplog, text
     modem = Eg25Modem("unused-fake-port")
     modem._ser = SimpleNamespace(is_open=True)
     sent = []
-    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    monkeypatch.setattr(modem, "_write_command", lambda cmd: "OK")
     monkeypatch.setattr(modem, "_send_sms_payload", lambda addr, payload: sent.append((addr, payload)) or True)
     with caplog.at_level(logging.DEBUG):
         assert modem.send_sms("10086", text)
-    expected_payload = text if text.isascii() else text.encode("utf-16-be").hex().upper()
+    expected_payload = encode_submit("10086", text)[0].pdu
     assert sent[0][1] == expected_payload
     assert text not in caplog.text and expected_payload not in caplog.text
     assert "10086" in caplog.text and f"字符数={len(text)}" in caplog.text

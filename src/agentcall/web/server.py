@@ -801,8 +801,20 @@ async def _send_sms(request: web.Request) -> web.Response:
         )
 
     loop = asyncio.get_running_loop()
+    message_id = "msg_" + secrets.token_urlsafe(18)
+
+    def publish_queue(event: dict) -> None:
+        hub.publish({**event, "number": number, "text": text})
+
     try:
-        ok = await loop.run_in_executor(None, modem.send_sms, number, text)
+        send_status = getattr(modem, "send_sms_status", None)
+        if callable(send_status):
+            status = await loop.run_in_executor(
+                None, partial(send_status, number, text, message_id=message_id, on_queue_result=publish_queue),
+            )
+        else:
+            ok = await loop.run_in_executor(None, modem.send_sms, number, text)
+            status = "sent" if ok else "failed"
     except Exception as exc:  # noqa: BLE001
         logger.warning("发送短信异常: error_type=%s", type(exc).__name__)
         hub.publish(
@@ -810,15 +822,11 @@ async def _send_sms(request: web.Request) -> web.Response:
         )
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
-    hub.publish(
-        {
-            "type": "sms_out",
-            "number": number,
-            "text": text,
-            "status": "sent" if ok else "failed",
-        }
-    )
-    return web.json_response({"ok": bool(ok)})
+    if status != "queued":
+        hub.publish({"type": "sms_out", "number": number, "text": text,
+                     "status": status, "message_id": message_id})
+    return web.json_response({"ok": status != "failed", "queued": status == "queued",
+                              "status": status, "message_id": message_id})
 
 
 async def _dial(request: web.Request) -> web.Response:

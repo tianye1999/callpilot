@@ -8,8 +8,10 @@ import time
 
 import pytest
 import serial
+from test_sms_pdu import as_deliver
 
 from agentcall.modem import Eg25Modem, parse_sms_pdu
+from agentcall.sms_pdu import encode_submit
 
 
 @pytest.fixture(autouse=True)
@@ -80,8 +82,8 @@ def test_open_serial_hardware_info_follows_signal_poll_switch(monkeypatch, poll_
     if poll_seconds > 0:
         expected += ["AT+CGMM", "AT+CGMR"]
     expected += [
-        "AT+CLIP=1", "AT+CMGF=1", 'AT+CPMS="SM","SM","SM"',
-        "AT+CNMI=2,1,0,0,0", 'AT+CMGL="ALL"', "AT+QSIMSTAT=1",
+        "AT+CLIP=1", "AT+CMGF=0", 'AT+CSCS="GSM"', 'AT+CPMS="SM","SM","SM"',
+        "AT+CNMI=2,1,0,0,0", 'AT+CPMS="SM"', "AT+CMGL=4", "AT+QSIMSTAT=1",
         "AT+CREG=1", "AT+CEREG=1", "AT+CIMI", "AT+CIMI", "AT+CIMI",
         "AT+CREG?", "AT+CEREG?",
     ]
@@ -447,9 +449,9 @@ def test_clcc_response_with_cmti_reads_sms():
         if cmd == 'AT+CPMS="SM"':
             return "\r\nOK\r\n"
         if cmd == "AT+CMGR=5":
+            pdu = as_deliver(encode_submit("+8613800000000", "hello from cmti")[0])
             return (
-                '\r\n+CMGR: "REC UNREAD","+8613800000000",,"26/07/01,14:20:07+32"\r\n'
-                "hello from cmti\r\n"
+                f'\r\n+CMGR: 0,,{len(pdu) // 2 - 1}\r\n{pdu}\r\n'
                 "OK\r\n"
             )
         return "\r\nOK\r\n"
@@ -462,7 +464,7 @@ def test_clcc_response_with_cmti_reads_sms():
         "OK\r\n"
     )
 
-    assert sent == ['AT+CPMS="SM"', "AT+CMGR=5", "AT+CMGD=5"]  # 读完删 SIM 副本
+    assert sent == ['AT+CPMS="SM"', "AT+CMGR=5", 'AT+CPMS="SM"', "AT+CMGD=5"]
     assert messages == [("+8613800000000", "hello from cmti")]
 
 
@@ -1121,10 +1123,8 @@ class CMTIFakeSerial(FakeSerial):
             elif cmd == 'AT+CPMS="SM"':
                 self._pending = b"\r\nOK\r\n"
             elif cmd == "AT+CMGR=5":
-                self._pending = (
-                    b'\r\n+CMGR: "REC UNREAD","+8613800000000",,"26/07/01,14:20:07+32"\r\n'
-                    b"hello from send\r\nOK\r\n"
-                )
+                pdu = as_deliver(encode_submit("+8613800000000", "hello from send")[0])
+                self._pending = f"\r\n+CMGR: 0,,{len(pdu) // 2 - 1}\r\n{pdu}\r\nOK\r\n".encode()
             else:
                 self._pending = b"\r\nOK\r\n"
         return len(data)
@@ -1139,7 +1139,7 @@ def test_send_response_with_cmti_reads_sms():
     response = modem.send_command("AT+CSQ")
 
     assert "+CSQ:" in response
-    assert modem._ser.writes == ["AT+CSQ", 'AT+CPMS="SM"', "AT+CMGR=5", "AT+CMGD=5"]  # 读完删 SIM 副本
+    assert modem._ser.writes == ["AT+CSQ", 'AT+CPMS="SM"', "AT+CMGR=5", 'AT+CPMS="SM"', "AT+CMGD=5"]
     assert messages == [("+8613800000000", "hello from send")]
 
 
@@ -1169,9 +1169,10 @@ def test_reader_preserves_fragmented_urcs_and_sms(factory):
     modem.on_sms(lambda sender, body, ts: messages.append((sender, body)))
     delete_sms = modem._delete_stored_sms
 
-    def delete_and_notify(index: str) -> None:
-        delete_sms(index)
+    def delete_and_notify(index: str) -> bool:
+        result = delete_sms(index)
         deleted.set()
+        return result
 
     modem._delete_stored_sms = delete_and_notify
     reader = threading.Thread(target=modem._read_loop, daemon=True)
@@ -1185,7 +1186,7 @@ def test_reader_preserves_fragmented_urcs_and_sms(factory):
     assert not reader.is_alive()
     assert rings == [None]
     assert messages == [("+8613800000000", "hello from send")]
-    assert fake.writes == ['AT+CPMS="SM"', "AT+CMGR=5", "AT+CMGD=5"]
+    assert fake.writes == ['AT+CPMS="SM"', "AT+CMGR=5", 'AT+CPMS="SM"', "AT+CMGD=5"]
     assert fake.fragments == []
 
 
@@ -1355,10 +1356,10 @@ def test_poll_failure_threshold_fires_hangup(monkeypatch):
 
 
 _CMGL_TWO = (
-    '+CMGL: 1,"REC READ","10086",,"26/07/08,20:03:24+32"\r\n'
-    "余额100元\r\n"
-    '+CMGL: 3,"REC READ","10001",,"26/07/09,14:01:34+32"\r\n'
-    "剩余1.00GB\r\n"
+    '+CMGL: 1,1,,28\r\n'
+    f'{as_deliver(encode_submit("10086", "余额100元")[0])}\r\n'
+    '+CMGL: 3,1,,32\r\n'
+    f'{as_deliver(encode_submit("10001", "剩余1.00GB")[0])}\r\n'
     "OK\r\n"
 )
 
@@ -1373,7 +1374,7 @@ def test_dump_stored_sms_backfills_and_deletes(monkeypatch):
 
     def fake_send(cmd: str) -> str:
         sent.append(cmd)
-        return _CMGL_TWO if cmd == 'AT+CMGL="ALL"' else "OK"
+        return _CMGL_TWO if cmd == "AT+CMGL=4" else "OK"
 
     monkeypatch.setattr(modem, "_send", fake_send)
     modem._dump_stored_sms()
@@ -1393,7 +1394,7 @@ def test_dump_stored_sms_keeps_sim_when_delete_disabled(monkeypatch):
 
     def fake_send(cmd: str) -> str:
         sent.append(cmd)
-        return _CMGL_TWO if cmd == 'AT+CMGL="ALL"' else "OK"
+        return _CMGL_TWO if cmd == "AT+CMGL=4" else "OK"
 
     monkeypatch.setattr(modem, "_send", fake_send)
     modem._dump_stored_sms()

@@ -136,11 +136,12 @@ def test_notification_failure_never_escapes_shared_hook(monkeypatch):
 
 def test_modem_backfill_marks_only_stored_sms(monkeypatch):
     from agentcall.modem import SerialModem
+    from agentcall.sms_pdu import SmsDeliver
 
     feed = notifications.NotificationFeed()
-    modem = object.__new__(SerialModem)
+    modem = SerialModem("unused-fake-port")
     modem._send = lambda command: "OK"
-    modem._parse_cmgl = lambda response: [("1", "+12025550123", "", "历史短信")]
+    modem._parse_cmgl = lambda response: [("1", SmsDeliver("10086", "", "历史短信"))]
     modem._on_sms = lambda sender, body, timestamp: feed.sms_received(sender, body)
     monkeypatch.setenv("SMS_DELETE_AFTER_INGEST", "false")
     modem._dump_stored_sms()

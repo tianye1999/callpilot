@@ -490,6 +490,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 收件短信进 app 后删 SIM 上那条，防 SIM 短信存储（常 ~20-50 条）满导致
     # 新短信收不进来。默认开；关掉则 SIM 会堆积，满后需手动清。
     ConfigSpec("SMS_DELETE_AFTER_INGEST", "短信入库后删 SIM 副本", "bool", "true"),
+    ConfigSpec("SMS_CALL_SETTLE_SECONDS", "短信挂断后静置（秒）", "float", "30"),
     ConfigSpec("SMS_EMAIL_FORWARD_ENABLED", "收到短信后转发到邮箱", "bool", "false"),
     ConfigSpec("SMS_EMAIL_RECIPIENT", "短信转发收件邮箱", "str", ""),
     ConfigSpec("SMS_EMAIL_SMTP_HOST", "发件 SMTP 主机", "str", ""),
@@ -832,6 +833,7 @@ _NUMERIC_RANGES: dict[str, tuple[float, float, bool]] = {
     "OUTBOUND_MAX_SECONDS": (0, 86400, False),  # ≥0 且 ≤24h
     "OWNER_CONFIRM_TIMEOUT_SECONDS": (0, 600, True),  # >0 且 ≤10min
     "WAIT_SMS_TIMEOUT_SECONDS": (0, 600, True),       # >0 且 ≤10min
+    "SMS_CALL_SETTLE_SECONDS": (0, 600, False),      # 允许测试时关闭静置，生产默认 30 秒。
 }
 
 

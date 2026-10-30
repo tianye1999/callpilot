@@ -1948,7 +1948,10 @@ def test_send_sms_success_and_validation():
             "/api/sms/send", json={"number": "10086", "text": "余额查询"}
         )
         assert resp.status == 200
-        assert await resp.json() == {"ok": True}
+        body = await resp.json()
+        assert body["ok"] is True
+        assert body["queued"] is False and body["status"] == "sent"
+        assert body["message_id"] == hub.events[-1]["message_id"]
 
         # 号码空 → 400
         resp = await client.post("/api/sms/send", json={"number": "", "text": "x"})
