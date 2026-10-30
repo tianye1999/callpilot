@@ -217,6 +217,11 @@ def stall_call(stall_modem, monkeypatch, tmp_path):
     monkeypatch.setenv("PCM_STALL_RECOVERY", "true")
     monkeypatch.setenv("PROMPT_GEN_ENABLED", "false")
     monkeypatch.setenv("WRAP_UP_JUDGE_ENABLED", "false")
+    # 只测卡死状态机：固定关掉平台相关的启动/收尾分支。Linux 默认的模组接听问候
+    # 会在假时钟上空转掉 100 多秒启动时间，撞上下面「120 秒结束」；通话后重启
+    # 模组则让每个用例多等十几秒。
+    monkeypatch.setenv("MODEM_ANSWER_GREETING", "")
+    monkeypatch.setenv("MODEM_RESET_AFTER_CALL", "false")
     clock = SimpleNamespace(now=100.0)
     monkeypatch.setattr(call_agent, "time", SimpleNamespace(monotonic=lambda: clock.now, time=time.time))
 

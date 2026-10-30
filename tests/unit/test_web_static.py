@@ -93,7 +93,8 @@ for (LANG of ['zh', 'en']) {
   assert.equal($('setupHwStatus').textContent, t('setup_hint_ready'));
 }
 '''
-    result = subprocess.run([node, "-e", harness + source + assertions],
+    # 整个 I18N 字典超过 Windows 命令行 32K 上限（WinError 206），脚本改从 stdin 传给 node。
+    result = subprocess.run([node, "-"], input=harness + source + assertions,
                             capture_output=True, text=True, encoding="utf-8", timeout=NODE_TIMEOUT)
     assert result.returncode == 0, result.stderr
 
