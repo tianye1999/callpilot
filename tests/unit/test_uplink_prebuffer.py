@@ -239,13 +239,14 @@ def test_read_contract_full_block_partial_timeout_and_odd_carry(monkeypatch):
         start = time.monotonic()
         assert bridge.read_modem_chunk() == b"\x02\x00"
         elapsed = time.monotonic() - start
-        # 为 Windows 15.6ms 时钟粒度及 CI 调度抖动留余量。
-        assert 0.01 <= elapsed < 0.12
+        # 下限给 Windows 15.6ms 时钟粒度留余量；上限只证明「不会等到凑满整块」
+        # （没有超时就会一直阻塞），CI macOS 负载下唤醒曾晚到 165ms，故放宽到 1s。
+        assert 0.01 <= elapsed < 1.0
         source.feed(b"\x00")
         assert bridge.read_modem_chunk() == b"\x03\x00"
         start = time.monotonic()
         assert bridge.read_modem_chunk() == b""
-        assert time.monotonic() - start < 0.12
+        assert time.monotonic() - start < 1.0
     finally:
         bridge.stop()
 

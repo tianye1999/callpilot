@@ -116,7 +116,8 @@ def test_sms_queue_call_settle_new_call_and_fifo(modem, monkeypatch):
     start = time.monotonic()
     assert modem.send_sms("10086", "a" * 161)
     assert modem.send_sms("10086", "中" * 71)
-    assert time.monotonic() - start < 0.2
+    # 只证明通话中入队不阻塞等挂断；CI 负载下唤醒可晚到 100ms+，不卡毫秒级。
+    assert time.monotonic() - start < 1.0
     assert len(modem.sms_queue_status()) == 2
     modem._hardware_call_present = False
     modem._sms_maintenance()
