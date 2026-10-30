@@ -8,6 +8,7 @@ import pytest
 
 from agentcall import macos_launchd as launchd
 from agentcall import macos_upgrade as upgrade
+from agentcall.app_version import VERSION
 
 
 @pytest.fixture(autouse=True)
@@ -27,7 +28,7 @@ def prepare(layout):
         (layout.launch_agents_dir / f"{label}.plist").write_bytes(launchd.plist_bytes(data))
     layout.support_dir.mkdir(exist_ok=True)
     (layout.support_dir / "bridge-version.json").write_text(json.dumps(
-        {"version": "26.10.4", "executable": str(layout.executable)}))
+        {"version": VERSION, "executable": str(layout.executable)}))
 
 
 def test_version_mismatch_restarts_pair_after_call_and_queue_end(tmp_path):
@@ -89,7 +90,7 @@ def test_matching_runtime_does_not_restart(tmp_path):
     layout = layout_at(tmp_path)
     prepare(layout)
     installs = []
-    upgrade.reconcile(layout, lambda: {"version": "26.10.4", "call_active": False,
+    upgrade.reconcile(layout, lambda: {"version": VERSION, "call_active": False,
                                        "executable": str(layout.executable)},
                       install=lambda *a, **kw: installs.append(kw))
     assert not installs[0]["force_restart_labels"]
@@ -110,7 +111,7 @@ def test_changed_bridge_or_program_path_restarts_pair(tmp_path):
     prepare(layout)
     (layout.support_dir / "bridge-version.json").write_text('{"version":"26.9.1"}')
     installs = []
-    upgrade.reconcile(layout, lambda: {"version": "26.10.4", "call_active": False, "upgrade_guard": True},
+    upgrade.reconcile(layout, lambda: {"version": VERSION, "call_active": False, "upgrade_guard": True},
                       install=lambda *a, **kw: installs.append(kw))
     assert installs[0]["force_restart_labels"] == {launchd.APP_LABEL, launchd.BRIDGE_LABEL}
 

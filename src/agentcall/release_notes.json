@@ -1,4 +1,4 @@
 {
-  "zh": "覆盖升级后旧窗口自动换新；修复通话稳定性：接通检测更快、对方挂断不再拆桥、减少开头噪声；修正新版本检查频率；日志降噪。",
-  "en": "Old windows now refresh automatically after an in-place upgrade; call stability fixes include faster answer detection, keeping the bridge running after remote hangup, and reduced opening noise; corrected update-check frequency and reduced log noise."
+  "zh": "来电不再出现乱码，AI 不再莫名沉默；挂断后立即停止播放，下一通不会听到上一通的尾音；长短信能正确收发，通话中发的长短信挂断后自动补发；模组需要重新插拔时会提示；AI 以机主名义直接办事，来电不报机主姓名；外呼最长时长放宽到 10 分钟。",
+  "en": "Incoming calls no longer garble the caller's voice or leave the AI silent; playback stops the moment a call ends, so the next caller never hears the previous call's tail; long SMS are sent and received correctly, and long messages sent during a call go out after hang-up; you are told when the modem needs to be replugged; the AI acts directly on the owner's behalf and never gives the owner's name to incoming callers; outbound calls may now last up to 10 minutes."
 }
