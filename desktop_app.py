@@ -313,18 +313,21 @@ def _import_webview():
     return webview
 
 
-def startup_html(reason: str | None = None, lang: str | None = None) -> str:
+def startup_html(reason: str | None = None, lang: str | None = None, *, action: str = "") -> str:
     from agentcall.macos_shell import ui_language, ui_text
 
     lang = lang or ui_language()
+    migrating = action == "legacy-migration-pending"
     title = (ui_text("服务未能启动", "Service could not start", lang) if reason
              else ui_text("正在启动…", "Starting…", lang))
+    if migrating:
+        title = ui_text("正在迁移…", "Migrating…", lang)
     buttons = f"""<p><button onclick="pywebview.api.retry()">{ui_text('重试', 'Retry', lang)}</button>
         <button onclick="pywebview.api.copy_diagnostics().then(() => {{
           document.getElementById('copied').textContent = '{ui_text('诊断信息已复制', 'Diagnostics copied', lang)}';
         }})">{ui_text('复制诊断信息', 'Copy diagnostics', lang)}</button>
         <button onclick="pywebview.api.open_login_settings()">{ui_text('登录项设置', 'Login Items', lang)}</button></p>
-        <p id="copied" role="status"></p>""" if reason else ""
+        <p id="copied" role="status"></p>""" if reason and not migrating else ""
     message = html_escape.escape(reason or ui_text(
         '正在连接电话服务，请稍候。', 'Connecting to the phone service. Please wait.', lang,
     ))
@@ -520,15 +523,16 @@ class BundledStartup:
                 displayed_failure = ""
                 self.generation += 1
             startup_failure = macos_shell.read_startup_failure(self.layout.support_dir)
+            failure_action = macos_shell.read_startup_failure(self.layout.support_dir, field="action")
             if startup_failure and startup_failure != displayed_failure:
                 # 安装结果可能晚于超时诊断；具体错误始终优先，不能被 diagnosing 挡住。
-                self.window.load_html(startup_html(startup_failure, self.lang))
+                self.window.load_html(startup_html(startup_failure, self.lang, action=failure_action))
                 displayed_failure = startup_failure
             try:
                 generation, reason, diagnostics = self.diagnostic_results.get_nowait()
                 if generation == self.generation and waiting:
                     self.diagnostics = diagnostics
-                    self.window.load_html(startup_html(startup_failure or reason, self.lang))
+                    self.window.load_html(startup_html(startup_failure or reason, self.lang, action=failure_action))
             except queue.Empty:
                 pass
             if not waiting:
@@ -567,7 +571,8 @@ class BundledStartup:
                     target = self.url.rstrip("/") + "/" + notification_target
                 self.window.load_url(target)
                 waiting = False
-            elif (startup_failure or time.monotonic() >= deadline) and not diagnosing:
+            elif (failure_action != "legacy-migration-pending"
+                  and (startup_failure or time.monotonic() >= deadline) and not diagnosing):
                 diagnosing = True
                 # launchctl 诊断再慢也不能挡住关窗或重试；过期结果不覆盖新一轮启动。
                 def diagnose(generation, startup_failure):

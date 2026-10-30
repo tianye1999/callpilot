@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import platform
 import plistlib
 import re
@@ -17,6 +19,7 @@ SM_STATUS_NOT_REGISTERED = 0
 SM_STATUS_ENABLED = 1
 SM_STATUS_REQUIRES_APPROVAL = 2
 SM_STATUS_NOT_FOUND = 3
+LEGACY_MIGRATION_SECONDS = 180
 
 APPROVAL_REQUIRED_ZH = (
     "请在 系统设置 → 通用 → 登录项与扩展 中打开 CallPilot 的后台开关"
@@ -98,17 +101,38 @@ class NativeServices:
     def open_settings(self):
         self.api.openSystemSettingsLoginItems()
 
-    def check_approval(self, *, wait=False, sleep=time.sleep):
-        # BTM removes disabled legacy records asynchronously after plist cleanup.
-        # Only that migration needs up to 20 half-second waits; otherwise fail promptly.
-        retries = 20 if wait else 0
-        for attempt in range(retries + 1):
-            if not any(self._service(label).status() == SM_STATUS_REQUIRES_APPROVAL
-                       for label in ld.LAUNCH_LABELS):
-                return
-            if attempt == retries:
-                raise ApprovalRequired()
-            sleep(0.5)
+    def check_approval(self):
+        # BTM migration is retried by the tray worker, never by a synchronous caller.
+        if any(self._service(label).status() == SM_STATUS_REQUIRES_APPROVAL for label in ld.LAUNCH_LABELS):
+            raise ApprovalRequired()
+
+
+def legacy_migration_remaining(support) -> float:
+    path = support / "legacy-cleanup.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        timestamp = value.get("time") if isinstance(value, dict) else None
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+            age = time.time() - timestamp
+            if 0 <= age < LEGACY_MIGRATION_SECONDS:
+                return LEGACY_MIGRATION_SECONDS - age
+    except (OSError, ValueError):
+        pass
+    path.unlink(missing_ok=True)
+    return 0
+
+
+def _record_legacy_cleanup(support):
+    # Do not extend the migration window on retries or after reopening the app.
+    if legacy_migration_remaining(support):
+        return
+    support.mkdir(parents=True, exist_ok=True)
+    path = support / "legacy-cleanup.json"
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        os.chmod(temporary, 0o600)
+        json.dump({"time": time.time()}, stream)
+    temporary.replace(path)
 
 
 def set_login_enabled(layout, enabled, runner=subprocess.run):
@@ -201,13 +225,13 @@ def install(layout, runner=subprocess.run, *, services=None, sleep=time.sleep,
     try:
         # Disabled legacy caffeinate items can block the same bundle-owned label.
         # Only preclean idle jobs; running legacy services remain reconcile-owned.
-        cleaned_legacy = False
         for label in (ld.APP_LABEL, ld.BRIDGE_LABEL):
             if list(legacy_paths(layout, label)) and not agent_running(label, layout, runner):
                 action = "cleanup-legacy"
-                cleaned_legacy = cleanup_legacy(layout, runner, labels={label}, sleep=sleep) or cleaned_legacy
+                if cleanup_legacy(layout, runner, labels={label}, sleep=sleep):
+                    _record_legacy_cleanup(layout.support_dir)
         action = "check-approval"
-        services.check_approval(wait=cleaned_legacy, sleep=sleep)
+        services.check_approval()
         for label in (ld.APP_LABEL, ld.BRIDGE_LABEL, ld.TRAY_LABEL):
             if label in force_restart_labels and label not in no_restart_labels:
                 action = "unregister"
@@ -234,11 +258,13 @@ def install(layout, runner=subprocess.run, *, services=None, sleep=time.sleep,
                 action = "verify-version"
                 if not verify_bridge():
                     raise RuntimeError("New bridge did not acquire its instance lock/version")
+        (layout.support_dir / "legacy-cleanup.json").unlink(missing_ok=True)
         return ld.LaunchdInstallResult(changed, [], [])
     except (RuntimeError, OSError, ValueError) as exc:
         logger.exception("SMAppService installation failed")
         if isinstance(exc, ApprovalRequired):
-            action = "approval-required"
+            action = ("legacy-migration-pending" if legacy_migration_remaining(layout.support_dir)
+                      else "approval-required")
         return ld.LaunchdInstallResult(changed, [ld.LaunchctlFailure(label, action, (), 1, stderr=str(exc))], [])
     finally:
         if not ld.autostart_enabled(layout):

@@ -278,6 +278,152 @@ def test_ensure_launchd_forwards_user_launch_flag(monkeypatch, tmp_path, user_in
     assert callable(calls[0]["acquire"])
 
 
+@pytest.fixture
+def migration_install(monkeypatch, tmp_path):
+    import plistlib
+    import subprocess
+    import types
+
+    from agentcall import macos_launchd as ld
+    from agentcall import macos_service_management as sm
+    from agentcall import macos_shell
+
+    layout = ld.make_layout(tmp_path / "CallPilot", uid=123, support_dir=tmp_path / "support",
+                            launch_dir=tmp_path / "agents")
+    layout.launch_agents_dir.mkdir()
+    (layout.launch_agents_dir / f"{ld.APP_LABEL}.plist").write_bytes(plistlib.dumps({"Label": ld.APP_LABEL}))
+    now, calls, states, waits, reasons = [1000.0], [], {label: 2 for label in ld.LAUNCH_LABELS}, [], []
+
+    class Service:
+        def __init__(self, label):
+            self.label = label
+
+        def status(self):
+            return states[self.label]
+
+        def registerAndReturnError_(self, error):
+            states[self.label] = 1
+            return True, None
+
+    native = object.__new__(sm.NativeServices)
+    monkeypatch.setattr(native, "_service", Service)
+
+    def runner(cmd, **kwargs):
+        label = cmd[-1].split("/")[-1]
+        return subprocess.CompletedProcess(cmd, 113 if cmd[1] == "print" else 0, "",
+                                           f'Could not find service "{label}"' if cmd[1] == "print" else "")
+
+    def install(**kwargs):
+        calls.append(now[0])
+        return sm.install(layout, runner, services=native, **kwargs,
+                          sleep=lambda _: pytest.fail("Single install must not sleep for BTM"))
+
+    def sleep(delay):
+        waits.append(delay)
+        reasons.append(macos_shell.read_startup_failure(layout.support_dir))
+        now[0] += delay
+
+    monkeypatch.setattr(tray_app, "_bundled_macos", lambda: True)
+    monkeypatch.setattr(ld, "app_support_dir", lambda: layout.support_dir)
+    monkeypatch.setattr(macos_shell, "ui_language", lambda: "zh")
+    monkeypatch.setattr(sm.time, "time", lambda: now[0])
+    monkeypatch.setattr(tray_app, "_ensure_launchd_installed", install)
+    return types.SimpleNamespace(layout=layout, now=now, calls=calls, states=states, waits=waits,
+                                 sleep=sleep, reasons=reasons)
+
+
+@pytest.mark.parametrize("status", [0, 3])
+def test_background_migration_retries_until_success_and_clears_failure(migration_install, status):
+    from agentcall import macos_shell
+
+    env = migration_install
+
+    def sleep(delay):
+        env.sleep(delay)
+        if env.now[0] >= 1070:
+            env.states.update({label: status for label in env.states})
+
+    tray_app._retry_background_services(user_initiated=True, sleep=sleep)
+    assert env.waits == [10] * 7
+    assert env.calls == list(range(1000, 1071, 10))
+    assert all(reason == "正在完成旧版本迁移，约 1 分钟后会自动启动，无需操作。" for reason in env.reasons)
+    assert macos_shell.read_startup_failure(env.layout.support_dir) == ""
+    assert macos_shell.read_startup_failure(env.layout.support_dir, field="diagnostics") == ""
+    assert not (env.layout.support_dir / "legacy-cleanup.json").exists()
+
+
+@pytest.mark.parametrize("reopen_age", [0, 70, 175])
+def test_background_migration_timeout_uses_original_cleanup_time(migration_install, reopen_age):
+    from agentcall import macos_shell
+
+    env = migration_install
+    tray_app._start_background_services()
+    env.now[0] += reopen_age
+    tray_app._retry_background_services(sleep=env.sleep)
+    assert sum(env.waits) == 180 - reopen_age
+    assert all(0 < delay <= 10 for delay in env.waits)
+    assert all("无需操作" in reason for reason in env.reasons)
+    assert "登录项与扩展" in macos_shell.read_startup_failure(env.layout.support_dir)
+    assert not (env.layout.support_dir / "legacy-cleanup.json").exists()
+
+
+def test_background_without_cleanup_immediately_shows_approval(migration_install):
+    from agentcall import macos_launchd, macos_shell
+
+    env = migration_install
+    (env.layout.launch_agents_dir / f"{macos_launchd.APP_LABEL}.plist").unlink()
+    tray_app._retry_background_services(sleep=lambda _: pytest.fail("Real approval must not wait"))
+    assert env.calls == [1000]
+    assert "登录项与扩展" in macos_shell.read_startup_failure(env.layout.support_dir)
+
+
+def test_migration_wait_can_be_cancelled_without_losing_reopen_marker(monkeypatch, migration_install):
+    import threading
+
+    from agentcall import macos_shell
+
+    env = migration_install
+    cancelled = threading.Event()
+
+    def wait(delay):
+        assert delay == 10
+        cancelled.set()
+        return True
+
+    monkeypatch.setattr(cancelled, "wait", wait)
+    tray_app._retry_background_services(cancel=cancelled,
+                                        sleep=lambda _: pytest.fail("Must use cancellable wait"))
+    assert env.calls == [1000]
+    assert (env.layout.support_dir / "legacy-cleanup.json").exists()
+    assert macos_shell.read_startup_failure(env.layout.support_dir, field="action") == "legacy-migration-pending"
+
+
+def test_migration_retries_have_monotonic_limit_if_wall_clock_stalls(migration_install):
+    from agentcall import macos_shell
+
+    env = migration_install
+    elapsed = [0]
+
+    def sleep(delay):
+        elapsed[0] += delay
+
+    tray_app._retry_background_services(sleep=sleep, monotonic=lambda: elapsed[0])
+    assert elapsed[0] == 180
+    assert "登录项与扩展" in macos_shell.read_startup_failure(env.layout.support_dir)
+
+
+def test_second_instance_migration_does_not_run_retry_loop(monkeypatch, migration_install):
+    env = migration_install
+    monkeypatch.setattr(tray_app, "_acquire_tray_singleton_lock", lambda: None)
+    monkeypatch.setattr(tray_app, "_handoff_previous_tray", lambda: None)
+    monkeypatch.setattr(tray_app.sys, "argv", ["CallPilot"])
+    monkeypatch.setattr(tray_app, "_import_rumps", lambda: pytest.fail("Second instance must yield"))
+    monkeypatch.setattr(tray_app.time, "sleep", lambda _: pytest.fail("Second instance must not wait"))
+    tray_app.main()
+    assert env.calls == [1000]
+    assert (env.layout.support_dir / "legacy-cleanup.json").exists()
+
+
 @pytest.fixture(params=[False, True], ids=["foreground", "login"])
 def bundled_tray(monkeypatch, tmp_path, request):
     import types
@@ -919,6 +1065,25 @@ def test_non_crash_exit_recovery_uses_guarded_reconciler(bundled_tray):
     assert env.app._install_thread is not None
     env.app._install_thread.finish()
     assert env.installs[-1] == {"user_initiated": False}
+
+
+def test_reopen_retry_and_timer_share_one_install_worker(monkeypatch, bundled_tray):
+    from agentcall import macos_shell
+
+    env = bundled_tray
+    workers = []
+    monkeypatch.setattr(tray_app, "_retry_background_services", lambda **kwargs: workers.append(kwargs))
+    env.app._start_services()
+    worker = env.app._install_thread
+    env.app._reopen()
+    env.now[0] = 31
+    monkeypatch.setattr(macos_shell, "take_commands", lambda: {"retry"})
+    env.app._requests(None)
+    assert env.app._install_thread is worker
+    assert workers == []  # Only the already scheduled thread may enter the retry loop.
+    worker.finish()
+    assert len(workers) == 1
+    assert workers[0]["cancel"] is env.app._install_cancel
 
 
 def test_reopen_callback_forwards_to_same_open_action(monkeypatch):

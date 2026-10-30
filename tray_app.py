@@ -411,21 +411,23 @@ def _install_tracking_hooks(app, rumps) -> None:
     )
 
 
-def _start_background_services(user_initiated: bool = False) -> None:
+def _start_background_services(user_initiated: bool = False):
     from agentcall import macos_launchd, macos_shell
 
     support = macos_launchd.app_support_dir() if _bundled_macos() else None
     lang = macos_shell.ui_language() if support is not None else "en"
     try:
-        if support is not None:
-            macos_shell.write_startup_failure(support, "")
         result = _ensure_launchd_installed(user_initiated=user_initiated)
         if result.failures:
             logger.error("launchd 自装失败: %s", result.failure_summary())
             if support is not None:
                 macos_shell.write_startup_failure(
                     support, macos_shell.launchd_failure_reason(result, lang), diagnostics=result.failure_summary(),
+                    action=result.failures[0].action,
                 )
+        elif support is not None:
+            macos_shell.write_startup_failure(support, "")
+        return result
     except Exception as exc:  # noqa: BLE001
         logger.exception("launchd 自装失败")
         if support is not None:
@@ -438,6 +440,34 @@ def _start_background_services(user_initiated: bool = False) -> None:
                 f"后台服务无法启动（{type(exc).__name__}）。请重试。",
                 f"Background services could not start ({type(exc).__name__}). Please retry.", lang,
             ))
+
+
+def _retry_background_services(user_initiated: bool = False, *, sleep=time.sleep, monotonic=time.monotonic,
+                               cancel: threading.Event | None = None):
+    """Only the singleton tray's install thread owns the BTM retry window."""
+    from agentcall import macos_launchd
+    from agentcall import macos_service_management as sm
+
+    deadline = monotonic() + sm.LEGACY_MIGRATION_SECONDS
+    while True:
+        if cancel is not None and cancel.is_set():
+            return
+        result = _start_background_services(user_initiated=user_initiated)
+        if result is None or not any(f.action == "legacy-migration-pending" for f in result.failures):
+            return
+        support = macos_launchd.app_support_dir()
+        remaining = min(sm.legacy_migration_remaining(support), deadline - monotonic())
+        deadline = min(deadline, monotonic() + remaining)
+        if remaining <= 0:
+            # Also bound retries if the wall clock moves during migration.
+            (support / "legacy-cleanup.json").unlink(missing_ok=True)
+            _start_background_services(user_initiated=user_initiated)
+            return
+        if cancel is not None:
+            if cancel.wait(min(10, remaining)):
+                return
+        else:
+            sleep(min(10, remaining))
 
 
 def _handoff_previous_tray():
@@ -526,6 +556,7 @@ def main() -> None:
     if singleton_lock is None:
         if _bundled_macos() and "--login" not in sys.argv:
             # The incumbent tray may still be old code from before an overwrite.
+            # One attempt only: the singleton owner's install thread handles migration retries.
             # Reconcile in this new executable, not only via the old tray's reopen callback.
             _start_background_services(user_initiated=not login)
             singleton_lock = _handoff_previous_tray()
@@ -573,6 +604,7 @@ def main() -> None:
             )
             self._window_proc: subprocess.Popen | None = early_window
             self._install_thread: threading.Thread | None = None
+            self._install_cancel = threading.Event()
             self._enable_requested = False
             self._quitting = False
             self._replace_requested = False
@@ -652,8 +684,10 @@ def main() -> None:
                 return
             if self._install_thread is None or not self._install_thread.is_alive():
                 self._enable_requested = False
+                self._install_cancel.clear()
                 self._install_thread = threading.Thread(
-                    target=lambda: _start_background_services(user_initiated=user_initiated), daemon=True,
+                    target=lambda: _retry_background_services(user_initiated=user_initiated,
+                                                              cancel=self._install_cancel), daemon=True,
                 )
                 self._install_thread.start()
             elif user_initiated:
@@ -692,6 +726,7 @@ def main() -> None:
             if "resume" in commands:
                 self._uninstall_pending = False
             if self._uninstall_pending and "replace" not in commands:
+                self._install_cancel.set()
                 if self._install_thread is None or not self._install_thread.is_alive():
                     from agentcall.macos_launchd import app_support_dir
 
@@ -699,6 +734,7 @@ def main() -> None:
                 return
             self._replace_requested = self._replace_requested or "replace" in commands
             if self._replace_requested:
+                self._install_cancel.set()
                 if self._install_thread is not None and self._install_thread.is_alive():
                     return
                 from agentcall.macos_launchd import app_support_dir
@@ -868,6 +904,7 @@ def main() -> None:
                 return
             self._quitting = True
             try:
+                self._install_cancel.set()
                 # 等待正在进行的安装完成，防止 bootout 后被安装线程再次 bootstrap。
                 if self._install_thread is not None:
                     self._install_thread.join(timeout=1)

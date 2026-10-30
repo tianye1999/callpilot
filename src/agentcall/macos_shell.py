@@ -258,6 +258,12 @@ def launchd_failure_reason(result: macos_launchd.LaunchdInstallResult, lang: str
         return ""
     if any(failure.action == "approval-required" for failure in result.failures):
         return ui_text(APPROVAL_REQUIRED_ZH, APPROVAL_REQUIRED_EN, lang)
+    if any(failure.action == "legacy-migration-pending" for failure in result.failures):
+        return ui_text(
+            "正在完成旧版本迁移，约 1 分钟后会自动启动，无需操作。",
+            "Finishing migration from the previous version. CallPilot will start automatically in about "
+            "1 minute. No action is needed.", lang,
+        )
     return ui_text(
         "后台服务无法启动。请点重试；仍失败请点「复制诊断信息」发给管理员。",
         'Background services could not start. Click Retry; if it still fails, click "Copy diagnostics" '
@@ -265,7 +271,7 @@ def launchd_failure_reason(result: macos_launchd.LaunchdInstallResult, lang: str
     )
 
 
-def write_startup_failure(support: Path, reason: str, *, diagnostics: str = "") -> None:
+def write_startup_failure(support: Path, reason: str, *, diagnostics: str = "", action: str = "") -> None:
     path = support / "startup-failure.json"
     if not reason:
         path.unlink(missing_ok=True)
@@ -274,7 +280,8 @@ def write_startup_failure(support: Path, reason: str, *, diagnostics: str = "") 
     temporary = path.with_suffix(".tmp")
     with temporary.open("w", encoding="utf-8") as stream:
         os.chmod(temporary, 0o600)
-        json.dump({"reason": reason, "diagnostics": diagnostics, "time": time.time()}, stream, ensure_ascii=False)
+        json.dump({"reason": reason, "diagnostics": diagnostics, "action": action, "time": time.time()},
+                  stream, ensure_ascii=False)
     temporary.replace(path)
 
 

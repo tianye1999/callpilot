@@ -133,6 +133,18 @@ def test_launchd_approval_failure_page_uses_localized_settings_guidance(lang):
     assert "launchctl" not in reason and "Error Domain" not in reason
 
 
+@pytest.mark.parametrize("lang,expected", [
+    ("zh", "正在完成旧版本迁移，约 1 分钟后会自动启动，无需操作。"),
+    ("en", "Finishing migration from the previous version. CallPilot will start automatically in about "
+           "1 minute. No action is needed."),
+])
+def test_legacy_migration_reason_does_not_ask_for_settings_or_retry(lang, expected):
+    result = macos_launchd.LaunchdInstallResult([], [macos_launchd.LaunchctlFailure(
+        macos_launchd.APP_LABEL, "legacy-migration-pending", (), 1,
+    )], [])
+    assert macos_shell.launchd_failure_reason(result, lang) == expected
+
+
 def test_shell_logging_rotates_and_captures_uncaught_exceptions(tmp_path):
     result = subprocess.run([sys.executable, "-c", '''
 import logging, sys, threading, traceback

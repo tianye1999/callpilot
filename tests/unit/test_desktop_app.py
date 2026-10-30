@@ -147,6 +147,40 @@ def test_startup_and_failure_pages_follow_ui_language(lang, starting, retry):
     assert f'lang="{lang}"' in page
 
 
+@pytest.mark.parametrize("lang,title", [("zh", "正在迁移"), ("en", "Migrating")])
+def test_migration_page_does_not_offer_manual_actions(lang, title):
+    page = desktop_app.startup_html("migration pending", lang, action="legacy-migration-pending")
+    assert title in page and "migration pending" in page
+    assert "<button" not in page
+    assert "open_login_settings" not in page and "api.retry" not in page
+
+
+def test_migration_window_automatically_enters_dashboard_after_failure_cleared(monkeypatch, tmp_path):
+    from agentcall import macos_shell
+
+    pages, urls, ticks = [], [], []
+    startup = desktop_app.BundledStartup(
+        types.SimpleNamespace(load_html=pages.append, load_url=urls.append),
+        "http://test", types.SimpleNamespace(support_dir=tmp_path),
+    )
+    macos_shell.write_startup_failure(tmp_path, "migration pending", action="legacy-migration-pending")
+
+    def tick(delay):
+        ticks.append(delay)
+        if len(ticks) == 2:
+            macos_shell.write_startup_failure(tmp_path, "")
+        return len(ticks) > 2
+
+    monkeypatch.setattr(startup.closed, "wait", tick)
+    monkeypatch.setattr(macos_shell, "fetch_meta", lambda url: {"setup_required": True})
+    monkeypatch.setattr(macos_shell, "collect_diagnostics",
+                        lambda *a, **kw: pytest.fail("Pending migration is not a startup error"))
+    startup.run()
+    assert len(pages) == 1 and "<button" not in pages[0]
+    assert urls == ["http://test"]
+    assert macos_shell.take_commands(tmp_path) == set()
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="需要真实 macOS Cocoa/PyObjC")
 @pytest.mark.parametrize("preloaded", [False, True])
 def test_real_cocoa_window_hooks_install_without_bad_prototype(tmp_path, preloaded):

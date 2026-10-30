@@ -1,5 +1,6 @@
 """SMAppService lifecycle tests: no native registrations or running jobs touched."""
 
+import json
 import plistlib
 import subprocess
 
@@ -205,7 +206,7 @@ def test_native_absent_service_skips_unregister_and_can_register(monkeypatch, st
 def test_native_approval_accepts_nonblocked_status_without_wait(monkeypatch, status):
     native = object.__new__(sm.NativeServices)
     monkeypatch.setattr(native, "_service", lambda label: NativeService(status))
-    native.check_approval(sleep=lambda _: pytest.fail("No approval wait needed"))
+    native.check_approval()
 
 
 def test_native_approval_without_cleanup_fails_immediately(monkeypatch):
@@ -218,18 +219,17 @@ def test_native_approval_without_cleanup_fails_immediately(monkeypatch):
 
     monkeypatch.setattr(native, "_service", service)
     with pytest.raises(sm.ApprovalRequired):
-        native.check_approval(sleep=lambda _: pytest.fail("Must not wait without legacy cleanup"))
+        native.check_approval()
     assert len(checks) == 1
 
 
-def test_native_approval_timeout_is_bounded_and_actionable(monkeypatch):
+def test_native_approval_is_immediate_and_actionable(monkeypatch):
     native = object.__new__(sm.NativeServices)
     service = NativeService(2)
     monkeypatch.setattr(native, "_service", lambda label: service)
-    waits = []
+    monkeypatch.setattr(sm.time, "sleep", lambda _: pytest.fail("Approval check must not sleep"))
     with pytest.raises(sm.ApprovalRequired) as error:
-        native.check_approval(wait=True, sleep=waits.append)
-    assert waits == [0.5] * 20
+        native.check_approval()
     assert "登录项与扩展" in str(error.value)
     assert "Login Items & Extensions" in str(error.value)
     assert "caffeinate" in str(error.value)
@@ -239,7 +239,8 @@ def test_native_approval_timeout_is_bounded_and_actionable(monkeypatch):
 
 @pytest.mark.parametrize("cleared_status", [0, 3])
 @pytest.mark.parametrize("loaded_idle", [False, True])
-def test_install_cleans_idle_legacy_before_waiting_for_btm(monkeypatch, tmp_path, cleared_status, loaded_idle):
+def test_install_cleans_idle_legacy_then_returns_pending_without_wait(monkeypatch, tmp_path,
+                                                                    cleared_status, loaded_idle):
     layout, events, absent_runner, _ = fixture(tmp_path)
     paths = []
     for directory in (layout.launch_agents_dir, layout.support_dir / "LaunchAgents"):
@@ -269,19 +270,54 @@ def test_install_cleans_idle_legacy_before_waiting_for_btm(monkeypatch, tmp_path
         return agents[label]
 
     monkeypatch.setattr(native, "_service", service)
-    waits = []
+    def no_sleep(delay):
+        pytest.fail("BTM waiting belongs to the background retry worker")
 
-    def sleep(delay):
-        waits.append(delay)
-        for agent in agents.values():
-            agent.state = cleared_status
-
-    result = sm.install(layout, runner, services=native, sleep=sleep)
+    result = sm.install(layout, runner, services=native, sleep=no_sleep)
+    assert result.failures[0].action == "legacy-migration-pending"
+    marker = layout.support_dir / "legacy-cleanup.json"
+    assert marker.stat().st_mode & 0o777 == 0o600
+    assert isinstance(json.loads(marker.read_text())["time"], (int, float))
+    assert all(not agent.calls for agent in agents.values())
+    for agent in agents.values():
+        agent.state = cleared_status
+    result = sm.install(layout, runner, services=native, sleep=no_sleep)
     assert not result.failures
-    assert waits == [0.5]
+    assert not marker.exists()
     assert all(agent.calls == ["register"] for agent in agents.values())
     assert ("bootout", ld.TRAY_LABEL) not in events
     assert (layout.launch_agents_dir / f"{ld.TRAY_LABEL}.plist").exists()
+
+
+@pytest.mark.parametrize("age,pending", [(0, True), (70, True), (179, True), (180, False), (181, False)])
+def test_cleanup_marker_survives_reopen_but_expires(monkeypatch, tmp_path, age, pending):
+    layout, _, runner, _ = fixture(tmp_path)
+    layout.support_dir.mkdir()
+    marker = layout.support_dir / "legacy-cleanup.json"
+    marker.write_text(json.dumps({"time": 1000}))
+    monkeypatch.setattr(sm.time, "time", lambda: 1000 + age)
+    native = object.__new__(sm.NativeServices)
+    monkeypatch.setattr(native, "_service", lambda label: NativeService(2))
+    result = sm.install(layout, runner, services=native,
+                        sleep=lambda _: pytest.fail("Install must not wait for approval"))
+    assert result.failures[0].action == ("legacy-migration-pending" if pending else "approval-required")
+    assert marker.exists() is pending
+    if pending:
+        assert json.loads(marker.read_text())["time"] == 1000
+
+
+@pytest.mark.parametrize("contents", ['{}', '[]', '{bad', '{"time": "bad"}', '{"time": 9999}',
+                                    '{"time": NaN}', '{"time": true}'])
+def test_invalid_marker_does_not_delay_real_approval(monkeypatch, tmp_path, contents):
+    layout, _, runner, _ = fixture(tmp_path)
+    layout.support_dir.mkdir()
+    (layout.support_dir / "legacy-cleanup.json").write_text(contents)
+    monkeypatch.setattr(sm.time, "time", lambda: 1000)
+    native = object.__new__(sm.NativeServices)
+    monkeypatch.setattr(native, "_service", lambda label: NativeService(2))
+    result = sm.install(layout, runner, services=native,
+                        sleep=lambda _: pytest.fail("Invalid marker must not cause waiting"))
+    assert result.failures[0].action == "approval-required"
 
 
 def test_install_without_legacy_cleanup_does_not_wait_for_approval(monkeypatch, tmp_path):
