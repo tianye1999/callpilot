@@ -47,7 +47,8 @@ def test_parallel_serial_playout_resumes_uplink_after_idle_filler(
         expected = b"".join(bridge.agent_to_modem(pcm, agent.output_rate) for pcm in (first_pcm, second_pcm))
         first_size = len(bridge.agent_to_modem(first_pcm, agent.output_rate))
         silence = bytes(bridge._write_size)
-        uplink = array("h", [(index % 128) * 64 - 4096 for index in range(320)]).tobytes()
+        uplink = array("h", [(index % 128) * 64 - 4096 for index in range(160)]).tobytes()
+        serial_tick = threading.Event()
         observed = bytearray()
         writes = []
         forwarded = []
@@ -78,9 +79,8 @@ def test_parallel_serial_playout_resumes_uplink_after_idle_filler(
                 return 0
 
             def read(self, _count):
-                if not first_loop_read.is_set():
-                    opening_at_first_read.append(opening_pending)
-                    first_loop_read.set()
+                # 模拟 20ms 串口超时/320B 实时输入，不能无限速灌满常驻缓冲。
+                serial_tick.wait(0.02)
                 return uplink
 
             def write(self, pcm):
@@ -94,6 +94,16 @@ def test_parallel_serial_playout_resumes_uplink_after_idle_filler(
 
         port = MemorySerial()
         monkeypatch.setattr(bridge, "_open_serial", lambda: port)
+        original_read = bridge.read_modem_chunk
+
+        def read_modem_chunk():
+            # 观察主循环消费，不再把后台串口读取误认成开场后的第一次消费。
+            if not first_loop_read.is_set():
+                opening_at_first_read.append(opening_pending)
+                first_loop_read.set()
+            return original_read()
+
+        monkeypatch.setattr(bridge, "read_modem_chunk", read_modem_chunk)
         original_set_observer = bridge.set_output_observer
 
         def set_observer(callback):

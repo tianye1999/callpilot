@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import re
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -538,6 +541,215 @@ def test_serial_pcm_discard_pending_output_clears_backlog():
     assert bridge.discard_pending_output() == 4800
     assert bridge.pending_output_bytes() == 0
     assert bridge.discard_pending_output() == 0  # 幂等
+
+
+def test_uplink_backlog_logs_tty_before_read_and_buffer_separately(monkeypatch, caplog):
+    bridge = audio_bridge.SerialPcmAudioBridge("fake-pcm")
+    now = [0.0]
+    monkeypatch.setattr(audio_bridge, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    caplog.set_level(logging.INFO)
+    calls = []
+    readings = iter(zip([640, 320, 0, 1022, 320, 0], [1, 4, 5, 6, 9, 10], strict=True))
+
+    class Port:
+        @property
+        def in_waiting(self):
+            self.waiting, self.at = next(readings)
+            calls.append("sample")
+            return self.waiting
+
+        def read(self, count):
+            calls.append("read")
+            now[0] = self.at
+            if self.at == 10:
+                bridge._running = False
+            return b"\x01\x00" * 160
+
+    bridge._ser = Port()
+    bridge._running = bridge._reader_alive = True
+    bridge._read_loop()
+    assert calls == ["sample", "read"] * 6
+    messages = [r.message for r in caplog.records if "[timing] 上行积压" in r.message]
+    assert len(messages) == 2  # 虚拟时钟跨过两个 5 秒窗口，不等待真实时间。
+    pattern = (
+        r"\[timing\] 上行积压: tty max=(\d+)B\(≈\d+ms\) 均值=(\d+)B \(n=(\d+)\)"
+        r" \| 读线程缓冲 max=(\d+)B\(≈\d+ms\) 均值=(\d+)B \(n=(\d+)\)"
+    )
+    matches = [re.fullmatch(pattern, message) for message in messages]
+    assert all(matches)
+    assert [match.groups() for match in matches] == [
+        ("640", "320", "3", "960", "640", "3"),
+        ("1022", "447", "3", "1920", "1600", "3"),
+    ]
+
+    # 读线程已退出，故障回退路径只能统计 tty，不应把剩余进程缓冲混入日志。
+    class DirectPort:
+        in_waiting = 320
+
+        def read(self, count):
+            return b"\x02\x00"
+
+    bridge._ser = DirectPort()
+    bridge._rx_buffer.clear()
+    now[0] = 15
+    assert bridge.read_modem_chunk() == b"\x02\x00"
+    assert re.fullmatch(
+        r"\[timing\] 上行积压（直读）: tty max=320B\(≈\d+ms\) 均值=320B \(n=1\)",
+        caplog.records[-1].message,
+    )
+
+
+@pytest.mark.parametrize("reader_alive", [False, True])
+@pytest.mark.parametrize("fail_all", [False, True])
+def test_uplink_backlog_sampling_failure_does_not_pollute_averages(
+    monkeypatch, caplog, reader_alive, fail_all,
+):
+    bridge = audio_bridge.SerialPcmAudioBridge("fake-pcm")
+    now = [0.0]
+    monkeypatch.setattr(audio_bridge, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    caplog.set_level(logging.INFO)
+    samples = iter([None, None if fail_all else 640])
+
+    class Port:
+        @property
+        def in_waiting(self):
+            value = next(samples)
+            if value is None:
+                raise OSError("fake tty sampling failure")
+            return value
+
+        def read(self, count):
+            now[0] += 2.5
+            if now[0] == 5:
+                bridge._running = False
+            return b"\x01\x00" * 160
+
+    bridge._ser = Port()
+    if reader_alive:
+        bridge._reader_alive = bridge._running = True
+        bridge._read_loop()
+    else:
+        # 直读在 read 前记录，第二次采样跨越日志窗口。
+        bridge.read_modem_chunk()
+        now[0] = 5
+        bridge.read_modem_chunk()
+    messages = [r.message for r in caplog.records if "[timing] 上行积压" in r.message]
+    assert len(messages) == 1
+    expected = ("-1", "-1", "0") if fail_all else ("640", "640", "1")
+    match = re.search(r"tty max=(-?\d+)B\(≈-?\d+ms\) 均值=(-?\d+)B \(n=(\d+)\)", messages[0])
+    assert match and match.groups() == expected
+    assert ("读线程缓冲" in messages[0]) is reader_alive
+    assert ("直读" in messages[0]) is not reader_alive
+    if reader_alive:
+        assert re.search(r"读线程缓冲 max=640B\(≈\d+ms\) 均值=480B \(n=2\)", messages[0])
+
+
+def test_hangup_silence_stops_even_filler_and_restart_restores_writer(monkeypatch):
+    from test_uplink_prebuffer import TtyPcmSource
+
+    source = TtyPcmSource()
+    bridge = audio_bridge.SerialPcmAudioBridge("fake-pcm", write_interval=0.002)
+    monkeypatch.setattr(bridge, "_open_serial", lambda: source)
+    writes = []
+    observed = []
+    written = threading.Event()
+    played = threading.Event()
+    cycles = threading.Event()
+    checks = 0
+    allow_write = False
+
+    def ready():
+        nonlocal checks
+        checks += 1
+        if checks >= 4:
+            cycles.set()
+        return allow_write
+
+    def write(data):
+        writes.append(data)
+        written.set()
+        return len(data)
+
+    def observe(data):
+        observed.append(data)
+        played.set()
+
+    bridge.set_ready_check(ready)
+    bridge.set_output_observer(observe)
+    monkeypatch.setattr(source, "write", write)
+    bridge.start()
+    try:
+        bridge.write_modem_chunks([audio_bridge.AgentPcm(b"\x01\x00" * 1000)])
+        assert bridge.silence_for_hangup() == 2000
+        assert not bridge._output_spans
+        assert bridge.silence_for_hangup() == 0
+        bridge.write_modem_chunks([audio_bridge.AgentPcm(b"\x02\x00" * 320)])
+        assert bridge.pending_output_bytes() == 0
+        allow_write = True
+        checks = 0
+        cycles.clear()
+        assert cycles.wait(1)
+        assert writes == [] and observed == []
+    finally:
+        bridge.stop()
+    source.is_open = True
+    bridge.start()
+    try:
+        assert written.wait(1)
+        assert writes[0] == bytes(bridge._write_size)
+        bridge.write_modem_chunks([audio_bridge.AgentPcm(b"\x03\x00" * 256)])
+        assert played.wait(1)
+        bridge.silence_for_hangup()
+        assert b"".join(observed) == b"\x03\x00" * 256
+    finally:
+        bridge.stop()
+
+
+def test_hangup_waits_for_inflight_write_then_resets_output(monkeypatch):
+    from test_uplink_prebuffer import TtyPcmSource
+
+    source = TtyPcmSource()
+    bridge = audio_bridge.SerialPcmAudioBridge("fake-pcm")
+    monkeypatch.setattr(bridge, "_open_serial", lambda: source)
+    entered = threading.Event()
+    release = threading.Event()
+    silenced = threading.Event()
+    events = []
+
+    def write(data):
+        entered.set()
+        assert release.wait(2)
+        events.append("write")
+        return len(data)
+
+    def reset():
+        events.append("reset")
+        raise OSError("fake reset failure")
+
+    monkeypatch.setattr(source, "write", write)
+    bridge.start()
+    assert entered.wait(2)
+    monkeypatch.setattr(source, "reset_output_buffer", reset)
+    bridge.write_modem_chunks([b"\x01\x00" * 1000])
+    results = []
+
+    def silence():
+        results.append(bridge.silence_for_hangup())
+        silenced.set()
+
+    caller = threading.Thread(target=silence)
+    try:
+        caller.start()
+        assert not silenced.wait(0.02)
+        release.set()
+        assert silenced.wait(2)
+        assert results == [2000]
+        assert events == ["write", "reset"]
+        assert bridge.pending_output_bytes() == 0
+    finally:
+        release.set()
+        caller.join(2)
+        bridge.stop()
 
 
 # ---- 上行字节对齐自愈（真机 2026-08-12：整条上行恒偏移 1 字节）----

@@ -92,7 +92,8 @@ def test_hold_default_and_quectel_keep_immediate_writer(monkeypatch, caplog, ven
         audio.start()
         try:
             assert ser.written.wait(0.3)
-            assert audio._prebuffer_thread is None
+            assert audio._reader_thread.is_alive()
+            assert not audio.uplink_prebuffer_enabled
         finally:
             audio.stop()
     assert "PCM_UPLINK_HOLD" not in caplog.text
@@ -105,7 +106,7 @@ def test_hold_stop_interrupts_wait_without_writing(monkeypatch):
     audio.stop()
     assert not ser.written.is_set()
     assert not audio._writer_thread.is_alive()
-    assert not audio._prebuffer_thread.is_alive()
+    assert not audio._reader_thread.is_alive()
 
 
 @pytest.mark.parametrize("hold,mode,marked", [(None, "nmea", False), ("0", "nmea", False),

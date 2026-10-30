@@ -13,12 +13,12 @@ import serial
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
 from agentcall import config
-from agentcall.audio_bridge import SerialPcmAudioBridge
+from agentcall.audio_bridge import PrebufferedPcm, SerialPcmAudioBridge
 from agentcall.call_agent import CallSession
 
 
 class TtyPcmSource:
-    """4095B tty FIFO, advanced in acknowledged 20ms/320B virtual-time ticks."""
+    """1022B tty 队列，以确认过的 20ms/320B 步进模拟实时生产者。"""
 
     def __init__(self):
         self.is_open = True
@@ -50,7 +50,7 @@ class TtyPcmSource:
 
     def feed(self, data):
         with self.cv:
-            accepted = min(len(data), 4095 - len(self.buffer))
+            accepted = min(len(data), 1022 - len(self.buffer))
             self.buffer.extend(data[:accepted])
             self.lost_bytes += len(data) - accepted
             self.cv.notify_all()
@@ -90,6 +90,7 @@ class TtyPcmSource:
 
     def close(self):
         with self.cv:
+            assert self.active_reads == 0
             self.is_open = False
             self.cv.notify_all()
 
@@ -133,26 +134,23 @@ def test_prebuffer_config_defaults_false_on_all_platforms(monkeypatch):
         assert "MODEM_PCM_UPLINK_PREBUFFER=false" in path.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("enabled, lost", [(False, 19905), (True, 0)])
-def test_first_read_after_1500ms_loss_comparison(monkeypatch, caplog, enabled, lost):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_first_read_after_1500ms_preserves_switch_semantics(monkeypatch, caplog, enabled):
     bridge, source = start_bridge(monkeypatch, enabled)
     caplog.set_level(logging.INFO)
     try:
-        data = feed_ticks(source, 75, acknowledged=enabled)  # 1.5s * 16000B/s = 24000B
-        if not enabled:
-            assert source.readers == set()  # No drain thread or serial reads when disabled.
-            assert bridge._prebuffer_thread is None
-        # Disabled tty contains 4095B: the last odd byte remains in the existing carry.
-        result = bridge.read_modem_chunk() if enabled else read_all(bridge, 4094)
-        assert len(result) == (24000 if enabled else 4094)
-        assert result == data[:len(result)]
-        assert source.lost_bytes == lost
+        data = feed_ticks(source, 75, acknowledged=True)
+        assert len(bridge._rx_buffer) == 24000
+        result = bridge.read_modem_chunk()
+        assert result == (data if enabled else b"")
+        assert isinstance(result, PrebufferedPcm) is enabled
+        assert source.lost_bytes == 0
         assert source.max_readers == 1
+        assert bridge._reader_thread.is_alive()
         if enabled:
             assert "[timing] 上行预缓冲: bytes=24000(≈1500ms) dropped=0" in caplog.text
-            assert not bridge._prebuffer_thread.is_alive()
         else:
-            assert bridge._rx_carry == data[4094:4095]
+            assert "上行开场积压已丢弃: bytes=24000" in caplog.text
             assert "上行预缓冲" not in caplog.text
     finally:
         bridge.stop()
@@ -163,7 +161,7 @@ def test_overflow_discards_oldest_whole_samples(monkeypatch, caplog):
     caplog.set_level(logging.INFO)
     try:
         data = feed_ticks(source, 200, acknowledged=True)  # 4s -> retain most recent 3s
-        assert len(bridge._prebuffer) == 48000
+        assert len(bridge._rx_buffer) == 48000
         assert bridge._prebuffer_dropped == 16000
         assert read_all(bridge, 48000) == data[16000:]
         source.feed(b"\x01\x00\x02\x00")
@@ -174,8 +172,98 @@ def test_overflow_discards_oldest_whole_samples(monkeypatch, caplog):
         bridge.stop()
 
 
+@pytest.mark.parametrize("ticks", [25, 100])
+def test_resident_reader_preserves_midcall_stall_and_catches_up(monkeypatch, ticks):
+    bridge, source = start_bridge(monkeypatch, False)
+    try:
+        assert bridge.read_modem_chunk() == b""
+        expected = feed_ticks(source, ticks, acknowledged=True)
+        assert len(bridge._rx_buffer) == len(expected) > 1022
+        assert bridge._rx_buffer_max >= len(expected)
+        assert bridge._inwaiting_max <= 1022
+        assert source.lost_bytes == 0
+        result = bytearray()
+        rounds = 0
+        # 主循环每轮耗时 10ms，期间生产者仍按 16kB/s 送入新的 PCM。
+        while len(bridge._rx_buffer) > 1280:
+            chunk = bridge.read_modem_chunk()
+            assert 1280 < len(chunk) <= 5120 and len(chunk) % 2 == 0
+            result.extend(chunk)
+            live = b"\x03\x00" * 80
+            expected += live
+            source.feed(live)
+            source.wait_drained(len(expected))
+            rounds += 1
+            assert rounds * 0.01 <= 1.0
+        result.extend(read_all(bridge, len(expected) - len(result)))
+        assert result == expected
+        assert source.max_readers == 1
+        assert source.readers == {"pcm-uplink-reader"}
+    finally:
+        bridge.stop()
+
+
+def test_live_buffer_overflow_is_even_bounded_warned_and_summarized(monkeypatch, caplog):
+    bridge, source = start_bridge(monkeypatch, False)
+    caplog.set_level(logging.INFO)
+    try:
+        bridge.read_modem_chunk()
+        data = feed_ticks(source, 205, acknowledged=True)
+        source.feed(b"\x07")
+        source.wait_drained(len(data) + 1)
+        data += b"\x07"
+        dropped = len(data) - len(bridge._rx_buffer)
+        assert dropped == 66 and dropped % 2 == 0
+        assert len(bridge._rx_buffer) <= 65536
+        assert bytes(bridge._rx_buffer) == data[dropped:]
+        assert bridge._rx_dropped == dropped
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "上行缓冲溢出" in warnings[0].message
+    finally:
+        bridge.stop()
+    assert "上行缓冲丢弃汇总: bytes=66(≈4ms)" in caplog.text
+
+
+def test_read_contract_full_block_partial_timeout_and_odd_carry(monkeypatch):
+    bridge, source = start_bridge(monkeypatch, False)
+    try:
+        bridge.read_modem_chunk()
+        source.feed(b"\x01\x00" * 320)
+        source.wait_drained(640)
+        # 已有整块时不能进入等待，比依赖调度器的毫秒级断言更稳定。
+        with monkeypatch.context() as patch:
+            patch.setattr(bridge._rx_condition, "wait", lambda *_: pytest.fail("整块不应等待"))
+            assert bridge.read_modem_chunk() == b"\x01\x00" * 320
+        source.feed(b"\x02\x00\x03")
+        source.wait_drained(643)
+        start = time.monotonic()
+        assert bridge.read_modem_chunk() == b"\x02\x00"
+        elapsed = time.monotonic() - start
+        # 为 Windows 15.6ms 时钟粒度及 CI 调度抖动留余量。
+        assert 0.01 <= elapsed < 0.12
+        source.feed(b"\x00")
+        assert bridge.read_modem_chunk() == b"\x03\x00"
+        start = time.monotonic()
+        assert bridge.read_modem_chunk() == b""
+        assert time.monotonic() - start < 0.12
+    finally:
+        bridge.stop()
+
+
+def test_disabled_opening_discards_only_whole_samples(monkeypatch):
+    bridge, source = start_bridge(monkeypatch, False)
+    try:
+        source.feed(b"\x01\x00\x02")
+        source.wait_drained(3)
+        assert bridge.read_modem_chunk() == b""
+        source.feed(b"\x00\x03\x00")
+        assert bridge.read_modem_chunk() == b"\x02\x00\x03\x00"
+    finally:
+        bridge.stop()
+
+
 @pytest.mark.parametrize("operation", ["first_read", "stop"])
-def test_handoff_and_stop_join_inflight_reader(monkeypatch, operation):
+def test_snapshot_keeps_reader_and_stop_joins_inflight_reader(monkeypatch, operation):
     bridge, source = start_bridge(monkeypatch, True)
     data = feed_ticks(source, 1, acknowledged=True)
     with source.cv:
@@ -190,17 +278,23 @@ def test_handoff_and_stop_join_inflight_reader(monkeypatch, operation):
     caller = threading.Thread(target=act, name="test-main-reader")
     try:
         caller.start()
-        assert bridge._prebuffer_stop.wait(timeout=5)
-        assert source.readers == {"pcm-uplink-prebuffer"}
+        if operation == "stop":
+            with bridge._rx_condition:
+                assert bridge._rx_condition.wait_for(lambda: not bridge._running, timeout=5)
+        else:
+            caller.join(timeout=5)
+            assert results == [data]
+            assert bridge._reader_thread.is_alive()
+        assert source.readers == {"pcm-uplink-reader"}
         assert source.is_open
         source.release_read.set()
         caller.join(timeout=5)
         assert not caller.is_alive()
-        assert not bridge._prebuffer_thread.is_alive()
         assert source.max_readers == 1
         if operation == "first_read":
             assert results == [data]
         else:
+            assert not bridge._reader_thread.is_alive()
             assert results == [None] and not source.is_open
             assert bridge.read_modem_chunk() == b""
     finally:
@@ -214,8 +308,10 @@ def test_stop_after_prebuffer_serial_error_is_clean(monkeypatch):
     with source.cv:
         source.fail = True
         source.cv.notify_all()
-    bridge._prebuffer_thread.join(timeout=5)
-    assert not bridge._prebuffer_thread.is_alive()
+    bridge._reader_thread.join(timeout=5)
+    assert not bridge._reader_thread.is_alive()
+    with pytest.raises(serial.SerialException, match="fake PCM disconnect"):
+        bridge.read_modem_chunk()
     bridge.stop()
     bridge.stop()
     assert not source.is_open
@@ -225,8 +321,72 @@ def test_stop_after_prebuffer_serial_error_is_clean(monkeypatch):
     source.is_open = True
     bridge.start()
     try:
+        assert bridge.read_modem_chunk() == b""
         source.feed(b"\x01\x00")
         assert bridge.read_modem_chunk() == b"\x01\x00"
+    finally:
+        bridge.stop()
+
+
+def test_stop_waits_for_inflight_fallback_read(monkeypatch):
+    bridge, source = start_bridge(monkeypatch, False)
+    with source.cv:
+        source.fail = True
+        source.cv.notify_all()
+    bridge._reader_thread.join(2)
+    assert not bridge._reader_thread.is_alive()
+    source.fail = False
+    source.block_reads = True
+    source.release_read.clear()
+    reader = threading.Thread(target=bridge.read_modem_chunk)
+    stopped = threading.Event()
+
+    def stop():
+        bridge.stop()
+        stopped.set()
+
+    stopper = threading.Thread(target=stop)
+    try:
+        reader.start()
+        assert source.read_blocked.wait(2)
+        stopper.start()
+        assert not stopped.wait(0.02)
+        assert source.is_open
+        source.release_read.set()
+        assert stopped.wait(2)
+        assert not source.is_open
+        assert source.max_readers == 1
+    finally:
+        source.release_read.set()
+        reader.join(2)
+        stopper.join(2)
+        bridge.stop()
+
+
+def test_reuse_clears_carry_alignment_backlog_and_counters(monkeypatch):
+    bridge, source = start_bridge(monkeypatch, True)
+    source.feed(b"\x01\x00\x02")
+    source.wait_drained(3)
+    assert bridge.read_modem_chunk() == b"\x01\x00"
+    assert bridge._rx_carry == b"\x02"
+    bridge._align_drop = True
+    bridge._align_locked = True
+    bridge._rx_dropped = 2
+    source.feed(b"\x00\x03\x00")
+    source.wait_drained(6)
+    old_reader = bridge._reader_thread
+    bridge.stop()
+    source.is_open = True
+    bridge.start()
+    try:
+        assert not old_reader.is_alive()
+        assert bridge._reader_thread is not old_reader
+        assert bridge._rx_carry == b"" and not bridge._rx_buffer
+        assert not bridge._align_drop and not bridge._align_locked
+        assert bridge._rx_dropped == bridge._prebuffer_dropped == 0
+        source.feed(b"\x04\x00")
+        source.wait_drained(8)
+        assert bridge.read_modem_chunk() == b"\x04\x00"
     finally:
         bridge.stop()
 
@@ -352,16 +512,17 @@ def test_real_startup_drains_while_agent_connects(monkeypatch, parallel):
         assert agent.received_audio == expected
         assert len(expected[0]) == 24000
         assert source.max_readers == 1 and source.lost_bytes == 0
-        assert not bridge._prebuffer_thread.is_alive() and not bridge._writer_thread.is_alive()
+        assert not bridge._reader_thread.is_alive() and not bridge._writer_thread.is_alive()
     finally:
         session._set_active(False)
         bridge.stop()
 
 
+@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("phase", ["connect", "opening"])
-def test_startup_failure_stops_prebuffer_before_first_read(monkeypatch, parallel, phase):
-    monkeypatch.setenv("MODEM_PCM_UPLINK_PREBUFFER", "true")
+def test_startup_failure_stops_reader_before_first_read(monkeypatch, parallel, phase, enabled):
+    monkeypatch.setenv("MODEM_PCM_UPLINK_PREBUFFER", str(enabled).lower())
     monkeypatch.setenv("PARALLEL_AGENT_CONNECT", str(parallel).lower())
     monkeypatch.setenv("MODEM_ANSWER_GREETING", "")
     modem = FakeModem()
@@ -395,7 +556,7 @@ def test_startup_failure_stops_prebuffer_before_first_read(monkeypatch, parallel
     try:
         asyncio.run(run())
         assert agent.stopped and not source.is_open
-        assert not bridge._prebuffer_thread.is_alive()
+        assert not bridge._reader_thread.is_alive()
         assert not bridge._writer_thread.is_alive()
     finally:
         session._set_active(False)

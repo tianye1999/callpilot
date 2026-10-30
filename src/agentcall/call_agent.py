@@ -230,6 +230,9 @@ class CallSession:
         self._last_downlink_play_at = 0.0
         self._active_lock = threading.Lock()
         self._outgoing_audio: Queue[bytes] = Queue()
+        # 挂断回调可能先于桥启动完成；保存停写闸门，防止迟到的桥重新播放。
+        self._hangup_bridge: AudioBridge | None = None
+        self._hangup_silenced = False
         # 本轮是否已记过「排队时长」（每轮只记一次，见 _make_agent_audio_handler）。
         self._turn_first_audio_logged = False
         # 上行最近一次「有声」块的到达时刻（monotonic）。首块回复音频到达时用
@@ -426,6 +429,9 @@ class CallSession:
         if self.is_busy:
             logger.warning("已有通话进行中，忽略新的呼叫请求")
             return
+        with self._media_lock:
+            self._hangup_silenced = False
+            self._hangup_bridge = None
         self._outbound_number = outbound_number
         self._setup_test = setup_test
         self._inbound_record = inbound_record
@@ -680,7 +686,7 @@ class CallSession:
             )
             agent = self._local_prepared_agent or create_agent(self.provider)
             self._configure_call_agent(agent, lambda: bridge, record, transcripts, direction, number, session_t0)
-            bridge.start()
+            self._start_hangup_bridge(bridge)
             mark("bridge_started")
 
             try:
@@ -700,8 +706,8 @@ class CallSession:
                     await agent.say(self._opening_instructions(direction))
                     mark_greeting_sent()
             except BaseException:
-                if (isinstance(self.modem, BluetoothModem)
-                        or isinstance(bridge, SerialPcmAudioBridge) and bridge.uplink_prebuffer_enabled):
+                if isinstance(self.modem, BluetoothModem) or isinstance(bridge, SerialPcmAudioBridge):
+                    # 串口桥现为整通常驻读写，开场失败也必须走挂断停写及线程回收。
                     await self._shutdown_agent(agent, bridge)
                 raise
 
@@ -957,7 +963,7 @@ class CallSession:
             bridge.set_output_observer(observe_output)
             if not startup_current():
                 return
-            bridge.start()
+            self._start_hangup_bridge(bridge)
             mark("bridge_started")
             bridge_ready.set()
 
@@ -1397,7 +1403,9 @@ class CallSession:
                     tagged.on_written = on_written
                     tagged.on_played = on_played
                     pcm_8k = tagged
-                self._outgoing_audio.put(pcm_8k)
+                with self._media_lock:
+                    if not self._hangup_silenced:
+                        self._outgoing_audio.put(pcm_8k)
 
         return on_agent_audio
 
@@ -1861,7 +1869,7 @@ class CallSession:
             )
             if isinstance(new_bridge, SerialPcmAudioBridge):
                 new_bridge.set_ready_check(self.modem.pcm_ready)
-            new_bridge.start()
+            self._start_hangup_bridge(new_bridge)
             if not self._agent_generation_current(generation) or (
                 self._takeover_deadline is not None and time.monotonic() >= self._takeover_deadline
             ):
@@ -1906,7 +1914,7 @@ class CallSession:
                     pass
             if old_stopped:
                 try:
-                    old_bridge.start()
+                    self._start_hangup_bridge(old_bridge)
                 except Exception as restart_exc:  # noqa: BLE001
                     logger.warning(
                         "回滚重启旧音频桥失败: error_type=%s",
@@ -4220,6 +4228,7 @@ class CallSession:
         logger.info("Agent 已从物理通话分离（modem 与 QPCMV 保持）")
 
     async def _shutdown_agent(self, agent, bridge: AudioBridge | None, *, threaded: bool = False) -> None:
+        self._silence_for_hangup(bridge, "shutdown_agent")
         await self._stop_agent_resources(agent, bridge, threaded=threaded)
         # 会话结束（含异常/端口冲突）时确保挂断物理通话，避免线路悬空。
         try:
@@ -4234,8 +4243,47 @@ class CallSession:
             {"type": "call", "status": "ended", "caller": self.current_caller}
         )
 
+    def _start_hangup_bridge(self, bridge: AudioBridge) -> None:
+        # 与远端挂断串行化，覆盖启动中及接管换桥的窗口。
+        with self._media_lock:
+            self._hangup_bridge = bridge
+            if self._hangup_silenced:
+                self._silence_bridge_for_hangup(bridge)
+                return
+            bridge.start()
+
+    @staticmethod
+    def _silence_bridge_for_hangup(bridge: AudioBridge | None) -> int:
+        try:
+            silence = getattr(bridge, "silence_for_hangup", None)
+            return int(silence() or 0) if callable(silence) else 0
+        except Exception:  # noqa: BLE001
+            logger.debug("挂断停写失败（不影响挂断）", exc_info=True)
+            return 0
+
+    def _silence_for_hangup(self, bridge: AudioBridge | None, reason: str) -> None:
+        with self._media_lock:
+            self._hangup_silenced = True
+            dropped = self._silence_bridge_for_hangup(bridge or self._hangup_bridge)
+            if bridge is not None and self._hangup_bridge is not None and bridge is not self._hangup_bridge:
+                # 接管失败时 finally 可能仍持有旧桥，当前桥也不能漏停。
+                dropped += self._silence_bridge_for_hangup(self._hangup_bridge)
+            queued_bytes = queued_chunks = 0
+            while True:
+                try:
+                    queued_bytes += len(self._outgoing_audio.get_nowait())
+                    queued_chunks += 1
+                except Empty:
+                    break
+        if dropped or queued_chunks:
+            logger.info("挂断停写下行: 原因=%s 桥=%d bytes 队列=%d bytes/%d 块",
+                        reason, dropped, queued_bytes, queued_chunks)
+
     def _drain_agent_audio(self, bridge: AudioBridge) -> None:
         with self._media_lock:
+            if self._hangup_silenced:
+                self._clear_outgoing_audio()
+                return
             chunks: list[bytes] = []
             while True:
                 try:
@@ -4507,8 +4555,12 @@ class CallAgentService:
             with self._ring_lock:
                 remote_owner = self._remote_call_owner
             if remote_owner is not None:
+                self.session._silence_for_hangup(
+                    getattr(remote_owner, "_bridge", None), "remote_party_hangup",
+                )
                 remote_owner.request_call_stop("remote_party_hangup")
                 return
+            self.session._silence_for_hangup(None, "remote_party_hangup")
             shutdown_owned = self.session.owns_modem_shutdown
             self.session.stop()
             if not shutdown_owned:
