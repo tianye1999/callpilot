@@ -1170,6 +1170,9 @@ def test_moss_loopback_call_writes_metrics_and_transcripts(setup_call, monkeypat
                 async with asyncio.timeout(2):
                     while session._last_voiced_at == 0:
                         await asyncio.sleep(0.001)
+                # 真实通话的回复至少几百 ms；假服务端同一时钟格内就回，Windows 单调时钟
+                # 约 15.6ms 才走一格，量出 0 会被延迟指标的 0 < elapsed 护栏丢弃。
+                await asyncio.sleep(0.05)
                 await ws.send_json({"action": "input.speech.stopped", "data": {}})
                 await ws.send_json({"action": "input.transcript.done", "data": {"text": "test question"}})
                 context = {"chunk_id": "c", "run_id": "r", "turn_id": "t"}
