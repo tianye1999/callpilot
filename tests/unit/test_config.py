@@ -400,7 +400,7 @@ def test_openai_registered_defaults(monkeypatch):
 
 
 def test_agent_provider_choices_include_openai_and_local():
-    assert get_spec("AGENT_PROVIDER").choices == ("qwen", "doubao", "openai", "local")
+    assert get_spec("AGENT_PROVIDER").choices == ("qwen", "doubao", "openai", "local", "moss")
 
 
 def test_tool_security_config_defaults(monkeypatch):
@@ -974,7 +974,7 @@ def test_panel_marks_doubao_choice_experimental():
     rows = {row["key"]: row for row in read_panel_values()}
     provider = rows["AGENT_PROVIDER"]
     assert provider["choice_labels"]["doubao"] == "doubao (experimental)"
-    assert provider["choices"] == ["qwen", "doubao", "openai", "local"]
+    assert provider["choices"] == ["qwen", "doubao", "openai", "local", "moss"]
 
 
 # ---- 收口回归护栏 ----

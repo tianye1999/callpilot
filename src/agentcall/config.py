@@ -124,9 +124,13 @@ class KeyValidationResult:
 CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- Agent ----
     ConfigSpec("AGENT_PROVIDER", "Agent 提供方", "select", "local",
-               choices=("qwen", "doubao", "openai", "local"), requires_restart=True,
+               choices=("qwen", "doubao", "openai", "local", "moss"), requires_restart=True,
                choice_labels={"doubao": "doubao (experimental)",
-                              "local": "local (三段式，音频不出本机)"}),
+                              "local": "local (三段式，音频不出本机)",
+                              "moss": "moss (experimental)"}),
+    ConfigSpec("MOSS_API_KEY", "MOSS API Key", "str", "", secret=True, requires_restart=True),
+    ConfigSpec("MOSS_URL", "MOSS Realtime URL", "str",
+               "wss://api.mosi.cn/v1/realtime?model=moss-live-1.0", editable=False, hidden=True),
     ConfigSpec("DASHSCOPE_API_KEY", "DashScope API Key", "str", "",
                secret=True, requires_restart=True),
     ConfigSpec("QWEN_REALTIME_MODEL", "Qwen 实时模型", "str",
@@ -582,6 +586,7 @@ _SPECS_BY_KEY: dict[str, ConfigSpec] = {spec.key: spec for spec in CONFIG_SPECS}
 
 # Agent 提供方 -> 必需的环境变量（凭证不进注册表，避免出现在面板）。
 PROVIDER_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
+    "moss": ("MOSS_API_KEY",),
     "qwen": ("DASHSCOPE_API_KEY",),
     "doubao": ("DOUBAO_APP_ID", "DOUBAO_ACCESS_KEY"),
     "openai": ("OPENAI_API_KEY",),
@@ -662,8 +667,8 @@ def validate_provider_credentials(provider: str) -> list[str]:
         if not os.environ.get(key, "").strip():
             errors.append(f"缺少环境变量 {key}（{provider} 必需）")
     text_key = "OPENAI_API_KEY" if provider == "openai" else "DASHSCOPE_API_KEY"
-    if provider == "local":
-        text_key = required[0]
+    if provider in {"local", "moss"}:
+        text_key = "DEEPSEEK_API_KEY" if get_str("LOCAL_LLM_PROVIDER") == "deepseek" else "DASHSCOPE_API_KEY"
     if (
         get_str("DTMF_JUDGE_MODE") == "shadow"
         and not os.environ.get(text_key, "").strip()

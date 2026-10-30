@@ -49,6 +49,7 @@ class FakeAudioBridge:
                 self.downlink.append(chunk)
                 if self._output_observer is not None and isinstance(chunk, AgentPcm):
                     self._output_observer(chunk)
+                    chunk.written_callback(len(chunk))()
 
     @staticmethod
     def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:

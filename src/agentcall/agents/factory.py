@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 def create_agent(provider: str | None = None) -> VoiceAgent:
     selected = (provider or config.get_str("AGENT_PROVIDER")).lower()
 
+    if selected == "moss":
+        from .moss_agent import MossVoiceAgent
+
+        return MossVoiceAgent(os.environ["MOSS_API_KEY"], config.get_str("MOSS_URL"))
+
     if selected == "qwen":
         return QwenVoiceAgent(
             # API Key 属凭证不走注册表默认值：缺失即 KeyError fail-fast。
@@ -68,5 +73,5 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
         )
 
     raise ValueError(
-        f"不支持的 AGENT_PROVIDER: {selected}，请使用 qwen、doubao、openai 或 local"
+        f"不支持的 AGENT_PROVIDER: {selected}，请使用 qwen、doubao、openai、local 或 moss"
     )

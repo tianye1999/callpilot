@@ -652,3 +652,20 @@ def test_uplink_alignment_ambiguous_evidence_does_not_lock():
     ambiguous = (b"\x10\x10" * 20000)
     _feed(bridge, ambiguous)
     assert bridge._align_locked is False
+
+
+def test_played_counts_only_successful_partial_writes_not_discards():
+    from agentcall.audio_bridge import AgentPcm, _OutputObserver
+
+    bridge = _OutputObserver()
+    bridge.set_output_observer(lambda _pcm: None)
+    played = []
+    pcm = AgentPcm(b"\x01\x02" * 320)
+    pcm.on_played = played.append
+    bridge._queue_output_span(pcm)
+    first = bridge._take_output_ranges(160)
+    assert not played
+    bridge._notify_output(pcm[:160], first)
+    assert played == [160]
+    bridge._take_output_ranges(480)  # Discarded, not written.
+    assert played == [160]

@@ -20,6 +20,7 @@ from . import call_playbooks, config, modem_hardware, platforms
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.local_agent import LocalPipelineAgent
+from .agents.moss_agent import MossVoiceAgent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
 from .audio_bridge import (
     MODEM_RATE,
@@ -98,6 +99,7 @@ from .triage_judge import (
 )
 
 logger = logging.getLogger(__name__)
+_MOSS_PREBRIEF_TIMEOUT = 30.0
 
 # 上行「有声」判定峰值（int16）。真机实测（2026-08-12）上行静音是纯数字零
 # （峰值中位 2、p90 13）——modem 不给底噪，所以阈值可以放得很低；而对端小声
@@ -431,7 +433,9 @@ class CallSession:
         self._phone_audio_lost = False
         self._resources_released = False
         self._bluetooth_cleanup_started = False
-        self._parallel_agent_connect = setup_test or config.get_bool("PARALLEL_AGENT_CONNECT")
+        self._parallel_agent_connect = (
+            setup_test or self.provider == "moss" or config.get_bool("PARALLEL_AGENT_CONNECT")
+        )
         self._outbound_task_value = task
         self._preset_hint = preset_hint
         self._preset_id = preset_id
@@ -546,7 +550,7 @@ class CallSession:
         self._call_task = asyncio.current_task()
         self._clear_outgoing_audio()
         self._load_session_config()
-        self._parallel_agent_connect = config.get_bool("PARALLEL_AGENT_CONNECT")
+        self._parallel_agent_connect = self.provider == "moss" or config.get_bool("PARALLEL_AGENT_CONNECT")
         self._last_downlink_play_at = 0.0
 
         session_t0 = time.monotonic()
@@ -752,9 +756,14 @@ class CallSession:
     def _configure_call_agent(
         self, agent, get_bridge: Callable[[], AudioBridge | None], record: CallRecord | None,
         transcripts: list[tuple[str, str]], direction: str, number: str | None, session_t0: float,
+        *, instructions: str | None = None,
     ) -> None:
         self._start_dtmf_judge(record, session_t0=session_t0)
-        agent.set_session_instructions(self._build_agent_instructions(direction))
+        agent.set_session_instructions(
+            instructions if instructions is not None else self._build_agent_instructions(direction)
+        )
+        if isinstance(agent, MossVoiceAgent) and direction == "outbound":
+            agent.set_briefing_context(number or "对方", self._outbound_task(agent_language()))
         agent.set_transcript_handler(self._make_transcript_handler(record, transcripts, agent))
         agent.set_repeat_stuck_handler(self._request_repeat_stuck_wrap_up)
         agent.set_status_handler(lambda text: self._publish({"type": "system", "text": text}))
@@ -777,13 +786,15 @@ class CallSession:
                 bridge.set_output_observer(lambda pcm: None)
         if isinstance(bridge, SerialPcmAudioBridge):
             bridge.set_ready_check(self.modem.pcm_ready)
-        self._barge_in = config.get_bool("BARGE_IN_ENABLED")
+        self._barge_in = self.provider == "moss" or config.get_bool("BARGE_IN_ENABLED")
         self._barge_in_echo_strikes = 0
         self._turn_audio_started_at = 0.0
         if self._barge_in:
             agent.set_user_interrupt_handler(lambda: self._handle_peer_barge_in(get_bridge()))
         # The same queue is used before/after bridge startup, including guard-aware cuts.
-        agent.set_late_cut_handler(lambda: self._discard_agent_playback(get_bridge(), "复读晚截"))
+        agent.set_late_cut_handler(lambda: self._discard_agent_playback(
+            get_bridge(), "MOSS audio.stop" if self.provider == "moss" else "复读晚截",
+        ))
         if record is not None:
             agent.set_latency_handler(record.log_latency)
             try:
@@ -855,7 +866,8 @@ class CallSession:
         first_output = False
         first_received = False
         output_lock = threading.Lock()
-        hangup_owned = True
+        moss_prebrief = self.provider == "moss" and bool(self._outbound_number)
+        hangup_owned = not moss_prebrief
         native_greeting = (
             config.get_str("MODEM_ANSWER_GREETING")
             if direction == "inbound" and isinstance(self.modem, Sim7600Modem) else ""
@@ -864,6 +876,7 @@ class CallSession:
         native_greeting_done = asyncio.Event()
         event_loop = asyncio.get_running_loop()
         answered_at = 0.0
+        agent_ready_at = 0.0
 
         def startup_current() -> bool:
             return not stop_preparing.is_set() and self._agent_generation_current(generation)
@@ -949,9 +962,23 @@ class CallSession:
             bridge_ready.set()
 
         async def connect_and_greet() -> None:
-            nonlocal greeting_at
+            nonlocal greeting_at, agent_ready_at
             assert agent is not None
             mark("agent_connect_started")
+            if self.provider == "moss":
+                # The shared builder may wait for dynamic prompts. Keep that wait off
+                # the dial/answer event loop, and join it before releasing this session.
+                building = asyncio.create_task(asyncio.to_thread(self._build_agent_instructions, direction))
+                try:
+                    instructions = await asyncio.shield(building)
+                finally:
+                    await asyncio.gather(building, return_exceptions=True)
+                if not startup_current():
+                    return
+                self._configure_call_agent(
+                    agent, lambda: bridge, record, transcripts, direction, number, session_t0,
+                    instructions=instructions,
+                )
             await agent.start(self._make_agent_audio_handler(
                 agent, None, record, note_received, bridge_getter=lambda: bridge, record_at_playout=True,
             ))
@@ -959,7 +986,13 @@ class CallSession:
                 return
             mark("agent_connected")
             mark("agent_started")
+            agent_ready_at = time.monotonic()
             agent_ready.set()
+            if self.provider == "moss":
+                # Briefing already asks it to wait for the phone; say() has no
+                # verified protocol equivalent. Never inject another oral briefing.
+                mark("opening_skipped", mode="moss_wait")
+                return
             if direction == "outbound" and self._prompt_gen_opening_mode == "wait":
                 mark("opening_skipped", mode="wait")
             else:
@@ -972,13 +1005,53 @@ class CallSession:
                 mark("greeting_sent")
 
         try:
-            if self._outbound_number and not await self._connect_outbound(mark, threaded=True):
-                hangup_owned = False
-                return False
+            if self.provider == "moss":
+                agent = create_agent(self.provider)
+                if moss_prebrief:
+                    self.current_caller = number
+                    self._start_prompt_generation()
+                connect_task = asyncio.create_task(connect_and_greet())
+                if moss_prebrief:
+                    prebrief_at = mark("moss_prebrief_started")
+                    try:
+                        async with asyncio.timeout(_MOSS_PREBRIEF_TIMEOUT):
+                            while startup_current() and not connect_task.done():
+                                await asyncio.sleep(0.01)
+                            if not startup_current():
+                                return False
+                            connect_task.result()
+                            if agent.fatal or not agent_ready.is_set():
+                                raise RuntimeError("MOSS is not ready")
+                    except Exception as exc:
+                        mark("moss_prebrief_failed", error_type=type(exc).__name__)
+                        message = "MOSS 拨号前 briefing 失败或超时，未拨号"
+                        logger.error("%s (error_type=%s)", message, type(exc).__name__)
+                        self._publish({"type": "call", "status": "error", "error": message})
+                        raise RuntimeError(message) from None
+                    finally:
+                        prebrief_ms = round((time.monotonic() - prebrief_at) * 1000, 1)
+                        if record is not None:
+                            try:
+                                record.log_latency("moss_prebrief", prebrief_ms)
+                            except Exception:  # noqa: BLE001 - diagnostics must not affect admission
+                                logger.warning("MOSS prebrief timing could not be recorded")
+                        logger.info("[timing] MOSS prebrief elapsed_ms=%.0f", prebrief_ms)
+            if self._outbound_number:
+                if moss_prebrief and not startup_current():
+                    return False
+                hangup_owned = True
+                if moss_prebrief:
+                    connected = await self._connect_outbound(mark, threaded=True, prompt_prepared=True)
+                else:
+                    connected = await self._connect_outbound(mark, threaded=True)
+                if not connected:
+                    hangup_owned = False
+                    return False
             if not self._outbound_number:
                 self._start_local_preparation("inbound")
-            agent = self._local_prepared_agent or create_agent(self.provider)
-            self._configure_call_agent(agent, lambda: bridge, record, transcripts, direction, number, session_t0)
+            if agent is None:
+                agent = self._local_prepared_agent or create_agent(self.provider)
+                self._configure_call_agent(agent, lambda: bridge, record, transcripts, direction, number, session_t0)
             if not self._outbound_number:
                 logger.info("开始处理来电（并行准备）...")
                 await self._threaded_modem_call(self.modem.answer)
@@ -987,7 +1060,8 @@ class CallSession:
             self._publish({"type": "call", "status": "answered", "caller": self.current_caller})
             answered_at = mark("answered")
             prepare_task = asyncio.create_task(asyncio.to_thread(prepare_media))
-            connect_task = asyncio.create_task(connect_and_greet())
+            if connect_task is None:
+                connect_task = asyncio.create_task(connect_and_greet())
             while startup_current():
                 for task in (prepare_task, connect_task):
                     if task.done():
@@ -995,6 +1069,11 @@ class CallSession:
                 if bridge_ready.is_set() and agent_ready.is_set():
                     break
                 await asyncio.sleep(0.01)
+            if self.provider == "moss" and agent_ready.is_set():
+                waited_ms = round(max(0, agent_ready_at - answered_at) * 1000, 1)
+                if record is not None:
+                    record.log_latency("moss_answered_wait", waited_ms)
+                logger.info("[timing] MOSS answered readiness wait %.0fms", waited_ms)
             if not startup_current() or bridge is None or not bridge_ready.is_set():
                 return True
             active_bridge = bridge
@@ -1042,14 +1121,19 @@ class CallSession:
             if hangup_owned:
                 await self._shutdown_agent(None, active_bridge or bridge, threaded=True)
 
-    async def _connect_outbound(self, mark: Callable[..., float], *, threaded: bool = False) -> bool:
+    async def _connect_outbound(
+        self, mark: Callable[..., float], *, threaded: bool = False, prompt_prepared: bool = False,
+    ) -> bool:
         """外呼：拨号并等待接通；未接通时发结束事件、挂断并返回 False。"""
         number = self._outbound_number
         if number is None:
             raise RuntimeError("外呼号码未设置")
         logger.info("开始外呼: %s", number)
         self.current_caller = number
-        self._start_prompt_generation()
+        if not prompt_prepared:
+            self._start_prompt_generation()
+        elif not self.is_active:
+            return False
         if threaded:
             await self._threaded_modem_call(self.modem.dial, number)
         else:
@@ -1249,9 +1333,10 @@ class CallSession:
             # 掐掉本轮开头的静音垫（WIL-112 最后一块）：TTS 音频前缘实测垫
             # 中位 470ms、最长 ~1s 纯静音——仪器在「首字节到达」停表，对端耳朵
             # 却要等垫子播完。只掐轮首、设上限防误伤；句中停顿原样保留。
-            if pcm_8k and self._turn_trim_budget > 0:
+            if pcm_8k and self._turn_trim_budget > 0 and self.provider != "moss":
                 pcm_8k = self._trim_leading_silence(pcm_8k)
             if pcm_8k:
+                first_for_turn = not self._turn_first_audio_logged
                 if record is not None and not record_at_playout:
                     record.write_downlink(pcm_8k)
                 # 本轮首块音频入队时，记录「它前面还排着多少秒没播完」——这才是
@@ -1304,13 +1389,42 @@ class CallSession:
                                 e2e * 1000,
                             )
                 on_written = getattr(pcm_agent, "on_written", None)
-                if record_at_playout or on_written is not None:
+                on_played = getattr(pcm_agent, "on_played", None)
+                if first_for_turn and self._last_voiced_at > 0 and record is not None:
+                    on_written = self._response_playout_observer(record, self._last_voiced_at, on_written)
+                if record_at_playout or on_written is not None or on_played is not None:
                     tagged = AgentPcm(pcm_8k)
                     tagged.on_written = on_written
+                    tagged.on_played = on_played
                     pcm_8k = tagged
                 self._outgoing_audio.put(pcm_8k)
 
         return on_agent_audio
+
+    @staticmethod
+    def _response_playout_observer(
+        record: CallRecord, voiced_at: float, previous: Callable[[], None] | None,
+    ) -> Callable[[], None]:
+        written = False
+        lock = threading.Lock()
+
+        def observe() -> None:
+            nonlocal written
+            if previous is not None:
+                previous()
+            with lock:
+                if written:
+                    return
+                written = True
+            elapsed = (time.monotonic() - voiced_at) * 1000
+            if 0 < elapsed < 30000:
+                try:
+                    record.log_latency("local_response_playout", round(elapsed, 1))
+                except Exception:  # noqa: BLE001 - metrics must not affect playback/ACKs
+                    pass
+                logger.info("[timing] 本地音尾→模组首帧写出: %.0fms", elapsed)
+
+        return observe
 
     def _trim_leading_silence(self, pcm_8k: bytes) -> bytes:
         """掐掉本轮开头的静音垫，返回剩余部分（可能为空）。
@@ -2741,12 +2855,13 @@ class CallSession:
             if profile is not None:
                 self._prompt_gen_result = profile
                 self._prompt_gen_done.set()
-                logger.info(
-                    "命中预调教任务库: number=%s task=%s scenario=%.120s",
-                    number,
-                    task,
-                    profile.get("scenario") or "",
-                )
+                if self.provider != "moss":
+                    logger.info(
+                        "命中预调教任务库: number=%s task=%s scenario=%.120s",
+                        number,
+                        task,
+                        profile.get("scenario") or "",
+                    )
                 self._log_prompt_gen_result(profile)
                 return
         if not config.get_bool("PROMPT_GEN_ENABLED"):
@@ -2833,6 +2948,12 @@ class CallSession:
         return None
 
     def _log_prompt_gen_result(self, result: dict) -> None:
+        if self.provider == "moss":
+            lengths = {f"{key}_chars": len(str(result.get(key) or "")) for key in ("scenario", "opening", "task")}
+            logger.info("MOSS scenario ready: ok=%s lengths=%s", bool(result.get("ok")), lengths)
+            if self._record is not None:
+                self._record.log_event("prompt_gen", ok=bool(result.get("ok")), **lengths)
+            return
         ok = bool(result.get("ok"))
         scenario = str(result.get("scenario") or "")
         opening = str(result.get("opening") or "")

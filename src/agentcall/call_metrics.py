@@ -40,7 +40,9 @@ from typing import Any
 # arrival metrics retain their definition and are null for local-write events.
 # v7 (#130): native modem greeting acknowledgement/timing, separate from AI playout.
 # （#131 与 #130 在各自分支上都从 v4 起号，合入 product/physical-sim 时顺延为 v5–v7。）
-SCHEMA_VERSION = 7
+# v8: shared local-tail -> actual-write latency and separate MOSS preparation/provider timings.
+# v9: MOSS outbound preparation is measured before dialing, separate from answered wait.
+SCHEMA_VERSION = 9
 
 # 逐轮时延指标：events.jsonl 里 latency 事件的 stage → metrics.json 字段名。
 # 各 stage 的精确定义（2026-08-14）：
@@ -53,6 +55,14 @@ SCHEMA_VERSION = 7
 #   实测体感 3~5s 的主因；0 是有效读数=无积压）
 _LATENCY_STAGES = {
     "local_response": "local_response_latency_ms",
+    # Same local peak-VAD tail, but stops on the first confirmed hardware write.
+    # Keep the historical arrival metric unchanged for existing local comparisons.
+    "local_response_playout": "local_response_playout_ms",
+    "moss_input_stop_to_audio": "moss_input_stop_to_audio_ms",
+    "moss_session_setup": "moss_session_setup_ms",
+    "moss_briefing": "moss_briefing_ms",
+    "moss_answered_wait": "moss_answered_wait_ms",
+    "moss_prebrief": "moss_prebrief_ms",
     "first_audio_delta": "first_audio_delta_ms",
     "playout_backlog": "playout_backlog_ms",
 }

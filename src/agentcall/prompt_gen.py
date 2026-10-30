@@ -96,11 +96,11 @@ def clear_cache() -> None:
 def text_backend_for_agent(provider: str | None = None) -> str:
     """Map the voice provider to the compatible auxiliary text backend.
 
-    Local DeepSeek uses the same backend as its conversational LLM. Other
+    Local and MOSS share the configured local text backend. Other
     non-OpenAI voice providers keep the historical Qwen text path.
     """
     selected = (provider or config.get_str("AGENT_PROVIDER")).strip().lower()
-    if selected == "local" and config.get_str("LOCAL_LLM_PROVIDER") == "deepseek":
+    if selected in {"local", "moss"} and config.get_str("LOCAL_LLM_PROVIDER") == "deepseek":
         return "deepseek"
     return "openai" if selected == "openai" else "qwen"
 
@@ -329,7 +329,7 @@ def generate_prompt_scenario(
         if not config.get_bool("PROMPT_GEN_ENABLED"):
             return _fail("动态场景提示词生成已关闭", provider)
         selected_provider = (provider or config.get_str("AGENT_PROVIDER")).strip().lower()
-        if selected_provider == "local":
+        if selected_provider in {"local", "moss"}:
             selected_provider = text_backend_for_agent(selected_provider)
         selected_timeout = timeout if timeout is not None else config.get_float("PROMPT_GEN_TIMEOUT")
         model = _select_model(selected_provider)

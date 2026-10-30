@@ -25,9 +25,10 @@ from agentcall import (
 from agentcall.call_agent import CallAgentService
 
 
-@pytest.fixture
-def deepseek(monkeypatch):
-    monkeypatch.setenv("AGENT_PROVIDER", "local")
+@pytest.fixture(params=["local", "moss"])
+def deepseek(monkeypatch, request):
+    monkeypatch.setenv("AGENT_PROVIDER", request.param)
+    monkeypatch.setenv("MOSS_API_KEY", "fake-moss-key")
     monkeypatch.setenv("LOCAL_LLM_PROVIDER", "deepseek")
     monkeypatch.setenv("LOCAL_LLM_MODEL", "deepseek-flash")
     monkeypatch.setenv("LOCAL_LLM_BASE_URL", "https://deepseek.invalid/v1/")
@@ -38,17 +39,17 @@ def deepseek(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
     def forbidden(**kwargs):
-        pytest.fail("local+deepseek must never call DashScope")
+        pytest.fail("local/moss+deepseek must never call DashScope")
 
     monkeypatch.setattr(dashscope.Generation, "call", staticmethod(forbidden))
     prompt_gen.clear_cache()
-    yield
+    yield request.param
     prompt_gen.clear_cache()
 
 
 @pytest.mark.parametrize("agent,expected", [
     ("qwen", "qwen"), ("openai", "openai"), ("doubao", "qwen"),
-    ("local", None),
+    ("local", None), ("moss", None),
 ])
 @pytest.mark.parametrize("local", ["dashscope", "deepseek"])
 def test_text_backend_routing_matrix(monkeypatch, agent, expected, local):
@@ -173,6 +174,7 @@ def test_all_auxiliary_call_sites_use_deepseek(deepseek, monkeypatch, caller, to
 
     def http(url, **kwargs):
         assert url == "https://deepseek.invalid/v1/chat/completions"
+        assert kwargs["headers"]["Authorization"] == "Bearer fake-deepseek-key"
         seen.append(json.loads(kwargs["body"]))
         return 200, json.dumps({"choices": [{"message": {"content": content}}]}).encode()
 
@@ -197,7 +199,7 @@ def test_all_auxiliary_call_sites_use_deepseek(deepseek, monkeypatch, caller, to
     elif caller == "relevance":
         assert result_verification._default_relevance_call([]) == (content, None)
     else:
-        service = CallAgentService("unused", "unused", provider="local", modem=FakeModem())
+        service = CallAgentService("unused", "unused", provider=deepseek, modem=FakeModem())
         service.session._outbound_number = "10000"
         service.session._outbound_task_value = "查询流量"
         service.session._start_prompt_generation()
@@ -214,8 +216,26 @@ def test_all_auxiliary_call_sites_use_deepseek(deepseek, monkeypatch, caller, to
 
 def test_deepseek_shadow_credentials_and_setup(deepseek, monkeypatch):
     monkeypatch.setenv("DTMF_JUDGE_MODE", "shadow")
-    assert config.validate_provider_credentials("local") == []
+    assert config.validate_provider_credentials(deepseek) == []
     assert config.credential_status()["ok"] is True
     assert config.any_provider_credentials_ready() is True
     monkeypatch.setenv("SETUP_DONE", "true")
     assert config.setup_required() is False
+
+
+@pytest.mark.parametrize("llm_provider,text_key,wrong_key", [
+    ("deepseek", "DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY"),
+    ("dashscope", "DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY"),
+])
+def test_moss_shadow_requires_selected_text_key(monkeypatch, llm_provider, text_key, wrong_key):
+    monkeypatch.setenv("MOSS_API_KEY", "fake-moss-key")
+    monkeypatch.setenv("LOCAL_LLM_PROVIDER", llm_provider)
+    monkeypatch.setenv("DTMF_JUDGE_MODE", "shadow")
+    monkeypatch.delenv(text_key, raising=False)
+    monkeypatch.setenv(wrong_key, "wrong-backend-key")
+    assert config.validate_provider_credentials("moss") == [f"缺少环境变量 {text_key}（DTMF 文本判官 shadow 必需）"]
+    monkeypatch.setenv(text_key, "fake-text-key")
+    monkeypatch.delenv(wrong_key)
+    assert config.validate_provider_credentials("moss") == []
+    monkeypatch.delenv("MOSS_API_KEY")
+    assert config.validate_provider_credentials("moss") == ["缺少环境变量 MOSS_API_KEY（moss 必需）"]

@@ -971,3 +971,265 @@ def test_completed_mobile_loop_result_is_closed_if_owner_cancelled(setup_call, m
     asyncio.run(run())
     assert old_bridge.stopped
     assert replacement.started and replacement.stopped
+
+
+@pytest.mark.parametrize("briefing_delay", [0.01, 0.12])
+def test_moss_outbound_briefing_finishes_before_dial(setup_call, monkeypatch, briefing_delay):
+    session, modem, bridge, agent, base = setup_call
+    session.provider = "moss"
+    session._outbound_number = "10086"
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "false")  # MOSS alone requires early startup.
+    monkeypatch.setattr(session, "_build_agent_instructions", lambda _direction: "shared scenario and task")
+    order = []
+    original_dial = modem.dial
+
+    def dial(number):
+        assert "briefing_ready" in order
+        order.append("dial")
+        return original_dial(number)
+
+    monkeypatch.setattr(modem, "dial", dial)
+    monkeypatch.setattr(session, "_start_prompt_generation", lambda: order.append("prompt_prepare"))
+
+    async def start(callback):
+        order.append("briefing_start")
+        assert order.count("prompt_prepare") == 1
+        assert "dial" not in modem.call_names()
+        assert not modem.is_call_connected()
+        assert agent._session_instructions == "shared scenario and task"
+        await asyncio.sleep(briefing_delay)
+        await FakeAgent.start(agent, callback)
+        order.append("briefing_ready")
+
+    async def connected(timeout):
+        await asyncio.sleep(0.05)
+        modem.connected_flag.set()
+        order.append("answered")
+        return True
+
+    async def run_loop(_agent, active_bridge, _record, _transcripts):
+        assert "briefing_ready" in order
+        order.append("phone_loop")
+        session._set_active(False)
+        return active_bridge
+
+    monkeypatch.setattr(agent, "start", start)
+    monkeypatch.setattr(session, "_wait_connected", connected)
+    monkeypatch.setattr(session, "_run_agent_loop", run_loop)
+    asyncio.run(session._handle_call())
+    assert order.index("briefing_ready") < order.index("dial") < order.index("answered") < order.index("phone_loop")
+    assert order.count("prompt_prepare") == 1
+    assert not agent.said  # No spoken briefing confirmation or synthetic opening in phone.
+    wait = next(event["ms"] for event in events(base)
+                if event["type"] == "latency" and event["stage"] == "moss_answered_wait")
+    assert wait == 0
+    prebrief = next(event["ms"] for event in events(base)
+                   if event["type"] == "latency" and event["stage"] == "moss_prebrief")
+    assert prebrief >= briefing_delay * 1000 - 1
+    metrics = json.loads((next(base.iterdir()) / "metrics.json").read_text())
+    assert metrics["latency"]["moss_prebrief_ms"]["n"] == 1
+    assert agent.stopped and bridge.stopped
+
+
+@pytest.mark.parametrize("end", ["failure", "timeout", "stop", "cancel"])
+def test_moss_prebrief_failure_or_cancel_never_touches_modem(setup_call, monkeypatch, end):
+    session, modem, bridge, agent, base = setup_call
+    session.provider = "moss"
+    session._outbound_number = "10086"
+    monkeypatch.setattr(session, "_build_agent_instructions", lambda _direction: "task")
+    monkeypatch.setattr("agentcall.call_agent._MOSS_PREBRIEF_TIMEOUT", 0.05)
+    published = []
+    monkeypatch.setattr(session, "_publish", published.append)
+
+    async def run():
+        entered = asyncio.Event()
+
+        async def start(_callback):
+            entered.set()
+            if end == "failure":
+                raise RuntimeError("fake briefing failure")
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(agent, "start", start)
+        task = asyncio.create_task(session._handle_call())
+        await asyncio.wait_for(entered.wait(), 1)
+        if end == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif end == "stop":
+            session.stop()
+            await asyncio.wait_for(task, 1)
+        else:
+            with pytest.raises(RuntimeError, match="MOSS"):
+                await asyncio.wait_for(task, 1)
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+
+    asyncio.run(run())
+    assert not modem.calls
+    assert agent.stopped and not bridge.started and not agent.said
+    if end in {"failure", "timeout"}:
+        assert any(event.get("status") == "error" for event in published)
+        assert any(event["type"] == "moss_prebrief_failed" for event in events(base))
+
+
+def test_moss_inbound_still_answers_while_briefing_is_pending(setup_call, monkeypatch):
+    session, modem, bridge, agent, base = setup_call
+    session.provider = "moss"
+    original_start = agent.start
+
+    async def start(callback):
+        await asyncio.sleep(0.06)
+        assert "answer" in modem.call_names()
+        await original_start(callback)
+
+    monkeypatch.setattr(agent, "start", start)
+    asyncio.run(session._handle_call())
+    recorded = events(base)
+    assert "dial" not in modem.call_names()
+    assert not any(event.get("stage") == "moss_prebrief" for event in recorded)
+    assert next(event["ms"] for event in recorded if event.get("stage") == "moss_answered_wait") > 0
+    assert agent.stopped and bridge.stopped
+
+
+@pytest.mark.parametrize("provider", ["local", "moss"])
+def test_response_playout_metric_same_tail_and_hardware_boundary(setup_call, monkeypatch, provider):
+    session, _modem, bridge, agent, _base = setup_call
+    session.provider = provider
+    clock = [101.0]
+    monkeypatch.setattr("agentcall.call_agent.time.monotonic", lambda: clock[0])
+    session._last_voiced_at = 100.0
+    session._max_turn_seconds = 0
+    bridge.set_output_observer(lambda _pcm: None)
+    latencies = []
+
+    class Record:
+        def log_latency(self, stage, ms):
+            latencies.append((stage, ms))
+
+    handler = session._make_agent_audio_handler(agent, bridge, Record(), record_at_playout=True)
+    handler(agent.reply_pcm)
+    assert ("local_response", 1000) in latencies
+    assert not any(stage == "local_response_playout" for stage, _ms in latencies)
+    clock[0] = 102.0
+    session._drain_agent_audio(bridge)
+    assert latencies.count(("local_response_playout", 2000)) == 1
+
+
+def test_moss_loopback_call_writes_metrics_and_transcripts(setup_call, monkeypatch):
+    from test_moss_agent import action, finish_briefing, moss_server
+
+    from agentcall.agents.moss_agent import MossVoiceAgent
+
+    session, modem, bridge, _fake_agent, base = setup_call
+    session.provider = "moss"
+    session._outbound_number = "10086"
+    session._outbound_task_value = "test balance inquiry"
+    monkeypatch.setenv("DTMF_JUDGE_MODE", "off")
+    monkeypatch.setenv("OWNER_NAME", "Test Owner")
+    monkeypatch.setenv("BARGE_IN_ENABLED", "false")
+    monkeypatch.setenv("WRAP_UP_JUDGE_GRACE_SECONDS", "9999")
+    # Restore the real phone loop; only modem, bridge, TTS and remote server are fake.
+    monkeypatch.setattr(session, "_run_agent_loop", CallSession._run_agent_loop.__get__(session))
+
+    async def synthesize(text):
+        assert text.startswith("接下来你要替我给10086打电话test balance in。")
+        assert "Test Owner" not in text and "test balance inquiry" not in text
+        return b"\x01\x02" * 320
+
+    monkeypatch.setattr("agentcall.agents.moss_agent.synthesize_briefing", synthesize)
+
+    async def run():
+        async with moss_server() as (url, connected, received):
+            agent = MossVoiceAgent("fake-moss-key", url)
+
+            def dial(number):
+                assert agent._ready and agent._brief_done.done()
+                modem.calls.append(("dial", (number,)))
+                modem.connected_flag.set()
+
+            monkeypatch.setattr(modem, "dial", dial)
+            monkeypatch.setattr("agentcall.call_agent.create_agent", lambda _provider: agent)
+            call = asyncio.create_task(session._handle_call())
+            ws = await connected
+            try:
+                update = await action(received, "session.update")
+                instructions = update["session"]["instructions"]
+                assert instructions == update["session"]["persona"]["prompt"]
+                assert "Test Owner" in instructions and "test balance inquiry" in instructions
+                assert not modem.calls and not bridge.started
+                # start() is owned by the CallSession, so wait on readiness separately.
+                async def ready():
+                    while not agent._ready:
+                        await asyncio.sleep(0.001)
+                await finish_briefing(ws, received, asyncio.create_task(ready()))
+                bridge.feed_uplink(b"\x00\x10" * 160)
+                async with asyncio.timeout(2):
+                    while session._last_voiced_at == 0:
+                        await asyncio.sleep(0.001)
+                await ws.send_json({"action": "input.speech.stopped", "data": {}})
+                await ws.send_json({"action": "input.transcript.done", "data": {"text": "test question"}})
+                context = {"chunk_id": "c", "run_id": "r", "turn_id": "t"}
+                await ws.send_json({"action": "response.audio.context", "data": context})
+                await ws.send_bytes(b"\x10\x20" * 960)
+                await ws.send_json({"action": "output.transcript.done", "data": {"text": "test answer"}})
+                await ws.send_json({"action": "response.audio.done", "data": {}})
+                await action(received, "playback.chunk.completed")
+                await action(received, "playback.completed")
+                session.stop()
+                await asyncio.wait_for(call, 2)
+            finally:
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+
+    asyncio.run(run())
+    metrics = json.loads((next(base.iterdir()) / "metrics.json").read_text())
+    for name in ("local_response_latency_ms", "local_response_playout_ms", "moss_input_stop_to_audio_ms",
+                 "moss_briefing_ms", "moss_answered_wait_ms", "moss_prebrief_ms"):
+        assert metrics["latency"][name]["n"] == 1
+    assert metrics["answered_to_first_playout_ms"] >= 0
+    assert metrics["latency"]["moss_answered_wait_ms"]["median"] == 0
+    assert session._barge_in  # MOSS remains full duplex even with the generic switch off.
+    transcript_events = [event for event in events(base) if event["type"] == "transcript"]
+    assert [event["text"] for event in transcript_events] == ["test question", "test answer"]
+    assert b"".join(bridge.downlink) == b"\x10\x20" * 160
+
+
+@pytest.mark.parametrize("failure", ["update", "response", "timeout"])
+def test_moss_loopback_prebrief_failure_never_dials(setup_call, monkeypatch, failure):
+    from test_moss_agent import moss_server, next_matching
+
+    from agentcall.agents.moss_agent import MossVoiceAgent
+
+    session, modem, bridge, _agent, base = setup_call
+    session.provider = "moss"
+    session._outbound_number = "10086"
+    monkeypatch.setattr("agentcall.call_agent._MOSS_PREBRIEF_TIMEOUT", 0.15)
+
+    async def synthesize(_text):
+        return b"\x01\x02" * 320
+
+    monkeypatch.setattr("agentcall.agents.moss_agent.synthesize_briefing", synthesize)
+
+    async def run():
+        async with moss_server(update_error="rejected" if failure == "update" else None) as (url, connected, received):
+            agent = MossVoiceAgent("fake-moss-key", url)
+            monkeypatch.setattr("agentcall.call_agent.create_agent", lambda _provider: agent)
+            call = asyncio.create_task(session._handle_call())
+            try:
+                ws = await asyncio.wait_for(connected, 1)
+                if failure == "response":
+                    await next_matching(received, lambda value: isinstance(value, bytes) and any(value))
+                    await ws.send_json({"action": "response.ended", "data": {"status": "failed"}})
+                with pytest.raises(RuntimeError, match="MOSS"):
+                    await asyncio.wait_for(call, 1)
+                assert not agent._tasks and agent._ws is None
+            finally:
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+
+    asyncio.run(run())
+    assert not modem.calls and not bridge.started
+    recorded = events(base)
+    assert any(event["type"] == "moss_prebrief_failed" for event in recorded)
+    assert next(event for event in recorded if event["type"] == "ended")["status"] == "failed"
