@@ -1025,7 +1025,10 @@ def test_moss_outbound_briefing_finishes_before_dial(setup_call, monkeypatch, br
     assert wait == 0
     prebrief = next(event["ms"] for event in events(base)
                    if event["type"] == "latency" and event["stage"] == "moss_prebrief")
-    assert prebrief >= briefing_delay * 1000 - 1
+    # asyncio 的定时回调最多提前一个时钟精度触发，计时本身再差一个精度；
+    # Windows 单调时钟精度约 15.6ms（曾实测 109 < 119），macOS/Linux 接近 0。
+    clock_slack_ms = 2 * time.get_clock_info("monotonic").resolution * 1000
+    assert prebrief >= briefing_delay * 1000 - 1 - clock_slack_ms
     metrics = json.loads((next(base.iterdir()) / "metrics.json").read_text())
     assert metrics["latency"]["moss_prebrief_ms"]["n"] == 1
     assert agent.stopped and bridge.stopped
