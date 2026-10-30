@@ -1,6 +1,7 @@
 """SMAppService lifecycle tests: no native registrations or running jobs touched."""
 
 import json
+import os
 import plistlib
 import subprocess
 
@@ -276,7 +277,8 @@ def test_install_cleans_idle_legacy_then_returns_pending_without_wait(monkeypatc
     result = sm.install(layout, runner, services=native, sleep=no_sleep)
     assert result.failures[0].action == "legacy-migration-pending"
     marker = layout.support_dir / "legacy-cleanup.json"
-    assert marker.stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert marker.stat().st_mode & 0o777 == 0o600
     assert isinstance(json.loads(marker.read_text())["time"], (int, float))
     assert all(not agent.calls for agent in agents.values())
     for agent in agents.values():
