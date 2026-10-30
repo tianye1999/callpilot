@@ -445,7 +445,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 0 = 不限制。（正常收尾由 summarizer.judge_wrap_up 提前判定。）
     # 长通话场景（客服排队）不改这里——用 number_profiles 的 max_call_seconds
     # 按场景覆盖（WIL-120 一期），全局保持安全默认。
-    ConfigSpec("OUTBOUND_MAX_SECONDS", "外呼最长时长（秒）", "int", "150"),
+    ConfigSpec("OUTBOUND_MAX_SECONDS", "外呼最长时长（秒）", "int", "600"),
     # 来电缺失 NO CARRIER 且 CLCC 轮询也停活时的会话级最后防线。
     ConfigSpec("INBOUND_MAX_SECONDS", "来电最长时长（秒）", "int", "1800"),
     ConfigSpec("WRAP_UP_JUDGE_GRACE_SECONDS", "收尾裁判首次等待（秒）", "float", "20.0",

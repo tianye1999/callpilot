@@ -264,7 +264,7 @@ def check_normal_ending(events: Sequence[Event], meta: Event | None = None) -> C
     # 上限 = 外呼硬时限 + 收尾余量：到点后还要跨一个判定 tick、说完告别语、
     # 延迟挂断（HANGUP_TOOL_DELAY 默认 4.5s）再落盘。真机实测兜底收尾最长 170.5s
     # （2026-07-10），余量 20s 会把正常兜底误伤成 FAIL——放宽到 30s。
-    max_duration = float(os.environ.get("OUTBOUND_MAX_SECONDS", "150") or 150) + 30
+    max_duration = float(os.environ.get("OUTBOUND_MAX_SECONDS", "600") or 600) + 30
     if duration is None:
         failures.append("无法确定通话时长")
     elif duration >= max_duration:

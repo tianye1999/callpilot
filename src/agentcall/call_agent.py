@@ -1546,7 +1546,7 @@ class CallSession:
         last_judge_at = loop_started
         if record is not None and self._outbound_number is not None:
             # 生效时限随通落盘（WIL-95 归因惯例）：没有这条，长通话演练的
-            # 指标就无法区分「配置放开了」和「默认 150s 恰好没触发」。
+            # 指标就无法区分「配置放开了」和「默认时限恰好没触发」。
             try:
                 record.log_event(
                     "call_limits",
