@@ -415,7 +415,8 @@ def close_bundled_window(support: Path) -> None:
                             (time.monotonic() - started) * 1000)
                 return
         elapsed = time.monotonic() - started
-        sig = (signal.SIGKILL if elapsed >= 3.3 and not sent_kill else
+        # Windows 没有 SIGKILL；该兜底只在 macOS 身份核验通过后才会真正发信号。
+        sig = (getattr(signal, "SIGKILL", signal.SIGTERM) if elapsed >= 3.3 and not sent_kill else
                signal.SIGTERM if elapsed >= 2.5 and not sent_term else None)
         if sig is not None and identity is not None and pid is not None:
             # 不能只信 PID 文件，更不能按进程名批量杀：任何身份/持锁人变化都停止升级。
