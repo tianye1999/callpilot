@@ -111,7 +111,7 @@ def test_check_at_start_and_every_24_hours(tmp_path):
 def test_version_is_pyproject_snapshot_and_notes_are_bundled():
     from agentcall.app_version import RELEASE_NOTES, VERSION
 
-    assert VERSION == "26.10.2"
+    assert VERSION == "26.10.3"
     assert RELEASE_NOTES["zh"] and RELEASE_NOTES["en"]
 
 

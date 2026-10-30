@@ -1,9 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../src/edge-room", () => ({ EdgeRoom: class {} }));
-
-import worker from "../src/index";
-import type { Env } from "../src/types";
+import worker, { type Env } from "../src/sim-api";
 
 const endpoint = "https://example.test/v1/releases/latest";
 const query = "?product=physical-sim&platform=macos";
@@ -85,7 +82,12 @@ describe("GET /v1/releases/latest", () => {
       const { env } = releaseEnv({ ...release, download_url: downloadUrl });
       const response = await worker.fetch(new Request(endpoint + query), env);
       expect(response.status).toBe(500);
-      expect(await response.json()).toMatchObject({ error: { code: "INTERNAL_ERROR" } });
+      expect(await response.json()).toEqual({
+        error: {
+          code: "INTERNAL_ERROR", message: "The request could not be completed",
+          requestId: expect.stringMatching(/^req_/)
+        }
+      });
       expect(response.headers.get("Cache-Control")).toBe("no-store");
     }
   );
@@ -116,5 +118,52 @@ describe("GET /v1/releases/latest", () => {
     expect(prepare).toHaveBeenCalledOnce();
     expect(log).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled();
+  });
+});
+
+describe("SIM API routing", () => {
+  it("serves health without accessing D1", async () => {
+    const { env, prepare } = releaseEnv();
+    const response = await worker.fetch(new Request("https://example.test/healthz"), env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it.each(["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])(
+    "rejects %s on health with Allow: GET", async (method) => {
+      const { env, prepare } = releaseEnv();
+      const response = await worker.fetch(new Request("https://example.test/healthz", { method }), env);
+      expect(response.status).toBe(405);
+      expect(response.headers.get("Allow")).toBe("GET");
+      expect(prepare).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(["/", "/v1/releases", "/v1/admin/enrollment-invites", "/v1/edges/connect", "/unknown"])(
+    "returns JSON 404 for %s without accessing D1", async (path) => {
+      const { env, prepare } = releaseEnv();
+      const response = await worker.fetch(new Request(`https://example.test${path}`), env);
+      expect(response.status).toBe(404);
+      expect(await response.json()).toMatchObject({ error: { code: "NOT_FOUND" } });
+      expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+      expect(prepare).not.toHaveBeenCalled();
+    }
+  );
+
+  it("does not expose storage errors", async () => {
+    const { env, prepare } = releaseEnv();
+    prepare.mockImplementation(() => { throw new Error("private database details"); });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const response = await worker.fetch(new Request(endpoint + query), env);
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "INTERNAL_ERROR", message: "The request could not be completed",
+        requestId: expect.stringMatching(/^req_/)
+      }
+    });
+    expect(JSON.stringify(log.mock.calls)).not.toContain("private database details");
   });
 });

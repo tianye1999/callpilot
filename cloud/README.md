@@ -7,6 +7,11 @@ gate and closed-Beta allowlist are both enabled, it can relay one bounded SMS or
 normalized call-history response in memory. It never stores those bodies,
 transcripts, summaries, recordings, or audio in D1 or Durable Object storage.
 
+**Never deploy the shared `callpilot-cloud-beta` Worker from this repository.**
+Its maintained deployment source is in a separate checkout and contains modules
+not present here; deploying this copy would overwrite that implementation. The
+Physical-SIM release API below has its own Worker, domain, and D1 database.
+
 ## Local verification
 
 ```bash
@@ -14,29 +19,20 @@ cd cloud
 npm ci
 npm run check
 npx wrangler deploy --dry-run
+npx wrangler deploy --dry-run -c wrangler.sim-api.jsonc
 ```
 
 `npm run check` includes TypeScript, ESLint, unit tests, and a local Wrangler
 integration flow covering one-time enrollment, pairing, Origin enforcement,
 Edge WSS presence, idempotent call creation, LiveKit token brokering, and device
-revocation.
+revocation, plus a separate local SIM API integration flow with isolated D1 data.
 
-## First staging deployment
+## Shared staging operations
 
-Never place values in `wrangler.jsonc` or `.dev.vars.example`.
-
-```bash
-cd cloud
-npx wrangler login
-npx wrangler d1 create callpilot-cloud-beta
-# Replace only database_id in wrangler.jsonc with the returned UUID.
-npx wrangler d1 migrations apply callpilot-cloud-beta --remote
-npx wrangler secret put ADMIN_TOKEN
-npx wrangler secret put LIVEKIT_API_KEY
-npx wrangler secret put LIVEKIT_API_SECRET
-npx wrangler secret put LIVEKIT_URL
-npx wrangler deploy
-```
+Shared-Worker deployment, migrations, and secret changes belong to its maintainer
+and authoritative checkout, not this repository. The shared rollout notes below
+are architectural context, not instructions to deploy this copy. Never place
+secret values in `wrangler.jsonc` or `.dev.vars.example`.
 
 The Beta staging Worker is attached to `dial-beta.bondings.ai` and
 `api-beta.bondings.ai`. Attach `dial.bondings.ai` and `api.bondings.ai` only
@@ -100,9 +96,17 @@ tokens while delivery is disabled.
 
 ## Physical-SIM app releases
 
-`GET /v1/releases/latest?product=physical-sim&platform=macos` is public and
+The independent `callpilot-sim-api` Worker serves `sim-api.bondings.ai` in the
+same Cloudflare account, using only its own D1 database `callpilot-sim-api`.
+Its config is `wrangler.sim-api.jsonc`, entry point is `src/sim-api.ts`, and
+migrations live in `sim-api-migrations/`. It reuses this directory's npm project,
+TypeScript and ESLint setup. It has no assets, Durable Objects, or secrets;
+observability and `workers.dev` are disabled.
+
+`GET https://sim-api.bondings.ai/v1/releases/latest?product=physical-sim&platform=macos` is public and
 read-only. It does not read identity headers, authenticate a device, or write
-audit/content records. There is no release write endpoint.
+audit/content records. `GET /healthz` returns `{"ok":true}`. These are the only
+routes: other paths return JSON 404. There is no release write endpoint.
 
 Both parameters are required, must occur exactly once, and accept 1-64 lowercase
 ASCII letters/digits with single internal hyphens (for example `physical-sim`
@@ -131,30 +135,35 @@ or 500 `INTERNAL_ERROR` for storage failures or an invalid stored download URL.
 Only HTTPS download URLs are returned. The migration rejects non-`https://`
 prefixes; the reader additionally validates the full URL and fails closed.
 
-### Owner-operated deployment
+### Maintainer-operated deployment
 
-This is the shared US-line Worker, not a separate Physical-SIM backend. The
-following are future operator steps, not part of local verification. The owner
-must authorize deployment and log in with `npx wrangler login` if required.
+The following are future maintainer steps requiring separate owner authorization,
+not part of local verification. **Never deploy `callpilot-cloud-beta` from this
+repository.** Always specify `-c wrangler.sim-api.jsonc` for SIM API operations;
+bare `wrangler deploy` and `npm run deploy` target the shared Worker and must not
+be used. Do not reuse its database ID or apply `cloud/migrations/` to the SIM API.
 
-1. From `cloud/`, run `npx wrangler deployments list` **before migrations or
-   deployment**. Record the active deployment/version IDs and match them to the
-   source commit in the deployment record. Confirm the local candidate is that
-   deployed source plus only the approved release API changes. A deployment list
-   alone does not prove source equality: stop if the commit mapping is missing,
-   there is unexplained drift, or unrelated local cloud changes would be shipped.
-   Preserve the previous version ID for rollback.
-2. Run `npm run check` and `npx wrangler deploy --dry-run`. Inspect
-   `npx wrangler d1 migrations list callpilot-cloud-beta --remote`; confirm
-   migrations 0001-0008 are already applied and only the reviewed 0009 is pending.
-   Stop on unexpected pending migrations. Apply the additive table/index first:
-   `npx wrangler d1 migrations apply callpilot-cloud-beta --remote`.
-3. Run `npx wrangler deploy` only after migration success. Verify the deployment
-   ID, `/healthz`, the new endpoint (404 is expected before seeding), and the
-   existing US-line enrollment/pairing/call flow using its approved acceptance
-   procedure. Local tests do not replace that production acceptance gate.
-4. Insert the approved release row using the example below, then GET the exact
-   product/platform combination and check every field and the cache header.
+1. From `cloud/`, verify the intended Cloudflare account and authentication, then
+   create the independent database once:
+   `npx wrangler d1 create callpilot-sim-api -c wrangler.sim-api.jsonc`.
+2. Replace the all-zero `database_id` placeholder in `wrangler.sim-api.jsonc`
+   with the real ID returned by that command. Stop if it is still a placeholder
+   or points to the shared database. Run `npm run check` and
+   `npx wrangler deploy --dry-run -c wrangler.sim-api.jsonc`; verify the bundle
+   targets `callpilot-sim-api`, `sim-api.bondings.ai`, and only the dedicated DB.
+3. Apply the dedicated schema:
+   `npx wrangler d1 migrations apply callpilot-sim-api --remote -c wrangler.sim-api.jsonc`.
+   Only `sim-api-migrations/0001_app_releases.sql` is expected on first setup.
+   Stop on any unexpected migration or target.
+4. Deploy only the independent Worker:
+   `npx wrangler deploy -c wrangler.sim-api.jsonc`.
+   Record its deployment ID and source commit; on subsequent releases, preserve
+   its previous version ID for rollback. Check `https://sim-api.bondings.ai/healthz`
+   and expect 404 from the release endpoint before its first row is published.
+5. Write the approved release row below to the independent D1 database.
+6. Use the curl commands below to read it back. Verify every response field,
+   HTTPS download URL, and `Cache-Control: public, max-age=300`. Local tests and
+   dry-runs do not replace this production acceptance gate.
 
 Maintainers write release data directly to D1. Replace every `REPLACE_WITH_*`
 value; timestamps must be unquoted epoch-millisecond integers. Use an approved,
@@ -164,17 +173,22 @@ quote becomes two single quotes); also quote shell metacharacters safely. Do not
 paste untrusted notes directly into a shell command.
 
 ```bash
-npx wrangler d1 execute callpilot-cloud-beta --remote --command "INSERT INTO app_releases (product, platform, version, published_at, notes_zh, notes_en, download_url, created_at) VALUES ('physical-sim', 'macos', 'REPLACE_WITH_VERSION', REPLACE_WITH_PUBLISHED_AT_MS, 'REPLACE_WITH_ZH_NOTES', 'REPLACE_WITH_EN_NOTES', 'https://downloads.example.com/REPLACE_WITH_ARTIFACT.dmg', REPLACE_WITH_CREATED_AT_MS)"
+npx wrangler d1 execute callpilot-sim-api --remote -c wrangler.sim-api.jsonc --command "INSERT INTO app_releases (product, platform, version, published_at, notes_zh, notes_en, download_url, created_at) VALUES ('physical-sim', 'macos', 'REPLACE_WITH_VERSION', REPLACE_WITH_PUBLISHED_AT_MS, 'REPLACE_WITH_ZH_NOTES', 'REPLACE_WITH_EN_NOTES', 'https://downloads.example.com/REPLACE_WITH_ARTIFACT.dmg', REPLACE_WITH_CREATED_AT_MS)"
+
+curl --fail-with-body -i https://sim-api.bondings.ai/healthz
+curl --fail-with-body -i 'https://sim-api.bondings.ai/v1/releases/latest?product=physical-sim&platform=macos'
 ```
 
 The `(product, platform, version)` primary key rejects duplicate versions; this
 example deliberately does not overwrite an existing row. A corrected/new row
 can take up to 300 seconds to appear to clients with cached responses. HTTPS is
 not an artifact authenticity check: the maintainer must verify the host, file,
-and signing before publishing. If the shared Worker regresses, the owner should
-roll back to the recorded previous Worker version using the normal deployment
-procedure; leave the additive `app_releases` table in place. No existing tables,
-credentials, feature flags, routes, or observability settings need changing.
+and signing before publishing. If the SIM API regresses, the maintainer should
+roll back only `callpilot-sim-api` to its recorded previous version; leave its
+additive `app_releases` table in place. On first deployment there is no previous
+version: stop publication and keep client update checks disabled until corrected.
+No shared Worker, database, credentials, feature flags, routes, or observability
+settings need changing.
 
 ## Rollback
 

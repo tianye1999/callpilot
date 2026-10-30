@@ -29,4 +29,5 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npx wrangler deploy --dry-run
+      - run: npx wrangler deploy --dry-run -c wrangler.sim-api.jsonc
 

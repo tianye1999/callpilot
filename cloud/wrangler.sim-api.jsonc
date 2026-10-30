@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "callpilot-sim-api",
+  "main": "src/sim-api.ts",
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "sim-api.bondings.ai", "custom_domain": true }
+  ],
+  "compatibility_date": "2026-07-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": false
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "callpilot-sim-api",
+      // Real ID of the independent D1 created on 2026-10-30 (callpilot-sim-api).
+      "database_id": "3f5bdad2-7258-436c-8924-050161364c2b",
+      "migrations_dir": "sim-api-migrations"
+    }
+  ]
+}

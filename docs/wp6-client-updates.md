@@ -9,7 +9,7 @@
 
 ## Update checks
 
-- Python owns HTTPS requests, with a total timeout of five seconds and redirects disabled. Default: `https://api-beta.bondings.ai/v1/releases/latest?product=physical-sim&platform=macos`.
+- Python owns HTTPS requests, with a total timeout of five seconds and redirects disabled. Default: `https://sim-api.bondings.ai/v1/releases/latest?product=physical-sim&platform=macos`.
 - `UPDATE_CHECK_ENABLED=true` by default; `UPDATE_CHECK_URL` is configurable. Invalid/non-HTTPS URLs, HTTP errors including the currently expected 404, malformed data and network errors produce no alert.
 - Checks run at service startup and every 24 hours. A local shell-open request can wake the checker; repeated startup requests within 60 seconds coalesce. Neither the web page nor tray contacts the release host.
 - `/api/meta` exposes the process version, package notes and validated `update`. Version comparison uses numeric segments, with trailing zero segments normalized.

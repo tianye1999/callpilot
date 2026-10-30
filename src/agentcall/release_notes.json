@@ -1,4 +1,4 @@
 {
-  "zh": "修复首次安装后台服务无法启动；修复从 0.6 升级时旧后台项被关闭导致卡住。",
-  "en": "Fixed background services failing to start on first install; fixed upgrades from 0.6 getting stuck when legacy background items were disabled."
+  "zh": "修复首次安装后台服务无法启动；从 0.6 升级时自动完成旧版迁移，无需手动设置；新版本提醒改用实体卡线独立服务。",
+  "en": "Fixed background services failing to start on first install; upgrades from 0.6 now finish migrating automatically with no manual setup; release alerts now use the Physical-SIM line's own service."
 }
