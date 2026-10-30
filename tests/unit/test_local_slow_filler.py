@@ -259,10 +259,24 @@ def test_new_speech_interrupts_pending_filler(rig, streaming):
     r = rig(streaming=streaming)
     old = r.agent._turn
     asyncio.run(r.agent.send_audio(b"new"))
-    assert _wait_until(lambda: old.cancelled.is_set())
+    # Keep the clock fixed and both LLM replies gated until the new request is pending.
+    assert _wait_until(lambda: (batch := r.agent._waiting_batch) is not None and batch.turn is not old)
+    new = r.agent._waiting_batch.turn
+    assert old.cancelled.is_set() and not new.cancelled.is_set()
     r.now[0] = 110.0
     r.agent._maybe_slow_filler()
-    assert not r.audio
+    # Advancing the shared clock also makes the new turn's filler legitimately due.
+    assert [e["turn_id"] for e in r.events if e["stage"] == "slow_filler"] == [new.sequence]
+    assert len(r.audio) == 1
+    assert r.pipeline.synthesized == [FILLER]
+
+    r.release.set()
+    assert _wait_until(lambda: r.agent._brain_queue.unfinished_tasks == 0)
+    r.agent._tts_queue.join()
+    assert len(r.audio) == 2
+    assert r.pipeline.synthesized == [FILLER, "好的。"]
+    assert [e["turn_id"] for e in r.events if e["stage"] == "first_pcm_written"] == [new.sequence]
+    assert not old.reply_started
 
 
 @pytest.mark.parametrize("seconds", ["-1", "nan", "inf"])
