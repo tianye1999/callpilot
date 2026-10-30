@@ -526,10 +526,12 @@ async def _remote_dialer_asset(request: web.Request) -> web.StreamResponse:
 
 
 class TrayAccessLogger(AccessLogger):
-    """仅忽略托盘探测，普通请求保留 aiohttp 的原始访问日志。"""
+    """忽略成功的本机轮询；失败、非本机及其他请求保留原始访问日志。"""
 
     def log(self, request, response, time: float) -> None:
-        if request.path == "/api/meta" and request.query.get("tray") == "1":
+        if (request.method == "GET" and response.status < 400
+                and config.is_loopback_host(request.remote or "")
+                and request.path in {"/api/meta", "/api/notify/feed"}):
             return
         super().log(request, response, time)
 

@@ -1,4 +1,4 @@
 {
-  "zh": "修复首次安装后台服务无法启动；从 0.6 升级时自动完成旧版迁移，无需手动设置；新版本提醒改用实体卡线独立服务。",
-  "en": "Fixed background services failing to start on first install; upgrades from 0.6 now finish migrating automatically with no manual setup; release alerts now use the Physical-SIM line's own service."
+  "zh": "覆盖升级后旧窗口自动换新；修复通话稳定性：接通检测更快、对方挂断不再拆桥、减少开头噪声；修正新版本检查频率；日志降噪。",
+  "en": "Old windows now refresh automatically after an in-place upgrade; call stability fixes include faster answer detection, keeping the bridge running after remote hangup, and reduced opening noise; corrected update-check frequency and reduced log noise."
 }

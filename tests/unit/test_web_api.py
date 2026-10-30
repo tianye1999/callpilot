@@ -158,7 +158,7 @@ def test_meta_version_notes_update_and_persistent_dismiss(monkeypatch, tmp_path)
         app["updates"].latest = dict(version="26.11.1", notes={"zh": "说明", "en": "Notes"},
                                      downloadUrl="https://example.test/app.dmg")
         result = await (await client.get("/api/meta?tray=1")).json()
-        assert result["version"] == "26.10.3"
+        assert result["version"] == "26.10.4"
         assert result["release_notes"]["en"]
         assert result["update"]["dismissed"] is False
         response = await client.post("/api/updates/dismiss", json={"version": "26.11.1"})
@@ -418,15 +418,22 @@ def test_setup_scan_shares_lock_and_log_fields(monkeypatch, caplog):
         assert field in line
 
 
-def test_access_logger_suppresses_only_tray_probe(monkeypatch):
+@pytest.mark.parametrize("remote", ["127.0.0.1", "::1", "192.0.2.1", None])
+@pytest.mark.parametrize("status", [200, 401, 500])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_access_logger_suppresses_only_successful_local_polls(monkeypatch, remote, status, method):
     from aiohttp.web_log import AccessLogger
 
     seen = []
     monkeypatch.setattr(AccessLogger, "log", lambda self, request, response, elapsed: seen.append(request.path_qs))
     log = server.TrayAccessLogger(__import__("logging").getLogger("test"), "%r")
-    for path in ("/api/meta?tray=1", "/api/meta", "/api/meta?tray=0", "/api/other?tray=1"):
-        log.log(make_mocked_request("GET", path), None, 0.1)
-    assert seen == ["/api/meta", "/api/meta?tray=0", "/api/other?tray=1"]
+    polls = ["/api/meta?tray=1", "/api/meta", "/api/meta?tray=0", "/api/notify/feed?after=1&epoch=test"]
+    others = ["/api/other?tray=1", "/api/updates/check", "/api/notify/feed/other"]
+    for path in polls + others:
+        request = make_mocked_request(method, path).clone(remote=remote)
+        log.log(request, SimpleNamespace(status=status), 0.1)
+    quiet = method == "GET" and status < 400 and remote in {"127.0.0.1", "::1"}
+    assert seen == (others if quiet else polls + others)
 
 
 @pytest.mark.parametrize("source", ["tray", "setup"])
@@ -517,14 +524,14 @@ def test_tray_access_log_integration(monkeypatch, caplog):
         await test_server.start_server(access_log_class=server.TrayAccessLogger,
                                        access_log=logging.getLogger("test.tray.access"))
         async with TestClient(test_server) as client:
-            for path in ("/api/meta?tray=1", "/api/meta"):
+            for path in ("/api/meta?tray=1", "/api/meta", "/api/notify/feed?after=0&epoch=test", "/api/not-found"):
                 await (await client.get(path)).read()
 
     with caplog.at_level(logging.INFO, logger="test.tray.access"):
         asyncio.run(check())
     messages = [r.message for r in caplog.records if r.name == "test.tray.access"]
     assert len(messages) == 1
-    assert "GET /api/meta " in messages[0]
+    assert "GET /api/not-found " in messages[0]
 
 
 def test_meta_uses_line_owner_state_even_without_active_local_session(monkeypatch):

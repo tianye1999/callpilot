@@ -697,7 +697,9 @@ def setup_required() -> bool:
 
 def runtime_meta(provider: str, model: str, port: str) -> dict:
     """Build /api/meta payload with non-fatal configuration readiness."""
-    if provider == "local":
+    if provider == "moss":
+        model = "MOSS-Live（实验）"
+    elif provider == "local":
         model = (
             f"本地 · {get_str('LOCAL_LLM_MODEL')} + "
             f"{get_str('LOCAL_TTS_MODEL')}#{get_int('LOCAL_TTS_SPEAKER_ID')}"

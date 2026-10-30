@@ -51,6 +51,8 @@ logging.basicConfig(level=logging.INFO)
 directory = Path(sys.argv[2])
 if sys.argv[1] == "service":
     import app
+    from agentcall.macos_shell import configure_shell_logging
+    configure_shell_logging("service", directory)
     app.load_dotenv = lambda *args: None
     app._force_utf8 = lambda: None
     app.config.log_dir = lambda: directory
@@ -79,6 +81,37 @@ assert len(handlers) == 1
 assert handlers[0].maxBytes == 5 * 1024 * 1024 and handlers[0].backupCount == 3
 assert handlers[0].encoding == "utf-8"
 assert "file logging marker" in path.read_text(encoding="utf-8")
+if sys.argv[1] == "service":
+    import traceback
+    logging.info("info logging marker")
+    try:
+        raise RuntimeError("logged exception marker")
+    except RuntimeError:
+        logging.exception("caught exception")
+    shell_log = (directory / "service.log").read_text(encoding="utf-8")
+    app_log = path.read_text(encoding="utf-8")
+    for marker in ("file logging marker", "info logging marker", "RuntimeError: logged exception marker"):
+        assert app_log.count(marker) == 1
+        assert marker not in shell_log
+    assert "[INFO] root: info logging marker" in app_log
+    try:
+        raise RuntimeError("direct traceback marker")
+    except RuntimeError:
+        traceback.print_exc()
+    def fail():
+        raise RuntimeError("uncaught thread marker")
+    import threading
+    thread = threading.Thread(target=fail)
+    thread.start()
+    thread.join()
+    try:
+        raise RuntimeError("uncaught main marker")
+    except RuntimeError:
+        sys.excepthook(*sys.exc_info())
+    shell_log = (directory / "service.log").read_text(encoding="utf-8")
+    for marker in ("direct traceback marker", "uncaught thread marker", "uncaught main marker"):
+        assert marker in shell_log
+    assert "Traceback (most recent call last)" in shell_log
 ''', entry, str(tmp_path)], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -272,10 +305,12 @@ def test_ensure_launchd_forwards_user_launch_flag(monkeypatch, tmp_path, user_in
     monkeypatch.setattr(tray_app.sys, "platform", "darwin")
     monkeypatch.setattr(macos_launchd, "make_layout", lambda *args, **kwargs: tmp_path)
     monkeypatch.setattr(macos_upgrade, "reconcile", lambda *args, **kwargs: calls.append(kwargs))
-    monkeypatch.setattr(macos_upgrade, "_lease_request", lambda *args: {})
+    checks = []
+    monkeypatch.setattr(macos_upgrade, "_lease_request", lambda *args: checks.append(args) or {})
     tray_app._ensure_launchd_installed(user_initiated=user_initiated)
     assert calls[0]["user_initiated"] is user_initiated
     assert callable(calls[0]["acquire"])
+    assert checks == ([(tray_app.web_url(), "check", {})] if user_initiated else [])
 
 
 @pytest.fixture

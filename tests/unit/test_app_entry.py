@@ -29,7 +29,7 @@ class FakeTimer:
         self.callback()
 
 
-@pytest.mark.parametrize("provider", ["local", "qwen", "openai", "doubao"])
+@pytest.mark.parametrize("provider", ["local", "qwen", "openai", "doubao", "moss"])
 def test_main_serves_meta_while_local_models_preload(monkeypatch, tmp_path, provider):
     entered, release = threading.Event(), threading.Event()
     threads, sites = [], []
@@ -55,7 +55,10 @@ def test_main_serves_meta_while_local_models_preload(monkeypatch, tmp_path, prov
         async with ClientSession() as client:
             async with client.get(f"http://127.0.0.1:{port}/api/meta") as response:
                 assert response.status == 200
-                assert (await response.json())["provider"] == provider
+                meta = await response.json()
+                assert meta["provider"] == provider
+                if provider == "moss":
+                    assert meta["model"] == "MOSS-Live（实验）"
         if provider == "local":
             assert entered.is_set() and threads[0].is_alive()
         else:

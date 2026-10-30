@@ -145,7 +145,9 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(), file_handler],
+        # Frozen stderr is captured by the shell into service.log as ERROR.
+        # Keep logging in app.log; leave stderr available for raw tracebacks.
+        handlers=[file_handler] if config._is_frozen() else [logging.StreamHandler(), file_handler],
         # 冻结入口或依赖可能已配置 root logger；服务必须接管自己的文件 handler。
         force=config._is_frozen(),
     )

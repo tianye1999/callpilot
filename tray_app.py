@@ -197,7 +197,8 @@ def _ensure_launchd_installed(user_initiated: bool = False):
     from agentcall import macos_launchd, macos_shell, macos_upgrade
 
     layout = macos_launchd.make_layout(sys.executable, resources_dir=_resources_dir())
-    macos_upgrade._lease_request(web_url(), "check", {})
+    if user_initiated:
+        macos_upgrade._lease_request(web_url(), "check", {})
     # tray 单元由本进程自装：声明 no_restart 防止 bootout 杀掉自己（见函数 docstring）。
     result = macos_upgrade.reconcile(
         layout, lambda: macos_shell.fetch_meta(web_url(), tray=True), user_initiated=user_initiated,
