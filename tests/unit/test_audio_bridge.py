@@ -740,7 +740,12 @@ def test_hangup_waits_for_inflight_write_then_resets_output(monkeypatch):
     caller = threading.Thread(target=silence)
     try:
         caller.start()
-        assert not silenced.wait(0.02)
+        # 握手：挂断方已置位、正等在途写；不能用「20ms 内没完成」代替。
+        deadline = time.monotonic() + 2
+        while not bridge._hangup_silenced and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert bridge._hangup_silenced
+        assert not silenced.is_set()
         release.set()
         assert silenced.wait(2)
         assert results == [2000]

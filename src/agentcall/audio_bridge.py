@@ -686,9 +686,12 @@ class SerialPcmAudioBridge(_OutputObserver):
         与打断用的 discard_pending_output 不同，这里停止静音时钟并清串口输出，
         防止旧尾音进入下一通。先等在途写完成，再清空，不能让已取出的帧漏写。
         """
+        # 先置位再等写锁：写线程落后节拍时会连续抢回锁追帧，等锁期间不置位
+        # 就会把排队的尾音补写出去（CI macOS 3.12 偶发复现）。
+        with self._tx_lock:
+            self._hangup_silenced = True
         with self._write_lock:
             with self._tx_lock:
-                self._hangup_silenced = True
                 dropped = len(self._tx_buffer)
                 self._take_output_ranges(dropped)
                 self._tx_buffer.clear()

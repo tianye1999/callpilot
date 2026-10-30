@@ -174,7 +174,7 @@ def test_sms_settle_config_matches_env_example(monkeypatch):
     assert spec.default == "30"
     assert config.get_float(spec.key) == 30
     root = Path(__file__).resolve().parents[2]
-    assert f"{spec.key}={spec.default}" in (root / ".env.example").read_text()
+    assert f"{spec.key}={spec.default}" in (root / ".env.example").read_text(encoding="utf-8")
 
 
 def test_sms_expiry_is_delivered_by_poll_maintenance(modem):
