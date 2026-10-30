@@ -262,6 +262,8 @@ def test_window_identity_requires_same_user_executable_and_window_role(monkeypat
     identity = desktop_app._window_process_identity(4242)
     assert (identity is not None) is accepted
     assert calls[0][1]["timeout"] <= 0.2
+    # 中文区域的 lstart 少一段，命令行会被切掉；必须固定 C 区域（2026-10-30 真机）。
+    assert calls[0][1]["env"]["LC_ALL"] == "C"
     if accepted:
         assert "12:34:56" in identity
 

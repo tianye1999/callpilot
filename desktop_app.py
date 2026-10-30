@@ -358,7 +358,9 @@ def _window_process_identity(pid: int) -> str | None:
     try:
         result = subprocess.run(
             ["/bin/ps", "-ww", "-p", str(pid), "-o", "uid=,lstart=,command="],
-            capture_output=True, text=True, timeout=0.2,
+            # 中文等区域设置下 lstart 是「五 10月/30 12:21:09 2026」（4 段而非 5 段），
+            # 固定 C 区域才能按 5 段切出完整命令行。
+            capture_output=True, text=True, timeout=0.2, env={**os.environ, "LC_ALL": "C"},
         )
         if result.returncode == 1 and not result.stdout.strip():
             return None  # ps 明确报告未找到该 PID。
