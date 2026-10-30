@@ -152,9 +152,9 @@ sudo systemctl start callpilot-edge.service
 ```bash
 cd ~/callpilot
 export PATH="$HOME/.local/bin:$PATH"
-bash scripts/linux/update.sh --adopt --branch product/physical-sim --dry-run
+bash scripts/linux/update.sh --adopt --branch main --dry-run
 # 仅在人工确认所有通话均已结束后：
-bash scripts/linux/update.sh --adopt --branch product/physical-sim --force
+bash scripts/linux/update.sh --adopt --branch main --force
 git status --short
 git branch -vv
 # adopt 不重启；仍运行旧版 Edge，确认持续空闲后执行首次更新：
