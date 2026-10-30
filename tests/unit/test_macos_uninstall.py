@@ -107,6 +107,19 @@ def test_native_confirmation_cancel_defaults_to_keep_data(native_worker):
     assert env.events == []
 
 
+def test_uninstall_escape_cancels_and_return_is_not_destructive(native_worker):
+    from unittest.mock import MagicMock
+
+    env = native_worker
+    uninstall_button, cancel_button = MagicMock(), MagicMock()
+    env.alert.addButtonWithTitle_.side_effect = [uninstall_button, cancel_button]
+    env.alert.runModal.return_value = 1001
+    uninstall.worker_main("http://not-accessed.invalid", None, None)
+    uninstall_button.setKeyEquivalent_.assert_called_once_with("")
+    cancel_button.setKeyEquivalent_.assert_called_once_with("\x1b")
+    assert env.events == []
+
+
 @pytest.mark.parametrize("state", [{"call_active": True}, {"call_active": False, "dial_queue_busy": True}])
 def test_worker_busy_call_or_queue_does_not_stop_or_delete(native_worker, state):
     env = native_worker

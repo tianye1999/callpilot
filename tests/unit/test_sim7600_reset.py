@@ -27,6 +27,25 @@ def test_reset_hook_claims_once_after_hangup_and_pcm_disable(modem, monkeypatch)
     assert calls == ["ATA", "AT+CPCMREG=1", "AT+CHUP", "AT+CPCMREG=0", ("reset", True)]
 
 
+@pytest.mark.parametrize("reset_enabled", [False, True])
+@pytest.mark.parametrize("attempts", [2, 3])
+def test_pcm_retry_recovery_never_competes_with_post_call_reset(modem, monkeypatch, tmp_path, reset_enabled, attempts):
+    monkeypatch.setenv("MODEM_RESET_AFTER_CALL", str(reset_enabled).lower())
+    request = tmp_path / "recovery-request"
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(request))
+    responses = iter(["ERROR"] * (attempts - 1) + ["OK"])
+    monkeypatch.setattr(modem, "_send", lambda cmd: next(responses) if cmd == "AT+CPCMREG=1" else "OK")
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda seconds: None)
+    resets = []
+    modem.on_post_call_reset(lambda: resets.append(True))
+    modem.answer()
+    modem.initialize_for_voice()
+    modem.hangup()
+    assert resets == ([True] if reset_enabled else [])
+    assert request.exists() is (attempts >= 3 and not reset_enabled)
+    assert not modem._pcm_degraded
+
+
 @pytest.mark.parametrize("case", ["disabled", "not_enabled", "idle_enable", "failed_enable"])
 def test_reset_hook_only_qualifies_a_real_pcm_enabled_call(modem, monkeypatch, case):
     requests = []

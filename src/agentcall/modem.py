@@ -295,6 +295,8 @@ class SerialModem:
         # 接听（ATA）时置位。除 _wait_connected 外，还是 CLCC「通话消失」
         # 判定的前提（见 _process_clcc_response）。
         self._call_connected_event = threading.Event()
+        self._fast_poll_until = 0.0
+        self._poll_wakeup = threading.Event()
         # CLCC 消失/失联计数：通话在线期间，有效 CLCC 连续无活跃通话、或
         # 轮询连续异常达到阈值，判定通话已丢并触发 on_hangup 收尾会话。
         # 真机事故（2026-07-08）：通话中串口断死，NO CARRIER 永远收不到，
@@ -817,12 +819,14 @@ class SerialModem:
 
     def stop_listener(self) -> None:
         self._running = False
+        self._poll_wakeup.set()
         if self._reader_thread:
             self._reader_thread.join(timeout=2)
         if self._poll_thread:
             self._poll_thread.join(timeout=2)
 
     def answer(self) -> None:
+        self._start_fast_clcc_poll()
         if config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
             with self._serial_lock:
                 self._start_release_call()
@@ -851,6 +855,7 @@ class SerialModem:
             self._clcc_absent_count = 0
             self._clcc_fail_count = 0
             self._last_dialed = number
+            self._start_fast_clcc_poll()
             # 自测禁止串口重连后的隐式重拨；普通通话沿用原有重试。
             response = self._send(f"ATD{number};") if retry else self._write_command(f"ATD{number};")
         logger.info("已拨号 -> %s", number)
@@ -960,6 +965,7 @@ class SerialModem:
             self._pcm_ready_event.set()
             self._call_connected_event.clear()
             self._connected_call_ids.clear()
+            self._fast_poll_until = 0.0
             self._clcc_absent_count = 0
             self._clcc_fail_count = 0
             if report is not None:
@@ -1358,6 +1364,7 @@ class SerialModem:
                 # 不清的话下一通会把**上一通**的号码当成本通来电（转告短信会把
                 # 错误的回拨号码写给机主，review finding #8）。None = 如实的未知。
                 self._last_caller = None
+                self._fast_poll_until = 0.0
                 if self._on_hangup:
                     self._on_hangup()
                 self._request_release_cause()
@@ -1441,12 +1448,21 @@ class SerialModem:
     # 已无法恢复、通话必然丢失，放弃等待并收尾会话（覆盖桥永久死亡场景）。
     _CLCC_FAIL_THRESHOLD = 30
 
+    def _start_fast_clcc_poll(self) -> None:
+        # 只加速接通检测，不改变 ATA 后的在线标志或来电接通状态机。
+        self._fast_poll_until = time.monotonic() + 60.0
+        self._poll_wakeup.set()
+
+    def _clcc_poll_interval(self) -> float:
+        return 0.25 if time.monotonic() < self._fast_poll_until else 2.0
+
     def _poll_call_status(self) -> None:
         while self._running:
             if self.transport_paused:
                 time.sleep(0.2)
                 continue
             generation = self._maintenance_generation
+            self._poll_wakeup.clear()
             try:
                 response = self._send("AT+CLCC")
             except Exception as exc:  # noqa: BLE001
@@ -1458,6 +1474,7 @@ class SerialModem:
                             self._clcc_fail_count = 0
                             self._call_connected_event.clear()
                             self._connected_call_ids.clear()
+                            self._fast_poll_until = 0.0
                         logger.warning(
                             "串口失联超 %d 秒且通话在线，判定通话已丢失，收尾会话",
                             self._CLCC_FAIL_THRESHOLD * 2,
@@ -1472,8 +1489,9 @@ class SerialModem:
                 continue
             self._process_clcc_response(response)
             self._hardware_call_present = bool(parse_clcc_lines(response)) or "OK" not in response
-            self.poll_signal()
-            time.sleep(2)
+            if self._clcc_poll_interval() == 2.0:
+                self.poll_signal()
+            self._poll_wakeup.wait(self._clcc_poll_interval())
 
     def _process_clcc_response(self, response: str) -> None:
         generation = self._maintenance_generation
@@ -1496,6 +1514,8 @@ class SerialModem:
                 direction = match.group("dir")
                 status = match.group("stat")
                 number = match.group("number") or None
+                if status == "0":
+                    self._fast_poll_until = 0.0
 
                 if direction == "1" and status == "4":
                     seen_incoming_ids.add(call_id)
@@ -1529,6 +1549,7 @@ class SerialModem:
                         self._clcc_absent_count = 0
                         self._call_connected_event.clear()
                         self._connected_call_ids.clear()
+                        self._fast_poll_until = 0.0
                         call_lost = True
 
         for number in pending_ring:
@@ -1693,10 +1714,9 @@ class Sim7600Modem(SerialModem):
       ``pcm_ready`` 恒 True。
     """
 
-    # 劣化检测信号：健康态 AT+CPCMREG=1 一次就 OK；劣化态要重试多次（每次 _send
-    # 读超时 3s）。真机 2026-08-12 与人耳评价完全对上——好通 2~3s/1 次即成，
-    # 坏通 9~12s/多次重试，无交叉。故「启用需要重试」即判定 PCM 子系统已劣化。
-    _DEGRADED_ENABLE_ATTEMPTS = 2
+    # 来电常在第二次 CPCMREG 才就绪，不能套用外呼「一次即成」的健康阈值，
+    # 否则每通正常来电后都会误触发约 100 秒组合切换自愈。第三次起才判劣化。
+    _DEGRADED_ENABLE_ATTEMPTS = 3
     # 通话结束后写这个哨兵文件，由 USB 桥进程读到后执行组合切换自愈（WIL-109）。
     # 只报告不自己动手：桥才是 USB 设备的持有者。
     RECOVERY_REQUEST_PATH = modem_hardware.RECOVERY_REQUEST_PATH
@@ -1926,7 +1946,7 @@ class Sim7600Modem(SerialModem):
                     "PCM-over-USB 语音通道已启用 (AT+CPCMREG=1，第 %d 次)", attempts
                 )
                 if attempts >= self._DEGRADED_ENABLE_ATTEMPTS:
-                    # 启用要重试 = 模组已劣化（对端会听到卡顿），标记待恢复；
+                    # 多次重试才就绪，标记待恢复；一次重试仍属来电正常波动。
                     # 真正的恢复在通话结束时请求，绝不打断进行中的通话。
                     self._pcm_degraded = True
                     logger.warning(
@@ -1972,6 +1992,11 @@ class Sim7600Modem(SerialModem):
         if not self._pcm_degraded:
             return
         self._pcm_degraded = False
+        if (self._on_post_call_reset is not None and self._voice_call_armed and self._call_pcm_enabled
+                and config.get_bool("MODEM_RESET_AFTER_CALL")):
+            # hangup 随后取得 CRESET 所有权；不能同时让桥拆掉它正在使用的 AT 口。
+            logger.info("PCM 劣化由通话后 CRESET 接管，不并发请求 USB 组合恢复")
+            return
         try:
             Path(self.RECOVERY_REQUEST_PATH).write_text(
                 f"degraded at {time.time():.0f}\n", encoding="utf-8"

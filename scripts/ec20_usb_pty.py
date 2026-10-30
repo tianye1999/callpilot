@@ -15,6 +15,7 @@ import logging
 import logging.handlers
 import os
 import pty
+import re
 import select
 import signal
 import sys
@@ -42,8 +43,10 @@ logger = logging.getLogger("ec20_usb_pty")
 VID = modem_hardware.PRESETS[0].vid
 PID = modem_hardware.PRESETS[0].pid
 
-# 连续写超时容忍上限：≤此值视作瞬时忙丢帧继续，超过判定设备掉线拆桥重连。
+# 连续写超时先容忍三次；超过后，PCM 还需结合 AT 活性判断是否拆桥。
 PTY_WRITE_TIMEOUT_TOLERANCE = 3
+# 对端挂断后仍可能有残余 PCM 写入。AT 仍响应就只丢帧，不能凭超时次数拆桥。
+AT_ALIVE_WINDOW_SECONDS = 5.0
 # USB→PTY 每块数据的总背压预算，容忍服务短暂调度迟滞但不无限等待。
 USB_TO_PTY_WRITE_TIMEOUT = 0.5
 PTY_TO_USB_WRITE_TIMEOUT = 1.0
@@ -373,9 +376,43 @@ def find_at_port_dynamic(
     return None, None
 
 
+def composition_matches(dev: usb.core.Device, response: str, target_pid: int) -> bool:
+    """回读会滞后于重新枚举；有总线 PID 时绝不让旧回读覆盖它。"""
+    bus_pid = getattr(dev, "idProduct", None)
+    if isinstance(bus_pid, int):
+        return bus_pid == target_pid
+    match = re.search(r"\+CUSBPIDSWITCH:\s*(?:0x)?([0-9a-fA-F]{4})\b", response)
+    return match is not None and int(match[1], 16) == target_pid
+
+
+def confirm_composition(vid: int, target_pid: int, timeout: float) -> tuple[bool, str]:
+    """重新找 AT 口并逐轮回读，容忍枚举期间暂时失联；零窗口也检查一次。"""
+    deadline = time.monotonic() + timeout
+    evidence = "未找到 AT 口"
+    while True:
+        dev, port = find_at_port_dynamic(vid, timeout=max(0.01, min(30.0, deadline - time.monotonic())))
+        if dev is not None:
+            try:
+                if port is not None:
+                    reply = at_on_interface(dev, port, "AT+CUSBPIDSWITCH?")
+                    evidence = f"bus_pid={getattr(dev, 'idProduct', None)!r}, read_back={reply.strip()!r}"
+                    if composition_matches(dev, reply, target_pid):
+                        logger.info("USB 组合确认 %04x：%s", target_pid, evidence)
+                        return True, evidence
+            except usb.core.USBError:
+                evidence = "回读时 USB 正在重新枚举"
+            finally:
+                usb.util.dispose_resources(dev)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, evidence
+        time.sleep(min(3.0, remaining))
+
+
 def usb_composition_recovery(
     vid: int, target_pid: int, alt_pid: int,
     attempts: int = 3, settle: float = 20.0,
+    confirm_grace: float = 20.0,
 ) -> bool:
     """PCM 子系统卡死的软件恢复：切到备用 USB 组合再切回，等效物理断电重插。
 
@@ -386,7 +423,8 @@ def usb_composition_recovery(
     两个真机踩过的坑，这里都必须处理：
     1. 备用组合下 AT 口不在原接口号——用 ``find_at_port_dynamic`` 动态探；
     2. 切回指令若在重枚举/启动完成前下发会返回 ``ERROR`` 并**滞留在备用组合**
-       ——故每次切换后等待 ``settle`` 秒，并**回读校验**，失败重试。
+       ——切走后等待 ``settle`` 秒，切回后逐轮回读，最多等 settle + confirm_grace。
+    回读可能比 USB 总线枚举慢，以实际 PID 为准；最后一次切回也必须确认。
     """
     logger.warning(
         "检测到 PCM 子系统卡死，开始 USB 组合切换恢复（%04x → %04x → %04x）",
@@ -399,39 +437,30 @@ def usb_composition_recovery(
             time.sleep(settle)
             continue
         current = at_on_interface(dev, port, "AT+CUSBPIDSWITCH?")
-        if f"{target_pid:04X}" in current.upper() and attempt > 1:
+        going_out = composition_matches(dev, current, target_pid)
+        if going_out and attempt > 1:
             logger.info("已回到目标组合 %04x，恢复完成", target_pid)
             usb.util.dispose_resources(dev)
             return True
         # 在目标组合上：先切走；已在备用组合（上次没切回来）：直接切回。
-        going_out = f"{target_pid:04X}" in current.upper()
         pid = alt_pid if going_out else target_pid
         logger.info("恢复第 %d 次：切换到 %04x（AT 口 interface %d）",
                     attempt, pid, port.interface)
         at_on_interface(dev, port, f"AT+CUSBPIDSWITCH={pid:04X},1,1", wait=2.0)
         usb.util.dispose_resources(dev)
-        time.sleep(settle)  # 等重枚举+固件启动，发太早会 ERROR 并卡在备用组合
+        if going_out:
+            time.sleep(settle)  # 备用组合启动完成前切回会被固件拒绝。
+            dev, port = find_at_port_dynamic(vid)
+            if dev is None or port is None:
+                logger.error("恢复第 %d 次：切走后失联，重试", attempt)
+                continue
+            logger.info("恢复第 %d 次：切回 %04x（AT 口 interface %d）",
+                        attempt, target_pid, port.interface)
+            at_on_interface(dev, port, f"AT+CUSBPIDSWITCH={target_pid:04X},1,1", wait=2.0)
+            usb.util.dispose_resources(dev)
 
-        if not going_out:
-            continue  # 本轮是切回，下一轮开头会回读校验
-
-        dev, port = find_at_port_dynamic(vid)
-        if dev is None or port is None:
-            logger.error("恢复第 %d 次：切走后失联，重试", attempt)
-            continue
-        logger.info("恢复第 %d 次：切回 %04x（AT 口 interface %d）",
-                    attempt, target_pid, port.interface)
-        at_on_interface(dev, port, f"AT+CUSBPIDSWITCH={target_pid:04X},1,1", wait=2.0)
-        usb.util.dispose_resources(dev)
-        time.sleep(settle)
-
-        dev, port = find_at_port_dynamic(vid)
-        if dev is None or port is None:
-            logger.error("恢复第 %d 次：切回后失联，重试", attempt)
-            continue
-        verify = at_on_interface(dev, port, "AT+CUSBPIDSWITCH?")
-        usb.util.dispose_resources(dev)
-        if f"{target_pid:04X}" in verify.upper():
+        confirmed, verify = confirm_composition(vid, target_pid, settle + confirm_grace)
+        if confirmed:
             logger.warning("USB 组合切换恢复成功，已回到 %04x", target_pid)
             return True
         logger.error("恢复第 %d 次：回读未确认（%r），重试", attempt, verify.strip())
@@ -476,10 +505,33 @@ def write_pty_bounded(master_fd: int, data: bytes, stop: threading.Event) -> int
     return len(remaining)
 
 
+class DeviceActivity:
+    """同一设备各桥共享的 AT 活性，不把 PCM 流量误当成 AT 响应。"""
+
+    def __init__(self, at_interface: int = 2) -> None:
+        self.at_interface = at_interface
+        self._last_at: float | None = None
+        self._lock = threading.Lock()
+
+    def mark(self, interface: int) -> None:
+        if interface == self.at_interface:
+            with self._lock:
+                self._last_at = time.monotonic()
+
+    def should_escalate(self, interface: int, consecutive: int) -> bool:
+        if consecutive <= PTY_WRITE_TIMEOUT_TOLERANCE:
+            return False
+        with self._lock:
+            at_alive = self._last_at is not None and time.monotonic() - self._last_at <= AT_ALIVE_WINDOW_SECONDS
+        # 不设 PCM_HANG_HARD_LIMIT：无法区分通话内卡死和挂断后的排空，次数再多也不能单独升级。
+        return interface not in (1, 4) or not at_alive
+
+
 def bridge_port(
     dev: usb.core.Device,
     port: UsbPort,
     link: str,
+    *, activity: DeviceActivity | None = None,
 ) -> BridgeHandle:
     master_fd, slave_fd = pty.openpty()
     stop = threading.Event()
@@ -508,6 +560,7 @@ def bridge_port(
 
     def usb_to_pty() -> None:
         last_drop_log = float("-inf")
+        drop_next_byte = False
         while not stop.is_set():
             try:
                 data = dev.read(port.bulk_in, port.max_packet, timeout=100)
@@ -524,8 +577,19 @@ def bridge_port(
             if stop.is_set():
                 return
             if data:
+                if activity is not None:
+                    activity.mark(port.interface)
                 try:
-                    dropped = write_pty_bounded(master_fd, bytes(data), stop)
+                    payload = bytes(data)
+                    parity_drop = int(drop_next_byte)
+                    if drop_next_byte:
+                        payload = payload[1:]
+                        drop_next_byte = False
+                    dropped = write_pty_bounded(master_fd, payload, stop)
+                    # AT 文本不能补丢；PCM 丢奇数字节后再补一个，累计丢失保持偶数。
+                    if port.interface in (1, 4) and dropped % 2:
+                        drop_next_byte = True
+                    dropped += parity_drop
                 except OSError as exc:
                     if not stop.is_set():
                         logger.error("interface %d PTY write failed: %s", port.interface, exc)
@@ -562,9 +626,15 @@ def bridge_port(
                         # （否则连累同桥 AT 口，通话中掉线）。但持续超时=设备可能已掉线/
                         # 重启，需拆桥触发外层重连，否则会永远空转丢帧连不回来。
                         consecutive_timeouts += 1
-                        if consecutive_timeouts <= PTY_WRITE_TIMEOUT_TOLERANCE:
+                        escalate = (activity.should_escalate(port.interface, consecutive_timeouts)
+                                    if activity is not None else consecutive_timeouts > PTY_WRITE_TIMEOUT_TOLERANCE)
+                        if not escalate:
                             if not stop.is_set():
-                                logger.warning("interface %d USB 写超时，丢帧继续", port.interface)
+                                if consecutive_timeouts <= PTY_WRITE_TIMEOUT_TOLERANCE:
+                                    logger.warning("interface %d USB 写超时，丢帧继续", port.interface)
+                                elif consecutive_timeouts == 4 or consecutive_timeouts % 10 == 0:
+                                    logger.warning("interface %d 连续写超时 %d 次，AT 仍活跃，只丢帧不拆桥",
+                                                   port.interface, consecutive_timeouts)
                             continue
                         if not stop.is_set():
                             logger.error(
@@ -645,11 +715,13 @@ def run_bridges_once(
             logger.warning("USB 复位失败（继续尝试桥接）: %s", exc)
     ports = discover_ports(dev)
     handles: list[BridgeHandle] = []
+    # 当前 EC20/SIM7600 的正常组合均使用 interface 2 作为 AT 口。
+    activity = DeviceActivity(at_interface=2)
     try:
         for iface, link in maps:
             if iface not in ports:
                 raise RuntimeError(f"接口 {iface} 不存在，可用接口: {sorted(ports)}")
-            handles.append(bridge_port(dev, ports[iface], link))
+            handles.append(bridge_port(dev, ports[iface], link, activity=activity))
 
         requested = False
         held = False

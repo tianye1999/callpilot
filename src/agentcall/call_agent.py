@@ -526,7 +526,11 @@ class CallSession:
             self._stop_triage_judge()
             # 会话收尾统一取消未触发的延迟挂断，不让它跨到下一通。
             self._cancel_hangup_timer()
-            self._loop.close()
+            try:
+                self._loop.close()
+            except Exception as exc:  # noqa: BLE001
+                # close 异常不能跳过队列通知，否则下一通一直等不到收尾。
+                logger.warning("事件循环关闭失败，继续会话收尾: %s", type(exc).__name__)
             # All resources/workers are joined. The completion callback may now
             # admit the next queued call even though this thread has not returned.
             self._parallel_agent_connect = False
@@ -647,11 +651,20 @@ class CallSession:
             # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
             # 否则第二通开始模组无 PCM 流（双向无声）。
             self.modem.initialize_for_voice(self.audio_mode)
-            # 通话内的启用结果进事件流：ok=False 即整通无声、attempts≥2 即已劣化
+            # 通话内的启用结果进事件流：ok=False 即整通无声、attempts≥3 即已劣化
             # ——WIL-95 D 组「异常掉话指纹」的蜂窝形态（CPCMREG 替代 RTP keepalive）。
             enable_info = getattr(self.modem, "last_voice_enable", None)
             if record is not None and isinstance(enable_info, dict):
                 record.log_event("pcm_enable", **enable_info)
+
+            if isinstance(enable_info, dict) and enable_info.get("ok") is False:
+                status = "failed"
+                mark("pcm_enable_failed")
+                logger.error("PCM 启用全部失败（%s 次），直接挂断，不启动音频桥", enable_info.get("attempts"))
+                self._set_active(False)
+                self.modem.hangup()
+                self._publish({"type": "call", "status": "ended", "caller": self.current_caller})
+                return
 
             bridge = create_audio_bridge(
                 modem=self.modem,

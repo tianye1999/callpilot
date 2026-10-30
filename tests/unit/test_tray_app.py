@@ -1002,18 +1002,20 @@ def test_bridge_only_records_version_after_acquiring_instance_lock(monkeypatch, 
 def test_previous_tray_handoff_releases_only_ui_singleton(monkeypatch, tmp_path):
     import json
 
+    import desktop_app
     from agentcall import macos_launchd, macos_shell
 
     (tmp_path / "tray-version.json").write_text(json.dumps({"version": "26.9.1", "handoff": True}))
     monkeypatch.setattr(macos_launchd, "app_support_dir", lambda: tmp_path)
     commands, lock = [], object()
     monkeypatch.setattr(macos_shell, "send_command", commands.append)
+    monkeypatch.setattr(desktop_app, "close_bundled_window", lambda support: commands.append("window-closed"))
     waits = []
     locks = iter([None] * 100 + [lock])
     monkeypatch.setattr(tray_app, "_acquire_tray_singleton_lock", lambda: next(locks))
     monkeypatch.setattr(tray_app.time, "sleep", waits.append)
     assert tray_app._handoff_previous_tray() is lock
-    assert commands == ["replace"]
+    assert commands == ["replace", "window-closed"]
     assert len(waits) == 100  # Ten seconds must not abandon the successor.
 
 
@@ -1037,6 +1039,7 @@ def test_same_generation_reopen_does_not_replace_tray(monkeypatch, tmp_path):
 def test_same_version_wp6_tray_still_hands_off(monkeypatch, tmp_path):
     import json
 
+    import desktop_app
     from agentcall import macos_launchd, macos_shell
     from agentcall.app_version import VERSION
 
@@ -1045,9 +1048,10 @@ def test_same_version_wp6_tray_still_hands_off(monkeypatch, tmp_path):
     monkeypatch.setattr(macos_launchd, "app_support_dir", lambda: tmp_path)
     commands, lock = [], object()
     monkeypatch.setattr(macos_shell, "send_command", commands.append)
+    monkeypatch.setattr(desktop_app, "close_bundled_window", lambda support: commands.append("window-closed"))
     monkeypatch.setattr(tray_app, "_acquire_tray_singleton_lock", lambda: lock)
     assert tray_app._handoff_previous_tray() is lock
-    assert commands == ["replace"]
+    assert commands == ["replace", "window-closed"]
 
 
 def test_uninstall_timeout_resume_wins_over_unconsumed_pause(monkeypatch, bundled_tray):

@@ -243,7 +243,7 @@ def test_sim7600_pcm_pin_failure_preserves_enable_retries(monkeypatch, caplog, f
         modem.initialize_for_voice("nmea")
 
     assert sent == ["AT+CPCMBANDWIDTH=1,1", "AT+CPCMREG=1", "AT+CPCMREG=1"]
-    assert modem.last_voice_enable == {"ok": True, "attempts": 2, "degraded": True}
+    assert modem.last_voice_enable == {"ok": True, "attempts": 2, "degraded": False}
     assert "CPCMBANDWIDTH" in caplog.text
 
 
@@ -276,15 +276,16 @@ def test_sim7600_voice_enable_snapshot_success_first_try(monkeypatch):
     assert modem.last_voice_enable == {"ok": True, "attempts": 1, "degraded": False}
 
 
-def test_sim7600_voice_enable_snapshot_marks_degraded_on_retry(monkeypatch):
-    """要重试才成 = 劣化：快照 degraded=True，与 _pcm_degraded 恢复标记一致。"""
+@pytest.mark.parametrize("attempts", [2, 3])
+def test_sim7600_voice_enable_snapshot_retry_threshold(monkeypatch, attempts):
+    """来电第二次成功属正常波动，第三次起才标记劣化。"""
     modem = make_sim7600()
-    responses = iter(["ERROR", "OK"])
+    responses = iter(["ERROR"] * (attempts - 1) + ["OK"])
     monkeypatch.setattr(modem, "_send", lambda cmd: next(responses))
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     modem.initialize_for_voice("nmea")
-    assert modem.last_voice_enable == {"ok": True, "attempts": 2, "degraded": True}
-    assert modem._pcm_degraded is True
+    assert modem.last_voice_enable == {"ok": True, "attempts": attempts, "degraded": attempts >= 3}
+    assert modem._pcm_degraded is (attempts >= 3)
 
 
 def test_sim7600_voice_enable_snapshot_records_total_failure(monkeypatch):
@@ -1278,6 +1279,56 @@ def test_answer_marks_call_connected_for_loss_detection():
     assert hangups == ["hangup"]
 
 
+@pytest.mark.parametrize("operation,direction", [("answer", 1), ("dial", 0)])
+def test_clcc_fast_poll_until_active_and_bounded(monkeypatch, operation, direction):
+    clock = [100.0]
+    monkeypatch.setattr("agentcall.modem.time.monotonic", lambda: clock[0])
+    modem = make_modem()
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+
+    def start():
+        modem.answer() if operation == "answer" else modem.dial("123")
+
+    assert modem._clcc_poll_interval() == 2
+    start()
+    assert modem._clcc_poll_interval() == 0.25
+    assert modem._poll_wakeup.is_set()  # 打断空闲期的两秒等待。
+    clock[0] += 59.9
+    assert modem._clcc_poll_interval() == 0.25
+    clock[0] += 0.1
+    assert modem._clcc_poll_interval() == 2
+    start()
+    modem._process_clcc_response(f'+CLCC: 1,{direction},0,0,0,"123",129\r\nOK')
+    assert modem._clcc_poll_interval() == 2
+    start()
+    modem.hangup()
+    assert modem._clcc_poll_interval() == 2
+    start()
+    modem._buffer = "\r\nNO CARRIER\r\n"
+    modem._process_buffer()
+    assert modem._clcc_poll_interval() == 2
+
+
+def test_poll_loop_uses_fast_cadence_then_returns_to_idle(monkeypatch):
+    modem = make_modem()
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    monkeypatch.setattr(modem, "poll_signal", lambda: None)
+    modem.dial("123")
+    delays = []
+
+    def wait(seconds):
+        delays.append(seconds)
+        if len(delays) == 1:
+            modem._process_clcc_response('+CLCC: 1,0,0,0,0,"123",129\r\nOK')
+        else:
+            modem._running = False
+
+    monkeypatch.setattr(modem._poll_wakeup, "wait", wait)
+    modem._running = True
+    modem._poll_call_status()
+    assert delays == [0.25, 2.0]
+
+
 def test_poll_failure_threshold_fires_hangup(monkeypatch):
     """通话在线期串口持续失联达阈值 → 放弃等待，收尾会话（跑真实轮询循环）。"""
     modem, hangups = _connected_modem()
@@ -1410,10 +1461,10 @@ def test_is_connected_reflects_transport_state():
 # ---- WIL-109 续：劣化检测 + 自愈请求（覆盖「收数据但播放卡」形态）----
 
 def test_sim7600_marks_degraded_when_enable_needs_retry(monkeypatch, tmp_path, caplog):
-    """CPCMREG 需重试 = 模组已劣化（真机：好通 1 次即成，坏通要重试）。"""
+    """CPCMREG 第三次才成功时，仍保留通话后的劣化恢复。"""
     modem = make_sim7600()
     monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(tmp_path / "req"))
-    responses = iter(["ERROR", "OK"])            # 第1次失败、第2次成功
+    responses = iter(["ERROR", "ERROR", "OK"])
     monkeypatch.setattr(modem, "_send", lambda cmd: next(responses))
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     with caplog.at_level(logging.WARNING):

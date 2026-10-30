@@ -432,6 +432,51 @@ def test_startup_failure_closes_every_resource(setup_call, monkeypatch, failure)
         assert bridge.stopped
 
 
+@pytest.mark.parametrize("outbound", [False, True])
+def test_serial_startup_pcm_failure_hangs_up_before_bridge(setup_call, monkeypatch, outbound):
+    session, modem, bridge, agent, base = setup_call
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", "false")
+    modem.last_voice_enable = {"ok": False, "attempts": 6, "degraded": True}
+    if outbound:
+        session._outbound_number = "123"
+
+        async def connected(mark):
+            return True
+
+        monkeypatch.setattr(session, "_connect_outbound", connected)
+    asyncio.run(session._handle_call())
+    assert modem.call_names().count("hangup") == 1
+    assert not bridge.started and not agent.started
+    assert not session.is_active
+    assert any(e["type"] == "pcm_enable_failed" for e in events(base))
+    assert next(e for e in events(base) if e["type"] == "ended")["status"] == "failed"
+
+
+def test_loop_close_failure_still_notifies_queue_once(setup_call, monkeypatch, caplog):
+    session, _modem, _bridge, _agent, _base = setup_call
+    loop = asyncio.new_event_loop()
+    close = loop.close
+    ended = []
+    session._on_ended = lambda: ended.append(session._resources_released)
+
+    async def finish():
+        pass
+
+    def failed_close():
+        raise RuntimeError("Cannot close a running event loop")
+
+    monkeypatch.setattr(session, "_handle_call", finish)
+    monkeypatch.setattr("agentcall.call_agent.asyncio.new_event_loop", lambda: loop)
+    monkeypatch.setattr(loop, "close", failed_close)
+    try:
+        session._run()
+    finally:
+        close()
+        asyncio.set_event_loop(None)
+    assert ended == [True]
+    assert "事件循环关闭失败" in caplog.text
+
+
 @pytest.mark.parametrize("phase", ["pcm", "connect", "say"])
 @pytest.mark.parametrize("cancel", [False, True])
 def test_hangup_or_cancel_during_startup_joins_workers(setup_call, monkeypatch, phase, cancel):

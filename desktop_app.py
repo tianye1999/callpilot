@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -42,7 +43,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
@@ -350,25 +351,128 @@ def _window_lock(support: Path):
     return _acquire_tray_singleton_lock(support / "window.lock")
 
 
+def _window_process_identity(pid: int) -> str | None:
+    """返回窗口启动指纹；不存在/身份不符为 None，无法查询则抛错，不能混为退出证据。"""
+    if sys.platform != "darwin" or pid <= 1 or pid == os.getpid():
+        return None
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-ww", "-p", str(pid), "-o", "uid=,lstart=,command="],
+            capture_output=True, text=True, timeout=0.2,
+        )
+        if result.returncode == 1 and not result.stdout.strip():
+            return None  # ps 明确报告未找到该 PID。
+        fields = result.stdout.strip().split(maxsplit=6)
+        if result.returncode != 0 or len(fields) != 7:
+            raise ValueError("无法解析进程身份")
+        if int(fields[0]) == os.getuid() and fields[6] == f"{sys.executable} --window":
+            return " ".join(fields[1:6])
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("无法查询窗口进程身份") from exc
+    return None
+
+
+def _window_pid(support: Path) -> int | None:
+    try:
+        return int((support / "window.lock").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def close_bundled_window(support: Path) -> None:
-    """让窗口正常关闭以保存几何；持锁到进程收尾，避免退出后遗留 Dock 图标。"""
+    """先正常关窗保存几何，旧版本无退出保障时仅对核验过的窗口进程有界兜底。"""
+    started = time.monotonic()
     lock = _window_lock(support)
     if lock is not None:
         lock.close()
+        logger.info("窗口关闭检查：无持锁窗口")
         return
+    pid = _window_pid(support)
+    try:
+        identity = _window_process_identity(pid) if pid is not None else None
+    except RuntimeError:
+        identity = None
+    logger.info("请求关闭窗口 pid=%s，身份核验=%s", pid, identity is not None)
     (support / "close-window").touch(mode=0o600)
-    deadline = time.monotonic() + 4
+    # 给最后一次身份查询（最多 0.2 秒）留余量，整个调用不超过四秒窗口。
+    deadline = started + 3.75
+    sent_term = sent_kill = False
     while time.monotonic() < deadline:
+        queried = False
+        current = None
         lock = _window_lock(support)
         if lock is not None:
             lock.close()
-            return
-        time.sleep(0.05)
+            # 新窗口持锁至退出；旧窗口可能提前释放，已知身份时还须确认原进程退出。
+            queried = True
+            try:
+                current = _window_process_identity(pid) if pid is not None else None
+                exited = current is None or identity is not None and current != identity
+            except RuntimeError:
+                exited = False
+            if exited:
+                logger.info("窗口退出已确认，window.lock 已释放 elapsed_ms=%.0f",
+                            (time.monotonic() - started) * 1000)
+                return
+        elapsed = time.monotonic() - started
+        sig = (signal.SIGKILL if elapsed >= 3.3 and not sent_kill else
+               signal.SIGTERM if elapsed >= 2.5 and not sent_term else None)
+        if sig is not None and identity is not None and pid is not None:
+            # 不能只信 PID 文件，更不能按进程名批量杀：任何身份/持锁人变化都停止升级。
+            if not queried:
+                try:
+                    current = _window_process_identity(pid)
+                except RuntimeError:
+                    current = None  # 查询失败禁止发送信号，也不能当作释放锁的证明。
+            if _window_pid(support) != pid:
+                identity = None
+            elif current == identity:
+                logger.warning("窗口正常关闭超时，向已核验窗口发送 %s pid=%d", sig.name, pid)
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+                if sig == signal.SIGTERM:
+                    sent_term = True
+                else:
+                    sent_kill = True
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
     from agentcall.macos_shell import ui_text
 
+    logger.error("窗口关闭超时，未确认 window.lock 释放")
     raise RuntimeError(ui_text(
         "窗口尚未关闭，请重试退出。", "The window has not closed yet. Please try quitting again.",
     ))
+
+
+def _destroy_bundled_window(window) -> None:
+    """Cocoa 走与红色关闭按钮相同的路径，避免 destroy 的 shown 等待和跳过 closing。"""
+    if sys.platform != "darwin" or not getattr(window, "uid", None):
+        window.destroy()
+        return
+    from PyObjCTools import AppHelper
+    from webview.platforms.cocoa import BrowserView
+
+    def close_on_main():
+        try:
+            instance = BrowserView.instances.get(window.uid)
+            if instance is None:
+                logger.warning("窗口销毁执行：Cocoa 窗口尚未创建或已经移除")
+                return
+            logger.info("窗口销毁执行：Cocoa 主线程 performClose")
+            instance.window.performClose_(None)
+            logger.info("窗口销毁调用已返回")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("窗口销毁失败 error_type=%s", type(exc).__name__)
+
+    logger.info("窗口销毁已投递 Cocoa 主线程")
+    AppHelper.callAfter(close_on_main)
+
+
+def _exit_window_process(code: int) -> None:
+    # 只由独立 --window 入口注入；内核同时释放文件锁，不等待 WebKit/Python 残留线程。
+    logger.info("窗口进程退出 pid=%d code=%d", os.getpid(), code)
+    os._exit(code)
 
 
 def _install_window_hooks(window, support: Path, splash=None) -> None:
@@ -414,9 +518,11 @@ def _install_window_hooks(window, support: Path, splash=None) -> None:
         app.activateIgnoringOtherApps_(True)
 
     def shown():
+        logger.info("窗口 shown，恢复窗口几何")
         AppHelper.callAfter(restore)
 
     def closing():
+        logger.info("窗口 closing，保存窗口几何")
         native = BrowserView.instances[window.uid].window
         macos_shell.save_geometry(path, rect_tuple(native.frame()))
 
@@ -427,7 +533,7 @@ def _install_window_hooks(window, support: Path, splash=None) -> None:
 class BundledStartup:
     """后台等待服务；本地页面立即显示，重试与关闭不阻塞 Cocoa。"""
 
-    def __init__(self, window, url: str, layout) -> None:
+    def __init__(self, window, url: str, layout, *, request_exit: Callable[[], None] | None = None) -> None:
         from agentcall.macos_shell import ui_language
 
         self.lang = ui_language()
@@ -439,6 +545,7 @@ class BundledStartup:
         self.diagnostics = ""
         self.diagnostic_results: queue.Queue = queue.Queue()
         self.generation = 0
+        self.request_exit = request_exit
 
     def retry(self):
         from agentcall.macos_shell import send_command, write_startup_failure
@@ -508,7 +615,14 @@ class BundledStartup:
         while not self.closed.wait(0.1):
             if close_request.exists():
                 close_request.unlink(missing_ok=True)
-                self.window.destroy()
+                logger.info("窗口关闭请求已消费 close-window")
+                if self.request_exit is not None:
+                    self.request_exit()
+                try:
+                    logger.info("开始销毁窗口")
+                    _destroy_bundled_window(self.window)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("窗口销毁失败 error_type=%s", type(exc).__name__)
                 return
             if focus_request.exists():
                 focus_request.unlink(missing_ok=True)
@@ -586,13 +700,14 @@ class BundledStartup:
                 threading.Thread(target=diagnose, args=(self.generation, startup_failure), daemon=True).start()
 
 
-def _bundled_main(webview, web_url: str) -> None:
+def _bundled_main(webview, web_url: str, exit_process: Callable[[int], None] | None = None) -> None:
     from agentcall import macos_launchd
     from tray_app import _bring_window_to_front
 
     layout = macos_launchd.make_layout(sys.executable)
     lock = _window_lock(layout.support_dir)
     if lock is None:
+        logger.info("已有窗口持锁，转为聚焦请求")
         try:
             pid = int((layout.support_dir / "window.lock").read_text())
             _bring_window_to_front(pid)
@@ -601,6 +716,7 @@ def _bundled_main(webview, web_url: str) -> None:
         return
     splash = None
     try:
+        logger.info("窗口已取得 window.lock pid=%d", os.getpid())
         lock.seek(0)
         lock.truncate()
         lock.write(str(os.getpid()))
@@ -616,7 +732,19 @@ def _bundled_main(webview, web_url: str) -> None:
         window = webview.create_window(
             WINDOW_TITLE, html=startup_html(), width=1100, height=780, **({"hidden": True} if splash else {}),
         )
-        startup = BundledStartup(window, web_url, layout)
+        exit_guard_lock = threading.Lock()
+        exit_timer = None
+
+        def request_exit():
+            nonlocal exit_timer
+            with exit_guard_lock:
+                if exit_process is not None and exit_timer is None:
+                    logger.info("窗口退出保障已启动，最长等待 2.5 秒")
+                    exit_timer = threading.Timer(2.5, exit_process, args=(0,))
+                    exit_timer.daemon = True
+                    exit_timer.start()
+
+        startup = BundledStartup(window, web_url, layout, request_exit=request_exit)
         from agentcall.macos_notifications import NotificationBridge
 
         notifications = NotificationBridge(window.get_current_url, web_url)
@@ -624,14 +752,24 @@ def _bundled_main(webview, web_url: str) -> None:
                       startup.uninstall_callpilot, startup.open_login_settings,
                       notifications.notification_status, notifications.request_notifications,
                       notifications.open_notification_settings)
-        window.events.closed += startup.closed.set
+        def closed():
+            logger.info("窗口 closed，等待 Cocoa 事件循环退出")
+            request_exit()  # 红钮关闭也可能留下事件循环；closed 不是进程退出确认。
+            startup.closed.set()
+
+        window.events.closed += closed
         _install_window_hooks(window, layout.support_dir, splash)
+        logger.info("窗口进入 Cocoa 事件循环")
         webview.start(lambda: threading.Thread(target=startup.run, daemon=True).start())
+        logger.info("窗口 Cocoa 事件循环已返回")
         startup.closed.set()
     finally:
         if splash is not None:
             splash.close()
         lock.close()
+        logger.info("窗口已释放 window.lock")
+        if exit_process is not None:
+            exit_process(1 if sys.exc_info()[0] is not None else 0)
 
 
 def main() -> None:
@@ -643,9 +781,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    from agentcall.app_version import VERSION
+
+    logger.info("窗口入口启动 version=%s pid=%d", VERSION, os.getpid())
     web_url = os.getenv("AGENTCALL_WEB_URL", DEFAULT_WEB_URL).rstrip("/")
     if _bundled_macos_service_is_system_managed():
-        _bundled_main(None, web_url)
+        _bundled_main(None, web_url, _exit_window_process)
         return
     webview = _import_webview()
     meta_url = f"{web_url}/api/meta"

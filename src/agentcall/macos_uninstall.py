@@ -150,8 +150,9 @@ def _worker_main(url, close_window, acquire_tray_lock) -> None:
     prompt.setInformativeText_(text(
         "将停止接打电话，并把 CallPilot 移到废纸篓。通话或队列忙碌时不会卸载。",
         "CallPilot will stop taking calls and move to Trash. Uninstall is blocked during calls."))
-    prompt.addButtonWithTitle_(text("卸载", "Uninstall"))
-    prompt.addButtonWithTitle_(text("取消", "Cancel"))
+    # NSAlert 首按钮默认绑定回车；破坏性操作必须显式点击，Esc 始终安全取消。
+    prompt.addButtonWithTitle_(text("卸载", "Uninstall")).setKeyEquivalent_("")
+    prompt.addButtonWithTitle_(text("取消", "Cancel")).setKeyEquivalent_("\x1b")
     checkbox = NSButton.alloc().initWithFrame_(((0, 0), (500, 40)))
     checkbox.setButtonType_(NSButtonTypeSwitch)
     checkbox.setTitle_(text("同时删除通话录音、短信和设置（不可恢复）",

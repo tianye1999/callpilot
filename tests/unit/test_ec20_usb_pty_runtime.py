@@ -240,7 +240,7 @@ def test_shutdown_timeout_stops_all_bridges_and_is_fatal(monkeypatch):
 
     handles = iter([SimpleNamespace(stop=stops[i], degraded=False, close=lambda i=i: close(i)) for i in range(2)])
     monkeypatch.setattr(ec20_usb_pty, "discover_ports", lambda dev: {2: None, 4: None})
-    monkeypatch.setattr(ec20_usb_pty, "bridge_port", lambda *args: next(handles))
+    monkeypatch.setattr(ec20_usb_pty, "bridge_port", lambda *args, **kwargs: next(handles))
     monkeypatch.setattr(ec20_usb_pty.usb.util, "dispose_resources", lambda dev: pytest.fail("不能释放活动 USB"))
     stop = threading.Event()
     stop.set()
@@ -480,7 +480,7 @@ def test_usb_recovery_switches_out_and_back_then_verifies(monkeypatch):
     monkeypatch.setattr(ec20_usb_pty.time, "sleep", lambda s: None)
     monkeypatch.setattr(ec20_usb_pty.usb.util, "dispose_resources", lambda d: None)
 
-    assert ec20_usb_pty.usb_composition_recovery(0x1E0E, 0x9001, 0x9011, settle=0) is True
+    assert ec20_usb_pty.usb_composition_recovery(0x1E0E, 0x9001, 0x9011, settle=0, confirm_grace=0) is True
     switches = [c for c in sent if c.startswith("AT+CUSBPIDSWITCH=")]
     assert switches == ["AT+CUSBPIDSWITCH=9011,1,1", "AT+CUSBPIDSWITCH=9001,1,1"]
     assert sent[-1] == "AT+CUSBPIDSWITCH?"          # 最后必须回读校验
@@ -511,7 +511,7 @@ def test_usb_recovery_retries_when_switch_back_fails(monkeypatch):
     monkeypatch.setattr(ec20_usb_pty.time, "sleep", lambda s: None)
     monkeypatch.setattr(ec20_usb_pty.usb.util, "dispose_resources", lambda d: None)
 
-    assert ec20_usb_pty.usb_composition_recovery(0x1E0E, 0x9001, 0x9011, settle=0) is True
+    assert ec20_usb_pty.usb_composition_recovery(0x1E0E, 0x9001, 0x9011, settle=0, confirm_grace=0) is True
     assert state["pid"] == "9001"                  # 重试后确实回到目标组合
 
 
@@ -529,4 +529,61 @@ def test_usb_recovery_gives_up_and_reports_failure(monkeypatch):
     monkeypatch.setattr(ec20_usb_pty.usb.util, "dispose_resources", lambda d: None)
 
     assert ec20_usb_pty.usb_composition_recovery(
-        0x1E0E, 0x9001, 0x9011, attempts=2, settle=0) is False
+        0x1E0E, 0x9001, 0x9011, attempts=2, settle=0, confirm_grace=0) is False
+
+
+@pytest.mark.parametrize("bus_pid,reply,expected", [
+    (0x9001, "+CUSBPIDSWITCH: 9011\r\nOK", True),
+    (0x9011, "+CUSBPIDSWITCH: 9001\r\nOK", False),
+    (None, "+CUSBPIDSWITCH: 9001\r\nOK", True),
+    (None, "ERROR 9001", False),
+])
+def test_composition_confirmation_uses_bus_over_stale_reply(monkeypatch, bus_pid, reply, expected):
+    from types import SimpleNamespace
+
+    dev = SimpleNamespace(idProduct=bus_pid)
+    released = []
+    commands = []
+    monkeypatch.setattr(ec20_usb_pty, "find_at_port_dynamic", lambda *a, **kw: (dev, object()))
+    monkeypatch.setattr(ec20_usb_pty, "at_on_interface", lambda d, p, cmd: commands.append(cmd) or reply)
+    monkeypatch.setattr(ec20_usb_pty.usb.util, "dispose_resources", released.append)
+    assert ec20_usb_pty.confirm_composition(0x1E0E, 0x9001, timeout=0)[0] is expected
+    assert commands == ["AT+CUSBPIDSWITCH?"]
+    assert released == [dev]
+
+
+def test_last_recovery_attempt_polls_until_late_enumeration(monkeypatch):
+    from types import SimpleNamespace
+
+    clock = [0.0]
+    commands = []
+    released = []
+    monkeypatch.setattr(ec20_usb_pty.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ec20_usb_pty.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    def find(vid, timeout=60):
+        return SimpleNamespace(idProduct=0x9001 if clock[0] >= 33 else 0x9011), SimpleNamespace(interface=4)
+
+    monkeypatch.setattr(ec20_usb_pty, "find_at_port_dynamic", find)
+    monkeypatch.setattr(ec20_usb_pty, "at_on_interface", lambda d, p, cmd, **kw:
+                        commands.append(cmd) or "+CUSBPIDSWITCH: 9011\r\nOK")
+    monkeypatch.setattr(ec20_usb_pty.usb.util, "dispose_resources", released.append)
+    assert ec20_usb_pty.usb_composition_recovery(0x1E0E, 0x9001, 0x9011, attempts=1)
+    assert commands.count("AT+CUSBPIDSWITCH=9001,1,1") == 1
+    assert commands.count("AT+CUSBPIDSWITCH?") > 2
+    assert 33 <= clock[0] <= 40
+    assert len(released) == commands.count("AT+CUSBPIDSWITCH?")
+
+
+def test_composition_confirmation_absent_device_is_bounded(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(ec20_usb_pty.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ec20_usb_pty.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    def absent(vid, timeout):
+        clock[0] += timeout
+        return None, None
+
+    monkeypatch.setattr(ec20_usb_pty, "find_at_port_dynamic", absent)
+    assert not ec20_usb_pty.confirm_composition(0x1E0E, 0x9001, timeout=7)[0]
+    assert clock[0] == 7

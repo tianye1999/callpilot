@@ -1,7 +1,8 @@
-"""desktop_app 桌面窗口单测：fake webview/subprocess/urllib，不开真窗口、不起真进程。"""
+"""窗口回归：假后端为主；少量 Cocoa 子进程使用独立临时用户目录。"""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import types
@@ -14,6 +15,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import desktop_app
+
+
+def _cocoa_test_env(home):
+    # pywebview 私密模式也使用默认 WebKit datastore；业务 support_dir 隔离还不够。
+    return {**os.environ, "HOME": str(home), "CFFIXED_USER_HOME": str(home)}
 
 
 @pytest.mark.parametrize("current, trusted, allowed", [
@@ -71,6 +77,7 @@ def test_native_startup_handoff_has_one_visible_window_and_preserves_geometry(tm
     result = subprocess.run([sys.executable, "-c", '''
 import json, sys
 from pathlib import Path
+from Foundation import NSHomeDirectory
 from AppKit import NSApplication, NSMakeRect, NSScreen
 from PyObjCTools import AppHelper
 import desktop_app
@@ -78,6 +85,7 @@ from agentcall import macos_launchd, macos_shell
 if not NSScreen.screens():
     sys.exit(77)
 support = Path(sys.argv[1])
+assert Path(NSHomeDirectory()).resolve() == support.resolve()
 layout = macos_launchd.make_layout(sys.executable, uid=123, support_dir=support)
 macos_launchd.make_layout = lambda *args, **kwargs: layout
 desktop_app.BundledStartup.run = lambda self: None
@@ -105,7 +113,7 @@ desktop_app._install_window_hooks = install
 desktop_app._bundled_main(None, 'http://unused.invalid')
 assert checks == [True, True], checks
 assert json.loads((support / 'window.json').read_text(encoding='utf-8')) == expected_geometry
-''', str(tmp_path)], capture_output=True, text=True, timeout=20)
+''', str(tmp_path)], capture_output=True, text=True, timeout=20, env=_cocoa_test_env(tmp_path))
     if result.returncode == 77:
         pytest.skip("当前 macOS 会话没有可用屏幕；固定屏幕几何由纯逻辑测试覆盖")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -116,9 +124,11 @@ def test_native_startup_close_and_quit_before_handoff(tmp_path):
     result = subprocess.run([sys.executable, "-c", '''
 import sys
 from pathlib import Path
+from Foundation import NSHomeDirectory
 import desktop_app
 from agentcall import macos_launchd, macos_shell, macos_window
 support = Path(sys.argv[1])
+assert Path(NSHomeDirectory()).resolve() == support.resolve()
 layout = macos_launchd.make_layout(sys.executable, uid=123, support_dir=support)
 macos_launchd.make_layout = lambda *args, **kwargs: layout
 original = macos_window.show_startup_window
@@ -135,7 +145,7 @@ desktop_app._bundled_main(None, 'http://unused.invalid')
 lock = desktop_app._window_lock(support)
 assert lock is not None
 lock.close()
-''', str(tmp_path)], capture_output=True, text=True, timeout=20)
+''', str(tmp_path)], capture_output=True, text=True, timeout=20, env=_cocoa_test_env(tmp_path))
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -203,7 +213,7 @@ method = BrowserView.AppDelegate.applicationShouldTerminate_
 assert method.signature == expected, method.signature
 assert method(BrowserView.AppDelegate.alloc().init(), None) == 0
 assert (Path(sys.argv[1]) / "shell-requests" / "quit").exists()
-''', str(tmp_path), str(preloaded)], capture_output=True, text=True, timeout=20)
+''', str(tmp_path), str(preloaded)], capture_output=True, text=True, timeout=20, env=_cocoa_test_env(tmp_path))
     assert result.returncode == 0, result.stdout + result.stderr
 
 _ENV_VARS = [

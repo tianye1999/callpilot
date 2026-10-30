@@ -43,8 +43,9 @@ NMEA_WRITE_INTERVAL_SECONDS = 0.1
 # 为「每个字都卡」。写成 512B/32ms 即每帧恰好一个满包，不产生短包。
 SERIAL_PCM_WRITE_SIZE = 512  # 32ms @ 8kHz/16-bit mono，= USB bulk 满包
 # 上行对齐自检参数：攒够 ~1s 且有明显声音才判定，避免拿静音瞎判。
-_ALIGN_PROBE_BYTES = 16000      # ~1s @ 8kHz/16-bit
+_ALIGN_PROBE_BYTES = 4000       # ~0.25s @ 8kHz/16-bit，避免开场长时间等待语音
 _ALIGN_MIN_PEAK = 800           # 低于此峰值视为静音，继续攒
+_ALIGN_RAIL_PEAK = 16000        # 静音错位后的大幅噪声，与安静偏移形成明确证据
 _ALIGN_MARGIN = 0.15            # 偏移1 需明显优于对齐0 才纠正
 _ALIGN_CLEAR_WIN = 0.6          # 判定所需的「明确赢家」相关性下限；两侧都含糊不锁定
 _ALIGN_BAD_CORR = 0.3           # 锁定后监控：有声段相关性低于此=疑似中途错位，重探
@@ -508,7 +509,8 @@ class SerialPcmAudioBridge(_OutputObserver):
         """用相邻样本相关性判断上行是否整体错位 1 字节。
 
         真实语音相邻样本高度相关（r>0.8）；错位后高低字节颠倒，相关性趋近 0。
-        只在攒够足够「有声」样本后判定，避免拿静音段瞎判。证据必须**一边倒**才
+        一边安静而另一边大幅噪声时直接锁定安静偏移；两边都静音则不猜。
+        其余情况用有声样本相关性判断。证据必须**一边倒**才
         锁定（真机教训 2026-08-12：两个偏移都 0.8+ 的含糊样本被当「对齐正常」
         锁死，整通乱码没人管）；含糊就扔掉这批继续攒。锁定后仍由
         _monitor_alignment 持续复核——劣化的模组会中途丢字节，错位可能随时发生。
@@ -518,12 +520,24 @@ class SerialPcmAudioBridge(_OutputObserver):
             return
         probe = bytes(self._align_probe)
         self._align_probe.clear()
-        scores = []
+        views = []
         for offset in (0, 1):
             chunk = probe[offset: offset + (len(probe) - offset) // 2 * 2]
             samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
-            if samples.size < 1000 or np.max(np.abs(samples)) < _ALIGN_MIN_PEAK:
-                return  # 太安静，判不准，继续攒
+            if samples.size < 1000:
+                return
+            views.append(samples)
+        peaks = [float(np.max(np.abs(samples))) for samples in views]
+        if min(peaks) < _ALIGN_MIN_PEAK and max(peaks) >= _ALIGN_RAIL_PEAK:
+            self._align_locked = True
+            self._align_drop = peaks[1] < peaks[0]
+            logger.info("上行静音对齐锁定：偏移0峰值 %.0f，偏移1峰值 %.0f，补丢字节=%d",
+                        peaks[0], peaks[1], int(self._align_drop))
+            return
+        if min(peaks) < _ALIGN_MIN_PEAK:
+            return
+        scores = []
+        for samples in views:
             scores.append(float(np.corrcoef(samples[:-1], samples[1:])[0, 1]))
         best = max(scores)
         # NaN（恒定/退化信号，如纯音尾巴）视为含糊：NaN 的比较全为 False，

@@ -181,7 +181,7 @@ def test_pcm_stall_hold_preserves_at_and_ignores_recovery_request(monkeypatch, t
     handles[1].stop.set()
     ports = {2: handles[0].port, 4: handles[1].port}
     monkeypatch.setattr(bridge, "discover_ports", lambda dev: ports)
-    monkeypatch.setattr(bridge, "bridge_port", lambda dev, port, link: handles[0 if port.interface == 2 else 1])
+    monkeypatch.setattr(bridge, "bridge_port", lambda dev, port, link, **kw: handles[0 if port.interface == 2 else 1])
     monkeypatch.setattr(bridge.usb.util, "dispose_resources", lambda dev: closed.append("dispose"))
     request = tmp_path / "request"
 
@@ -254,6 +254,87 @@ def test_usb_non_timeout_error_does_not_increment_timeout_count():
     total = stats.snapshot()["total"]
     assert total["out_calls"] == 1
     assert total["out_timeouts"] == 0
+
+
+@pytest.mark.parametrize("count", [4, 16, 1000])
+def test_pcm_timeouts_only_escalate_when_at_is_silent(monkeypatch, count):
+    clock = [10.0]
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    activity = bridge.DeviceActivity(at_interface=2)
+    activity.mark(4)  # PCM 自身的下行流量不能证明 AT 存活。
+    assert activity.should_escalate(4, count)
+    activity.mark(2)
+    clock[0] += 5.0
+    assert not activity.should_escalate(4, count)
+    assert activity.should_escalate(2, count)  # AT 写故障不能由自身旧数据掩盖。
+    assert activity.should_escalate(3, count)  # modem 文本口不套用 PCM 策略。
+    clock[0] += 0.001
+    assert activity.should_escalate(4, count)
+    assert not activity.should_escalate(4, 3)
+
+
+def test_bridge_pcm_timeout_loop_keeps_running_with_live_at(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    activity = bridge.DeviceActivity(at_interface=2)
+    writes = []
+
+    def write(*args, **kwargs):
+        writes.append(True)
+        clock[0] += 1
+        activity.mark(2)
+        if len(writes) == 20:
+            handle.stop.set()
+        raise bridge.usb.core.USBTimeoutError("fake post-hangup drain")
+
+    monkeypatch.setattr(bridge.pty, "openpty", lambda: (101, 102))
+    monkeypatch.setattr(bridge, "make_raw", lambda fd: None)
+    monkeypatch.setattr(bridge.os, "set_blocking", lambda *args: None)
+    monkeypatch.setattr(bridge.os, "ttyname", lambda fd: "/fake-pty")
+    monkeypatch.setattr(bridge, "link_pty", lambda *args: None)
+    monkeypatch.setattr(bridge.usb.util, "claim_interface", lambda *args: None)
+    monkeypatch.setattr(bridge.threading, "Thread", lambda target, **kwargs:
+                        SimpleNamespace(target=target, start=lambda: None))
+    monkeypatch.setattr(bridge.select, "select", lambda *args: ([101], [], []))
+    monkeypatch.setattr(bridge.os, "read", lambda *args: b"abcd")
+    handle = bridge.bridge_port(SimpleNamespace(write=write), bridge.UsbPort(4, 1, 2, 512),
+                                "/fake-link", activity=activity)
+    handle.threads[1].target()
+    assert len(writes) == 20
+    assert not handle.degraded
+
+
+@pytest.mark.parametrize("interface", [1, 2, 3, 4])
+@pytest.mark.parametrize("lost", [1, 2, 3])
+def test_bridge_downlink_drop_preserves_pcm_parity_only(monkeypatch, interface, lost):
+    chunks = iter([b"abcd", b"", b"e", b"fghi", b"jklm"])
+    seen = []
+
+    def read(*args, **kwargs):
+        try:
+            return next(chunks)
+        except StopIteration:
+            handle.stop.set()
+            return b""
+
+    def write(fd, data, stop):
+        seen.append(data)
+        return lost if len(seen) == 1 else 0
+
+    monkeypatch.setattr(bridge.pty, "openpty", lambda: (101, 102))
+    monkeypatch.setattr(bridge, "make_raw", lambda fd: None)
+    monkeypatch.setattr(bridge.os, "set_blocking", lambda *args: None)
+    monkeypatch.setattr(bridge.os, "ttyname", lambda fd: "/fake-pty")
+    monkeypatch.setattr(bridge, "link_pty", lambda *args: None)
+    monkeypatch.setattr(bridge.usb.util, "claim_interface", lambda *args: None)
+    monkeypatch.setattr(bridge.threading, "Thread", lambda target, **kwargs:
+                        SimpleNamespace(target=target, start=lambda: None))
+    monkeypatch.setattr(bridge, "write_pty_bounded", write)
+    handle = bridge.bridge_port(SimpleNamespace(read=read), bridge.UsbPort(interface, 1, 2, 512), "/fake-link")
+    handle.threads[0].target()
+    extra = int(interface in (1, 4) and lost % 2 == 1)
+    assert b"".join(seen) == (b"abcdfghijklm" if extra else b"abcdefghijklm")
+    assert handle.stats.snapshot()["total"]["pty_dropped"] == lost + extra
 
 
 @pytest.mark.parametrize("setting", [None, "0", "1"])

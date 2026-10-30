@@ -486,12 +486,18 @@ def _handoff_previous_tray():
         macos_shell.send_command("open")
         return None
     if previous.get("handoff") is True:
+        logger.info("托盘 replace：请求旧版交接，先确认旧窗口退出")
         macos_shell.send_command("replace")
+        # 旧窗口/旧托盘不会因覆盖安装获得修复，升级当次由新版执行有界退出检查。
+        from desktop_app import close_bundled_window
+
+        close_bundled_window(support)
         # The incumbent may still be installing or closing its window. Keep the
         # successor alive until it owns the lock; a timeout can leave both trays exited.
         while True:
             lock = _acquire_tray_singleton_lock()
             if lock is not None:
+                logger.info("托盘 replace：旧窗口已退出，已取得托盘锁")
                 return lock
             time.sleep(0.1)
     # Pre-WP6 shells cannot cooperate in a generation handoff. Do not send 'open':
@@ -733,6 +739,8 @@ def main() -> None:
                     (app_support_dir() / "uninstall-ready").touch(mode=0o600)
                 return
             self._replace_requested = self._replace_requested or "replace" in commands
+            if "replace" in commands:
+                logger.info("托盘 replace：已收到交接请求")
             if self._replace_requested:
                 self._install_cancel.set()
                 if self._install_thread is not None and self._install_thread.is_alive():
@@ -740,7 +748,9 @@ def main() -> None:
                 from agentcall.macos_launchd import app_support_dir
                 from desktop_app import close_bundled_window
 
+                logger.info("托盘 replace：开始关闭窗口")
                 close_bundled_window(app_support_dir())
+                logger.info("托盘 replace：窗口退出已确认，旧托盘退出")
                 self._quitting = True
                 rumps.quit_application()
                 return

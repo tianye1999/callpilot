@@ -606,6 +606,21 @@ def test_uplink_alignment_waits_while_silent():
     assert bridge._align_locked is False
 
 
+@pytest.mark.parametrize("shifted", [False, True])
+def test_uplink_alignment_locks_on_quiet_offset_within_quarter_second(shifted):
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    # 低幅背景噪声错位后成为大幅噪声；无需等来电者开口。
+    quiet = np.random.default_rng(42).integers(-100, 101, size=2001, dtype=np.int16).tobytes()
+    raw = (b"\x00" + quiet) if shifted else quiet
+    bridge = SerialPcmAudioBridge("/fake-pcm")
+    bridge._probe_alignment(raw[:3998])
+    assert not bridge._align_locked
+    bridge._probe_alignment(raw[3998:4000])
+    assert bridge._align_locked
+    assert bridge._align_drop is shifted
+
+
 def test_uplink_alignment_reprobes_after_midstream_slip():
     """锁定后中途丢 1 字节（劣化模组丢字节）：监控应发现相关性塌陷并重探纠正。"""
     from agentcall.audio_bridge import SerialPcmAudioBridge
