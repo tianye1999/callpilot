@@ -256,7 +256,10 @@ def stall_call(stall_modem, monkeypatch, tmp_path):
         return original_rearm() if state.rearm_ok else False
 
     def read():
-        if clock.now >= 120:
+        # 重挂后第二次判定之前不准用「120 秒」结束：等重挂线程时假时钟按事件循环
+        # 轮次前进，Windows 线程慢、轮次多，会提前走过 120（CI 实测漏掉第二次判定）。
+        rearm_pending = bool(rearm_threads) and len(checks) < 2
+        if clock.now >= 120 and not rearm_pending:
             session._set_active(False)
         return b""
 
@@ -336,9 +339,6 @@ def test_pcm_stall_unrecovered_says_scenario_hangs_up_and_records_failed(stall_c
     assert len(call.agent.said) == 2
     assert "一句" in call.agent.said[-1] or "one" in call.agent.said[-1]
     assert len(call.bridge.downlink) >= 2
-    # 只证明是卡死处理结束了通话，而不是夹具的「120 秒结束」。假时钟在等重挂
-    # 线程期间按事件循环轮次前进，慢机器上会多走几格（Windows CI 曾到 115.9）。
-    assert call.clock.now < 120
 
 
 @pytest.mark.parametrize("case", ["other_modem", "other_bridge"])

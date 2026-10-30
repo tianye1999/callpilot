@@ -119,7 +119,8 @@ def test_setup_call_hard_deadline_forces_hangup_without_retry(monkeypatch, tmp_p
     session, modem = session_for_test(tmp_path)
     monkeypatch.setattr(setup_call, "MAX_SECONDS", 0.02)
     asyncio.run(setup_call.run_setup_call(session))
-    assert modem.call_names().count("dial") == 1
+    # 20ms 硬截止在慢机器上可能赶在拨号前触发（Windows CI 实测 0 次）；要守的是「截止后不重试」。
+    assert modem.call_names().count("dial") <= 1
     assert modem.call_names().count("hangup") >= 1
     assert session.setup_test_result["status"] == "timeout"
     assert session.setup_test_result["sent"]["ok"] is False
