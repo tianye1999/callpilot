@@ -336,7 +336,9 @@ def test_pcm_stall_unrecovered_says_scenario_hangs_up_and_records_failed(stall_c
     assert len(call.agent.said) == 2
     assert "一句" in call.agent.said[-1] or "one" in call.agent.said[-1]
     assert len(call.bridge.downlink) >= 2
-    assert call.clock.now < 115
+    # 只证明是卡死处理结束了通话，而不是夹具的「120 秒结束」。假时钟在等重挂
+    # 线程期间按事件循环轮次前进，慢机器上会多走几格（Windows CI 曾到 115.9）。
+    assert call.clock.now < 120
 
 
 @pytest.mark.parametrize("case", ["other_modem", "other_bridge"])
