@@ -50,6 +50,54 @@ def test_index_does_not_use_html_injection_apis():
     assert "dangerouslySetInnerHTML" not in text
 
 
+def test_power_cycle_hardware_warning_in_both_languages():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 执行硬件状态渲染函数")
+    text = INDEX.read_text(encoding="utf-8")
+    source = text[text.index("const I18N = {"):text.index("function initialUiLanguage(")]
+    source += text[text.index("let modemConnected = false;"):text.index("let metaRefreshTimer = null;")]
+    source += text[text.index("function setupStatus("):text.index("let rereadSimPending = false;")]
+    harness = r'''
+const assert = require('node:assert/strict');
+const elements = new Map();
+const $ = id => {
+  if (!elements.has(id)) elements.set(id, {
+    textContent: '', className: '', appendChild() {},
+    classList: {toggle(key, enabled) { this[key] = enabled; }}
+  });
+  return elements.get(id);
+};
+const el = (tag, cls, text) => ({textContent: text, appendChild() {}});
+let rereadSimPending = false;
+let LANG = 'zh';
+const t = key => I18N[LANG][key];
+'''
+    assertions = r'''
+for (LANG of ['zh', 'en']) {
+  lastMeta = {hardware: {needs_power_cycle: true, modem_connected: true, usb_online: true},
+              sim: {present: true, registered: true, network_attached: true}};
+  setModem(true);
+  renderSetupHardware();
+  const warning = t('modem_power_cycle');
+  assert.match(warning, /USB/);
+  assert.match(warning, /5/);
+  assert.equal($('modemState').textContent, warning);
+  assert.equal($('setupHwStatus').textContent, warning);
+  assert.equal($('modemDot').classList.on, false);
+  assert.equal($('setupHwStatus').className, 'setup-status err');
+  lastMeta.hardware.needs_power_cycle = false;
+  setModem(true);
+  renderSetupHardware();
+  assert.equal($('modemState').textContent, t('modem_on'));
+  assert.equal($('setupHwStatus').textContent, t('setup_hint_ready'));
+}
+'''
+    result = subprocess.run([node, "-e", harness + source + assertions],
+                            capture_output=True, text=True, encoding="utf-8", timeout=NODE_TIMEOUT)
+    assert result.returncode == 0, result.stderr
+
+
 def test_settings_render_uses_choice_labels_for_provider_badges():
     text = INDEX.read_text(encoding="utf-8")
     assert "(c.choice_labels && c.choice_labels[ch]) || ch" in text

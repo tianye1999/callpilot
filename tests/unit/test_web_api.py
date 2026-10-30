@@ -654,11 +654,38 @@ def test_meta_includes_setup_and_hardware_status(monkeypatch):
         "usb_online": True,
         "modem_connected": False,
         "modem_resetting": False,
+        "needs_power_cycle": False,
         "port": "/tmp/ec20-at",
         "vendor": "", "model": "", "firmware": "",
         "signal": {"csq": None, "level": "unknown", "updated_at": None},
     }
     assert meta["setup_sms_token"]
+
+
+@pytest.mark.parametrize("platform", ["macos", "linux", "windows"])
+@pytest.mark.parametrize("present", [False, True])
+def test_meta_power_cycle_flag_only_reads_supported_platforms(monkeypatch, platform, present):
+    from agentcall import modem_hardware
+
+    for name in ("MACOS", "LINUX", "WINDOWS"):
+        monkeypatch.setattr(platforms, "IS_" + name, name.lower() == platform)
+    reads = []
+
+    def read_marker():
+        reads.append(True)
+        return {"reason": "failed", "updated_at": 1} if present else None
+
+    monkeypatch.setattr(modem_hardware, "read_needs_power_cycle", read_marker)
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
+
+    async def fn(client):
+        response = await client.get("/api/meta")
+        assert response.status == 200
+        return await response.json()
+
+    meta = api(make_app(FakeService()), fn)
+    assert meta["hardware"]["needs_power_cycle"] is (present and platform != "windows")
+    assert bool(reads) is (platform != "windows")
 
 
 def test_meta_exposes_recordings_dir_from_call_logger(tmp_path):
@@ -1593,7 +1620,8 @@ def test_meta_returns_injected_metadata(monkeypatch):
     assert meta["credentials"]["ok"] is False
     assert meta["setup_required"] is True
     assert set(meta["hardware"]) == {
-        "usb_online", "modem_connected", "modem_resetting", "port", "vendor", "model", "firmware", "signal",
+        "usb_online", "modem_connected", "modem_resetting", "needs_power_cycle",
+        "port", "vendor", "model", "firmware", "signal",
     }
 
 

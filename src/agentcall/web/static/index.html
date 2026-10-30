@@ -1428,6 +1428,7 @@ const I18N = {
     phone_on: "Phone connected", phone_off: "Phone disconnected", phone_line: "Bluetooth phone",
     phone_signal: "Phone signal", phone_sms_unavailable: "SMS is unavailable on this Bluetooth line. Use the phone.",
     modem_resetting: "Modem restarting (about 30 seconds)",
+    modem_power_cycle: "Modem needs a power cycle: unplug USB, wait 5 seconds, then reconnect",
     about_app: "About", update_available: "New version", update_notes: "Release notes",
     update_download: "Download", release_close: "Close",
     keypad: "Keys", hangup: "Hang up",
@@ -1755,6 +1756,7 @@ const I18N = {
     phone_on: "手机已连接", phone_off: "手机未连接", phone_line: "蓝牙手机线路",
     phone_signal: "手机信号", phone_sms_unavailable: "蓝牙线路不支持短信，请在手机上收发短信。",
     modem_resetting: "模组重启中（约 30 秒）",
+    modem_power_cycle: "模组需要重新插拔：拔下 USB，等 5 秒再插上",
     keypad: "按键", hangup: "挂断",
     dial_label: "拨打电话", preset_label: "预设任务", preset_custom: "自定义（手动输入）",
     dial: "拨打", ph_number: "输入号码", remote_pair: "配对手机", remote_invite: "临时链接",
@@ -2262,13 +2264,14 @@ let lastMeta = null;
 function setModem(connected, resetting = false) {
   modemConnected = connected;
   modemResetting = resetting;
-  $("modemDot").classList.toggle("on", connected && !resetting);
+  const needsPowerCycle = !!lastMeta?.hardware?.needs_power_cycle;
+  $("modemDot").classList.toggle("on", connected && !resetting && !needsPowerCycle);
   $("modemDot").classList.toggle("resetting", resetting);
   const phoneLine = lastMeta?.hardware?.line_kind === "bluetooth";
   $("modemState").textContent = phoneLine
     ? [t(connected ? "phone_on" : "phone_off"), ...(connected ? [lastMeta.sim?.carrier,
         lastMeta.hardware.signal_strength == null ? "" : `${lastMeta.hardware.signal_strength}%`] : [])].filter(Boolean).join(" · ")
-    : t(modemResetting ? "modem_resetting" : connected ? "modem_on" : "modem_off");
+    : t(needsPowerCycle ? "modem_power_cycle" : modemResetting ? "modem_resetting" : connected ? "modem_on" : "modem_off");
 }
 let metaRefreshTimer = null;
 function scheduleMetaRefresh() {
@@ -4057,6 +4060,10 @@ function renderSetupHardware() {
   reread.disabled = !!meta.call_active || !!meta.dial_queue_busy || rereadSimPending;
   if (phoneLine) {
     setupStatus("setupHwStatus", hw.modem_connected ? "ok" : "err", t(hw.modem_connected ? "setup_hw_ok" : "setup_hw_wait"));
+    return;
+  }
+  if (hw.needs_power_cycle) {
+    setupStatus("setupHwStatus", "err", t("modem_power_cycle"));
     return;
   }
   const hint = hw.modem_resetting ? "reset" : !hw.usb_online ? "usb"

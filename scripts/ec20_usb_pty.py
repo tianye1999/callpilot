@@ -671,6 +671,18 @@ def parse_map(value: str) -> tuple[int, str]:
     return iface, link
 
 
+def clear_power_cycle_if_absent(vid: int) -> bool:
+    """恢复失败可能停在备用 PID；只有同厂商设备确实离开总线才算拔出。"""
+    try:
+        if usb.core.find(idVendor=vid, backend=libusb_backend()) is not None:
+            return False
+    except usb.core.USBError as exc:
+        logger.warning("确认 USB 拔出失败，保留重插提示: %s", exc)
+        return False
+    modem_hardware.clear_needs_power_cycle()
+    return True
+
+
 def wait_for_device(
     stop: threading.Event,
     poll_seconds: float = 2.0,
@@ -683,6 +695,7 @@ def wait_for_device(
         try:
             return find_device(vid, pid)
         except RuntimeError:
+            clear_power_cycle_if_absent(vid)
             if not announced:
                 logger.warning("未检测到 USB 设备 (%04x:%04x)，等待设备接入…", vid, pid)
                 announced = True
@@ -782,17 +795,23 @@ def run_auto(stop: threading.Event, *, once: bool = False, poll_seconds: float =
     modem_hardware.STATE_PATH.unlink(missing_ok=True)
     failures = 0
     selected_vendor: str | None = None
+    present_vid: int | None = None
     while not stop.is_set():
         try:
             found = find_auto_device()
         except usb.core.USBError as exc:
             logger.warning("USB 自动扫描失败: %s", exc)
-            found = None
+            # 枚举异常不是拔出证据，保留重插告警与上一轮在场状态。
+            stop.wait(poll_seconds)
+            continue
         if found is None:
+            if present_vid is not None and clear_power_cycle_if_absent(present_vid):
+                present_vid = None
             failures = 0
             stop.wait(poll_seconds)
             continue
         dev, preset = found
+        present_vid = preset.vid
         first_selection = selected_vendor != preset.vendor
         if first_selection:
             failures = 0
@@ -838,7 +857,10 @@ def run_auto(stop: threading.Event, *, once: bool = False, poll_seconds: float =
         if once or stop.is_set():
             break
         if degraded and preset.recover_alt_pid is not None:
-            usb_composition_recovery(preset.vid, preset.pid, preset.recover_alt_pid)
+            if usb_composition_recovery(preset.vid, preset.pid, preset.recover_alt_pid):
+                modem_hardware.clear_needs_power_cycle()
+            else:
+                modem_hardware.write_needs_power_cycle("USB 组合切换恢复失败，需人工物理断电重插")
             if request is not None:
                 request.unlink(missing_ok=True)
         failures = failures + 1 if time.monotonic() - started < 5 else 0
@@ -991,7 +1013,10 @@ def main(
         # 设备仍在总线上却不收 PCM = 模组音频子系统卡死；软重启/CFUN 都救不回，
         # 只有 USB 重新枚举有效（WIL-109）。此时通话已随拆桥结束，恢复不会打断通话。
         if degraded and recover_alt_pid is not None:
-            usb_composition_recovery(args.vid, args.pid, recover_alt_pid)
+            if usb_composition_recovery(args.vid, args.pid, recover_alt_pid):
+                modem_hardware.clear_needs_power_cycle()
+            else:
+                modem_hardware.write_needs_power_cycle("USB 组合切换恢复失败，需人工物理断电重插")
             if recovery_request is not None:
                 recovery_request.unlink(missing_ok=True)  # 消费掉，避免反复触发
             consecutive_fast_fail = 0

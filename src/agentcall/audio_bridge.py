@@ -319,6 +319,7 @@ class SerialPcmAudioBridge(_OutputObserver):
         self._queued_bytes = 0
         self._last_stats_at = 0.0
         self._write_timeouts = 0
+        self._last_uplink_at: float | None = None
         self._prebuffer_enabled = False
         self._prebuffer_dropped = 0
         self._rx_buffer = bytearray()
@@ -335,6 +336,20 @@ class SerialPcmAudioBridge(_OutputObserver):
         with self._rx_lock:
             self._start_serial()
 
+    def reset_stall_clock(self) -> None:
+        """启动或重挂后重新给上行完整观察窗口，并清连续写超时。"""
+        self._last_uplink_at = time.monotonic()
+        self._write_timeouts = 0
+
+    def pcm_stalled(self) -> str | None:
+        if not self._running or self._last_uplink_at is None:
+            return None
+        if self._write_timeouts >= 3:
+            return "consecutive_write_timeouts"
+        if time.monotonic() - self._last_uplink_at >= config.get_float("PCM_STALL_SECONDS"):
+            return "no_uplink_bytes"
+        return None
+
     def _start_serial(self) -> None:
         self._ser = self._open_serial()
         self._rx_carry = b""
@@ -345,6 +360,7 @@ class SerialPcmAudioBridge(_OutputObserver):
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
         self._running = True
+        self.reset_stall_clock()
         self._written_bytes = 0
         self._queued_bytes = 0
         self._write_timeouts = 0
@@ -543,6 +559,9 @@ class SerialPcmAudioBridge(_OutputObserver):
         if not self._reader_alive:
             self._log_uplink_backlog()
         data = self._ser.read(NMEA_READ_SIZE)
+        if data:
+            # 在原始读取处计时：奇数字节、数字静音、回退直读都算通路有数据。
+            self._last_uplink_at = time.monotonic()
         if self._uplink_hold_ms > 0 and not self._first_downlink.is_set():
             self._first_downlink_bytes += len(data)
             if self._first_downlink_bytes >= 2:

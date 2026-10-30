@@ -1450,6 +1450,7 @@ class SerialModem:
                 continue
 
             if RING_PATTERN.search(self._buffer):
+                modem_hardware.clear_needs_power_cycle()
                 if (config.get_bool("MODEM_LOG_RELEASE_CAUSE")
                         and self._release_report.requested):
                     self._release_report = _ReleaseReport()
@@ -1631,6 +1632,7 @@ class SerialModem:
                     self._fast_poll_until = 0.0
 
                 if direction == "1" and status == "4":
+                    modem_hardware.clear_needs_power_cycle()
                     seen_incoming_ids.add(call_id)
                     if call_id not in self._incoming_call_ids:
                         self._incoming_call_ids.add(call_id)
@@ -1890,22 +1892,16 @@ class Sim7600Modem(SerialModem):
         self._call_pcm_enabled = False
 
     def answer(self) -> None:
-        if self._on_post_call_reset is None:
-            return super().answer()
         with self._serial_lock:
             self._arm_voice_call()
             super().answer()
 
     def dial(self, number: str, *, retry: bool = True, deadline: float | None = None) -> str:
-        if self._on_post_call_reset is None:
-            return super().dial(number, retry=retry, deadline=deadline)
         with self._serial_lock:
             self._arm_voice_call()
             return super().dial(number, retry=retry, deadline=deadline)
 
     def hangup(self) -> None:
-        if self._on_post_call_reset is None:
-            return super().hangup()
         if (config.get_bool("MODEM_LOG_RELEASE_CAUSE") and self._release_report.hung_up
                 and self._release_report.requested and not self._release_report.done.is_set()):
             return
@@ -1998,7 +1994,33 @@ class Sim7600Modem(SerialModem):
         logger.info("[timing] 模组接听问候耗时 %.3fs ok=%s", time.monotonic() - started, ok)
         return ok
 
-    def initialize_for_voice(self, audio_mode: str = "nmea") -> None:
+    def _voice_generation_current(self, generation: int) -> bool:
+        return (self._voice_call_armed and generation == self._voice_call_generation
+                and self.is_call_connected() and not self.transport_paused)
+
+    def rearm_voice_channel(self) -> bool:
+        """仅重挂当前通话的 PCM；不能调用会请求拆桥的关闭收尾方法。"""
+        generation = self._voice_call_generation
+        try:
+            with self._serial_lock:
+                if not self._voice_generation_current(generation):
+                    return False
+                self._send("AT+CPCMREG=0")
+            self.initialize_for_voice(expected_generation=generation)
+            with self._serial_lock:
+                return (self._voice_generation_current(generation)
+                        and bool(self.last_voice_enable and self.last_voice_enable.get("ok")))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PCM 重挂失败: error_type=%s", type(exc).__name__)
+            return False
+
+    def mark_pcm_degraded(self) -> None:
+        """只标记本通劣化；自愈请求仍由挂断路径发出。"""
+        self._pcm_degraded = True
+
+    def initialize_for_voice(
+        self, audio_mode: str = "nmea", *, expected_generation: int | None = None,
+    ) -> None:
         """使能 PCM-over-USB 语音通道（``AT+CPCMREG=1``）。
 
         SIM7600 仅此一条 USB 音频路径，与 ``audio_mode`` 取值无关（宿主侧桥的
@@ -2014,14 +2036,20 @@ class Sim7600Modem(SerialModem):
         # audio_bridge 修复），与音量无关；而实测这条指令本身要花 **2.3 秒**，
         # 占「接听→启用」总耗时的 83%（WIL-104）。治的是不存在的病，故移除。
         started = time.monotonic()
-        call_generation = self._voice_call_generation
-        call_armed = self._voice_call_armed
-        # 先清快照：中途串口异常时读取方拿到 None（未知），而非上一次的旧结果。
-        self.last_voice_enable = None
+        with self._serial_lock:
+            if expected_generation is not None and not self._voice_generation_current(expected_generation):
+                return
+            call_generation = self._voice_call_generation
+            call_armed = self._voice_call_armed
+            # 先清快照；旧世代的重挂不能清掉下一通的结果。
+            self.last_voice_enable = None
         if config.get_bool("MODEM_PCM_PIN_8K"):
             # VoLTE 出厂为 16k（0,1）；必须在每通启用 PCM 前对齐宿主的 8k 链路。
             try:
-                response = self._send("AT+CPCMBANDWIDTH=1,1")
+                with self._serial_lock:
+                    if expected_generation is not None and not self._voice_generation_current(expected_generation):
+                        return
+                    response = self._send("AT+CPCMBANDWIDTH=1,1")
                 if "OK" in response:
                     logger.info("SIM7600 PCM 已钉定 8kHz (AT+CPCMBANDWIDTH=1,1)")
                 else:
@@ -2033,18 +2061,30 @@ class Sim7600Modem(SerialModem):
         hold_uplink = audio_mode.lower() == "nmea" and config.get_int("MODEM_PCM_UPLINK_HOLD_MS") > 0
         for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
             attempt_started = time.monotonic()
-            ok = "OK" in self._send("AT+CPCMREG=1")
+            with self._serial_lock:
+                if expected_generation is not None and not self._voice_generation_current(expected_generation):
+                    return
+                ok = "OK" in self._send("AT+CPCMREG=1")
             enabled_mono = time.monotonic() if ok and hold_uplink else None
             logger.info(
                 "[timing] CPCMREG 第 %d 次耗时 %.2fs -> %s",
                 i + 1, time.monotonic() - attempt_started, "OK" if ok else "ERROR",
             )
             if ok:
-                if call_armed:
-                    with self._serial_lock:
-                        if self._voice_call_armed and call_generation == self._voice_call_generation:
-                            self._call_pcm_enabled = True
                 attempts = i + 1
+                with self._serial_lock:
+                    if expected_generation is not None and not self._voice_generation_current(expected_generation):
+                        return
+                    if call_armed and self._voice_call_armed and call_generation == self._voice_call_generation:
+                        self._call_pcm_enabled = True
+                    if attempts >= self._DEGRADED_ENABLE_ATTEMPTS:
+                        # 只标记本通劣化，实际恢复仍留给挂断路径。
+                        self._pcm_degraded = True
+                    self.last_voice_enable = {
+                        "ok": True, "attempts": attempts, "degraded": self._pcm_degraded,
+                    }
+                    if enabled_mono is not None:
+                        self.last_voice_enable["enabled_mono"] = enabled_mono
                 logger.info(
                     "[timing] 启用总耗时 %.2fs", time.monotonic() - started
                 )
@@ -2052,29 +2092,22 @@ class Sim7600Modem(SerialModem):
                     "PCM-over-USB 语音通道已启用 (AT+CPCMREG=1，第 %d 次)", attempts
                 )
                 if attempts >= self._DEGRADED_ENABLE_ATTEMPTS:
-                    # 多次重试才就绪，标记待恢复；一次重试仍属来电正常波动。
-                    # 真正的恢复在通话结束时请求，绝不打断进行中的通话。
-                    self._pcm_degraded = True
                     logger.warning(
                         "PCM 启用重试 %d 次，判定模组已劣化，本通结束后请求自愈", attempts
                     )
-                self.last_voice_enable = {
-                    "ok": True,
-                    "attempts": attempts,
-                    "degraded": self._pcm_degraded,
-                }
-                if enabled_mono is not None:
-                    self.last_voice_enable["enabled_mono"] = enabled_mono
                 return
             if i < self._CPCMREG_ENABLE_ATTEMPTS - 1:
                 time.sleep(self._CPCMREG_ENABLE_RETRY_DELAY)
         # 全部尝试失败：通话中意味着整通无声（下行写不进 iface4）；supervisor
         # 启动期（无活跃通话）属预期。区分交给读取方——有活跃通话才会落事件。
-        self.last_voice_enable = {
-            "ok": False,
-            "attempts": self._CPCMREG_ENABLE_ATTEMPTS,
-            "degraded": True,
-        }
+        with self._serial_lock:
+            if expected_generation is not None and not self._voice_generation_current(expected_generation):
+                return
+            self.last_voice_enable = {
+                "ok": False,
+                "attempts": self._CPCMREG_ENABLE_ATTEMPTS,
+                "degraded": True,
+            }
         logger.info("AT+CPCMREG=1 未启用（无活跃通话时属正常，接通后 per-call 会再试）")
 
     def _send_dtmf_digit(self, ch: str) -> bool:

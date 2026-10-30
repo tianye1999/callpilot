@@ -23,6 +23,7 @@ SIM7600_ALT_PID = 0x9011
 SIM7600_MAPS = ["2:/tmp/sim7600-at", "4:/tmp/sim7600-pcm"]
 RECOVERY_REQUEST_PATH = "/tmp/sim7600-recover-request"
 STATE_PATH = Path("/tmp/callpilot-modem.json")
+NEEDS_POWER_CYCLE_PATH = Path("/tmp/callpilot-modem-needs-power-cycle")
 STATE_MAX_AGE = 15.0
 # 服务初始化识别与 meta 观测扫描互斥，不能同时枚举同一设备。
 USB_SCAN_LOCK = threading.Lock()
@@ -99,6 +100,39 @@ def read_state() -> dict | None:
         return data
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def write_needs_power_cycle(reason: str) -> None:
+    """持久告警不设有效期；重启桥不能证明模组已恢复。"""
+    name = None
+    try:
+        fd, name = tempfile.mkstemp(prefix=".callpilot-power-cycle-", dir=NEEDS_POWER_CYCLE_PATH.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"updated_at": time.time(), "reason": reason}, stream)
+        os.replace(name, NEEDS_POWER_CYCLE_PATH)
+    except OSError as exc:
+        logger.warning("写模组重插标记失败: %s", exc)
+    finally:
+        if name is not None:
+            Path(name).unlink(missing_ok=True)
+
+
+def read_needs_power_cycle() -> dict | None:
+    try:
+        data = json.loads(NEEDS_POWER_CYCLE_PATH.read_text(encoding="utf-8"))
+        if (isinstance(data, dict) and isinstance(data.get("updated_at"), (int, float))
+                and isinstance(data.get("reason"), str)):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def clear_needs_power_cycle() -> None:
+    try:
+        NEEDS_POWER_CYCLE_PATH.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("清模组重插标记失败: %s", exc)
 
 
 def scan_preset() -> ModemPreset | None:

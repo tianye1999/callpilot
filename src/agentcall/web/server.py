@@ -637,6 +637,8 @@ async def _meta(request: web.Request) -> web.Response:
         await asyncio.shield(task)
         usb_online = _tray_usb_online(request.app, "meta")
     meta["hardware"] = {
+        "needs_power_cycle": bool(modem_hardware.read_needs_power_cycle())
+        if platforms.IS_MACOS or platforms.IS_LINUX else False,
         "usb_online": usb_online,
         "modem_connected": bool(getattr(service, "modem_connected", False)),
         "modem_resetting": isinstance(modem, SerialModem) and modem.recovery_in_progress,

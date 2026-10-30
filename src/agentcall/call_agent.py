@@ -380,6 +380,7 @@ class CallSession:
         self._dead_media_seconds = 0.0
         self._dead_media_hangup = False
         self._dead_media_reported = False
+        self._pcm_stall_failed = False
         # 最近一次 Agent 音频采样率，供收尾兜底计算丢弃时长。
         self._agent_output_rate = 24000
 
@@ -554,6 +555,7 @@ class CallSession:
 
     async def _handle_call(self) -> None:
         self._call_task = asyncio.current_task()
+        self._pcm_stall_failed = False
         self._clear_outgoing_audio()
         self._load_session_config()
         self._parallel_agent_connect = self.provider == "moss" or config.get_bool("PARALLEL_AGENT_CONNECT")
@@ -727,6 +729,9 @@ class CallSession:
             raise
         finally:
             await self._finish_local_preparation()
+            # 故障说明期间对端挂断也不能把已确认的系统故障覆盖成 completed。
+            if self._pcm_stall_failed:
+                status = "failed"
             if isinstance(self.modem, BluetoothModem):
                 self._bluetooth_cleanup_started = True
                 if self._phone_audio_lost:
@@ -1592,6 +1597,16 @@ class CallSession:
         generation = self._session_generation
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
+        pcm_modem = self.modem if isinstance(self.modem, Sim7600Modem) else None
+        stall_check = getattr(bridge, "pcm_stalled", None)
+        reset_stall_clock = getattr(bridge, "reset_stall_clock", None)
+        stall_recovery = config.get_bool("PCM_STALL_RECOVERY")
+        stall_seconds = config.get_float("PCM_STALL_SECONDS")
+        stall_detected = False
+        rearmed = False
+        next_stall_check = loop_started
+        # 包含 Agent 建连和开场耗时；进入循环后仍用单调时钟累计。
+        call_age_at_loop_start = max(0.0, time.time() - self.call_started_at) if self.call_started_at else 0.0
         while self.is_active and not agent.fatal:
             self._expire_takeover(generation=generation)
             triage_action = await self._consume_triage_results(
@@ -1616,6 +1631,37 @@ class CallSession:
                 self._clear_outgoing_audio()
 
             now = time.monotonic()
+            if (pcm_modem is not None and callable(stall_check) and callable(reset_stall_clock)
+                    and now >= next_stall_check and (not stall_detected or rearmed)):
+                next_stall_check = now + 1.0
+                stall_reason = stall_check()
+                if stall_reason and self._agent_generation_current(generation):
+                    if rearmed:
+                        self._pcm_stall_failed = True
+                        if record is not None:
+                            record.log_event("pcm_stall_unrecovered", reason=stall_reason,
+                                             call_seconds=round(call_age_at_loop_start + now - loop_started, 2))
+                        pcm_modem.mark_pcm_degraded()
+                        await self._explain_pcm_failure(agent, bridge, generation)
+                        # 交给现有 finally 收尾：停音频、挂断并将通话记为 failed。
+                        break
+                    stall_detected = True
+                    if record is not None:
+                        record.log_event("pcm_stall_detected", reason=stall_reason,
+                                         call_seconds=round(call_age_at_loop_start + now - loop_started, 2))
+                    if stall_recovery:
+                        started = time.monotonic()
+                        ok = await self._threaded_modem_call(pcm_modem.rearm_voice_channel)
+                        if not self._agent_generation_current(generation):
+                            break
+                        reset_stall_clock()
+                        rearmed = True
+                        ended = time.monotonic()
+                        # 连续写超时也须等完整 N 秒，不能重挂后立刻再次挂断。
+                        next_stall_check = ended + max(1.0, stall_seconds)
+                        if record is not None:
+                            record.log_event("pcm_rearm", ok=ok, elapsed_seconds=round(ended - started, 3))
+                        now = ended
             # 来电的 NO CARRIER 与 CLCC 轮询可能同时停活；会话自己持有最终时限，
             # 确保 Agent/bridge/CallRecord 最终仍走统一 finally 收尾。
             if (
@@ -1801,6 +1847,29 @@ class CallSession:
             uplink_post_stats.maybe_log(gain=agent_uplink_gain)
             await asyncio.sleep(0.01)
         return bridge
+
+    async def _explain_pcm_failure(self, agent, bridge: AudioBridge, generation: int) -> None:
+        """给模型场景而不是固定话术，生成与播出共享三秒上限。"""
+        instructions = (
+            "The call has a technical line problem and must end. Briefly explain the situation "
+            "in one sentence and suggest contacting again later. Do not claim the line was repaired."
+            if agent_language() == "en" else
+            "当前通话线路出现技术问题，必须结束通话。请结合上下文用一句话自然说明情况，"
+            "表示稍后再联系；不要声称线路已修好。"
+        )
+        speech = asyncio.create_task(agent.say(instructions))
+        deadline = time.monotonic() + 3.0
+        try:
+            while self._agent_generation_current(generation) and time.monotonic() < deadline:
+                self._drain_agent_audio(bridge)
+                if speech.done():
+                    speech.result()
+                await asyncio.sleep(0.01)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PCM 故障说明失败: error_type=%s", type(exc).__name__)
+        finally:
+            speech.cancel()
+            await asyncio.gather(speech, return_exceptions=True)
 
     async def _handoff_to_mobile(
         self,

@@ -121,6 +121,10 @@ def tray_status(
         parts.append(f"{seconds // 60:02d}:{seconds % 60:02d}" if started is not None else "--:--")
         return TrayStatus("in_call", " · ".join(parts), detail)
 
+    if hardware.get("needs_power_cycle"):
+        return status("attention", "模组需要重新插拔：拔下 USB，等 5 秒再插上",
+                      "Modem needs a power cycle: unplug USB, wait 5 seconds, then reconnect")
+
     # 未连上 AT 时 SIM 缓存可能是 UNKNOWN_SIM，不据此判定缺卡。
     connected = hardware.get("modem_connected")
     resetting = hardware.get("modem_resetting")
