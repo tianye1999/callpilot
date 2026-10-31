@@ -190,6 +190,34 @@ version: stop publication and keep client update checks disabled until corrected
 No shared Worker, database, credentials, feature flags, routes, or observability
 settings need changing.
 
+## Physical-SIM relay
+
+The physical-SIM line runs its own copy of the hosted control plane as
+`callpilot-sim-relay` on `sim-relay.bondings.ai` (API and dial page on one host,
+so `PUBLIC_ORIGIN` is that host). It has its own D1 database `callpilot-sim-relay`
+and Durable Objects; the shared Beta Worker is never touched. Always pass
+`-c wrangler.sim-relay.jsonc`:
+
+```bash
+npx wrangler deploy --dry-run -c wrangler.sim-relay.jsonc
+npx wrangler d1 migrations apply callpilot-sim-relay --remote -c wrangler.sim-relay.jsonc
+npx wrangler deploy -c wrangler.sim-relay.jsonc
+```
+
+Secrets (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `ADMIN_TOKEN`,
+`CONTENT_READ_ENABLED=true`) are set with `wrangler secret bulk` from stdin; the
+admin token lives only in the maintainer's Keychain. The zone rejects requests
+whose User-Agent looks like a script (Cloudflare error 1010), so admin calls must
+send an explicit User-Agent such as `CallPilot-Edge/1`.
+
+Edge setup: create an enrollment invite on `sim-relay.bondings.ai`, enroll from the
+desktop app (a new enrollment replaces any earlier Beta credential), add the Edge to
+`content_read_edges` as in the content-read rollout above, then set
+`REMOTE_WEB_DIALER_ENABLED=true`, `REMOTE_CLOUD_ENABLED=true`,
+`REMOTE_CLOUD_URL=https://sim-relay.bondings.ai`, `REMOTE_CONTENT_READ_ENABLED=true`
+and `REMOTE_CLOUD_DIALER_URL=https://sim-relay.bondings.ai/` and restart. Phones pair
+with gateway `https://sim-relay.bondings.ai` and the Hosted protocol.
+
 ## Rollback
 
 The hosted mode is independently gated by `REMOTE_CLOUD_ENABLED=false`. Turning
