@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sms_alert_channel">Messages</string>
+    <string name="sms_alert_public_title">New message received</string>
+    <string name="sms_alert_settings_hint">You will also be notified when this SIM receives a text message.</string>
+</resources>

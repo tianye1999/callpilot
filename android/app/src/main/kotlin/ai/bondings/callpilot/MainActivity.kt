@@ -5,6 +5,7 @@ import ai.bondings.callpilot.call.CallDigestAlerts
 import ai.bondings.callpilot.call.CallState
 import ai.bondings.callpilot.call.OfferAlerts
 import ai.bondings.callpilot.call.OfferWatchService
+import ai.bondings.callpilot.call.SmsAlerts
 import ai.bondings.callpilot.content.ProtectedJsonStore
 import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
@@ -67,12 +68,14 @@ class MainActivity : ComponentActivity() {
     private var showingOverLockscreen by mutableStateOf(false)
     private var offerLookupPending by mutableStateOf(false)
     private var digestCallId by mutableStateOf<String?>(null)
+    private var smsMessageId by mutableStateOf<String?>(null)
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleOfferIntent(intent)
         handleDigestIntent(intent)
+        handleSmsIntent(intent)
     }
 
     override fun onResume() {
@@ -103,6 +106,15 @@ class MainActivity : ComponentActivity() {
         if (digestCallId == null) intent.removeExtra(CallDigestAlerts.EXTRA_CALL_ID)
     }
 
+    private fun handleSmsIntent(intent: Intent) {
+        val messageId = intent.getStringExtra(SmsAlerts.EXTRA_MESSAGE_ID)
+        smsMessageId = messageId?.takeIf {
+            intent.action == SmsAlerts.ACTION_SMS && ContentWireValidation.validMessageId(it) &&
+                CredentialStore(applicationContext).load()?.protocol == PairingProtocol.HOSTED
+        }
+        if (smsMessageId == null) intent.removeExtra(SmsAlerts.EXTRA_MESSAGE_ID)
+    }
+
     private fun setOfferLockscreen(enabled: Boolean) {
         showingOverLockscreen = enabled
         if (Build.VERSION.SDK_INT >= 27) {
@@ -124,6 +136,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         handleOfferIntent(intent)
         handleDigestIntent(intent)
+        handleSmsIntent(intent)
         enableEdgeToEdge()
         val store = CredentialStore(applicationContext)
         val manager = CallGraph.manager(applicationContext)
@@ -265,9 +278,16 @@ class MainActivity : ComponentActivity() {
                                     digestCallId = null
                                     intent.removeExtra(CallDigestAlerts.EXTRA_CALL_ID)
                                 },
+                                smsMessageId = smsMessageId,
+                                onSmsOpened = {
+                                    smsMessageId = null
+                                    intent.removeExtra(SmsAlerts.EXTRA_MESSAGE_ID)
+                                },
                                 onUnpaired = {
                                     digestCallId = null
                                     intent.removeExtra(CallDigestAlerts.EXTRA_CALL_ID)
+                                    smsMessageId = null
+                                    intent.removeExtra(SmsAlerts.EXTRA_MESSAGE_ID)
                                     incomingOffer = null
                                     pairing = null
                                     alerts.reset()

@@ -35,7 +35,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** 等待转接与通话摘要提醒；麦克风与接听仍由 CallManager / CallService 管理。 */
+/** 等待转接、通话摘要与短信提醒；麦克风与接听仍由 CallManager / CallService 管理。 */
 class OfferWatchService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var polling: Job? = null
@@ -155,6 +155,7 @@ class OfferWatchService : Service() {
             }
         }
         startDigestPolling(store, manager)
+        startSmsPolling(store)
         return START_STICKY
     }
 
@@ -231,6 +232,59 @@ class OfferWatchService : Service() {
         }
     }
 
+    private fun startSmsPolling(store: CredentialStore) {
+        val messages = SmsAlertStore(applicationContext)
+        val alerts = SmsAlerts(applicationContext)
+        // 短信与转接、摘要各自轮询；本机通话期间也继续查询。
+        scope.launch {
+            while (isActive) {
+                val started = SystemClock.elapsedRealtime()
+                var interval = SMS_POLL_INTERVAL_MS
+                try {
+                    val current = store.load()
+                    if (current?.protocol != PairingProtocol.HOSTED) {
+                        stopWatching()
+                        return@launch
+                    }
+                    val policy = messages.load(current.credential.deviceId, System.currentTimeMillis())
+                    val client = HostedCloudClient(current.gatewayUrl, HttpClients.shared).also {
+                        it.credential = current.credential
+                    }
+                    try {
+                        // 接口按 occurredAt 倒序，null 游标取最新页；提醒资格按 recordedAt 判断。
+                        val page = client.listMessages(limit = 20, cursor = null)
+                        if (store.load() == current) {
+                            for (action in policy.pending(page.items, System.currentTimeMillis())) {
+                                if (store.load() != current) break
+                                if (alerts.show(action.message, action.silent)) {
+                                    policy.notified(action.message)
+                                    messages.save(policy)
+                                }
+                            }
+                        }
+                    } catch (error: HostedCloudException) {
+                        if (error.statusCode == 401 && store.load() == current) {
+                            // 沿用撤销流程，旧请求的 401 不能清掉新配对。
+                            ProtectedJsonStore.clearAll(applicationContext)
+                            store.clear()
+                            OfferAlerts.get(this@OfferWatchService).reset()
+                            stopWatching()
+                            return@launch
+                        }
+                        if (error.statusCode == 403 || error.errorCode == "FEATURE_DISABLED") {
+                            interval = SMS_BACKOFF_MS
+                        }
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    // 网络与响应异常静默重试，不清理共享连接池以免干扰转接。
+                }
+                delay((interval - (SystemClock.elapsedRealtime() - started)).coerceAtLeast(1))
+            }
+        }
+    }
+
     private fun updateWakeLock(waiting: Boolean) {
         if (!waiting) {
             releaseWakeLock()
@@ -273,6 +327,8 @@ class OfferWatchService : Service() {
         private const val POLL_INTERVAL_MS = 3_000L
         private const val DIGEST_POLL_INTERVAL_MS = 30_000L
         private const val DIGEST_BACKOFF_MS = 300_000L
+        private const val SMS_POLL_INTERVAL_MS = 15_000L
+        private const val SMS_BACKOFF_MS = 300_000L
         private val mutableRunning = MutableStateFlow(false)
         val running = mutableRunning.asStateFlow()
 

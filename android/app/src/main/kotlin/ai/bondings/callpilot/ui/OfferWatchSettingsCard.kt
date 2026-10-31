@@ -68,6 +68,7 @@ fun OfferWatchSettingsCard(hostedPairing: Boolean) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text(stringResource(R.string.offer_settings_title), style = MaterialTheme.typography.titleMedium)
             Text(stringResource(R.string.digest_settings_hint), style = MaterialTheme.typography.bodySmall)
+            Text(stringResource(R.string.sms_alert_settings_hint), style = MaterialTheme.typography.bodySmall)
             Text(stringResource(if (running) R.string.offer_service_running else R.string.offer_service_stopped))
             Text(stringResource(if (exempt) R.string.offer_battery_exempt else R.string.offer_battery_restricted))
             if (!hostedPairing) Text(stringResource(R.string.offer_hosted_only))

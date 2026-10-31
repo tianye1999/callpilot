@@ -36,7 +36,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -72,9 +74,12 @@ fun MainTabShell(
     modifier: Modifier = Modifier,
     digestCallId: String? = null,
     onDigestOpened: () -> Unit = {},
+    smsMessageId: String? = null,
+    onSmsOpened: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val navController = rememberNavController()
+    var smsDetailVersion by remember { mutableIntStateOf(0) }
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route ?: MainTab.Dial.route
     val tunnelClient = remember(pairing) {
@@ -166,6 +171,15 @@ fun MainTabShell(
             onDigestOpened()
         }
     }
+    LaunchedEffect(smsMessageId) {
+        if (smsMessageId != null && hostedClient != null) {
+            smsDetailVersion++
+            navController.navigate("messages/detail/${Uri.encode(smsMessageId)}") {
+                launchSingleTop = true
+            }
+            onSmsOpened()
+        }
+    }
 
     Scaffold(
         modifier = modifier,
@@ -232,6 +246,7 @@ fun MainTabShell(
                     messageId = entry.arguments?.getString("messageId").orEmpty(),
                     model = messageModel,
                     onBack = { navController.popBackStack() },
+                    refreshVersion = smsDetailVersion,
                 )
             }
             composable(MainTab.Settings.route) {

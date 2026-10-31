@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sms_alert_channel">短信</string>
+    <string name="sms_alert_public_title">收到一条短信</string>
+    <string name="sms_alert_settings_hint">这张卡收到短信时也会通知你</string>
+</resources>

@@ -16,6 +16,46 @@ import org.junit.Test
 
 class MessageInboxModelTest {
     @Test
+    fun `notification detail loads a message without first visiting inbox`() = runTest {
+        val target = bulkMessage(30)
+        val first = fixturePage().copy(items = listOf(bulkMessage(0)), hasMore = true, nextCursor = "cursor_next")
+        val last = first.copy(items = listOf(target), hasMore = false, nextCursor = null)
+        val model = MessageInboxModel(
+            FakeMessageClient(mutableListOf(Result.success(first), Result.success(last))),
+            InMemoryMessageCache(), DEVICE_ID,
+        )
+        model.loadMessage(target.messageId)
+        assertEquals(target, model.state.value.messages.last())
+    }
+
+    @Test
+    fun `notification detail refreshes cached revision and stops on network error`() = runTest {
+        val old = bulkMessage(0)
+        val updated = old.copy(revision = "revision_updated_000000000001", text = "Test message continued")
+        val page = fixturePage().copy(items = listOf(updated), hasMore = false, nextCursor = null)
+        val model = MessageInboxModel(
+            FakeMessageClient(mutableListOf(Result.success(page), Result.failure(java.io.IOException()))),
+            InMemoryMessageCache(MessageCacheSnapshot(DEVICE_ID, listOf(old), null, page.collectionRevision, 1_000)),
+            DEVICE_ID,
+        )
+        model.loadMessage(old.messageId)
+        assertEquals(updated, model.state.value.messages.single())
+        model.loadMessage(bulkMessage(1).messageId)
+        assertEquals(MessageSyncStatus.STALE, model.state.value.syncStatus)
+    }
+
+    @Test
+    fun `notification detail stops when pagination cursor does not advance`() = runTest {
+        val page = fixturePage().copy(items = emptyList(), hasMore = true, nextCursor = "cursor_same")
+        val model = MessageInboxModel(
+            FakeMessageClient(mutableListOf(Result.success(page), Result.success(page))),
+            InMemoryMessageCache(), DEVICE_ID,
+        )
+        model.loadMessage(bulkMessage(0).messageId)
+        assertTrue(model.state.value.messages.isEmpty())
+    }
+
+    @Test
     fun `refresh is live and watermark advances only after visible display`() = runTest {
         val page = fixturePage()
         val store = InMemoryMessageCache()

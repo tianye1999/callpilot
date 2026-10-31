@@ -1,6 +1,7 @@
 package ai.bondings.callpilot.pairing
 
 import ai.bondings.callpilot.call.CallDigestStore
+import ai.bondings.callpilot.call.SmsAlertStore
 import ai.bondings.callpilot.protocol.DeviceCredential
 import ai.bondings.callpilot.protocol.PairingProtocol
 import android.content.Context
@@ -57,6 +58,7 @@ class CredentialStore(private val context: Context) {
         prefs.edit().clear().apply()
         lastGateway?.let { prefs.edit().putString(KEY_LAST_GATEWAY, it).apply() }
         CallDigestStore(context).clear()
+        SmsAlertStore(context).clear()
         mutableChanges.update { it + 1 }
     }
 

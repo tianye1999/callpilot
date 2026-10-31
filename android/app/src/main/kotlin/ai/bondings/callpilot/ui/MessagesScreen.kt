@@ -38,7 +38,10 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -173,14 +176,22 @@ fun MessageDetailScreen(
     messageId: String,
     model: MessageInboxModel?,
     onBack: () -> Unit,
+    refreshVersion: Int = 0,
 ) {
     if (model == null) {
         UnsupportedContentScreen(stringResource(R.string.messages_detail_unavailable))
         return
     }
     val state by model.state.collectAsState()
+    var loading by remember(model, messageId, refreshVersion) { mutableStateOf(true) }
+    LaunchedEffect(model, messageId, refreshVersion) {
+        try {
+            model.loadMessage(messageId)
+        } finally {
+            loading = false
+        }
+    }
     val message = state.messages.firstOrNull { it.messageId == messageId }
-        ?: return UnsupportedContentScreen(stringResource(R.string.messages_detail_unavailable))
     Column(Modifier.fillMaxSize()) {
         Row(
             modifier = Modifier
@@ -196,6 +207,14 @@ fun MessageDetailScreen(
                 style = MaterialTheme.typography.headlineSmall,
                 modifier = Modifier.padding(start = 4.dp),
             )
+        }
+        if (message == null) {
+            CenteredStatus(
+                progress = loading,
+                title = stringResource(if (loading) R.string.messages_loading else R.string.messages_detail_unavailable),
+                detail = state.errorCode?.let { messageErrorText(it) },
+            )
+            return@Column
         }
         LazyColumn(Modifier.weight(1f)) {
             item {

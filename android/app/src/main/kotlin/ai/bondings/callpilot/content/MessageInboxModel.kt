@@ -9,6 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 
 enum class MessageSyncStatus { IDLE, LOADING, LIVE, STALE, OFFLINE }
@@ -115,6 +116,23 @@ class MessageInboxModel(
     }
 
     suspend fun loadCachedContent() = loadCacheIfNeeded()
+
+    /** 通知可绕过列表进入详情；只按 ID 查询，不从 Intent 接收正文。 */
+    suspend fun loadMessage(messageId: String) {
+        val requestGeneration = generation.get()
+        state.first { !it.isRefreshing && !it.isLoadingMore }
+        if (requestGeneration != generation.get()) return
+        refresh()
+        // 最新页之外的旧通知也能打开；限制页数并检测游标停滞，避免无限查询。
+        repeat(MAX_MESSAGES / 25) {
+            if (requestGeneration != generation.get() || state.value.messages.any { it.messageId == messageId } ||
+                state.value.syncStatus != MessageSyncStatus.LIVE || state.value.errorCode != null
+            ) return
+            val cursor = nextCursor ?: return
+            loadMore()
+            if (nextCursor == cursor) return
+        }
+    }
 
     fun setVisible(value: Boolean) {
         visible = value
