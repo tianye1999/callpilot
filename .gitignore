@@ -32,6 +32,8 @@ packaging/*.icns
 
 # 本地开发运作(个人/本机编排,不入库)
 CLAUDE.local.md
+# 会话交接文档、经验笔记等本地 MD(含本机环境细节,不入库)
+local-docs/
 
 # setuptools/pip install -e 构建产物(不入库)
 *.egg-info/
