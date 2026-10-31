@@ -43,6 +43,8 @@ def bundled_plists() -> dict[str, dict]:
         "Label": label, "BundleProgram": "Contents/MacOS/CallPilot",
         "ProgramArguments": ["CallPilot", *args],
         "AssociatedBundleIdentifiers": ["ai.bondings.callpilot"],
+        # 桥和服务不设 Interactive 会被 launchd 限 CPU / IO，实时通话音频会断续。
+        **({"ProcessType": "Interactive"} if label in (ld.BRIDGE_LABEL, ld.APP_LABEL) else {}),
         # Only tray starts at login. It verifies the bridge before starting app.
         # Even crash recovery must reconcile the pair after an app overwrite.
         "RunAtLoad": label == ld.TRAY_LABEL,

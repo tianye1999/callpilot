@@ -114,6 +114,9 @@ write_dev_app_plist() {
 <dict>
     <key>Label</key>
     <string>com.agentcall.app</string>
+    <!-- 不设 Interactive 会被 launchd 限 CPU / IO，实时通话音频会断续。 -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/caffeinate</string>
@@ -164,6 +167,9 @@ write_dev_bridge_plist() {
 <dict>
     <key>Label</key>
     <string>com.agentcall.bridge</string>
+    <!-- 不设 Interactive 会被 launchd 限 CPU / IO，实时通话音频会断续。 -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/caffeinate</string>

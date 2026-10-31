@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import plistlib
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -65,6 +66,7 @@ def test_template_points_writes_to_application_support(labeled_plist):
 
 def test_common_keys(labeled_plist):
     _, data = labeled_plist
+    assert data["ProcessType"] == "Interactive"
     assert data["ThrottleInterval"] == 10
     assert data["LimitLoadToSessionType"] == "Aqua"
 
@@ -94,6 +96,16 @@ def test_app_program_arguments_exact():
         "/Applications/CallPilot.app/Contents/MacOS/CallPilot",
         "--service",
     ]
+
+
+def test_dev_plists_use_same_process_type_as_templates():
+    script = (LAUNCHD_DIR / "install.sh").read_text(encoding="utf-8")
+    plists = [plistlib.loads(xml.encode()) for xml in re.findall(
+        r'<plist version="1.0">.*?</plist>', script, re.DOTALL,
+    )]
+    assert {data["Label"] for data in plists} == set(PLIST_SPECS)
+    for data in plists:
+        assert data["ProcessType"] == load_plist(PLIST_SPECS[data["Label"]])["ProcessType"] == "Interactive"
 
 
 def test_install_sh_syntax():

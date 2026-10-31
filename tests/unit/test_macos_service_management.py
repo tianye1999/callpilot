@@ -56,6 +56,9 @@ def test_embedded_plists_are_relocatable_and_do_not_start_services_before_reconc
     # launchd respawn could execute an overwritten bundle beside an old peer.
     assert plists[ld.APP_LABEL]["KeepAlive"] is False
     assert plists[ld.BRIDGE_LABEL]["KeepAlive"] is False
+    assert plists[ld.APP_LABEL]["ProcessType"] == "Interactive"
+    assert plists[ld.BRIDGE_LABEL]["ProcessType"] == "Interactive"
+    assert "ProcessType" not in plists[ld.TRAY_LABEL]
 
 
 def test_replacement_lease_stop_order_bridge_verification_and_no_self_unregister(tmp_path):

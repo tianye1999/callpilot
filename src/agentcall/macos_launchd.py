@@ -170,6 +170,8 @@ def build_plists(layout: LaunchdLayout) -> dict[str, dict]:
     bridge = {
         **common,
         "Label": BRIDGE_LABEL,
+        # 不设 Interactive 会被 launchd 限 CPU / IO，实时通话音频会断续。
+        "ProcessType": "Interactive",
         "ProgramArguments": [
             "/usr/bin/caffeinate",
             "-s",
@@ -185,6 +187,8 @@ def build_plists(layout: LaunchdLayout) -> dict[str, dict]:
     app = {
         **common,
         "Label": APP_LABEL,
+        # 不设 Interactive 会被 launchd 限 CPU / IO，实时通话音频会断续。
+        "ProcessType": "Interactive",
         "ProgramArguments": [
             "/usr/bin/caffeinate",
             "-s",

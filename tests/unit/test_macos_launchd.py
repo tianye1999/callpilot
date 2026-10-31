@@ -78,6 +78,9 @@ def test_build_plists_use_current_bundle_and_application_support_paths(tmp_path)
     app = plists["com.agentcall.app"]
     bridge = plists["com.agentcall.bridge"]
 
+    assert app["ProcessType"] == "Interactive"
+    assert bridge["ProcessType"] == "Interactive"
+    assert "ProcessType" not in plists[macos_launchd.TRAY_LABEL]
     assert app["ProgramArguments"] == ["/usr/bin/caffeinate", "-s", str(exe.resolve()), "--service"]
     assert bridge["ProgramArguments"][:4] == [
         "/usr/bin/caffeinate",
