@@ -22,7 +22,7 @@ data class NegotiatedPairing(
 /** Pair on one origin, preferring hosted v1 and falling back only when that route is absent. */
 class PairingNegotiator(
     private val baseUrl: String,
-    private val client: OkHttpClient = OkHttpClient(),
+    private val client: OkHttpClient = HttpClients.shared,
 ) {
     fun pair(
         code: String,

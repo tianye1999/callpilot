@@ -6,6 +6,7 @@ import ai.bondings.callpilot.protocol.DeviceStatus
 import ai.bondings.callpilot.protocol.GatewayClient
 import ai.bondings.callpilot.protocol.HostedCloudClient
 import ai.bondings.callpilot.protocol.HostedDeviceStatus
+import ai.bondings.callpilot.protocol.HttpClients
 import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.protocol.Validation
 import android.Manifest
@@ -50,12 +51,32 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val LINE_STATUS_REFRESH_MS = 15_000L
+
+/**
+ * 线路状态跨页面 / 锁屏保留：拨号页每次进组合都会重建 remember 状态，
+ * 不缓存就会先闪回「获取中」直到下一次请求返回。切回来先显示上次结果，后台再刷新。
+ */
+private object LineStatusCache {
+    data class Entry(
+        val pairing: StoredPairing,
+        val ready: Boolean?,
+        val label: String,
+        val error: String?,
+    )
+
+    @Volatile
+    var entry: Entry? = null
+}
 
 internal fun isDialEnabled(number: String, lineReady: Boolean?): Boolean =
     Validation.isValidNumber(number) && lineReady == true
@@ -68,9 +89,10 @@ fun DialScreen(
     manager: CallManager,
 ) {
     val context = LocalContext.current
-    var lineReady by remember(pairing) { mutableStateOf<Boolean?>(null) }
-    var lineStatusLabel by remember(pairing) { mutableStateOf("线路状态获取中…") }
-    var lineStatusError by remember(pairing) { mutableStateOf<String?>(null) }
+    val cachedStatus = remember(pairing) { LineStatusCache.entry?.takeIf { it.pairing == pairing } }
+    var lineReady by remember(pairing) { mutableStateOf(cachedStatus?.ready) }
+    var lineStatusLabel by remember(pairing) { mutableStateOf(cachedStatus?.label ?: "线路状态获取中…") }
+    var lineStatusError by remember(pairing) { mutableStateOf(cachedStatus?.error) }
     var number by remember { mutableStateOf("") }
     var message by remember { mutableStateOf<String?>(null) }
 
@@ -115,13 +137,23 @@ fun DialScreen(
             null
         }
 
+        suspend fun fetchLineStatus(): Any = withContext(Dispatchers.IO) {
+            when (pairing.protocol) {
+                PairingProtocol.TUNNEL -> checkNotNull(tunnelClient).deviceStatus()
+                PairingProtocol.HOSTED -> checkNotNull(hostedClient).deviceStatus()
+            }
+        }
+
         suspend fun refreshLineStatus() {
             try {
-                val status = withContext(Dispatchers.IO) {
-                    when (pairing.protocol) {
-                        PairingProtocol.TUNNEL -> checkNotNull(tunnelClient).deviceStatus()
-                        PairingProtocol.HOSTED -> checkNotNull(hostedClient).deviceStatus()
-                    }
+                val status = try {
+                    fetchLineStatus()
+                } catch (e: IOException) {
+                    // 锁屏后池里的连接可能已被系统静默断开：清掉后立刻重连一次，
+                    // 不让一次死连接把状态卡住一个刷新周期。已离开页面就不再重试。
+                    currentCoroutineContext().ensureActive()
+                    HttpClients.dropPooledConnections()
+                    fetchLineStatus()
                 }
                 when (status) {
                     is DeviceStatus -> {
@@ -142,11 +174,17 @@ fun DialScreen(
                     }
                 }
                 lineStatusError = null
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
+                // 阻塞的 OkHttp 请求不随协程取消而中断：离开页面后才返回的超时 / HTTP 错误
+                // 不能把状态（及进程缓存）改成「暂不可用」。
+                currentCoroutineContext().ensureActive()
                 lineReady = false
                 lineStatusLabel = "线路状态暂不可用"
                 lineStatusError = "获取线路状态失败：${e.message}"
             }
+            LineStatusCache.entry = LineStatusCache.Entry(pairing, lineReady, lineStatusLabel, lineStatusError)
         }
 
         val lifecycleOwner = context as? LifecycleOwner

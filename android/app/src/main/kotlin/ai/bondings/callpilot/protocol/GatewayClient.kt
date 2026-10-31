@@ -25,7 +25,7 @@ import okhttp3.Response
  */
 class GatewayClient(
     baseUrl: String,
-    private val client: OkHttpClient = OkHttpClient(),
+    private val client: OkHttpClient = HttpClients.shared,
 ) {
     companion object {
         const val DEVICE_COOKIE = "__Host-callpilot-device"

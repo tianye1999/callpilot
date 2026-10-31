@@ -27,7 +27,7 @@ import okhttp3.Response
 /** Hosted control-plane `/v1` adapter. Calls are blocking and must run on an IO dispatcher. */
 class HostedCloudClient(
     baseUrl: String,
-    private val client: OkHttpClient = OkHttpClient(),
+    private val client: OkHttpClient = HttpClients.shared,
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val sleepMs: (Long) -> Unit = Thread::sleep,
 ) : MessageContentClient, CallRecordContentClient {
