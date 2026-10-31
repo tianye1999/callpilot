@@ -399,6 +399,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 通话行为 ----
     ConfigSpec("HALF_DUPLEX_HANGOVER_SECONDS", "半双工挂尾时长（秒）", "float", "0.5"),
     ConfigSpec("HANGUP_TOOL_DELAY_SECONDS", "挂断工具延迟（秒）", "float", "4.5"),
+    ConfigSpec("HANGUP_PLAYOUT_MAX_SECONDS", "我方挂断前最多再等多久让 AI 把话说完（秒，0=不额外等待）", "float", "10"),
     # 默认维持 inband —— 2026-08-03 真机对照定档（#74 / WIL-82）：
     # 白天拨 10086 各 5 通，只统计「在按键菜单上按的键」，判据为对端是否真的
     # 推进到下一级（本机 result=success 已证实是假阳，不作数）。

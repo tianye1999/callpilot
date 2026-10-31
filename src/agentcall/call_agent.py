@@ -12,6 +12,7 @@ import secrets
 import threading
 import time
 from array import array
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from queue import Empty, Full, Queue
 from typing import Awaitable, Callable
@@ -21,6 +22,7 @@ from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.local_agent import LocalPipelineAgent
 from .agents.moss_agent import MossVoiceAgent
+from .agents.openai_agent import OpenAIVoiceAgent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
 from .audio_bridge import (
     MODEM_RATE,
@@ -141,6 +143,30 @@ HALF_DUPLEX_HANGOVER_SECONDS = 0.5
 # 挂断工具触发后延迟这么久再真正挂断，先让 Agent 播完告别语。
 # （仅作缺省值；每通会话开始时从 config.HANGUP_TOOL_DELAY_SECONDS 重新读取。）
 HANGUP_TOOL_DELAY_SECONDS = 4.5
+# 桥清空只代表已写给模组；留 300ms 让最后一个字通过设备缓冲。
+_HANGUP_PLAYOUT_TAIL_SECONDS = 0.3
+# 有积压却 1.5s 没有实际写出，继续等只会延长死线；不用于纯生成等待。
+_HANGUP_PLAYOUT_STALL_SECONDS = 1.5
+_HANGUP_PLAYOUT_POLL_SECONDS = 0.05
+
+
+@dataclass
+class _HangupPlayoutWait:
+    reason: str
+    started_at: float
+    pending_bytes: int
+    queued_bytes: int
+    generating: bool
+    media_busy: bool
+    record: CallRecord | None
+    last_progress_at: float
+    progress: int | None
+    last_pending: int
+    last_write_at: float
+    had_backlog: bool
+    empty_since: float | None = None
+    finished: bool = False
+
 
 # Profile-gated fallback: wait briefly for a genuine tool call after the Agent
 # says it is pressing a key. The recent-send window closes transcript/tool races.
@@ -263,6 +289,8 @@ class CallSession:
         # Timer 必须可取消；世代号兜住已越过 cancel、正在执行的回调，
         # 避免它 stop() 误伤下一通会话。
         self._hangup_timer: threading.Timer | None = None
+        self._hangup_playout_wait: _HangupPlayoutWait | None = None
+        self._hangup_agent: VoiceAgent | None = None
         self._session_generation = 0
         self._hangup_lock = threading.Lock()
         # 外呼收尾裁判（LLM 判断对话该继续还是收尾，替代关键词枚举）：
@@ -282,6 +310,7 @@ class CallSession:
         # 会话级可调参数：每通会话开始时从 config 重新读取，支持不重启改参。
         self._hangover_seconds = HALF_DUPLEX_HANGOVER_SECONDS
         self._hangup_delay_seconds = HANGUP_TOOL_DELAY_SECONDS
+        self._hangup_playout_max_seconds = 10.0
         # 外呼动态场景提示词：拨号等待接通时后台生成，接通后限时取用。
         self._prompt_gen_thread: threading.Thread | None = None
         self._prompt_gen_done = threading.Event()
@@ -473,6 +502,9 @@ class CallSession:
         # （只影响已结束的旧会话），要么校验失败直接放弃。
         with self._hangup_lock:
             self._cancel_hangup_timer()
+            self._finish_hangup_playout_wait("session_changed")
+            self._hangup_playout_wait = None
+            self._hangup_agent = None
             self._session_generation += 1
             self._set_active(True)
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -784,6 +816,12 @@ class CallSession:
             self._active_tools = tools
         agent.set_tools(tools)
         bridge = get_bridge()
+        # 非并行路径原先只在 local 指标开启时计写出字节；挂断排空也需要
+        # 这个计数，不能把「新音频不断入桥」误当成播放进度。
+        if (bridge is not None and not self._parallel_agent_connect
+                and (self._hangup_playout_max_seconds > 0
+                     or isinstance(agent, LocalPipelineAgent) and config.get_bool("LOCAL_LATENCY_METRICS"))):
+            bridge.set_output_observer(lambda pcm: None)
         if isinstance(agent, LocalPipelineAgent) and config.get_bool("LOCAL_LATENCY_METRICS"):
             if record is not None:
                 def local_event(fields: dict) -> None:
@@ -794,8 +832,6 @@ class CallSession:
                         fields["t_ms"] = round((at - session_t0) * 1000, 1)
                     record.log_event(event_type, **fields)
                 agent.set_turn_event_handler(local_event)
-            if bridge is not None and not self._parallel_agent_connect:
-                bridge.set_output_observer(lambda pcm: None)
         if isinstance(bridge, SerialPcmAudioBridge):
             bridge.set_ready_check(self.modem.pcm_ready)
         self._barge_in = self.provider == "moss" or config.get_bool("BARGE_IN_ENABLED")
@@ -1280,6 +1316,7 @@ class CallSession:
         """Agent 下行音频回调：浏览器实时旁听、本机监听旁路、重采样到 8k、录音、入发送队列。"""
 
         self._agent_output_rate = agent.output_rate
+        self._hangup_agent = agent
         # 实时旁听按 Agent 输出采样率播放（qwen/openai 均 24k）。
         if self.hub is not None:
             self.hub.set_audio_rate(agent.output_rate)
@@ -1595,6 +1632,7 @@ class CallSession:
         uplink_pre_stats = PcmFlowStats("agent_uplink_pre_gain")
         uplink_post_stats = PcmFlowStats("agent_uplink_post_gain")
         winddown_deadline: float | None = None
+        winddown_reason = ""
         generation = self._session_generation
         # agent.fatal：实现层判定会话不可恢复（如重连全败）时置位，
         # 结束整通电话而非让对方听沉默。
@@ -1608,13 +1646,14 @@ class CallSession:
         next_stall_check = loop_started
         # 包含 Agent 建连和开场耗时；进入循环后仍用单调时钟累计。
         call_age_at_loop_start = max(0.0, time.time() - self.call_started_at) if self.call_started_at else 0.0
-        while self.is_active and not agent.fatal:
+        while self._agent_generation_current(generation) and not agent.fatal:
             self._expire_takeover(generation=generation)
             triage_action = await self._consume_triage_results(
                 agent, bridge, generation
             )
             if triage_action == "reject":
                 winddown_deadline = self._triage_reject_deadline
+                winddown_reason = "triage_reject"
             await self._speak_takeover_hold_if_needed(agent, bridge, generation)
             self._expire_takeover(generation=generation)
             await self._resume_ai_after_takeover(agent, bridge, generation)
@@ -1706,6 +1745,7 @@ class CallSession:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("收尾道别发送失败: %s", exc)
                 winddown_deadline = now + self._hangup_delay_seconds
+                winddown_reason = "outbound_deadline"
             # ② 收尾裁判：到间隔就后台跑一次（asyncio task，不阻塞主循环）
             if (
                 judge_enabled
@@ -1728,8 +1768,13 @@ class CallSession:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("收尾道别发送失败: %s", exc)
                 winddown_deadline = now + self._hangup_delay_seconds
+                winddown_reason = "wrap_up_judge"
             if winddown_deadline is not None and now >= winddown_deadline:
-                break
+                # 分诊拒绝已有独立排空语义，不叠加本次预定挂断等待。
+                if winddown_reason == "triage_reject" or self._hangup_playout_ready(
+                    bridge, agent, record, winddown_reason, winddown_deadline, generation,
+                ):
+                    break
             pending = (
                 bridge.pending_output_bytes()
                 if hasattr(bridge, "pending_output_bytes")
@@ -1744,7 +1789,8 @@ class CallSession:
                     last_output_progress_at = now
                 if progress is not None:
                     previous_output_progress = progress
-                if (pending > 0 and now - last_output_progress_at >= _PARALLEL_PLAYOUT_STALL_SECONDS
+                if (self._hangup_playout_wait is None
+                        and pending > 0 and now - last_output_progress_at >= _PARALLEL_PLAYOUT_STALL_SECONDS
                         and now >= self._dtmf_guard_until and hasattr(bridge, "discard_pending_output")):
                     if self._discard_agent_playback(bridge, "下行写出停滞"):
                         logger.warning("下行写出停滞，已清积压并释放半双工屏蔽")
@@ -2079,6 +2125,9 @@ class CallSession:
         self._dead_media_silent_seconds = 0.0
         self._dead_media_reported = False
         self._hangup_delay_seconds = config.get_float("HANGUP_TOOL_DELAY_SECONDS")
+        self._hangup_playout_max_seconds = config.get_float("HANGUP_PLAYOUT_MAX_SECONDS")
+        if not math.isfinite(self._hangup_playout_max_seconds) or self._hangup_playout_max_seconds < 0:
+            self._hangup_playout_max_seconds = 10.0
         self._wrap_up_carrier_sms_enabled = False
         self._wrap_up_sms_service_number = ""
         self._wrap_up_sms_started_at = 0.0
@@ -3087,7 +3136,7 @@ class CallSession:
             timer = threading.Timer(
                 self._hangup_delay_seconds,
                 self._deferred_hangup,
-                args=(self._session_generation,),
+                args=(self._session_generation, time.monotonic() + self._hangup_delay_seconds),
             )
             self._hangup_timer = timer
             timer.start()
@@ -3764,11 +3813,135 @@ class CallSession:
             return "qvts"
         return configured
 
-    def _deferred_hangup(self, generation: int) -> None:
+    @staticmethod
+    def _hangup_reply_pending(agent: VoiceAgent | None) -> bool:
+        # 只复用已有且覆盖在途工作的状态，不从完成回调猜开始，也不扩 provider 接口。
+        if isinstance(agent, LocalPipelineAgent):
+            # empty() 漏掉 worker 已取出的 LLM/TTS；task_done 在音频回调之后。
+            for work in (agent._brain_queue, agent._tts_queue):
+                with work.mutex:
+                    if work.unfinished_tasks:
+                        return True
+        if isinstance(agent, OpenAIVoiceAgent):
+            return agent._response_active or agent._response_requested
+        return False
+
+    def _hangup_playout_ready(
+        self, bridge: AudioBridge | None, agent: VoiceAgent | None,
+        record: CallRecord | None, reason: str, deadline: float, generation: int,
+    ) -> bool:
+        """只观测、不睡眠；调用方不可持 _hangup_lock，写出回调也会取它。"""
+        if not self._agent_generation_current(generation):
+            return True
+        if self._hangup_playout_max_seconds <= 0:
+            return True
+        # 与队列搬运互斥采样，避免音频从队列转到桥的间隙被误判为已空。
+        # 先读生成状态：worker 的最后一块音频必先入队再 task_done；反序会漏掉它。
+        # UAC 的同步 write 可能占锁很久；拿不到就视为搬运在途，仍检查上限。
+        media_acquired = self._media_lock.acquire(blocking=False)
+        try:
+            generating = self._hangup_reply_pending(agent)
+            pending = (
+                bridge.pending_output_bytes()
+                if bridge is not None and hasattr(bridge, "pending_output_bytes") else 0
+            )
+            progress = (
+                bridge.output_progress_bytes()
+                if bridge is not None and hasattr(bridge, "output_progress_bytes") else None
+            )
+            with self._outgoing_audio.mutex:
+                queued_bytes = sum(len(chunk) for chunk in self._outgoing_audio.queue)
+                queued = bool(self._outgoing_audio.queue)
+        finally:
+            if media_acquired:
+                self._media_lock.release()
+        # 不嵌套媒体锁和挂断锁：UAC 同步写出回调存在 media -> hangup 顺序。
         with self._hangup_lock:
-            # 世代号不匹配 = 排定本 Timer 的那通已结束：不得 stop() 新会话。
+            if generation != self._session_generation or not self.is_active or self._hangup_silenced:
+                return True
+            now = time.monotonic()
+            backlog = pending > 0 or queued or not media_acquired
+            speaking = backlog or generating
+            wait = self._hangup_playout_wait
+            if wait is None:
+                if not speaking:
+                    return True  # 到点本来就空：不加尾巴，保持旧挂断时刻。
+                wait = _HangupPlayoutWait(
+                    reason, deadline, pending, queued_bytes, generating, not media_acquired, record, now,
+                    progress, pending, self._last_downlink_play_at, backlog,
+                )
+                self._hangup_playout_wait = wait
+            if wait.finished:
+                return True
+            if now - wait.started_at >= self._hangup_playout_max_seconds:
+                self._finish_hangup_playout_wait("max_wait")
+                return True
+            progressed = (
+                progress > wait.progress if progress is not None and wait.progress is not None
+                else pending < wait.last_pending
+            )
+            if (not backlog or not wait.had_backlog or progressed
+                    or self._last_downlink_play_at > wait.last_write_at):
+                wait.last_progress_at = now
+            wait.progress = progress
+            wait.last_pending = pending
+            wait.last_write_at = self._last_downlink_play_at
+            wait.had_backlog = backlog
+            if backlog and now - wait.last_progress_at >= _HANGUP_PLAYOUT_STALL_SECONDS:
+                self._finish_hangup_playout_wait("stalled")
+                return True
+            if speaking:
+                wait.empty_since = None
+            elif wait.empty_since is None:
+                wait.empty_since = now
+            elif now - wait.empty_since >= _HANGUP_PLAYOUT_TAIL_SECONDS:
+                self._finish_hangup_playout_wait("played_out")
+                return True
+            return False
+
+    def _finish_hangup_playout_wait(self, end_reason: str) -> None:
+        """持有 _hangup_lock 时结算一次，始终写回原通话记录。"""
+        wait = self._hangup_playout_wait
+        if wait is None or wait.finished:
+            return
+        wait.finished = True
+        fields = {
+            "reason": wait.reason, "pending_bytes": wait.pending_bytes,
+            "queued_bytes": wait.queued_bytes, "generating": wait.generating,
+            "media_busy": wait.media_busy,
+            "wait_ms": round(max(0.0, time.monotonic() - wait.started_at) * 1000, 1),
+            "end_reason": end_reason,
+        }
+        logger.info("挂断前等待播放: %s", fields)
+        if wait.record is not None:
+            try:
+                wait.record.log_event("hangup_playout_wait", **fields)
+            except Exception:  # noqa: BLE001
+                logger.warning("挂断播放等待事件落盘失败（不影响挂断）")
+
+    def _deferred_hangup(self, generation: int, deadline: float | None = None) -> None:
+        if deadline is None:
+            deadline = time.monotonic()
+        ready = self._hangup_playout_ready(
+            self._hangup_bridge, self._hangup_agent, self._record, "hangup_tool", deadline, generation,
+        )
+        with self._hangup_lock:
+            # 采样后必须重新检查，并与 stop 原子完成；旧 Timer 不得影响新会话。
             if generation != self._session_generation:
                 logger.info("延迟挂断已过期（会话已更替），忽略")
+                return
+            if not self.is_active or self._hangup_silenced:
+                return
+            if not ready:
+                wait = self._hangup_playout_wait
+                remaining = ((wait.started_at if wait is not None else deadline)
+                             + self._hangup_playout_max_seconds - time.monotonic())
+                timer = threading.Timer(
+                    max(0.0, min(_HANGUP_PLAYOUT_POLL_SECONDS, remaining)),
+                    self._deferred_hangup, args=(generation, deadline),
+                )
+                self._hangup_timer = timer
+                timer.start()
                 return
             logger.info("工具触发挂断通话")
             self.stop()
@@ -4287,6 +4460,7 @@ class CallSession:
         # Invalidate first. Callbacks already in flight then fail their generation
         # check before they can write PCM, send DTMF/SMS, or schedule a hangup.
         with self._hangup_lock:
+            self._finish_hangup_playout_wait("session_changed")
             self._session_generation += 1
             self._cancel_hangup_timer()
         with self._dtmf_lock:
@@ -4332,6 +4506,11 @@ class CallSession:
             return 0
 
     def _silence_for_hangup(self, bridge: AudioBridge | None, reason: str) -> None:
+        with self._hangup_lock:
+            self._hangup_silenced = True
+            self._finish_hangup_playout_wait(
+                "remote_hangup" if reason == "remote_party_hangup" else reason,
+            )
         with self._media_lock:
             self._hangup_silenced = True
             dropped = self._silence_bridge_for_hangup(bridge or self._hangup_bridge)
