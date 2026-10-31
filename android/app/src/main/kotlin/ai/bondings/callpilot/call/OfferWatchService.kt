@@ -6,6 +6,7 @@ import ai.bondings.callpilot.content.ProtectedJsonStore
 import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.protocol.HostedCloudClient
 import ai.bondings.callpilot.protocol.HostedCloudException
+import ai.bondings.callpilot.protocol.CallSummaryState
 import ai.bondings.callpilot.protocol.HttpClients
 import ai.bondings.callpilot.protocol.PairingProtocol
 import android.app.Notification
@@ -34,7 +35,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** 只等待转接和发提醒；麦克风与接听仍由 CallManager / CallService 管理。 */
+/** 等待转接与通话摘要提醒；麦克风与接听仍由 CallManager / CallService 管理。 */
 class OfferWatchService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var polling: Job? = null
@@ -153,7 +154,81 @@ class OfferWatchService : Service() {
                 delay((POLL_INTERVAL_MS - (SystemClock.elapsedRealtime() - started)).coerceAtLeast(1))
             }
         }
+        startDigestPolling(store, manager)
         return START_STICKY
+    }
+
+    private fun startDigestPolling(store: CredentialStore, manager: CallManager) {
+        val digests = CallDigestStore(applicationContext)
+        val alerts = CallDigestAlerts(applicationContext)
+        // 与 3 秒 offer 轮询独立；详情接口慢或退避都不占用转接循环。
+        scope.launch {
+            while (isActive) {
+                val started = SystemClock.elapsedRealtime()
+                var interval = DIGEST_POLL_INTERVAL_MS
+                try {
+                    val current = store.load()
+                    if (current?.protocol != PairingProtocol.HOSTED) {
+                        stopWatching()
+                        return@launch
+                    }
+                    val policy = digests.load(current.credential.deviceId, System.currentTimeMillis())
+                    fun canNotify() = store.load() == current && manager.state.value is CallState.Idle
+                    if (canNotify()) {
+                        val client = HostedCloudClient(current.gatewayUrl, HttpClients.shared).also {
+                            it.credential = current.credential
+                        }
+                        try {
+                            val page = client.listCallRecords(limit = 20, cursor = null)
+                            if (canNotify()) {
+                                for (record in policy.pending(page.items, System.currentTimeMillis())) {
+                                    if (!canNotify()) break
+                                    val detail = if (!CallDigestPolicy.isMissed(record) && record.summaryState != CallSummaryState.PENDING) {
+                                        try {
+                                            client.getCallRecord(record.callId).takeIf { it.record.callId == record.callId }
+                                        } catch (error: CancellationException) {
+                                            throw error
+                                        } catch (error: HostedCloudException) {
+                                            if (error.statusCode == 401 || error.statusCode == 403 || error.errorCode == "FEATURE_DISABLED") throw error
+                                            null
+                                        } catch (_: Exception) {
+                                            null
+                                        }
+                                    } else null
+                                    if (!canNotify()) break
+                                    // 详情可能比列表更新：已由手机接听或重新变为 PENDING 时也不误报。
+                                    val latest = detail?.record?.let {
+                                        it.copy(summaryPreview = it.summaryPreview?.takeIf(String::isNotBlank) ?: record.summaryPreview)
+                                    } ?: record
+                                    if (policy.pending(listOf(latest), System.currentTimeMillis()).isEmpty()) continue
+                                    if (alerts.show(latest, detail?.summary)) {
+                                        policy.notified(latest.callId)
+                                        digests.save(policy)
+                                    }
+                                }
+                            }
+                        } catch (error: HostedCloudException) {
+                            if (error.statusCode == 401 && store.load() == current) {
+                                // 与 offer 共用撤销流程，旧请求不能清掉新的配对。
+                                ProtectedJsonStore.clearAll(applicationContext)
+                                store.clear()
+                                OfferAlerts.get(this@OfferWatchService).reset()
+                                stopWatching()
+                                return@launch
+                            }
+                            if (error.statusCode == 403 || error.errorCode == "FEATURE_DISABLED") {
+                                interval = DIGEST_BACKOFF_MS
+                            }
+                        }
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    // 摘要接口异常静默重试，不清理共享连接池以免干扰 offer。
+                }
+                delay((interval - (SystemClock.elapsedRealtime() - started)).coerceAtLeast(1))
+            }
+        }
     }
 
     private fun updateWakeLock(waiting: Boolean) {
@@ -196,6 +271,8 @@ class OfferWatchService : Service() {
         private const val CHANNEL_ID = "callpilot_offer_watch"
         private const val NOTIFICATION_ID = 1002
         private const val POLL_INTERVAL_MS = 3_000L
+        private const val DIGEST_POLL_INTERVAL_MS = 30_000L
+        private const val DIGEST_BACKOFF_MS = 300_000L
         private val mutableRunning = MutableStateFlow(false)
         val running = mutableRunning.asStateFlow()
 

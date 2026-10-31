@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.pairing
 
+import ai.bondings.callpilot.call.CallDigestStore
 import ai.bondings.callpilot.protocol.DeviceCredential
 import ai.bondings.callpilot.protocol.PairingProtocol
 import android.content.Context
@@ -18,7 +19,7 @@ data class StoredPairing(
     val edgeId: String? = null,
 )
 
-class CredentialStore(context: Context) {
+class CredentialStore(private val context: Context) {
     private val prefs = EncryptedSharedPreferences.create(
         context,
         "callpilot_pairing",
@@ -55,6 +56,7 @@ class CredentialStore(context: Context) {
         val lastGateway = prefs.getString(KEY_GATEWAY, null)
         prefs.edit().clear().apply()
         lastGateway?.let { prefs.edit().putString(KEY_LAST_GATEWAY, it).apply() }
+        CallDigestStore(context).clear()
         mutableChanges.update { it + 1 }
     }
 

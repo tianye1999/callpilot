@@ -18,6 +18,7 @@ import ai.bondings.callpilot.protocol.GatewayClient
 import ai.bondings.callpilot.protocol.HostedCloudClient
 import ai.bondings.callpilot.protocol.HostedDeviceStatus
 import ai.bondings.callpilot.protocol.PairingProtocol
+import android.net.Uri
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Call
@@ -69,6 +70,8 @@ fun MainTabShell(
     manager: CallManager,
     onUnpaired: () -> Unit,
     modifier: Modifier = Modifier,
+    digestCallId: String? = null,
+    onDigestOpened: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val navController = rememberNavController()
@@ -154,6 +157,14 @@ fun MainTabShell(
     }
     LaunchedEffect(callHistoryModel) {
         callHistoryModel?.loadCachedContent()
+    }
+    LaunchedEffect(digestCallId) {
+        if (digestCallId != null && hostedClient != null) {
+            navController.navigate("records/detail/${Uri.encode(digestCallId)}") {
+                launchSingleTop = true
+            }
+            onDigestOpened()
+        }
     }
 
     Scaffold(

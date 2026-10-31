@@ -1,6 +1,7 @@
 package ai.bondings.callpilot
 
 import ai.bondings.callpilot.call.CallGraph
+import ai.bondings.callpilot.call.CallDigestAlerts
 import ai.bondings.callpilot.call.CallState
 import ai.bondings.callpilot.call.OfferAlerts
 import ai.bondings.callpilot.call.OfferWatchService
@@ -9,6 +10,7 @@ import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.HostedCloudClient
 import ai.bondings.callpilot.protocol.HostedCloudException
+import ai.bondings.callpilot.protocol.ContentWireValidation
 import ai.bondings.callpilot.protocol.InboundOffer
 import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.ui.CallPilotTheme
@@ -64,11 +66,13 @@ class MainActivity : ComponentActivity() {
     private var offerRefreshVersion by mutableIntStateOf(0)
     private var showingOverLockscreen by mutableStateOf(false)
     private var offerLookupPending by mutableStateOf(false)
+    private var digestCallId by mutableStateOf<String?>(null)
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleOfferIntent(intent)
+        handleDigestIntent(intent)
     }
 
     override fun onResume() {
@@ -88,6 +92,15 @@ class MainActivity : ComponentActivity() {
         offerLookupPending = fromOffer
         setOfferLockscreen(fromOffer)
         if (fromOffer) offerRefreshVersion++
+    }
+
+    private fun handleDigestIntent(intent: Intent) {
+        val callId = intent.getStringExtra(CallDigestAlerts.EXTRA_CALL_ID)
+        digestCallId = callId?.takeIf {
+            intent.action == CallDigestAlerts.ACTION_CALL_DIGEST && ContentWireValidation.validCallId(it) &&
+                CredentialStore(applicationContext).load()?.protocol == PairingProtocol.HOSTED
+        }
+        if (digestCallId == null) intent.removeExtra(CallDigestAlerts.EXTRA_CALL_ID)
     }
 
     private fun setOfferLockscreen(enabled: Boolean) {
@@ -110,6 +123,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleOfferIntent(intent)
+        handleDigestIntent(intent)
         enableEdgeToEdge()
         val store = CredentialStore(applicationContext)
         val manager = CallGraph.manager(applicationContext)
@@ -246,7 +260,14 @@ class MainActivity : ComponentActivity() {
                                 pairing = current,
                                 store = store,
                                 manager = manager,
+                                digestCallId = digestCallId,
+                                onDigestOpened = {
+                                    digestCallId = null
+                                    intent.removeExtra(CallDigestAlerts.EXTRA_CALL_ID)
+                                },
                                 onUnpaired = {
+                                    digestCallId = null
+                                    intent.removeExtra(CallDigestAlerts.EXTRA_CALL_ID)
                                     incomingOffer = null
                                     pairing = null
                                     alerts.reset()

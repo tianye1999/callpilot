@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="digest_channel">AI 代接来电</string>
+    <string name="digest_title">AI 替你接了一通来电</string>
+    <string name="digest_urgent_title">AI 替你接了一通来电（急）</string>
+    <string name="digest_missed_title">未接来电</string>
+    <string name="digest_detail_hint">点开查看通话详情</string>
+    <string name="digest_unknown_caller">未知号码</string>
+    <string name="digest_settings_hint">AI 替你接完来电后，也会通过通知告诉你摘要</string>
+</resources>

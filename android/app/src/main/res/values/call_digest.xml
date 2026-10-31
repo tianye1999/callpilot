@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="digest_channel">AI-handled calls</string>
+    <string name="digest_title">AI answered a call for you</string>
+    <string name="digest_urgent_title">AI answered a call for you (urgent)</string>
+    <string name="digest_missed_title">Missed call</string>
+    <string name="digest_detail_hint">Tap to view call details</string>
+    <string name="digest_unknown_caller">Unknown number</string>
+    <string name="digest_settings_hint">After AI handles a call for you, a notification will also show you the summary.</string>
+</resources>
