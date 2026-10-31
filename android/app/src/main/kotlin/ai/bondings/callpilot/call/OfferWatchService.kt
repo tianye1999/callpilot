@@ -1,0 +1,223 @@
+package ai.bondings.callpilot.call
+
+import ai.bondings.callpilot.MainActivity
+import ai.bondings.callpilot.R
+import ai.bondings.callpilot.content.ProtectedJsonStore
+import ai.bondings.callpilot.pairing.CredentialStore
+import ai.bondings.callpilot.protocol.HostedCloudClient
+import ai.bondings.callpilot.protocol.HostedCloudException
+import ai.bondings.callpilot.protocol.HttpClients
+import ai.bondings.callpilot.protocol.PairingProtocol
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
+import java.io.IOException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/** 只等待转接和发提醒；麦克风与接听仍由 CallManager / CallService 管理。 */
+class OfferWatchService : Service() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var polling: Job? = null
+    private var ready = false
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var renewWakeLockAt = 0L
+
+    override fun onCreate() {
+        super.onCreate()
+        val notifications = getSystemService(NotificationManager::class.java)
+        notifications.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, getString(R.string.offer_watch_channel), NotificationManager.IMPORTANCE_LOW).apply {
+                setSound(null, null)
+                enableVibration(false)
+            },
+        )
+        val pending = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_callpilot_notification)
+            .setContentTitle(getString(R.string.offer_watch_notification))
+            .setContentIntent(pending)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            ready = true
+        } catch (_: SecurityException) {
+            stopSelf()
+        } catch (_: IllegalStateException) {
+            stopSelf()
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!ready) return START_NOT_STICKY
+        if (polling?.isActive == true) return START_STICKY
+        val store = runCatching { CredentialStore(applicationContext) }.getOrNull()
+        val paired = runCatching { store?.load() }.getOrNull()
+        if (store == null || paired?.protocol != PairingProtocol.HOSTED) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val alerts = OfferAlerts.get(this)
+        alerts.bindPairing(paired.credential.deviceId)
+        val manager = CallGraph.manager(this)
+        mutableRunning.value = true
+        scope.launch {
+            CredentialStore.changes.collect {
+                val current = runCatching { store.load() }.getOrNull()
+                if (current?.protocol != PairingProtocol.HOSTED) {
+                    alerts.reset()
+                    stopWatching()
+                }
+            }
+        }
+        scope.launch {
+            manager.state.collect { state ->
+                alerts.tick(state !is CallState.Idle)
+                updateWakeLock(state is CallState.Idle)
+            }
+        }
+        scope.launch {
+            while (isActive) {
+                val idle = manager.state.value is CallState.Idle
+                alerts.tick(!idle)
+                updateWakeLock(idle)
+                delay(1_000)
+            }
+        }
+        polling = scope.launch {
+            while (isActive) {
+                val started = SystemClock.elapsedRealtime()
+                try {
+                    val current = store.load()
+                    if (current?.protocol != PairingProtocol.HOSTED) {
+                        alerts.reset()
+                        stopWatching()
+                        return@launch
+                    }
+                    alerts.bindPairing(current.credential.deviceId)
+                    if (manager.state.value is CallState.Idle) {
+                        val client = HostedCloudClient(current.gatewayUrl, HttpClients.shared).also {
+                            it.credential = current.credential
+                        }
+                        try {
+                            val offers = withContext(Dispatchers.IO) { client.listInboundOffers() }
+                            if (store.load() == current && manager.state.value is CallState.Idle) {
+                                alerts.update(offers)
+                            }
+                        } catch (error: HostedCloudException) {
+                            if (error.statusCode == 401 && store.load() == current) {
+                                // 旧请求的 401 不得清掉用户刚完成的新配对。
+                                ProtectedJsonStore.clearAll(applicationContext)
+                                store.clear()
+                                alerts.reset()
+                                stopWatching()
+                                return@launch
+                            }
+                        }
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: IOException) {
+                    HttpClients.dropPooledConnections()
+                } catch (_: Exception) {
+                    // 离线、响应异常均静默重试，不能结束等待循环。
+                }
+                delay((POLL_INTERVAL_MS - (SystemClock.elapsedRealtime() - started)).coerceAtLeast(1))
+            }
+        }
+        return START_STICKY
+    }
+
+    private fun updateWakeLock(waiting: Boolean) {
+        if (!waiting) {
+            releaseWakeLock()
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (wakeLock?.isHeld == true && now < renewWakeLockAt) return
+        val lock = wakeLock ?: getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CallPilot:OfferWatch")
+            .apply { setReferenceCounted(false) }.also { wakeLock = it }
+        // 3 秒轮询需 CPU 保持运行；两分钟兜底超时，服务活着才续期。
+        lock.acquire(120_000)
+        renewWakeLockAt = now + 60_000
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        renewWakeLockAt = 0
+    }
+
+    private fun stopWatching() {
+        scope.cancel()
+        releaseWakeLock()
+        mutableRunning.value = false
+        OfferAlerts.get(this).clearNotifications()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        stopWatching()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    companion object {
+        private const val CHANNEL_ID = "callpilot_offer_watch"
+        private const val NOTIFICATION_ID = 1002
+        private const val POLL_INTERVAL_MS = 3_000L
+        private val mutableRunning = MutableStateFlow(false)
+        val running = mutableRunning.asStateFlow()
+
+        /** 仅由前台 Activity 或 BOOT_COMPLETED 调用，不尝试绕过系统启动限制。 */
+        fun startIfPaired(context: Context) {
+            val paired = runCatching { CredentialStore(context.applicationContext).load() }.getOrNull()
+            if (paired?.protocol != PairingProtocol.HOSTED) {
+                stop(context)
+                return
+            }
+            try {
+                context.startForegroundService(Intent(context, OfferWatchService::class.java))
+            } catch (_: IllegalStateException) {
+                // 厂商拒绝后台启动时，下一次打开 App 再尝试。
+            } catch (_: SecurityException) {
+                // 系统权限或策略限制，不影响用户正常打开 App。
+            }
+        }
+
+        fun stop(context: Context) {
+            context.stopService(Intent(context, OfferWatchService::class.java))
+            OfferAlerts.get(context).clearNotifications()
+        }
+    }
+}

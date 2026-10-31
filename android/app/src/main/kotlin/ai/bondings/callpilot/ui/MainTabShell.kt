@@ -228,6 +228,7 @@ fun MainTabShell(
                     model = settingsModel,
                     messageState = messageState,
                     callHistoryState = callHistoryState,
+                    hostedPairing = pairing.protocol == PairingProtocol.HOSTED,
                 )
             }
         }

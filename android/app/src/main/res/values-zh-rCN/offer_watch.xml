@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="offer_watch_channel">后台等待</string>
+    <string name="offer_watch_notification">CallPilot 正在等待来电转接</string>
+    <string name="offer_channel">来电转接</string>
+    <string name="offer_notification_title">来电转接</string>
+    <string name="offer_notification_body">电脑端有电话等待接听</string>
+    <string name="offer_checking">正在确认来电转接…</string>
+    <string name="offer_settings_title">后台接收来电转接</string>
+    <string name="offer_service_running">等待服务：运行中</string>
+    <string name="offer_service_stopped">等待服务：未运行</string>
+    <string name="offer_battery_exempt">电池优化：已忽略</string>
+    <string name="offer_battery_restricted">电池优化：未忽略</string>
+    <string name="offer_battery_action">允许后台运行</string>
+    <string name="offer_autostart_hint">国内手机还需在系统设置里允许 CallPilot 自启动 / 后台运行</string>
+    <string name="offer_full_screen_action">允许全屏来电通知</string>
+    <string name="offer_notifications_disabled">通知未开启，无法显示来电提醒</string>
+    <string name="offer_notification_settings">通知设置</string>
+    <string name="offer_hosted_only">仅云端配对支持后台来电转接</string>
+</resources>

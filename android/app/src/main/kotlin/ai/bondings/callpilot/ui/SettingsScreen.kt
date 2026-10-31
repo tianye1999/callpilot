@@ -47,6 +47,7 @@ fun SettingsScreen(
     model: SettingsModel,
     messageState: MessageInboxState,
     callHistoryState: CallHistoryState,
+    hostedPairing: Boolean,
 ) {
     val state by model.state.collectAsState()
     val scope = rememberCoroutineScope()
@@ -57,6 +58,7 @@ fun SettingsScreen(
 
     LazyColumn {
         item { SettingsPageTitle() }
+        item { OfferWatchSettingsCard(hostedPairing) }
         item { SettingsSectionLabel(stringResource(R.string.settings_connection_section)) }
         item {
             SettingsStatusRow(

@@ -5,6 +5,9 @@ import ai.bondings.callpilot.protocol.PairingProtocol
 import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 /** 已配对状态的持久化：网关地址 + 设备凭证，落 EncryptedSharedPreferences。 */
 data class StoredPairing(
@@ -33,6 +36,7 @@ class CredentialStore(context: Context) {
             .putString(KEY_PROTOCOL, pairing.protocol.storedValue)
             .putString(KEY_EDGE_ID, pairing.edgeId)
             .apply()
+        mutableChanges.update { it + 1 }
     }
 
     fun load(): StoredPairing? {
@@ -51,17 +55,20 @@ class CredentialStore(context: Context) {
         val lastGateway = prefs.getString(KEY_GATEWAY, null)
         prefs.edit().clear().apply()
         lastGateway?.let { prefs.edit().putString(KEY_LAST_GATEWAY, it).apply() }
+        mutableChanges.update { it + 1 }
     }
 
     fun loadLastGateway(): String? = prefs.getString(KEY_LAST_GATEWAY, null)
 
-    private companion object {
-        const val KEY_GATEWAY = "gateway_url"
-        const val KEY_NAME = "display_name"
-        const val KEY_DEVICE_ID = "device_id"
-        const val KEY_SECRET = "secret"
-        const val KEY_PROTOCOL = "protocol"
-        const val KEY_EDGE_ID = "edge_id"
-        const val KEY_LAST_GATEWAY = "last_gateway_url"
+    companion object {
+        private val mutableChanges = MutableStateFlow(0L)
+        val changes = mutableChanges.asStateFlow()
+        private const val KEY_GATEWAY = "gateway_url"
+        private const val KEY_NAME = "display_name"
+        private const val KEY_DEVICE_ID = "device_id"
+        private const val KEY_SECRET = "secret"
+        private const val KEY_PROTOCOL = "protocol"
+        private const val KEY_EDGE_ID = "edge_id"
+        private const val KEY_LAST_GATEWAY = "last_gateway_url"
     }
 }

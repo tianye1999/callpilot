@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="offer_watch_channel">Background waiting</string>
+    <string name="offer_watch_notification">CallPilot is waiting for call transfers</string>
+    <string name="offer_channel">Call transfers</string>
+    <string name="offer_notification_title">Incoming call transfer</string>
+    <string name="offer_notification_body">A call on your computer is waiting for you</string>
+    <string name="offer_checking">Checking incoming call transfer...</string>
+    <string name="offer_settings_title">Receive call transfers in the background</string>
+    <string name="offer_service_running">Waiting service: running</string>
+    <string name="offer_service_stopped">Waiting service: stopped</string>
+    <string name="offer_battery_exempt">Battery optimization: ignored</string>
+    <string name="offer_battery_restricted">Battery optimization: active</string>
+    <string name="offer_battery_action">Allow background activity</string>
+    <string name="offer_autostart_hint">On Chinese Android phones, also allow CallPilot to auto-start and run in the background in system settings.</string>
+    <string name="offer_full_screen_action">Allow full-screen call notifications</string>
+    <string name="offer_notifications_disabled">Notifications are off. Incoming call alerts cannot be shown.</string>
+    <string name="offer_notification_settings">Notification settings</string>
+    <string name="offer_hosted_only">Background call transfers require cloud pairing.</string>
+</resources>
