@@ -1,8 +1,7 @@
 import { authenticateDevice, authenticateEdge } from "./auth";
 import {
   contentReadEnabled,
-  contentRelayTimeoutMs,
-  enforceContentRateLimit
+  contentRelayTimeoutMs
 } from "./content-access";
 import {
   CONTENT_CAPABILITIES,
@@ -564,7 +563,6 @@ async function relayContentRead(
   if (!contentReadEnabled(env.CONTENT_READ_ENABLED)) {
     throw new HttpError("FEATURE_DISABLED", "Content sync is disabled", 403);
   }
-  await enforceContentRateLimit(env, device);
 
   const params = contentParams(new URL(request.url), resource, callId);
   const now = Date.now();
@@ -589,7 +587,7 @@ async function relayContentRead(
   });
   if (!relayed.ok) {
     const internal = await safeInternalRelayError(relayed);
-    throw contentHttpError(internal);
+    throw contentHttpError(internal, relayed.headers.get("Retry-After"));
   }
   const rawResponse = await relayed.text();
   if (serializedByteLength(rawResponse) > CONTENT_WIRE_LIMIT_BYTES) {
@@ -693,7 +691,7 @@ function isContentErrorCode(code: string): code is ContentErrorCode {
   ].includes(code);
 }
 
-function contentHttpError(code: ContentErrorCode): HttpError {
+function contentHttpError(code: ContentErrorCode, retryAfter: string | null = null): HttpError {
   const mapping: Record<ContentErrorCode, [number, string]> = {
     INVALID_REQUEST: [400, "The request fields are invalid"],
     CURSOR_INVALID: [400, "The cursor is not valid for this resource"],
@@ -707,7 +705,9 @@ function contentHttpError(code: ContentErrorCode): HttpError {
     INTERNAL_ERROR: [500, "The request could not be completed"]
   };
   const [status, message] = mapping[code];
-  const headers = code === "RATE_LIMITED" ? { "Retry-After": "30" } : undefined;
+  const headers = code === "RATE_LIMITED"
+    ? { "Retry-After": retryAfter && /^[1-9]\d*$/.test(retryAfter) ? retryAfter : "30" }
+    : undefined;
   return new HttpError(code, message, status, headers);
 }
 
@@ -771,9 +771,14 @@ async function audit(
   resourceId: string,
   result: string
 ): Promise<void> {
-  await env.DB.prepare(
-    "INSERT INTO audit_events(event_id, actor_type, actor_id, action, resource_id, result, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-  ).bind(randomId("event"), actorType, actorId, action, resourceId, result, Date.now()).run();
+  const now = Date.now();
+  const insert = "INSERT INTO audit_events(event_id, actor_type, actor_id, action, resource_id, result, occurred_at)";
+  const values = [randomId("event"), actorType, actorId, action, resourceId, result, now];
+  await (action === "content.read"
+    ? env.DB.prepare(
+      `${insert} SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE NOT EXISTS (SELECT 1 FROM audit_events WHERE actor_id = ?3 AND action = ?4 AND resource_id = ?5 AND occurred_at > ?8)`
+    ).bind(...values, now - 10 * 60_000)
+    : env.DB.prepare(`${insert} VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`).bind(...values)).run();
 }
 
 async function enforceRateLimit(

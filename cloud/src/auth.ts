@@ -22,8 +22,17 @@ export async function authenticateDevice(request: Request, env: Env): Promise<De
     "SELECT * FROM devices WHERE device_id = ?1 AND revoked_at IS NULL"
   ).bind(deviceId).first<DeviceRecord>();
   if (!device || device.secret_hash !== await sha256(secret)) throw unauthorized();
-  await env.DB.prepare("UPDATE devices SET last_used_at = ?1 WHERE device_id = ?2")
-    .bind(Date.now(), deviceId).run();
+  const now = Date.now();
+  const cutoff = now - 10 * 60_000;
+  if (device.last_used_at === null || device.last_used_at <= cutoff) {
+    try {
+      await env.DB.prepare(
+        "UPDATE devices SET last_used_at = ?1 WHERE device_id = ?2 AND (last_used_at IS NULL OR last_used_at <= ?3)"
+      ).bind(now, deviceId, cutoff).run();
+    } catch {
+      console.warn("Device last-used update failed");
+    }
+  }
   return device;
 }
 

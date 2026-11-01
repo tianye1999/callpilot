@@ -1,22 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   contentReadEnabled,
   contentRelayTimeoutMs,
-  enforceContentRateLimit
+  ContentReadRateLimiter
 } from "../src/content-access";
-import { HttpError } from "../src/http";
-import type { DeviceRecord, Env } from "../src/types";
+import type { Env } from "../src/types";
 
-const device: DeviceRecord = {
-  device_id: "device_abcdefghijkl",
-  edge_id: "edge_abcdefghijkl",
-  display_name: "Test",
-  secret_hash: "hash",
-  created_at: 0,
-  last_used_at: 0,
-  revoked_at: null
-};
+afterEach(() => vi.restoreAllMocks());
 
 describe("content access gates and bounds", () => {
   it("enables the Cloud gate only for the exact true spelling", () => {
@@ -32,60 +23,49 @@ describe("content access gates and bounds", () => {
     expect(contentRelayTimeoutMs({ CONTENT_RELAY_TIMEOUT_MS: "invalid" } as Env)).toBe(5_000);
   });
 
-  it("charges both the authenticated device and its Edge without content keys", async () => {
-    const seen: string[] = [];
-    const env = rateEnv([true, true], seen);
-    await enforceContentRateLimit(env, device);
-    expect(seen).toHaveLength(2);
-    expect(seen[0]).toBe("content:device:device_abcdefghijkl");
-    expect(seen[1]).toBe("content:edge:edge_abcdefghijkl");
-    expect(seen.join(" ")).not.toMatch(/cursor|message|transcript|summary/);
+  it.each([{}, { CONTENT_READ_DEVICE_LIMIT: "0", CONTENT_READ_EDGE_LIMIT: "50001" }])(
+    "retains default limits for missing or invalid settings (%s)", (vars) => {
+      const limiter = new ContentReadRateLimiter();
+      const env = vars as Env;
+      for (let device = 0; device < 5; device += 1) {
+        for (let count = 0; count < 60; count += 1) limiter.enforce(env, String(device));
+        expect(() => limiter.enforce(env, String(device))).toThrow("Too many content requests");
+      }
+      expect(() => limiter.enforce(env, "another-device")).toThrow("Too many content requests");
+    }
+  );
+
+  it("bounds keys by accepted requests and removes expired keys on the next check", () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100_000);
+    const limiter = new ContentReadRateLimiter();
+    const env = { CONTENT_READ_DEVICE_LIMIT: "2", CONTENT_READ_EDGE_LIMIT: "3" } as Env;
+    for (const id of ["a", "b", "c"]) limiter.enforce(env, id);
+    for (let id = 0; id < 100; id += 1) {
+      expect(() => limiter.enforce(env, String(id))).toThrow("Too many content requests");
+    }
+    expect(limiter["deviceEvents"].size).toBe(3);
+    expect(limiter["edgeEvents"]).toHaveLength(3);
+    clock.mockReturnValue(160_000);
+    limiter.enforce(env, "fresh");
+    expect([...limiter["deviceEvents"].keys()]).toEqual(["fresh"]);
+    expect(limiter["edgeEvents"]).toEqual([160_000]);
   });
 
-  it("returns the stable rate error and Retry-After for either exhausted bucket", async () => {
-    const deviceLimited = rateEnv([false], [], {
-      CONTENT_READ_DEVICE_LIMIT: "1",
-      CONTENT_READ_EDGE_LIMIT: "10"
-    });
-    await expect(enforceContentRateLimit(deviceLimited, device)).rejects.toMatchObject({
-      code: "RATE_LIMITED",
-      status: 429
-    } satisfies Partial<HttpError>);
-
-    const edgeLimited = rateEnv([true, false], [], {
-      CONTENT_READ_DEVICE_LIMIT: "10",
-      CONTENT_READ_EDGE_LIMIT: "1"
-    });
-    try {
-      await enforceContentRateLimit(edgeLimited, device);
-      expect.fail("edge limit should reject");
-    } catch (error) {
-      expect(error).toBeInstanceOf(HttpError);
-      expect(new Headers((error as HttpError).headers).get("Retry-After")).toMatch(/^\d+$/);
-    }
+  it("uses a sliding window and waits for both exhausted buckets", () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100_000);
+    const limiter = new ContentReadRateLimiter();
+    const env = { CONTENT_READ_DEVICE_LIMIT: "1", CONTENT_READ_EDGE_LIMIT: "2" } as Env;
+    limiter.enforce(env, "a");
+    clock.mockReturnValue(130_000);
+    limiter.enforce(env, "b");
+    clock.mockReturnValue(159_999);
+    expect(() => limiter.enforce(env, "b")).toThrow(expect.objectContaining({
+      status: 429, headers: { "Retry-After": "31" }
+    }));
+    clock.mockReturnValue(160_000);
+    expect(() => limiter.enforce(env, "a")).not.toThrow();
+    expect(() => limiter.enforce(env, "c")).toThrow(expect.objectContaining({
+      status: 429, headers: { "Retry-After": "30" }
+    }));
   });
 });
-
-function rateEnv(
-  allowed: boolean[],
-  seen: string[],
-  vars: Partial<Env> = {}
-): Env {
-  let insertIndex = 0;
-  const db = {
-    prepare: (sql: string) => ({
-      bind: (...values: unknown[]) => ({
-        run: async () => ({ success: true }),
-        first: async () => {
-          if (sql.startsWith("SELECT MIN")) return { occurred_at: Date.now() };
-          const key = String(values[1]);
-          seen.push(key);
-          const isAllowed = allowed[insertIndex];
-          insertIndex += 1;
-          return isAllowed ? { event_id: "rate_fixture_0001" } : null;
-        }
-      })
-    })
-  };
-  return { DB: db, ...vars } as unknown as Env;
-}

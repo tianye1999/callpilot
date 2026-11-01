@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { dispatchAlertPushes, reserveAlertEvent } from "./alert-push";
+import { ContentReadRateLimiter } from "./content-access";
 
 import {
   CONTENT_WIRE_LIMIT_BYTES,
@@ -10,6 +11,7 @@ import {
   type DataResponse
 } from "./content-sync";
 import { edgeMessageSchema } from "./schemas";
+import { HttpError } from "./http";
 import type { EdgePresence, Env } from "./types";
 import { dispatchInboundOfferPushes } from "./voip-push";
 
@@ -29,6 +31,8 @@ interface PendingRelay {
 
 export class EdgeRoom extends DurableObject<Env> {
   private readonly pendingRelays = new Map<string, PendingRelay>();
+  private readonly contentRateLimiter = new ContentReadRateLimiter();
+  private lastSeenAttemptAt: number | undefined;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -64,8 +68,7 @@ export class EdgeRoom extends DurableObject<Env> {
     server.serializeAttachment({ edgeId, connectedAt: now } satisfies SocketAttachment);
     this.ctx.acceptWebSocket(server, ["edge"]);
     await this.ctx.storage.put<EdgePresence>("presence", { connected: true, lastSeenAt: now });
-    await this.env.DB.prepare("UPDATE edges SET last_seen_at = ?1 WHERE edge_id = ?2")
-      .bind(now, edgeId).run();
+    await this.updateLastSeen(edgeId, now);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -127,6 +130,12 @@ export class EdgeRoom extends DurableObject<Env> {
     }
     if (this.pendingRelays.has(result.data.requestId)) {
       return Response.json({ error: "INVALID_REQUEST" }, { status: 400 });
+    }
+    try {
+      this.contentRateLimiter.enforce(this.env, result.data.deviceId);
+    } catch (caught) {
+      if (!(caught instanceof HttpError)) throw caught;
+      return Response.json({ error: caught.code }, { status: caught.status, headers: caught.headers });
     }
     const socket = this.currentConnection();
     if (!socket) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
@@ -209,8 +218,7 @@ export class EdgeRoom extends DurableObject<Env> {
       };
       await Promise.all([
         this.ctx.storage.put("presence", presence),
-        this.env.DB.prepare("UPDATE edges SET last_seen_at = ?1 WHERE edge_id = ?2")
-          .bind(now, attachment.edgeId).run()
+        this.updateLastSeen(attachment.edgeId, now, true)
       ]);
       return;
     }
@@ -272,14 +280,29 @@ export class EdgeRoom extends DurableObject<Env> {
     });
     ws.close(code, reason);
     if (attachment) {
-      await this.env.DB.prepare("UPDATE edges SET last_seen_at = ?1 WHERE edge_id = ?2")
-        .bind(Date.now(), attachment.edgeId).run();
+      await this.updateLastSeen(attachment.edgeId, Date.now());
     }
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
     this.failRelaysForSocket(ws, "EDGE_OFFLINE", 503);
     ws.close(1011, "WebSocket error");
+  }
+
+  private async updateLastSeen(edgeId: string, now: number, heartbeat = false): Promise<void> {
+    const cutoff = now - 5 * 60_000;
+    if (heartbeat && this.lastSeenAttemptAt !== undefined && this.lastSeenAttemptAt > cutoff) return;
+    // Reserve before awaiting D1, including failures, to avoid overlapping retries.
+    this.lastSeenAttemptAt = now;
+    try {
+      const sql = "UPDATE edges SET last_seen_at = ?1 WHERE edge_id = ?2";
+      await (heartbeat
+        ? this.env.DB.prepare(`${sql} AND (last_seen_at IS NULL OR last_seen_at <= ?3)`)
+          .bind(now, edgeId, cutoff)
+        : this.env.DB.prepare(sql).bind(now, edgeId)).run();
+    } catch {
+      console.warn("Edge last-seen update failed");
+    }
   }
 
   private acceptRelayResponse(ws: WebSocket, response: DataResponse): void {

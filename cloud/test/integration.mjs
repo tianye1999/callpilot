@@ -571,6 +571,10 @@ try {
   socket.send(JSON.stringify(correctFencedResponse));
   const fencedResponse = await fencedFetch;
   assert.equal(fencedResponse.status, 200);
+  assert.equal(d1Rows("SELECT COUNT(*) AS count FROM content_read_rate_events")[0].count, 0);
+  assert.equal(d1Rows(
+    `SELECT COUNT(*) AS count FROM audit_events WHERE actor_id = '${paired.device.deviceId}' AND action = 'content.read' AND resource_id = 'messages.list'`
+  )[0].count, 1);
   // Duplicate/unsolicited response is discarded and cannot poison the next read.
   socket.send(JSON.stringify(correctFencedResponse));
 
