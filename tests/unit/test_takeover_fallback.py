@@ -332,7 +332,11 @@ def test_blocked_triage_preflight_times_out_without_a_late_offer(monkeypatch) ->
     async def run() -> None:
         task = asyncio.create_task(session._consume_triage_results(agent, FakeAudioBridge(), 4))
         try:
-            await asyncio.sleep(0.02)
+            # Windows CI 上线程起得慢，固定等 20 ms 偶尔还没进到 keyring 读取；最多等 1 s。
+            for _ in range(100):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
             assert entered.is_set()
             assert session._agent_effect_allowed(4) and not session._triage_terminal
             assert await asyncio.wait_for(task, 1.3) is None
