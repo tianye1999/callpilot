@@ -674,6 +674,9 @@ try {
   const replacementCommandPromise = nextMessage(socket);
   const replacementFetch = fetch(`${base}/v1/messages`, { headers: { Cookie: cookie } });
   await replacementCommandPromise;
+  const replacedSocketClosed = new Promise((resolve) => socket.once("close", (code, reason) => {
+    resolve({ code, reason: reason.toString() });
+  }));
   const replacementSocket = new WebSocket(`${base.replace("http", "ws")}/v1/edges/connect`, {
     headers: edgeHeaders("GET", "/v1/edges/connect", enrollment)
   });
@@ -685,6 +688,27 @@ try {
   assert.equal(replacedResponse.status, 503);
   assert.equal((await replacedResponse.json()).error.code, "EDGE_OFFLINE");
   socket = replacementSocket;
+
+  // Failing the old in-flight request must not make the new connection offline.
+  const replacementPresence = await fetch(`${base}/v1/edges/${enrollment.edgeId}/presence`, {
+    headers: { Cookie: cookie }
+  });
+  assert.equal(replacementPresence.status, 200);
+  assert.equal((await replacementPresence.json()).presence.connected, true);
+  assert.deepEqual(await contentRead(
+    socket, cookie, "/v1/messages", "messages.list", messages,
+    { limit: 25, cursor: null }
+  ), messages);
+  const replacementCallCommand = nextMessage(socket);
+  const replacementCall = await post("/v1/calls", {
+    edgeId: enrollment.edgeId, idempotencyKey: "integration-call-after-replacement"
+  }, { Cookie: cookie, Origin: origin }, 202);
+  const replacementStart = await replacementCallCommand;
+  assert.equal(replacementStart.type, "session.start");
+  assert.equal(replacementStart.callId, replacementCall.callId);
+  assert.deepEqual(await replacedSocketClosed, {
+    code: 4001, reason: "Replaced by a newer connection"
+  });
 
   // No connected socket produces the content-specific 503 contract. Reconnect
   // afterwards so the in-flight revocation race can be exercised independently.

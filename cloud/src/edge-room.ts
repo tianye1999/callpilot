@@ -15,6 +15,8 @@ import { dispatchInboundOfferPushes } from "./voip-push";
 
 interface SocketAttachment {
   edgeId: string;
+  connectedAt: number;
+  replaced?: boolean;
 }
 
 interface PendingRelay {
@@ -50,35 +52,61 @@ export class EdgeRoom extends DurableObject<Env> {
     if (!/^edge_[A-Za-z0-9_-]{12,80}$/.test(edgeId)) return new Response("Forbidden", { status: 403 });
 
     for (const existing of this.ctx.getWebSockets("edge")) {
+      const attachment = existing.deserializeAttachment() as SocketAttachment;
+      existing.serializeAttachment({ ...attachment, replaced: true });
       this.failRelaysForSocket(existing, "EDGE_OFFLINE", 503);
       existing.close(4001, "Replaced by a newer connection");
     }
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-    server.serializeAttachment({ edgeId } satisfies SocketAttachment);
-    this.ctx.acceptWebSocket(server, ["edge"]);
     const now = Date.now();
+    server.serializeAttachment({ edgeId, connectedAt: now } satisfies SocketAttachment);
+    this.ctx.acceptWebSocket(server, ["edge"]);
     await this.ctx.storage.put<EdgePresence>("presence", { connected: true, lastSeenAt: now });
     await this.env.DB.prepare("UPDATE edges SET last_seen_at = ?1 WHERE edge_id = ?2")
       .bind(now, edgeId).run();
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  private currentConnection(): WebSocket | undefined {
+    const sockets = this.ctx.getWebSockets("edge")
+      .filter((socket) => socket.readyState === WebSocket.OPEN)
+      .map((socket) => ({ socket, attachment: socket.deserializeAttachment() as SocketAttachment }));
+    let current: WebSocket | undefined;
+    let connectedAt = 0;
+    for (const { socket, attachment } of sockets) {
+      // Attachments from before connection fencing have no timestamp.
+      const timestamp = attachment?.connectedAt ?? 0;
+      if (!attachment?.replaced && (!current || timestamp > connectedAt)) {
+        current = socket;
+        connectedAt = timestamp;
+      }
+    }
+    for (const { socket, attachment } of sockets) {
+      if (socket === current) continue;
+      // Persist the fence even if closing leaves the socket reporting OPEN.
+      socket.serializeAttachment({ ...attachment, replaced: true });
+      this.failRelaysForSocket(socket, "EDGE_OFFLINE", 503);
+      socket.close(4001, "Replaced by a newer connection");
+    }
+    return current;
+  }
+
   private async presence(): Promise<Response> {
     const stored = await this.ctx.storage.get<EdgePresence>("presence");
-    const connected = this.ctx.getWebSockets("edge").some((socket) => socket.readyState === WebSocket.OPEN);
+    const connected = this.currentConnection() !== undefined;
     return Response.json({ ...(stored ?? {}), connected });
   }
 
   private async sendCommand(request: Request): Promise<Response> {
-    const sockets = this.ctx.getWebSockets("edge").filter((socket) => socket.readyState === WebSocket.OPEN);
-    if (sockets.length !== 1) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
     const text = await request.text();
     if (serializedByteLength(text) > CONTENT_WIRE_LIMIT_BYTES) {
       return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
     }
-    sockets[0]?.send(text);
+    const socket = this.currentConnection();
+    if (!socket) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
+    socket.send(text);
     return Response.json({ accepted: true }, { status: 202 });
   }
 
@@ -100,9 +128,8 @@ export class EdgeRoom extends DurableObject<Env> {
     if (this.pendingRelays.has(result.data.requestId)) {
       return Response.json({ error: "INVALID_REQUEST" }, { status: 400 });
     }
-    const sockets = this.ctx.getWebSockets("edge").filter((socket) => socket.readyState === WebSocket.OPEN);
-    if (sockets.length !== 1) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
-    const socket = sockets[0] as WebSocket;
+    const socket = this.currentConnection();
+    if (!socket) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
 
     return new Promise<Response>((resolve) => {
       const requestId = result.data.requestId;
@@ -160,8 +187,7 @@ export class EdgeRoom extends DurableObject<Env> {
     const now = Date.now();
     if (result.data.type === "device.notify") {
       // Identity comes only from the authenticated connection, never the payload.
-      if (!attachment?.edgeId || ws.readyState !== WebSocket.OPEN
-          || !this.ctx.getWebSockets("edge").includes(ws)) return;
+      if (!attachment?.edgeId || this.currentConnection() !== ws) return;
       const { kind, eventId } = result.data;
       try {
         if (await reserveAlertEvent(this.env, attachment.edgeId, eventId, now)) {
