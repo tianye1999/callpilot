@@ -151,8 +151,12 @@ lock.close()
 
 @pytest.mark.parametrize("lang,starting,retry", [("zh", "正在启动", "重试"), ("en", "Starting", "Retry")])
 def test_startup_and_failure_pages_follow_ui_language(lang, starting, retry):
+    name = "KinyAI-SIM助手" if lang == "zh" else "KinyAI SIM Assistant"
+    assert desktop_app.window_title(lang) == name
+    assert desktop_app.window_title(lang, error=True).startswith(name + " - ")
     assert starting in desktop_app.startup_html(lang=lang)
     page = desktop_app.startup_html("<error>", lang=lang)
+    assert f"<title>{name}</title>" in page and f"<h1>{name}</h1>" in page
     assert retry in page and "&lt;error&gt;" in page
     assert f'lang="{lang}"' in page
 
@@ -813,7 +817,7 @@ def test_main_service_already_running(monkeypatch):
 
     assert len(fake.windows) == 1
     win = fake.windows[0]
-    assert win["title"] == "CallPilot"
+    assert win["title"] == "KinyAI-SIM助手"
     assert win["url"] == "http://127.0.0.1:47100"
     assert win["html"] is None
     assert win["kwargs"] == {"width": 1100, "height": 780}
@@ -878,7 +882,7 @@ def test_main_startup_timeout_shows_error_window(monkeypatch, tmp_path):
 
     assert len(fake.windows) == 1
     win = fake.windows[0]
-    assert win["title"] == "CallPilot — 服务未启动"
+    assert win["title"] == "KinyAI-SIM助手 - 服务未启动"
     assert win["url"] is None
     assert win["html"] is not None
     assert "app.py" in win["html"]  # 提示了手动启动命令

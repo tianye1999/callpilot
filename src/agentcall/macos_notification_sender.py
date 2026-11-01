@@ -79,7 +79,7 @@ class TrayNotifications:
         for identifier, deadline in current.items():
             if identifier not in self._confirmations and self._enabled("confirm") and deadline > time.time():
                 self.sender.send(identifier, dict(
-                    tier="confirm", title="AI 请你确认", body="请打开 CallPilot 处理，超时将按拒绝处理。",
+                    tier="confirm", title="AI 请你确认", body="请打开 KinyAI-SIM助手 处理，超时将按拒绝处理。",
                     target="#confirm/" + identifier.removeprefix(CONFIRM_PREFIX),
                     deadline=deadline,
                 ))
@@ -121,7 +121,8 @@ class TrayNotifications:
             return
         self._red_reasons.add(reason)
         if self._enabled("alert"):
-            self.sender.send("callpilot.alert", dict(tier="alert", title="CallPilot", body=reason, target="#settings"))
+            self.sender.send("callpilot.alert", dict(
+                tier="alert", title="KinyAI-SIM助手", body=reason, target="#settings"))
 
 
 class NativeSender:

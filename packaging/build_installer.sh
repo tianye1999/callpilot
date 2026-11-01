@@ -214,7 +214,7 @@ sips -z 420 660 "$ROOT/packaging/dmg-background.png" --out "$DMG_STAGE/backgroun
 export CALLPILOT_DMG_APP="$APP_PATH"
 export CALLPILOT_DMG_BACKGROUND="$DMG_STAGE/background.png"
 # dmgbuild owns hdiutil create/attach/detach and writes .DS_Store without Finder automation.
-"$PYTHON" -m dmgbuild -s "$ROOT/packaging/dmg-settings.py" "CallPilot $VERSION" "$DMG_PATH"
+"$PYTHON" -m dmgbuild -s "$ROOT/packaging/dmg-settings.py" "KinyAI-SIM助手 $VERSION" "$DMG_PATH"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
     codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG_PATH"

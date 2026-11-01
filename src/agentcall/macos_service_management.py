@@ -22,11 +22,11 @@ SM_STATUS_NOT_FOUND = 3
 LEGACY_MIGRATION_SECONDS = 180
 
 APPROVAL_REQUIRED_ZH = (
-    "请在 系统设置 → 通用 → 登录项与扩展 中打开 CallPilot 的后台开关"
+    "请在 系统设置 → 通用 → 登录项与扩展 中打开 KinyAI-SIM助手 的后台开关"
     "（旧版可能显示为 caffeinate），然后点重试。"
 )
 APPROVAL_REQUIRED_EN = (
-    "Turn on CallPilot's background switch in System Settings > General > Login Items & Extensions "
+    "Turn on KinyAI SIM Assistant's background switch in System Settings > General > Login Items & Extensions "
     "(older versions may appear as caffeinate), then click retry."
 )
 
@@ -66,7 +66,7 @@ def uses_service_management(layout) -> bool:
 class NativeServices:
     def __init__(self):
         if int(platform.mac_ver()[0].split(".")[0] or 0) < 13:
-            raise RuntimeError("CallPilot requires macOS 13 or later")
+            raise RuntimeError("KinyAI SIM Assistant requires macOS 13 or later")
         from ServiceManagement import SMAppService
 
         self.api = SMAppService
@@ -143,7 +143,7 @@ def set_login_enabled(layout, enabled, runner=subprocess.run):
     result = ld._run_launchctl(["enable" if enabled else "disable", f"{layout.gui_domain}/{ld.TRAY_LABEL}"],
                               runner)
     if result.returncode:
-        raise RuntimeError(f"Cannot change CallPilot login scheduling: {result.stderr}")
+        raise RuntimeError(f"Cannot change KinyAI SIM Assistant login scheduling: {result.stderr}")
 
 
 def job_state(label, layout, runner=subprocess.run) -> str | None:

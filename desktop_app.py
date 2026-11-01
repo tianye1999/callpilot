@@ -68,11 +68,16 @@ if not getattr(sys, "_MEIPASS", None):
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from agentcall import config, platforms  # noqa: E402
 
-WINDOW_TITLE = "CallPilot"
-ERROR_WINDOW_TITLE = "CallPilot — 服务未启动"
 DEFAULT_WEB_URL = "http://127.0.0.1:47100"
 
 ServiceStatus = Literal["already", "started", "failed"]
+
+
+def window_title(lang: str | None = None, *, error: bool = False) -> str:
+    from agentcall.macos_shell import ui_text
+
+    name = ui_text("KinyAI-SIM助手", "KinyAI SIM Assistant", lang)
+    return name + ui_text(" - 服务未启动", " - Service not running", lang) if error else name
 
 
 # ---- 环境变量读取 ----
@@ -253,7 +258,7 @@ def build_error_html(web_url: str, log_path: str, start_cmd: str) -> str:
     return f"""
 <div style="font-family: -apple-system, 'PingFang SC', sans-serif;
             max-width: 620px; margin: 60px auto; padding: 0 24px; color: #333;">
-  <h1 style="font-size: 22px;">AgentCall 服务未能启动</h1>
+  <h1 style="font-size: 22px;">KinyAI-SIM助手 服务未能启动</h1>
   <p>桌面窗口尝试自动拉起后端服务，但等待超时或拉起失败。</p>
   <p>请在终端手动启动服务后重新打开本窗口：</p>
   <pre style="background: #f4f4f4; padding: 12px 16px; border-radius: 8px;
@@ -334,13 +339,13 @@ def startup_html(reason: str | None = None, lang: str | None = None, *, action: 
     ))
     return f"""<!doctype html><html lang="{lang}"><meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>CallPilot</title><style>
+      <title>{window_title(lang)}</title><style>
       body {{font:16px -apple-system,'PingFang SC',sans-serif;color:#242424;background:#fafafa;
              max-width:640px;margin:80px auto;padding:24px}}
       h1 {{font-size:28px}} h2 {{font-size:20px}} p {{line-height:1.6}}
       button {{font:inherit;padding:10px 16px;margin:8px 8px 0 0;border:1px solid #aaa;
                border-radius:6px;background:white;cursor:pointer}}
-      </style><h1>CallPilot</h1><h2>{title}</h2>
+      </style><h1>{window_title(lang)}</h1><h2>{title}</h2>
       <p>{message}</p>{buttons}</html>"""
 
 
@@ -733,7 +738,7 @@ def _bundled_main(webview, web_url: str, exit_process: Callable[[int], None] | N
             if splash.closed:
                 return
         window = webview.create_window(
-            WINDOW_TITLE, html=startup_html(), width=1100, height=780, **({"hidden": True} if splash else {}),
+            window_title(), html=startup_html(), width=1100, height=780, **({"hidden": True} if splash else {}),
         )
         exit_guard_lock = threading.Lock()
         exit_timer = None
@@ -802,13 +807,13 @@ def main() -> None:
         # Windows PowerShell 5.1 不认 &&，且路径可能含空格；分号 + 引号两平台通吃
         start_cmd = f'cd "{PROJECT_ROOT}"; "{python_exe}" "{app_script}"'
         window = webview.create_window(
-            ERROR_WINDOW_TITLE,
+            window_title(error=True),
             html=build_error_html(web_url, log_path, start_cmd),
             width=width,
             height=height,
         )
     else:
-        window = webview.create_window(WINDOW_TITLE, web_url, width=width, height=height)
+        window = webview.create_window(window_title(), web_url, width=width, height=height)
     if window is not None:
         _activate_on_window_shown(window)
     webview.start()

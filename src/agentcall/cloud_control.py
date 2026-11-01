@@ -168,7 +168,7 @@ class CloudControlApi:
             code = _cloud_error_code(raw) or f"HTTP_{exc.code}"
             raise RuntimeError(f"云端请求失败: {code}") from None
         except (OSError, urllib.error.URLError) as exc:
-            raise RuntimeError("无法连接 CallPilot 云控制面") from exc
+            raise RuntimeError("无法连接 KinyAI-SIM助手 云控制面") from exc
         if len(raw) > _MAX_JSON_BYTES:
             raise RuntimeError("云端响应过大")
         try:

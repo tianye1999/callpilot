@@ -175,7 +175,7 @@ def test_status_and_menu_labels_bilingual():
     assert tray_app.menu_label("open", "en") == "Open dashboard"
     assert tray_app.menu_label("restart", "zh") == "重启服务"
     assert tray_app.menu_label("uninstall", "zh") == "卸载常驻"
-    assert tray_app.menu_label("quit", "en") == "Quit CallPilot"
+    assert tray_app.menu_label("quit", "en") == "Quit KinyAI SIM Assistant"
     # 未知语言回退中文
     assert tray_app.status_label(True, "fr") == "服务：运行中"
 
@@ -580,7 +580,7 @@ def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, bundled_tr
     assert len(ticks) == 6
     assert app.icon_updates == ["transient", "ready"]
     assert app._status_item.titles == [tray_app.status_label(False), "正在启动…", "可以接打电话"]
-    assert [item.title for item in app.menu][2:] == ["打开 CallPilot", "退出 CallPilot"]
+    assert [item.title for item in app.menu][2:] == ["打开 KinyAI-SIM助手", "退出 KinyAI-SIM助手"]
     assert app.menu[0].callback is None and app.menu[1].callback is None
 
     now[0] = 1.0
@@ -604,7 +604,7 @@ def test_bundled_health_probe_throttles_ticks_from_start(monkeypatch, bundled_tr
     app._meta = {**meta, "call_active": True, "call": {"number_suffix": "1234", "started_at": 100}}
     monkeypatch.setattr(tray_app.time, "time", lambda: 183)
     app._render_status()
-    assert [item.title for item in app.menu][2:] == ["挂断", "旁听", "打开 CallPilot", "退出 CallPilot"]
+    assert [item.title for item in app.menu][2:] == ["挂断", "旁听", "打开 KinyAI-SIM助手", "退出 KinyAI-SIM助手"]
     assert app._status_item.title == "通话中 · 尾号 1234 · 01:23"
     monkeypatch.setattr(tray_app.time, "time", lambda: 184)
     before = len(app.icon_updates)

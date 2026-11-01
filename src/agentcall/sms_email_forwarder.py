@@ -295,7 +295,7 @@ def _safe_sender_label(sender: str | None) -> str:
 
 def build_email_message(sms: ForwardSms, settings: SmsEmailSettings) -> EmailMessage:
     sender_label = _safe_sender_label(sms.sender)
-    base_subject = f"[CallPilot 短信转发] 来自 {sender_label}"
+    base_subject = f"[KinyAI-SIM助手 短信转发] 来自 {sender_label}"
     otp = extract_otp(sms.body)
     subject = f"【验证码 {otp}】{base_subject}" if otp else base_subject
     received_at = sms.received_at
@@ -304,7 +304,7 @@ def build_email_message(sms: ForwardSms, settings: SmsEmailSettings) -> EmailMes
 
     message = EmailMessage()
     message["Subject"] = subject
-    message["From"] = Address(display_name="CallPilot", addr_spec=settings.from_address)
+    message["From"] = Address(display_name="KinyAI-SIM助手", addr_spec=settings.from_address)
     message["To"] = settings.recipient
     message.set_content(
         "\n".join(

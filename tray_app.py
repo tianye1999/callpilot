@@ -60,8 +60,8 @@ _MENU_LABELS = {
         "open": "Open dashboard",
         "restart": "Restart service",
         "uninstall": "Uninstall background services",
-        "quit": "Quit CallPilot",
-        "open_app": "Open CallPilot",
+        "quit": "Quit KinyAI SIM Assistant",
+        "open_app": "Open KinyAI SIM Assistant",
         "hangup": "Hang up",
         "listen": "Listen live",
     },
@@ -69,8 +69,8 @@ _MENU_LABELS = {
         "open": "打开控制台",
         "restart": "重启服务",
         "uninstall": "卸载常驻",
-        "quit": "退出 CallPilot",
-        "open_app": "打开 CallPilot",
+        "quit": "退出 KinyAI-SIM助手",
+        "open_app": "打开 KinyAI-SIM助手",
         "hangup": "挂断",
         "listen": "旁听",
     },
@@ -605,6 +605,7 @@ def main() -> None:
     class CallPilotTray(rumps.App):
         def __init__(self) -> None:
             # 图标模式（非 template，保留品牌绿）；title 留空只显图标。
+            # rumps uses this internal name for Application Support; do not rebrand it.
             super().__init__(
                 "CallPilot", title=None, icon=icon_path(False),
                 template=False, quit_button=None,
@@ -777,8 +778,8 @@ def main() -> None:
                     from agentcall.macos_shell import ui_text
 
                     rumps.alert(title=menu_label("hangup", lang), message=ui_text(
-                        "挂断失败，请打开 CallPilot 查看当前通话后重试。",
-                        "Could not hang up. Open CallPilot to check the call and retry.", lang,
+                        "挂断失败，请打开 KinyAI-SIM助手 查看当前通话后重试。",
+                        "Could not hang up. Open KinyAI SIM Assistant to check the call and retry.", lang,
                     ))
 
         def _menu_will_open(self) -> None:
@@ -907,7 +908,7 @@ def main() -> None:
             NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             meta = macos_shell.fetch_meta(web_url())
             confirmed = rumps.alert(
-                title=macos_shell.ui_text("退出 CallPilot？", "Quit CallPilot?", lang),
+                title=macos_shell.ui_text("退出 KinyAI-SIM助手？", "Quit KinyAI SIM Assistant?", lang),
                 message=macos_shell.quit_message(meta, lang),
                 ok=menu_label("quit", lang), cancel=macos_shell.ui_text("取消", "Cancel", lang),
             ) == 1

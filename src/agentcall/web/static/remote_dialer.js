@@ -16,6 +16,7 @@
 
   const text = {
     en: {
+      app_name: "Phone App",
       remote_line: "REMOTE LINE",
       title: "Call with your SIM",
       number_label: "Phone number",
@@ -45,13 +46,14 @@
       pairing: "Pairing",
       paired: "Paired",
       pair_failed: "Pairing failed",
-      invalid_pair_code: "Enter the code shown by CallPilot",
+      invalid_pair_code: "Enter the code shown by KinyAI SIM Assistant",
       unpair: "Unpair",
       default_device_name: "My phone",
       edge_disabled: "Remote dialing is disabled",
       edge_unconfigured: "Remote dialing is not configured",
     },
     zh: {
+      app_name: "手机 App",
       remote_line: "远程 SIM 线路",
       title: "使用 SIM 卡拨号",
       number_label: "电话号码",
@@ -81,7 +83,7 @@
       pairing: "正在配对",
       paired: "已配对",
       pair_failed: "配对失败",
-      invalid_pair_code: "请输入 CallPilot 电脑端显示的配对码",
+      invalid_pair_code: "请输入 KinyAI-SIM助手电脑端显示的配对码",
       unpair: "解除配对",
       default_device_name: "我的手机",
       edge_disabled: "电脑端未启用远程拨号",
@@ -91,6 +93,7 @@
 
   const language = navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
   const t = (key) => text[language][key] || text.en[key] || key;
+  document.title = t("app_name");
   document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
   document.querySelectorAll("[data-i18n]").forEach((element) => {
     element.textContent = t(element.dataset.i18n);

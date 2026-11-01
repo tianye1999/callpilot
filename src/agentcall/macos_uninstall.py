@@ -27,7 +27,7 @@ def launch(layout, runner=subprocess.run):
 def validate_data_directory(layout):
     expected = Path.home() / "Library/Application Support/CallPilot"
     if layout.support_dir != expected or any(p.is_symlink() for p in (expected, *expected.parents)):
-        raise RuntimeError("Refusing to delete a redirected CallPilot data directory")
+        raise RuntimeError("Refusing to delete a redirected KinyAI SIM Assistant data directory")
 
 
 def execute(layout, *, delete_data, stop, close_shell, cleanup, trash, delete):
@@ -54,7 +54,7 @@ def _trash(bundle):
     ok, _, error = NSFileManager.defaultManager().trashItemAtURL_resultingItemURL_error_(
         NSURL.fileURLWithPath_(str(bundle)), None, None)
     if not ok:
-        raise RuntimeError(f"Could not move CallPilot to Trash: {error}")
+        raise RuntimeError(f"Could not move KinyAI SIM Assistant to Trash: {error}")
 
 
 def _prepare_data_delete(layout):
@@ -90,7 +90,7 @@ def _close_shell(layout, close_window, acquire_tray_lock):
         if lock is not None:
             return lock
         if time.monotonic() >= deadline:
-            raise RuntimeError("CallPilot menu bar has not exited; please retry")
+            raise RuntimeError("KinyAI SIM Assistant menu bar has not exited; please retry")
         time.sleep(0.1)
 
 
@@ -107,7 +107,7 @@ def _pause_shell(layout, acquire_tray_lock):
             lock.close()
             return
         if time.monotonic() >= deadline:
-            raise RuntimeError("CallPilot is starting or busy; please retry later")
+            raise RuntimeError("KinyAI SIM Assistant is starting or busy; please retry later")
         time.sleep(0.1)
 
 
@@ -146,10 +146,10 @@ def _worker_main(url, close_window, acquire_tray_lock) -> None:
         return macos_shell.ui_text(zh, en, lang)
 
     prompt = NSAlert.alloc().init()
-    prompt.setMessageText_(text("卸载 CallPilot？", "Uninstall CallPilot?"))
+    prompt.setMessageText_(text("卸载 KinyAI-SIM助手？", "Uninstall KinyAI SIM Assistant?"))
     prompt.setInformativeText_(text(
-        "将停止接打电话，并把 CallPilot 移到废纸篓。通话或队列忙碌时不会卸载。",
-        "CallPilot will stop taking calls and move to Trash. Uninstall is blocked during calls."))
+        "将停止接打电话，并把 KinyAI-SIM助手 移到废纸篓。通话或队列忙碌时不会卸载。",
+        "KinyAI SIM Assistant will stop taking calls and move to Trash. Uninstall is blocked during calls."))
     # NSAlert 首按钮默认绑定回车；破坏性操作必须显式点击，Esc 始终安全取消。
     prompt.addButtonWithTitle_(text("卸载", "Uninstall")).setKeyEquivalent_("")
     prompt.addButtonWithTitle_(text("取消", "Cancel")).setKeyEquivalent_("\x1b")
@@ -166,10 +166,10 @@ def _worker_main(url, close_window, acquire_tray_lock) -> None:
     try:
         bundle = ld.bundle_root_for_executable(layout.executable)
         if bundle is None or bundle.is_symlink():
-            raise RuntimeError("Invalid CallPilot bundle")
+            raise RuntimeError("Invalid KinyAI SIM Assistant bundle")
         with (bundle / "Contents/Info.plist").open("rb") as stream:
             if plistlib.load(stream).get("CFBundleIdentifier") != "ai.bondings.callpilot":
-                raise RuntimeError("Not a CallPilot bundle")
+                raise RuntimeError("Not a KinyAI SIM Assistant bundle")
         if delete_data:
             validate_data_directory(layout)
         _pause_shell(layout, acquire_tray_lock)

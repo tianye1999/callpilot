@@ -83,8 +83,8 @@ def tray_status(
     if not meta:
         if uptime <= startup_grace:
             return TrayStatus("transient", text("正在启动…", "Starting…"), "")
-        return TrayStatus("attention", text("服务没有运行：打开 CallPilot 查看原因",
-                                            "Service is not running: open CallPilot to check why"), "")
+        return TrayStatus("attention", text("服务没有运行：打开 KinyAI-SIM助手 查看原因",
+                                            "Service is not running: open KinyAI SIM Assistant to check why"), "")
     hardware = meta.get("hardware") or {}
     sim = meta.get("sim") or {}
     details = []
@@ -133,17 +133,17 @@ def tray_status(
                       "No modem detected: Check the USB cable or try another port")
     if hardware.get("usb_online") and not connected and connecting_for > 60:
         return status("attention", "未能连接模组：重新插拔 USB，在窗口里查看原因",
-                      "Cannot connect to modem: reconnect USB and open CallPilot to check why")
+                      "Cannot connect to modem: reconnect USB and open KinyAI SIM Assistant to check why")
     if connected and sim.get("present") is False:
         return status("attention", "没检测到 SIM 卡：插好卡后在窗口里点『重新读卡』",
-                      "No SIM detected: insert the SIM, then choose Read SIM again in CallPilot")
+                      "No SIM detected: insert the SIM, then choose Read SIM again in KinyAI SIM Assistant")
     if (connected and not sim.get("network_attached")
             and sim.get("reg_status") == sim.get("eps_status") == "注册被拒"):
         return status("attention", "卡被网络拒绝：确认卡已开通、未欠费",
                       "SIM rejected by network: check activation and account balance")
     if (meta.get("credentials") or {}).get("ok") is False:
-        return status("attention", "还没填写模型 Key：打开 CallPilot 完成设置",
-                      "Missing model key: open CallPilot to finish setup")
+        return status("attention", "还没填写模型 Key：打开 KinyAI-SIM助手 完成设置",
+                      "Missing model key: open KinyAI SIM Assistant to finish setup")
     if resetting:
         return status("transient", "模组恢复中，约 30 秒", "Modem recovering, about 30 seconds")
     if not connected:
@@ -265,7 +265,7 @@ def launchd_failure_reason(result: macos_launchd.LaunchdInstallResult, lang: str
     if any(failure.action == "legacy-migration-pending" for failure in result.failures):
         return ui_text(
             "正在完成旧版本迁移，约 1 分钟后会自动启动，无需操作。",
-            "Finishing migration from the previous version. CallPilot will start automatically in about "
+            "Finishing migration from the previous version. KinyAI SIM Assistant will start automatically in about "
             "1 minute. No action is needed.", lang,
         )
     return ui_text(
@@ -410,7 +410,7 @@ def quit_message(meta: dict, lang: str = "zh") -> str:
         warning = ui_text("暂时无法确认通话状态，可能有通话正在进行。\n",
                           "Call status is unavailable. A call may be in progress.\n", lang)
     return warning + ui_text(
-        "退出后将不再接打电话。", "CallPilot will no longer make or receive calls after quitting.", lang,
+        "退出后将不再接打电话。", "KinyAI SIM Assistant will no longer make or receive calls after quitting.", lang,
     )
 
 
@@ -436,7 +436,7 @@ def quit_services(
                     break
                 raise RuntimeError(ui_text(
                     "无法确认后台服务已经停止；菜单栏将保留，请重试。",
-                    "Could not confirm the services stopped. CallPilot will stay open. Please retry.", lang,
+                    "Could not confirm the services stopped. KinyAI SIM Assistant will stay open. Please retry.", lang,
                 ))
             if time.monotonic() >= deadline:
                 raise RuntimeError(ui_text("后台服务尚未停止，请稍后重试。",

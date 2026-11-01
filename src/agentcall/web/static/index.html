@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<title>CallPilot</title>
+<title>KinyAI-SIM助手</title>
 <style>
   /* ========= 设计基座：iOS 深色玻璃态（借鉴 Agent for Call.app）========= */
   :root {
@@ -884,8 +884,8 @@
 </head>
 <body>
   <header>
-    <div class="logo"><svg width="100%" height="100%" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CallPilot"><defs><filter id="cpGlow" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="0.9" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><rect x="0.5" y="0.5" width="27" height="27" rx="7" fill="#0a0e16" stroke="#1c2740" stroke-width="1"/><g filter="url(#cpGlow)" stroke="#43e69a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9.4 8.2c-.5-.5-1.3-.5-1.7.1-.7 1-1 2.2-.5 3.6.9 2.6 3 4.7 5.6 5.6 1.4.5 2.6.2 3.6-.5.6-.4.6-1.2.1-1.7l-1.7-1.7c-.4-.4-1-.4-1.4-.1l-.7.5c-1-.6-1.9-1.5-2.5-2.5l.5-.7c.3-.4.3-1-.1-1.4z"/><path d="M17.4 6.6c1.1.3 2 1.2 2.3 2.3" opacity="0.95"/><path d="M17.8 4.1c2 .5 3.6 2.1 4.1 4.1" opacity="0.6"/></g></svg></div>
-    <div class="titlebox"><b>CallPilot</b><span id="slogan"></span></div>
+    <div class="logo"><svg width="100%" height="100%" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="KinyAI-SIM助手"><defs><filter id="cpGlow" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="0.9" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><rect x="0.5" y="0.5" width="27" height="27" rx="7" fill="#0a0e16" stroke="#1c2740" stroke-width="1"/><g filter="url(#cpGlow)" stroke="#43e69a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9.4 8.2c-.5-.5-1.3-.5-1.7.1-.7 1-1 2.2-.5 3.6.9 2.6 3 4.7 5.6 5.6 1.4.5 2.6.2 3.6-.5.6-.4.6-1.2.1-1.7l-1.7-1.7c-.4-.4-1-.4-1.4-.1l-.7.5c-1-.6-1.9-1.5-2.5-2.5l.5-.7c.3-.4.3-1-.1-1.4z"/><path d="M17.4 6.6c1.1.3 2 1.2 2.3 2.3" opacity="0.95"/><path d="M17.8 4.1c2 .5 3.6 2.1 4.1 4.1" opacity="0.6"/></g></svg></div>
+    <div class="titlebox"><b data-i18n="app_name">KinyAI-SIM助手</b><span id="slogan"></span></div>
     <span class="state-chip idle" id="stateChip">
       <span class="sdot"></span><span id="stateText">待命</span><span class="num" id="stateNum"></span>
       <span class="recording-badge" id="recordingBadge">REC</span>
@@ -1217,7 +1217,7 @@
       </div>
     </div>
   </main>
-  <footer class="version-footer">CallPilot <span id="appVersion"></span> ·
+  <footer class="version-footer"><span data-i18n="app_name">KinyAI-SIM助手</span> <span id="appVersion"></span> ·
     <button id="aboutApp" data-i18n="about_app"></button></footer>
   <dialog id="releaseDialog" aria-labelledby="releaseTitle">
     <h2 id="releaseTitle"></h2><p id="releaseNotes"></p>
@@ -1420,6 +1420,7 @@ const $ = (id) => document.getElementById(id);
 /* ========= i18n（默认英文，localStorage 记忆） ========= */
 const I18N = {
   en: {
+    app_name: "KinyAI SIM Assistant",
     slogan: "Your calls, handled by AI",
     nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_metrics: "Metrics", nav_profiles: "Presets", nav_settings: "Settings",
     st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
@@ -1487,7 +1488,7 @@ const I18N = {
     hangup_msg: "A call is in progress. Hang up now?",
     hangup_ok: "Hang up",
     batch_title: "Start batch calling?",
-    batch_msg: (n) => `CallPilot will place ${n} call${n > 1 ? "s" : ""}, one at a time.`,
+    batch_msg: (n) => `KinyAI SIM Assistant will place ${n} call${n > 1 ? "s" : ""}, one at a time.`,
     batch_ok: "Start dialing",
     restart_title: "Restarting service…",
     restart_msg: "Applying settings that need a restart. This takes a few seconds.",
@@ -1604,9 +1605,9 @@ const I18N = {
       latency: "Latency", summary: "Summary", ended: "Wrap-up", call_finished: "Call finished",
       not_connected: "No answer", dtmf: "DTMF keys", transcript_user: "Caller said", transcript_agent: "AI said" },
     settings_title: "Settings", cfg_loading: "Loading…", cfg_save: "Save",
-    macos_autostart: "Start CallPilot at login",
+    macos_autostart: "Start KinyAI SIM Assistant at login",
     macos_login_settings: "Login Items…",
-    macos_uninstall: "Uninstall CallPilot…",
+    macos_uninstall: "Uninstall KinyAI SIM Assistant…",
     restart_btn: "Restart service",
     restart_confirm_title: "Restart the service?",
     restart_confirm_msg: "The service will restart to reconnect the modem and apply settings. Any call in progress will end.",
@@ -1617,7 +1618,7 @@ const I18N = {
     secret_set: "Set", secret_unset: "Not set", secret_keep: "Leave blank to keep current",
     sms_email_privacy: "When enabled, SMS content will be sent to the configured email address.",
     modem_prefix: "Modem ", setup_rerun: "Run setup",
-    setup_kicker: "FIRST RUN", setup_title: "Set up CallPilot",
+    setup_kicker: "FIRST RUN", setup_title: "Set up KinyAI SIM Assistant",
     setup_subtitle: "Connect the modem, add your model key, and personalize the assistant.",
     setup_skip_all: "Skip setup", setup_skip_step: "Skip step", setup_back: "Back", setup_next: "Next",
     setup_finish: "Finish", setup_steps: ["Hardware", "Model", "Personalize", "Recording", "Self-test", "Done"],
@@ -1693,7 +1694,7 @@ const I18N = {
     recording_details: (path, days) => `Files are stored in ${path} and kept for ${days} days.`,
     setup_test_title: "Self-test", setup_test_hint: "Test the line with your SIM's free customer service number. You can also send a test SMS to a phone number you can receive on.",
     setup_sms_number: "Phone number to receive the test SMS", setup_sms_text: "Message", setup_send_sms: "Send test SMS",
-    setup_sms_default: "CallPilot setup test.", setup_sms_sent: "Test SMS sent. It is listed in the SMS tab.", setup_sms_fail: "Test SMS failed: ",
+    setup_sms_default: "KinyAI SIM Assistant setup test.", setup_sms_sent: "Test SMS sent. It is listed in the SMS tab.", setup_sms_fail: "Test SMS failed: ",
     setup_ready_creds: "Model key", setup_ready_modem: "Modem", setup_ready_yes: "Ready", setup_ready_no: "Not ready",
     setup_done_title: "Ready to start", setup_done_hint: "Finish setup to enter the main interface.",
     setup_done_status: "Setup will be marked complete on this Mac.",
@@ -1731,8 +1732,8 @@ const I18N = {
       SMS_EMAIL_SMTP_PASSWORD: "Sender SMTP app password",
       SMS_EMAIL_FROM: "Sender email address",
       REMOTE_WEB_DIALER_ENABLED: "Remote Web Dialer",
-      REMOTE_CLOUD_ENABLED: "Use hosted CallPilot control plane",
-      REMOTE_CLOUD_URL: "CallPilot control plane URL",
+      REMOTE_CLOUD_ENABLED: "Use hosted KinyAI SIM Assistant control plane",
+      REMOTE_CLOUD_URL: "KinyAI SIM Assistant control plane URL",
       REMOTE_MEDIA_PROVIDER: "Remote media provider",
       REMOTE_DTMF_MODE: "Remote DTMF mode",
       REMOTE_HUMAN_RECORDING_ENABLED: "Record remote human calls",
@@ -1748,6 +1749,7 @@ const I18N = {
     },
   },
   zh: {
+    app_name: "KinyAI-SIM助手",
     slogan: "电话，交给 AI",
     nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_metrics: "指标", nav_profiles: "任务库", nav_settings: "设置",
     st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
@@ -1932,9 +1934,9 @@ const I18N = {
       latency: "延迟打点", summary: "生成摘要", ended: "会话收尾", call_finished: "通话结束",
       not_connected: "未接通", dtmf: "发送按键", transcript_user: "对方说", transcript_agent: "分身说" },
     settings_title: "系统设置", cfg_loading: "正在加载配置…", cfg_save: "保存设置",
-    macos_autostart: "登录时自动启动 CallPilot",
+    macos_autostart: "登录时自动启动 KinyAI-SIM助手",
     macos_login_settings: "登录项设置…",
-    macos_uninstall: "卸载 CallPilot…",
+    macos_uninstall: "卸载 KinyAI-SIM助手…",
     restart_btn: "重启服务",
     restart_confirm_title: "重启服务？",
     restart_confirm_msg: "服务将重启以重连模组并应用设置，进行中的通话会中断。",
@@ -1945,7 +1947,7 @@ const I18N = {
     secret_set: "已设置", secret_unset: "未设置", secret_keep: "留空则保持现有密钥",
     sms_email_privacy: "开启后，短信内容将发送到你配置的收件邮箱。",
     modem_prefix: "模组 ", setup_rerun: "重新运行向导",
-    setup_kicker: "首次启动", setup_title: "配置 CallPilot",
+    setup_kicker: "首次启动", setup_title: "配置 KinyAI-SIM助手",
     setup_subtitle: "连接模组、填写模型 Key，并设定你的 AI 助理。",
     setup_skip_all: "跳过向导", setup_skip_step: "跳过本步", setup_back: "上一步", setup_next: "下一步",
     setup_finish: "完成", setup_steps: ["硬件", "模型", "个性化", "通话录音", "自测", "完成"],
@@ -2021,7 +2023,7 @@ const I18N = {
     recording_details: (path, days) => `录音保存在 ${path}，保留 ${days} 天。`,
     setup_test_title: "自测", setup_test_hint: "拨本卡运营商免费客服号测试线路，也可以向你能接收短信的手机号发送一条测试短信。",
     setup_sms_number: "接收测试短信的手机号", setup_sms_text: "短信内容", setup_send_sms: "发送测试短信",
-    setup_sms_default: "CallPilot 配置测试。", setup_sms_sent: "测试短信已发送，可在短信页查看。", setup_sms_fail: "测试短信失败：",
+    setup_sms_default: "KinyAI-SIM助手 配置测试。", setup_sms_sent: "测试短信已发送，可在短信页查看。", setup_sms_fail: "测试短信失败：",
     setup_ready_creds: "模型 Key", setup_ready_modem: "模组", setup_ready_yes: "就绪", setup_ready_no: "未就绪",
     setup_done_title: "可以开始了", setup_done_hint: "完成向导后会进入主界面。",
     setup_done_status: "本机将记录首次启动向导已完成。",
@@ -2041,6 +2043,8 @@ const t = (key) => {
   return v !== undefined ? v : key;
 };
 function applyI18n() {
+  document.title = t("app_name");
+  document.querySelector(".logo svg").setAttribute("aria-label", t("app_name"));
   document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
   document.querySelectorAll("[data-i18n]").forEach((n) => { n.textContent = t(n.dataset.i18n); });
   document.querySelectorAll("[data-i18n-ph]").forEach((n) => { n.placeholder = t(n.dataset.i18nPh); });
@@ -2633,7 +2637,7 @@ function showRelease(about) {
   if (callActive || lastMeta?.call_active) return;
   const release = about ? {version: lastMeta?.version, notes: lastMeta?.release_notes} : lastMeta?.update;
   if (!release) return;
-  $("releaseTitle").textContent = `${about ? "CallPilot" : t("update_available")} ${release.version || ""}`;
+  $("releaseTitle").textContent = `${about ? t("app_name") : t("update_available")} ${release.version || ""}`;
   $("releaseNotes").textContent = release.notes?.[LANG === "zh" ? "zh" : "en"] || "";
   $("releaseDialog").showModal();
 }

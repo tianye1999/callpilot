@@ -118,7 +118,7 @@ class UpdateChecker:
         if any(event["kind"] == kind for event in feed.read(0)["events"]):
             return
         feed.info(kind, f"有新版本 {self.latest['version']}",
-                  "打开 CallPilot 查看更新说明和下载。", target="#settings")
+                  "打开 KinyAI-SIM助手 查看更新说明和下载。", target="#settings")
 
     def claim_notification(self, version: str, *, busy: bool) -> bool:
         if (busy or not self.latest or version != self.latest["version"]

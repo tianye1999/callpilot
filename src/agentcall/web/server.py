@@ -1088,7 +1088,7 @@ async def _remote_cloud_enroll(request: web.Request) -> web.Response:
     cloud_store = request.app.get("remote_cloud_store")
     if cloud_api is None or cloud_store is None:
         return web.json_response(
-            {"ok": False, "error": "CallPilot 云控制面未启用"}, status=409
+            {"ok": False, "error": "KinyAI-SIM助手 云控制面未启用"}, status=409
         )
     data = await read_json(request)
     code = data.get("code") if isinstance(data, dict) else None

@@ -1868,7 +1868,7 @@ def test_remote_dialer_page_is_no_store_and_does_not_expose_admin_data():
         assert page.headers["Referrer-Policy"] == "no-referrer"
         assert "frame-ancestors 'none'" in page.headers["Content-Security-Policy"]
         body = await page.text()
-        assert "CallPilot Remote" in body
+        assert "手机 App" in body
         assert "LIVEKIT_API_SECRET" not in body
 
         script = await client.get("/remote-dialer/remote_dialer.js")

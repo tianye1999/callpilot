@@ -1,7 +1,7 @@
 {
-  "name": "CallPilot Remote",
-  "short_name": "CallPilot",
-  "description": "Use your CallPilot SIM line from your phone.",
+  "name": "KinyAI-SIM助手",
+  "short_name": "KinyAI SIM",
+  "description": "在手机 App 中使用你的 SIM 线路。",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

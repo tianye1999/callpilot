@@ -120,9 +120,9 @@ def test_build_email_message_prefixes_otp_and_preserves_unicode_body():
         settings(),
     )
 
-    assert message["Subject"] == "【验证码 482913】[CallPilot 短信转发] 来自 10086"
+    assert message["Subject"] == "【验证码 482913】[KinyAI-SIM助手 短信转发] 来自 10086"
     assert message["To"] == "owner@example.com"
-    assert message["From"] == "CallPilot <sender@example.com>"
+    assert message["From"] == "KinyAI-SIM助手 <sender@example.com>"
     content = message.get_content()
     assert "发件号码: 10086" in content
     assert "接收时间: 2026-07-10 08:09:10 +0000" in content
@@ -136,7 +136,7 @@ def test_build_email_message_without_otp_uses_plain_subject_and_unknown_sender()
         settings(),
     )
 
-    assert message["Subject"] == "[CallPilot 短信转发] 来自 未知发件人"
+    assert message["Subject"] == "[KinyAI-SIM助手 短信转发] 来自 未知发件人"
     assert "发件号码: 未知" in message.get_content()
 
 

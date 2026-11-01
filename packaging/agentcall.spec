@@ -153,11 +153,12 @@ if IS_MACOS:
         icon=str(project_root / "packaging" / "CallPilot.icns"),
         bundle_identifier="ai.bondings.callpilot",
         info_plist={
-            "CFBundleDisplayName": "CallPilot",
+            "CFBundleDisplayName": "KinyAI-SIM助手",
+            "CFBundleName": "KinyAI SIM",
             "CFBundleShortVersionString": APP_VERSION,
             "CFBundleVersion": APP_VERSION,
             "LSMinimumSystemVersion": "13.0",
-            "NSMicrophoneUsageDescription": "CallPilot 需要采集通话对方的语音，供 AI 实时应答。",
+            "NSMicrophoneUsageDescription": "KinyAI-SIM助手 需要采集通话对方的语音，供 AI 实时应答。",
             "NSHighResolutionCapable": True,
             # 菜单栏保持 accessory；--window 运行时切换 regular，关窗后 Dock 图标消失。
             "LSUIElement": True,

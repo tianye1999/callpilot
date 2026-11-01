@@ -68,7 +68,7 @@ def show_startup_window(support: Path) -> StartupWindow:
         NSBackingStoreBuffered, False,
     )
     native.setReleasedWhenClosed_(False)
-    native.setTitle_("CallPilot")
+    native.setTitle_(macos_shell.ui_text("KinyAI-SIM助手", "KinyAI SIM Assistant"))
     native.setFrame_display_(NSMakeRect(*geometry), True)
     label = NSTextField.labelWithString_(macos_shell.ui_text("正在启动…", "Starting…"))
     label.setFont_(NSFont.systemFontOfSize_(24))
@@ -89,10 +89,10 @@ def show_startup_window(support: Path) -> StartupWindow:
     native.setDelegate_(delegate)
     app.setDelegate_(delegate)
     menu = NSMenu.alloc().init()
-    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("CallPilot", None, "")
+    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("KinyAI SIM", None, "")
     submenu = NSMenu.alloc().init()
     submenu.addItemWithTitle_action_keyEquivalent_(
-        macos_shell.ui_text("退出 CallPilot", "Quit CallPilot"), "terminate:", "q",
+        macos_shell.ui_text("退出 KinyAI-SIM助手", "Quit KinyAI SIM Assistant"), "terminate:", "q",
     )
     item.setSubmenu_(submenu)
     menu.addItem_(item)

@@ -113,7 +113,7 @@ def reconcile(layout, fetch_meta, *, user_initiated=False, install=None, loaded=
             return launchd.LaunchdInstallResult([], [], [])
         while True:
             if getattr(sys, "frozen", False) and not layout.executable.is_file():
-                raise RuntimeError("CallPilot bundle was removed; refusing to restart services")
+                raise RuntimeError("KinyAI SIM Assistant bundle was removed; refusing to restart services")
             meta = fetch_meta()
             if (meta and (meta.get("call_active") is not False or meta.get("dial_queue_busy"))
                     or not meta and loaded(launchd.APP_LABEL, layout)):
@@ -124,8 +124,8 @@ def reconcile(layout, fetch_meta, *, user_initiated=False, install=None, loaded=
             restart = SERVICE_LABELS if _needs_restart(layout, meta) else set()
             if restart and meta and not meta.get("upgrade_guard"):
                 raise LegacyUpgradeRequired(
-                    "旧版服务不支持安全切换。请在通话结束后退出 CallPilot，再重新打开一次。\n"
-                    "After the call ends, quit CallPilot and reopen it once to finish this legacy upgrade.")
+                    "旧版服务不支持安全切换。请在通话结束后退出 KinyAI-SIM助手，再重新打开一次。\n"
+                    "After the call ends, quit KinyAI SIM Assistant and reopen it once to finish this legacy upgrade.")
             release = None
 
             def before_restart():

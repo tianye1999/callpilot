@@ -72,7 +72,7 @@ class NotificationFeed:
             self._confirmations[confirm_id] = dict(
                 id=confirm_id, question=question[:500], deadline=self._clock() + timeout,
             )
-            self._append("confirm", "confirm", "AI 请你确认", "请打开 CallPilot 处理，超时将按拒绝处理。",
+            self._append("confirm", "confirm", "AI 请你确认", "请打开 KinyAI-SIM助手 处理，超时将按拒绝处理。",
                          f"#confirm/{confirm_id}")
 
     def confirm_closed(self, confirm_id: str) -> None:
