@@ -1,2 +1,3 @@
-"NSCameraUsageDescription" = "CallPilot 当前版本不使用相机采集。内置通信框架包含相机支持。";
-"NSMicrophoneUsageDescription" = "用于在通过远端 SIM 的通话中传输您的语音。";
+"CFBundleDisplayName" = "KinyAI SIM";
+"NSCameraUsageDescription" = "KinyAI-SIM助手当前版本不使用相机采集。内置通信框架包含相机支持。";
+"NSMicrophoneUsageDescription" = "KinyAI-SIM助手用于在通过远端 SIM 的通话中传输您的语音。";

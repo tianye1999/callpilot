@@ -118,7 +118,7 @@ final class CallKitCoordinator: NSObject {
         if preparedAudio { CallKitAudioSessionBridge.prepareForIncoming() }
         let update = CXCallUpdate()
         update.localizedCallerName = L10n.text("callkit.incoming.name")
-        update.remoteHandle = CXHandle(type: .generic, value: "CallPilot")
+        update.remoteHandle = CXHandle(type: .generic, value: "KinyAI SIM")
         update.hasVideo = false
         update.supportsDTMF = true
         update.supportsGrouping = false

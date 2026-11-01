@@ -20,9 +20,9 @@
 
 "content.error.unauthorized" = "设备授权已失效，请重新配对。";
 
-"pair.title" = "配对 CallPilot";
-"pair.subtitle" = "输入电脑端 CallPilot 生成的配对码。";
-"pair.code_placeholder" = "配对码（如 ABCD-EFGH）";
+"pair.title" = "配对 KinyAI-SIM助手";
+"pair.subtitle" = "粘贴电脑端生成的配对链接，或输入配对码。";
+"pair.code_placeholder" = "配对链接或配对码";
 "pair.gateway_placeholder" = "网关地址";
 "pair.device_name_placeholder" = "设备名";
 "pair.action" = "配对";
@@ -36,11 +36,11 @@
 "dial.accessibility.call" = "拨打";
 "dial.accessibility.delete" = "删除一位";
 
-"incoming.title" = "来电转接";
-"incoming.description" = "AI 正在处理一通需要你本人接听的来电。接听后将在这台 iPhone 上继续通话。";
+"incoming.title" = "来电";
+"incoming.description" = "有一通电话需要你接听，接听后通话转到这台手机。";
 "incoming.decline" = "拒绝";
 "incoming.answer" = "接听";
-"incoming.decline_footer" = "拒绝后，AI 会继续处理这通电话。";
+"incoming.decline_footer" = "拒绝后，通话不会转到这台手机。";
 
 "call.remote_sim_notice" = "正在通过远端 SIM 通话";
 "call.return_to_dialer" = "返回拨号";
@@ -193,4 +193,4 @@
 "settings.unpair.action" = "解除配对";
 "settings.unpair.confirm_title" = "解除与电脑端的配对？";
 "settings.unpair.confirm_message" = "解除后将清除本机内容，需要重新输入配对码才能使用远程线路。";
-"callkit.incoming.name" = "AI 来电转接";
+"callkit.incoming.name" = "来电";

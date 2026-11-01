@@ -3,6 +3,39 @@ import XCTest
 @testable import CallPilot
 
 final class LocalizationTests: XCTestCase {
+    func testSIMBrandAndNeutralIncomingCopyInBothLanguages() throws {
+        let info = try catalog("ios/CallPilot/Info.plist")
+        XCTAssertEqual(info["CFBundleDisplayName"], "KinyAI SIM")
+        for (language, name, title, description) in [
+            ("en", "KinyAI SIM Assistant", "Incoming Call",
+             "You have a call to answer. Answer to move the call to this phone."),
+            ("zh-Hans", "KinyAI-SIM助手", "来电",
+             "有一通电话需要你接听，接听后通话转到这台手机。"),
+        ] {
+            let strings = try catalog("ios/CallPilot/Resources/\(language).lproj/Localizable.strings")
+            XCTAssertTrue(try XCTUnwrap(strings["pair.title"]).contains(name))
+            XCTAssertEqual(strings["incoming.title"], title)
+            XCTAssertEqual(strings["callkit.incoming.name"], title)
+            XCTAssertEqual(strings["incoming.description"], description)
+            XCTAssertFalse(try XCTUnwrap(strings["incoming.decline_footer"]).contains("AI"))
+            XCTAssertFalse(strings.values.contains { $0.contains("CallPilot") })
+            let purposes = try catalog("ios/CallPilot/Resources/\(language).lproj/InfoPlist.strings")
+            XCTAssertEqual(purposes["CFBundleDisplayName"], "KinyAI SIM")
+            for key in ["NSCameraUsageDescription", "NSMicrophoneUsageDescription"] {
+                XCTAssertTrue(try XCTUnwrap(purposes[key]).contains(name))
+                XCTAssertFalse(try XCTUnwrap(info[key]).contains("CallPilot"))
+            }
+        }
+    }
+
+    private func catalog(_ path: String) throws -> [String: String] {
+        let source = try String(contentsOf: repositoryRoot.appendingPathComponent(path), encoding: .utf8)
+        let values = try XCTUnwrap(PropertyListSerialization.propertyList(
+            from: Data(source.utf8), options: [], format: nil
+        ) as? [String: Any])
+        return values.compactMapValues { $0 as? String }
+    }
+
     func testCallMediaPrivacyPurposeStringsCoverCameraAndMicrophoneInBothLanguages() throws {
         let root = repositoryRoot
         let infoURL = root.appendingPathComponent("ios/CallPilot/Info.plist")

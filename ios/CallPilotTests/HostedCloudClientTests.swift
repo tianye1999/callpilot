@@ -168,6 +168,21 @@ final class HostedCloudClientTests: XCTestCase {
         XCTAssertEqual(requestCount, 2)
     }
 
+    func testVoipTokenRegistrationPreservesSandboxEnvironment() async throws {
+        let token = String(repeating: "AB", count: 32)
+        let client = try makeClient { request in
+            XCTAssertEqual(request.httpMethod, "PUT")
+            XCTAssertEqual(request.url?.path, "/v1/device/push-token")
+            let fields = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Self.requestBody(request)
+            ) as? [String: String])
+            XCTAssertEqual(fields, ["token": token.lowercased(), "environment": "sandbox"])
+            return Self.response(for: request, json: #"{"registered":true}"#)
+        }
+        client.credential = DeviceCredential(deviceId: "device_abcdefghijkl", secret: "secret-value")
+        try await client.registerVoipToken(token, environment: .sandbox)
+    }
+
     func testClaimInboundOfferReturnsValidatedSession() async throws {
         // Android parity: HostedCloudClientTest.`claimInboundOffer 成功返回入房凭证`.
         let client = try makeClient(clockMilliseconds: { 1_000 }) { request in

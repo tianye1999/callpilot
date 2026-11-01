@@ -1,2 +1,3 @@
-"NSCameraUsageDescription" = "CallPilot does not use camera capture in this version. The bundled communication framework includes camera support.";
-"NSMicrophoneUsageDescription" = "CallPilot uses the microphone to transmit your voice during calls through your remote SIM.";
+"CFBundleDisplayName" = "KinyAI SIM";
+"NSCameraUsageDescription" = "KinyAI SIM Assistant does not use camera capture in this version. The bundled communication framework includes camera support.";
+"NSMicrophoneUsageDescription" = "KinyAI SIM Assistant uses the microphone to transmit your voice during calls through your remote SIM.";

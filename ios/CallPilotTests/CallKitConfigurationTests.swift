@@ -2,6 +2,30 @@ import Foundation
 import XCTest
 
 final class CallKitConfigurationTests: XCTestCase {
+    func testVersionAndInternalProductIdentityRemainExplicit() throws {
+        let project = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("ios/project.yml"), encoding: .utf8
+        )
+        XCTAssertTrue(project.contains("MARKETING_VERSION: \"0.7.5\""))
+        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"5\""))
+        XCTAssertTrue(project.contains("PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot\n"))
+        XCTAssertTrue(project.contains("name: CallPilot\n"))
+        XCTAssertTrue(project.contains("DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}"))
+    }
+
+    func testCallKitUsesSIMDisplayNameAndBuildSpecificPushEnvironment() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/CallKitCoordinator.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("CXHandle(type: .generic, value: \"KinyAI SIM\")"))
+        XCTAssertTrue(source.contains("CXProviderConfiguration()"))
+        let tokenCallback = try XCTUnwrap(source.components(separatedBy: "didUpdate pushCredentials").last?
+            .components(separatedBy: "didInvalidatePushTokenFor").first)
+        XCTAssertTrue(tokenCallback.contains("#if DEBUG\n            let environment = ApnsEnvironment.sandbox\n            #else\n            let environment = ApnsEnvironment.production\n            #endif"))
+        XCTAssertTrue(tokenCallback.contains("self.delegate?.callKitDidUpdateToken(token, environment: environment)"))
+    }
+
     func testVoipBackgroundModeAndPushEntitlementAreDeclared() throws {
         let info = try plist("ios/CallPilot/Info.plist")
         XCTAssertEqual(info["UIBackgroundModes"] as? [String], ["voip"])
