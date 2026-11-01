@@ -6,7 +6,7 @@ Edge/cloud 侧无需改动;Android(`../android`)是同协议的活参照实现�
 ## 当前配置
 
 - 主屏名称: `KinyAI SIM`; App 内中文名称: `KinyAI-SIM助手`。
-- 版本: `0.7.5 (6)`。Bundle ID `ai.bondings.callpilot.sim`（实体 SIM 线独立的
+- 版本: `0.7.5 (7)`。Bundle ID `ai.bondings.callpilot.sim`（实体 SIM 线独立的
   App Store Connect 记录，不与 `ai.bondings.callpilot` 共用）；target/module/product
   `CallPilot` 保持不变。
 - 新配对默认中转: `https://sim-relay.bondings.ai`。不会覆盖已保存配对的网关。
@@ -58,7 +58,9 @@ CORE_TEST_CONFIGURATION=Release python3 run-core-tests.py
 HTTP 测试使用现有 URLProtocol mock;测试缓存使用临时目录。
 资源及构建产物位于被忽略的 `.validation/`。文本生成和读取显式使用 UTF-8。
 
-它不等同于 iOS 全量运行验收:媒体会话/LiveKit、SwiftUI 行布局和 Tab 壳测试
+独立 runner 也执行媒体会话、CallKit action/激活超时与音频所有权测试,
+使用 fake transport/audio device,不启动真实麦克风或 CallKit provider。
+它不等同于 iOS 全量运行验收:LiveKit 适配器、SwiftUI 行布局和 Tab 壳测试
 仅随 `build-for-testing` 编译,不在独立 runner 中运行。需要完整 App 托管测试时,
 可在允许读取模拟器配对钥匙串的环境使用相同 scheme 的 `xcodebuild test`,
 并指定已安装 runtime 的具体模拟器 destination。缺 runtime 时不得把仅编译当作测试通过。
@@ -75,6 +77,18 @@ HTTP 测试使用现有 URLProtocol mock;测试缓存使用临时目录。
   属于签名/导出阶段验证,无签名编译不能证明 TestFlight APNs 投递成功。
 
 ## 待授权运行验收
+
+- 来电 claim 后配置 session 并 fulfill,room connected + didActivate 两个条件齐备才开麦。
+- `Info.plist` 是 App 的唯一输入 (`GENERATE_INFOPLIST_FILE=NO`),后台能力为 `voip` + `audio`。
+- 接管 20 秒 watchdog 按 attempt/阶段判定;系统 action deadline 与 10 秒音频激活 deadline 独立。
+- 无 transport 的失败也清理音频;旧 SDK 任务完全退出前不将全局音频 lease 交给下一通。
+- CallKit 音频回调不带 UUID,结束/失败后的未激活周期保留 2 秒,已激活周期保留 3 秒。
+  宽限内迟到回调按 FIFO 吸收,迟到激活不将总宽限延长到结束后的 3 秒以外。
+  宽限与等待预算使用可注入的单调时钟,不受系统时间校准影响。
+  到期移除旧周期并显式停止其 owner 的音频;外呼与新来电先等待排空,最多 3 秒,
+  来电等待同时受 action 截止时间约束,无需靠 provider reset 或重启恢复漏回调场景。
+  宽限后才到达的无 UUID 回调仍无法可靠区分归属;旧 SDK 原生任务若永久不返回,
+  音频 lease 仍不会强交给新通话。上述边界仍需真机连续失败/重试验收。
 
 - iPhone 配对链接粘贴、手动网关兜底、中英界面及大字体布局。
 - 真实 SIM 外呼、来电先响手机及 AI 转接的双向音频。

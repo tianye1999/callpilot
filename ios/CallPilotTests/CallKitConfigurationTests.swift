@@ -2,12 +2,28 @@ import Foundation
 import XCTest
 
 final class CallKitConfigurationTests: XCTestCase {
+    func testIncomingAndOutboundAdmissionAwaitDrainInsteadOfRejectingIncomingPush() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8
+        )
+        let outbound = try XCTUnwrap(source.components(separatedBy: "func startCall(number:").last?
+            .components(separatedBy: "func answerTakeover").first)
+        let incoming = try XCTUnwrap(source.components(separatedBy: "private func performTakeover").last?
+            .components(separatedBy: "private func scheduleMediaTimeout").first)
+        let acceptance = try XCTUnwrap(source.components(separatedBy: "var callKitCanAcceptIncomingCall:").last?
+            .components(separatedBy: "func callKitDidUpdateToken").first)
+        XCTAssertTrue(outbound.contains("await canBeginAudio"))
+        XCTAssertTrue(incoming.contains("await canBeginAudio"))
+        XCTAssertFalse(acceptance.contains("isAudioSessionDrained"))
+        XCTAssertTrue(source.contains("await callKit.waitUntilAudioDrained(offerId: callKitOfferId)"))
+    }
+
     func testVersionAndInternalProductIdentityRemainExplicit() throws {
         let project = try String(
             contentsOf: repositoryRoot.appendingPathComponent("ios/project.yml"), encoding: .utf8
         )
         XCTAssertTrue(project.contains("MARKETING_VERSION: \"0.7.5\""))
-        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"6\""))
+        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"7\""))
         XCTAssertTrue(project.contains("PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot.sim\n"))
         XCTAssertTrue(project.contains("name: CallPilot\n"))
         XCTAssertTrue(project.contains("DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}"))
@@ -29,7 +45,7 @@ final class CallKitConfigurationTests: XCTestCase {
 
     func testVoipBackgroundModeAndPushEntitlementAreDeclared() throws {
         let info = try plist("ios/CallPilot/Info.plist")
-        XCTAssertEqual(info["UIBackgroundModes"] as? [String], ["voip"])
+        XCTAssertEqual(info["UIBackgroundModes"] as? [String], ["voip", "audio"])
 
         let entitlements = try plist("ios/CallPilot/CallPilot.entitlements")
         XCTAssertEqual(entitlements["aps-environment"] as? String, "development")

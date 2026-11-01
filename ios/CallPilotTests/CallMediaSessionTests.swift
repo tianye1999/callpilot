@@ -4,6 +4,207 @@ import XCTest
 
 @MainActor
 final class CallMediaSessionTests: XCTestCase {
+    func testExpiredCallKitDrainStopsOldSessionWithoutStoppingReplacementOutbound() async throws {
+        let client = try makeTakeoverClient()
+        let device = TestCallAudioDevice()
+        let audio = CallAudioOwner(device: device, onCleanupError: { _ in XCTFail("cleanup") })
+        let oldTransport = FakeCallMediaTransport()
+        var oldStates: [CallState] = []
+        let old = CallMediaSession(onState: { oldStates.append($0) },
+                                   transportFactory: { oldTransport }, audio: audio)
+        await old.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+                                onClaimed: { try old.prepareCallKitAnswer() }, onConnected: {})
+        old.finishCallKitAudioDrain()
+        XCTAssertGreaterThan(device.stopCount, 0)
+        XCTAssertTrue(oldStates.last?.isTerminal == true)
+        await old.stop()
+        XCTAssertNil(audio.owner)
+        XCTAssertTrue(oldTransport.operations.contains(.disconnect))
+
+        let nextClient = try makeOutboundClient()
+        let nextTransport = FakeCallMediaTransport()
+        let next = CallMediaSession(onState: { _ in }, transportFactory: { nextTransport }, audio: audio)
+        await next.startOutbound(client: nextClient, edgeId: "edge_abcdefghijkl", number: "10086")
+        let stops = device.stopCount
+        let owner = audio.owner
+        old.finishCallKitAudioDrain()
+        XCTAssertEqual(device.stopCount, stops)
+        XCTAssertEqual(audio.owner, owner)
+        XCTAssertEqual(oldStates.filter(\.isTerminal).count, 1)
+        await next.stop()
+    }
+
+    func testStopCancelsInFlightDTMFBeforeReleasingAudio() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        let gate = PublishGate()
+        transport.dtmfPublishGate = gate
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport })
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "1")
+        let sending = Task { await media.sendDTMF("2") }
+        await waitUntil { gate.didStart }
+        await media.stop()
+        await sending.value
+        XCTAssertFalse(transport.operations.contains { if case .publish = $0 { return true }; return false })
+    }
+
+    func testCancelledSetupEndsUIAndCannotBeRevivedByLateConnect() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        let gate = ConnectGate()
+        transport.connectGate = gate
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { transport })
+        let setup = Task { await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "1") }
+        await waitUntil { gate.didStart }
+        setup.cancel()
+        await waitUntil { transport.operations.contains(.disconnect) }
+        XCTAssertTrue(states.last?.isTerminal == true)
+        gate.open()
+        await setup.value
+        await media.stop()
+        await transport.emit(.data(Data(#"{"type":"status","status":"connected"}"#.utf8),
+                                   topic: CallPilotTopic.status))
+        XCTAssertEqual(states.filter(\.isTerminal).count, 1)
+    }
+
+    func testCallKitClaimCompletesBeforeConnectAndActivationWaitsForRoom() async throws {
+        let client = try makeTakeoverClient()
+        let transport = FakeCallMediaTransport()
+        let gate = ConnectGate()
+        transport.connectGate = gate
+        let device = TestCallAudioDevice()
+        let audio = CallAudioOwner(device: device, onCleanupError: { _ in XCTFail("cleanup") })
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport }, audio: audio)
+        var claimed = false
+        transport.onConnect = { XCTAssertTrue(claimed) }
+        let setup = Task {
+            await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+                                      onClaimed: {
+                try media.prepareCallKitAnswer()
+                claimed = true
+                try media.activateCallKitAudio()
+            }, onConnected: {})
+        }
+        await waitUntil { gate.didStart }
+        XCTAssertEqual(device.configureCount, 1)
+        XCTAssertEqual(transport.concurrentMicrophone, false)
+        XCTAssertEqual(transport.microphoneEnableCount, 0)
+        gate.open()
+        _ = await setup.value
+        await waitUntil { transport.microphoneEnableCount == 1 }
+        try media.activateCallKitAudio()
+        await Task.yield()
+        XCTAssertEqual(transport.microphoneEnableCount, 1)
+        await media.stop()
+    }
+
+    func testCallKitConnectedRoomWaitsForActivationNotEdgeConnected() async throws {
+        let client = try makeTakeoverClient()
+        let transport = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport })
+        let joined = await media.startTakeover(
+            client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+            onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {}
+        )
+        XCTAssertTrue(joined)
+        XCTAssertEqual(transport.concurrentMicrophone, false)
+        XCTAssertEqual(transport.microphoneEnableCount, 0)
+        try media.activateCallKitAudio()
+        await waitUntil { transport.microphoneEnableCount == 1 }
+        // No Edge connected event was sent; it is not an opening condition.
+        await media.stop()
+        XCTAssertThrowsError(try media.activateCallKitAudio())
+        XCTAssertEqual(transport.microphoneEnableCount, 1)
+    }
+
+    func testHTTPFailureCleansAudioWithoutCreatingTransport() async throws {
+        MediaMockURLProtocol.requestHandler = { request in
+            Self.httpResponse(for: request, statusCode: 503,
+                              json: #"{"error":{"code":"EDGE_OFFLINE","message":"offline"}}"#)
+        }
+        defer { MediaMockURLProtocol.requestHandler = nil }
+        let client = try makeClient()
+        let device = TestCallAudioDevice()
+        let audio = CallAudioOwner(device: device, onCleanupError: { _ in XCTFail("cleanup") })
+        var created = 0
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: {
+            created += 1
+            return FakeCallMediaTransport()
+        }, audio: audio)
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086")
+        XCTAssertEqual(created, 0)
+        XCTAssertEqual(device.stopCount, 2)
+        XCTAssertNil(audio.owner)
+        XCTAssertTrue(states.last?.isTerminal == true)
+    }
+
+    func testClaimFailureNeverFulfillsOrConnectsAndCleansAudio() async throws {
+        MediaMockURLProtocol.requestHandler = { _ in throw URLError(.notConnectedToInternet) }
+        defer { MediaMockURLProtocol.requestHandler = nil }
+        let client = try makeClient()
+        let device = TestCallAudioDevice()
+        let audio = CallAudioOwner(device: device, onCleanupError: { _ in XCTFail("cleanup") })
+        let transport = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport }, audio: audio)
+        let joined = await media.startTakeover(
+            client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+            onClaimed: { XCTFail("claim must not complete") }, onConnected: {}
+        )
+        XCTAssertFalse(joined)
+        XCTAssertFalse(transport.operations.contains(.connect))
+        XCTAssertEqual(device.stopCount, 2)
+        XCTAssertNil(audio.owner)
+    }
+
+    func testStopCancelsMicrophonePublicationBeforeReleasingAudio() async throws {
+        let client = try makeTakeoverClient()
+        let transport = FakeCallMediaTransport()
+        let gate = PublishGate()
+        transport.microphoneGate = gate
+        let device = TestCallAudioDevice()
+        let audio = CallAudioOwner(device: device, onCleanupError: { _ in XCTFail("cleanup") })
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport }, audio: audio)
+        await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+                                  onClaimed: { try media.activateCallKitAudio() }, onConnected: {})
+        await waitUntil { gate.didStart }
+        await media.stop()
+        XCTAssertNil(audio.owner)
+        XCTAssertEqual(device.stopCount, 2)
+        gate.open()
+        XCTAssertEqual(transport.microphoneEnableCount, 1)
+    }
+
+    func testLateConnectIsReapedBeforeNextCallCanUseAudio() async throws {
+        let client = try makeOutboundClient()
+        let device = TestCallAudioDevice()
+        let audio = CallAudioOwner(device: device, onCleanupError: { _ in XCTFail("cleanup") })
+        let oldTransport = FakeCallMediaTransport()
+        let gate = ConnectGate()
+        oldTransport.connectGate = gate
+        let old = CallMediaSession(onState: { _ in }, transportFactory: { oldTransport }, audio: audio)
+        let setup = Task { await old.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "1") }
+        await waitUntil { gate.didStart }
+        let stop = Task { await old.stop() }
+        await waitUntil { oldTransport.operations.contains(.disconnect) }
+        let newTransport = FakeCallMediaTransport()
+        let next = CallMediaSession(onState: { _ in }, transportFactory: { newTransport }, audio: audio)
+        let nextSetup = Task { await next.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "2") }
+        await Task.yield()
+        XCTAssertFalse(newTransport.operations.contains(.connect))
+        gate.open()
+        await setup.value
+        await stop.value
+        await nextSetup.value
+        XCTAssertTrue(newTransport.operations.contains(.connect))
+        XCTAssertEqual(newTransport.concurrentMicrophone, true)
+        let stops = device.stopCount
+        await old.stop()
+        XCTAssertEqual(device.stopCount, stops)
+        await next.stop()
+    }
+
     func testStatusPayloadDrivesStateCallback() {
         // Android parity: CallManagerTest.`完整生命周期 拨号到本地挂断`.
         var states: [CallState] = []
@@ -68,9 +269,9 @@ final class CallMediaSessionTests: XCTestCase {
             label: "10086"
         ))
 
-        XCTAssertEqual(states, [.ended(label: "通话", reason: "local_hangup")])
+        XCTAssertEqual(states, [.ended(label: "", reason: "local_hangup")])
         await session.sendDTMF("2")
-        XCTAssertEqual(states, [.ended(label: "通话", reason: "local_hangup")])
+        XCTAssertEqual(states, [.ended(label: "", reason: "local_hangup")])
     }
 
     func testStartOutboundPreparesSessionAndDefersDialPacket() async throws {
@@ -182,7 +383,8 @@ final class CallMediaSessionTests: XCTestCase {
         )
 
         XCTAssertTrue(joined)
-        XCTAssertEqual(states, [.waitingMedia(label: "来电接管"), .inCall(label: "来电接管")])
+        let label = L10n.text("call.takeover.label")
+        XCTAssertEqual(states, [.waitingMedia(label: label), .inCall(label: label)])
         XCTAssertEqual(connectedCount, 1)
         XCTAssertFalse(transport.operations.contains { operation in
             if case .publish = operation { return true }
@@ -300,8 +502,10 @@ final class CallMediaSessionTests: XCTestCase {
             await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086")
         }
         await waitUntil { gate.didStart }
-        await media.stop()
+        let stopTask = Task { await media.stop() }
+        await waitUntil { transport.operations.contains(.disconnect) }
         gate.open()
+        await stopTask.value
         await startTask.value
         await transport.emit(
             .data(Data(#"{"type":"status","status":"connected"}"#.utf8), topic: CallPilotTopic.status)
@@ -328,13 +532,6 @@ final class CallMediaSessionTests: XCTestCase {
             },
             [.setSpeaker(false), .setSpeaker(true), .setSpeaker(false)]
         )
-    }
-
-    func testLiveKitAdapterUsesMicrophoneAndReliableControlOptions() {
-        // SDK contract regression: both SDK defaults are unsafe for phone control.
-        XCTAssertTrue(LiveKitRoomTransport.connectOptions.enableMicrophone)
-        XCTAssertEqual(LiveKitRoomTransport.controlPublishOptions.topic, CallPilotTopic.control)
-        XCTAssertTrue(LiveKitRoomTransport.controlPublishOptions.reliable)
     }
 
     func testDelegateRelayPreservesBurstOrderWhileFirstDeliverySuspends() async {
@@ -522,8 +719,13 @@ private final class FakeCallMediaTransport: CallMediaTransport {
     var onConnect: (() -> Void)?
     var connectGate: ConnectGate?
     var dialPublishGate: PublishGate?
+    var dtmfPublishGate: PublishGate?
+    var concurrentMicrophone: Bool?
+    var microphoneEnableCount = 0
+    var microphoneGate: PublishGate?
 
-    func connect(url: String, token: String) async throws {
+    func connect(url: String, token: String, enableMicrophone: Bool) async throws {
+        concurrentMicrophone = enableMicrophone
         operations.append(.connect)
         onConnect?()
         if let connectGate { await connectGate.wait() }
@@ -532,7 +734,17 @@ private final class FakeCallMediaTransport: CallMediaTransport {
         }
     }
 
+    func setMicrophone(enabled: Bool) async throws {
+        microphoneEnableCount += 1
+        if let microphoneGate { try await microphoneGate.wait() }
+        try Task.checkCancellation()
+    }
+
     func publishControl(_ data: Data) async throws {
+        if let fields = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+           fields["type"] == "dtmf", let dtmfPublishGate {
+            try await dtmfPublishGate.wait()
+        }
         if let fields = try? JSONSerialization.jsonObject(with: data) as? [String: String],
            fields["type"] == "dial",
            let dialPublishGate {
@@ -552,6 +764,17 @@ private final class FakeCallMediaTransport: CallMediaTransport {
 
     func emit(_ event: CallMediaTransportEvent) async {
         await eventHandler?(event)
+    }
+}
+
+@MainActor
+private extension CallMediaSession {
+    convenience init(
+        onState: @escaping StateHandler,
+        transportFactory: @escaping TransportFactory = { FakeCallMediaTransport() }
+    ) {
+        self.init(onState: onState, transportFactory: transportFactory,
+                  audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }))
     }
 }
 

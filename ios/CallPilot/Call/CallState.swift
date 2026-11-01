@@ -56,6 +56,11 @@ struct CallAttemptStateMachine {
         attempt.generation == generation
     }
 
+    func isWaitingForMedia(_ attempt: CallAttempt) -> Bool {
+        guard isCurrent(attempt), case .waitingMedia = state else { return false }
+        return true
+    }
+
     @discardableResult
     mutating func transition(
         from expectedState: CallState? = nil,

@@ -28,6 +28,8 @@ def main():
         "Protocol/HostedCloudClient.swift", "Protocol/VoipPushPayload.swift", "Protocol/CallSignaling.swift",
         "Support/Localization.swift", "Support/AppLinks.swift", "Support/ErrorCopy.swift",
         "Call/CallState.swift", "Call/CallStatusReducer.swift", "Call/CallKitCallRegistry.swift",
+        "Call/CallAudioOwner.swift", "Call/CallKitAnswerController.swift",
+        "Call/CallMediaTransport.swift", "Call/CallMediaSession.swift",
         "Content/SettingsState.swift", "UI/RootPresentation.swift",
         "Content/CallHistoryModel.swift", "Content/CallHistoryCache.swift",
         "Content/MessageInboxModel.swift", "Content/MessageCache.swift",
@@ -41,6 +43,7 @@ def main():
         "RootPresentationTests", "ContentModelsTests", "CallContentModelsTests", "PrivacyManifestTests",
         "CallHistoryModelTests", "MessageInboxModelTests",
         "AlertPushTests",
+        "CallAudioOwnerTests", "CallKitAnswerControllerTests", "CallMediaSessionTests",
     ]
     for language in ["en", "zh-Hans"]:
         destination = RESOURCES / (language + ".lproj")

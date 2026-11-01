@@ -106,6 +106,43 @@ final class CallStateTests: XCTestCase {
         XCTAssertEqual(machine.state, .waitingMedia(label: "来电接管"))
     }
 
+    func testMediaWatchdogIgnoresChineseAndEnglishDisplayLabelChanges() {
+        for initialLabel in ["来电转接", "Incoming handoff"] {
+            var machine = CallAttemptStateMachine()
+            let attempt = machine.begin(with: .waitingMedia(label: initialLabel))
+            XCTAssertTrue(machine.transition(to: .waitingMedia(label: "来电接管"), for: attempt))
+
+            XCTAssertTrue(machine.isWaitingForMedia(attempt), initialLabel)
+        }
+    }
+
+    func testMediaWatchdogRejectsOldAttemptEvenWhenNewAttemptIsWaiting() {
+        var machine = CallAttemptStateMachine()
+        let oldAttempt = machine.begin(with: .waitingMedia(label: "Incoming handoff"))
+        let newAttempt = machine.begin(with: .waitingMedia(label: "来电转接"))
+
+        XCTAssertFalse(machine.isWaitingForMedia(oldAttempt))
+        XCTAssertTrue(machine.isWaitingForMedia(newAttempt))
+    }
+
+    func testMediaWatchdogRejectsConnectedAndTerminalPhases() {
+        let nonWaitingStates: [CallState] = [
+            .idle,
+            .preparing(label: "Incoming handoff"),
+            .dialing(number: "10086"),
+            .inCall(label: "来电转接"),
+            .ended(label: "Incoming handoff", reason: "remote_hangup"),
+            .failed(label: "来电转接", reason: "timeout", code: "TAKEOVER_MEDIA_TIMEOUT"),
+        ]
+        for state in nonWaitingStates {
+            var machine = CallAttemptStateMachine()
+            let attempt = machine.begin(with: .waitingMedia(label: "Incoming handoff"))
+            XCTAssertTrue(machine.transition(to: state, for: attempt))
+
+            XCTAssertFalse(machine.isWaitingForMedia(attempt), "\(state)")
+        }
+    }
+
     func testLateTerminalResetFromOldGenerationCannotResetNewAttempt() {
         // Android parity: CallManagerTest fences an old Failed result before a new attempt.
         var machine = CallAttemptStateMachine()

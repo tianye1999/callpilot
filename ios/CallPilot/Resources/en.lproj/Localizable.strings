@@ -51,6 +51,8 @@
 "call.hangup" = "End call";
 "call.takeover.label" = "Incoming handoff";
 "call.takeover.timeout" = "The call handoff timed out";
+"call.audio.failed" = "Call audio could not be started";
+"call.audio.busy" = "The previous call's audio session is still closing";
 "call.state.preparing" = "%@ · Preparing";
 "call.state.waiting_media" = "%@ · Connecting audio";
 "call.state.dialing" = "%@ · Calling";

@@ -1,7 +1,6 @@
 @preconcurrency import AVFAudio
 @preconcurrency import CallKit
 import Foundation
-import LiveKit
 @preconcurrency import PushKit
 
 @MainActor
@@ -12,7 +11,11 @@ protocol CallKitCoordinatorDelegate: AnyObject {
     func callKitDidReceiveOffer(_ offer: InboundOffer)
     func callKitDidRequestAnswer(_ offer: InboundOffer)
     func callKitDidRequestDecline(_ offer: InboundOffer)
-    func callKitDidRequestHangup()
+    func callKitDidRequestHangup(offerId: String)
+    func callKitPrepareToAnswer(offerId: String) throws
+    func callKitDidActivateAudio(offerId: String) throws
+    func callKitDidFail(offerId: String, code: String)
+    func callKitAudioStopper(offerId: String) -> () -> Void
 }
 
 @MainActor
@@ -24,8 +27,25 @@ final class CallKitCoordinator: NSObject {
     private let controller: CXCallController
     private var pushRegistry: PKPushRegistry?
     private var calls = CallKitCallRegistry()
-    private var pendingAnswers: [UUID: CXAnswerCallAction] = [:]
     private var expirationTasks: [UUID: Task<Void, Never>] = [:]
+    private lazy var answers = CallKitAnswerController(
+        configureAudio: { [weak self] id in
+            guard let self, let payload = calls.payload(callUUID: id), let delegate else {
+                throw CancellationError()
+            }
+            try delegate.callKitPrepareToAnswer(offerId: payload.offerId)
+        },
+        activateAudio: { [weak self] id in
+            guard let self, let payload = calls.payload(callUUID: id), let delegate else {
+                throw CancellationError()
+            }
+            try delegate.callKitDidActivateAudio(offerId: payload.offerId)
+        },
+        onFailure: { [weak self] id, code in self?.failAnswer(callUUID: id, code: code) },
+        onDeactivate: { [weak self] id in
+            self?.failAnswer(callUUID: id, code: "CALLKIT_AUDIO_DEACTIVATED")
+        }
+    )
 
     override init() {
         let configuration = CXProviderConfiguration()
@@ -48,6 +68,16 @@ final class CallKitCoordinator: NSObject {
         pushRegistry = registry
     }
 
+    var isAudioSessionDrained: Bool { !answers.hasUnresolvedAudioEvents }
+
+    func waitUntilAudioDrained(offerId: String?) async -> Bool {
+        if let offerId {
+            guard let id = calls.callUUID(offerId: offerId), isAnswering(offerId: offerId) else { return false }
+            return await answers.waitUntilAudioDrained(answerID: id)
+        }
+        return await answers.waitUntilAudioDrained()
+    }
+
     func requestAnswerIfManaged(_ offer: InboundOffer) async -> Bool {
         guard let callUUID = calls.callUUID(offerId: offer.offerId),
               calls.phase(callUUID: callUUID) == .ringing else { return false }
@@ -65,30 +95,38 @@ final class CallKitCoordinator: NSObject {
             try await request(CXEndCallAction(call: callUUID))
         } catch {
             finish(callUUID: callUUID, reason: .failed)
+            delegate?.callKitDidRequestHangup(offerId: offer.offerId)
         }
         return true
     }
 
     func requestEndActiveIfManaged() async -> Bool {
-        guard let callUUID = pendingOrActiveCallUUID() else { return false }
+        guard let callUUID = pendingOrActiveCallUUID(),
+              let payload = calls.payload(callUUID: callUUID) else { return false }
         do {
             try await request(CXEndCallAction(call: callUUID))
         } catch {
             finish(callUUID: callUUID, reason: .failed)
+            delegate?.callKitDidRequestHangup(offerId: payload.offerId)
         }
         return true
     }
 
     func markConnected(offerId: String) {
-        guard let callUUID = calls.callUUID(offerId: offerId),
-              calls.markConnected(callUUID: callUUID) else { return }
-        pendingAnswers.removeValue(forKey: callUUID)?.fulfill()
+        guard let callUUID = calls.callUUID(offerId: offerId) else { return }
+        _ = calls.markConnected(callUUID: callUUID)
     }
 
-    func markMediaJoined(offerId: String) {
+    func isAnswering(offerId: String) -> Bool {
+        guard let id = calls.callUUID(offerId: offerId) else { return false }
+        return calls.phase(callUUID: id) == .answering
+    }
+
+    func markClaimed(offerId: String) throws {
         guard let callUUID = calls.callUUID(offerId: offerId),
-              calls.phase(callUUID: callUUID) == .answering else { return }
-        pendingAnswers.removeValue(forKey: callUUID)?.fulfill()
+              calls.phase(callUUID: callUUID) == .answering else { throw CancellationError() }
+        let stopAudio = delegate?.callKitAudioStopper(offerId: offerId) ?? {}
+        try answers.claimSucceeded(callID: callUUID, stopAudio: stopAudio)
     }
 
     func finishActiveCall(reason: CXCallEndedReason) {
@@ -105,7 +143,6 @@ final class CallKitCoordinator: NSObject {
             expirationTasks.removeValue(forKey: callUUID)?.cancel()
             provider.reportCall(with: callUUID, endedAt: Date(), reason: .unanswered)
         }
-        if !stale.isEmpty { CallKitAudioSessionBridge.prepareForStandaloneCall() }
     }
 
     private func report(_ payload: VoipPushPayload, completion: PushCompletion) {
@@ -114,8 +151,6 @@ final class CallKitCoordinator: NSObject {
             completion.call()
             return
         }
-        let preparedAudio = delegate?.callKitCanAcceptIncomingCall == true
-        if preparedAudio { CallKitAudioSessionBridge.prepareForIncoming() }
         let update = CXCallUpdate()
         update.localizedCallerName = L10n.text("callkit.incoming.name")
         update.remoteHandle = CXHandle(type: .generic, value: "KinyAI SIM")
@@ -140,7 +175,6 @@ final class CallKitCoordinator: NSObject {
                     self.scheduleExpiration(payload)
                 } else {
                     _ = self.calls.remove(callUUID: payload.callUUID)
-                    if preparedAudio { CallKitAudioSessionBridge.prepareForStandaloneCall() }
                 }
                 completion.call()
             }
@@ -169,10 +203,10 @@ final class CallKitCoordinator: NSObject {
         let phase = calls.phase(callUUID: callUUID)
         guard let payload = calls.remove(callUUID: callUUID) else { return }
         expirationTasks.removeValue(forKey: callUUID)?.cancel()
-        pendingAnswers.removeValue(forKey: callUUID)?.fail()
-        provider.reportCall(with: callUUID, endedAt: Date(), reason: reason)
+        if answers.end(callID: callUUID) {
+            provider.reportCall(with: callUUID, endedAt: Date(), reason: reason)
+        }
         if phase == .ringing {
-            CallKitAudioSessionBridge.prepareForStandaloneCall()
             delegate?.callKitDidRequestDecline(InboundOffer(
                 offerId: payload.offerId,
                 callUUID: payload.callUUID,
@@ -182,9 +216,14 @@ final class CallKitCoordinator: NSObject {
     }
 
     private func pendingOrActiveCallUUID() -> UUID? {
-        pendingAnswers.keys.first
-            ?? calls.firstCallUUID(in: .active)
+        calls.firstCallUUID(in: .active)
             ?? calls.firstCallUUID(in: .answering)
+    }
+
+    private func failAnswer(callUUID: UUID, code: String) {
+        guard let payload = calls.payload(callUUID: callUUID) else { return }
+        finish(callUUID: callUUID, reason: .failed)
+        delegate?.callKitDidFail(offerId: payload.offerId, code: code)
     }
 
     private func request(_ action: CXCallAction) async throws {
@@ -255,27 +294,25 @@ extension CallKitCoordinator: PKPushRegistryDelegate {
 
 extension CallKitCoordinator: CXProviderDelegate {
     nonisolated func providerDidReset(_ provider: CXProvider) {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.pendingAnswers.values.forEach { $0.fail() }
-            self.pendingAnswers.removeAll()
+        MainActor.assumeIsolated {
+            self.answers.reset()
             self.expirationTasks.values.forEach { $0.cancel() }
             self.expirationTasks.removeAll()
-            _ = self.calls.removeAll()
-            CallKitAudioSessionBridge.prepareForStandaloneCall()
-            self.delegate?.callKitDidRequestHangup()
+            let removed = self.calls.removeAll()
+            for payload in removed {
+                self.delegate?.callKitDidRequestHangup(offerId: payload.offerId)
+            }
         }
     }
 
     nonisolated func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
-        Task { @MainActor [weak self] in
-            guard let self,
-                  let payload = self.calls.beginAnswer(callUUID: action.callUUID) else {
-                action.fail()
+        MainActor.assumeIsolated {
+            guard let payload = self.calls.beginAnswer(callUUID: action.callUUID) else {
+                if !action.isComplete, Date() < action.timeoutDate { action.fail() }
                 return
             }
             self.expirationTasks.removeValue(forKey: action.callUUID)?.cancel()
-            self.pendingAnswers[action.callUUID] = action
+            self.answers.begin(callID: action.callUUID, action: CallKitAnswerActionAdapter(action))
             self.delegate?.callKitDidRequestAnswer(InboundOffer(
                 offerId: payload.offerId,
                 callUUID: payload.callUUID,
@@ -285,38 +322,45 @@ extension CallKitCoordinator: CXProviderDelegate {
     }
 
     nonisolated func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
-        Task { @MainActor [weak self] in
-            guard let self else {
-                action.fail()
-                return
-            }
+        MainActor.assumeIsolated {
             let phase = self.calls.phase(callUUID: action.callUUID)
             guard let payload = self.calls.remove(callUUID: action.callUUID) else {
-                action.fail()
+                if !action.isComplete, Date() < action.timeoutDate { action.fail() }
                 return
             }
             self.expirationTasks.removeValue(forKey: action.callUUID)?.cancel()
-            self.pendingAnswers.removeValue(forKey: action.callUUID)?.fail()
+            _ = self.answers.end(callID: action.callUUID)
             if phase == .active || phase == .answering {
-                self.delegate?.callKitDidRequestHangup()
+                self.delegate?.callKitDidRequestHangup(offerId: payload.offerId)
             } else {
-                CallKitAudioSessionBridge.prepareForStandaloneCall()
                 self.delegate?.callKitDidRequestDecline(InboundOffer(
                     offerId: payload.offerId,
                     callUUID: payload.callUUID,
                     expiresAt: payload.expiresAtUnixMs
                 ))
             }
-            action.fulfill()
+            if !action.isComplete, Date() < action.timeoutDate { action.fulfill() }
         }
     }
 
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
-        CallKitAudioSessionBridge.didActivate(audioSession)
+        // Provider callbacks use .main. Consume the epoch synchronously rather
+        // than looking up whichever call happens to be current in a later Task.
+        MainActor.assumeIsolated { answers.didActivate() }
     }
 
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
-        CallKitAudioSessionBridge.didDeactivate()
+        MainActor.assumeIsolated { answers.didDeactivate() }
+    }
+
+    nonisolated func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) {
+        MainActor.assumeIsolated {
+            if let answer = action as? CXAnswerCallAction {
+                answers.timedOut(callID: answer.callUUID)
+            } else if let callAction = action as? CXCallAction {
+                failAnswer(callUUID: callAction.callUUID, code: "CALLKIT_ACTION_TIMEOUT")
+            }
+        }
     }
 }
 
@@ -332,27 +376,12 @@ private final class PushCompletion: @unchecked Sendable {
     }
 }
 
-enum CallKitAudioSessionBridge {
-    static func prepareForIncoming() {
-        AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
-        try? AudioManager.shared.setEngineAvailability(.none)
-    }
-
-    static func didActivate(_ session: AVAudioSession) {
-        do {
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.mixWithOthers])
-            try AudioManager.shared.setEngineAvailability(.default)
-        } catch {
-            try? AudioManager.shared.setEngineAvailability(.none)
-        }
-    }
-
-    static func didDeactivate() {
-        try? AudioManager.shared.setEngineAvailability(.none)
-    }
-
-    static func prepareForStandaloneCall() {
-        AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = true
-        try? AudioManager.shared.setEngineAvailability(.default)
-    }
+@MainActor
+private final class CallKitAnswerActionAdapter: CallKitAnswerAction {
+    private let action: CXAnswerCallAction
+    init(_ action: CXAnswerCallAction) { self.action = action }
+    var deadline: Date { action.timeoutDate }
+    var isComplete: Bool { action.isComplete }
+    func fulfill() { action.fulfill() }
+    func fail() { action.fail() }
 }

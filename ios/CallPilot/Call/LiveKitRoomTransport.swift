@@ -1,24 +1,11 @@
 import Foundation
 import LiveKit
 
-enum CallMediaTransportEvent: Equatable, Sendable {
-    case data(Data, topic: String)
-    case disconnected(reason: String)
-}
-
-@MainActor
-protocol CallMediaTransport: AnyObject {
-    var eventHandler: ((CallMediaTransportEvent) async -> Void)? { get set }
-
-    func connect(url: String, token: String) async throws
-    func publishControl(_ data: Data) async throws
-    func disconnect() async
-    func setSpeakerphone(_ enabled: Bool)
-}
-
 @MainActor
 final class LiveKitRoomTransport: CallMediaTransport {
-    static let connectOptions = ConnectOptions(enableMicrophone: true)
+    static func connectOptions(enableMicrophone: Bool) -> ConnectOptions {
+        ConnectOptions(enableMicrophone: enableMicrophone)
+    }
     static let controlPublishOptions = DataPublishOptions(
         topic: CallPilotTopic.control,
         reliable: true
@@ -38,15 +25,20 @@ final class LiveKitRoomTransport: CallMediaTransport {
         let proxy = LiveKitRoomDelegateProxy(target: target)
         eventTarget = target
         delegateProxy = proxy
-        room = Room(delegate: proxy, connectOptions: Self.connectOptions)
+        room = Room(delegate: proxy)
     }
 
-    func connect(url: String, token: String) async throws {
+    func connect(url: String, token: String, enableMicrophone: Bool) async throws {
         try await room.connect(
             url: url,
             token: token,
-            connectOptions: Self.connectOptions
+            connectOptions: Self.connectOptions(enableMicrophone: enableMicrophone)
         )
+    }
+
+    func setMicrophone(enabled: Bool) async throws {
+        try Task.checkCancellation()
+        try await room.localParticipant.setMicrophone(enabled: enabled)
     }
 
     func publishControl(_ data: Data) async throws {
@@ -73,43 +65,6 @@ private final class LiveKitRoomEventTarget {
 
     func emit(_ event: CallMediaTransportEvent) async {
         await handler?(event)
-    }
-}
-
-/// Preserves the SDK delegate's FIFO event order while crossing into
-/// MainActor-isolated call state. A Task per callback would not provide that
-/// ordering guarantee once one delivery suspends.
-final class CallMediaEventRelay: Sendable {
-    private let continuation: AsyncStream<CallMediaTransportEvent>.Continuation
-    private let consumer: Task<Void, Never>
-
-    init(
-        deliver: @escaping @MainActor (CallMediaTransportEvent) async -> Void
-    ) {
-        let (stream, continuation) = AsyncStream.makeStream(
-            of: CallMediaTransportEvent.self,
-            bufferingPolicy: .unbounded
-        )
-        self.continuation = continuation
-        consumer = Task { @MainActor in
-            for await event in stream {
-                guard !Task.isCancelled else { break }
-                await deliver(event)
-            }
-        }
-    }
-
-    deinit {
-        finish()
-    }
-
-    func yield(_ event: CallMediaTransportEvent) {
-        continuation.yield(event)
-    }
-
-    func finish() {
-        continuation.finish()
-        consumer.cancel()
     }
 }
 

@@ -51,6 +51,8 @@
 "call.hangup" = "挂断";
 "call.takeover.label" = "来电转接";
 "call.takeover.timeout" = "来电转接媒体建立超时";
+"call.audio.failed" = "无法启动通话音频";
+"call.audio.busy" = "上一通电话的音频会话尚未结束";
 "call.state.preparing" = "%@ · 准备中";
 "call.state.waiting_media" = "%@ · 正在建立音频";
 "call.state.dialing" = "%@ · 正在拨号";
