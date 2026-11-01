@@ -306,7 +306,7 @@ def test_media_ready_after_eight_seconds_records_both_latencies(rig, monkeypatch
     asyncio.run(rig.session._handle_call())
     assert rig.session._record.source == "remote_web_dialer"
     assert rig.commands.count("ATA") == 1
-    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     latencies = {event["stage"]: event["ms"] for event in events if event["type"] == "latency"}
     assert 8000 <= latencies["phone_first_media_ready_ms"] < 8051
     assert latencies["phone_first_ata_ms"] == pytest.approx(300)
@@ -336,7 +336,7 @@ def test_full_offer_queue_falls_back_to_ai(rig, monkeypatch, caplog):
     assert rig.commands.count("ATA") == 1
     assert rig.clock.now == 100
     assert "phone-first offer queue full" in caplog.text
-    meta = json.loads((rig.session._record.path / "meta.json").read_text())
+    meta = json.loads((rig.session._record.path / "meta.json").read_text(encoding="utf-8"))
     assert meta["status"] != "failed" and meta["answered"]
 
 
@@ -366,7 +366,7 @@ def test_mobile_answer_never_starts_ai_or_greeting(rig, monkeypatch, provider, p
     assert rig.endpoint.closed
     assert rig.bridge.max_writers == 1 and rig.bridge.writer_count == 0
     assert not rig.notifications
-    meta = json.loads((rig.session._record.path / "meta.json").read_text())
+    meta = json.loads((rig.session._record.path / "meta.json").read_text(encoding="utf-8"))
     assert meta["answered"] and meta["status"] == "completed"
     assert meta["source"] == "remote_web_dialer"
 
@@ -386,7 +386,7 @@ def test_early_hangup_revokes_one_unanswered_record(rig, monkeypatch):
     assert rig.session.next_takeover_revoke().reason == "CALL_ENDED"
     record = rig.session._record
     assert len(list(record.path.parent.glob("*/meta.json"))) == 1
-    meta = json.loads((record.path / "meta.json").read_text())
+    meta = json.loads((record.path / "meta.json").read_text(encoding="utf-8"))
     assert meta["status"] == "not_connected" and not meta["answered"]
     assert "source" not in meta
     assert not (record.path / "summary.json").exists()
@@ -464,7 +464,7 @@ def test_disabled_path_has_no_new_queries_timers_commands_or_events(rig, monkeyp
     assert agent.started and agent.said
     assert rig.session.next_takeover_offer() is None
     assert rig.session.next_takeover_revoke() is None
-    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert not any(e["type"].startswith("phone_first") for e in events)
 
 
@@ -610,7 +610,7 @@ def test_post_answer_failure_parallel_and_legacy_have_one_answer_event(rig, monk
     assert rig.commands.count("ATA") == 1
     assert rig.bridge.max_writers == 1
     assert agent.started and agent.said
-    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert sum(event["type"] == "answered" for event in events) == 1
 
 
@@ -712,7 +712,7 @@ def test_modem_failure_never_reanswers_or_creates_ai_on_dead_call(rig, monkeypat
     asyncio.run(rig.session._handle_call())
     assert rig.commands.count("ATA") <= 1
     assert not rig.bridge.started
-    meta = json.loads((rig.session._record.path / "meta.json").read_text())
+    meta = json.loads((rig.session._record.path / "meta.json").read_text(encoding="utf-8"))
     assert meta["status"] == ("failed" if fault == "pcm_failed" else "not_connected")
 
 
