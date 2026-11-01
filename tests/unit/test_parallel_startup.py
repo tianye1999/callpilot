@@ -1040,7 +1040,8 @@ def test_moss_prebrief_failure_or_cancel_never_touches_modem(setup_call, monkeyp
     session.provider = "moss"
     session._outbound_number = "10086"
     monkeypatch.setattr(session, "_build_agent_instructions", lambda _direction: "task")
-    monkeypatch.setattr("agentcall.call_agent._MOSS_PREBRIEF_TIMEOUT", 0.05)
+    # 只有 timeout 用例要短超时；其余用例也用 0.05 s 的话，CI 慢机上超时会抢在 stop / cancel 之前触发。
+    monkeypatch.setattr("agentcall.call_agent._MOSS_PREBRIEF_TIMEOUT", 0.05 if end == "timeout" else 5.0)
     published = []
     monkeypatch.setattr(session, "_publish", published.append)
 
