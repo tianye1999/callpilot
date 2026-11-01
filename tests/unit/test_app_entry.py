@@ -216,7 +216,7 @@ def test_invalid_optional_cloud_url_does_not_crash_core_app(monkeypatch, caplog)
 def test_cloud_components_wire_content_repository_behind_edge_gate(monkeypatch):
     hub = object()
     call_logger = object()
-    service = type("Service", (), {"call_logger": call_logger})()
+    service = SimpleNamespace(call_logger=call_logger, session=SimpleNamespace())
     repository = object()
     captured = {}
 
@@ -237,6 +237,9 @@ def test_cloud_components_wire_content_repository_behind_edge_gate(monkeypatch):
 
         def start(self):
             self.started = True
+
+        def takeover_available(self):
+            return self.started
 
     monkeypatch.setattr(app, "CloudCredentialStore", FakeStore)
     monkeypatch.setattr(app, "CloudControlApi", lambda *_args, **_kwargs: object())
@@ -266,6 +269,7 @@ def test_cloud_components_wire_content_repository_behind_edge_gate(monkeypatch):
     _api, _store, client = app._create_cloud_components(service, hub)
 
     assert client.started is True
+    assert service.session._phone_first_cloud_ready() is True
     assert captured["service"] is service
     assert captured["content_repository"] is repository
     assert captured["content_read_enabled"]() is True

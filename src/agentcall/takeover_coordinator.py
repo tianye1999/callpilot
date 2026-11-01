@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 
 class TakeoverState(StrEnum):
+    RINGING_OWNER = "RINGING_OWNER"
     AI_ACTIVE = "AI_ACTIVE"
     TAKEOVER_PREPARING = "TAKEOVER_PREPARING"
     WAITING_OWNER = "WAITING_OWNER"
@@ -185,6 +186,9 @@ class TakeoverResult:
 
 
 _ALLOWED_TRANSITIONS: dict[TakeoverState, frozenset[TakeoverState]] = {
+    TakeoverState.RINGING_OWNER: frozenset(
+        {TakeoverState.WAITING_OWNER, TakeoverState.AI_ACTIVE, TakeoverState.ENDED}
+    ),
     TakeoverState.AI_ACTIVE: frozenset(
         {TakeoverState.TAKEOVER_PREPARING, TakeoverState.ENDED}
     ),
@@ -226,18 +230,20 @@ class InboundTakeoverCoordinator:
         generation: int,
         media_router: MediaRouter,
         clock: Callable[[], float] = time.time,
+        unanswered: bool = False,
     ) -> None:
         _require_identifier(call_id, "call_id")
         if generation < 0:
             raise ValueError("generation must be non-negative")
-        if media_router.owner is not MediaOwner.AI:
+        if media_router.owner is not (MediaOwner.NONE if unanswered else MediaOwner.AI):
             raise ValueError("media router must start with AI ownership")
         self.call_id = call_id
         self.generation = generation
         self._router = media_router
         self._clock = clock
         self._lock = threading.RLock()
-        self._state = TakeoverState.AI_ACTIVE
+        self._state = TakeoverState.RINGING_OWNER if unanswered else TakeoverState.AI_ACTIVE
+        self._unanswered = unanswered
         self._offers: dict[str, TakeoverOffer] = {}
         self._active_offer_id: str | None = None
         self._active_fence: ClaimFence | None = None
@@ -282,7 +288,7 @@ class InboundTakeoverCoordinator:
                 duplicate_offer = True
             offers_by_id[offer.offer_id] = offer
         with self._lock:
-            if self._state is not TakeoverState.TAKEOVER_PREPARING:
+            if self._state not in {TakeoverState.TAKEOVER_PREPARING, TakeoverState.RINGING_OWNER}:
                 return TakeoverResult.reject(TakeoverRejection.INVALID_STATE)
             if not offers_by_id:
                 return TakeoverResult.reject(TakeoverRejection.OFFER_NOT_FOUND)
@@ -296,7 +302,7 @@ class InboundTakeoverCoordinator:
                     TakeoverRejection.OFFER_SCOPE_MISMATCH
                 )
             self._offers = offers_by_id
-            self._router.switch_owner(MediaOwner.HOLD)
+            self._router.switch_owner(MediaOwner.NONE if self._unanswered else MediaOwner.HOLD)
             self._transition(TakeoverState.WAITING_OWNER)
             return TakeoverResult.success()
 
@@ -441,6 +447,7 @@ class InboundTakeoverCoordinator:
         _require_identifier(reason, "reason")
         with self._lock:
             if self._state not in {
+                TakeoverState.RINGING_OWNER,
                 TakeoverState.TAKEOVER_PREPARING,
                 TakeoverState.WAITING_OWNER,
                 TakeoverState.MOBILE_MEDIA_READY,
@@ -460,6 +467,7 @@ class InboundTakeoverCoordinator:
             return TakeoverResult.success()
 
     def _rollback_locked(self, reason: str) -> TakeoverResult:
+        self._unanswered = False
         self._router.switch_owner(MediaOwner.AI)
         self._transition(TakeoverState.AI_ACTIVE)
         self._last_reason = reason

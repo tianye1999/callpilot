@@ -35,6 +35,17 @@ CEND_PATTERN = re.compile(r"\+CEND:[^\r\n]*(?=\r?\n)")
 
 
 @dataclass
+class IncomingReservation:
+    maintenance_generation: int
+    call_ids: set[str]
+    valid: bool = True
+    absent_count: int = 0
+    ata_sent: bool = False
+    answered: bool = False
+    ata_ms: float | None = None
+
+
+@dataclass
 class _SmsJob:
     """只在内存保留已编码短信，重试从失败段继续，避免重发成功段。"""
 
@@ -189,6 +200,7 @@ class SerialModem:
         self._last_caller: str | None = None
         self._last_dialed: str | None = None
         self._incoming_call_ids: set[str] = set()
+        self._incoming_reservation: IncomingReservation | None = None
         self._connected_call_ids: set[str] = set()
         # 通话在线标志：拨号后清除，外呼接通（CLCC dir=0 stat=0）或来电
         # 接听（ATA）时置位。除 _wait_connected 外，还是 CLCC「通话消失」
@@ -795,6 +807,117 @@ class SerialModem:
         # 置「通话在线」：让来电同样受 CLCC 消失判定保护（串口死亡场景）。
         self._call_connected_event.set()
         logger.info("已发送 ATA 接听来电")
+
+    def reserve_incoming(self) -> IncomingReservation:
+        """Reserve without I/O; only the opt-in phone-first path uses this lease."""
+        with self._serial_lock:
+            # RING has no call index; bind only to a subsequent fresh CLCC snapshot.
+            lease = IncomingReservation(self._maintenance_generation, set())
+            self._incoming_reservation = lease
+            return lease
+
+    def incoming_reserved(self, lease: IncomingReservation) -> bool:
+        with self._serial_lock:
+            return (self._incoming_reservation is lease and lease.valid
+                    and lease.maintenance_generation == self._maintenance_generation
+                    and not self.transport_paused and not self.recovery_in_progress)
+
+    def answer_reserved_incoming(
+        self, lease: IncomingReservation, current: Callable[[], bool], *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> bool:
+        """One ATA; tolerate delayed CLCC state without hanging up a live call."""
+        with self._serial_lock:
+            if not self.incoming_reserved(lease) or not current():
+                return False
+            if lease.ata_sent:
+                return lease.answered
+            response = self._write_command("AT+CLCC")
+            self._process_response_urcs(response)
+            if "OK" not in response.split() or not self.incoming_reserved(lease):
+                return False
+            incoming = {m.group("idx") for m in CLCC_PATTERN.finditer(response)
+                        if m.group("dir") == "1" and m.group("stat") == "4"}
+            if not incoming or (lease.call_ids and not lease.call_ids.intersection(incoming)):
+                lease.valid = False
+                return False
+            lease.call_ids = incoming
+            if not self.incoming_reserved(lease) or not current():
+                return False
+            if isinstance(self, Sim7600Modem):
+                self._arm_voice_call()
+            if config.get_bool("MODEM_LOG_RELEASE_CAUSE"):
+                self._start_release_call()
+            lease.ata_sent = True
+            ata_started = clock()
+            response = self._write_command("ATA")
+            self._process_response_urcs(response)
+            if "ERROR" in response or "NO CARRIER" in response:
+                lease.valid = False
+                return False
+            if not self.incoming_reserved(lease):
+                return False
+        deadline = clock() + 2.0
+        absent_count = 0
+        while True:
+            with self._serial_lock:
+                if not current() or not self.incoming_reserved(lease):
+                    return False
+                active: set[str] = set()
+                if clock() < deadline:
+                    response = self._write_command("AT+CLCC")
+                    self._process_response_urcs(response)
+                    if not current() or not self.incoming_reserved(lease):
+                        return False
+                    if "OK" in response.split() and "ERROR" not in response:
+                        calls = [m for m in CLCC_PATTERN.finditer(response)
+                                 if m.group("dir") == "1" and m.group("idx") in lease.call_ids]
+                        active = {m.group("idx") for m in calls if m.group("stat") == "0"}
+                        incoming = {m.group("idx") for m in calls if m.group("stat") == "4"}
+                        absent_count = 0 if active or incoming else absent_count + 1
+                        if absent_count >= 2:
+                            lease.valid = False
+                            return False
+                if active or clock() >= deadline:
+                    # No proof of disappearance: match answer() and let normal
+                    # URC / CLCC disappearance detection own subsequent teardown.
+                    lease.answered = True
+                    lease.ata_ms = (clock() - ata_started) * 1000
+                    self._clcc_absent_count = 0
+                    self._call_connected_event.set()
+                    self._start_fast_clcc_poll()
+                    return True
+            # The reader needs this lock to deliver NO CARRIER / CEND promptly.
+            sleep(min(0.25, max(0.0, deadline - clock())))
+
+    def prepare_reserved_voice(
+        self, lease: IncomingReservation, current: Callable[[], bool], audio_mode: str,
+    ) -> bool:
+        with self._serial_lock:
+            if not self.incoming_reserved(lease) or not lease.answered or not current():
+                return False
+            self.initialize_for_voice(audio_mode)
+            return self.incoming_reserved(lease) and current()
+
+    def finish_reserved_incoming(self, lease: IncomingReservation) -> None:
+        with self._serial_lock:
+            if self._incoming_reservation is not lease:
+                return
+            try:
+                if self.incoming_reserved(lease) and lease.ata_sent:
+                    self.hangup()
+            finally:
+                self._incoming_reservation = None
+                # A very short call may end before the poller observes its active
+                # state. Let the next CLCC-only call reuse the same modem index.
+                self._incoming_call_ids.clear()
+
+    def _invalidate_reserved_incoming(self) -> None:
+        with self._serial_lock:
+            if self._incoming_reservation is not None:
+                self._incoming_reservation.valid = False
+                self._call_connected_event.clear()
 
     def dial(self, number: str, *, retry: bool = True, deadline: float | None = None) -> str:
         """拨打语音电话（ATD<number>; 末尾分号表示语音呼叫）。"""
@@ -1419,6 +1542,7 @@ class SerialModem:
     def _process_response_urcs(self, text: str, report: _ReleaseReport | None = None) -> None:
         self._capture_cend(text, report)
         if "NO CARRIER" in text or CEND_PATTERN.search(text):
+            self._invalidate_reserved_incoming()
             self._request_release_cause(report)
         self._scan_pcm_flow(text)
         matches = list(CMTI_PATTERN.finditer(text))
@@ -1470,6 +1594,7 @@ class SerialModem:
                         partial_cend = self._buffer[self._buffer.index("+CEND:"):]
                     self._capture_cend(self._buffer)
                 trigger = "NO CARRIER" if "NO CARRIER" in self._buffer else "+CEND:"
+                self._invalidate_reserved_incoming()
                 logger.info("通话已结束 (触发=%s)", trigger)
                 self._buffer = partial_cend
                 # 通话结束即清来电号码：隐藏号码来电的 +CLIP 是空引号、匹配不到，
@@ -1651,6 +1776,17 @@ class SerialModem:
 
             self._incoming_call_ids.intersection_update(seen_incoming_ids)
 
+            lease = self._incoming_reservation
+            if lease is not None and lease.valid and not lease.ata_sent and "OK" in response:
+                if seen_incoming_ids and (not lease.call_ids or lease.call_ids.intersection(seen_incoming_ids)):
+                    lease.call_ids = set(seen_incoming_ids)
+                    lease.absent_count = 0
+                else:
+                    lease.absent_count += 1
+                    if lease.absent_count >= 2 or seen_incoming_ids:
+                        lease.valid = False
+                        call_lost = True
+
             # 通话消失判定：会话认为通话在线，而一次**有效**的 CLCC（回了 OK）
             # 却没有任何通话行——正常挂断走读循环的 NO CARRIER，但串口死亡
             # 期间收不到该事件，重连后只有这里能发现通话早已结束。连续两次
@@ -1674,6 +1810,7 @@ class SerialModem:
             if self._on_call_connected:
                 self._on_call_connected(connected_number)
         if call_lost:
+            self._invalidate_reserved_incoming()
             logger.warning("CLCC 连续无通话记录，判定通话已丢失（串口断连期挂断？），收尾会话")
             if self._on_hangup:
                 self._on_hangup()

@@ -92,6 +92,7 @@ def _create_cloud_components(service, hub: EventHub | None = None):
                 "REMOTE_CONTENT_READ_ENABLED"
             ),
         )
+        service.session._phone_first_cloud_ready = client.takeover_available
         client.start()
         return api, store, client
     except (RuntimeError, ValueError) as exc:

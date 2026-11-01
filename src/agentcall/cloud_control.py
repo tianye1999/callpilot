@@ -238,6 +238,11 @@ class CloudEdgeClient:
                 last_error=self._last_error,
             )
 
+    def takeover_available(self) -> bool:
+        """Cached only: a connected authenticated WSS implies an enrolled Edge."""
+        with self._state_lock:
+            return self._connected and not self._stop_event.is_set()
+
     def handle_message(self, raw: str, send: Callable[[str], None]) -> None:
         try:
             command = _parse_cloud_command(raw)
