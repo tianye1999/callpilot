@@ -1211,7 +1211,8 @@ def test_moss_loopback_prebrief_failure_never_dials(setup_call, monkeypatch, fai
     session, modem, bridge, _agent, base = setup_call
     session.provider = "moss"
     session._outbound_number = "10086"
-    monkeypatch.setattr("agentcall.call_agent._MOSS_PREBRIEF_TIMEOUT", 0.15)
+    # 只有 timeout 用例要短超时；其余用例也用 0.15 s 的话，CI 慢机上连接还没建好超时就先触发。
+    monkeypatch.setattr("agentcall.call_agent._MOSS_PREBRIEF_TIMEOUT", 0.15 if failure == "timeout" else 5.0)
 
     async def synthesize(_text):
         return b"\x01\x02" * 320
@@ -1224,12 +1225,13 @@ def test_moss_loopback_prebrief_failure_never_dials(setup_call, monkeypatch, fai
             monkeypatch.setattr("agentcall.call_agent.create_agent", lambda _provider: agent)
             call = asyncio.create_task(session._handle_call())
             try:
-                ws = await asyncio.wait_for(connected, 1)
+                # timeout 用例可能在连上之前就结束，只有 response 用例需要拿到连接。
                 if failure == "response":
+                    ws = await asyncio.wait_for(connected, 2)
                     await next_matching(received, lambda value: isinstance(value, bytes) and any(value))
                     await ws.send_json({"action": "response.ended", "data": {"status": "failed"}})
                 with pytest.raises(RuntimeError, match="MOSS"):
-                    await asyncio.wait_for(call, 1)
+                    await asyncio.wait_for(call, 3)
                 assert not agent._tasks and agent._ws is None
             finally:
                 call.cancel()
