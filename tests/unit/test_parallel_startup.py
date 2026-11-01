@@ -146,7 +146,8 @@ def test_native_greeting_sequence_parallel_connect_and_conditional_hint(native_c
     monkeypatch.setattr(agent, "say", say)
     asyncio.run(session._handle_call())
     # Sampled intervals can lose one monotonic tick; allow 1ms for metric rounding.
-    tick_ms = time.get_clock_info("monotonic").resolution * 1000
+    # Windows 上事件循环的定时唤醒可能提前 1–2 ms（3.13 起时钟精度报得很小），再留 3 ms。
+    tick_ms = time.get_clock_info("monotonic").resolution * 1000 + 3
     assert tts_at - answered_at >= (50 - tick_ms - 1) / 1000
     assert order.index("ATA") < order.index("CTTS") < order.index("CTTS_return") < order.index("AT+CPCMREG=1")
     assert order.index("agent_connected") < order.index("CTTS_return")
