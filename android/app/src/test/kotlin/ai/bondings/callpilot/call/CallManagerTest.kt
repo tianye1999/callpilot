@@ -498,16 +498,16 @@ class CallManagerTest {
 
         manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
         runCurrent()
-        assertEquals(CallState.WaitingMedia("来电接管"), manager.state.value)
+        assertEquals(CallState.WaitingMedia("Incoming call"), manager.state.value)
 
         advanceTimeBy(999L)
         runCurrent()
-        assertEquals(CallState.WaitingMedia("来电接管"), manager.state.value)
+        assertEquals(CallState.WaitingMedia("Incoming call"), manager.state.value)
 
         advanceTimeBy(1L)
         runCurrent()
         assertEquals(
-            CallState.Failed("来电接管", "接管媒体建立超时", "TAKEOVER_MEDIA_TIMEOUT"),
+            CallState.Failed("Incoming call", "接管媒体建立超时", "TAKEOVER_MEDIA_TIMEOUT"),
             manager.state.value,
         )
         assertTrue(session.disconnected)

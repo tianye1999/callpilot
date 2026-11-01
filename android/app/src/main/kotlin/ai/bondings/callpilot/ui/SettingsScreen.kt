@@ -1,6 +1,8 @@
 package ai.bondings.callpilot.ui
 
 import ai.bondings.callpilot.R
+import ai.bondings.callpilot.BuildConfig
+import ai.bondings.callpilot.updates.AppUpdates
 import ai.bondings.callpilot.content.CallHistoryState
 import ai.bondings.callpilot.content.CallHistorySyncStatus
 import ai.bondings.callpilot.content.MessageInboxState
@@ -38,6 +40,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -53,11 +56,43 @@ fun SettingsScreen(
     val scope = rememberCoroutineScope()
     var confirmingClear by remember { mutableStateOf(false) }
     var confirmingUnpair by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val updates = remember(context) { AppUpdates.get(context) }
+    val latest by updates.latest.collectAsState()
+    val checkingUpdates by updates.checking.collectAsState()
 
     LaunchedEffect(model) { model.refresh() }
 
     LazyColumn {
         item { SettingsPageTitle() }
+        item { SettingsSectionLabel(stringResource(R.string.update_channel)) }
+        item {
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(stringResource(R.string.update_current_version, BuildConfig.VERSION_NAME))
+                OutlinedButton(
+                    onClick = { scope.launch { updates.check(manual = true) } },
+                    enabled = !checkingUpdates,
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Filled.Refresh, contentDescription = null)
+                    Text(
+                        stringResource(if (checkingUpdates) R.string.update_checking else R.string.update_check),
+                        Modifier.padding(start = 8.dp),
+                    )
+                }
+                latest?.let { release ->
+                    Text(stringResource(R.string.update_available, release.version))
+                    Text(release.notes.zh, style = MaterialTheme.typography.bodyMedium)
+                    Button(
+                        onClick = { updates.openDownload(context) },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text(stringResource(R.string.update_download, release.version)) }
+                }
+            }
+        }
         item { OfferWatchSettingsCard(hostedPairing) }
         item { SettingsSectionLabel(stringResource(R.string.settings_connection_section)) }
         item {

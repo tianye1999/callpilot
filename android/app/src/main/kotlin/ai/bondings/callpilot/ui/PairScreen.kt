@@ -1,5 +1,7 @@
 package ai.bondings.callpilot.ui
 
+import ai.bondings.callpilot.R
+import androidx.compose.ui.res.stringResource
 import ai.bondings.callpilot.pairing.CredentialStore
 import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.PairingLink
@@ -98,10 +100,10 @@ fun PairScreen(store: CredentialStore, onPaired: (StoredPairing) -> Unit) {
             )
         }
         Spacer(Modifier.height(18.dp))
-        Text("配对到 CallPilot Edge", style = MaterialTheme.typography.headlineSmall)
+        Text(stringResource(R.string.pair_desktop_title), style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(8.dp))
         Text(
-            "在电脑端 CallPilot 点「配对手机」，复制配对链接后回到这里粘贴。",
+            stringResource(R.string.pair_desktop_hint),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,

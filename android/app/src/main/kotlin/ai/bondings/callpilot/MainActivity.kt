@@ -20,6 +20,7 @@ import ai.bondings.callpilot.ui.IncomingOfferScreen
 import ai.bondings.callpilot.ui.MainTabShell
 import ai.bondings.callpilot.ui.PairScreen
 import ai.bondings.callpilot.ui.RootPresentation
+import ai.bondings.callpilot.updates.AppUpdates
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -54,10 +55,12 @@ import androidx.compose.ui.semantics.hideFromAccessibility
 import androidx.compose.ui.semantics.semantics
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val OFFER_POLL_INTERVAL_MS = 3_000L
@@ -81,6 +84,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         OfferAlerts.get(this).setForeground(true)
+        lifecycleScope.launch { AppUpdates.get(this@MainActivity).check() }
     }
 
     override fun onPause() {

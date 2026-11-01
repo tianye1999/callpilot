@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">CallPilot</string>
+    <string name="app_name">KinyAI-SIM助手</string>
     <string name="common_back">返回</string>
     <string name="common_cancel">取消</string>
     <string name="common_load_more">加载更多</string>

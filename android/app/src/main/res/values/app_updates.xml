@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="update_channel">App updates</string>
+    <string name="update_available">New version %1$s available</string>
+    <string name="update_current_version">Current version: %1$s</string>
+    <string name="update_check">Check for updates</string>
+    <string name="update_checking">Checking for updates...</string>
+    <string name="update_download">Download %1$s</string>
+    <string name="update_downloading">Downloading update...</string>
+    <string name="update_install">Install %1$s</string>
+    <string name="update_ready">Download complete. Tap to install.</string>
+</resources>

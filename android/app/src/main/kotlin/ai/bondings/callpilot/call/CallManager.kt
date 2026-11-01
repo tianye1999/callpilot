@@ -69,6 +69,7 @@ class CallManager(
     scope: CoroutineScope? = null,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val takeoverMediaTimeoutMs: Long = 20_000L,
+    private val incomingCallLabel: () -> String = { "Incoming call" },
     private val takeoverFailureVisibleMs: Long = 2_000L,
 ) {
     private val scope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -148,7 +149,7 @@ class CallManager(
     fun answerTakeover(pairing: StoredPairing, offerId: String) {
         if (isActive) return
         if (pairing.protocol != PairingProtocol.HOSTED) return
-        val label = "来电接管"
+        val label = incomingCallLabel()
         synchronized(commandLock) {
             takeoverMediaTimeoutJob?.cancel()
             takeoverMediaTimeoutJob = null

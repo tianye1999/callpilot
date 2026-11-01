@@ -1,10 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="offer_watch_channel">Background waiting</string>
-    <string name="offer_watch_notification">CallPilot is waiting for call transfers</string>
+    <string name="offer_watch_notification">KinyAI-SIM助手 is waiting for incoming calls</string>
     <string name="offer_channel">Call transfers</string>
-    <string name="offer_notification_title">Incoming call transfer</string>
-    <string name="offer_notification_body">A call on your computer is waiting for you</string>
+    <string name="offer_notification_title">Incoming call</string>
+    <string name="offer_notification_body">A call needs your attention. Answer to take the call on this phone.</string>
+    <string name="offer_accept">Answer</string>
+    <string name="offer_decline">Decline</string>
+    <string name="offer_decline_hint">Declining will not answer the call on this phone.</string>
+    <string name="pair_desktop_title">Pair with the desktop app</string>
+    <string name="pair_desktop_hint">In the desktop app, select “Pair phone”, copy the pairing link, then return here to paste it.</string>
+    <string name="call_notification_title">%1$s: Call in progress</string>
     <string name="offer_checking">Checking incoming call transfer...</string>
     <string name="offer_settings_title">Receive call transfers in the background</string>
     <string name="offer_service_running">Waiting service: running</string>
@@ -12,7 +18,7 @@
     <string name="offer_battery_exempt">Battery optimization: ignored</string>
     <string name="offer_battery_restricted">Battery optimization: active</string>
     <string name="offer_battery_action">Allow background activity</string>
-    <string name="offer_autostart_hint">On Chinese Android phones, also allow CallPilot to auto-start and run in the background in system settings.</string>
+    <string name="offer_autostart_hint">Some phones also require allowing this app to auto-start and run in the background in system settings.</string>
     <string name="offer_full_screen_action">Allow full-screen call notifications</string>
     <string name="offer_notifications_disabled">Notifications are off. Incoming call alerts cannot be shown.</string>
     <string name="offer_notification_settings">Notification settings</string>

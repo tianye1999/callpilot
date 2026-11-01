@@ -1,5 +1,7 @@
 package ai.bondings.callpilot.ui
 
+import ai.bondings.callpilot.R
+import androidx.compose.ui.res.stringResource
 import ai.bondings.callpilot.call.CallManager
 import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.DeviceStatus
@@ -212,7 +214,7 @@ fun DialScreen(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("CallPilot", style = MaterialTheme.typography.titleLarge)
+            Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.weight(1f))
         }
 

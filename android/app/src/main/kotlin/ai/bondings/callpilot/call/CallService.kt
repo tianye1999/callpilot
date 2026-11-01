@@ -41,7 +41,7 @@ class CallService : Service() {
             Notification.Builder(this)
         }
         return builder
-            .setContentTitle("CallPilot 通话中")
+            .setContentTitle(getString(R.string.call_notification_title, getString(R.string.app_name)))
             .setContentText("正在通过远端 SIM 通话")
             .setSmallIcon(R.drawable.ic_callpilot_notification)
             .setOngoing(true)

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 桌面图标下只放得下短名，中英文共用；其他地方用 app_name 全名。 -->
+    <string name="launcher_name" translatable="false">KinyAI SIM</string>
+</resources>

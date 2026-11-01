@@ -1,5 +1,7 @@
 package ai.bondings.callpilot.ui
 
+import ai.bondings.callpilot.R
+import androidx.compose.ui.res.stringResource
 import android.content.Context
 import android.media.RingtoneManager
 import android.os.Build
@@ -35,7 +37,7 @@ internal object IncomingOfferColors {
 }
 
 /**
- * #95 inbound takeover：AI 请求把进行中的来电转给机主。
+ * 来电 offer：既支持直接响手机，也支持 AI 接听后转给机主。
  * 前台全屏卡：铃声 + 振动 + 接听/拒绝。仅在 App 前台且空闲时展示（MVP 边界）。
  */
 @Composable
@@ -72,10 +74,10 @@ fun IncomingOfferScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text("来电转接请求", style = MaterialTheme.typography.headlineMedium)
+        Text(stringResource(R.string.offer_notification_title), style = MaterialTheme.typography.headlineMedium)
         Spacer(Modifier.height(14.dp))
         Text(
-            "AI 正在接听一通来电，判断需要你本人处理。\n接听后通话将转到这台手机。",
+            stringResource(R.string.offer_notification_body),
             style = MaterialTheme.typography.bodyLarge,
             textAlign = TextAlign.Center,
         )
@@ -88,7 +90,7 @@ fun IncomingOfferScreen(
                     containerColor = IncomingOfferColors.reject.container,
                     contentColor = IncomingOfferColors.reject.content,
                 ),
-            ) { Text("拒绝", style = MaterialTheme.typography.titleMedium) }
+            ) { Text(stringResource(R.string.offer_decline), style = MaterialTheme.typography.titleMedium) }
             Button(
                 onClick = onAccept,
                 modifier = Modifier.weight(1f).height(64.dp),
@@ -96,11 +98,11 @@ fun IncomingOfferScreen(
                     containerColor = IncomingOfferColors.accept.container,
                     contentColor = IncomingOfferColors.accept.content,
                 ),
-            ) { Text("接听", style = MaterialTheme.typography.titleMedium) }
+            ) { Text(stringResource(R.string.offer_accept), style = MaterialTheme.typography.titleMedium) }
         }
         Spacer(Modifier.height(18.dp))
         Text(
-            "拒绝后 AI 会继续处理这通电话。",
+            stringResource(R.string.offer_decline_hint),
             style = MaterialTheme.typography.bodySmall,
         )
     }

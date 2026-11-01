@@ -9,6 +9,7 @@ import ai.bondings.callpilot.protocol.HostedCloudException
 import ai.bondings.callpilot.protocol.CallSummaryState
 import ai.bondings.callpilot.protocol.HttpClients
 import ai.bondings.callpilot.protocol.PairingProtocol
+import ai.bondings.callpilot.updates.AppUpdates
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -156,6 +157,13 @@ class OfferWatchService : Service() {
         }
         startDigestPolling(store, manager)
         startSmsPolling(store)
+        scope.launch {
+            val updates = AppUpdates.get(this@OfferWatchService)
+            while (isActive) {
+                updates.check()
+                delay(updates.nextCheckDelay())
+            }
+        }
         return START_STICKY
     }
 

@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.call
 
+import ai.bondings.callpilot.R
 import ai.bondings.callpilot.media.LiveKitSession
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope
@@ -18,6 +19,7 @@ object CallGraph {
         return manager ?: synchronized(this) {
             manager ?: CallManager(
                 sessionFactory = { LiveKitSession(app, sessionScope) },
+                incomingCallLabel = { app.getString(R.string.offer_notification_title) },
                 onForeground = { active ->
                     if (active) CallService.start(app) else CallService.stop(app)
                 },
