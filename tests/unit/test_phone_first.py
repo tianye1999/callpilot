@@ -306,7 +306,8 @@ def test_media_ready_after_eight_seconds_records_both_latencies(rig, monkeypatch
     asyncio.run(rig.session._handle_call())
     assert rig.session._record.source == "remote_web_dialer"
     assert rig.commands.count("ATA") == 1
-    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    events_text = (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in events_text.splitlines()]
     latencies = {event["stage"]: event["ms"] for event in events if event["type"] == "latency"}
     assert 8000 <= latencies["phone_first_media_ready_ms"] < 8051
     assert latencies["phone_first_ata_ms"] == pytest.approx(300)
@@ -464,7 +465,8 @@ def test_disabled_path_has_no_new_queries_timers_commands_or_events(rig, monkeyp
     assert agent.started and agent.said
     assert rig.session.next_takeover_offer() is None
     assert rig.session.next_takeover_revoke() is None
-    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    events_text = (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in events_text.splitlines()]
     assert not any(e["type"].startswith("phone_first") for e in events)
 
 
@@ -610,7 +612,8 @@ def test_post_answer_failure_parallel_and_legacy_have_one_answer_event(rig, monk
     assert rig.commands.count("ATA") == 1
     assert rig.bridge.max_writers == 1
     assert agent.started and agent.said
-    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    events_text = (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in events_text.splitlines()]
     assert sum(event["type"] == "answered" for event in events) == 1
 
 
