@@ -6,7 +6,8 @@ Edge/cloud 侧无需改动;Android(`../android`)是同协议的活参照实现�
 ## 当前配置
 
 - 主屏名称: `KinyAI SIM`; App 内中文名称: `KinyAI-SIM助手`。
-- 版本: `0.7.5 (5)`。Bundle ID `ai.bondings.callpilot`、target/module/product
+- 版本: `0.7.5 (6)`。Bundle ID `ai.bondings.callpilot.sim`（实体 SIM 线独立的
+  App Store Connect 记录，不与 `ai.bondings.callpilot` 共用）；target/module/product
   `CallPilot` 保持不变。
 - 新配对默认中转: `https://sim-relay.bondings.ai`。不会覆盖已保存配对的网关。
 - 配对输入兼容 Android: `https://<网关>/remote_dialer.html#pair=XXXX-XXXX`

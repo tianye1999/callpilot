@@ -7,8 +7,8 @@ final class CallKitConfigurationTests: XCTestCase {
             contentsOf: repositoryRoot.appendingPathComponent("ios/project.yml"), encoding: .utf8
         )
         XCTAssertTrue(project.contains("MARKETING_VERSION: \"0.7.5\""))
-        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"5\""))
-        XCTAssertTrue(project.contains("PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot\n"))
+        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"6\""))
+        XCTAssertTrue(project.contains("PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot.sim\n"))
         XCTAssertTrue(project.contains("name: CallPilot\n"))
         XCTAssertTrue(project.contains("DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}"))
     }
