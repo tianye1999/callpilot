@@ -248,6 +248,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("INBOUND_TAKEOVER_TIMEOUT_SECONDS", "来电真人接管等待时限（秒）", "float", "20"),
     ConfigSpec("INBOUND_PHONE_FIRST_ENABLED", "串口模组来电先响手机（依赖真人接管）", "bool", "false"),
     ConfigSpec("INBOUND_PHONE_FIRST_RING_SECONDS", "串口模组先响手机等待（1–15 秒）", "int", "15"),
+    ConfigSpec("INBOUND_PHONE_FIRST_MEDIA_SECONDS", "认领后等手机音轨就绪（5–30 秒）", "int", "20"),
     # 机主确认环（WIL-120 二期 Path A）：ask_owner 工具等 Web 确认卡答复的
     # 窗口；超时=拒绝（fail-closed，机主没看到不等于同意）。
     ConfigSpec("OWNER_CONFIRM_TIMEOUT_SECONDS", "机主确认等待窗口（秒）", "int", "60"),
@@ -841,6 +842,7 @@ _NUMERIC_RANGES: dict[str, tuple[float, float, bool]] = {
     "INBOUND_MAX_SECONDS": (0, 86400, True),   # >0 且 ≤24h
     "INBOUND_AI_ANSWER_AFTER_SECONDS": (0, 600, True),  # Bluetooth unanswered policy
     "INBOUND_PHONE_FIRST_RING_SECONDS": (0, 15, True),
+    "INBOUND_PHONE_FIRST_MEDIA_SECONDS": (5, 30, False),
     # 0=不限时合法（number_profiles 的 max_call_seconds 可按场景覆盖，WIL-120）。
     "OUTBOUND_MAX_SECONDS": (0, 86400, False),  # ≥0 且 ≤24h
     "OWNER_CONFIRM_TIMEOUT_SECONDS": (0, 600, True),  # >0 且 ≤10min

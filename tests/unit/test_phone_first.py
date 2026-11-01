@@ -20,13 +20,24 @@ from agentcall.takeover_coordinator import InboundTakeoverCoordinator, MediaOwne
 
 
 def test_phone_first_configuration_defaults_and_example(monkeypatch):
-    example = dotenv_values(Path(__file__).parents[2] / ".env.example")
-    for key, default in (("INBOUND_PHONE_FIRST_ENABLED", "false"), ("INBOUND_PHONE_FIRST_RING_SECONDS", "15")):
+    example = dotenv_values(Path(__file__).parents[2] / ".env.example", encoding="utf-8")
+    for key, default in (
+        ("INBOUND_PHONE_FIRST_ENABLED", "false"),
+        ("INBOUND_PHONE_FIRST_RING_SECONDS", "15"),
+        ("INBOUND_PHONE_FIRST_MEDIA_SECONDS", "20"),
+    ):
         monkeypatch.delenv(key, raising=False)
         assert config.get_str(key) == default == example[key]
     for value in ("0", "16", "nan", "1.5"):
         with pytest.raises(ValueError):
             config._check_value(config.get_spec("INBOUND_PHONE_FIRST_RING_SECONDS"), value)
+    spec = config.get_spec("INBOUND_PHONE_FIRST_MEDIA_SECONDS")
+    assert spec.kind == "int"
+    for value in ("5", "20", "30"):
+        config._check_value(spec, value)
+    for value in ("4", "31", "nan", "1.5", "", "-1"):
+        with pytest.raises(ValueError):
+            config._check_value(spec, value)
 
 
 def test_unanswered_coordinator_has_no_ai_owner():
@@ -172,6 +183,7 @@ def test_reserved_ata_confirmation_is_bounded_and_urc_friendly(monkeypatch, outc
 
 @pytest.fixture
 def rig(monkeypatch):
+    monkeypatch.delenv("INBOUND_PHONE_FIRST_MEDIA_SECONDS", raising=False)
     monkeypatch.setenv("INBOUND_PHONE_FIRST_ENABLED", "true")
     monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
     monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
@@ -275,7 +287,8 @@ def rig(monkeypatch):
     )
 
 
-def test_media_ready_after_eight_seconds_records_both_latencies(rig, monkeypatch):
+@pytest.mark.parametrize("delay", [8, 12, 19])
+def test_delayed_media_ready_records_both_latencies(rig, monkeypatch, delay):
     def forbidden(*args, **kwargs):
         pytest.fail("ready mobile must not start AI")
 
@@ -296,7 +309,7 @@ def test_media_ready_after_eight_seconds_records_both_latencies(rig, monkeypatch
         claimed_at = rig.clock.now
 
         def ready():
-            if rig.clock.now >= claimed_at + 8:
+            if rig.clock.now >= claimed_at + delay:
                 rig.endpoint.media_ready = True
                 rig.clock.tick = lambda: None
 
@@ -309,7 +322,7 @@ def test_media_ready_after_eight_seconds_records_both_latencies(rig, monkeypatch
     events_text = (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8")
     events = [json.loads(line) for line in events_text.splitlines()]
     latencies = {event["stage"]: event["ms"] for event in events if event["type"] == "latency"}
-    assert 8000 <= latencies["phone_first_media_ready_ms"] < 8051
+    assert delay * 1000 <= latencies["phone_first_media_ready_ms"] < delay * 1000 + 51
     assert latencies["phone_first_ata_ms"] == pytest.approx(300)
 
 
@@ -431,7 +444,7 @@ def test_phone_first_falls_back_to_ai_with_one_ata(rig, monkeypatch, cause):
     assert rig.commands.count("ATA") == 1
     assert agent.started and agent.said
     assert rig.bridge.max_writers == 1 and rig.bridge.writer_count == 0
-    limit = 115.1 if cause == "timeout" else 110.2 if cause == "no_media" else 103
+    limit = 115.1 if cause == "timeout" else 120.2 if cause == "no_media" else 103
     assert rig.clock.now < limit
 
 
@@ -617,7 +630,7 @@ def test_post_answer_failure_parallel_and_legacy_have_one_answer_event(rig, monk
     assert sum(event["type"] == "answered" for event in events) == 1
 
 
-def test_duplicate_claim_never_renews_ten_second_budget(rig):
+def test_duplicate_claim_never_renews_media_budget(rig, monkeypatch):
     rig.ring()
     session = rig.session
 
@@ -626,7 +639,8 @@ def test_duplicate_claim_never_renews_ten_second_budget(rig):
         assert rig.claim().accepted
         request = session._takeover_request
         deadline = session._phone_first_claim_deadline
-        assert deadline == pytest.approx(rig.clock.now + 10)
+        assert deadline == pytest.approx(rig.clock.now + 20)
+        monkeypatch.setenv("INBOUND_PHONE_FIRST_MEDIA_SECONDS", "30")
         rig.clock.now += 1
         repeated = session.accept_takeover_claim(
             offer_id=request.offer_id, call_id=request.call_id, claim_id="claim_test",
@@ -640,7 +654,16 @@ def test_duplicate_claim_never_renews_ten_second_budget(rig):
     assert rig.commands.count("ATA") == 1
 
 
-def test_pending_connect_is_cancelled_at_fake_ten_second_budget(rig, monkeypatch):
+@pytest.mark.parametrize("configured,seconds", [
+    (None, 20), ("5", 5), ("12", 12), ("30", 30),
+    ("4", 20), ("31", 20), ("nan", 20), ("1.5", 20), ("", 20), ("-1", 20),
+])
+@pytest.mark.parametrize("pending_connect", [False, True])
+def test_media_timeout_uses_live_config_and_warns_on_invalid_value(
+    rig, monkeypatch, caplog, configured, seconds, pending_connect,
+):
+    if configured is not None:
+        monkeypatch.setenv("INBOUND_PHONE_FIRST_MEDIA_SECONDS", configured)
     rig.ring()
     cancelled = []
 
@@ -650,7 +673,9 @@ def test_pending_connect_is_cancelled_at_fake_ten_second_budget(rig, monkeypatch
         finally:
             cancelled.append(True)
 
-    rig.endpoint.connect = connect
+    if pending_connect:
+        rig.endpoint.connect = connect
+    rig.endpoint.media_ready = False
     agent = FakeAgent()
     monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
 
@@ -662,12 +687,40 @@ def test_pending_connect_is_cancelled_at_fake_ten_second_budget(rig, monkeypatch
     def tick():
         rig.clock.tick = lambda: None
         assert rig.claim().accepted
+        assert rig.session._phone_first_claim_deadline == pytest.approx(rig.clock.now + seconds)
 
     rig.clock.tick = tick
     asyncio.run(rig.session._handle_call())
-    assert cancelled == [True] and rig.endpoint.closed
-    assert 110 <= rig.clock.now < 110.2
+    assert cancelled == ([True] if pending_connect else [])
+    assert rig.endpoint.closed
+    assert 100 + seconds <= rig.clock.now < 100 + seconds + 0.2
     assert agent.started and rig.commands.count("ATA") == 1
+    invalid = configured is not None and configured not in {"5", "12", "30"}
+    warnings = [record for record in caplog.records if "INBOUND_PHONE_FIRST_MEDIA_SECONDS" in record.message]
+    assert len(warnings) == int(invalid)
+    if invalid:
+        assert warnings[0].levelname == "WARNING"
+        assert "20" in warnings[0].message
+
+
+def test_media_budget_is_reread_for_next_call(rig, monkeypatch):
+    session = rig.session
+
+    for seconds in (5, 30):
+        monkeypatch.setenv("INBOUND_PHONE_FIRST_MEDIA_SECONDS", str(seconds))
+        rig.commands.clear()
+        rig.endpoint.closed = False
+        rig.ring()
+
+        def claim_once():
+            rig.clock.tick = lambda: None
+            assert rig.claim().accepted
+            assert session._phone_first_claim_deadline == pytest.approx(rig.clock.now + seconds)
+
+        rig.clock.tick = claim_once
+        session._run()
+        assert session._record.source == "remote_web_dialer"
+        assert rig.commands.count("ATA") == 1
 
 
 def test_hangup_while_media_connects_never_answers_or_runs_ai(rig, monkeypatch):
@@ -810,7 +863,7 @@ def test_media_cleanup_cannot_delay_ai_fallback(rig, monkeypatch):
     rig.endpoint.close = close
 
     async def loop(*args):
-        assert rig.clock.now < 110.2
+        assert rig.clock.now < 120.2
         return rig.bridge
 
     monkeypatch.setattr(rig.session, "_run_agent_loop", loop)

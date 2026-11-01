@@ -181,7 +181,7 @@ _INBOUND_TAKEOVER_HOLD_INSTRUCTIONS = {
           "let the caller know they are waiting for the owner, without promising a connection or starting a new topic.",
 }
 _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
-_PHONE_FIRST_MEDIA_TIMEOUT_SECONDS = 10.0
+_PHONE_FIRST_MEDIA_TIMEOUT_SECONDS = 20.0
 _INBOUND_TRIAGE_CLARIFY_TEXT = {
     "zh": "请简单确认一下，您是有具体事情找本人，还是一般业务介绍？",
     "en": "Just to confirm — do you have a specific matter for them personally, or is this a general offer?",
@@ -4632,8 +4632,15 @@ class CallSession:
             except Full:
                 return TakeoverResult.reject(TakeoverRejection.CLAIM_CONFLICT)
             if phone_first_offer:
+                try:
+                    media_seconds: float = int(config.get_str("INBOUND_PHONE_FIRST_MEDIA_SECONDS"))
+                    if not 5 <= media_seconds <= 30:
+                        raise ValueError("out of range")
+                except ValueError:
+                    media_seconds = _PHONE_FIRST_MEDIA_TIMEOUT_SECONDS
+                    logger.warning("Invalid INBOUND_PHONE_FIRST_MEDIA_SECONDS; using default %g seconds", media_seconds)
                 self._phone_first_claimed_at = self._phone_first_clock()
-                self._phone_first_claim_deadline = self._phone_first_claimed_at + _PHONE_FIRST_MEDIA_TIMEOUT_SECONDS
+                self._phone_first_claim_deadline = self._phone_first_claimed_at + media_seconds
             return result
 
     def accept_takeover_claim(
