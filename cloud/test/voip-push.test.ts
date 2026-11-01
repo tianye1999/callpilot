@@ -11,8 +11,54 @@ import {
   voipPushEnabled
 } from "../src/voip-push";
 import type { Env } from "../src/types";
+import { buildAlertPayload, dispatchAlertPushes } from "../src/alert-push";
 
 describe("VoIP push security boundary", () => {
+  it.each(["sandbox", "production"] as const)("sends alerts using the %s host and base topic", async (environment) => {
+    const key = crypto.getRandomValues(new Uint8Array(32));
+    const token = "ab".repeat(40);
+    const encrypted = await encryptPushToken(token, key);
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const env = pushEnv({ key, privateKeyPEM: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      alert: true, deleted: [], rows: [{ device_id: "device_abcdefghijkl",
+        token_ciphertext: encrypted.ciphertext, token_nonce: encrypted.nonce, environment }] });
+    let count = 0;
+    await dispatchAlertPushes(env, "edge_abcdefghijkl", "sms", async (url, init) => {
+      count++;
+      expect(String(url)).toBe(`https://${environment === "sandbox" ? "api.sandbox" : "api"}.push.apple.com/3/device/${token}`);
+      const headers = new Headers(init?.headers);
+      expect(headers.get("apns-push-type")).toBe("alert");
+      expect(headers.get("apns-topic")).toBe("ai.bondings.callpilot");
+      expect(headers.get("apns-priority")).toBe("10");
+      expect(JSON.parse(String(init?.body))).toEqual(buildAlertPayload("sms"));
+      return new Response(null, { status: 200 });
+    });
+    expect(count).toBe(1);
+  });
+
+  it.each([[410, "Unregistered", true], [400, "BadDeviceToken", true],
+    [400, "BadTopic", false], [403, "InvalidProviderToken", false], [503, "ServiceUnavailable", false]] as const)(
+    "cleans up alerts only for invalid device tokens (%s %s)", async (status, reason, removed) => {
+      const key = crypto.getRandomValues(new Uint8Array(32));
+      const encrypted = await encryptPushToken("ef".repeat(32), key);
+      const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+      const deleted: string[] = [];
+      const env = pushEnv({ key, privateKeyPEM: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+        alert: true, deleted, rows: [{ device_id: "device_abcdefghijkl",
+          token_ciphertext: encrypted.ciphertext, token_nonce: encrypted.nonce, environment: "production" }] });
+      await dispatchAlertPushes(env, "edge_abcdefghijkl", "missed_call",
+        async () => Response.json({ reason }, { status }));
+      expect(deleted).toEqual(removed ? ["device_abcdefghijkl"] : []);
+    }
+  );
+
+  it("does not query tokens or call APNs unless explicitly enabled", async () => {
+    for (const flag of [undefined, "false", "TRUE", "1"]) {
+      await dispatchAlertPushes({ ALERT_PUSH_ENABLED: flag } as Env, "edge_test", "sms", async () => {
+        throw new Error("must not send");
+      });
+    }
+  });
   it("enables delivery only for the exact opt-in value", () => {
     expect(voipPushEnabled("true")).toBe(true);
     expect(voipPushEnabled(undefined)).toBe(false);
@@ -152,6 +198,7 @@ function pushEnv(input: {
   privateKeyPEM: string;
   rows: Array<Record<string, string>>;
   deleted: string[];
+  alert?: boolean;
 }): Env {
   const db = {
     prepare(sql: string) {
@@ -159,12 +206,17 @@ function pushEnv(input: {
         bind(...values: unknown[]) {
           return {
             async all() {
-              expect(sql).toContain("FROM device_push_tokens");
+              expect(sql).toContain(`FROM ${input.alert ? "device_alert_push_tokens" : "device_push_tokens"}`);
+              expect(sql).toContain("devices.edge_id = ?1 AND devices.revoked_at IS NULL");
               expect(values).toEqual(["edge_abcdefghijkl"]);
               return { results: input.rows };
             },
             async run() {
-              expect(sql).toContain("DELETE FROM device_push_tokens");
+              expect(sql).toContain(`DELETE FROM ${input.alert ? "device_alert_push_tokens" : "device_push_tokens"}`);
+              if (input.alert) {
+                expect(sql).toContain("AND token_ciphertext = ?2");
+                expect(values[1]).toBe(input.rows[0]?.token_ciphertext);
+              }
               input.deleted.push(String(values[0]));
               return { meta: { changes: 1 } };
             }
@@ -176,6 +228,7 @@ function pushEnv(input: {
   return {
     DB: db,
     VOIP_PUSH_ENABLED: "true",
+    ALERT_PUSH_ENABLED: input.alert ? "true" : undefined,
     APNS_TEAM_ID: "TEAMID1234",
     APNS_KEY_ID: "KEYID12345",
     APNS_PRIVATE_KEY: input.privateKeyPEM,

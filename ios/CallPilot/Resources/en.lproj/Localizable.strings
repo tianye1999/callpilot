@@ -194,3 +194,6 @@
 "settings.unpair.confirm_title" = "Unpair from the Computer?";
 "settings.unpair.confirm_message" = "This clears local content. You’ll need a new pairing code to use the remote line again.";
 "callkit.incoming.name" = "Incoming Call";
+"push.sms" = "You received a new text message";
+"push.call_digest" = "AI answered a call for you";
+"push.missed_call" = "You have a missed call";

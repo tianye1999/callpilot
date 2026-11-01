@@ -467,6 +467,9 @@ class CloudEdgeClient:
                     websocket.send(self._heartbeat())
                     next_heartbeat = now + self._heartbeat_seconds
                 self._drain_takeover_events(websocket.send)
+                from .remote_alert_push import drain
+
+                drain(websocket.send)
                 try:
                     message = websocket.recv(timeout=1.0)
                 except TimeoutError:

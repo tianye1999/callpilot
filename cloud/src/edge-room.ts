@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { dispatchAlertPushes, reserveAlertEvent } from "./alert-push";
 
 import {
   CONTENT_WIRE_LIMIT_BYTES,
@@ -157,6 +158,21 @@ export class EdgeRoom extends DurableObject<Env> {
     }
     const attachment = ws.deserializeAttachment() as SocketAttachment;
     const now = Date.now();
+    if (result.data.type === "device.notify") {
+      // Identity comes only from the authenticated connection, never the payload.
+      if (!attachment?.edgeId || ws.readyState !== WebSocket.OPEN
+          || !this.ctx.getWebSockets("edge").includes(ws)) return;
+      const { kind, eventId } = result.data;
+      try {
+        if (await reserveAlertEvent(this.env, attachment.edgeId, eventId, now)) {
+          this.ctx.waitUntil(dispatchAlertPushes(this.env, attachment.edgeId, kind)
+            .catch(() => { console.warn("Alert push delivery failed"); }));
+        }
+      } catch {
+        console.warn("Alert push reservation failed");
+      }
+      return;
+    }
     if (result.data.type === "heartbeat") {
       const presence: EdgePresence = {
         connected: true,

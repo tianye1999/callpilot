@@ -11,7 +11,8 @@ const wrangler = join(cloudDir, "node_modules", ".bin", process.platform === "wi
 const port = 18788;
 const base = `http://127.0.0.1:${port}`;
 const persistDir = mkdtempSync(join(tmpdir(), "callpilot-sim-api-"));
-const localArgs = ["-c", "wrangler.sim-api.jsonc", "--local", "--persist-to", persistDir];
+const localArgs = ["-c", "wrangler.sim-api.jsonc", "--local", "--persist-to", persistDir,
+  "--env-file", join(cloudDir, "test/empty-vars")];
 const releaseProduct = "physical-sim-integration";
 let worker;
 let workerOutput = "";

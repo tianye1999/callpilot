@@ -32,6 +32,12 @@ export const createCallSchema = z.object({
 export const edgeMessageSchema = z.union([
   z.object({
     v: z.literal(1),
+    type: z.literal("device.notify"),
+    kind: z.enum(["sms", "call_digest", "missed_call"]),
+    eventId: z.string().regex(/^event_[a-f0-9]{64}$/)
+  }).strict(),
+  z.object({
+    v: z.literal(1),
     type: z.literal("heartbeat"),
     occurredAt: z.string().datetime(),
     status: z.object({

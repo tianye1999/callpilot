@@ -7,6 +7,8 @@ import Combine
 @MainActor
 final class AppModel: ObservableObject {
     @Published var pairing: StoredPairing?
+    @Published var selectedTab: MainTab = .dial
+    @Published private(set) var alertRouteID: UUID?
     @Published var callState: CallState = .idle
     @Published var incomingOffer: InboundOffer?
     @Published var lineStatusLabel = L10n.text("line.status.checking")
@@ -94,7 +96,10 @@ final class AppModel: ObservableObject {
 
     func unpair() {
         let pairedClient = client
-        Task { try? await pairedClient?.unregisterVoipToken() }
+        Task {
+            try? await pairedClient?.unregisterVoipToken()
+            if AlertPushConfiguration.isEnabled { try? await pairedClient?.unregisterAlertToken() }
+        }
         messageInbox?.clearLocalData()
         callHistory?.clearLocalData()
         store.clear()
@@ -111,6 +116,25 @@ final class AppModel: ObservableObject {
         callHistory?.clearLocalData()
         try? messageStore.clear()
         try? callHistoryStore.clear()
+    }
+
+    func syncAlertToken(_ token: String?, authorized: Bool) async {
+        guard AlertPushConfiguration.isEnabled, let client else { return }
+        if !authorized {
+            try? await client.unregisterAlertToken()
+        } else if let token {
+            try? await client.registerAlertToken(token, environment: PushEnvironment.current())
+        }
+    }
+
+    func openAlert(_ route: AlertPushRoute) async {
+        guard AlertPushConfiguration.isEnabled, pairing != nil else { return }
+        selectedTab = route.destination == .messages ? .messages : .records
+        alertRouteID = route.id
+        switch route.destination {
+        case .messages: await messageInbox?.refresh(waitForCurrentRequest: true)
+        case .records: await callHistory?.refresh(waitForCurrentRequest: true)
+        }
     }
 
     func loadCachedContentForSettings() {

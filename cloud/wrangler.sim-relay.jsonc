@@ -36,6 +36,7 @@
     { "tag": "v1", "new_sqlite_classes": ["EdgeRoom"] }
   ],
   "vars": {
-    "PUBLIC_ORIGIN": "https://sim-relay.bondings.ai"
+    "PUBLIC_ORIGIN": "https://sim-relay.bondings.ai",
+    "ALERT_PUSH_ENABLED": "false"
   }
 }

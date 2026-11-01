@@ -22,7 +22,8 @@ final class CallKitConfigurationTests: XCTestCase {
         XCTAssertTrue(source.contains("CXProviderConfiguration()"))
         let tokenCallback = try XCTUnwrap(source.components(separatedBy: "didUpdate pushCredentials").last?
             .components(separatedBy: "didInvalidatePushTokenFor").first)
-        XCTAssertTrue(tokenCallback.contains("#if DEBUG\n            let environment = ApnsEnvironment.sandbox\n            #else\n            let environment = ApnsEnvironment.production\n            #endif"))
+        XCTAssertTrue(tokenCallback.contains("let environment = PushEnvironment.current()"))
+        XCTAssertFalse(tokenCallback.contains("#if DEBUG"))
         XCTAssertTrue(tokenCallback.contains("self.delegate?.callKitDidUpdateToken(token, environment: environment)"))
     }
 

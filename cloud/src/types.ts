@@ -13,6 +13,7 @@ export interface Env {
   CONTENT_READ_EDGE_LIMIT?: string;
   APP_REVIEW_PAIRING_ENABLED?: string;
   VOIP_PUSH_ENABLED?: string;
+  ALERT_PUSH_ENABLED?: string;
   APNS_TEAM_ID?: string;
   APNS_KEY_ID?: string;
   APNS_PRIVATE_KEY?: string;

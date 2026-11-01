@@ -2,9 +2,10 @@ import SwiftUI
 
 @main
 struct CallPilotApp: App {
+    @UIApplicationDelegateAdaptor(AlertPushDelegate.self) private var alerts
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView(alerts: alerts)
         }
     }
 }
@@ -12,6 +13,8 @@ struct CallPilotApp: App {
 /// 根展示层:未配对时显示配对页;配对后保持主 Tab 壳常驻,通话与来电作为顶层覆盖。
 struct RootView: View {
     @StateObject private var model = AppModel()
+    @ObservedObject var alerts: AlertPushDelegate
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         let presentation = RootPresentation.resolve(
@@ -41,6 +44,35 @@ struct RootView: View {
             }
         }
         .task { await model.startOfferPolling() }
+        .task(id: model.pairing?.credential.deviceId) {
+            guard model.pairing != nil else { return }
+            await refreshAlertRegistration()
+            await openPendingAlert()
+        }
+        .task(id: alerts.token) {
+            guard let token = alerts.token, alerts.authorized else { return }
+            await model.syncAlertToken(token, authorized: true)
+        }
+        .onChange(of: alerts.pendingRoute?.id, initial: true) { _, _ in
+            Task { await openPendingAlert() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Task { await refreshAlertRegistration() }
+            }
+        }
+    }
+
+    private func refreshAlertRegistration() async {
+        guard model.pairing != nil else { return }
+        await alerts.refreshAuthorization()
+        await model.syncAlertToken(alerts.token, authorized: alerts.authorized)
+    }
+
+    private func openPendingAlert() async {
+        guard model.pairing != nil, let route = alerts.pendingRoute else { return }
+        alerts.pendingRoute = nil
+        await model.openAlert(route)
     }
 
     private func fullScreenOverlay<Content: View>(

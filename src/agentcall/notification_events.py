@@ -108,6 +108,10 @@ feed = NotificationFeed()
 
 
 def publish_notification(kind: str, *args: object) -> None:
+    if kind == "sms_received" and not _backfill.get():
+        from .remote_alert_push import publish
+
+        publish("sms")
     # 通知是旁路；任何通知错误都不能改变接听、确认决定、摘要保存或短信转发。
     try:
         getattr(feed, kind)(*args)

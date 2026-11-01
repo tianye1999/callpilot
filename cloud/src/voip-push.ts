@@ -108,10 +108,28 @@ export async function dispatchInboundOfferPushes(
   fetcher: Fetcher = fetch
 ): Promise<void> {
   if (!voipPushEnabled(env.VOIP_PUSH_ENABLED)) return;
+  await dispatchApnsPushes(env, {
+    edgeId: input.edgeId,
+    pushType: "voip",
+    expiresAtUnixMs: input.expiresAtUnixMs,
+    payload: buildVoipPayload({
+      offerId: input.offerId,
+      callUUID: input.callUUID,
+      expiresAtUnixMs: input.expiresAtUnixMs
+    })
+  }, fetcher);
+}
+
+export async function dispatchApnsPushes(
+  env: Env,
+  input: { edgeId: string; pushType: "voip" | "alert"; expiresAtUnixMs: number; payload: unknown },
+  fetcher: Fetcher = fetch
+): Promise<void> {
   const config = readPushConfig(env);
   const encryptionKey = decodeEncryptionKey(config.encryptionKey);
+  const table = input.pushType === "voip" ? "device_push_tokens" : "device_alert_push_tokens";
   const targets = await env.DB.prepare(
-    "SELECT push.device_id, push.token_ciphertext, push.token_nonce, push.environment FROM device_push_tokens AS push JOIN devices ON devices.device_id = push.device_id WHERE devices.edge_id = ?1 AND devices.revoked_at IS NULL"
+    `SELECT push.device_id, push.token_ciphertext, push.token_nonce, push.environment FROM ${table} AS push JOIN devices ON devices.device_id = push.device_id WHERE devices.edge_id = ?1 AND devices.revoked_at IS NULL`
   ).bind(input.edgeId).all<PushTarget>();
   if (!targets.results?.length) return;
 
@@ -120,12 +138,7 @@ export async function dispatchInboundOfferPushes(
     teamId: config.teamId,
     privateKeyPEM: config.privateKey
   });
-  const payload = buildVoipPayload({
-    offerId: input.offerId,
-    callUUID: input.callUUID,
-    expiresAtUnixMs: input.expiresAtUnixMs
-  });
-  await Promise.allSettled(targets.results.map(async (target) => {
+  const outcomes = await Promise.allSettled(targets.results.map(async (target) => {
     const token = await decryptPushToken({
       ciphertext: target.token_ciphertext,
       nonce: target.token_nonce
@@ -135,23 +148,34 @@ export async function dispatchInboundOfferPushes(
       : "https://api.sandbox.push.apple.com";
     const response = await fetcher(`${host}/3/device/${token}`, {
       method: "POST",
+      ...(input.pushType === "alert" ? { signal: AbortSignal.timeout(10_000) } : {}),
       headers: {
         Authorization: `bearer ${authorization}`,
         "Content-Type": "application/json",
         "apns-expiration": String(Math.floor(input.expiresAtUnixMs / 1000)),
         "apns-priority": "10",
-        "apns-push-type": "voip",
-        "apns-topic": `${config.bundleId}.voip`
+        "apns-push-type": input.pushType,
+        "apns-topic": config.bundleId + (input.pushType === "voip" ? ".voip" : "")
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(input.payload)
     });
     if (response.ok) return;
     const reason = await apnsReason(response);
     if (response.status === 410 || (response.status === 400 && reason === "BadDeviceToken")) {
-      await env.DB.prepare("DELETE FROM device_push_tokens WHERE device_id = ?1")
-        .bind(target.device_id).run();
+      if (input.pushType === "alert") {
+        await env.DB.prepare(`DELETE FROM ${table} WHERE device_id = ?1 AND token_ciphertext = ?2`)
+          .bind(target.device_id, target.token_ciphertext).run();
+      } else {
+        await env.DB.prepare("DELETE FROM device_push_tokens WHERE device_id = ?1")
+          .bind(target.device_id).run();
+      }
+    } else if (input.pushType === "alert") {
+      console.warn("Alert push rejected", response.status);
     }
   }));
+  if (input.pushType === "alert" && outcomes.some((outcome) => outcome.status === "rejected")) {
+    console.warn("Alert push delivery failed");
+  }
 }
 
 export function decodeEncryptionKey(value: string): Uint8Array {

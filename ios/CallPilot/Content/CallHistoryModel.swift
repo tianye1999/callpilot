@@ -106,7 +106,14 @@ final class CallHistoryModel: ObservableObject {
         loadCacheIfNeeded()
     }
 
-    func refresh() async {
+    func refresh(waitForCurrentRequest: Bool = false) async {
+        let queuedGeneration = generation
+        if waitForCurrentRequest {
+            while isRefreshing || isLoadingMore {
+                do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
+            }
+        }
+        guard queuedGeneration == generation else { return }
         guard !isRefreshing, !isLoadingMore else { return }
         loadCacheIfNeeded()
         let requestGeneration = generation

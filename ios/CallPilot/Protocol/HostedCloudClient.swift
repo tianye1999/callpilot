@@ -80,20 +80,32 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     // MARK: - PushKit token
 
     func registerVoipToken(_ token: String, environment: ApnsEnvironment) async throws {
+        try await registerPushToken(token, environment: environment, path: "v1/device/push-token")
+    }
+
+    func registerAlertToken(_ token: String, environment: ApnsEnvironment) async throws {
+        try await registerPushToken(token, environment: environment, path: "v1/device/alert-push-token")
+    }
+
+    func unregisterAlertToken() async throws {
+        _ = try await request("DELETE", "v1/device/alert-push-token")
+    }
+
+    private func registerPushToken(_ token: String, environment: ApnsEnvironment, path: String) async throws {
         // APNs device-token size is not a stable API contract. Validate an
         // even-length, bounded byte string rather than hard-coding 32 bytes.
         guard token.wholeMatch(of: /^(?:[A-Fa-f0-9]{2}){32,256}$/) != nil else {
             throw HostedCloudError(
                 statusCode: 0,
                 code: "BAD_PUSH_TOKEN",
-                message: "VoIP push token is invalid"
+                message: "Push token is invalid"
             )
         }
         let body = try JSONSerialization.data(withJSONObject: [
             "token": token.lowercased(),
             "environment": environment.rawValue,
         ])
-        _ = try await request("PUT", "v1/device/push-token", body: body)
+        _ = try await request("PUT", path, body: body)
     }
 
     func unregisterVoipToken() async throws {

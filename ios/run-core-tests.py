@@ -32,6 +32,7 @@ def main():
         "Content/CallHistoryModel.swift", "Content/CallHistoryCache.swift",
         "Content/MessageInboxModel.swift", "Content/MessageCache.swift",
         "Pairing/PairingLink.swift",
+        "Protocol/AlertPushRoute.swift", "Support/PushEnvironment.swift",
     ]
     tests = [
         "PairingLinkTests", "LocalizationTests", "CallKitConfigurationTests", "HostedCloudClientTests",
@@ -39,6 +40,7 @@ def main():
         "CallStatusReducerTests", "CallKitCallRegistryTests", "SettingsStateTests",
         "RootPresentationTests", "ContentModelsTests", "CallContentModelsTests", "PrivacyManifestTests",
         "CallHistoryModelTests", "MessageInboxModelTests",
+        "AlertPushTests",
     ]
     for language in ["en", "zh-Hans"]:
         destination = RESOURCES / (language + ".lproj")

@@ -5111,7 +5111,7 @@ class CallAgentService:
                 self.modem.hangup()
 
         def on_sms(sender: str | None, text: str, sms_ts: str = "") -> None:
-            logger.info("收到短信 来自=%s 时间=%s 字符数=%d", sender or "未知", sms_ts, len(text))
+            logger.info("收到短信")
             # publish 返回是否为新短信：补收 SIM 已存短信 / +CMTI 重复上报时，
             # 去重后重复的一条既不入库也不重复转发邮件（is_new=False 直接跳过）。
             is_new = True

@@ -85,6 +85,12 @@ async function route(request: Request, env: Env, requestId: string): Promise<Res
     return getDevice(request, env);
   }
   if (path === "/v1/device" && request.method === "DELETE") return unpairCurrentDevice(request, env);
+  if (path === "/v1/device/alert-push-token" && request.method === "PUT") {
+    return registerVoipToken(request, env, "alert");
+  }
+  if (path === "/v1/device/alert-push-token" && request.method === "DELETE") {
+    return unregisterVoipToken(request, env, "alert");
+  }
   if (path === "/v1/device/push-token" && request.method === "PUT") {
     return registerVoipToken(request, env);
   }
@@ -291,6 +297,10 @@ async function unpairCurrentDevice(request: Request, env: Env): Promise<Response
     .bind(Date.now(), device.device_id).run();
   await env.DB.prepare("DELETE FROM device_push_tokens WHERE device_id = ?1")
     .bind(device.device_id).run();
+  if (voipPushEnabled(env.ALERT_PUSH_ENABLED)) {
+    await env.DB.prepare("DELETE FROM device_alert_push_tokens WHERE device_id = ?1")
+      .bind(device.device_id).run();
+  }
   await audit(env, "phone", device.device_id, "device.unpaired", device.edge_id, "allowed");
   return json(
     { paired: false },
@@ -308,15 +318,19 @@ async function revokeDevice(request: Request, env: Env, deviceId: string): Promi
   if (!result.meta.changes) throw new HttpError("NOT_FOUND", "Device not found", 404);
   await env.DB.prepare("DELETE FROM device_push_tokens WHERE device_id = ?1")
     .bind(deviceId).run();
+  if (voipPushEnabled(env.ALERT_PUSH_ENABLED)) {
+    await env.DB.prepare("DELETE FROM device_alert_push_tokens WHERE device_id = ?1")
+      .bind(deviceId).run();
+  }
   await audit(env, "edge", edge.edge_id, "device.revoked", deviceId, "allowed");
   return json({ revoked: true });
 }
 
-async function registerVoipToken(request: Request, env: Env): Promise<Response> {
+async function registerVoipToken(request: Request, env: Env, kind: "voip" | "alert" = "voip"): Promise<Response> {
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
   const device = await authenticateDevice(request, env);
-  if (!voipPushEnabled(env.VOIP_PUSH_ENABLED)) {
-    throw new HttpError("FEATURE_DISABLED", "VoIP push is disabled", 403);
+  if (!voipPushEnabled(kind === "voip" ? env.VOIP_PUSH_ENABLED : env.ALERT_PUSH_ENABLED)) {
+    throw new HttpError("FEATURE_DISABLED", kind === "voip" ? "VoIP push is disabled" : "Alert push is disabled", 403);
   }
   if (!env.PUSH_TOKEN_ENCRYPTION_KEY) {
     throw new HttpError("FEATURE_UNAVAILABLE", "VoIP push is unavailable", 503);
@@ -326,8 +340,9 @@ async function registerVoipToken(request: Request, env: Env): Promise<Response> 
     input.token,
     decodeEncryptionKey(env.PUSH_TOKEN_ENCRYPTION_KEY)
   );
+  const table = kind === "voip" ? "device_push_tokens" : "device_alert_push_tokens";
   await env.DB.prepare(
-    "INSERT INTO device_push_tokens(device_id, token_ciphertext, token_nonce, environment, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(device_id) DO UPDATE SET token_ciphertext = excluded.token_ciphertext, token_nonce = excluded.token_nonce, environment = excluded.environment, updated_at = excluded.updated_at"
+    `INSERT INTO ${table}(device_id, token_ciphertext, token_nonce, environment, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(device_id) DO UPDATE SET token_ciphertext = excluded.token_ciphertext, token_nonce = excluded.token_nonce, environment = excluded.environment, updated_at = excluded.updated_at`
   ).bind(
     device.device_id,
     encrypted.ciphertext,
@@ -335,16 +350,20 @@ async function registerVoipToken(request: Request, env: Env): Promise<Response> 
     input.environment,
     Date.now()
   ).run();
-  await audit(env, "phone", device.device_id, "voip_token.registered", device.edge_id, "allowed");
+  await audit(env, "phone", device.device_id, `${kind}_token.registered`, device.edge_id, "allowed");
   return json({ registered: true });
 }
 
-async function unregisterVoipToken(request: Request, env: Env): Promise<Response> {
+async function unregisterVoipToken(request: Request, env: Env, kind: "voip" | "alert" = "voip"): Promise<Response> {
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
   const device = await authenticateDevice(request, env);
-  await env.DB.prepare("DELETE FROM device_push_tokens WHERE device_id = ?1")
+  if (kind === "alert" && !voipPushEnabled(env.ALERT_PUSH_ENABLED)) {
+    throw new HttpError("FEATURE_DISABLED", "Push is disabled", 403);
+  }
+  const table = kind === "voip" ? "device_push_tokens" : "device_alert_push_tokens";
+  await env.DB.prepare(`DELETE FROM ${table} WHERE device_id = ?1`)
     .bind(device.device_id).run();
-  await audit(env, "phone", device.device_id, "voip_token.unregistered", device.edge_id, "allowed");
+  await audit(env, "phone", device.device_id, `${kind}_token.unregistered`, device.edge_id, "allowed");
   return json({ registered: false });
 }
 

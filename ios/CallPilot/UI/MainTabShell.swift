@@ -11,14 +11,13 @@ enum MainTab: String, CaseIterable {
 struct MainTabShell: View {
     @ObservedObject var model: AppModel
 
-    @State private var selectedTab: MainTab = .dial
     @State private var dialPath = NavigationPath()
     @State private var recordsPath = NavigationPath()
     @State private var messagesPath = NavigationPath()
     @State private var settingsPath = NavigationPath()
 
     var body: some View {
-        TabView(selection: $selectedTab) {
+        TabView(selection: $model.selectedTab) {
             NavigationStack(path: $dialPath) {
                 DialView(model: model)
                     .navigationTitle(L10n.text("tab.dial"))
@@ -61,6 +60,10 @@ struct MainTabShell: View {
             }
             .tabItem { Label(L10n.text("tab.settings"), systemImage: "gearshape") }
             .tag(MainTab.settings)
+        }
+        .onChange(of: model.alertRouteID) { _, _ in
+            if model.selectedTab == .messages { messagesPath = NavigationPath() }
+            if model.selectedTab == .records { recordsPath = NavigationPath() }
         }
     }
 }

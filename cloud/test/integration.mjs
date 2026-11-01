@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -11,7 +11,7 @@ import WebSocket from "ws";
 
 const port = 18787;
 const base = `http://127.0.0.1:${port}`;
-const origin = process.env.CALLPILOT_PUBLIC_ORIGIN ?? "https://dial-beta.bondings.ai";
+const origin = process.env.CALLPILOT_PUBLIC_ORIGIN ?? "https://sim-relay.bondings.ai";
 const adminToken = "integration-admin-token-with-at-least-32-characters";
 const livekitSecret = "integration-livekit-secret-with-at-least-32-characters";
 const pushEncryptionKey = Buffer.alloc(32, 7).toString("base64url");
@@ -20,6 +20,9 @@ const edgeKeys = generateKeyPairSync("ed25519");
 const publicDer = edgeKeys.publicKey.export({ format: "der", type: "spki" });
 const publicKey = publicDer.subarray(publicDer.length - 32).toString("base64url");
 const cloudDir = fileURLToPath(new URL("..", import.meta.url));
+const persistDir = mkdtempSync(join(tmpdir(), "callpilot-relay-test-"));
+const localArgs = ["-c", "wrangler.sim-relay.jsonc", "--local", "--persist-to", persistDir,
+  "--env-file", join(cloudDir, "test/empty-vars")];
 const contentFixtureDir = join(cloudDir, "../docs/fixtures/content-sync/v1");
 const wrangler = join(
   cloudDir,
@@ -30,7 +33,7 @@ const wrangler = join(
 
 const migration = spawnSync(
   wrangler,
-  ["d1", "migrations", "apply", "DB", "--local"],
+  ["d1", "migrations", "apply", "DB", ...localArgs],
   { cwd: cloudDir, encoding: "utf8" }
 );
 if (migration.status !== 0) throw new Error(migration.stderr || migration.stdout);
@@ -184,6 +187,11 @@ try {
   });
   assert.equal(disabledPushRegistration.status, 403);
   assert.equal((await disabledPushRegistration.json()).error.code, "FEATURE_DISABLED");
+  const alertHeaders = { "Content-Type": "application/json", Cookie: cookie, Origin: origin };
+  const alertBody = JSON.stringify({ token: "cd".repeat(40), environment: "production" });
+  assert.equal((await fetch(`${base}/v1/device/alert-push-token`, {
+    method: "PUT", headers: alertHeaders, body: alertBody
+  })).status, 403);
 
   worker = await restartWorker(worker, true, true);
   const pushRegistration = await fetch(`${base}/v1/device/push-token`, {
@@ -204,6 +212,66 @@ try {
   assert.equal(storedPushTokens[0].environment, "sandbox");
   assert.notEqual(storedPushTokens[0].token_ciphertext, pushToken);
   assert.equal(JSON.stringify(storedPushTokens).includes(pushToken), false);
+  assert.equal((await fetch(`${base}/v1/device/alert-push-token`, {
+    method: "PUT", headers: { "Content-Type": "application/json", Origin: origin }, body: alertBody
+  })).status, 401);
+  assert.equal((await fetch(`${base}/v1/device/alert-push-token`, {
+    method: "PUT", headers: { ...alertHeaders, Origin: "https://untrusted.test" }, body: alertBody
+  })).status, 403);
+  for (const environment of ["sandbox", "production"]) {
+    assert.equal((await fetch(`${base}/v1/device/alert-push-token`, {
+      method: "PUT", headers: alertHeaders,
+      body: JSON.stringify({ token: "cd".repeat(40), environment })
+    })).status, 200);
+  }
+  const alertRows = d1Rows(`SELECT * FROM device_alert_push_tokens WHERE device_id = '${paired.device.deviceId}'`);
+  assert.equal(alertRows.length, 1);
+  assert.equal(alertRows[0].environment, "production");
+  assert.equal(JSON.stringify(alertRows).includes("cd".repeat(40)), false);
+  assert.equal(d1Rows(`SELECT * FROM device_push_tokens WHERE device_id = '${paired.device.deviceId}'`).length, 1);
+  const alertSocket = new WebSocket(`${base.replace("http", "ws")}/v1/edges/connect`, {
+    headers: edgeHeaders("GET", "/v1/edges/connect", enrollment)
+  });
+  await new Promise((resolve, reject) => {
+    alertSocket.once("open", resolve);
+    alertSocket.once("error", reject);
+  });
+  const alertEvent = { v: 1, type: "device.notify", kind: "sms", eventId: `event_${"a".repeat(64)}` };
+  const invalidAlert = nextMessage(alertSocket);
+  alertSocket.send(JSON.stringify({ ...alertEvent, edgeId: "edge_spoofed" }));
+  assert.equal((await invalidAlert).code, "INVALID_MESSAGE");
+  alertSocket.send(JSON.stringify(alertEvent));
+  alertSocket.send(JSON.stringify(alertEvent));
+  for (let index = 0; index < 25; index++) {
+    alertSocket.send(JSON.stringify({ ...alertEvent, eventId: `event_${index.toString(16).padStart(64, "0")}` }));
+  }
+  await delay(300);
+  let reservations = d1Rows(`SELECT * FROM alert_push_events WHERE edge_id = '${enrollment.edgeId}'`);
+  assert.equal(reservations.length, 20);
+  assert.equal(reservations.filter((row) => row.event_id === alertEvent.eventId).length, 1);
+  alertSocket.close(1000);
+  await new Promise((resolve) => alertSocket.once("close", resolve));
+  // Replay protection survives a Worker restart, not just an in-memory socket map.
+  worker = await restartWorker(worker, true, true);
+  d1Rows(`UPDATE alert_push_events SET created_at = ${Date.now() - 61_000} WHERE edge_id = '${enrollment.edgeId}'`);
+  const replaySocket = new WebSocket(`${base.replace("http", "ws")}/v1/edges/connect`, {
+    headers: edgeHeaders("GET", "/v1/edges/connect", enrollment)
+  });
+  await new Promise((resolve, reject) => {
+    replaySocket.once("open", resolve);
+    replaySocket.once("error", reject);
+  });
+  replaySocket.send(JSON.stringify(alertEvent));
+  replaySocket.send(JSON.stringify({ ...alertEvent, eventId: `event_${"b".repeat(64)}` }));
+  await delay(200);
+  reservations = d1Rows(`SELECT * FROM alert_push_events WHERE edge_id = '${enrollment.edgeId}'`);
+  assert.equal(reservations.length, 21);
+  replaySocket.close(1000);
+  await new Promise((resolve) => replaySocket.once("close", resolve));
+  assert.equal((await fetch(`${base}/v1/device/alert-push-token`, {
+    method: "DELETE", headers: alertHeaders
+  })).status, 200);
+  assert.equal(d1Rows(`SELECT * FROM device_alert_push_tokens WHERE device_id = '${paired.device.deviceId}'`).length, 0);
 
   const pushRemoval = await fetch(`${base}/v1/device/push-token`, {
     method: "DELETE",
@@ -224,7 +292,7 @@ try {
   const grant = spawnSync(
     wrangler,
     [
-      "d1", "execute", "DB", "--local",
+      "d1", "execute", "DB", ...localArgs,
       "--command", `INSERT OR REPLACE INTO content_read_edges(edge_id, created_at) VALUES ('${enrollment.edgeId}', ${Date.now()})`
     ],
     { cwd: cloudDir, encoding: "utf8" }
@@ -726,15 +794,10 @@ try {
   // Application output and every local D1 row remain free of relayed content.
   // Audit rows hold only opaque actor ids plus the closed resource discriminator.
   assert.doesNotMatch(workerOutput, /Synthetic notice fragment|verification value redacted/);
-  const dumpPath = join(tmpdir(), `callpilot-cloud-content-${process.pid}-${Date.now()}.sql`);
-  const exported = spawnSync(
-    wrangler,
-    ["d1", "export", "DB", "--local", "--output", dumpPath],
-    { cwd: cloudDir, encoding: "utf8" }
-  );
-  if (exported.status !== 0) throw new Error(exported.stderr || exported.stdout);
-  const durableDump = readFileSync(dumpPath, "utf8");
-  rmSync(dumpPath, { force: true });
+  const tables = d1Rows("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '_*'");
+  const durableDump = JSON.stringify(d1Rows(tables.map(({ name }) =>
+    `SELECT * FROM "${name.replaceAll('"', '""')}";`
+  ).join(" ")));
   assert.doesNotMatch(
     durableDump,
     /Synthetic notice fragment|verification value redacted|Hello\. Who are you calling for|cursor_messages_fixture_0001/
@@ -747,6 +810,7 @@ try {
   throw error;
 } finally {
   await stopWorker(worker);
+  rmSync(persistDir, { recursive: true, force: true });
 }
 
 async function eventuallyOffers(cookie, predicate, label) {
@@ -851,7 +915,7 @@ function startWorker(reviewPairingEnabled, voipPushEnabled = false) {
   const child = spawn(
     wrangler,
     [
-      "dev", "--local", "--ip", "127.0.0.1", "--port", String(port),
+      "dev", ...localArgs, "--ip", "127.0.0.1", "--port", String(port),
       "--var", `ADMIN_TOKEN:${adminToken}`,
       "--var", "LIVEKIT_API_KEY:integration-key",
       "--var", `LIVEKIT_API_SECRET:${livekitSecret}`,
@@ -862,6 +926,7 @@ function startWorker(reviewPairingEnabled, voipPushEnabled = false) {
       "--var", "CONTENT_READ_EDGE_LIMIT:200",
       "--var", `APP_REVIEW_PAIRING_ENABLED:${reviewPairingEnabled}`,
       "--var", `VOIP_PUSH_ENABLED:${voipPushEnabled}`,
+      "--var", `ALERT_PUSH_ENABLED:${voipPushEnabled}`,
       "--var", `PUSH_TOKEN_ENCRYPTION_KEY:${pushEncryptionKey}`
     ],
     { cwd: cloudDir, stdio: ["ignore", "pipe", "pipe"] }
@@ -881,10 +946,10 @@ async function restartWorker(current, reviewPairingEnabled, voipPushEnabled = fa
 function d1Rows(command) {
   const result = spawnSync(
     wrangler,
-    ["d1", "execute", "DB", "--local", "--json", "--command", command],
+    ["d1", "execute", "DB", ...localArgs, "--json", "--command", command],
     { cwd: cloudDir, encoding: "utf8" }
   );
   if (result.status !== 0) throw new Error(result.stderr || result.stdout);
   const payload = JSON.parse(result.stdout);
-  return payload[0]?.results ?? [];
+  return payload.flatMap((statement) => statement.results ?? []);
 }

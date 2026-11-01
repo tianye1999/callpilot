@@ -210,11 +210,7 @@ extension CallKitCoordinator: PKPushRegistryDelegate {
         let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
         Task { @MainActor [weak self] in
             guard let self else { return }
-            #if DEBUG
-            let environment = ApnsEnvironment.sandbox
-            #else
-            let environment = ApnsEnvironment.production
-            #endif
+            let environment = PushEnvironment.current()
             self.currentToken = (token, environment)
             self.delegate?.callKitDidUpdateToken(token, environment: environment)
         }

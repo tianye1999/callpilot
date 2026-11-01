@@ -4,6 +4,41 @@ import XCTest
 
 @MainActor
 final class MessageInboxModelTests: XCTestCase {
+    func testAlertRefreshWaitsForExistingRequestThenFetchesAgain() async throws {
+        let page = try fixturePage()
+        let client = SuspendedMessageContentClient()
+        let model = MessageInboxModel(client: client, store: InMemoryMessageCacheStore(),
+                                      deviceId: "device_abcdefghijkl")
+        let first = Task { await model.refresh() }
+        while !client.isWaiting { await Task.yield() }
+        let alert = Task { await model.refresh(waitForCurrentRequest: true) }
+        await Task.yield()
+        client.succeed(with: page)
+        await first.value
+        while !client.isWaiting { await Task.yield() }
+        client.succeed(with: page)
+        await alert.value
+        XCTAssertEqual(model.messages, page.items)
+    }
+
+    func testUnpairFencesQueuedAlertRefresh() async throws {
+        let page = try fixturePage()
+        let client = SuspendedMessageContentClient()
+        let model = MessageInboxModel(client: client, store: InMemoryMessageCacheStore(),
+                                      deviceId: "device_abcdefghijkl")
+        let first = Task { await model.refresh() }
+        while !client.isWaiting { await Task.yield() }
+        let alert = Task { await model.refresh(waitForCurrentRequest: true) }
+        // Let the queued refresh capture its generation before clearing content.
+        try await Task.sleep(for: .milliseconds(5))
+        model.clearLocalData()
+        client.succeed(with: page)
+        await first.value
+        await alert.value
+        XCTAssertFalse(client.isWaiting)
+        XCTAssertTrue(model.messages.isEmpty)
+    }
+
     func testSuccessfulRefreshIsLiveAndAdvancesWatermarkOnlyAfterDisplay() async throws {
         let page = try fixturePage()
         let client = FakeMessageContentClient(results: [.success(page)])

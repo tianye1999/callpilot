@@ -732,6 +732,36 @@ def test_cloud_websocket_uses_product_user_agent() -> None:
     assert captured["user_agent_header"] == "CallPilot-Edge/1"
 
 
+def test_cloud_websocket_drains_content_free_alerts(monkeypatch) -> None:
+    from agentcall import remote_alert_push
+
+    monkeypatch.setenv("REMOTE_ALERT_PUSH_ENABLED", "true")
+    monkeypatch.setattr(remote_alert_push, "queue", remote_alert_push.AlertQueue())
+    remote_alert_push.publish("sms")
+    sent = []
+    credential = EdgeCredential("edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40)
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def send(self, message):
+            sent.append(json.loads(message))
+
+        def recv(self, *, timeout):
+            client._stop_event.set()
+            raise TimeoutError(timeout)
+
+    client = CloudEdgeClient("https://relay.example.test", _Service(), _Store(credential),
+                             connect=lambda *_args, **_kwargs: Socket())
+    client._run_connection(credential)
+    assert [message["type"] for message in sent] == ["heartbeat", "device.notify"]
+    assert set(sent[1]) == {"v", "type", "kind", "eventId"}
+
+
 @pytest.mark.parametrize(
     "url",
     [

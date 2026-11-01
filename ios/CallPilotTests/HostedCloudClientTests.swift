@@ -183,6 +183,28 @@ final class HostedCloudClientTests: XCTestCase {
         try await client.registerVoipToken(token, environment: .sandbox)
     }
 
+    func testAlertTokenUsesSeparateAuthenticatedEndpoint() async throws {
+        let token = String(repeating: "AB", count: 40)
+        let client = try makeClient { request in
+            XCTAssertEqual(request.url?.path, "/v1/device/alert-push-token")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Cookie"),
+                           "__Host-callpilot-device=device_abcdefghijkl.secret-value")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Origin"), "https://cloud.example.test")
+            if request.httpMethod == "PUT" {
+                let fields = try XCTUnwrap(JSONSerialization.jsonObject(
+                    with: Self.requestBody(request)
+                ) as? [String: String])
+                XCTAssertEqual(fields, ["token": token.lowercased(), "environment": "sandbox"])
+            } else {
+                XCTAssertEqual(request.httpMethod, "DELETE")
+            }
+            return Self.response(for: request, json: #"{"registered":true}"#)
+        }
+        client.credential = DeviceCredential(deviceId: "device_abcdefghijkl", secret: "secret-value")
+        try await client.registerAlertToken(token, environment: .sandbox)
+        try await client.unregisterAlertToken()
+    }
+
     func testClaimInboundOfferReturnsValidatedSession() async throws {
         // Android parity: HostedCloudClientTest.`claimInboundOffer 成功返回入房凭证`.
         let client = try makeClient(clockMilliseconds: { 1_000 }) { request in

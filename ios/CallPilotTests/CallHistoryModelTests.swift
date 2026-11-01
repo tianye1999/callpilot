@@ -4,6 +4,23 @@ import XCTest
 
 @MainActor
 final class CallHistoryModelTests: XCTestCase {
+    func testAlertRefreshWaitsForExistingRequestThenFetchesAgain() async throws {
+        let page = try fixture(CallRecordsPage.self, "call-records-page.json")
+        let client = SuspendedCallRecordContentClient()
+        let model = CallHistoryModel(client: client, store: InMemoryCallHistoryCacheStore(),
+                                     deviceId: "device_abcdefghijkl")
+        let first = Task { await model.refresh() }
+        while !client.isListWaiting { await Task.yield() }
+        let alert = Task { await model.refresh(waitForCurrentRequest: true) }
+        await Task.yield()
+        client.succeedList(page)
+        await first.value
+        while !client.isListWaiting { await Task.yield() }
+        client.succeedList(page)
+        await alert.value
+        XCTAssertEqual(model.records, page.items)
+    }
+
     func testRefreshLoadsListAndLateRevisionReplacesInPlaceWithoutDuplicate() async throws {
         let initial = try fixture(CallRecordsPage.self, "call-records-page.json")
         let readyDetail = try fixture(CallRecordDetail.self, "call-record-detail-ready.json")
@@ -316,11 +333,18 @@ private final class InMemoryCallHistoryCacheStore: CallHistoryCacheStoring {
 
 @MainActor
 private final class SuspendedCallRecordContentClient: CallRecordContentClient {
+    private var listContinuation: CheckedContinuation<CallRecordsPage, Error>?
+    var isListWaiting: Bool { listContinuation != nil }
     private var detailContinuation: CheckedContinuation<CallRecordDetail, Error>?
     var isDetailWaiting: Bool { detailContinuation != nil }
 
     func listCallRecords(limit: Int, cursor: String?) async throws -> CallRecordsPage {
-        throw URLError(.unsupportedURL)
+        try await withCheckedThrowingContinuation { listContinuation = $0 }
+    }
+
+    func succeedList(_ page: CallRecordsPage) {
+        listContinuation?.resume(returning: page)
+        listContinuation = nil
     }
 
     func getCallRecord(callId: String) async throws -> CallRecordDetail {

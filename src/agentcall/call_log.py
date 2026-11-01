@@ -179,6 +179,9 @@ class CallRecord:
         self._downlink: list[tuple[int, bytes]] = []  # (上行位置, AI PCM)
         self._answered = False
         self._finished = False
+        self._persisted_status: str | None = None
+        self._alert_summary_ready = False
+        self._alert_notified = False
 
     # ---- 热路径：只做内存追加 ----
 
@@ -230,11 +233,13 @@ class CallRecord:
     def set_summary(self, summary: dict) -> None:
         """写 summary.json 并记一条 summary 事件。"""
         with self._disk_lock:
+            saved = False
             try:
                 (self.path / "summary.json").write_text(
                     json.dumps(summary, ensure_ascii=False, indent=2, default=str),
                     encoding="utf-8",
                 )
+                saved = True
             except OSError as exc:
                 logger.warning("写入 %s/summary.json 失败: %s", self.id, exc)
             self.log_event("summary", summary=summary)
@@ -246,6 +251,10 @@ class CallRecord:
                 )
                 summary_state = self._summary_state
             self._update_content_meta(content_updated_at, summary_state)
+            self._alert_summary_ready = saved and summary.get("ok") is True and bool(
+                str(summary.get("summary") or "").strip()
+            )
+            self._publish_remote_alert()
         from .notification_events import publish_notification
 
         publish_notification("summary_written", self.id, self.number, summary)
@@ -322,6 +331,8 @@ class CallRecord:
                 (self.path / "meta.json").write_text(
                     json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
+                self._persisted_status = status
+                self._publish_remote_alert()
             except OSError as exc:
                 logger.error("落盘通话记录 %s 失败: %s", self.id, exc)
             # metrics.json（WIL-95 第一期）：每通一条汇总，带 schema_version。
@@ -343,6 +354,20 @@ class CallRecord:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("生成 %s/metrics.json 失败: %s", self.id, exc)
+
+    def _publish_remote_alert(self) -> None:
+        # Called under disk_lock, after content persistence. Match the phone's
+        # incoming-call classification and suppress owner-handled calls.
+        if (self._alert_notified or self._persisted_status is None
+                or self.direction != "inbound"
+                or self.source in {"remote_web_dialer", "REMOTE_HANDSET"}):
+            return
+        from .remote_alert_push import publish
+
+        missed = not self._answered or self._persisted_status.lower() != "completed"
+        if missed or self._alert_summary_ready:
+            self._alert_notified = True
+            publish("missed_call" if missed else "call_digest", self.public_id)
 
     def _update_content_meta(
         self, content_updated_at: float, summary_state: str
