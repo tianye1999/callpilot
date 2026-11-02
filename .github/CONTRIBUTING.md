@@ -131,10 +131,12 @@ Be respectful and constructive; assume good faith and help newcomers.
 - **Never commit secrets.** `.env` is git-ignored — keep your `DASHSCOPE_API_KEY`
   and other credentials there, never in code, tests, issues, or PRs. Scrub keys,
   phone numbers, and SIM numbers from any logs you paste.
-- **Outbound-calling compliance is on you.** When testing outbound/batch dialing,
-  use the dial whitelist and dial **your own numbers**. Respect anti-harassment /
-  telemarketing law and recording-consent law in your jurisdiction. CallPilot is
-  **not** for emergency calls.
+- **Outbound-calling compliance is on you.** Use the dial whitelist. Real-machine
+  dialing is limited to one target: the free customer-service hotline of the carrier
+  your SIM belongs to. Identify the carrier from the SIM first and check the number
+  on screen before dialing. Never dial any other real number — keep those as offline
+  test data only. Respect anti-harassment / telemarketing law and recording-consent
+  law in your jurisdiction. CallPilot is **not** for emergency calls.
 - Don't add code that auto-dials third parties, exfiltrates call data, or weakens
   the local-only storage of recordings.
 
@@ -229,7 +231,8 @@ cp .env.example .env                 # 然后按需编辑 .env
 
 - **绝不提交任何密钥。** `.env` 已 git 忽略——`DASHSCOPE_API_KEY` 等凭证只放这里，
   不进代码、测试、issue 或 PR。粘贴日志前请把 Key、手机号、SIM 卡号脱敏。
-- **外呼合规由你负责。** 测试外呼/批量呼叫时用拨号白名单、拨**你自己的号码**；遵守
+- **外呼合规由你负责。** 使用拨号白名单；真机拨测只拨本卡运营商的免费客服号：先按 SIM
+  识别运营商，拨号前核对屏幕号码；其他真实号码只作离线测试数据，绝不真机拨出。遵守
   当地反骚扰/营销法规与录音同意法规。CallPilot **不用于**紧急电话。
 - 不要添加会自动拨打第三方、外泄通话数据、或削弱录音本地存储的代码。
 

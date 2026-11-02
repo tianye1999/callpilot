@@ -293,9 +293,13 @@ stapled, and self-verified.
 
 ### Verify it works, without a human on the line
 
-- **Dial your own mobile**: the simplest check — pick up and you hear the AI talk.
-- **Dial your carrier's customer-service hotline** (an IVR that speaks back): if the AI
-  holds a coherent multi-turn exchange with the voice menu, both audio directions work.
+- **Dial the free customer-service hotline of your SIM's own carrier** (an IVR that
+  speaks back): if the AI holds a coherent multi-turn exchange with the voice menu,
+  both audio directions work. This is the only real-machine dialing target — identify
+  the carrier from the SIM first (mainland China: China Mobile 10086 / China Telecom
+  10000 / China Unicom 10010; elsewhere use the carrier's published free number and
+  verify it before dialing) and check the number on screen before dialing. Never dial
+  any other real number; keep those as offline test data only.
 - **SMS a balance query to your carrier's service number**: you should receive a reply
   SMS — proves send + receive, including non-ASCII (UCS2) decoding.
 - **Run the hardware regression script**: `.venv/bin/python scripts/regression_call.py --task "check plan usage"`
@@ -327,7 +331,9 @@ New-user install & first-run Q&A: [`docs/faq.md`](docs/faq.md) (Chinese).
   and change it later in Settings or with `RECORDING_ENABLED=false`. You are
   responsible for obtaining any consent the law requires.
 - **Anti-harassment / telemarketing rules apply** to outbound and batch dialing.
-  Use the dial whitelist and dial your own numbers for testing.
+  Use the dial whitelist; for real-machine testing, dial only the free customer-service
+  hotline of your SIM's own carrier. Never dial other real numbers — they are offline
+  test data only.
 - **You bear all carrier charges and API costs.**
 - **Your API keys stay in your local `.env`** (git-ignored). Never commit them.
 - **SMS-to-email forwarding is a data export.** It is disabled by default; when
@@ -573,7 +579,10 @@ macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=
 
 ### 无需真人也能自测
 
-- **拨你的运营商客服/IVR 热线**：若 AI 能与语音菜单连贯多轮对话，说明双向语音都通。
+- **拨本卡运营商的免费客服/IVR 热线**（中国大陆：移动 10086 / 电信 10000 / 联通 10010；
+  其他地区以当地运营商公布的免费客服号为准，拨前先查证）：若 AI 能与语音菜单连贯多轮对话，
+  说明双向语音都通。真机拨测只认这一种目标，拨号前核对屏幕号码；其他真实号码只作离线测试数据，
+  绝不真机拨出。
 - **向运营商服务号发送余额查询短信**：会收到回复短信，验证发+收+中文编解码全链路。
 - **跑真机回归脚本**：`.venv/bin/python scripts/regression_call.py --task "查询套餐使用情况"`
   会通过本地 Web API 发起一通测试外呼、等待录音并以 PASS/FAIL 退出；加 `--no-dial`
@@ -596,7 +605,8 @@ macOS 上 `CallPilot.app` 是**菜单栏 App**：顶栏一个电话图标（绿=
 
 **上真机前务必阅读。** 不用于紧急电话；通话录音**默认关闭**，首启时需明确选择，开启后
 仅存储在本地，可在设置面板或 `RECORDING_ENABLED=false` 关闭——是否录音、是否需征得对方同意由你按
-当地法律负责；外呼/批量呼叫须遵守反骚扰与营销合规；运营商资费与 API 费用由你自行
+当地法律负责；外呼/批量呼叫须遵守反骚扰与营销合规，真机拨测只拨本卡运营商的免费客服号，
+其他真实号码只作离线测试数据、绝不真机拨出；运营商资费与 API 费用由你自行
 承担；API Key 和 SMTP 应用密码只存于本地 `.env`（已 git 忽略），切勿提交。短信邮件
 转发默认关闭；开启后，短信发件号码、接收时间和正文会离开 App 并发往配置邮箱。本软件按「原样」提供，
 不作任何担保（Apache-2.0）。

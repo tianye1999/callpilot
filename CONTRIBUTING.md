@@ -41,9 +41,12 @@ Quality gate before opening a PR (all three must pass):
 ## Ground rules
 
 - **Never commit secrets.** API keys and SMTP passwords live only in the git-ignored `.env`.
-- **Real-machine dialing:** for testing, dial your own number or your carrier's free
-  customer-service hotline. Respect anti-harassment, telemarketing, and call-recording
-  laws in your jurisdiction — you are responsible for any consent the law requires.
+- **Real-machine dialing:** real outbound testing is limited to one target — the free
+  customer-service hotline of the carrier your SIM belongs to. Identify the carrier
+  from the SIM first and check the number on screen before dialing. Other real numbers
+  are offline test data only and must never be dialed. Respect anti-harassment,
+  telemarketing, and call-recording laws in your jurisdiction — you are responsible
+  for any consent the law requires.
 - Keep PRs focused; describe what you changed and how you verified it.
 
 ## License

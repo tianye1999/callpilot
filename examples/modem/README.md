@@ -56,8 +56,11 @@ From the repo root:
 ## Safety
 
 - `dial_call.py` and `send_sms.py` perform **real** telephony and may incur carrier
-  charges. Only dial/text numbers you are authorized to contact (your own phone, a
-  carrier service hotline such as `10000`/`10086`, etc.).
+  charges. Real-machine dialing is limited to one target: the free customer-service
+  hotline of the carrier your SIM belongs to (the `10000`/`10086` above are examples
+  for China Telecom / China Mobile). Identify the carrier from the SIM first and
+  check the number on screen before dialing. Never dial any other real number — keep
+  those as offline test data only.
 - `send_dtmf.py` only does something useful during an active call — pair it with
   `dial_call.py`.
 
