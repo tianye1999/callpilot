@@ -62,7 +62,11 @@ line-length = 120
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I"]
+select = ["E", "F", "W", "I", "PLW1514"]
+# PLW1514 catches text-mode open()/read_text() without encoding=, which only the
+# Windows CI used to reveal (cp1252). It is a preview rule: enable just this one.
+preview = true
+explicit-preview-rules = true
 
 [tool.ruff.lint.per-file-ignores]
 # Ad-hoc recording analysis script kept in its compact exploratory style for now;

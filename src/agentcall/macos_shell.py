@@ -460,7 +460,7 @@ def restore_geometry(path: Path, screens: list[Geometry]) -> Geometry:
     sx, sy, sw, sh = screens[0]
     geometry = (sx + max(0, (sw - 1100) // 2), sy + max(0, (sh - 780) // 2), 1100, 780)
     try:
-        value = json.loads(path.read_text())
+        value = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(value, list) and len(value) == 4 and all(type(v) is int for v in value):
             if value[2] > 0 and value[3] > 0:
                 geometry = tuple(value)  # type: ignore[assignment]

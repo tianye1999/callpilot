@@ -30,7 +30,7 @@ def _bridge_running(pid: object) -> bool:
     import fcntl
 
     try:
-        with BRIDGE_LOCK_PATH.open("r") as lock:
+        with BRIDGE_LOCK_PATH.open("r", encoding="utf-8") as lock:
             if str(pid) != lock.read().strip():
                 return False
             try:
