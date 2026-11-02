@@ -71,6 +71,89 @@ class _Store:
         return "proof"
 
 
+def test_v2_reservation_acknowledges_before_sdp_and_never_reclaims(monkeypatch):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+
+    class Service(_Service):
+        def supply_inbound_direct_sdp(self, command, reply):
+            direct = self.claims[0]["issued"].direct
+            return direct.supply_sdp(command["direct"]["sdpOffer"], command["direct"]["iceServers"], reply)
+
+    service = Service()
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    messages = []
+    reserve = _takeover_claim(direct={"deferred": True})
+    client.handle_message(json.dumps(reserve), messages.append)
+    assert len(service.claims) == len(messages) == 1
+    ack = json.loads(messages[0])
+    assert ack["type"] == "inbound.answer" and ack["status"] == "accepted"
+    assert "sdpAnswer" not in ack
+    direct = service.claims[0]["issued"].direct
+    assert direct.media_offer() is None
+    submit = {**reserve, "type": "inbound.media.sdp", "commandId": "command_sdp_abcdefghijkl",
+              "direct": {"sdpOffer": "v=0\r\n", "iceServers": [
+                  {"urls": ["stun:stun.example.test:3478"]},
+                  {"urls": ["turn:turn.example.test:3478"], "username": "test", "credential": "test"},
+              ]}}
+    client.handle_message(json.dumps(submit), messages.append)
+    assert len(messages) == 1 and len(service.claims) == 1
+    assert direct.media_offer()[0] == "v=0\r\n"
+    direct.reply("v=0\r\nanswer", None)
+    answer = json.loads(messages[-1])
+    assert answer["commandId"] == submit["commandId"] and answer["sdpAnswer"] == "v=0\r\nanswer"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_v2_turn_prepare_is_scoped_and_never_claims(monkeypatch, enabled):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", str(enabled).lower())
+    service = _Service()
+    prepared = []
+    monkeypatch.setattr(service, "prepare_inbound_direct", prepared.append, raising=False)
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    value = _takeover_claim()
+    del value["claimId"], value["session"]
+    value.update(type="inbound.prepare", mode="phone_first", expiresAtUnixMs=round(time.time() * 1000) + 5000,
+                 direct={"iceServers": [{"urls": ["stun:stun.example.test:3478"]}]})
+    sent = []
+    client.handle_message(json.dumps(value), sent.append)
+    assert len(prepared) == int(enabled)
+    assert not sent and not service.claims
+    value["nonce"] = "bad"
+    client.handle_message(json.dumps(value), sent.append)
+    assert len(prepared) == int(enabled)
+
+
+@pytest.mark.parametrize("direct", [{"deferred": False}, {"deferred": "true"}, {"deferred": True, "sdpOffer": "v=0"}])
+def test_v2_malformed_reservation_never_reaches_service(monkeypatch, direct):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+    service = _Service()
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    sent = []
+    client.handle_message(json.dumps(_takeover_claim(direct=direct)), sent.append)
+    assert not service.claims and not sent
+
+
+@pytest.mark.parametrize("enabled, accepted", [(False, True), (True, False), (True, True)])
+def test_v2_control_plane_end_has_correlated_reply_without_reclaim(monkeypatch, enabled, accepted):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", str(enabled).lower())
+    service = _Service()
+    ended = []
+
+    def end(command):
+        ended.append(command)
+        return accepted
+
+    monkeypatch.setattr(service, "end_inbound_direct", end, raising=False)
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    sent = []
+    command = _takeover_claim(type="inbound.media.end")
+    client.handle_message(json.dumps(command), sent.append)
+    assert len(ended) == int(enabled) and not service.claims
+    reply = json.loads(sent[0])
+    assert reply["type"] == "inbound.answer" and reply["commandId"] == command["commandId"]
+    assert reply["status"] == ("accepted" if enabled and accepted else "rejected")
+
+
 class _ContentRepository:
     def __init__(self, body: dict | None = None, error: str | None = None) -> None:
         self.body = body or {
