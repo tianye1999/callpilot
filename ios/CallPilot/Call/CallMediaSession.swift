@@ -28,6 +28,8 @@ final class CallMediaSession {
     private var setupTask: Task<Void, Error>?
     // Answer setup replaces setupTask; retain silent work for cancellation and drain.
     private var silentSetupTask: Task<Void, Error>?
+    private var silentAudioLeaseTask: Task<Void, Error>?
+    private var silentTeardownTask: Task<Void, Never>?
     private var silentPreconnectPending = false
     private var microphoneTask: Task<Void, Error>?
     private var controlTasks: [UUID: Task<Void, Error>] = [:]
@@ -62,13 +64,14 @@ final class CallMediaSession {
         let task = Task {
             defer { silentPreconnectPending = false }
             try checkCurrent(attempt)
-            async let acquiring: Void = acquireSilentAudioLease(for: attempt)
+            let acquiring = Task { try await acquireSilentAudioLease(for: attempt) }
+            silentAudioLeaseTask = acquiring
             // Start the request before the lease's synchronous native audio preparation.
             timing.mark(.prepareStart)
             let candidate = try await client.prepareInboundOffer(offerId: offer.offerId)
             try checkCurrent(attempt)
             timing.mark(.prepareResponse)
-            try await acquiring
+            try await acquiring.value
             try checkCurrent(attempt)
             let connection = transportFactory()
             // The factory is synchronous, but may reenter session cancellation.
@@ -126,22 +129,23 @@ final class CallMediaSession {
         try checkCurrent(attempt)
     }
 
-    private func closeSilentTransport(_ pending: Task<Void, Error>?) async {
+    private func closeSilentTransport(_ pending: Task<Void, Error>?) {
         preconnectReady = false
+        silentPreconnectPending = false
         permissionReady = false
         preparation = nil
-        pending?.cancel()
         let old = silentTransport
+        silentTransport = nil
         if let old, transport === old { transport = nil }
         old?.eventHandler = nil
-        await old?.disconnect()
-        _ = await pending?.result
-        // Re-read after draining: clean up the actual silent connection, never a cold one.
-        let settled = silentTransport
-        if let settled, transport === settled { transport = nil }
-        settled?.eventHandler = nil
-        await settled?.disconnect()
-        silentTransport = nil
+        pending?.cancel()
+        // SDK disconnect/connect may stall. Neither may delay the cold claim.
+        silentTeardownTask = Task {
+            await old?.disconnect()
+            _ = await pending?.result
+            // Reap a late connect using only the detached connection, never the cold one.
+            await old?.disconnect()
+        }
     }
 
     init(onState: @escaping StateHandler,
@@ -204,14 +208,19 @@ final class CallMediaSession {
             let candidate = preconnectReady ? preparation : nil
             if silentOfferId != nil && candidate == nil {
                 timing.mark(.coldFallback)
-                await closeSilentTransport(silentTask)
+                closeSilentTransport(silentTask)
                 try checkCurrent(attempt)
             }
             if !audioLeaseAcquired {
-                timing.mark(.audioLeaseStart)
-                try await audio.acquire(ownerID, mode: mode)
-                audioLeaseAcquired = true
-                timing.mark(.audioLeaseEnd)
+                if let silentAudioLeaseTask {
+                    // Share the in-flight lease, not the cancelled silent SDK setup.
+                    try await silentAudioLeaseTask.value
+                } else {
+                    timing.mark(.audioLeaseStart)
+                    try await audio.acquire(ownerID, mode: mode)
+                    audioLeaseAcquired = true
+                    timing.mark(.audioLeaseEnd)
+                }
             }
             try checkCurrent(attempt)
             timing.startClaim()
@@ -233,7 +242,7 @@ final class CallMediaSession {
             }
             if candidate != nil {
                 timing.mark(.coldFallback)
-                await closeSilentTransport(silentTask)
+                closeSilentTransport(silentTask)
                 try checkCurrent(attempt)
             }
             silentOfferId = nil
@@ -542,6 +551,8 @@ final class CallMediaSession {
         generation &+= 1
         let setup = setupTask
         let silentSetup = silentSetupTask
+        let silentAudioLease = silentAudioLeaseTask
+        let silentTeardown = silentTeardownTask
         let microphone = microphoneTask
         let controls = Array(controlTasks.values)
         let telemetry = timingTask
@@ -549,10 +560,13 @@ final class CallMediaSession {
         timingTask = nil
         setup?.cancel()
         silentSetup?.cancel()
+        silentAudioLease?.cancel()
         microphone?.cancel()
         controls.forEach { $0.cancel() }
         setupTask = nil
         silentSetupTask = nil
+        silentAudioLeaseTask = nil
+        silentTeardownTask = nil
         microphoneTask = nil
         controlTasks.removeAll()
         connectedHandler = nil
@@ -574,6 +588,8 @@ final class CallMediaSession {
             // the SDK's unstructured concurrent-mic child task.
             _ = await setup?.result
             _ = await silentSetup?.result
+            _ = await silentAudioLease?.result
+            await silentTeardown?.value
             _ = await microphone?.result
             for control in controls { _ = await control.result }
             await telemetry?.value

@@ -4,6 +4,153 @@ import XCTest
 
 @MainActor
 final class CallMediaSessionTests: XCTestCase {
+    func testColdClaimAfterThreeSecondsDoesNotWaitForStuckSilentTeardown() async throws {
+        try await assertDetachedSilentTeardown(stopBeforeDrain: false)
+    }
+
+    func testTerminationHoldsAudioLeaseUntilDetachedSilentTeardownFinishes() async throws {
+        try await assertDetachedSilentTeardown(stopBeforeDrain: true)
+    }
+
+    func testReadyPreconnectRejectedAsColdDoesNotWaitForStuckDisconnect() async throws {
+        try await assertDetachedSilentTeardown(stopBeforeDrain: false, readyBeforeAnswer: true)
+    }
+
+    private func assertDetachedSilentTeardown(stopBeforeDrain: Bool, readyBeforeAnswer: Bool = false) async throws {
+        let claimReceived = expectation(description: "claim reaches server before silent teardown is released")
+        let client = try makePreparedClient(mode: "cold", onClaim: { claimReceived.fulfill() })
+        let silent = FakeCallMediaTransport(), cold = FakeCallMediaTransport()
+        let connectGate = ManualGate(), disconnectGate = ManualGate()
+        let finalDisconnectGate = ManualGate()
+        silent.silentConnectGate = connectGate
+        silent.disconnectGate = disconnectGate
+        if stopBeforeDrain { silent.thirdDisconnectGate = finalDisconnectGate }
+        silent.ignoreSilentCancellation = true
+        defer { connectGate.open(); disconnectGate.open(); finalDisconnectGate.open() }
+        let device = TestCallAudioDevice()
+        let audio = CallAudioOwner(device: device, onCleanupError: { _ in XCTFail("cleanup") })
+        var factoryCount = 0
+        var states: [CallState] = []
+        var claimedAt: ContinuousClock.Instant?
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: {
+            factoryCount += 1
+            return factoryCount == 1 ? silent : cold
+        }, audio: audio)
+        let preparing = Task { await media.startSilentPreconnect(client: client,
+            offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
+        await waitUntil { connectGate.didStart }
+        if readyBeforeAnswer {
+            connectGate.open()
+            await preparing.value
+        }
+        let owner = audio.owner
+        XCTAssertNotNil(owner)
+        let lateHandler = silent.eventHandler
+        let answeredAt = ContinuousClock.now
+        let answering = Task { await media.startTakeover(client: client,
+            offerId: "offer_abcdefghijkl", usesCallKit: true,
+            onClaimed: { claimedAt = .now }, onConnected: {}) }
+        await fulfillment(of: [claimReceived], timeout: readyBeforeAnswer ? 1 : 4)
+        await waitUntil { cold.operations.contains(.connect) }
+        XCTAssertEqual(factoryCount, 2)
+        XCTAssertEqual(cold.operations.filter { $0 == .connect }.count, 1)
+        XCTAssertNotNil(claimedAt)
+        if let claimedAt {
+            if !readyBeforeAnswer {
+                XCTAssertGreaterThanOrEqual(answeredAt.duration(to: claimedAt), .seconds(3))
+            }
+            XCTAssertLessThan(answeredAt.duration(to: claimedAt), readyBeforeAnswer ? .seconds(1) : .seconds(4))
+        }
+        await waitUntil { disconnectGate.didStart }
+        XCTAssertFalse(silent.operations.contains(.disconnect))
+        XCTAssertNil(silent.eventHandler)
+        XCTAssertNil(field(media, "silentTransport", as: FakeCallMediaTransport.self))
+        XCTAssertNil(field(media, "preparation", as: InboundPreparation.self))
+        XCTAssertEqual(field(media, "preconnectReady", as: Bool.self), false)
+        XCTAssertTrue(field(media, "transport", as: FakeCallMediaTransport.self) === cold)
+        let events: [CallMediaTransportEvent] = [
+            .permissionsReady(true), .tracksChanged,
+            .data(Data(#"{"type":"status","status":"connected","clientTimingVersion":1}"#.utf8),
+                  topic: CallPilotTopic.status),
+            .timing(.downlinkFirstFrame, at: CallMonotonic.now()),
+            .disconnected(reason: "late_silent_disconnect"),
+        ]
+        let before = states
+        for event in events { await lateHandler?(event) }
+        XCTAssertEqual(states, before)
+        XCTAssertEqual(field(media, "permissionReady", as: Bool.self), false)
+        XCTAssertNil(timingMarks(media)[.downlinkFirstFrame])
+        XCTAssertEqual(device.modes, [.callKit])
+
+        var stopped = false
+        let stopping: Task<Void, Never>? = stopBeforeDrain ? Task {
+            await media.stop()
+            stopped = true
+        } : nil
+        let next = UUID()
+        var nextAcquired = false
+        var acquiring: Task<Void, Error>?
+        if stopBeforeDrain {
+            await waitUntil { cold.operations.contains(.disconnect) }
+            acquiring = Task {
+                try await audio.acquire(next, mode: .standalone)
+                nextAcquired = true
+            }
+            await Task.yield()
+            XCTAssertFalse(stopped)
+            XCTAssertFalse(nextAcquired)
+            XCTAssertEqual(audio.owner, owner)
+        }
+        if !stopBeforeDrain && !readyBeforeAnswer {
+            // A cancelled SDK connect can succeed before its stuck disconnect returns.
+            connectGate.open()
+            await waitUntil { silent.silentConnectReturnCount == 1 }
+            XCTAssertNil(timingMarks(media)[.preconnectReady])
+            XCTAssertTrue(field(media, "transport", as: FakeCallMediaTransport.self) === cold)
+        }
+        // Even a completed disconnect must not release the lease while connect is stuck.
+        disconnectGate.open()
+        await waitUntil { silent.operations.contains(.disconnect) }
+        if stopBeforeDrain {
+            XCTAssertFalse(stopped)
+            XCTAssertFalse(nextAcquired)
+            XCTAssertEqual(audio.owner, owner)
+        }
+        connectGate.open()
+        await preparing.value
+        let joined = await answering.value
+        if stopBeforeDrain {
+            // The silent task has settled, but the background reaper still owns work.
+            await waitUntil { finalDisconnectGate.didStart }
+            XCTAssertFalse(stopped)
+            XCTAssertFalse(nextAcquired)
+            XCTAssertEqual(audio.owner, owner)
+            finalDisconnectGate.open()
+        }
+        await stopping?.value
+        try await acquiring?.value
+        if stopBeforeDrain {
+            XCTAssertEqual(audio.owner, next)
+            XCTAssertTrue(nextAcquired)
+            await audio.release(next, after: {}).value
+        } else {
+            XCTAssertTrue(joined)
+            for event in events { await lateHandler?(event) }
+            XCTAssertEqual(states, before)
+            XCTAssertTrue(field(media, "transport", as: FakeCallMediaTransport.self) === cold)
+            XCTAssertNil(field(media, "preparation", as: InboundPreparation.self))
+            XCTAssertEqual(field(media, "preconnectReady", as: Bool.self), false)
+            if !readyBeforeAnswer { XCTAssertNil(timingMarks(media)[.preconnectReady]) }
+            XCTAssertFalse(cold.operations.contains(.disconnect))
+            await media.stop()
+        }
+        XCTAssertGreaterThanOrEqual(silent.operations.filter { $0 == .disconnect }.count, 2)
+        XCTAssertEqual(cold.operations.filter { $0 == .connect }.count, 1)
+        XCTAssertEqual(silent.microphoneEnableCount, 0)
+        XCTAssertTrue(silent.subscriptions.isEmpty)
+        XCTAssertNil(audio.owner)
+    }
+
     func testTerminalResetAndDroppingMediaKeepHangupAndAudioCleanupAheadOfNextCall() async throws {
         let client = try makeTakeoverClient(offerId: "offer_previouscall")
         let device = TestCallAudioDevice()
@@ -477,7 +624,7 @@ final class CallMediaSessionTests: XCTestCase {
         }
     }
 
-    func testColdFallbackClosesPreparedTransportBeforeConnectingAndKeepsLease() async throws {
+    func testColdFallbackDetachesPreparedTransportBeforeConnectingAndKeepsLease() async throws {
         let client = try makePreparedClient(mode: "cold")
         let silent = FakeCallMediaTransport(), cold = FakeCallMediaTransport()
         let device = TestCallAudioDevice()
@@ -485,7 +632,7 @@ final class CallMediaSessionTests: XCTestCase {
         var count = 0
         let media = CallMediaSession(onState: { _ in }, transportFactory: {
             count += 1
-            if count == 2 { XCTAssertTrue(silent.operations.contains(.disconnect)) }
+            if count == 2 { XCTAssertNil(silent.eventHandler) }
             return count == 1 ? silent : cold
         }, audio: audio)
         await media.startSilentPreconnect(client: client, offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999))
@@ -500,7 +647,7 @@ final class CallMediaSessionTests: XCTestCase {
         await media.stop()
     }
 
-    func testAnswerDuringSilentConnectCancelsAndDrainsBeforeSingleColdClaim() async throws {
+    func testAnswerDuringSilentConnectCancelsAndEventuallyDrainsWithSingleColdClaim() async throws {
         let client = try makePreparedClient(mode: "cold")
         let silent = FakeCallMediaTransport(), cold = FakeCallMediaTransport()
         silent.connectGate = ConnectGate()
@@ -553,7 +700,7 @@ final class CallMediaSessionTests: XCTestCase {
     }
 
     private func makePreparedClient(mode: String, prepareGate: ResponseGate? = nil,
-                                    failPrepare: Bool = false) throws -> HostedCloudClient {
+                                    failPrepare: Bool = false, onClaim: (() -> Void)? = nil) throws -> HostedCloudClient {
         MediaMockURLProtocol.requestHandler = { request in
             if request.url?.path == "/v1/inbound-offers/prepare" {
                 prepareGate?.wait()
@@ -562,6 +709,7 @@ final class CallMediaSessionTests: XCTestCase {
                     json: #"{"prepareId":"prepare_abcdefghijkl","roomName":"callpilot_abcdefghijkl","participantIdentity":"web_abcdefghijkl","url":"wss://lk.example.com","token":"restricted-token","expiresAt":9999}"#)
             }
             XCTAssertEqual(request.url?.path, "/v1/inbound-offers/claim")
+            onClaim?()
             return Self.httpResponse(for: request, statusCode: 202,
                 json: "{\"claimId\":\"claim_abcdefghijkl\",\"offerId\":\"offer_abcdefghijkl\",\"roomName\":\"callpilot_abcdefghijkl\",\"participantIdentity\":\"web_abcdefghijkl\",\"edgeIdentity\":\"edgepart_abcdefghijkl\",\"url\":\"wss://winner.example.com\",\"token\":\"winner-token\",\"expiresAt\":9999,\"mode\":\"\(mode)\"}")
         }
@@ -1411,6 +1559,26 @@ final class CallMediaSessionTests: XCTestCase {
 }
 
 @MainActor
+private final class ManualGate {
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
+    private(set) var didStart = false
+
+    func wait() async {
+        didStart = true
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuations.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = continuations
+        continuations.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+@MainActor
 private final class ConnectGate {
     private var continuation: CheckedContinuation<Void, Never>?
     private(set) var didStart = false
@@ -1461,6 +1629,7 @@ private enum FakeTransportOperation: Equatable {
 @MainActor
 private final class FakeCallMediaTransport: CallMediaTransport {
     var silentConnectCount = 0
+    var silentConnectReturnCount = 0
     var silentConnectError: Error?
     var ignoreSilentCancellation = false
     var connectedURLs: [String] = []
@@ -1471,6 +1640,10 @@ private final class FakeCallMediaTransport: CallMediaTransport {
     var eventsDuringConnect: [CallMediaTransportEvent] = []
     var onConnect: (() -> Void)?
     var connectGate: ConnectGate?
+    var silentConnectGate: ManualGate?
+    var disconnectGate: ManualGate?
+    var thirdDisconnectGate: ManualGate?
+    var disconnectCount = 0
     var dialPublishGate: PublishGate?
     var dtmfPublishGate: PublishGate?
     var concurrentMicrophone: Bool?
@@ -1520,9 +1693,11 @@ private final class FakeCallMediaTransport: CallMediaTransport {
 
     func connectSilent(url: String, token: String) async throws {
         silentConnectCount += 1
+        await silentConnectGate?.wait()
         if let connectGate { await connectGate.wait() }
         if !ignoreSilentCancellation { try Task.checkCancellation() }
         if let silentConnectError { throw silentConnectError }
+        silentConnectReturnCount += 1
     }
 
     func subscribeToEdge(_ identity: String) async throws { subscriptions.append(identity) }
@@ -1558,6 +1733,9 @@ private final class FakeCallMediaTransport: CallMediaTransport {
     }
 
     func disconnect() async {
+        disconnectCount += 1
+        if disconnectCount == 3 { await thirdDisconnectGate?.wait() }
+        await disconnectGate?.wait()
         operations.append(.disconnect)
         connectGate?.open()
         hangupDisconnectGate?.open()
