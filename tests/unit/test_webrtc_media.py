@@ -275,7 +275,7 @@ def test_pcm_queues_are_bounded_and_ready_requires_actual_audio():
 def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch):
     monkeypatch.setenv("REMOTE_DOWNLINK_GAIN", "1")
 
-    async def scenario():
+    async def scenario(final_attempt: bool) -> bool:
         phone = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         phone.addTrack(ToneTrack())
         channel = phone.createDataChannel(REMOTE_CONTROL_TOPIC)
@@ -308,7 +308,15 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch)
             await media.connect()
             assert media.answer is not None and not media.media_ready
             await phone.setRemoteDescription(RTCSessionDescription(**media.answer))
-            await asyncio.wait_for(wait_ready(), 60)  # 看门狗：CI macOS 冷启动 ICE/DTLS 可能超过 10 s
+            try:
+                await asyncio.wait_for(wait_ready(), 60 if final_attempt else 20)
+            except TimeoutError:
+                # Two aiortc peers in one process occasionally lose the answerer's ICE transport mid-check on
+                # Python 3.12 (also reproduced with our ICE adapter disabled). Retry a fresh pair; the
+                # final attempt keeps the full cold-start watchdog and fails loudly.
+                if final_attempt:
+                    raise
+                return False
             uplink = media.take_browser_audio()
             assert uplink and all(len(chunk) == 320 for chunk in uplink)
             assert max(abs(value) for chunk in uplink for value in struct.unpack("<160h", chunk)) > 500
@@ -342,5 +350,11 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch)
                 await media.close()
             await phone.close()
         assert not media.media_ready and not media.browser_connected
+        return True
 
-    asyncio.run(scenario())
+    async def run_with_retry():
+        for attempt in range(3):
+            if await scenario(final_attempt=attempt == 2):
+                return
+
+    asyncio.run(run_with_retry())

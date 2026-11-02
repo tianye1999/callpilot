@@ -24,24 +24,35 @@ GATHER_MAX_SECONDS = 1.5
 TURN_DELETE_MAX_SECONDS = 0.25  # Local teardown cannot wait for a disappeared TURN server.
 _VIRTUAL_PREFIXES = ("utun", "ipsec", "tun", "tap", "awdl", "llw", "bridge", "ppp", "wg", "gif", "stf", "lo",
                      "tailscale", "wireguard", "wintun")
-_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
 def physical_host_addresses(adapters: Any = None) -> list[str]:
-    addresses: list[str] = []
-    for adapter in ifaddr.get_adapters() if adapters is None else adapters:
+    """Host candidates come from physical interfaces; a host with none keeps every routable address.
+
+    VPN / Tailscale interfaces are excluded by name only (utun*, ipsec*, tailscale*, wg*, ...).
+    If the name filter leaves nothing (unusual interface naming, cloud VMs, CI runners), fall back to
+    the upstream-equivalent list so gathering never starts with zero host candidates.
+    """
+    adapters = list(ifaddr.get_adapters() if adapters is None else adapters)
+    physical: list[str] = []
+    everything: list[str] = []
+    for adapter in adapters:
         names = (str(adapter.name).lower(), str(adapter.nice_name).lower())
-        if any(name.startswith(_VIRTUAL_PREFIXES) for name in names):
-            continue
+        virtual = any(name.startswith(_VIRTUAL_PREFIXES) for name in names)
         for entry in adapter.ips:
             value = entry.ip if isinstance(entry.ip, str) else entry.ip[0]
             address = ipaddress.ip_address(value)
-            if (address.is_loopback or address.is_link_local or address.is_unspecified or address.is_multicast
-                    or (address.version == 4 and address in _CGNAT)):
+            if address.is_loopback or address.is_link_local or address.is_unspecified or address.is_multicast:
                 continue
-            if value not in addresses:
-                addresses.append(value)
-    return addresses
+            if value not in everything:
+                everything.append(value)
+            if not virtual and value not in physical:
+                physical.append(value)
+    if not physical and everything:
+        logger.warning("Direct ICE: no physical interface address found; using all %d routable addresses",
+                       len(everything))
+        return everything
+    return physical
 
 
 def default_stun_sources(server: tuple[str, int]) -> dict[str, tuple[str, int]]:

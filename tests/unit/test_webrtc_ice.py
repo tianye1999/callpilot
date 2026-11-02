@@ -17,7 +17,16 @@ def test_only_physical_routable_host_addresses():
                   adapter("utun12", "100.100.1.1"), adapter("ipsec0", "10.0.0.3"),
                   adapter("en1", "169.254.1.1", "100.64.0.1"), adapter("lo0", "127.0.0.1"),
                   adapter("bridge0", "192.168.2.1"), adapter("Tailscale", ("fd7a::1", 0, 0))]
-    assert webrtc_ice.physical_host_addresses(interfaces) == ["192.168.1.2", "240e::1"]
+    # VPN/Tailscale only by interface name; CGNAT ranges stay (cloud VMs and some LANs use them).
+    assert webrtc_ice.physical_host_addresses(interfaces) == ["192.168.1.2", "240e::1", "100.64.0.1"]
+
+
+def test_no_physical_interface_falls_back_to_every_routable_address(caplog):
+    interfaces = [adapter("utun3", "10.8.0.2", ("fd00::2", 0, 0)), adapter("lo0", "127.0.0.1"),
+                  adapter("awdl0", ("fe80::9", 0, 7))]
+    with caplog.at_level("WARNING"):
+        assert webrtc_ice.physical_host_addresses(interfaces) == ["10.8.0.2", "fd00::2"]
+    assert any("no physical interface" in record.getMessage() for record in caplog.records)
 
 
 def test_default_source_uses_kernel_socket_route_and_closes(monkeypatch):

@@ -41,4 +41,5 @@ jobs:
         run: mypy
 
       - name: Test
-        run: pytest -q
+        # 挂死/极慢的腿要在 10 分钟内以失败收场并打印用例名，而不是占满 6 小时
+        run: pytest -q --timeout 600 --durations=25
