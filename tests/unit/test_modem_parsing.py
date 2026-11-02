@@ -282,6 +282,7 @@ def test_sim7600_voice_enable_snapshot_success_first_try(monkeypatch):
 def test_sim7600_voice_enable_snapshot_retry_threshold(monkeypatch, attempts):
     """来电第二次成功属正常波动，第三次起才标记劣化。"""
     modem = make_sim7600()
+    modem._arm_voice_call()
     responses = iter(["ERROR"] * (attempts - 1) + ["OK"])
     monkeypatch.setattr(modem, "_send", lambda cmd: next(responses))
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
@@ -1464,6 +1465,7 @@ def test_is_connected_reflects_transport_state():
 def test_sim7600_marks_degraded_when_enable_needs_retry(monkeypatch, tmp_path, caplog):
     """CPCMREG 第三次才成功时，仍保留通话后的劣化恢复。"""
     modem = make_sim7600()
+    modem._arm_voice_call()
     monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(tmp_path / "req"))
     responses = iter(["ERROR", "ERROR", "OK"])
     monkeypatch.setattr(modem, "_send", lambda cmd: next(responses))
@@ -1472,6 +1474,127 @@ def test_sim7600_marks_degraded_when_enable_needs_retry(monkeypatch, tmp_path, c
         modem.initialize_for_voice("nmea")
     assert modem._pcm_degraded is True
     assert "判定模组已劣化" in caplog.text
+
+
+@pytest.mark.parametrize("attempts", [3, 5])
+def test_sim7600_idle_pcm_retries_do_not_leak_into_next_call(monkeypatch, tmp_path, caplog, attempts):
+    modem = make_sim7600()
+    request = tmp_path / "recovery-request"
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(request))
+    monkeypatch.setenv("MODEM_RESET_AFTER_CALL", "false")
+    monkeypatch.setenv("MODEM_LOG_RELEASE_CAUSE", "false")
+    responses = iter(["ERROR"] * (attempts - 1) + ["OK"])
+    monkeypatch.setattr(modem, "_send", lambda cmd: next(responses))
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda seconds: None)
+
+    with caplog.at_level(logging.WARNING):
+        modem.initialize_for_voice()
+    assert not modem._pcm_degraded
+    assert not modem._call_pcm_enabled
+    assert modem.last_voice_enable == {"ok": True, "attempts": attempts, "degraded": False}
+    assert "本通结束后请求自愈" not in caplog.text
+    assert "不标记通话劣化" in caplog.text
+
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem.answer()
+    modem.initialize_for_voice()
+    modem.hangup()
+    assert not request.exists()
+    assert not modem._pcm_degraded
+
+
+@pytest.mark.parametrize("start", ["answer", "dial"])
+def test_sim7600_new_call_clears_stale_degradation(monkeypatch, tmp_path, start):
+    modem = make_sim7600()
+    request = tmp_path / "recovery-request"
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(request))
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem._pcm_degraded = True
+    if start == "answer":
+        modem.answer()
+    else:
+        modem.dial("test-number")
+    assert modem._voice_call_armed
+    assert not modem._pcm_degraded
+    assert not request.exists()
+
+
+@pytest.mark.parametrize("transition", ["arm", "disarm", "next_call"])
+def test_sim7600_pcm_retries_only_mark_the_original_armed_call(monkeypatch, tmp_path, transition):
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(tmp_path / "recovery-request"))
+    if transition != "arm":
+        modem._arm_voice_call()
+    attempts = 0
+
+    def send(cmd):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return "ERROR"
+        if transition == "disarm":
+            modem._voice_call_armed = False
+        else:
+            modem._arm_voice_call()
+        return "OK"
+
+    monkeypatch.setattr(modem, "_send", send)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda seconds: None)
+    modem.initialize_for_voice()
+    assert not modem._call_pcm_enabled
+    assert not modem._pcm_degraded
+
+
+@pytest.mark.parametrize("ending", ["local", "NO CARRIER", "+CEND: 1,30,0,16", "response"])
+@pytest.mark.parametrize("attempts", [1, 2, 3])
+@pytest.mark.parametrize("reset_enabled", [False, True])
+def test_sim7600_call_end_consumes_own_pcm_degradation(
+    monkeypatch, tmp_path, ending, attempts, reset_enabled,
+):
+    modem = make_sim7600()
+    request = tmp_path / "recovery-request"
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(request))
+    monkeypatch.setenv("MODEM_RESET_AFTER_CALL", str(reset_enabled).lower())
+    monkeypatch.setenv("MODEM_LOG_RELEASE_CAUSE", "false")
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda seconds: None)
+    responses = iter(["ERROR"] * (attempts - 1) + ["OK"])
+    sent = []
+
+    def send(cmd):
+        sent.append(cmd)
+        return next(responses) if cmd == "AT+CPCMREG=1" else "OK"
+
+    monkeypatch.setattr(modem, "_send", send)
+    resets = []
+    modem.on_post_call_reset(lambda: resets.append(True))
+    modem.answer()
+    modem.initialize_for_voice()
+    assert modem._pcm_degraded is (attempts >= 3)
+    assert not request.exists()
+    if ending == "local":
+        modem.hangup()
+    else:
+        notifications = []
+        modem.on_hangup(lambda: notifications.append((request.exists(), modem._pcm_degraded)))
+        before = list(sent)
+        if ending == "response":
+            modem._process_response_urcs("\r\nNO CARRIER\r\n")
+            assert request.exists() is (attempts >= 3 and not reset_enabled)
+            assert not modem._pcm_degraded
+        else:
+            modem._buffer = f"\r\n{ending}\r\n"
+            modem._process_buffer()
+            assert notifications == [(attempts >= 3 and not reset_enabled, False)]
+        assert sent == before  # URC handling adds no AT commands.
+        assert resets == []  # CRESET still belongs to the existing hangup path.
+        modem.hangup()
+    assert request.exists() is (attempts >= 3 and not reset_enabled)
+    assert not modem._pcm_degraded
+    assert resets == ([True] if reset_enabled else [])
+    if request.exists():
+        request.unlink()
+    modem.hangup()
+    assert not request.exists()  # The degradation was consumed exactly once.
 
 
 def test_sim7600_first_try_enable_not_degraded(monkeypatch, tmp_path):

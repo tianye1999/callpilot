@@ -1029,6 +1029,9 @@ class SerialModem:
         """挂断时关闭语音 PCM 通道（厂商钩子，子类按各自 AT 指令实现）。"""
         raise NotImplementedError("_disable_voice_channel 需由厂商子类实现")
 
+    def _request_recovery_if_degraded(self) -> None:
+        """通话结束时消费厂商的 PCM 劣化标记；默认无需恢复。"""
+
     def _hangup_command(self) -> str:
         """挂断用的 AT 指令（厂商钩子）；默认 ``ATH``。语音挂断不认 ATH 的模组覆写。"""
         return "ATH"
@@ -1543,6 +1546,8 @@ class SerialModem:
         self._capture_cend(text, report)
         if "NO CARRIER" in text or CEND_PATTERN.search(text):
             self._invalidate_reserved_incoming()
+            with self._serial_lock:
+                self._request_recovery_if_degraded()
             self._request_release_cause(report)
         self._scan_pcm_flow(text)
         matches = list(CMTI_PATTERN.finditer(text))
@@ -1602,6 +1607,9 @@ class SerialModem:
                 # 错误的回拨号码写给机主，review finding #8）。None = 如实的未知。
                 self._last_caller = None
                 self._fast_poll_until = 0.0
+                # 不依赖上层回调是否再次 hangup，也不在 URC 路径发送关闭 PCM 的 AT。
+                with self._serial_lock:
+                    self._request_recovery_if_degraded()
                 if self._on_hangup:
                     self._on_hangup()
                 self._request_release_cause()
@@ -2027,6 +2035,7 @@ class Sim7600Modem(SerialModem):
         self._voice_call_generation += 1
         self._voice_call_armed = True
         self._call_pcm_enabled = False
+        self._pcm_degraded = False
 
     def answer(self) -> None:
         with self._serial_lock:
@@ -2212,11 +2221,14 @@ class Sim7600Modem(SerialModem):
                 with self._serial_lock:
                     if expected_generation is not None and not self._voice_generation_current(expected_generation):
                         return
-                    if call_armed and self._voice_call_armed and call_generation == self._voice_call_generation:
+                    belongs_to_call = (
+                        call_armed and self._voice_call_armed and call_generation == self._voice_call_generation
+                    )
+                    if belongs_to_call:
                         self._call_pcm_enabled = True
-                    if attempts >= self._DEGRADED_ENABLE_ATTEMPTS:
-                        # 只标记本通劣化，实际恢复仍留给挂断路径。
-                        self._pcm_degraded = True
+                        if attempts >= self._DEGRADED_ENABLE_ATTEMPTS:
+                            # 只标记本通劣化，实际恢复仍留给挂断路径。
+                            self._pcm_degraded = True
                     self.last_voice_enable = {
                         "ok": True, "attempts": attempts, "degraded": self._pcm_degraded,
                     }
@@ -2229,9 +2241,14 @@ class Sim7600Modem(SerialModem):
                     "PCM-over-USB 语音通道已启用 (AT+CPCMREG=1，第 %d 次)", attempts
                 )
                 if attempts >= self._DEGRADED_ENABLE_ATTEMPTS:
-                    logger.warning(
-                        "PCM 启用重试 %d 次，判定模组已劣化，本通结束后请求自愈", attempts
-                    )
+                    if belongs_to_call:
+                        logger.warning(
+                            "PCM 启用重试 %d 次，判定模组已劣化，本通结束后请求自愈", attempts
+                        )
+                    else:
+                        logger.warning(
+                            "PCM 启用重试 %d 次，不属于当前已武装通话，不标记通话劣化", attempts
+                        )
                 return
             if i < self._CPCMREG_ENABLE_ATTEMPTS - 1:
                 time.sleep(self._CPCMREG_ENABLE_RETRY_DELAY)
