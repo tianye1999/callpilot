@@ -184,6 +184,7 @@ _INBOUND_TAKEOVER_HOLD_INSTRUCTIONS = {
 }
 _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
 _PHONE_FIRST_MEDIA_TIMEOUT_SECONDS = 20.0
+_EARLY_ANSWER_CONNECTED_WAIT_SECONDS = 8.0
 _INBOUND_TRIAGE_CLARIFY_TEXT = {
     "zh": "请简单确认一下，您是有具体事情找本人，还是一般业务介绍？",
     "en": "Just to confirm — do you have a specific matter for them personally, or is this a general offer?",
@@ -255,6 +256,8 @@ class CallSession:
         self._phone_first_offer_id: str | None = None
         self._phone_first_answered = False
         self._phone_first_answer_event = False
+        self._phone_first_early_answer = False
+        self._phone_first_pcm_enable_info: dict | None = None
         self._phone_first_closers: list[asyncio.Task[None]] = []
         self.current_caller: str | None = None
         self.call_started_at: float | None = None
@@ -490,6 +493,8 @@ class CallSession:
         self._phone_first_lease = None
         self._phone_first_answered = False
         self._phone_first_answer_event = False
+        self._phone_first_early_answer = False
+        self._phone_first_pcm_enable_info = None
         self._phone_first_claim_deadline = None
         self._phone_first_claimed_at = None
         self._phone_first_offer_id = None
@@ -737,16 +742,20 @@ class CallSession:
 
             # 接听后静置时长由厂商实现决定：自带重试的（SIM7600）不必盲等整秒，
             # 首次失败立刻重试即可，健康态省约 0.8s（WIL-104）。Quectel 维持 1.0s。
-            await asyncio.sleep(
-                getattr(self.modem, "POST_ANSWER_SETTLE_SECONDS", 1.0)
-            )
+            if self._phone_first_pcm_enable_info is None:
+                await asyncio.sleep(
+                    getattr(self.modem, "POST_ANSWER_SETTLE_SECONDS", 1.0)
+                )
 
             # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
             # 否则第二通开始模组无 PCM 流（双向无声）。
-            self.modem.initialize_for_voice(self.audio_mode)
+            if self._phone_first_pcm_enable_info is None:
+                self.modem.initialize_for_voice(self.audio_mode)
             # 通话内的启用结果进事件流：ok=False 即整通无声、attempts≥3 即已劣化
             # ——WIL-95 D 组「异常掉话指纹」的蜂窝形态（CPCMREG 替代 RTP keepalive）。
             enable_info = getattr(self.modem, "last_voice_enable", None)
+            if self._phone_first_pcm_enable_info is not None:
+                enable_info = {**self._phone_first_pcm_enable_info, "reused": True}
             if record is not None and isinstance(enable_info, dict):
                 record.log_event("pcm_enable", **enable_info)
 
@@ -983,7 +992,8 @@ class CallSession:
         hangup_owned = not moss_prebrief
         native_greeting = (
             config.get_str("MODEM_ANSWER_GREETING")
-            if direction == "inbound" and isinstance(self.modem, Sim7600Modem) else ""
+            if (direction == "inbound" and isinstance(self.modem, Sim7600Modem)
+                and self._phone_first_pcm_enable_info is None) else ""
         )
         native_greeting_spoken = ""
         native_greeting_done = asyncio.Event()
@@ -1025,7 +1035,9 @@ class CallSession:
 
         def prepare_media() -> None:
             nonlocal bridge, native_greeting_spoken
-            if native_greeting:
+            if self._phone_first_pcm_enable_info is not None:
+                delay = 0.0
+            elif native_greeting:
                 delay = max(0, config.get_int("MODEM_ANSWER_GREETING_DELAY_MS")) / 1000
                 delay = max(0.0, answered_at + delay - time.monotonic())
             else:
@@ -1051,8 +1063,11 @@ class CallSession:
                     event_loop.call_soon_threadsafe(native_greeting_done.set)
                 if not startup_current():
                     return
-            self.modem.initialize_for_voice(self.audio_mode)
+            if self._phone_first_pcm_enable_info is None:
+                self.modem.initialize_for_voice(self.audio_mode)
             enable_info = getattr(self.modem, "last_voice_enable", None)
+            if self._phone_first_pcm_enable_info is not None:
+                enable_info = {**self._phone_first_pcm_enable_info, "reused": True}
             if record is not None and isinstance(enable_info, dict):
                 record.log_event("pcm_enable", **enable_info)
             if isinstance(enable_info, dict) and enable_info.get("ok") is False:
@@ -2091,7 +2106,78 @@ class CallSession:
         bridge: AudioBridge | None = None
         connecting: asyncio.Task | None = None
         status_task: asyncio.Task | None = None
+        answering: asyncio.Task[str | None] | None = None
+        early_answer = self._phone_first_early_answer
+        abandoned = False
+        pcm_ready_at: float | None = None
+        connected_wait_logged = False
+        media_ready_logged = False
         committed = False
+
+        def waiting_current() -> bool:
+            # PCM preparation holds the serial lock in its worker. Never wait for
+            # that lock on the event loop while the phone is connecting.
+            return (self.is_active and generation == self._session_generation
+                    and self._phone_first_lease is lease and lease.valid
+                    and self._phone_first_guard())
+
+        def log_connected_wait() -> None:
+            nonlocal connected_wait_logged
+            if pcm_ready_at is not None and not connected_wait_logged:
+                connected_wait_logged = True
+                if record is not None:
+                    record.log_latency(
+                        "phone_first_connected_wait_ms", (self._phone_first_clock() - pcm_ready_at) * 1000,
+                    )
+
+        def mark_media_ready() -> None:
+            nonlocal media_ready_logged
+            if media_ready_logged:
+                return
+            media_ready_logged = True
+            timing.mark("media_ready")
+            if record is not None and self._phone_first_claimed_at is not None:
+                record.log_latency(
+                    "phone_first_media_ready_ms",
+                    (self._phone_first_clock() - self._phone_first_claimed_at) * 1000,
+                )
+
+        async def answer_and_prepare() -> str | None:
+            nonlocal bridge, pcm_ready_at
+            timing.mark("ata_start")
+            if not await self._answer_phone_first(generation, lease):
+                return "not_connected"
+            timing.mark("ata_return")
+            if record is not None:
+                record.log_event("answered", owner=True)
+            self._phone_first_answer_event = True
+            await self._phone_first_sleep(getattr(self.modem, "POST_ANSWER_SETTLE_SECONDS", 1.0))
+            if (abandoned or not current() or not self._phone_first_cloud_ready()
+                    or (not early_answer and (endpoint is None or not endpoint.media_ready))):
+                raise RuntimeError("media_lost_after_answer")
+            prepared = await self._threaded_modem_call(
+                self.modem.prepare_reserved_voice, lease, current, self.audio_mode,
+            )
+            if not prepared:
+                raise RuntimeError("call_ended_during_pcm_prepare")
+            enable_info = getattr(self.modem, "last_voice_enable", None)
+            if isinstance(enable_info, dict) and enable_info.get("ok") is False:
+                return "failed"
+            timing.mark("pcm_ready")
+            if early_answer:
+                pcm_ready_at = self._phone_first_clock()
+                self._phone_first_pcm_enable_info = dict(enable_info) if isinstance(enable_info, dict) else {}
+                if abandoned or not waiting_current():
+                    raise RuntimeError("call_ended_during_pcm_prepare")
+            bridge = create_audio_bridge(
+                modem=self.modem, mode=self.audio_mode, device_keyword=self.audio_keyword,
+                pcm_port=self.pcm_port, pcm_baudrate=self.pcm_baudrate, tx_gain=self.tx_gain,
+            )
+            if isinstance(bridge, SerialPcmAudioBridge):
+                bridge.set_ready_check(self.modem.pcm_ready)
+            self._start_hangup_bridge(bridge)
+            return None
+
         try:
             factory = self._takeover_endpoint_factory
             if factory is None:
@@ -2107,25 +2193,45 @@ class CallSession:
                     await endpoint.connect()
 
             connecting = asyncio.create_task(connect_claim())
+            if early_answer:
+                if record is not None:
+                    record.log_event("phone_first_early_answer", generation=generation)
+                answering = asyncio.create_task(answer_and_prepare())
             deadline = self._phone_first_claim_deadline
             assert deadline is not None
-            while current() and self._phone_first_cloud_ready() and self._phone_first_clock() < deadline:
+            while (waiting_current() if early_answer else current()) and self._phone_first_cloud_ready():
+                if answering is not None and answering.done():
+                    outcome = answering.result()
+                    if outcome is not None:
+                        return outcome
+                if early_answer and bridge is not None:
+                    # Some bridges wait for the next frame and never return an
+                    # empty chunk on a live stream. Drain backlog off-loop, but
+                    # give connection/deadline checks a turn every 50 ms.
+                    drain_deadline = self._phone_first_clock() + 0.05
+                    while await self._threaded_modem_call(bridge.read_modem_chunk):
+                        if self._phone_first_clock() >= drain_deadline:
+                            break
+                if (self._phone_first_clock() >= deadline or (
+                    pcm_ready_at is not None
+                    and self._phone_first_clock() >= pcm_ready_at + _EARLY_ANSWER_CONNECTED_WAIT_SECONDS
+                )):
+                    raise RuntimeError("media_prepare_timeout")
                 if connecting.done():
                     connecting.result()
                     assert endpoint is not None
                     timing.mark("endpoint_connect_return")
-                    if endpoint.media_ready:
+                    if early_answer and endpoint.media_ready:
+                        mark_media_ready()
+                    if endpoint.media_ready and (answering is None or answering.done()):
                         break
                 await self._phone_first_sleep(0.05)
+            if answering is not None and not answering.done():
+                raise RuntimeError("media_prepare_failed")
             if (not current() or not self._phone_first_cloud_ready() or not connecting.done()
                     or endpoint is None or not endpoint.media_ready or self._phone_first_clock() >= deadline):
                 raise RuntimeError("media_prepare_failed")
-            timing.mark("media_ready")
-            if record is not None and self._phone_first_claimed_at is not None:
-                record.log_latency(
-                    "phone_first_media_ready_ms",
-                    (self._phone_first_clock() - self._phone_first_claimed_at) * 1000,
-                )
+            mark_media_ready()
             command = await endpoint.next_command(timeout=0.001)
             if command is not None and command.get("type") == "client_timing":
                 timing.receive_client(command)
@@ -2136,32 +2242,10 @@ class CallSession:
                 raise RuntimeError("owner_cancelled")
             if self._phone_first_clock() >= deadline:
                 raise RuntimeError("media_prepare_timeout")
-            timing.mark("ata_start")
-            if not await self._answer_phone_first(generation, lease):
-                return "not_connected"
-            timing.mark("ata_return")
-            if record is not None:
-                record.log_event("answered", owner=True)
-            self._phone_first_answer_event = True
-            await self._phone_first_sleep(getattr(self.modem, "POST_ANSWER_SETTLE_SECONDS", 1.0))
-            if not current() or not self._phone_first_cloud_ready() or not endpoint.media_ready:
-                raise RuntimeError("media_lost_after_answer")
-            prepared = await self._threaded_modem_call(
-                self.modem.prepare_reserved_voice, lease, current, self.audio_mode,
-            )
-            if not prepared:
-                raise RuntimeError("call_ended_during_pcm_prepare")
-            enable_info = getattr(self.modem, "last_voice_enable", None)
-            if isinstance(enable_info, dict) and enable_info.get("ok") is False:
-                return "failed"
-            timing.mark("pcm_ready")
-            bridge = create_audio_bridge(
-                modem=self.modem, mode=self.audio_mode, device_keyword=self.audio_keyword,
-                pcm_port=self.pcm_port, pcm_baudrate=self.pcm_baudrate, tx_gain=self.tx_gain,
-            )
-            if isinstance(bridge, SerialPcmAudioBridge):
-                bridge.set_ready_check(self.modem.pcm_ready)
-            self._start_hangup_bridge(bridge)
+            if not early_answer:
+                outcome = await answer_and_prepare()
+                if outcome is not None:
+                    return outcome
             command = await endpoint.next_command(timeout=0.001)
             if command is not None and command.get("type") == "client_timing":
                 timing.receive_client(command)
@@ -2172,20 +2256,34 @@ class CallSession:
                 raise RuntimeError("owner_cancelled")
             if not current() or not self._phone_first_cloud_ready() or not endpoint.media_ready:
                 raise RuntimeError("call_ended_before_commit")
+            if early_answer and (self._phone_first_clock() >= deadline or (
+                pcm_ready_at is not None
+                and self._phone_first_clock() >= pcm_ready_at + _EARLY_ANSWER_CONNECTED_WAIT_SECONDS
+            )):
+                raise RuntimeError("media_prepare_timeout")
             ready = coordinator.mark_mobile_media_ready(claimed.fence)
             if not ready.accepted or not coordinator.commit_mobile(claimed.fence).accepted:
                 raise RuntimeError("mobile_commit_rejected")
             committed = True
+            log_connected_wait()
             if record is not None:
                 record.source = "remote_web_dialer"
                 record.log_event("takeover_committed", generation=generation)
             self._publish({"type": "call", "status": "answered", "caller": self.current_caller, "owner": "mobile"})
             await self._send_takeover_connected(endpoint)
             status_task = asyncio.create_task(self._takeover_connected_snapshot_loop(endpoint))
+            assert bridge is not None
             await self._pump_mobile_media(endpoint, bridge, record, claimed)
             return "completed"
         except Exception as exc:
             logger.warning("Phone-first media failed: %s", type(exc).__name__)
+            abandoned = True
+            if answering is not None:
+                # Join before current(): even that reservation check takes the
+                # serial lock. Preserve a successful PCM enable for AI fallback.
+                results = await asyncio.gather(answering, return_exceptions=True)
+                if results[0] in ("not_connected", "failed"):
+                    return str(results[0])
             if committed:
                 return "failed"
             if not current():
@@ -2193,6 +2291,10 @@ class CallSession:
             self._phone_first_fallback("MEDIA_PREPARE_FAILED", generation)
             return "ai"
         finally:
+            abandoned = True
+            if answering is not None:
+                await asyncio.gather(answering, return_exceptions=True)
+            log_connected_wait()
             for task in (connecting, status_task):
                 if task is not None:
                     task.cancel()
@@ -4714,6 +4816,7 @@ class CallSession:
                     logger.warning("Invalid INBOUND_PHONE_FIRST_MEDIA_SECONDS; using default %g seconds", media_seconds)
                 self._phone_first_claimed_at = self._phone_first_clock()
                 self._phone_first_claim_deadline = self._phone_first_claimed_at + media_seconds
+                self._phone_first_early_answer = config.get_bool("INBOUND_EARLY_ANSWER_ENABLED")
             return result
 
     def accept_takeover_claim(

@@ -24,6 +24,7 @@ def test_phone_first_configuration_defaults_and_example(monkeypatch):
     for key, default in (
         ("INBOUND_PHONE_FIRST_ENABLED", "false"),
         ("INBOUND_PRECONNECT_ENABLED", "false"),
+        ("INBOUND_EARLY_ANSWER_ENABLED", "false"),
         ("INBOUND_PHONE_FIRST_RING_SECONDS", "15"),
         ("INBOUND_PHONE_FIRST_MEDIA_SECONDS", "20"),
     ):
@@ -1096,3 +1097,406 @@ def test_next_clcc_only_call_can_reuse_index_after_window_cleanup():
     modem.finish_reserved_incoming(lease)
     modem._process_clcc_response(incoming)
     assert rings == [None, None]
+
+
+def enable_early_answer(rig, monkeypatch):
+    monkeypatch.setenv("INBOUND_EARLY_ANSWER_ENABLED", "true")
+    monkeypatch.setenv("MODEM_ANSWER_GREETING", "")
+    rig.modem.last_voice_enable = {"ok": True, "attempts": 1}
+
+    async def sleep(seconds):
+        rig.clock.sleep_sync(seconds)
+        # Give real modem workers a turn without spending the fake media budget.
+        await asyncio.sleep(0.001)
+
+    rig.session._phone_first_sleep = sleep
+    rig.ring()
+
+    def claim_once():
+        rig.clock.tick = lambda: None
+        assert rig.claim().accepted
+
+    rig.clock.tick = claim_once
+
+
+def phone_first_events(rig):
+    return [json.loads(line) for line in
+            (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+def test_early_answer_pcm_precedes_late_media_and_discards_waiting_audio(rig, monkeypatch):
+    enable_early_answer(rig, monkeypatch)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda *args: pytest.fail("unexpected AI"))
+    rig.endpoint.media_ready = False
+    order = []
+    original_start = rig.bridge.start
+
+    def start():
+        original_start()
+        order.append("pcm")
+        rig.bridge.feed_uplink(b"old caller audio")
+
+    monkeypatch.setattr(rig.bridge, "start", start)
+
+    async def connect():
+        for _ in range(200):
+            if rig.bridge.started:
+                break
+            await asyncio.sleep(0.001)
+        assert rig.bridge.started, "PCM must start without waiting for phone media"
+        await asyncio.sleep(0.005)
+        assert rig.bridge.read_modem_chunk() == b""
+        assert rig.session.takeover_state is not TakeoverState.MOBILE_ACTIVE
+        assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+        order.append("media")
+        rig.endpoint.media_ready = True
+
+    async def pump(*args):
+        order.append("pump")
+        assert rig.endpoint.media_ready
+        assert rig.session.takeover_state is TakeoverState.MOBILE_ACTIVE
+        assert rig.bridge.read_modem_chunk() == b""
+
+    rig.endpoint.connect = connect
+    monkeypatch.setattr(rig.session, "_pump_mobile_media", pump)
+    asyncio.run(rig.session._handle_call())
+    assert order == ["pcm", "media", "pump"]
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+    events = phone_first_events(rig)
+    assert sum(event["type"] == "phone_first_early_answer" for event in events) == 1
+    waits = [event for event in events if event.get("stage") == "phone_first_connected_wait_ms"]
+    assert len(waits) == 1
+
+
+def test_early_answer_media_ready_still_waits_for_pcm_without_serial_lock(rig, monkeypatch):
+    enable_early_answer(rig, monkeypatch)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda *args: pytest.fail("unexpected AI"))
+    entered, release = threading.Event(), threading.Event()
+    original_initialize = rig.modem.initialize_for_voice
+    original_reserved = rig.modem.incoming_reserved
+    loop_thread = threading.get_ident()
+    progress = []
+
+    def initialize(mode):
+        with rig.modem._serial_lock:
+            entered.set()
+            assert release.wait(2), "event loop blocked behind modem serial lock"
+            original_initialize(mode)
+
+    def reserved(lease):
+        if entered.is_set() and not release.is_set():
+            assert threading.get_ident() != loop_thread, "serial-lock check on event loop"
+        return original_reserved(lease)
+
+    async def connect():
+        for _ in range(200):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert entered.is_set()
+        try:
+            for _ in range(3):
+                assert rig.session.takeover_state is not TakeoverState.MOBILE_ACTIVE
+                progress.append(True)
+                await asyncio.sleep(0.001)
+        finally:
+            release.set()
+
+    monkeypatch.setattr(rig.modem, "initialize_for_voice", initialize)
+    monkeypatch.setattr(rig.modem, "incoming_reserved", reserved)
+    rig.endpoint.connect = connect
+    asyncio.run(rig.session._handle_call())
+    assert len(progress) == 3
+    assert rig.session._record.source == "remote_web_dialer"
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("failure", [
+    "connect_error", "timeout", "claim_timeout", "owner_cancelled", "commit_rejected", "media_lost",
+])
+def test_early_answer_fallback_reuses_pcm(rig, monkeypatch, parallel, failure):
+    enable_early_answer(rig, monkeypatch)
+    monkeypatch.setenv("PARALLEL_AGENT_CONNECT", str(parallel))
+    if failure == "claim_timeout":
+        monkeypatch.setenv("INBOUND_PHONE_FIRST_MEDIA_SECONDS", "5")
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+    pcm_at = []
+    original_start = rig.bridge.start
+
+    def start():
+        if not pcm_at:
+            pcm_at.append(rig.clock.now)
+        original_start()
+
+    monkeypatch.setattr(rig.bridge, "start", start)
+
+    async def loop(*args):
+        assert rig.session.takeover_state is TakeoverState.AI_ACTIVE
+        assert rig.commands.count("PCM") == 1
+        return rig.bridge
+
+    monkeypatch.setattr(rig.session, "_run_agent_loop", loop)
+    if failure in {"connect_error", "timeout", "claim_timeout"}:
+        rig.endpoint.media_ready = False
+
+    async def connect():
+        while not rig.bridge.started:
+            await asyncio.sleep(0.001)
+        if failure == "connect_error":
+            # The reuse event must use the original result, not a later snapshot.
+            rig.modem.last_voice_enable = {"ok": False, "attempts": 9}
+            raise ConnectionError("synthetic")
+        if failure == "commit_rejected":
+            rig.session._takeover_coordinator.commit_mobile = lambda fence: SimpleNamespace(accepted=False)
+
+    async def next_command(timeout):
+        if failure == "owner_cancelled":
+            return {"type": "hangup"}
+        if failure == "media_lost":
+            rig.endpoint.media_ready = False
+        return None
+
+    rig.endpoint.connect = connect
+    rig.endpoint.next_command = next_command
+    asyncio.run(rig.session._handle_call())
+    assert agent.started and agent.said
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+    assert rig.bridge.max_writers == 1
+    assert rig.endpoint.closed and rig.bridge.stopped
+    events = phone_first_events(rig)
+    enables = [event for event in events if event["type"] == "pcm_enable"]
+    assert len(enables) == 1
+    assert enables[0]["reused"] is True and enables[0]["ok"] is True and enables[0]["attempts"] == 1
+    assert sum(event["type"] == "answered" for event in events) == 1
+    waits = [event for event in events if event.get("stage") == "phone_first_connected_wait_ms"]
+    assert len(waits) == 1
+    if failure == "timeout":
+        assert 8000 <= waits[0]["ms"] < 8051
+        assert 8 <= rig.clock.now - pcm_at[0] < 8.1
+        assert rig.clock.now < rig.session._phone_first_claim_deadline
+    if failure == "claim_timeout":
+        assert 0 < waits[0]["ms"] < 5000
+        assert rig.session._phone_first_claim_deadline <= rig.clock.now < rig.session._phone_first_claim_deadline + 0.1
+    if failure == "owner_cancelled":
+        assert sum(event["type"] == "takeover_owner_cancelled_precommit" for event in events) == 1
+        assert not any(event["type"] == "takeover_owner_hangup" for event in events)
+        assert not any(event.get("type") == "hangup.ack" for event in rig.endpoint.events)
+
+
+def test_early_answer_caller_ends_while_waiting_for_media(rig, monkeypatch):
+    enable_early_answer(rig, monkeypatch)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda *args: pytest.fail("unexpected AI"))
+    rig.endpoint.media_ready = False
+
+    async def connect():
+        while not rig.bridge.started:
+            await asyncio.sleep(0.001)
+        rig.modem._invalidate_reserved_incoming()
+        rig.modem._on_hangup()
+
+    rig.endpoint.connect = connect
+    asyncio.run(rig.session._handle_call())
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+    assert rig.endpoint.closed and rig.bridge.stopped
+    meta = json.loads((rig.session._record.path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["status"] == "completed"
+
+
+@pytest.mark.parametrize("failure", ["ata", "pcm"])
+def test_early_answer_modem_failure_does_not_start_ai(rig, monkeypatch, failure):
+    enable_early_answer(rig, monkeypatch)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda *args: pytest.fail("unexpected AI"))
+    original = rig.modem._write_command
+
+    def command(cmd):
+        result = original(cmd)
+        return "ERROR" if cmd == "ATA" and failure == "ata" else result
+
+    monkeypatch.setattr(rig.modem, "_write_command", command)
+    if failure == "pcm":
+        rig.modem.last_voice_enable = {"ok": False}
+    asyncio.run(rig.session._handle_call())
+    assert rig.commands.count("ATA") == 1
+    assert rig.commands.count("PCM") == int(failure == "pcm")
+    assert rig.endpoint.closed and not rig.bridge.started
+    meta = json.loads((rig.session._record.path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["status"] == ("not_connected" if failure == "ata" else "failed")
+
+
+def test_early_answer_adopts_ready_preconnect_before_pcm(rig, monkeypatch):
+    enable_early_answer(rig, monkeypatch)
+    monkeypatch.setenv("INBOUND_PRECONNECT_ENABLED", "true")
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda *args: pytest.fail("unexpected AI"))
+    operations = []
+    session = rig.session
+
+    async def prepare():
+        operations.append("prepare")
+        assert not rig.commands
+
+    async def bind(issued):
+        operations.append("bind")
+        assert "PCM" not in rig.commands
+        assert session.takeover_state is not TakeoverState.MOBILE_ACTIVE
+
+    async def connect():
+        pytest.fail("ready preconnect must be reused")
+
+    rig.endpoint.preconnect, rig.endpoint.bind_winner, rig.endpoint.connect = prepare, bind, connect
+
+    def tick():
+        request = session._takeover_request
+        if not operations:
+            assert session.prepare_takeover({
+                "offerId": request.offer_id, "callId": request.call_id, "generation": request.generation,
+                "nonce": request.nonce, "session": {
+                    "sessionId": "session_test", "roomName": rig.issued.room_name,
+                    "browserIdentity": rig.issued.browser_identity, "edgeIdentity": rig.issued.edge_identity,
+                    "livekitUrl": rig.issued.livekit_url, "token": rig.issued.edge_token,
+                },
+            })
+        else:
+            rig.clock.tick = lambda: None
+            assert rig.claim().accepted
+
+    rig.clock.tick = tick
+
+    async def pump(*args):
+        assert operations == ["prepare", "bind"]
+        assert rig.commands.count("PCM") == 1
+        assert session.takeover_state is TakeoverState.MOBILE_ACTIVE
+
+    monkeypatch.setattr(session, "_pump_mobile_media", pump)
+    asyncio.run(session._handle_call())
+    assert session._record.source == "remote_web_dialer"
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+
+
+@pytest.mark.parametrize("initial", [False, True])
+def test_early_answer_setting_is_frozen_at_claim_and_reset_for_next_call(rig, monkeypatch, initial):
+    enable_early_answer(rig, monkeypatch)
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda *args: pytest.fail("unexpected AI"))
+    for enabled in (initial, not initial):
+        monkeypatch.setenv("INBOUND_EARLY_ANSWER_ENABLED", str(enabled))
+        rig.commands.clear()
+        rig.endpoint.closed = False
+        rig.ring()
+
+        def claim_once():
+            rig.clock.tick = lambda: None
+            assert rig.claim().accepted
+            monkeypatch.setenv("INBOUND_EARLY_ANSWER_ENABLED", str(not enabled))
+
+        rig.clock.tick = claim_once
+        rig.session._run()
+        assert rig.session._record.source == "remote_web_dialer"
+        events = phone_first_events(rig)
+        assert any(event["type"] == "phone_first_early_answer" for event in events) is enabled
+        assert (rig.session._phone_first_pcm_enable_info is not None) is enabled
+
+
+@pytest.mark.parametrize("ending", ["connect_error", "cancel", "hangup"])
+def test_early_answer_joins_pcm_worker_before_cleanup_and_never_builds_late_bridge(rig, monkeypatch, ending):
+    enable_early_answer(rig, monkeypatch)
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    original_initialize = rig.modem.initialize_for_voice
+    starts = []
+    original_start = rig.bridge.start
+    agent = FakeAgent()
+
+    def create_agent(provider):
+        assert ending == "connect_error" and finished.is_set()
+        return agent
+
+    monkeypatch.setattr("agentcall.call_agent.create_agent", create_agent)
+
+    def initialize(mode):
+        with rig.modem._serial_lock:
+            entered.set()
+            assert release.wait(2)
+            original_initialize(mode)
+            finished.set()
+
+    def start():
+        assert finished.is_set()
+        starts.append(True)
+        original_start()
+
+    async def loop(*args):
+        return rig.bridge
+
+    async def connect():
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+        if ending == "connect_error":
+            raise ConnectionError("synthetic")
+        await asyncio.Event().wait()
+
+    async def exercise():
+        task = asyncio.create_task(rig.session._handle_call())
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            if ending == "cancel":
+                task.cancel()
+            elif ending == "hangup":
+                rig.session._set_active(False)
+            await asyncio.sleep(0.01)
+            assert not task.done() and not rig.endpoint.closed and not starts
+        finally:
+            release.set()
+        if ending == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await task
+
+    monkeypatch.setattr(rig.modem, "initialize_for_voice", initialize)
+    monkeypatch.setattr(rig.bridge, "start", start)
+    monkeypatch.setattr(rig.session, "_run_agent_loop", loop)
+    rig.endpoint.connect = connect
+    asyncio.run(exercise())
+    assert finished.is_set() and rig.endpoint.closed
+    assert len(starts) == int(ending == "connect_error")
+    assert agent.started is (ending == "connect_error")
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+    assert rig.bridge.max_writers <= 1
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_early_answer_continuous_uplink_cannot_block_media_or_timeout(rig, monkeypatch, ready):
+    enable_early_answer(rig, monkeypatch)
+    rig.endpoint.media_ready = False
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+    loop_thread = threading.get_ident()
+    reads = []
+
+    def read():
+        assert threading.get_ident() != loop_thread
+        reads.append(True)
+        rig.clock.now += 0.01
+        assert len(reads) < 1000, "continuous PCM must not trap the drain loop"
+        return b"live caller audio"
+
+    async def connect():
+        while not reads:
+            await asyncio.sleep(0.001)
+        rig.endpoint.media_ready = ready
+
+    async def loop(*args):
+        return rig.bridge
+
+    monkeypatch.setattr(rig.bridge, "read_modem_chunk", read)
+    monkeypatch.setattr(rig.session, "_run_agent_loop", loop)
+    rig.endpoint.connect = connect
+    asyncio.run(rig.session._handle_call())
+    assert reads and rig.endpoint.closed and rig.bridge.stopped
+    assert agent.started is not ready
+    assert (rig.session._record.source == "remote_web_dialer") is ready
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+    if not ready:
+        waits = [event for event in phone_first_events(rig)
+                 if event.get("stage") == "phone_first_connected_wait_ms"]
+        assert len(waits) == 1 and 8000 <= waits[0]["ms"] < 8101
