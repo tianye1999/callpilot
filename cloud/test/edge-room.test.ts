@@ -65,6 +65,7 @@ afterEach(() => {
 
 describe("EdgeRoom current connection", () => {
   it("marks existing attachments before closing and timestamps the accepted connection", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
     const now = 123456;
     vi.spyOn(Date, "now").mockReturnValue(now);
     const old = edgeSocket(now);
@@ -87,8 +88,16 @@ describe("EdgeRoom current connection", () => {
     expect(legacy.deserializeAttachment()).toMatchObject({ edgeId, replaced: true });
     expect(old.close).toHaveBeenCalledWith(4001, "Replaced by a newer connection");
     expect(legacy.close).toHaveBeenCalledWith(4001, "Replaced by a newer connection");
-    expect(latest.deserializeAttachment()).toEqual({ edgeId, connectedAt: now });
+    expect(latest.deserializeAttachment()).toEqual({ edgeId, connectedAt: now, socketId: expect.stringMatching(/^[0-9a-f]{8}$/) });
     expect(state.acceptWebSocket).toHaveBeenCalledWith(latest, ["edge"]);
+    const records = log.mock.calls.map(([line]) => JSON.parse(line));
+    expect(records).toContainEqual(expect.objectContaining({
+      event: "edge.connect", sid: expect.stringMatching(/^[0-9a-f]{8}$/), code: null, reason: null, alive_s: 0
+    }));
+    expect(records.filter(record => record.event === "edge.replace")).toEqual([
+      { event: "edge.replace", sid: null, code: 4001, reason: "Replaced by a newer connection", alive_s: 0 },
+      { event: "edge.replace", sid: null, code: 4001, reason: "Replaced by a newer connection", alive_s: null }
+    ]);
     upgrade.mockRestore();
 
     // Simulate a wake-up: only attachments, not instance fields, survive.
@@ -222,6 +231,71 @@ const heartbeat = JSON.stringify({
   status: { modemOnline: true, lineBusy: false, version: "test" }
 });
 
+describe("EdgeRoom connection diagnostics", () => {
+  it.each([1005, 1006, 1015, 1000, 1001, 1011, 4001])("normalizes close reply %s on current and replaced sockets", async (code) => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(Date, "now").mockReturnValue(20_000);
+    for (const replaced of [false, true]) {
+      const socket = edgeSocket(5_000, replaced);
+      socket.close.mockImplementation(() => {});
+      const { room } = edgeRoom([socket]);
+      await room.webSocketClose(socket as unknown as WebSocket, code, "Closed");
+      const replyCode = [1005, 1006, 1015].includes(code) ? 1000 : code;
+      expect(socket.close).toHaveBeenCalledWith(replyCode, "Closed");
+      expect(log.mock.calls.map(([line]) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+        event: "edge.close", code, reason: "Closed", alive_s: 15, reply_code: replyCode
+      }));
+    }
+  });
+
+  it("logs error close intent and connection age", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(20_000);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const socket = edgeSocket(5_000);
+    socket.close.mockImplementation(() => {});
+    await edgeRoom([socket]).room.webSocketError(socket as unknown as WebSocket);
+    expect(log.mock.calls.map(([line]) => JSON.parse(line))[0]).toMatchObject({
+      event: "edge.error", code: 1011, reason: "WebSocket error", alive_s: 15
+    });
+    expect(socket.close).toHaveBeenCalledWith(1011, "WebSocket error");
+  });
+
+  it("times parallel heartbeat writes and exposes a fresh instance after wake-up", async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const socket = edgeSocket(now);
+    const { room, run, state } = edgeRoom([socket]);
+    let finishStorage!: () => void;
+    let finishD1!: () => void;
+    state.storage.put.mockImplementationOnce(() => new Promise<void>(resolve => { finishStorage = resolve; }));
+    run.mockImplementationOnce(() => new Promise<void>(resolve => { finishD1 = resolve; }));
+    const pending = room.webSocketMessage(socket as unknown as WebSocket, heartbeat);
+    // Both operations must start before either resolves.
+    expect(state.storage.put).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledOnce();
+    now += 20;
+    finishStorage();
+    await Promise.resolve();
+    now += 30;
+    finishD1();
+    await pending;
+    const records = () => log.mock.calls.map(([line]) => JSON.parse(line));
+    expect(records()).toContainEqual(expect.objectContaining({
+      event: "edge.heartbeat", storage_ms: 20, d1: true, d1_ms: 50, total_ms: 50, new_wake: true
+    }));
+    expect(records()).toContainEqual(expect.objectContaining({
+      event: "edge.last_seen", at: 1_000_000, d1_ms: 50, new_wake: true, ok: true
+    }));
+    now += 15_000;
+    await room.webSocketMessage(socket as unknown as WebSocket, heartbeat);
+    expect(records().at(-1)).toMatchObject({ event: "edge.heartbeat", d1: false, d1_ms: null, new_wake: false });
+    expect(run).toHaveBeenCalledOnce();
+    await edgeRoom([socket]).room.webSocketMessage(socket as unknown as WebSocket, heartbeat);
+    expect(records().at(-1)).toMatchObject({ event: "edge.heartbeat", d1: true, new_wake: true });
+  });
+});
+
 describe("EdgeRoom last-seen bookkeeping", () => {
   it("still returns a 101 upgrade when D1 rejects the update", async () => {
     const { room, run } = edgeRoom([]);
@@ -261,6 +335,7 @@ describe("EdgeRoom last-seen bookkeeping", () => {
   });
 
   it("keeps heartbeat and close nonfatal when D1 fails", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
     const socket = edgeSocket();
     socket.close.mockImplementation(() => {});
     const { room, run, state } = edgeRoom([socket]);
@@ -270,6 +345,24 @@ describe("EdgeRoom last-seen bookkeeping", () => {
     await expect(room.webSocketClose(socket as unknown as WebSocket, 1000, "Closed")).resolves.toBeUndefined();
     expect(warn).toHaveBeenCalledTimes(2);
     expect(state.storage.put).toHaveBeenCalledTimes(2);
+    const records = log.mock.calls.map(([line]) => JSON.parse(line));
+    expect(records.filter(record => record.event === "edge.last_seen")).toEqual([
+      expect.objectContaining({ edge_id: edgeId, ok: false, new_wake: true, heartbeat: true, d1_ms: expect.any(Number) }),
+      expect.objectContaining({ edge_id: edgeId, ok: false, new_wake: false, heartbeat: false, d1_ms: expect.any(Number) })
+    ]);
+    expect(records).toContainEqual(expect.objectContaining({ event: "edge.heartbeat", d1: true }));
+  });
+
+  it("logs heartbeat timing without swallowing a storage failure", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const socket = edgeSocket();
+    const { room, state } = edgeRoom([socket]);
+    const error = new Error("storage failure");
+    state.storage.put.mockRejectedValue(error);
+    await expect(room.webSocketMessage(socket as unknown as WebSocket, heartbeat)).rejects.toBe(error);
+    expect(log.mock.calls.map(([line]) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+      event: "edge.heartbeat", storage_ms: expect.any(Number), total_ms: expect.any(Number), new_wake: true
+    }));
   });
 });
 

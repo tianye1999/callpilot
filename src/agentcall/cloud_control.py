@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 _MAX_JSON_BYTES = 16 * 1024
 _ID_RE = r"[a-z]+_[A-Za-z0-9_-]{12,80}"
 _USER_AGENT = "CallPilot-Edge/1"
+_PING_INTERVAL_SECONDS = 20.0
+_PING_TIMEOUT_SECONDS = 20.0
 
 
 class CloudSessionService(Protocol):
@@ -209,6 +211,10 @@ class CloudEdgeClient:
         self._connected = False
         self._last_error: str | None = None
         self._state_lock = threading.Lock()
+        self._connection_started_at: float | None = None
+        self._last_disconnect_at: float | None = None
+        self._reconnect_started_at: float | None = None
+        self._connect_attempt = 0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -509,14 +515,39 @@ class CloudEdgeClient:
                 self._stop_event.wait(5.0)
                 continue
             try:
+                self._connection_started_at = None
+                self._connect_attempt += 1
                 self._run_connection(credential)
                 delay = 1.0
             except Exception as exc:  # network and SDK exceptions vary
+                from websockets.exceptions import ConnectionClosed
+
+                now = time.monotonic()
+                rcvd = exc.rcvd if isinstance(exc, ConnectionClosed) else None
+                sent = exc.sent if isinstance(exc, ConnectionClosed) else None
+                code = (rcvd.code if rcvd else sent.code if sent else 1006
+                        ) if isinstance(exc, ConnectionClosed) else None
                 self._set_connected(False)
-                self._set_error(type(exc).__name__)
+                self._set_error(f"{type(exc).__name__}:{code}" if code is not None else type(exc).__name__)
                 logger.warning(
-                    "CallPilot 云控制面连接中断: error_type=%s", type(exc).__name__
+                    "CallPilot 云控制面连接中断: %s",
+                    _compact_json({
+                        "error_type": type(exc).__name__, "code": code,
+                        "rcvd": {"code": rcvd.code, "reason": rcvd.reason} if rcvd else None,
+                        "sent": {"code": sent.code, "reason": sent.reason} if sent else None,
+                        "rcvd_then": exc.rcvd_then_sent if isinstance(exc, ConnectionClosed) else None,
+                        "alive_s": round(now - self._connection_started_at, 3)
+                        if self._connection_started_at is not None else None,
+                        "since_disconnect_s": round(now - self._last_disconnect_at, 3)
+                        if self._last_disconnect_at is not None else None,
+                        "keepalive_timeout": sent is not None and sent.code == 1011
+                        and sent.reason == "keepalive ping timeout",
+                    }),
                 )
+                if self._connection_started_at is not None:
+                    self._last_disconnect_at = now
+                if self._reconnect_started_at is None:
+                    self._reconnect_started_at = now
                 self._stop_event.wait(delay + random.random() * 0.25 * delay)
                 delay = min(delay * 2.0, 30.0)
 
@@ -533,9 +564,22 @@ class CloudEdgeClient:
             user_agent_header=_USER_AGENT,
             open_timeout=10.0,
             close_timeout=3.0,
+            ping_interval=_PING_INTERVAL_SECONDS,
+            ping_timeout=_PING_TIMEOUT_SECONDS,
         ) as websocket:
+            self._connection_started_at = time.monotonic()
             self._set_connected(True)
             self._set_error(None)
+            logger.info(
+                "CallPilot 云控制面已连接: %s",
+                _compact_json({
+                    "reconnect_s": round(self._connection_started_at - self._reconnect_started_at, 3)
+                    if self._reconnect_started_at is not None else 0.0,
+                    "attempt": self._connect_attempt or 1,
+                }),
+            )
+            self._reconnect_started_at = None
+            self._connect_attempt = 0
             next_heartbeat = 0.0
             while not self._stop_event.is_set():
                 now = time.monotonic()

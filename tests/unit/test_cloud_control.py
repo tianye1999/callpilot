@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from agentcall.cloud_control import CloudControlApi, CloudEdgeClient
 from agentcall.cloud_credentials import (
@@ -874,6 +876,102 @@ def test_cloud_websocket_uses_product_user_agent() -> None:
     client._run_connection(credential)
 
     assert captured["user_agent_header"] == "CallPilot-Edge/1"
+    assert captured["ping_interval"] == 20.0
+    assert captured["ping_timeout"] == 20.0
+
+
+@pytest.mark.parametrize(
+    "rcvd,sent,order,code,keepalive",
+    [
+        (None, Close(1011, "keepalive ping timeout"), None, 1011, True),
+        (Close(4001, "Replaced"), Close(4001, "Replaced"), True, 4001, False),
+        (Close(1011, "peer"), Close(1011, "keepalive ping timeout"), False, 1011, True),
+        (None, None, None, 1006, False),
+    ],
+)
+def test_cloud_disconnect_logs_close_frames(monkeypatch, caplog, rcvd, sent, order, code, keepalive):
+    credential = EdgeCredential("edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40)
+    clock = [100.0]
+    monkeypatch.setattr("agentcall.cloud_control.time.monotonic", lambda: clock[0])
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def send(self, _message):
+            pass
+
+        def recv(self, *, timeout):
+            clock[0] = 145.0
+            client._stop_event.set()
+            raise ConnectionClosedError(rcvd, sent, order)
+
+    client = CloudEdgeClient("https://relay.example.test", _Service(), _Store(credential),
+                             connect=lambda *_args, **_kwargs: Socket())
+    with caplog.at_level(logging.INFO):
+        client._run()
+    record = next(record for record in caplog.records if "连接中断" in record.message)
+    fields = json.loads(record.message.split(": ", 1)[1])
+    assert fields == {
+        "error_type": "ConnectionClosedError", "code": code,
+        "rcvd": None if rcvd is None else {"code": rcvd.code, "reason": rcvd.reason},
+        "sent": None if sent is None else {"code": sent.code, "reason": sent.reason},
+        "rcvd_then": order, "alive_s": 45.0, "since_disconnect_s": None,
+        "keepalive_timeout": keepalive,
+    }
+    assert client.status().last_error == f"ConnectionClosedError:{code}"
+
+
+def test_cloud_reconnect_logs_attempts_and_elapsed_without_changing_backoff(monkeypatch, caplog):
+    credential = EdgeCredential("edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40)
+    clock = [100.0]
+    attempts = [0]
+    waits = []
+    monkeypatch.setattr("agentcall.cloud_control.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("agentcall.cloud_control.random.random", lambda: 0.0)
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def send(self, _message):
+            pass
+
+        def recv(self, *, timeout):
+            clock[0] += 10.0
+            if attempts[0] == 3:
+                client._stop_event.set()
+            raise ConnectionClosedError(None, None)
+
+    def connect(*_args, **_kwargs):
+        attempts[0] += 1
+        if attempts[0] == 2:
+            clock[0] += 4.0
+            raise OSError("handshake failed")
+        return Socket()
+
+    def wait(delay):
+        waits.append(delay)
+        clock[0] += delay
+
+    client = CloudEdgeClient("https://relay.example.test", _Service(), _Store(credential), connect=connect)
+    monkeypatch.setattr(client._stop_event, "wait", wait)
+    with caplog.at_level(logging.INFO):
+        client._run()
+    connected = [json.loads(r.message.split(": ", 1)[1]) for r in caplog.records if "已连接" in r.message]
+    assert connected == [{"reconnect_s": 0.0, "attempt": 1}, {"reconnect_s": 7.0, "attempt": 2}]
+    disconnected = [json.loads(r.message.split(": ", 1)[1]) for r in caplog.records if "连接中断" in r.message]
+    assert disconnected[1]["alive_s"] is None
+    assert disconnected[1]["since_disconnect_s"] == 5.0
+    assert disconnected[2]["alive_s"] == 10.0
+    assert disconnected[2]["since_disconnect_s"] == 17.0
+    assert waits == [1.0, 2.0, 4.0]
 
 
 def test_cloud_websocket_drains_content_free_alerts(monkeypatch) -> None:

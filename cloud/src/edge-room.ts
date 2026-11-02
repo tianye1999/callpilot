@@ -23,7 +23,13 @@ import { issueIceServers, type IceCredentials } from "./turn";
 interface SocketAttachment {
   edgeId: string;
   connectedAt: number;
+  socketId?: string;
   replaced?: boolean;
+}
+
+interface LastSeenTiming {
+  d1: boolean;
+  d1_ms: number | null;
 }
 
 interface PendingRelay {
@@ -94,14 +100,16 @@ export class EdgeRoom extends DurableObject<Env> {
       const attachment = existing.deserializeAttachment() as SocketAttachment;
       existing.serializeAttachment({ ...attachment, replaced: true });
       this.failRelaysForSocket(existing, "EDGE_OFFLINE", 503);
+      this.logSocket("edge.replace", existing, 4001, "Replaced by a newer connection");
       existing.close(4001, "Replaced by a newer connection");
     }
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     const now = Date.now();
-    server.serializeAttachment({ edgeId, connectedAt: now } satisfies SocketAttachment);
+    server.serializeAttachment({ edgeId, connectedAt: now, socketId: crypto.randomUUID().slice(0, 8) } satisfies SocketAttachment);
     this.ctx.acceptWebSocket(server, ["edge"]);
+    this.logSocket("edge.connect", server, null, null);
     await this.ctx.storage.put<EdgePresence>("presence", { connected: true, lastSeenAt: now });
     await this.updateLastSeen(edgeId, now);
     return new Response(null, { status: 101, webSocket: client });
@@ -126,6 +134,7 @@ export class EdgeRoom extends DurableObject<Env> {
       // Persist the fence even if closing leaves the socket reporting OPEN.
       socket.serializeAttachment({ ...attachment, replaced: true });
       this.failRelaysForSocket(socket, "EDGE_OFFLINE", 503);
+      this.logSocket("edge.replace", socket, 4001, "Replaced by a newer connection");
       socket.close(4001, "Replaced by a newer connection");
     }
     return current;
@@ -323,6 +332,10 @@ export class EdgeRoom extends DurableObject<Env> {
       return;
     }
     if (result.data.type === "heartbeat") {
+      const startedAt = Date.now();
+      const newWake = this.lastSeenAttemptAt === undefined;
+      let storageMs: number | null = null;
+      let lastSeen: LastSeenTiming | undefined;
       const presence: EdgePresence = {
         connected: true,
         lastSeenAt: now,
@@ -332,10 +345,16 @@ export class EdgeRoom extends DurableObject<Env> {
         inboundPreconnectV1: result.data.status.inboundPreconnectV1 === true,
         inboundFastpathV2: result.data.status.inboundFastpathV2 === true
       };
-      await Promise.all([
-        this.ctx.storage.put("presence", presence),
-        this.updateLastSeen(attachment.edgeId, now, true)
-      ]);
+      try {
+        await Promise.all([
+          this.ctx.storage.put("presence", presence).finally(() => { storageMs = Date.now() - startedAt; }),
+          this.updateLastSeen(attachment.edgeId, now, true).then(timing => { lastSeen = timing; })
+        ]);
+      } finally {
+        console.log(JSON.stringify({ event: "edge.heartbeat", sid: attachment.socketId ?? null,
+          storage_ms: storageMs, d1: lastSeen?.d1 ?? null, d1_ms: lastSeen?.d1_ms ?? null,
+          new_wake: newWake, total_ms: Date.now() - startedAt }));
+      }
       return;
     }
     if (result.data.type === "command.ack") {
@@ -439,16 +458,19 @@ export class EdgeRoom extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    // These are local status sentinels, never valid codes in an outgoing close frame.
+    const replyCode = [1005, 1006, 1015].includes(code) ? 1000 : code;
+    this.logSocket("edge.close", ws, code, reason, { reply_code: replyCode });
     this.failRelaysForSocket(ws, "EDGE_OFFLINE", 503);
     const attachment = ws.deserializeAttachment() as SocketAttachment | null;
     const current = this.currentConnection();
-    if (attachment?.replaced || (current && current !== ws)) { ws.close(code, reason); return; }
+    if (attachment?.replaced || (current && current !== ws)) { ws.close(replyCode, reason); return; }
     await this.ctx.storage.put<EdgePresence>("presence", {
       ...(await this.ctx.storage.get<EdgePresence>("presence")),
       connected: false,
       lastSeenAt: Date.now()
     });
-    ws.close(code, reason);
+    ws.close(replyCode, reason);
     if (attachment) {
       await this.disconnectPreconnect(attachment.edgeId);
       await this.updateLastSeen(attachment.edgeId, Date.now());
@@ -456,10 +478,19 @@ export class EdgeRoom extends DurableObject<Env> {
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
+    this.logSocket("edge.error", ws, 1011, "WebSocket error");
     this.failRelaysForSocket(ws, "EDGE_OFFLINE", 503);
     ws.close(1011, "WebSocket error");
     const attachment = ws.deserializeAttachment() as SocketAttachment | null;
     if (attachment && !attachment.replaced) await this.disconnectPreconnect(attachment.edgeId);
+  }
+
+  private logSocket(event: string, ws: WebSocket, code: number | null, reason: string | null,
+    extra: Record<string, number> = {}): void {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | null;
+    console.log(JSON.stringify({ event, sid: attachment?.socketId ?? null, code, reason,
+      alive_s: attachment?.connectedAt === undefined ? null : (Date.now() - attachment.connectedAt) / 1000,
+      ...extra }));
   }
 
   private async disconnectPreconnect(edgeId: string) {
@@ -483,20 +514,30 @@ export class EdgeRoom extends DurableObject<Env> {
     else await this.ctx.storage.setAlarm(Date.now() + interval);
   }
 
-  private async updateLastSeen(edgeId: string, now: number, heartbeat = false): Promise<void> {
+  private async updateLastSeen(edgeId: string, now: number, heartbeat = false): Promise<LastSeenTiming> {
     const cutoff = now - 5 * 60_000;
-    if (heartbeat && this.lastSeenAttemptAt !== undefined && this.lastSeenAttemptAt > cutoff) return;
+    if (heartbeat && this.lastSeenAttemptAt !== undefined && this.lastSeenAttemptAt > cutoff) return { d1: false, d1_ms: null };
+    const newWake = this.lastSeenAttemptAt === undefined;
     // Reserve before awaiting D1, including failures, to avoid overlapping retries.
     this.lastSeenAttemptAt = now;
+    const startedAt = Date.now();
+    let ok = false;
+    let durationMs: number;
     try {
       const sql = "UPDATE edges SET last_seen_at = ?1 WHERE edge_id = ?2";
       await (heartbeat
         ? this.env.DB.prepare(`${sql} AND (last_seen_at IS NULL OR last_seen_at <= ?3)`)
           .bind(now, edgeId, cutoff)
         : this.env.DB.prepare(sql).bind(now, edgeId)).run();
+      ok = true;
     } catch {
       console.warn("Edge last-seen update failed");
+    } finally {
+      durationMs = Date.now() - startedAt;
+      console.log(JSON.stringify({ event: "edge.last_seen", edge_id: edgeId, at: startedAt, d1_ms: durationMs,
+        new_wake: newWake, heartbeat, ok }));
     }
+    return { d1: true, d1_ms: durationMs };
   }
 
   private acceptRelayResponse(ws: WebSocket, response: DataResponse): void {
