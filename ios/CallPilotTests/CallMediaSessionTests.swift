@@ -4,7 +4,7 @@ import XCTest
 
 @MainActor
 final class CallMediaSessionTests: XCTestCase {
-    func testColdClaimAfterThreeSecondsDoesNotWaitForStuckSilentTeardown() async throws {
+    func testColdClaimAfterEightSecondsDoesNotWaitForStuckSilentTeardown() async throws {
         try await assertDetachedSilentTeardown(stopBeforeDrain: false)
     }
 
@@ -50,16 +50,16 @@ final class CallMediaSessionTests: XCTestCase {
         let answering = Task { await media.startTakeover(client: client,
             offerId: "offer_abcdefghijkl", usesCallKit: true,
             onClaimed: { claimedAt = .now }, onConnected: {}) }
-        await fulfillment(of: [claimReceived], timeout: readyBeforeAnswer ? 1 : 4)
+        await fulfillment(of: [claimReceived], timeout: readyBeforeAnswer ? 1 : 9)
         await waitUntil { cold.operations.contains(.connect) }
         XCTAssertEqual(factoryCount, 2)
         XCTAssertEqual(cold.operations.filter { $0 == .connect }.count, 1)
         XCTAssertNotNil(claimedAt)
         if let claimedAt {
             if !readyBeforeAnswer {
-                XCTAssertGreaterThanOrEqual(answeredAt.duration(to: claimedAt), .seconds(3))
+                XCTAssertGreaterThanOrEqual(answeredAt.duration(to: claimedAt), .seconds(8))
             }
-            XCTAssertLessThan(answeredAt.duration(to: claimedAt), readyBeforeAnswer ? .seconds(1) : .seconds(4))
+            XCTAssertLessThan(answeredAt.duration(to: claimedAt), readyBeforeAnswer ? .seconds(1) : .seconds(9))
         }
         await waitUntil { disconnectGate.didStart }
         XCTAssertFalse(silent.operations.contains(.disconnect))
@@ -212,23 +212,23 @@ final class CallMediaSessionTests: XCTestCase {
         try await assertColdTakeover(at: .audioLease)
     }
 
-    func testAnswerWhilePrepareWaitsThenReusesSilentConnection() async throws {
-        try await assertWaitingTakeoverReuses(at: .prepare)
+    func testAnswerWhilePrepareWaitsClaimsColdBeforePrepareReturns() async throws {
+        try await assertColdClaimBeforePrepareReturns(failPrepare: false)
     }
 
-    func testAnswerWhileAudioLeaseWaitsThenReusesSilentConnection() async throws {
-        try await assertWaitingTakeoverReuses(at: .audioLease)
+    func testAnswerKeepsWaitingBeyondThreeSecondsAndReusesSilentConnection() async throws {
+        try await assertWaitingTakeoverReuses(after: .milliseconds(3200))
     }
 
     func testAnswerWhileSilentConnectWaitsThenReusesOneConnection() async throws {
-        try await assertWaitingTakeoverReuses(at: .connect)
+        try await assertWaitingTakeoverReuses(after: .milliseconds(50))
     }
 
-    func testAnswerWhilePrepareExceedsWaitBudgetFallsBackToCold() async throws {
+    func testAnswerWhilePrepareWaitsImmediatelyCancelsSilentSetupAndFallsBackToCold() async throws {
         try await assertColdTakeover(at: .prepare)
     }
 
-    func testAnswerWaitsThreeSecondsBeforeColdFallbackAndFencesLateEvents() async throws {
+    func testAnswerWaitsEightSecondsBeforeColdFallbackAndFencesLateEvents() async throws {
         try await assertColdTakeover(at: .connect)
     }
 
@@ -292,21 +292,12 @@ final class CallMediaSessionTests: XCTestCase {
 
     private enum SilentAnswerStage { case audioLease, prepare, connect, ready }
 
-    private func assertWaitingTakeoverReuses(at stage: SilentAnswerStage) async throws {
-        let responseGate = stage == .prepare ? ResponseGate() : nil
-        let client = try makePreparedClient(mode: "reuse", prepareGate: responseGate)
+    private func assertWaitingTakeoverReuses(after delay: Duration) async throws {
+        let client = try makePreparedClient(mode: "reuse")
         let device = TestCallAudioDevice()
         let audio = CallAudioOwner(device: device, onCleanupError: { _ in XCTFail("cleanup") })
-        let drain = ConnectGate()
-        var cleanup: Task<Void, Never>?
-        if stage == .audioLease {
-            let previous = UUID()
-            try await audio.acquire(previous, mode: .callKit)
-            cleanup = audio.release(previous) { await drain.wait() }
-            await waitUntil { drain.didStart }
-        }
         let transport = FakeCallMediaTransport()
-        if stage == .connect { transport.connectGate = ConnectGate() }
+        transport.connectGate = ConnectGate()
         var factoryCount = 0
         var claimed = false
         let media = CallMediaSession(onState: { _ in }, transportFactory: {
@@ -315,30 +306,22 @@ final class CallMediaSessionTests: XCTestCase {
         }, audio: audio)
         let preparing = Task { await media.startSilentPreconnect(client: client,
             offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
-        switch stage {
-        case .audioLease: await waitUntil { self.timingMarks(media)[.prepareResponse] != nil }
-        case .prepare: await waitUntil { responseGate?.didStart == true }
-        case .connect: await waitUntil { transport.connectGate?.didStart == true }
-        case .ready: await preparing.value
-        }
+        await waitUntil { transport.connectGate?.didStart == true }
         let answering = Task { await media.startTakeover(client: client,
             offerId: "offer_abcdefghijkl", usesCallKit: true, onClaimed: {
                 claimed = true
                 try media.prepareCallKitAnswer()
             }, onConnected: {}) }
         await waitUntil { self.field(media, "claimStarted", as: Bool.self) == true }
-        try await Task.sleep(for: .milliseconds(50))
+        try await Task.sleep(for: delay)
         XCTAssertFalse(claimed)
         XCTAssertNil(timingMarks(media)[.claimStart])
         XCTAssertNil(timingMarks(media)[.coldFallback])
         XCTAssertEqual(device.configureCount, 0)
         XCTAssertEqual(device.activateCount, 0)
-        responseGate?.open()
-        drain.open()
         transport.connectGate?.open()
         let joined = await answering.value
         await preparing.value
-        await cleanup?.value
         XCTAssertTrue(joined)
         XCTAssertTrue(claimed)
         XCTAssertEqual(factoryCount, 1)
@@ -360,10 +343,13 @@ final class CallMediaSessionTests: XCTestCase {
             let client = try makePreparedClient(mode: "cold")
             let silent = FakeCallMediaTransport(), cold = FakeCallMediaTransport()
             silent.connectGate = ConnectGate()
+            let disconnectGate = ManualGate()
+            silent.disconnectGate = disconnectGate
+            defer { disconnectGate.open() }
             var factoryCount = 0
             let media = CallMediaSession(onState: { _ in }, transportFactory: {
                 factoryCount += 1
-                if factoryCount == 2 { XCTAssertTrue(silent.operations.contains(.disconnect)) }
+                if factoryCount == 2 { XCTAssertNil(silent.eventHandler) }
                 return factoryCount == 1 ? silent : cold
             })
             let preparing = Task { await media.startSilentPreconnect(client: client,
@@ -384,6 +370,9 @@ final class CallMediaSessionTests: XCTestCase {
                 silent.connectGate?.open()
             }
             await waitUntil { self.timingMarks(media)[.claimStart] != nil }
+            XCTAssertLessThan(failedAt.duration(to: .now), .seconds(1))
+            XCTAssertFalse(silent.operations.contains(.disconnect))
+            disconnectGate.open()
             let joined = await answering.value
             await preparing.value
             XCTAssertTrue(joined)
@@ -396,26 +385,33 @@ final class CallMediaSessionTests: XCTestCase {
         }
     }
 
-    func testPrepareFailureDuringAnswerWaitFallsBackImmediately() async throws {
+    func testLatePrepareFailureDoesNotDelayOrFailColdClaim() async throws {
+        try await assertColdClaimBeforePrepareReturns(failPrepare: true)
+    }
+
+    private func assertColdClaimBeforePrepareReturns(failPrepare: Bool) async throws {
         let gate = ResponseGate()
-        let client = try makePreparedClient(mode: "cold", prepareGate: gate, failPrepare: true)
+        defer { gate.open() }
+        let claimReceived = expectation(description: "cold claim before prepare returns")
+        let client = try makePreparedClient(mode: "cold", prepareGate: gate, failPrepare: failPrepare,
+                                           onClaim: { claimReceived.fulfill() })
         let transport = FakeCallMediaTransport()
         let media = CallMediaSession(onState: { _ in }, transportFactory: { transport })
         let preparing = Task { await media.startSilentPreconnect(client: client,
             offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
         await waitUntil { gate.didStart }
+        let answeredAt = ContinuousClock.now
         let answering = Task { await media.startTakeover(client: client,
             offerId: "offer_abcdefghijkl", usesCallKit: true, onConnected: {}) }
-        await waitUntil { self.field(media, "claimStarted", as: Bool.self) == true }
-        try await Task.sleep(for: .milliseconds(50))
-        XCTAssertNil(timingMarks(media)[.claimStart])
-        let failedAt = ContinuousClock.now
-        gate.open()
+        await fulfillment(of: [claimReceived], timeout: 1)
         await waitUntil { self.timingMarks(media)[.claimStart] != nil }
+        XCTAssertLessThan(answeredAt.duration(to: .now), .seconds(1))
+        XCTAssertNil(timingMarks(media)[.prepareResponse])
+        XCTAssertNil(timingMarks(media)[.preconnectStart])
+        gate.open()
         let joined = await answering.value
         await preparing.value
         XCTAssertTrue(joined)
-        XCTAssertLessThan(failedAt.duration(to: .now), .seconds(1))
         XCTAssertNotNil(timingMarks(media)[.coldFallback])
         XCTAssertEqual(transport.silentConnectCount, 0)
         XCTAssertEqual(transport.operations.filter { $0 == .connect }.count, 1)
@@ -506,10 +502,14 @@ final class CallMediaSessionTests: XCTestCase {
         let answering = Task { await media.startTakeover(client: client,
             offerId: "offer_abcdefghijkl", usesCallKit: true,
             onClaimed: { try media.prepareCallKitAnswer() }, onConnected: { connectedCount += 1 }) }
-        await waitUntil(timeout: .seconds(4)) { self.timingMarks(media)[.coldFallback] != nil }
-        if stage != .ready {
-            XCTAssertGreaterThanOrEqual(answeredAt.duration(to: .now), .seconds(3))
-            XCTAssertLessThan(answeredAt.duration(to: .now), .seconds(4))
+        await waitUntil(timeout: stage == .connect ? .seconds(9) : .seconds(1)) {
+            self.timingMarks(media)[.coldFallback] != nil
+        }
+        if stage == .connect {
+            XCTAssertGreaterThanOrEqual(answeredAt.duration(to: .now), .seconds(8))
+            XCTAssertLessThan(answeredAt.duration(to: .now), .seconds(9))
+        } else {
+            XCTAssertLessThan(answeredAt.duration(to: .now), .seconds(1))
         }
         // Let cancellation reach dependencies which deliberately finish late.
         await Task.yield()
@@ -1783,6 +1783,8 @@ private final class MediaMockURLProtocol: URLProtocol {
     nonisolated(unsafe) static var requestHandler: (
         (URLRequest) throws -> (HTTPURLResponse, Data)
     )?
+    private let lock = NSLock()
+    private var stopped = false
 
     override class func canInit(with request: URLRequest) -> Bool { true }
 
@@ -1793,15 +1795,20 @@ private final class MediaMockURLProtocol: URLProtocol {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
-        do {
-            let (response, data) = try handler(request)
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: data)
-            client?.urlProtocolDidFinishLoading(self)
-        } catch {
-            client?.urlProtocol(self, didFailWithError: error)
-        }
+        // A gated prepare must not block URLProtocol from starting the cold claim.
+        DispatchQueue.global().async(execute: DispatchWorkItem { [self] in
+            do {
+                let (response, data) = try handler(request)
+                guard !lock.withLock({ stopped }) else { return }
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: data)
+                client?.urlProtocolDidFinishLoading(self)
+            } catch {
+                guard !lock.withLock({ stopped }) else { return }
+                client?.urlProtocol(self, didFailWithError: error)
+            }
+        })
     }
 
-    override func stopLoading() {}
+    override func stopLoading() { lock.withLock { stopped = true } }
 }

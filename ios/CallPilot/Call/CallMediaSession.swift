@@ -35,7 +35,7 @@ final class CallMediaSession {
     private var controlTasks: [UUID: Task<Void, Error>] = [:]
     private var cleanupTask: Task<Void, Never>?
     static let hangupBudget: Duration = .milliseconds(2500)
-    static let preconnectWaitTimeout: Duration = .seconds(3)
+    static let preconnectWaitTimeout: Duration = .seconds(8)
     private let hangupBudget: Duration
     let timing: CallTiming
     private var timingTask: Task<Void, Never>?
@@ -92,6 +92,7 @@ final class CallMediaSession {
                 try await connection.connectSilent(url: candidate.session.livekitURL, token: candidate.session.token)
                 try checkCurrent(attempt)
             } catch {
+                silentPreconnectPending = false
                 connection.eventHandler = nil
                 if transport === connection { transport = nil }
                 await connection.disconnect()
@@ -200,10 +201,12 @@ final class CallMediaSession {
             attempt = value
             silentTask = nil
         }
+        // Only a connection already started at answer time is worth waiting for.
+        let shouldWaitForPreconnect = silentTask != nil && silentTransport != nil
         claimStarted = true
         connectedHandler = onConnected
         let task = Task {
-            if silentTask != nil { try await waitForSilentPreconnect(for: attempt) }
+            if shouldWaitForPreconnect { try await waitForSilentPreconnect(for: attempt) }
             try checkCurrent(attempt)
             let candidate = preconnectReady ? preparation : nil
             if silentOfferId != nil && candidate == nil {
