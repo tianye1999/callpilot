@@ -1,7 +1,11 @@
 import { HttpError } from "./http";
-import { issueParticipantToken, participantRequest } from "./livekit";
+import { issueParticipantToken, LiveKitParticipantError, participantRequest } from "./livekit";
 import { randomId } from "./security";
 import type { DeviceRecord, EdgePresence, Env, InboundOfferRecord } from "./types";
+
+export const PRECONNECT_ACTIVE_INTERVAL_MS = 3000;
+export const PRECONNECT_CLEANUP_INTERVAL_MS = 15_000;
+const CLEANUP_CONCURRENCY = 4;
 
 export interface Preparation {
   prepare_id: string;
@@ -42,9 +46,11 @@ function unavailable() {
 }
 
 export async function queueParticipantCleanup(env: Env, offer: Pick<InboundOfferRecord, "edge_id" | "offer_id" | "expires_at">, room: string, identity: string) {
+  // A reused Edge identity can receive a five-minute token when claimed just
+  // before offer expiry. Persist that bound instead of extending it every sweep.
   await env.DB.prepare(`INSERT OR IGNORE INTO inbound_participant_cleanup
     (edge_id, offer_id, room_name, participant_identity, retry_until) VALUES (?1, ?2, ?3, ?4, ?5)`)
-    .bind(offer.edge_id, offer.offer_id, room, identity, Math.max(offer.expires_at + 60_000, Date.now() + 360_000)).run();
+    .bind(offer.edge_id, offer.offer_id, room, identity, Math.max(offer.expires_at, Date.now()) + 360_000).run();
 }
 
 export async function invalidateCandidates(env: Env, offerId: string, winner?: string) {
@@ -56,7 +62,19 @@ export async function invalidateCandidates(env: Env, offerId: string, winner?: s
 
 // The DO alarm retries removals, including late joins with still-valid JWTs.
 // Active winners are excluded; expiry only ends an unclaimed offer.
-export async function sweepPreconnect(env: Env, edgeId: string): Promise<boolean> {
+export async function sweepPreconnect(env: Env, edgeId: string): Promise<number | null> {
+  const work = await env.DB.prepare(`SELECT 1 FROM inbound_offers INDEXED BY idx_inbound_offers_edge_status
+    WHERE edge_id = ?1 AND preconnect_enabled = 1 AND status IN ('offered', 'claimed', 'edge_ready')
+    UNION ALL SELECT 1 FROM inbound_participant_cleanup INDEXED BY inbound_cleanup_pending
+    WHERE edge_id = ?1 AND completed = 0
+    UNION ALL SELECT 1 FROM inbound_preparations p INDEXED BY inbound_preparations_live
+    CROSS JOIN inbound_offers o ON o.offer_id = p.offer_id
+    WHERE p.state != 'invalid' AND o.edge_id = ?1 AND o.status NOT IN ('offered', 'claimed', 'edge_ready')
+    UNION ALL SELECT 1 FROM inbound_preparations p INDEXED BY inbound_preparations_unqueued
+    CROSS JOIN inbound_offers o ON o.offer_id = p.offer_id
+    WHERE p.state = 'invalid' AND p.cleanup_queued = 0 AND o.edge_id = ?1 LIMIT 1`)
+    .bind(edgeId).first();
+  if (!work) return null;
   await env.DB.prepare(`UPDATE inbound_offers INDEXED BY idx_inbound_offers_edge_status SET status = 'expired', updated_at = ?1
     WHERE edge_id = ?2 AND preconnect_enabled = 1 AND status = 'offered' AND expires_at <= ?1`)
     .bind(Date.now(), edgeId).run();
@@ -68,7 +86,9 @@ export async function sweepPreconnect(env: Env, edgeId: string): Promise<boolean
     .bind(edgeId).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO inbound_participant_cleanup
     (edge_id, offer_id, room_name, participant_identity, retry_until)
-    SELECT o.edge_id, p.offer_id, p.room_name, p.participant_identity, MAX(p.expires_at + 60000, ?2)
+    SELECT o.edge_id, p.offer_id, p.room_name, p.participant_identity,
+      MAX(p.expires_at + 60000, ?2, CASE WHEN p.participant_identity = o.phone_identity
+        THEN o.updated_at + 360000 ELSE 0 END)
     FROM inbound_preparations p INDEXED BY inbound_preparations_unqueued
     CROSS JOIN inbound_offers o ON o.offer_id = p.offer_id
     WHERE o.edge_id = ?1 AND p.state = 'invalid' AND p.cleanup_queued = 0`)
@@ -82,27 +102,51 @@ export async function sweepPreconnect(env: Env, edgeId: string): Promise<boolean
           AND EXISTS (SELECT 1 FROM inbound_participant_cleanup c
             WHERE c.room_name = p.room_name AND c.participant_identity = p.participant_identity))`)
     .bind(edgeId).run();
-  const rows = await env.DB.prepare(`SELECT c.room_name, c.participant_identity,
-    MAX(c.retry_until, CASE WHEN o.status NOT IN ('offered', 'claimed', 'edge_ready') THEN o.updated_at + 360000 ELSE 0 END) AS retry_until
+  // A promoted phone candidate has a five-minute token; its bound is persisted
+  // when queued above. Recent offer updates alone must never keep the alarm alive.
+  const rows = await env.DB.prepare(`SELECT c.room_name, c.participant_identity, c.retry_until
     FROM inbound_participant_cleanup c INDEXED BY inbound_cleanup_pending
     CROSS JOIN inbound_offers o ON o.offer_id = c.offer_id
     WHERE c.edge_id = ?1 AND c.completed = 0 AND (o.status NOT IN ('offered', 'claimed', 'edge_ready') OR c.room_name != o.room_name
       OR c.participant_identity NOT IN (COALESCE(o.phone_identity, ''), COALESCE(o.edge_identity, '')) AND o.status != 'offered')`)
     .bind(edgeId).all<{ room_name: string; participant_identity: string; retry_until: number }>();
-  let failed = false;
-  await Promise.all(rows.results.map(async row => {
-    try {
-      await participantRequest(env, "RemoveParticipant", row.room_name, row.participant_identity);
-      // Retain tombstones: repeated cleanup is intentional while a token can rejoin.
-      if (row.retry_until <= Date.now()) await env.DB.prepare(`UPDATE inbound_participant_cleanup SET completed = 1
-        WHERE room_name = ?1 AND participant_identity = ?2 AND completed = 0`).bind(row.room_name, row.participant_identity).run();
-    } catch { failed = true; console.warn("Inbound participant cleanup pending"); }
+  let next = 0;
+  let failed = 0;
+  let completed = 0;
+  let pending = 0;
+  const reasons = new Map<string, { errorName: string; httpStatus?: number; code?: string; count: number }>();
+  await Promise.all(Array.from({ length: Math.min(CLEANUP_CONCURRENCY, rows.results.length) }, async () => {
+    while (next < rows.results.length) {
+      const row = rows.results[next++]!;
+      try {
+        await participantRequest(env, "RemoveParticipant", row.room_name, row.participant_identity);
+      } catch (error) {
+        failed++;
+        // Never log messages, stacks, request fields, or arbitrary upstream names.
+        const reason = error instanceof LiveKitParticipantError
+          ? { errorName: error.name, httpStatus: error.httpStatus, code: error.code }
+          : { errorName: error instanceof Error && ["Error", "TypeError", "SyntaxError", "AbortError", "TimeoutError"]
+            .includes(error.name) ? error.name : "UnknownError" };
+        const key = JSON.stringify(reason);
+        const existing = reasons.get(key);
+        if (existing) existing.count++;
+        else reasons.set(key, { ...reason, count: 1 });
+      }
+      // One final removal attempt, then retire even on failure. The stored
+      // deadline already bounds token re-entry; an outage must not retry forever.
+      if (row.retry_until <= Date.now()) {
+        await env.DB.prepare(`UPDATE inbound_participant_cleanup SET completed = 1
+          WHERE room_name = ?1 AND participant_identity = ?2 AND completed = 0`).bind(row.room_name, row.participant_identity).run();
+        completed++;
+      } else pending++;
+    }
   }));
+  if (failed) console.warn("Inbound participant cleanup summary", {
+    attempted: rows.results.length, failed, completed, pending, reasons: [...reasons.values()]
+  });
   const active = await env.DB.prepare(`SELECT offer_id FROM inbound_offers INDEXED BY idx_inbound_offers_edge_status
     WHERE edge_id = ?1 AND preconnect_enabled = 1
-    AND status IN ('offered', 'claimed', 'edge_ready')
-    UNION ALL SELECT offer_id FROM inbound_offers INDEXED BY inbound_offers_preconnect_updated
-    WHERE edge_id = ?1 AND preconnect_enabled = 1 AND updated_at > ?2 LIMIT 1`)
-    .bind(edgeId, Date.now() - 360_000).first();
-  return failed || active !== null || rows.results.some(row => row.retry_until > Date.now());
+    AND status IN ('offered', 'claimed', 'edge_ready') LIMIT 1`)
+    .bind(edgeId).first();
+  return active !== null ? PRECONNECT_ACTIVE_INTERVAL_MS : pending ? PRECONNECT_CLEANUP_INTERVAL_MS : null;
 }

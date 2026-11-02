@@ -2,6 +2,20 @@ import { AccessToken, TrackSource } from "livekit-server-sdk";
 
 import type { Env } from "./types";
 
+export class LiveKitParticipantError extends Error {
+  override name = "LiveKitParticipantError";
+  readonly code?: string;
+
+  constructor(readonly httpStatus: number, code: unknown) {
+    super("LiveKit participant request failed");
+    // Only protocol codes are loggable; upstream messages can contain identities.
+    if (typeof code === "string" && ["canceled", "unknown", "invalid_argument", "malformed",
+      "deadline_exceeded", "not_found", "bad_route", "already_exists", "permission_denied",
+      "unauthenticated", "resource_exhausted", "failed_precondition", "aborted", "out_of_range",
+      "unimplemented", "internal", "unavailable", "data_loss"].includes(code)) this.code = code;
+  }
+}
+
 export async function issueParticipantToken(
   env: Env,
   room: string,
@@ -54,8 +68,12 @@ export async function participantRequest(
         }
       } : {}) })
     });
-    const payload = await response.json() as { code?: string };
-    if (!response.ok && !(method === "RemoveParticipant" && payload.code === "not_found")) {
+    const payload = await response.json().catch((error: unknown) => {
+      if (!response.ok && method === "RemoveParticipant") throw new LiveKitParticipantError(response.status, undefined);
+      throw error;
+    }) as { code?: string } | null;
+    if (!response.ok && !(method === "RemoveParticipant" && payload?.code === "not_found")) {
+      if (method === "RemoveParticipant") throw new LiveKitParticipantError(response.status, payload?.code);
       throw new Error("LiveKit participant request failed");
     }
   } finally {

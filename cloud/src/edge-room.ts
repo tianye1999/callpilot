@@ -15,7 +15,7 @@ import { HttpError } from "./http";
 import type { EdgePresence, Env } from "./types";
 import { randomId } from "./security";
 import { issueParticipantToken } from "./livekit";
-import { invalidateCandidates, queueParticipantCleanup, sweepPreconnect } from "./inbound-preconnect";
+import { invalidateCandidates, PRECONNECT_CLEANUP_INTERVAL_MS, queueParticipantCleanup, sweepPreconnect } from "./inbound-preconnect";
 import { dispatchInboundOfferPushes, errorName } from "./voip-push";
 
 interface SocketAttachment {
@@ -338,10 +338,15 @@ export class EdgeRoom extends DurableObject<Env> {
 
   override async alarm(): Promise<void> {
     const edgeId = await this.ctx.storage.get<string>("preconnectEdge");
-    if (!edgeId || typeof edgeId !== "string") return;
+    if (!edgeId || typeof edgeId !== "string") {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
     // Arm before I/O so a failed D1/admin request is retried after hibernation.
-    await this.ctx.storage.setAlarm(Date.now() + 3000);
-    if (!await sweepPreconnect(this.env, edgeId)) await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.setAlarm(Date.now() + PRECONNECT_CLEANUP_INTERVAL_MS);
+    const interval = await sweepPreconnect(this.env, edgeId);
+    if (interval === null) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(Date.now() + interval);
   }
 
   private async updateLastSeen(edgeId: string, now: number, heartbeat = false): Promise<void> {

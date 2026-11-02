@@ -9,7 +9,7 @@ vi.mock("cloudflare:workers", () => ({ DurableObject: class {
 import worker from "../src/index";
 import { sha256 } from "../src/security";
 import type { Env } from "../src/types";
-import { invalidateCandidates, sweepPreconnect } from "../src/inbound-preconnect";
+import { invalidateCandidates, queueParticipantCleanup, sweepPreconnect } from "../src/inbound-preconnect";
 import { participantRequest } from "../src/livekit";
 import { EdgeRoom } from "../src/edge-room";
 
@@ -122,10 +122,9 @@ describe("inbound preconnect", () => {
     const plans = [...new Set(f.queries.flatMap(query => query.plan))];
     // Only indexed pending sets or bounded offer ranges may drive the alarm.
     for (const plan of plans) {
-      if (/\bSCAN\b/.test(plan)) expect(plan).toMatch(/USING INDEX inbound_(preparations_live|preparations_unqueued)/);
+      if (/\bSCAN\b/.test(plan)) expect(plan).toMatch(/USING (COVERING )?INDEX inbound_(preparations_live|preparations_unqueued)/);
     }
     expect(plans.join("\n")).toContain("inbound_cleanup_pending");
-    expect(plans.join("\n")).toMatch(/inbound_offers_preconnect_updated.*updated_at>\?/);
     for (const plan of plans.filter(plan => plan.startsWith("SEARCH inbound_offers"))) {
       expect(plan).toMatch(/edge_id=\? AND (status=\?|updated_at>\?)/);
     }
@@ -153,7 +152,7 @@ describe("inbound preconnect", () => {
     expect(f.queries.reduce((sum, query) => sum + query.changes, 0)).toBe(0);
   });
 
-  it("keeps old unfinished work retryable and concurrent completion writes once", async () => {
+  it("completes expired work despite failure and concurrent completion writes once", async () => {
     const f = await fixture();
     const a = await (await f.request("prepare", { offerId: offer })).json() as Record<string, string>;
     const old = Date.now() - 86_400_000;
@@ -164,17 +163,183 @@ describe("inbound preconnect", () => {
       VALUES (?, ?, ?, ?, ?)`).run(edge, offer, a.roomName!, a.participantIdentity!, old);
     vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(new Error("offline"))
       .mockImplementation(async () => Response.json({})));
-    expect(await sweepPreconnect(f.env, edge)).toBe(true);
+    expect(await Promise.all([sweepPreconnect(f.env, edge), sweepPreconnect(f.env, edge)])).toEqual([null, null]);
     expect(f.db.prepare("SELECT state, cleanup_queued FROM inbound_preparations").get())
       .toMatchObject({ state: "invalid", cleanup_queued: 1 });
-    f.queries.length = 0;
-    expect(await Promise.all([sweepPreconnect(f.env, edge), sweepPreconnect(f.env, edge)])).toEqual([false, false]);
-    expect(f.queries.reduce((sum, query) => sum + query.changes, 0)).toBe(1);
+    expect(f.queries.filter(query => query.sql.includes("SET completed = 1"))
+      .reduce((sum, query) => sum + query.changes, 0)).toBe(1);
     f.queries.length = 0;
     vi.mocked(fetch).mockClear();
-    expect(await sweepPreconnect(f.env, edge)).toBe(false);
+    expect(await sweepPreconnect(f.env, edge)).toBeNull();
     expect(f.queries.reduce((sum, query) => sum + query.changes, 0)).toBe(0);
+    expect(f.queries.every(query => query.sql.trimStart().startsWith("SELECT"))).toBe(true);
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(["true", "false"])("drains persistent failures at retry_until and stops with flag %s", async flag => {
+    const f = await roomFixture();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await f.state.storage.put("preconnectEdge", edge);
+    f.env.INBOUND_PRECONNECT_ENABLED = flag;
+    f.db.prepare("UPDATE inbound_offers SET status = 'revoked'").run();
+    f.db.prepare(`INSERT INTO inbound_participant_cleanup
+      (edge_id, offer_id, room_name, participant_identity, retry_until)
+      VALUES (?, ?, 'private_room', 'private_identity', ?)`).run(edge, offer, now + 30_000);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ code: "unavailable", msg: "private_room private_identity secret" }, { status: 503 })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const elapsed of [0, 15_000, 30_000]) {
+      vi.mocked(Date.now).mockReturnValue(now + elapsed);
+      await f.room.alarm();
+      expect(f.db.prepare("SELECT completed FROM inbound_participant_cleanup").get()?.completed).toBe(elapsed === 30_000 ? 1 : 0);
+      if (elapsed < 30_000) expect(f.state.storage.setAlarm).toHaveBeenLastCalledWith(now + elapsed + 15_000);
+    }
+    expect(f.state.storage.deleteAlarm).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn.mock.calls[0]).toEqual(["Inbound participant cleanup summary", expect.objectContaining({
+      attempted: 1, failed: 1, completed: 0, pending: 1,
+      reasons: [{ errorName: "LiveKitParticipantError", httpStatus: 503, code: "unavailable", count: 1 }]
+    })]);
+    expect(warn.mock.calls[2]![1]).toMatchObject({ completed: 1, pending: 0 });
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private_room|private_identity|secret|Bearer/);
+    f.queries.length = 0;
+    await f.room.alarm();
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(f.queries.every(query => query.sql.trimStart().startsWith("SELECT"))).toBe(true);
+  });
+
+  it.each(["offered", "claimed", "edge_ready"])("schedules active %s offers every three seconds", async status => {
+    const f = await roomFixture();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await f.state.storage.put("preconnectEdge", edge);
+    f.db.prepare("UPDATE inbound_offers SET status = ?").run(status);
+    await f.room.alarm();
+    expect(f.state.storage.setAlarm).toHaveBeenLastCalledWith(now + 3000);
+    expect(f.state.storage.deleteAlarm).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("deletes an idle alarm without D1 writes (edge stored: %s)", async stored => {
+    const f = await roomFixture();
+    if (stored) await f.state.storage.put("preconnectEdge", edge);
+    // A recently updated terminal offer alone is not work.
+    f.db.prepare("UPDATE inbound_offers SET status = 'revoked'").run();
+    await f.room.alarm();
+    expect(f.state.storage.deleteAlarm).toHaveBeenCalledOnce();
+    expect(f.queries.every(query => query.sql.trimStart().startsWith("SELECT"))).toBe(true);
+  });
+
+  it("caps cleanup concurrency at four and aggregates failure reasons once", async () => {
+    const f = await fixture();
+    const now = Date.now();
+    f.db.prepare("UPDATE inbound_offers SET status = 'revoked'").run();
+    for (let i = 0; i < 9; i++) f.db.prepare(`INSERT INTO inbound_participant_cleanup
+      (edge_id, offer_id, room_name, participant_identity, retry_until)
+      VALUES (?, ?, 'private_room', ?, ?)`).run(edge, offer, `private_identity_${i}`, now + 60_000);
+    let running = 0;
+    let peak = 0;
+    const releases: (() => void)[] = [];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      peak = Math.max(peak, ++running);
+      await new Promise<void>(resolve => { releases.push(resolve); });
+      running--;
+      throw new TypeError("private_room private_identity token-secret");
+    }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const sweep = sweepPreconnect(f.env, edge);
+    for (const total of [4, 8, 9]) {
+      await vi.waitFor(() => { expect(fetch).toHaveBeenCalledTimes(total); });
+      releases.splice(0).forEach(resolve => resolve());
+    }
+    expect(await sweep).toBe(15_000);
+    expect(peak).toBe(4);
+    expect(warn).toHaveBeenCalledExactlyOnceWith("Inbound participant cleanup summary", expect.objectContaining({
+      attempted: 9, failed: 9, pending: 9, reasons: [{ errorName: "TypeError", count: 9 }]
+    }));
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private_room|private_identity|token-secret/);
+  });
+
+  it("retains a slow fallback alarm when D1 fails", async () => {
+    const f = await roomFixture();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await f.state.storage.put("preconnectEdge", edge);
+    vi.spyOn(f.env.DB, "prepare").mockImplementation(() => { throw new Error("D1 unavailable"); });
+    await expect(f.room.alarm()).rejects.toThrow("D1 unavailable");
+    expect(f.state.storage.setAlarm).toHaveBeenLastCalledWith(now + 15_000);
+    expect(f.state.storage.deleteAlarm).not.toHaveBeenCalled();
+  });
+
+  it("switches from active to cleanup cadence and waits for the last deadline", async () => {
+    const f = await roomFixture();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await f.state.storage.put("preconnectEdge", edge);
+    f.db.prepare("UPDATE inbound_offers SET status = 'edge_ready'").run();
+    for (const delay of [15_000, 30_000]) f.db.prepare(`INSERT INTO inbound_participant_cleanup
+      (edge_id, offer_id, room_name, participant_identity, retry_until)
+      VALUES (?, ?, 'old_room', ?, ?)`).run(edge, offer, `loser_${delay}`, now + delay);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ code: "not_found" }, { status: 404 })));
+    const warn = vi.spyOn(console, "warn");
+    await f.room.alarm();
+    expect(f.state.storage.setAlarm).toHaveBeenLastCalledWith(now + 3000);
+    f.db.prepare("UPDATE inbound_offers SET status = 'revoked'").run();
+    for (const elapsed of [15_000, 30_000]) {
+      vi.mocked(Date.now).mockReturnValue(now + elapsed);
+      await f.room.alarm();
+      expect(f.db.prepare("SELECT COUNT(*) AS count FROM inbound_participant_cleanup WHERE completed = 0").get()?.count)
+        .toBe(elapsed === 15_000 ? 1 : 0);
+      if (elapsed === 15_000) {
+        expect(f.state.storage.setAlarm).toHaveBeenLastCalledWith(now + 30_000);
+        expect(f.state.storage.deleteAlarm).not.toHaveBeenCalled();
+      }
+    }
+    expect(f.state.storage.deleteAlarm).toHaveBeenCalledOnce();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("persists token safety bounds for a reused Edge and promoted phone candidate", async () => {
+    const f = await fixture();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const a = await (await f.request("prepare", { offerId: offer })).json() as Record<string, string>;
+    const expires = now + 120_000;
+    await queueParticipantCleanup(f.env, { edge_id: edge, offer_id: offer, expires_at: expires }, a.roomName!, "edgepart_prepared");
+    expect(f.db.prepare("SELECT retry_until FROM inbound_participant_cleanup").get()?.retry_until).toBe(expires + 360_000);
+    f.db.prepare("UPDATE inbound_offers SET status = 'revoked', phone_identity = ?, updated_at = ?").run(a.participantIdentity!, now);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({})));
+    expect(await sweepPreconnect(f.env, edge)).toBe(15_000);
+    expect(f.db.prepare("SELECT retry_until FROM inbound_participant_cleanup WHERE participant_identity = ?")
+      .get(a.participantIdentity!)?.retry_until).toBe(now + 360_000);
+    // Later metadata changes must not extend an already queued deadline.
+    vi.mocked(Date.now).mockReturnValue(expires + 360_000);
+    f.db.prepare("UPDATE inbound_offers SET updated_at = ?").run(Date.now());
+    expect(await sweepPreconnect(f.env, edge)).toBeNull();
+    expect(f.db.prepare("SELECT COUNT(*) AS count FROM inbound_participant_cleanup WHERE completed = 0").get()?.count).toBe(0);
+  });
+
+  it.each(["invalid-json", "untrusted-code", "abort", "untrusted-name"])("logs safe diagnostics for %s", async failure => {
+    const f = await fixture();
+    f.db.prepare("UPDATE inbound_offers SET status = 'revoked'").run();
+    f.db.prepare(`INSERT INTO inbound_participant_cleanup
+      (edge_id, offer_id, room_name, participant_identity, retry_until)
+      VALUES (?, ?, 'private_room', 'private_identity', 0)`).run(edge, offer);
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      if (failure === "abort") throw new DOMException("private_identity", "AbortError");
+      if (failure === "untrusted-name") throw Object.assign(new Error("token-secret"), { name: "private_identity" });
+      return failure === "invalid-json" ? new Response("private_room token-secret", { status: 502 })
+        : Response.json({ code: "private_identity", msg: "token-secret" }, { status: 503 });
+    }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await sweepPreconnect(f.env, edge)).toBeNull();
+    expect(warn).toHaveBeenCalledExactlyOnceWith("Inbound participant cleanup summary", expect.objectContaining({
+      failed: 1, completed: 1, pending: 0, reasons: [expect.objectContaining({
+        errorName: failure === "abort" ? "AbortError" : failure === "untrusted-name" ? "UnknownError" : "LiveKitParticipantError",
+        ...(["invalid-json", "untrusted-code"].includes(failure) ? { httpStatus: failure === "invalid-json" ? 502 : 503 } : {}), count: 1
+      })]
+    }));
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private_room|private_identity|token-secret/);
   });
 
   it("repeated invalidation changes only candidates whose state changes", async () => {
