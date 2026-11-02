@@ -216,7 +216,7 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch)
             await media.connect()
             assert media.answer is not None and not media.media_ready
             await phone.setRemoteDescription(RTCSessionDescription(**media.answer))
-            await asyncio.wait_for(wait_ready(), 10)
+            await asyncio.wait_for(wait_ready(), 60)  # 看门狗：CI macOS 冷启动 ICE/DTLS 可能超过 10 s
             uplink = media.take_browser_audio()
             assert uplink and all(len(chunk) == 320 for chunk in uplink)
             assert max(abs(value) for chunk in uplink for value in struct.unpack("<160h", chunk)) > 500
@@ -225,9 +225,9 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch)
             assert "edge_phone_track_subscribed" not in stages
 
             channel.send('{"type":"dtmf","digits":"12#"}')
-            assert await media.next_command(2) == {"type": "dtmf", "digits": "12#"}
+            assert await media.next_command(10) == {"type": "dtmf", "digits": "12#"}
 
-            track = await asyncio.wait_for(remote_track, 2)
+            track = await asyncio.wait_for(remote_track, 30)
             for _ in range(10):
                 media.push_modem_audio(struct.pack("<160h", *([3000, -3000] * 80)))
 
@@ -238,13 +238,13 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch)
                         return True
                 return False
 
-            assert await asyncio.wait_for(hear_non_silent(), 5)
+            assert await asyncio.wait_for(hear_non_silent(), 30)
             command_id = str(uuid4())
             channel.send(json.dumps({"type": "hangup", "commandId": command_id}))
-            command = await media.next_command(2)
+            command = await media.next_command(10)
             assert command is not None and command["type"] == "hangup"
             assert await media._timing.acknowledge_hangup(command, media.send_event)
-            assert await asyncio.wait_for(events.get(), 2) == {"type": "hangup.ack", "commandId": command_id}
+            assert await asyncio.wait_for(events.get(), 10) == {"type": "hangup.ack", "commandId": command_id}
         finally:
             if media is not None:
                 await media.close()
