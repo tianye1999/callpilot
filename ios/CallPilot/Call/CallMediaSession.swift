@@ -30,6 +30,7 @@ final class CallMediaSession {
     private var edgeCommitted = false
     private var directFallbackStarted = false
     private var directControlOpen = false
+    private var lastDirectRtpStats: Data?
     private var directFallbackHandler: (() -> Void)?
     // A resource lease, not a network-speed threshold or a warm/cold heuristic.
     static let directSetupMax: Duration = .seconds(20)
@@ -242,6 +243,8 @@ final class CallMediaSession {
     }
 
     private func detachDirect(_ connection: any CallDirectMediaTransport) {
+        connection.finishRtpSampling()
+        if let packet = connection.latestRtpStats, CallRtpStats.validatedObject(packet) != nil { lastDirectRtpStats = packet }
         directControlOpen = false
         connection.stopDirectAudio()
         connection.eventHandler = nil
@@ -359,7 +362,8 @@ final class CallMediaSession {
         // A successful CAS is never repeated. The fallback route keeps its fence.
         let fallback = session.directAttempted
             ? try await client.fallbackInboundLiveKit(offerId: offerId, claimId: session.sessionId,
-                                                     clientTiming: timing.httpBatches())
+                                                     clientTiming: timing.httpBatches(reservingBytes: 512),
+                                                     clientRtpStats: lastDirectRtpStats)
             : session
         try checkCurrent(attempt)
         if mode == .callKit { try audio.configureCallKitSession(ownerID) }
@@ -605,6 +609,7 @@ final class CallMediaSession {
     func handleConnected(label: String) {
         guard !isStopped else { return }
         edgeCommitted = true
+        (transport as? any CallDirectMediaTransport)?.finishRtpSampling()
         directFallbackHandler = nil
         timing.mark(.edgeConnected)
         scheduleTiming()
@@ -674,11 +679,16 @@ final class CallMediaSession {
     private func endReservedClaimIfRequested() {
         guard ownerHangupRequested, controlEndTask == nil, let client = directClaimClient,
               let offerId = directOfferId, let claimId = directClaimID else { return }
+        if let direct = transport as? any CallDirectMediaTransport {
+            direct.finishRtpSampling()
+            if let packet = direct.latestRtpStats, CallRtpStats.validatedObject(packet) != nil { lastDirectRtpStats = packet }
+        }
         // Independent of media teardown and its cancellation. The server checks
         // the device/claim fence even when RTP and the data channel never opened.
         controlEndTask = Task {
             _ = try? await client.endInboundClaim(offerId: offerId, claimId: claimId,
-                                                clientTiming: timing.httpBatches())
+                                                clientTiming: timing.httpBatches(reservingBytes: 512),
+                                                clientRtpStats: lastDirectRtpStats)
         }
     }
 
@@ -785,13 +795,27 @@ final class CallMediaSession {
             if mark == .directControlReady {
                 directControlOpen = true
                 supportsClientTiming = true
+                if let packet = lastDirectRtpStats { try? await connection.publishControl(packet) }
             }
             scheduleTiming()
         case let .audioEngine(snapshot, failed):
             timing.recordAudioEngine(snapshot)
             timing.mark(failed ? .audioEngineFailed : .audioEngineRunning)
             scheduleTiming()
-            if failed, !edgeCommitted { directFallbackHandler?() }
+            if failed {
+                if edgeCommitted {
+                    // RTP can commit while the asynchronous ADM readback is
+                    // pending. This claim can no longer switch transports.
+                    fail(reason: L10n.text("call.audio.failed"), code: "AUDIO_ENGINE_FAILED")
+                } else {
+                    directFallbackHandler?()
+                }
+            }
+        case let .rtpStats(packet):
+            guard connection is any CallDirectMediaTransport,
+                  CallRtpStats.validatedObject(packet) != nil else { return }
+            lastDirectRtpStats = packet
+            if directControlOpen { try? await connection.publishControl(packet) }
         }
     }
 

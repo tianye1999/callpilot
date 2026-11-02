@@ -16,6 +16,13 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
     private var audioRevoked = false
     private var audioActive = false
     private var speakerPreferred = false
+    private var transportConnected = false
+    private var audioVerificationTask: Task<Void, Never>?
+    private(set) var latestRtpStats: Data?
+    private var latestRtpSequence = 0
+    private lazy var rtpSampler = CallRtpSampler { [weak self] sequence, elapsed in
+        self?.requestRtpStats(sequence: sequence, elapsedMs: elapsed)
+    }
     var eventHandler: ((CallMediaTransportEvent) async -> Void)?
 
     init() {
@@ -27,6 +34,9 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
 
     func prepareDirect(servers: [CallIceServer]) async throws -> String {
         guard !closed, !audioRevoked, peer == nil else { throw DirectMediaError.closed }
+        // Preparation already holds the exclusive audio lease. An enabled
+        // sender must still never capture during ringing or before CallKit.
+        try WebRtcAudioBridge.preparePrivacyGate(owner)
         LKRTCInitializeSSL()
         // Keep the reference implementation's platform AudioUnit ADM. The
         // explicit initializer also exposes its diagnostic/control wrapper.
@@ -46,7 +56,7 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
         }
         self.peer = peer
         let track = factory.audioTrack(with: factory.audioSource(with: constraints), trackId: "phone-uplink")
-        track.isEnabled = false
+        track.isEnabled = true
         microphone = track
         peer.add(track, streamIds: ["callpilot"])
         guard let channel = peer.dataChannel(forLabel: CallPilotTopic.control,
@@ -97,6 +107,9 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
             }
         }
         try await delegate.connected.wait()
+        transportConnected = true
+        rtpSampler.start()
+        verifyActivatedAudioIfReady()
         try await delegate.channelOpen.wait()
         try ensureOpen()
     }
@@ -107,9 +120,12 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
         try WebRtcAudioBridge.acquire(owner)
         try WebRtcAudioBridge.activate(owner)
         audioActive = true
+        verifyActivatedAudioIfReady()
     }
 
     func stopDirectAudio() {
+        finishRtpSampling()
+        audioVerificationTask?.cancel()
         audioRevoked = true
         microphone?.isEnabled = false
         delegate.revokeAudio()
@@ -131,7 +147,17 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
         try ensureOpen()
         guard !enabled || audioActive else { throw DirectMediaError.audioInactive }
         microphone?.isEnabled = enabled
-        guard enabled, let module = factory?.audioDeviceModule else { return }
+    }
+
+    private func verifyActivatedAudioIfReady() {
+        guard audioActive, transportConnected, !audioRevoked, !closed,
+              audioVerificationTask == nil, let module = factory?.audioDeviceModule else { return }
+        audioVerificationTask = Task { [weak self] in
+            await self?.verifyActivatedAudio(module)
+        }
+    }
+
+    private func verifyActivatedAudio(_ module: LKRTCAudioDeviceModule) async {
         // AudioUnit starts naturally via the CallKit/manual-audio gate. Only
         // repair a failed readback; do not replace that working primary path.
         let result: CallAudioEngineSnapshot
@@ -144,13 +170,32 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
             })
         } catch {
             if !Task.isCancelled, !audioRevoked { await reportAudio(module, failed: true) }
-            throw error
+            return
         }
-        try ensureOpen()
-        guard !audioRevoked else { throw DirectMediaError.audioInactive }
+        guard !Task.isCancelled, !audioRevoked, !closed else { return }
         let failed = !result.platformAudioReady
         await reportAudio(module, failed: failed)
-        if failed { microphone?.isEnabled = false; throw DirectMediaError.audioInactive }
+        if failed { microphone?.isEnabled = false }
+    }
+
+    func finishRtpSampling() { rtpSampler.finish() }
+
+    private func requestRtpStats(sequence: Int, elapsedMs: Int) {
+        guard let peer else { return }
+        peer.statistics { [weak self] report in
+            let reports = report.statistics.values.map {
+                CallRtpReport(id: $0.id, type: $0.type, values: $0.values)
+            }
+            guard let packet = CallRtpStats.packet(reports: reports, sequence: sequence, elapsedMs: elapsedMs) else { return }
+            Task { @MainActor [weak self] in
+                guard let self, sequence > latestRtpSequence else { return }
+                latestRtpSequence = sequence
+                latestRtpStats = packet
+                // Diagnostics never wait for the channel or hold media teardown.
+                guard !closed else { return }
+                await eventHandler?(.rtpStats(packet))
+            }
+        }
     }
 
     private func audioSnapshot(_ module: LKRTCAudioDeviceModule) -> CallAudioEngineSnapshot {
@@ -203,46 +248,43 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
 @MainActor
 enum WebRtcAudioBridge {
     private static let log = Logger(subsystem: "ai.bondings.callpilot.sim", category: "DirectAudio")
-    private static var owner: UUID?
-    private static var lastReleased: UUID?
-    static func owns(_ id: UUID) -> Bool { owner == id }
-    static func acquire(_ id: UUID) throws {
-        guard owner == nil || owner == id else {
+    private static let gate = CallDirectAudioGate()
+    static func owns(_ id: UUID) -> Bool { gate.owner == id }
+    static func preparePrivacyGate(_ id: UUID) throws {
+        let pending = gate.lastReleased != nil
+        do {
+            guard try gate.prepare(id) else { return }
+        } catch {
             log.error("direct audio register rejected: owner_present=true")
-            throw DirectMediaError.audioInactive
+            throw error
         }
-        guard owner != id else { return }
-        log.info("direct audio registered: prior_release_pending=\(lastReleased != nil)")
-        owner = id
-        lastReleased = nil
+        log.info("direct audio privacy gate prepared: prior_release_pending=\(pending)")
         let session = LKRTCAudioSession.sharedInstance()
         session.useManualAudio = true
         session.isAudioEnabled = false
     }
+    static func acquire(_ id: UUID) throws { try preparePrivacyGate(id) }
     static func activate(_ id: UUID) throws {
-        guard owner == id else { throw DirectMediaError.audioInactive }
+        try gate.activate(id)
         let session = LKRTCAudioSession.sharedInstance()
         session.audioSessionDidActivate(AVAudioSession.sharedInstance())
         session.isAudioEnabled = true
     }
     static func release(_ id: UUID) {
-        guard owner == id else {
-            log.debug("direct audio release ignored: newer_owner=\(owner != nil)")
+        guard gate.release(id) else {
+            log.debug("direct audio release ignored: newer_owner=\(gate.owner != nil)")
             return
         }
         let session = LKRTCAudioSession.sharedInstance()
         session.isAudioEnabled = false
         session.audioSessionDidDeactivate(AVAudioSession.sharedInstance())
-        owner = nil
-        lastReleased = id
         log.info("direct audio released: peer_close_pending=true")
         // Keep manual gating until this peer has actually closed. Otherwise a
         // late native operation could restart an old default audio device.
     }
     static func didClose(_ id: UUID) {
-        guard owner == nil, lastReleased == id else { return }
+        guard gate.didClose(id) else { return }
         LKRTCAudioSession.sharedInstance().useManualAudio = false
-        lastReleased = nil
         log.info("direct audio closed: owner_present=false")
     }
 }

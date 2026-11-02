@@ -25,6 +25,76 @@ def engine_snapshot(**changes):
             "muteMode": 0, **changes}
 
 
+def rtp_packet(**changes):
+    return {"type": "client_rtp_stats", "v": 1, "seq": 1, "elapsedMs": 0,
+            "outPackets": 0, "outBytes": 0, "inPackets": None, "inBytes": None,
+            "lost": -1, "rttMs": None, "localCandidate": "host", "remoteCandidate": None,
+            "pairState": "succeeded", **changes}
+
+
+def test_rtp_observations_buffer_deduplicate_and_keep_unknown_distinct_from_zero():
+    timing = CallTiming()
+    timing.receive_rtp(rtp_packet())
+    timing.receive_rtp(rtp_packet())
+    record = Record()
+    timing.bind(record)
+    timing.bind(record)
+    for seq in range(2, 12):
+        timing.receive_rtp(rtp_packet(seq=seq))
+    assert len(record.events) == 10
+    assert record.events[0] == rtp_packet()
+    assert record.events[0]["outPackets"] == 0
+    assert record.events[0]["inPackets"] is None
+
+
+@pytest.mark.parametrize("changes", [
+    {"seq": True}, {"seq": 11}, {"v": True}, {"elapsedMs": -1}, {"elapsedMs": 60001},
+    {"outPackets": -1}, {"outBytes": 2**53}, {"inBytes": 0.5}, {"lost": -(2**53)},
+    {"rttMs": float("nan")}, {"rttMs": float("inf")}, {"rttMs": True},
+    {"localCandidate": "192.0.2.1"}, {"pairState": "connected"}, {"address": "private"},
+])
+def test_invalid_rtp_is_rejected_without_advancing_sequence(changes):
+    record = Record()
+    timing = CallTiming(record)
+    timing.receive_rtp(rtp_packet(**changes))
+    assert record.events == []
+    timing.receive_rtp(rtp_packet())
+    assert record.events == [rtp_packet()]
+
+
+def test_rtp_envelope_requires_every_field_and_enforces_byte_bound():
+    from agentcall.call_timing import valid_client_rtp_stats
+
+    assert not valid_client_rtp_stats({})
+    assert not valid_client_rtp_stats({key: value for key, value in rtp_packet().items() if key != "lost"})
+    assert not valid_client_rtp_stats(rtp_packet(rttMs=10**1000))
+
+
+def test_internal_observations_survive_bind_and_reject_unknown_kind():
+    timing = CallTiming()
+    timing.record_observation("direct_sdp_summary", {"audioSections": 1})
+    timing.record_observation("private_event", {"address": "must-not-log"})
+    record = Record()
+    timing.bind(record)
+    assert record.events == [{"type": "direct_sdp_summary", "audioSections": 1}]
+
+
+def test_internal_observations_snapshot_and_bound_buffer():
+    timing = CallTiming()
+    sample = {"outPackets": 0}
+    timing.record_observation("edge_rtp_stats", sample)
+    sample["outPackets"] = 999
+    timing.record_observation("edge_rtp_stats", {"type": "private"})
+    timing.record_observation("edge_rtp_stats", {"outPackets": float("nan")})
+    timing.record_observation("edge_rtp_stats", {"extra": "x" * 4096})
+    for _ in range(20):
+        timing.record_observation("edge_rtp_stats", {"outPackets": 1})
+    record = Record()
+    timing.bind(record)
+    assert len(record.events) == 12
+    assert record.events[0] == {"type": "edge_rtp_stats", "outPackets": 0}
+
+
 def test_audio_engine_evidence_survives_binding_and_http_replay():
     timing = CallTiming()
     message = packet(marks={"direct_control_ready": 100, "audio_engine_running": 120},

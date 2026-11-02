@@ -237,8 +237,13 @@ def test_cancel_inflight_check_drains_transaction_before_socket_close(monkeypatc
             await asyncio.wait_for(received.wait(), 5)
             protocols = list(connection._protocols)
             assert any(p.transactions for p in protocols)
+            transactions = [t for p in protocols for t in p.transactions.values()]
+            timers = [t._Transaction__timeout_handle for t in transactions]
+            futures = [t._Transaction__future for t in transactions]
             await webrtc_ice.stop_connection_checks(connection)
             assert all(not p.transactions for p in protocols)
+            assert all(timer.cancelled() for timer in timers)
+            assert all(future.done() for future in futures)
             await connection.close()
             await asyncio.gather(connecting, return_exceptions=True)
             assert not errors
@@ -249,6 +254,12 @@ def test_cancel_inflight_check_drains_transaction_before_socket_close(monkeypatc
             transport.close()
 
     asyncio.run(scenario())
+
+
+def test_unknown_transaction_layout_warns_without_mutation(caplog):
+    transaction = SimpleNamespace()
+    asyncio.run(webrtc_ice._drain_protocol_transactions([SimpleNamespace(transactions={b"id": transaction})]))
+    assert "transaction adapter unsupported" in caplog.text
 
 
 def test_allocated_turn_disconnect_drains_bind_refresh_and_bounded_delete(monkeypatch):
@@ -351,5 +362,51 @@ def test_turn_delete_socket_error_is_expected_cleanup():
         relay.close()
         await relay._TurnTransport__close_task
         assert closed.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_orphaned_upstream_srflx_transaction_is_drained_before_socket_close(monkeypatch):
+    """Upstream gather cancellation leaves its separately created STUN task alive."""
+    from aioice import Connection, ice
+
+    async def scenario():
+        received = asyncio.Event()
+        errors = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+        class Blackhole(asyncio.DatagramProtocol):
+            def datagram_received(self, _data, _address):
+                received.set()
+
+        server, _ = await loop.create_datagram_endpoint(Blackhole, local_addr=("127.0.0.1", 0))
+        connection = Connection(ice_controlling=False, stun_server=server.get_extra_info("sockname"))
+        monkeypatch.setattr(ice, "get_host_addresses", lambda **_: ["127.0.0.1"])
+        gathering = asyncio.create_task(connection.gather_candidates())
+        orphan = None
+        try:
+            await asyncio.wait_for(received.wait(), 5)
+            protocols = list(connection._protocols)
+            transactions = [t for p in protocols for t in p.transactions.values()]
+            assert len(transactions) == 1
+            timer = transactions[0]._Transaction__timeout_handle
+            future = transactions[0]._Transaction__future
+            orphan = next(t for t in asyncio.all_tasks()
+                          if t.get_coro().__qualname__ == "server_reflexive_candidate")
+            gathering.cancel()
+            await asyncio.gather(gathering, return_exceptions=True)
+            assert not orphan.done() and not timer.cancelled()
+            await webrtc_ice.stop_connection_checks(connection)
+            assert orphan.done() and timer.cancelled() and future.done()
+            assert all(not p.transactions for p in protocols)
+            await connection.close()
+            assert not errors
+        finally:
+            if orphan is not None:
+                orphan.cancel()
+                await asyncio.gather(orphan, return_exceptions=True)
+            await connection.close()
+            server.close()
 
     asyncio.run(scenario())

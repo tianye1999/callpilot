@@ -2,6 +2,24 @@ import Foundation
 import XCTest
 
 final class CallKitConfigurationTests: XCTestCase {
+    func testDirectPreparedSenderIsEnabledBehindManualPrivacyGate() throws {
+        let source = try String(contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/WebRtcDirectTransport.swift"), encoding: .utf8)
+        let preparing = try section(source, from: "func prepareDirect", to: "func connectDirect")
+        try assertBefore("WebRtcAudioBridge.preparePrivacyGate(owner)", "LKRTCPeerConnectionFactory(", in: preparing)
+        try assertBefore("track.isEnabled = true", "peer.add(track", in: preparing)
+        XCTAssertFalse(preparing.contains("isEnabled = false"))
+        let privacy = try section(source, from: "static func preparePrivacyGate", to: "static func acquire")
+        try assertBefore("guard try gate.prepare(id) else { return }", "session.useManualAudio = true", in: privacy)
+        XCTAssertTrue(privacy.contains("session.isAudioEnabled = false"))
+        XCTAssertFalse(privacy.contains("audioSessionDidActivate"))
+        XCTAssertFalse(privacy.contains("setCategory"))
+        let muting = try section(source, from: "func setMicrophone", to: "private func verifyActivatedAudioIfReady")
+        XCTAssertFalse(muting.contains("initAndStartRecording"))
+        XCTAssertFalse(muting.contains("verify("))
+        let activation = try section(source, from: "func activateDirectAudio", to: "func stopDirectAudio")
+        XCTAssertTrue(activation.contains("verifyActivatedAudioIfReady()"))
+    }
+
     func testEndedResultTimerUsesFiveSecondsAndFencesDismissal() throws {
         let source = try String(
             contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8
@@ -124,7 +142,7 @@ final class CallKitConfigurationTests: XCTestCase {
             contentsOf: repositoryRoot.appendingPathComponent("ios/project.yml"), encoding: .utf8
         )
         XCTAssertTrue(project.contains("MARKETING_VERSION: \"0.7.5\""))
-        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"16\""))
+        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"17\""))
         XCTAssertTrue(project.contains("PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot.sim\n"))
         XCTAssertTrue(project.contains("name: CallPilot\n"))
         XCTAssertTrue(project.contains("DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}"))

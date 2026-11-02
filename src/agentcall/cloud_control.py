@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from . import config
-from .call_timing import valid_http_client_timing
+from .call_timing import valid_client_rtp_stats, valid_http_client_timing
 from .cloud_credentials import CloudCredentialStore, EdgeCredential
 from .content_sync import ContentSyncError
 from .inbound_direct import InboundDirectRequest
@@ -317,7 +317,8 @@ class CloudEdgeClient:
                 reply(None, "DIRECT_DISABLED")
                 return
             if (command["type"] in {"inbound.media.livekit", "inbound.media.end"}
-                    and config.get_bool("INBOUND_FASTPATH_V2_ENABLED") and "clientTiming" in command):
+                    and config.get_bool("INBOUND_FASTPATH_V2_ENABLED")
+                    and ("clientTiming" in command or "clientRtpStats" in command)):
                 receive_timing = getattr(self.service, "receive_inbound_client_timing", None)
                 if callable(receive_timing):
                     receive_timing(command)
@@ -669,12 +670,14 @@ def _parse_cloud_command(raw: str) -> dict[str, Any]:
             raise ValueError("invalid SDP command")
         return value
     if command_type in {"inbound.media.livekit", "inbound.media.end"}:
-        claim_fields = {key: item for key, item in value.items() if key != "clientTiming"}
+        claim_fields = {key: item for key, item in value.items() if key not in {"clientTiming", "clientRtpStats"}}
         _validate_inbound_claim({**claim_fields, "type": "inbound.claim"})
         if "direct" in value:
             raise ValueError("invalid fallback")
         if "clientTiming" in value and not valid_http_client_timing(value["clientTiming"]):
             raise ValueError("invalid client timing")
+        if "clientRtpStats" in value and not valid_client_rtp_stats(value["clientRtpStats"]):
+            raise ValueError("invalid client RTP stats")
         return value
     if command_type == "inbound.prepare":
         if value.get("mode") != "phone_first":

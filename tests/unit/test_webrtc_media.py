@@ -240,6 +240,11 @@ def test_hangup_reserved_slot_and_timing_cannot_be_starved_by_control_flood():
         assert await media.next_command(0.1) == {"type": "dtmf", "digits": "1"}
         assert media._commands.qsize() == 31
         assert ("latency", {"stage": "client_answer_action", "ms": -10}) in records
+        receive(json.dumps({"type": "client_rtp_stats", "v": 1, "seq": 1, "elapsedMs": 5,
+                            "outPackets": 2, "outBytes": 30, "inPackets": 3, "inBytes": 40,
+                            "lost": 0, "rttMs": None, "localCandidate": "host",
+                            "remoteCandidate": "relay", "pairState": "succeeded"}))
+        assert any(kind == "client_rtp_stats" and fields["outPackets"] == 2 for kind, fields in records)
         receive("[1]")
         receive(b"\xff")
         receive("x" * 5000)
@@ -270,6 +275,148 @@ def test_pcm_queues_are_bounded_and_ready_requires_actual_audio():
         assert len(media._modem_buffer) < 320
         assert media._modem_audio.get_nowait() == struct.pack("<160h", *([48] * 160))
         await media.close()
+    asyncio.run(scenario())
+
+
+def test_rtp_sampling_bounded_terminal_and_sender_silence_count():
+    async def scenario():
+        peer = FakePeer()
+        media = endpoint(peer)
+        observed = []
+        media._timing = SimpleNamespace(mark=lambda *_: None,
+                                        record_observation=lambda kind, fields: observed.append((kind, fields)))
+
+        async def stats():
+            return {"out": SimpleNamespace(type="outbound-rtp", kind="audio", packetsSent=5, bytesSent=100),
+                    "in": SimpleNamespace(type="inbound-rtp", kind="audio", packetsReceived=4, packetsLost=0),
+                    "transport": SimpleNamespace(type="transport", dtlsState="connected")}
+
+        peer.getStats = stats
+        await media.connect()
+        await media._local_track.recv()
+        for _ in range(12):
+            await media._sample_rtp_stats(terminal=False, reason="periodic")
+        await media.finish_rtp_stats("commit")
+        await media.finish_rtp_stats("close")
+        await media.close()
+        records = [fields for kind, fields in observed if kind == "edge_rtp_stats"]
+        assert len(records) == 10
+        assert [record["seq"] for record in records] == list(range(1, 11))
+        assert records[-1]["terminal"] and records[-1]["reason"] == "commit"
+        assert records[-1]["outPackets"] == 5 and records[-1]["inPackets"] == 4
+        assert records[-1]["inBytes"] is None
+        assert records[-1]["senderFrames"] == records[-1]["senderSilenceFrames"] == 1
+        assert records[-1]["dtlsState"] == "connected"
+
+    asyncio.run(scenario())
+
+
+def test_modem_sender_logs_pcm_windows_even_when_queue_is_empty(caplog):
+    from agentcall import webrtc_media
+    from agentcall.pcm_stats import PcmFlowStats
+
+    async def scenario():
+        await asyncio.wrap_future(webrtc_media.warm_webrtc_stack())
+        source = asyncio.Queue()
+        track = webrtc_media._modem_track(source, 1)
+        now = [0.0]
+        track.stats = PcmFlowStats("downlink1_direct_publish", clock=lambda: now[0])
+        caplog.set_level("INFO", logger="agentcall.pcm_stats")
+        source.put_nowait(struct.pack("<160h", *([300] * 160)))
+        await track.recv()
+        assert not caplog.records
+        now[0] = 5.0
+        track._next_at = None
+        await track.recv()
+        assert len(caplog.records) == 1
+        assert "frames=1 bytes=320 peak=300" in caplog.records[0].message
+        assert "senderFrames=2 senderSilenceFrames=1" in caplog.records[0].message
+        now[0] = 10.0
+        track._next_at = None
+        await track.recv()
+        assert len(caplog.records) == 2
+        assert "frames=0 bytes=0 peak=0" in caplog.records[1].message
+        assert "senderFrames=3 senderSilenceFrames=2" in caplog.records[1].message
+        track.stop()
+
+    asyncio.run(scenario())
+
+
+def test_periodic_rtp_stats_stop_at_reserved_terminal_slot(monkeypatch):
+    from agentcall import webrtc_media
+
+    async def scenario():
+        peer = FakePeer()
+        media = endpoint(peer)
+        ninth = asyncio.Event()
+        samples = []
+
+        def observe(kind, fields):
+            if kind == "edge_rtp_stats":
+                samples.append(fields)
+                if fields["seq"] == 9:
+                    ninth.set()
+
+        async def stats():
+            return {}
+
+        peer.getStats = stats
+        media._timing = SimpleNamespace(mark=lambda *_: None, record_observation=observe)
+        monkeypatch.setattr(webrtc_media, "_RTP_STATS_INTERVAL_SECONDS", 0)
+        await media.connect()
+        peer.connectionState = "connected"
+        peer.handlers["connectionstatechange"]()
+        await asyncio.wait_for(ninth.wait(), 5)
+        await media._stats_task
+        assert len(samples) == 9
+        await media.close()
+        assert len(samples) == 10 and samples[-1]["terminal"]
+        assert samples[-1]["outPackets"] is None and samples[-1]["inPackets"] is None
+
+    asyncio.run(scenario())
+
+
+def test_sdp_summary_does_not_copy_arbitrary_mid_codec_or_credentials():
+    from agentcall import webrtc_media
+
+    async def scenario():
+        await asyncio.wrap_future(webrtc_media.warm_webrtc_stack())
+        peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        peer.addTransceiver("audio")
+        try:
+            description = await peer.createOffer()
+            # Parse the generated description, but never set it on the peer or expose its content.
+            description.sdp = description.sdp.replace("a=mid:0", "a=mid:private-contact")
+            fake = SimpleNamespace(localDescription=description, getTransceivers=lambda: [])
+            summary = webrtc_media._sdp_summary(fake)
+            encoded = json.dumps(summary)
+            assert summary["mLines"][0]["mid"] is None
+            assert summary["mLines"][0]["codecs"][0]["mimeType"] == "audio/opus"
+            assert not any(value in encoded for value in ("private-contact", "ice-ufrag", "fingerprint", "ssrc"))
+        finally:
+            await peer.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_stats_reads_are_bounded_and_never_block_close():
+    async def scenario():
+        calls = 0
+        peer = FakePeer()
+
+        async def stats():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("unavailable")
+
+        peer.getStats = stats
+        media = endpoint(peer)
+        await media.connect()
+        for _ in range(12):
+            await media._sample_rtp_stats(terminal=False, reason="periodic")
+        await media.close()
+        assert calls == 10 and peer.closed == 1
+
     asyncio.run(scenario())
 
 
@@ -345,6 +492,17 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch)
                 return False
 
             assert await asyncio.wait_for(hear_non_silent(), 30)
+            await media.finish_rtp_stats("commit")
+            rtp = [fields for kind, fields in observations if kind == "edge_rtp_stats"]
+            assert rtp[-1]["terminal"] and rtp[-1]["outPackets"] > 0 and rtp[-1]["inPackets"] > 0
+            assert rtp[-1]["senderFrames"] > 0 and rtp[-1]["dtlsState"] == "connected"
+            assert rtp[-1]["selectedCandidatePair"] == {
+                "localCandidate": "host", "remoteCandidate": "host", "state": "succeeded"}
+            summaries = [fields for kind, fields in observations if kind == "direct_sdp_summary"]
+            audio = next(line for line in summaries[0]["mLines"] if line["kind"] == "audio")
+            assert audio["currentDirection"] == "sendrecv" and audio["rtcpMux"] and audio["bundle"]
+            assert any(codec["mimeType"] == "audio/opus" and codec["clockRate"] == 48000
+                       and codec["channels"] == 2 for codec in audio["codecs"])
             command_id = str(uuid4())
             channel.send(json.dumps({"type": "hangup", "commandId": command_id}))
             command = await media.next_command(10)

@@ -245,11 +245,11 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         return session
     }
 
-    func endInboundClaim(offerId: String, claimId: String, clientTiming: [Data] = []) async throws {
+    func endInboundClaim(offerId: String, claimId: String, clientTiming: [Data] = [], clientRtpStats: Data? = nil) async throws {
         guard offerId.wholeMatch(of: Self.offerIdRE) != nil, claimId.wholeMatch(of: Self.claimIdRE) != nil else {
             throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Invalid claim")
         }
-        let body = try Self.mediaRequestBody(claimId: claimId, clientTiming: clientTiming)
+        let body = try Self.mediaRequestBody(claimId: claimId, clientTiming: clientTiming, clientRtpStats: clientRtpStats)
         let path = "v1/inbound-offers/\(offerId)/media/end"
         do { _ = try await request("POST", path, body: body) }
         catch let error as HostedCloudError where error.statusCode == 503 && error.code == "MEDIA_RELAY_UNAVAILABLE" {
@@ -323,26 +323,54 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         }
     }
 
-    private static func mediaRequestBody(claimId: String, clientTiming: [Data]) throws -> Data {
+    private static func mediaRequestBody(claimId: String, clientTiming: [Data], clientRtpStats: Data?) throws -> Data {
         var object: [String: Any] = ["claimId": claimId]
-        if !clientTiming.isEmpty {
-            guard clientTiming.count <= 8, clientTiming.allSatisfy({ $0.count <= 2048 }) else {
-                throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Timing payload too large")
-            }
-            object["clientTiming"] = try clientTiming.map { try JSONSerialization.jsonObject(with: $0) }
+        if let stats = CallRtpStats.validatedObject(clientRtpStats) { object["clientRtpStats"] = stats }
+        var batches: [[String: Any]] = []
+        for packet in clientTiming.prefix(8) {
+            guard let batch = validatedTimingBatch(packet) else { continue }
+            var candidate = object
+            candidate["clientTiming"] = batches + [batch]
+            guard let encoded = try? JSONSerialization.data(withJSONObject: candidate), encoded.count <= 4096 else { break }
+            batches.append(batch)
         }
-        let data = try JSONSerialization.data(withJSONObject: object)
-        guard data.count <= 4096 else {
-            throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Timing payload too large")
-        }
-        return data
+        if !batches.isEmpty { object["clientTiming"] = batches }
+        // Optional diagnostics must never turn a valid fallback/end into an
+        // oversized request or local error; the claim fence always remains.
+        return try JSONSerialization.data(withJSONObject: object)
     }
 
-    func fallbackInboundLiveKit(offerId: String, claimId: String, clientTiming: [Data] = []) async throws -> HostedCallSession {
+    private static func validatedTimingBatch(_ packet: Data) -> [String: Any]? {
+        guard packet.count <= 2048,
+              let batch = try? JSONSerialization.jsonObject(with: packet) as? [String: Any],
+              Set(batch.keys).isSubset(of: ["type", "v", "attempt", "seq", "marks", "audioEngine"]),
+              batch["type"] as? String == "client_timing", jsonInt64(batch["v"]) == 1,
+              let attempt = batch["attempt"] as? String, UUID(uuidString: attempt) != nil,
+              let sequence = jsonInt64(batch["seq"]), (1...64).contains(sequence),
+              let marks = batch["marks"] as? [String: Any], (1...16).contains(marks.count) else { return nil }
+        let allowed = Set(CallTimingMark.allCases.map(\.rawValue)).union([
+            "cloud_cas_ms", "cloud_edge_reserve_ms", "cloud_turn_ms", "cloud_sdp_relay_ms", "cloud_claim_finalize_ms", "cloud_total_ms",
+        ])
+        for (key, value) in marks {
+            guard allowed.contains(key), let number = value as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite,
+                  (-60_000...86_400_000).contains(number.doubleValue) else { return nil }
+        }
+        if let engine = batch["audioEngine"] {
+            guard let fields = engine as? [String: Any],
+                  Set(fields.keys) == ["running", "recording", "playing", "inputEnabled", "inputRunning", "outputEnabled", "outputRunning", "inputMuted", "muteMode"],
+                  let bytes = try? JSONSerialization.data(withJSONObject: engine),
+                  let snapshot = try? JSONDecoder().decode(CallAudioEngineSnapshot.self, from: bytes),
+                  (-1...2).contains(snapshot.muteMode) else { return nil }
+        }
+        return batch
+    }
+
+    func fallbackInboundLiveKit(offerId: String, claimId: String, clientTiming: [Data] = [], clientRtpStats: Data? = nil) async throws -> HostedCallSession {
         guard offerId.wholeMatch(of: Self.offerIdRE) != nil, claimId.wholeMatch(of: Self.claimIdRE) != nil else {
             throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Invalid claim")
         }
-        let body = try Self.mediaRequestBody(claimId: claimId, clientTiming: clientTiming)
+        let body = try Self.mediaRequestBody(claimId: claimId, clientTiming: clientTiming, clientRtpStats: clientRtpStats)
         let path = "v1/inbound-offers/\(offerId)/media/livekit"
         let result: ([String: Any], HTTPURLResponse)
         do { result = try await request("POST", path, body: body) }

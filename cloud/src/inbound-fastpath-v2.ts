@@ -2,7 +2,7 @@ import { authenticateDevice } from "./auth";
 import { ClaimTiming } from "./claim-timing";
 import { HttpError, json, readJson, requireSameOrigin } from "./http";
 import { invalidateCandidatesStatement } from "./inbound-preconnect";
-import { issueParticipantToken } from "./livekit";
+import { issueParticipantToken, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS } from "./livekit";
 import { claimInboundOfferSchema, inboundAnswerSchema, inboundFallbackSchema, inboundSdpSchema } from "./schemas";
 import { cookieCredential, randomId, sha256 } from "./security";
 import { iceCredentialsSchema, issueIceServers, turnConfigured, type IceServer } from "./turn";
@@ -68,9 +68,10 @@ export async function claimInboundFastpathV2(request: Request, env: Env, timing:
   }
   timing.tagClaim(claimId);
   try {
+    const expiresAt = tokenExpiryBeforeMint();
     const [edgeToken, phoneToken] = await Promise.all([
-      timing.measure("edge_token", () => issueParticipantToken(env, room, edgeIdentity)),
-      timing.measure("phone_token", () => issueParticipantToken(env, room, phone))
+      timing.measure("edge_token", () => issueParticipantToken(env, room, edgeIdentity, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS)),
+      timing.measure("phone_token", () => issueParticipantToken(env, room, phone, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS))
     ]);
     // One stub preserves E-order at the DO; its dispatch gate preserves this
     // order through body reads without serializing the Edge acknowledgements.
@@ -124,7 +125,7 @@ export async function claimInboundFastpathV2(request: Request, env: Env, timing:
       AND (last_used_at IS NULL OR last_used_at <= ?3)`).bind(now, deviceId, now - 600_000).run()
       .catch(() => { console.warn("Inbound V2 accounting failed"); });
     if (ctx) ctx.waitUntil(accounting); else await accounting;
-    return json({ ...sessionPayload(offer, env, phoneToken), directAttempted: true,
+    return json({ ...sessionPayload(offer, env, phoneToken, expiresAt), directAttempted: true,
       sdpPending: !input.sdpOffer,
       transports: [...(sdpAnswer ? [{ kind: "webrtc", sdpAnswer, iceServers }] : []),
         { kind: "livekit", url: env.LIVEKIT_URL, token: phoneToken }] }, 202);
@@ -146,9 +147,10 @@ export async function completeInboundSdp(request: Request, env: Env, offerId: st
     AND media_transport IN ('direct_pending', 'direct')`)
     .bind(offerId, input.claimId, device.device_id, device.edge_id).first<InboundOfferRecord>();
   if (!offer) throw unavailable();
+  const expiresAt = tokenExpiryBeforeMint();
   const [edgeToken, phoneToken] = await Promise.all([
-    issueParticipantToken(env, offer.room_name!, offer.edge_identity!),
-    issueParticipantToken(env, offer.room_name!, offer.phone_identity!)
+    issueParticipantToken(env, offer.room_name!, offer.edge_identity!, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS),
+    issueParticipantToken(env, offer.room_name!, offer.phone_identity!, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS)
   ]);
   let iceServers: IceServer[] | undefined, sdpAnswer: string | undefined;
   try {
@@ -164,7 +166,7 @@ export async function completeInboundSdp(request: Request, env: Env, offerId: st
     AND EXISTS (SELECT device_id FROM devices WHERE device_id = ?4 AND revoked_at IS NULL) RETURNING offer_id`)
     .bind(sdpAnswer ? "direct" : offer.media_transport, offerId, input.claimId, device.device_id).first();
   if (!current) throw unavailable();
-  return json({ ...sessionPayload(offer, env, phoneToken), directAttempted: true, sdpPending: false,
+  return json({ ...sessionPayload(offer, env, phoneToken, expiresAt), directAttempted: true, sdpPending: false,
     transports: [...(sdpAnswer ? [{ kind: "webrtc", sdpAnswer, iceServers }] : []),
       { kind: "livekit", url: env.LIVEKIT_URL, token: phoneToken }] }, 202);
 }
@@ -204,7 +206,8 @@ export async function endInboundMedia(request: Request, env: Env, offerId: strin
   if (offer.status !== "revoked") {
     const token = await issueParticipantToken(env, offer.room_name!, offer.edge_identity!);
     const accepted = await relayAnswer(env, offer, { ...mediaCommand(offer, env, token, "inbound.media.end"),
-      ...(input.clientTiming === undefined ? {} : { clientTiming: input.clientTiming }) });
+      ...(input.clientTiming === undefined ? {} : { clientTiming: input.clientTiming }),
+      ...(input.clientRtpStats === undefined ? {} : { clientRtpStats: input.clientRtpStats }) });
     if (!accepted) throw new HttpError("MEDIA_RELAY_UNAVAILABLE", "Media end response is unavailable", 503);
   }
   // Edge can independently publish revoke before its end answer reaches us.
@@ -226,9 +229,10 @@ export async function fallbackInboundLivekit(request: Request, env: Env, offerId
     AND claimed_device_id = ?3 AND edge_id = ?4 AND status IN ('claimed', 'edge_ready') AND media_transport IS NOT NULL`)
     .bind(offerId, input.claimId, device.device_id, device.edge_id).first<InboundOfferRecord>();
   if (!offer) throw unavailable();
+  const expiresAt = tokenExpiryBeforeMint();
   const [edgeToken, phoneToken] = await Promise.all([
-    issueParticipantToken(env, offer.room_name!, offer.edge_identity!),
-    issueParticipantToken(env, offer.room_name!, offer.phone_identity!)
+    issueParticipantToken(env, offer.room_name!, offer.edge_identity!, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS),
+    issueParticipantToken(env, offer.room_name!, offer.phone_identity!, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS)
   ]);
   if (offer.media_transport !== "livekit") {
     const reserved = await env.DB.prepare(`UPDATE inbound_offers SET media_transport = 'livekit_pending'
@@ -236,7 +240,8 @@ export async function fallbackInboundLivekit(request: Request, env: Env, offerId
         AND media_transport IN ('direct', 'direct_pending', 'livekit_pending') RETURNING offer_id`).bind(offerId, input.claimId).first();
     if (!reserved) throw unavailable();
     const command = { ...mediaCommand(offer, env, edgeToken, "inbound.media.livekit"),
-      ...(input.clientTiming === undefined ? {} : { clientTiming: input.clientTiming }) };
+      ...(input.clientTiming === undefined ? {} : { clientTiming: input.clientTiming }),
+      ...(input.clientRtpStats === undefined ? {} : { clientRtpStats: input.clientRtpStats }) };
     // A lost DO response leaves this same claim pending. Repeating the command
     // must be idempotent at Edge; never give another phone a fresh claim.
     const response = await edgeRoom(env, offer.edge_id).fetch("https://edge-room/inbound-media-relay", {
@@ -249,7 +254,13 @@ export async function fallbackInboundLivekit(request: Request, env: Env, offerId
     const answer = inboundAnswerSchema.safeParse(await response.json().catch(() => null));
     if (!response.ok || !answer.success || answer.data.status !== "accepted"
         || answer.data.commandId !== command.commandId || answer.data.offerId !== offerId
-        || answer.data.callId !== offer.call_id || answer.data.claimId !== input.claimId) throw unavailable();
+        || answer.data.callId !== offer.call_id || answer.data.claimId !== input.claimId) {
+      const reason = answer.success ? answer.data.errorCode : undefined;
+      console.warn(JSON.stringify({ event: "inbound_livekit_fallback_rejected",
+        reason: reason && ["MEDIA_FALLBACK_REJECTED", "LIVEKIT_SETUP_FAILED", "MEDIA_ENDED"].includes(reason)
+          ? reason : "other" }));
+      throw unavailable();
+    }
     const current = await env.DB.prepare(`UPDATE inbound_offers SET media_transport = 'livekit', updated_at = ?1
       WHERE offer_id = ?2 AND claim_id = ?3 AND status IN ('claimed', 'edge_ready')
         AND media_transport IN ('livekit_pending', 'livekit') RETURNING offer_id`).bind(Date.now(), offerId, input.claimId).first();
@@ -259,7 +270,7 @@ export async function fallbackInboundLivekit(request: Request, env: Env, offerId
     WHERE o.offer_id = ?1 AND o.claim_id = ?2 AND o.claimed_device_id = ?3 AND o.status IN ('claimed', 'edge_ready')
       AND o.media_transport = 'livekit' AND d.revoked_at IS NULL`).bind(offerId, input.claimId, device.device_id).first();
   if (!current) throw unavailable();
-  return json({ ...sessionPayload(offer, env, phoneToken), directAttempted: true,
+  return json({ ...sessionPayload(offer, env, phoneToken, expiresAt), directAttempted: true,
     transports: [{ kind: "livekit", url: env.LIVEKIT_URL, token: phoneToken }] }, 202);
 }
 
@@ -270,9 +281,15 @@ function mediaCommand(offer: InboundOfferRecord, env: Env, token: string, type: 
       edgeIdentity: offer.edge_identity, livekitUrl: env.LIVEKIT_URL, token } };
 }
 
-function sessionPayload(offer: InboundOfferRecord, env: Env, token: string) {
+function tokenExpiryBeforeMint(): number {
+  // JWT exp is second-granularity. Capturing before signing is conservative;
+  // this credential lifetime never changes the offer fence or Edge media lease.
+  return Math.floor(Date.now() / 1000) * 1000 + LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS * 1000;
+}
+
+function sessionPayload(offer: InboundOfferRecord, env: Env, token: string, expiresAt: number) {
   return { claimId: offer.claim_id, offerId: offer.offer_id, callId: offer.call_id, roomName: offer.room_name,
-    url: env.LIVEKIT_URL, token, participantIdentity: offer.phone_identity, edgeIdentity: offer.edge_identity, expiresAt: offer.expires_at };
+    url: env.LIVEKIT_URL, token, participantIdentity: offer.phone_identity, edgeIdentity: offer.edge_identity, expiresAt };
 }
 
 function iceRequest(offer: InboundOfferRecord, mode: "warm" | "get") {

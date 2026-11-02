@@ -36,6 +36,12 @@ MAX_HTTP_TIMING_BATCHES = 8
 MAX_HTTP_TIMING_BYTES = 4096
 _ENGINE_FLAGS = frozenset({"running", "recording", "playing", "inputEnabled", "inputRunning",
                            "outputEnabled", "outputRunning", "inputMuted"})
+MAX_RTP_STATS_BYTES = 512
+MAX_RTP_STATS_SAMPLES = 10
+_SAFE_INTEGER = 2**53 - 1
+_RTP_COUNTERS = frozenset({"outPackets", "outBytes", "inPackets", "inBytes", "lost"})
+_CANDIDATE_TYPES = frozenset({"host", "srflx", "prflx", "relay"})
+_PAIR_STATES = frozenset({"frozen", "waiting", "in-progress", "failed", "succeeded"})
 
 
 class TimingRecord(Protocol):
@@ -85,6 +91,31 @@ def valid_http_client_timing(batches: Any) -> bool:
             and len(json.dumps(batches, separators=(",", ":")).encode()) <= MAX_HTTP_TIMING_BYTES)
 
 
+def valid_client_rtp_stats(packet: Any) -> bool:
+    """Only bounded counters and enums cross the client diagnostics boundary."""
+    fields = {"type", "v", "seq", "elapsedMs", "rttMs", "localCandidate", "remoteCandidate", "pairState"}
+    if not isinstance(packet, dict) or set(packet) != fields | _RTP_COUNTERS:
+        return False
+    if (packet["type"] != "client_rtp_stats" or type(packet["v"]) is not int or packet["v"] != 1
+            or type(packet["seq"]) is not int or not 1 <= packet["seq"] <= MAX_RTP_STATS_SAMPLES
+            or type(packet["elapsedMs"]) not in (int, float) or not 0 <= packet["elapsedMs"] <= 60_000):
+        return False
+    for name in _RTP_COUNTERS:
+        value = packet[name]
+        if value is not None and (type(value) is not int
+                                  or not (-_SAFE_INTEGER if name == "lost" else 0) <= value <= _SAFE_INTEGER):
+            return False
+    rtt = packet["rttMs"]
+    if rtt is not None and (type(rtt) not in (int, float) or not 0 <= rtt <= 1.7976931348623157e308):
+        return False
+    for name in ("localCandidate", "remoteCandidate", "pairState"):
+        value = packet[name]
+        allowed = _PAIR_STATES if name == "pairState" else _CANDIDATE_TYPES
+        if value is not None and (not isinstance(value, str) or value not in allowed):
+            return False
+    return len(json.dumps(packet, separators=(",", ":")).encode()) <= MAX_RTP_STATS_BYTES
+
+
 class CallTiming:
     def __init__(self, record: TimingRecord | None = None, *,
                  clock: Callable[[], float] = time.monotonic, origin: float | None = None) -> None:
@@ -96,6 +127,9 @@ class CallTiming:
         self._attempt: str | None = None
         self._seq = 0
         self._pending_engines: list[dict[str, Any]] = []
+        self._rtp_seq = 0
+        self._pending_observations: list[tuple[str, dict[str, Any]]] = []
+        self._observation_counts: dict[str, int] = {}
         self.hangup_received = False
 
     def bind(self, record: TimingRecord | None) -> None:
@@ -107,6 +141,36 @@ class CallTiming:
             for observation in self._pending_engines:
                 record.log_event("client_audio_engine_state", **observation)
             self._pending_engines.clear()
+            for kind, fields in self._pending_observations:
+                record.log_event(kind, **fields)
+            self._pending_observations.clear()
+
+    def _observation(self, kind: str, fields: dict[str, Any]) -> None:
+        if self._record is None:
+            self._pending_observations.append((kind, fields))
+        else:
+            self._record.log_event(kind, **fields)
+
+    def receive_rtp(self, packet: dict[str, Any]) -> None:
+        if not valid_client_rtp_stats(packet) or packet["seq"] <= self._rtp_seq:
+            return
+        self._rtp_seq = packet["seq"]
+        self._observation("client_rtp_stats", {key: value for key, value in packet.items() if key != "type"})
+
+    def record_observation(self, kind: str, fields: dict[str, Any]) -> None:
+        """Internal native-media summaries; never pass remote payloads to this API."""
+        if (kind not in {"edge_rtp_stats", "direct_sdp_summary", "direct_media_transition"}
+                or self._observation_counts.get(kind, 0) >= 12):
+            return
+        try:
+            wire = json.dumps(fields, separators=(",", ":"), allow_nan=False)
+            if len(wire.encode()) > 4096 or "type" in fields:
+                return
+            snapshot = json.loads(wire)
+        except (TypeError, ValueError):
+            return
+        self._observation_counts[kind] = self._observation_counts.get(kind, 0) + 1
+        self._observation(kind, snapshot)
 
     def _emit(self, stage: str, ms: float) -> None:
         if stage in self._marks or len(self._marks) >= MAX_TIMING_MARKS:

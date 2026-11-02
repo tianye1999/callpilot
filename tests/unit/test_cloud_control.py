@@ -1062,3 +1062,27 @@ def test_http_timing_cannot_be_smuggled_onto_claim():
 
     with pytest.raises(ValueError):
         _parse_cloud_command(json.dumps(_takeover_claim(clientTiming=[])))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_http_rtp_dispatches_without_timing_before_end(monkeypatch, enabled):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", str(enabled).lower())
+    service = _Service()
+    order = []
+    stats = {"type": "client_rtp_stats", "v": 1, "seq": 1, "elapsedMs": 0,
+             "outPackets": 0, "outBytes": 0, "inPackets": None, "inBytes": None,
+             "lost": None, "rttMs": None, "localCandidate": None, "remoteCandidate": None, "pairState": None}
+    service.receive_inbound_client_timing = lambda command: order.append(("rtp", command["clientRtpStats"]))
+    service.end_inbound_direct = lambda _command: order.append(("end", None)) or True
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    client.handle_message(json.dumps(_takeover_claim(type="inbound.media.end", clientRtpStats=stats)), lambda _: None)
+    assert order == ([("rtp", stats), ("end", None)] if enabled else [])
+
+
+def test_invalid_http_rtp_rejected_and_not_allowed_on_claim():
+    from agentcall.cloud_control import _parse_cloud_command
+
+    with pytest.raises(ValueError, match="client RTP"):
+        _parse_cloud_command(json.dumps(_takeover_claim(type="inbound.media.end", clientRtpStats={})))
+    with pytest.raises(ValueError):
+        _parse_cloud_command(json.dumps(_takeover_claim(clientRtpStats={})))

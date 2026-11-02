@@ -101,9 +101,98 @@ const clientTiming = [{ type: "client_timing", v: 1, attempt: "497f6eca-6276-499
   marks: { answer_action: -5, audio_engine_failed: 8, direct_control_ready: 7 },
   audioEngine: { running: false, recording: false, playing: false, inputEnabled: true, inputRunning: false,
     outputEnabled: true, outputRunning: false, inputMuted: false, muteMode: 0 } }];
+const clientRtpStats = { type: "client_rtp_stats", v: 1, seq: 1, elapsedMs: 0,
+  outPackets: 0, outBytes: 0, inPackets: null, inBytes: null, lost: -1, rttMs: null,
+  localCandidate: "host", remoteCandidate: null, pairState: "succeeded" };
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); databases.splice(0).forEach(db => db.close()); });
 
 describe("direct inbound fastpath V2", () => {
+  it.each(["claim", "sdp", "fallback"])("uses the minted token expiry after ringing expires: %s", async phase => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const origin = 1_800_000_000_123;
+    vi.setSystemTime(origin);
+    const f = await fixture();
+    const offerExpiry = origin + 15_000;
+    f.db.prepare("UPDATE inbound_offers SET expires_at = ? WHERE offer_id = ?").run(offerExpiry, offer);
+    vi.setSystemTime(origin + 14_000);
+    if (phase === "claim") {
+      const original = f.relay.getMockImplementation()!;
+      f.relay.mockImplementation(async (url, init) => {
+        const response = await original(url, init);
+        if (url.endsWith("/inbound-media-relay")) vi.setSystemTime(origin + 16_000);
+        return response;
+      });
+    }
+    let response = await f.request(claimPath, { offerId: offer, mediaTransport: "webrtc" });
+    expect(response.status).toBe(202);
+    let body = await response.json() as { claimId: string; token: string; expiresAt: number };
+    let mintStarted = origin + 14_000;
+    if (phase !== "claim") {
+      vi.setSystemTime(origin + 16_000);
+      mintStarted = Date.now();
+      response = await f.request(phase === "sdp" ? sdpPath : fallbackPath,
+        { claimId: body.claimId, ...(phase === "sdp" ? { sdpOffer: sdp } : {}) });
+      expect(response.status).toBe(202);
+      body = await response.json() as typeof body;
+    }
+    const token = JSON.parse(Buffer.from(body.token.split(".")[1]!, "base64url").toString()) as { exp: number };
+    expect(Date.now()).toBeGreaterThan(offerExpiry);
+    expect(body.expiresAt).toBeGreaterThan(Date.now());
+    expect(body.expiresAt).toBe(Math.floor(mintStarted / 1000) * 1000 + 300_000);
+    expect(body.expiresAt).toBeLessThanOrEqual(token.exp * 1000);
+    expect(body.expiresAt).toBe(token.exp * 1000);
+    expect(f.db.prepare("SELECT expires_at FROM inbound_offers WHERE offer_id = ?").get(offer)?.expires_at).toBe(offerExpiry);
+    await Promise.all(f.background);
+  });
+
+  it.each(["MEDIA_FALLBACK_REJECTED", "LIVEKIT_SETUP_FAILED", "MEDIA_ENDED", "PRIVATE_DEVICE_VALUE"])(
+    "logs only an allowlisted fallback rejection category for %s", async errorCode => {
+      const f = await fixture();
+      const claimed = await (await f.request(claimPath, { offerId: offer, mediaTransport: "webrtc" })).json() as { claimId: string };
+      const original = f.relay.getMockImplementation()!;
+      f.relay.mockImplementation(async (url, init) => {
+        const response = await original(url, init);
+        if (url.endsWith("/inbound-media-relay")) {
+          return Response.json({ ...await response.json() as object, status: "rejected", errorCode });
+        }
+        return response;
+      });
+      const log = vi.spyOn(console, "warn").mockImplementation(() => {});
+      expect((await f.request(fallbackPath, { claimId: claimed.claimId })).status).toBe(409);
+      expect(log).toHaveBeenCalledWith(JSON.stringify({ event: "inbound_livekit_fallback_rejected",
+        reason: errorCode === "PRIVATE_DEVICE_VALUE" ? "other" : errorCode }));
+      expect(JSON.stringify(log.mock.calls)).not.toContain(claimed.claimId);
+      expect(JSON.stringify(log.mock.calls)).not.toContain("PRIVATE_DEVICE_VALUE");
+      await Promise.all(f.background);
+    });
+
+  it.each([fallbackPath, endPath])("forwards only the final RTP sample on %s without storing it", async path => {
+    const f = await fixture();
+    const claimed = await (await f.request(claimPath, { offerId: offer, mediaTransport: "webrtc" })).json() as { claimId: string };
+    expect((await f.request(path, { claimId: claimed.claimId, clientTiming, clientRtpStats })).status).toBe(202);
+    const type = path === endPath ? "inbound.media.end" : "inbound.media.livekit";
+    const command = f.relay.mock.calls.map(([, init]) => init?.body ? JSON.parse(init.body as string) : null)
+      .find(value => value?.type === type);
+    expect(command?.clientRtpStats).toEqual(clientRtpStats);
+    expect(inboundMediaCommandSchema.safeParse(command).success).toBe(true);
+    expect(inboundMediaCommandSchema.safeParse({ ...command, type: "inbound.claim", direct: { deferred: true } }).success).toBe(false);
+    expect(JSON.stringify(f.db.prepare("SELECT * FROM inbound_offers").get())).not.toContain("outPackets");
+    await Promise.all(f.background);
+  });
+
+  it.each([
+    { seq: 11 }, { seq: true }, { elapsedMs: 60001 }, { outPackets: -1 }, { outBytes: 2 ** 53 },
+    { inPackets: 0.5 }, { lost: -(2 ** 53) }, { rttMs: -1 }, { localCandidate: "192.0.2.1" },
+    { pairState: "connected" }, { address: "must-not-log" }
+  ])("rejects invalid RTP diagnostics %j before relaying", async changes => {
+    const f = await fixture();
+    const claimed = await (await f.request(claimPath, { offerId: offer, mediaTransport: "webrtc" })).json() as { claimId: string };
+    const before = f.relay.mock.calls.length;
+    expect((await f.request(fallbackPath, { claimId: claimed.claimId, clientRtpStats: { ...clientRtpStats, ...changes } })).status).toBe(400);
+    expect(f.relay.mock.calls).toHaveLength(before);
+    await Promise.all(f.background);
+  });
+
   it.each([fallbackPath, endPath])("forwards bounded client timing on %s without persisting telemetry", async path => {
     const f = await fixture();
     const claimed = await (await f.request(claimPath, { offerId: offer, mediaTransport: "webrtc" })).json() as { claimId: string };

@@ -7,6 +7,43 @@ enum CallMediaTransportEvent: Equatable, Sendable {
     case permissionsReady(Bool)
     case tracksChanged
     case audioEngine(CallAudioEngineSnapshot, failed: Bool)
+    case rtpStats(Data)
+}
+
+@MainActor
+final class CallDirectAudioGate {
+    private(set) var owner: UUID?
+    private(set) var lastReleased: UUID?
+    private(set) var active = false
+
+    // Returns true only when the native manual gate needs initialization.
+    func prepare(_ id: UUID) throws -> Bool {
+        guard owner == nil || owner == id else { throw CallAudioError.busy }
+        guard owner != id else { return false }
+        owner = id
+        lastReleased = nil
+        active = false
+        return true
+    }
+
+    func activate(_ id: UUID) throws {
+        guard owner == id else { throw CallAudioError.busy }
+        active = true
+    }
+
+    func release(_ id: UUID) -> Bool {
+        guard owner == id else { return false }
+        owner = nil
+        lastReleased = id
+        active = false
+        return true
+    }
+
+    func didClose(_ id: UUID) -> Bool {
+        guard owner == nil, lastReleased == id else { return false }
+        lastReleased = nil
+        return true
+    }
 }
 
 struct CallAudioEngineSnapshot: Codable, Equatable, Sendable {
@@ -64,6 +101,13 @@ protocol CallDirectMediaTransport: CallMediaTransport {
     func activateDirectAudio() throws
     // Synchronous revocation fences audio before an uncooperative SDK teardown.
     func stopDirectAudio()
+    var latestRtpStats: Data? { get }
+    func finishRtpSampling()
+}
+
+extension CallDirectMediaTransport {
+    var latestRtpStats: Data? { nil }
+    func finishRtpSampling() {}
 }
 
 final class CallFirstFrameRendererRemoval: @unchecked Sendable {

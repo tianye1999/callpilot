@@ -106,6 +106,80 @@ def test_direct_claim_starts_pcm_without_waiting_for_sdp_and_rejects_postcommit_
     assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
 
 
+def test_direct_preview_forwards_caller_before_phone_audio_and_commit(rig, monkeypatch):
+    from agentcall.inbound_direct import SwitchableInboundEndpoint
+
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda *_: pytest.fail("preview waited for phone audio"))
+    direct = rig.endpoint
+    direct.media_ready = False
+    direct.browser_connected = True
+    direct.answer = {"sdp": "answer"}
+    received = []
+
+    def push(pcm):
+        assert rig.session.takeover_state is TakeoverState.WAITING_OWNER
+        assert not direct.media_ready
+        received.append(pcm)
+        direct.media_ready = True  # Phone starts its microphone only after hearing the caller.
+
+    direct.push_modem_audio = push
+    rig.bridge.feed_uplink(b"caller-before-microphone")
+    rig.session._takeover_endpoint_factory = lambda issued: SwitchableInboundEndpoint(
+        issued.direct, direct_factory=lambda *_args, **_kwargs: direct)
+
+    def claim():
+        rig.clock.tick = lambda: None
+        offer = rig.session.next_takeover_offer()
+        request = InboundDirectRequest(offer.offer_id, "claim_preview", "sdp", [], lambda *_: None)
+        assert rig.session.accept_takeover_claim(
+            offer_id=offer.offer_id, call_id=offer.call_id, claim_id="claim_preview",
+            generation=offer.generation, nonce=offer.nonce, issued=replace(rig.issued, direct=request),
+        ).accepted
+
+    rig.clock.tick = claim
+    rig.ring()
+    asyncio.run(rig.session._handle_call())
+    assert received == [b"caller-before-microphone"]
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+
+
+@pytest.mark.parametrize("operation", ["sdp", "fallback"])
+def test_direct_media_uses_claim_lease_after_ringing_window(rig, monkeypatch, operation):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+    session = rig.session
+
+    def claim():
+        rig.clock.tick = lambda: None
+        offer = session.next_takeover_offer()
+        rig.clock.now = 114
+        direct = InboundDirectRequest(offer.offer_id, "claim_late", None, [], lambda *_: None)
+        assert session.accept_takeover_claim(
+            offer_id=offer.offer_id, call_id=offer.call_id, claim_id="claim_late",
+            generation=offer.generation, nonce=offer.nonce, issued=replace(rig.issued, direct=direct),
+        ).accepted
+        fence = dict(offerId=offer.offer_id, callId=offer.call_id, claimId="claim_late",
+                     generation=offer.generation, nonce=offer.nonce)
+        rig.clock.now = 116
+        assert rig.clock.now > session._phone_first_deadline
+        assert session._phone_first_claim_deadline == 144
+
+        def submit():
+            if operation == "fallback":
+                return session.fallback_inbound_direct(fence, rig.issued, lambda *_: None)
+            return session.supply_inbound_direct_sdp(
+                {**fence, "direct": {"sdpOffer": "sdp", "iceServers": []}}, lambda *_: None)
+
+        assert submit(), "Accepted claim survives the original ringing deadline"
+        rig.clock.now = 144
+        assert not submit(), "Retry cannot extend the original media lease"
+        session._set_active(False)
+
+    rig.clock.tick = claim
+    rig.ring()
+    asyncio.run(session._handle_call())
+
+
 @pytest.mark.parametrize("accepted", [False, True])
 def test_cloud_claim_then_immediate_sdp_uses_same_fenced_request(rig, monkeypatch, accepted):
     monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")

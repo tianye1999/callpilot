@@ -48,6 +48,16 @@ export const clientTimingSchema = z.object({
 }).strict().refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 2048);
 const clientTimingBatchesSchema = z.array(clientTimingSchema).max(8)
   .refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 4096);
+const rtpCounter = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable();
+const candidateType = z.enum(["host", "srflx", "prflx", "relay"]).nullable();
+export const clientRtpStatsSchema = z.object({
+  type: z.literal("client_rtp_stats"), v: z.literal(1), seq: z.number().int().min(1).max(10),
+  elapsedMs: z.number().min(0).max(60_000), outPackets: rtpCounter, outBytes: rtpCounter,
+  inPackets: rtpCounter, inBytes: rtpCounter,
+  lost: z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER).nullable(),
+  rttMs: z.number().nonnegative().nullable(), localCandidate: candidateType, remoteCandidate: candidateType,
+  pairState: z.enum(["frozen", "waiting", "in-progress", "failed", "succeeded"]).nullable()
+}).strict().refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 512);
 
 export const inboundMediaCommandSchema = z.object({
   v: z.literal(1), type: z.enum(["inbound.claim", "inbound.media.sdp", "inbound.media.livekit", "inbound.media.end"]),
@@ -55,10 +65,11 @@ export const inboundMediaCommandSchema = z.object({
   generation: z.number().int().nonnegative(), nonce: z.string().min(16).max(128), session: inboundSessionSchema,
   direct: z.union([z.object({ deferred: z.literal(true) }).strict(),
     z.object({ sdpOffer: sdp, iceServers: z.array(iceServerSchema).max(16) }).strict()]).optional(),
-  clientTiming: clientTimingBatchesSchema.optional()
+  clientTiming: clientTimingBatchesSchema.optional(), clientRtpStats: clientRtpStatsSchema.optional()
 }).strict().refine(value => value.type === "inbound.claim" ? value.direct !== undefined && "deferred" in value.direct
   : value.type === "inbound.media.sdp" ? value.direct !== undefined && "sdpOffer" in value.direct : value.direct === undefined)
-  .refine(value => value.clientTiming === undefined || ["inbound.media.livekit", "inbound.media.end"].includes(value.type));
+  .refine(value => (value.clientTiming === undefined && value.clientRtpStats === undefined)
+    || ["inbound.media.livekit", "inbound.media.end"].includes(value.type));
 export const inboundAnswerSchema = z.object({
   v: z.literal(1), type: z.literal("inbound.answer"), commandId: opaqueId,
   offerId: opaqueId, callId: opaqueId, claimId: opaqueId,
@@ -162,7 +173,8 @@ export const claimInboundOfferSchema = z.object({
   sdpOffer: sdp.optional()
 }).strict();
 
-export const inboundFallbackSchema = z.object({ claimId: opaqueId, clientTiming: clientTimingBatchesSchema.optional() }).strict();
+export const inboundFallbackSchema = z.object({ claimId: opaqueId, clientTiming: clientTimingBatchesSchema.optional(),
+  clientRtpStats: clientRtpStatsSchema.optional() }).strict();
 export const inboundSdpSchema = z.object({ claimId: opaqueId, sdpOffer: sdp }).strict();
 
 export const prepareInboundOfferSchema = z.object({ offerId: opaqueId }).strict();

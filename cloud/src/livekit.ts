@@ -2,6 +2,8 @@ import { AccessToken, TrackSource } from "livekit-server-sdk";
 
 import type { Env } from "./types";
 
+export const LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS = 300;
+
 export class LiveKitParticipantError extends Error {
   override name = "LiveKitParticipantError";
   readonly code?: string;
@@ -20,7 +22,7 @@ export async function issueParticipantToken(
   env: Env,
   room: string,
   identity: string,
-  ttlSeconds = 300,
+  ttlSeconds = LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS,
   restricted = false
 ): Promise<string> {
   if (!env.LIVEKIT_API_KEY || !env.LIVEKIT_API_SECRET) throw new Error("LiveKit is not configured");

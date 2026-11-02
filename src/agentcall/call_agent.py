@@ -2331,7 +2331,12 @@ class CallSession:
                     # empty chunk on a live stream. Drain backlog off-loop, but
                     # give connection/deadline checks a turn every 50 ms.
                     drain_deadline = self._phone_first_clock() + 0.05
-                    while await self._threaded_modem_call(bridge.read_modem_chunk):
+                    while chunk := await self._threaded_modem_call(bridge.read_modem_chunk):
+                        if (fastpath_v2 and isinstance(endpoint, SwitchableInboundEndpoint)
+                                and endpoint.direct_preview_ready):
+                            endpoint.push_modem_audio(chunk)
+                            timing.mark("direct_preview_started")
+                            timing.mark("first_modem_to_phone")
                         if self._phone_first_clock() >= drain_deadline:
                             break
                 if (fastpath_v2 and isinstance(endpoint, SwitchableInboundEndpoint)
@@ -2394,8 +2399,10 @@ class CallSession:
                     if endpoint.media_ready and (answering is None or answering.done()):
                         if provisional_agent is not None:
                             await stop_provisional_ai()
-                        if isinstance(endpoint, SwitchableInboundEndpoint) and not endpoint.seal():
-                            continue
+                        if isinstance(endpoint, SwitchableInboundEndpoint):
+                            await endpoint.finish_rtp_stats()
+                            if not endpoint.seal():
+                                continue
                         break
                 await self._phone_first_sleep(0.05)
             if answering is not None and not answering.done():
@@ -5075,11 +5082,32 @@ class CallSession:
                     or command["offerId"] != request.offer_id or command["callId"] != request.call_id
                     or command["generation"] != request.generation or command["nonce"] != request.nonce
                     or command["claimId"] != direct.claim_id or request.generation != self._session_generation):
+                self._observe_direct_media_decision("fallback", False, "CLAIM_FENCE_OR_STATE")
                 return False
-            if (self._phone_first_claim_deadline is None
-                    or self._phone_first_clock() >= self._phone_first_claim_deadline):
+            deadline = self._direct_media_deadline()
+            if deadline is None or self._phone_first_clock() >= deadline:
+                self._observe_direct_media_decision("fallback", False, "MEDIA_LEASE_EXPIRED")
                 return False
-            return direct.fallback(issued, reply)
+            accepted = direct.fallback(issued, reply)
+            self._observe_direct_media_decision("fallback", accepted,
+                                               "ACCEPTED" if accepted else "TRANSPORT_STATE")
+            return accepted
+
+    def _direct_media_deadline(self) -> float | None:
+        # Only the successful claim starts this lease. Neither ringing expiry
+        # nor retries/transport replacement can shorten or extend it.
+        if self._phone_first_claimed_at is None:
+            return None
+        return self._phone_first_claimed_at + DIRECT_MEDIA_LEASE_SECONDS
+
+    def _observe_direct_media_decision(self, operation: str, accepted: bool, reason: str) -> None:
+        if self._mobile_timing is not None:
+            deadline = self._direct_media_deadline()
+            self._mobile_timing.record_observation("direct_media_transition", {
+                "operation": operation, "accepted": accepted, "reason": reason,
+                "leaseRemainingMs": round(max(0, deadline - self._phone_first_clock()) * 1000)
+                if deadline is not None else None,
+            })
 
     def prepare_inbound_direct(self, command: dict[str, Any]) -> bool:
         with self._takeover_lock:
@@ -5102,12 +5130,15 @@ class CallSession:
                     or command["offerId"] != request.offer_id or command["callId"] != request.call_id
                     or command["generation"] != request.generation or command["nonce"] != request.nonce
                     or command["claimId"] != direct.claim_id or request.generation != self._session_generation):
+                self._observe_direct_media_decision("sdp", False, "CLAIM_FENCE_OR_STATE")
                 return False
-            if (self._phone_first_claim_deadline is None
-                    or self._phone_first_clock() >= self._phone_first_claim_deadline):
+            deadline = self._direct_media_deadline()
+            if deadline is None or self._phone_first_clock() >= deadline:
+                self._observe_direct_media_decision("sdp", False, "MEDIA_LEASE_EXPIRED")
                 return False
             payload = command["direct"]
             accepted = direct.supply_sdp(payload["sdpOffer"], payload["iceServers"], reply)
+            self._observe_direct_media_decision("sdp", accepted, "ACCEPTED" if accepted else "TRANSPORT_STATE")
             if self._mobile_timing is not None:
                 if accepted:
                     self._mobile_timing.mark("direct_sdp_received")
@@ -5135,6 +5166,8 @@ class CallSession:
                 return
             for batch in command.get("clientTiming", []):
                 self._mobile_timing.receive_client(batch)
+            if "clientRtpStats" in command:
+                self._mobile_timing.receive_rtp(command["clientRtpStats"])
 
     def end_inbound_direct(self, command: dict[str, Any]) -> bool:
         with self._takeover_lock:

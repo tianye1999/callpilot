@@ -190,6 +190,7 @@ class SwitchableInboundEndpoint:
         self._direct_connect: asyncio.Task[None] | None = None
         self._watch_task: asyncio.Task[None] | None = None
         self._retire_task: asyncio.Task[None] | None = None
+        self._stats_finish_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._timing = CallTiming()
 
@@ -206,6 +207,25 @@ class SwitchableInboundEndpoint:
     @property
     def browser_connected(self) -> bool:
         return bool(not self._closed and self._inner is not None and self._inner.browser_connected)
+
+    @property
+    def direct_preview_ready(self) -> bool:
+        return bool(not self._closed and not self._switching and not self._direct_replaced
+                    and not self.no_phone_audio and self.browser_connected)
+
+    async def finish_rtp_stats(self) -> None:
+        finish = getattr(self._inner, "finish_rtp_stats", None)
+        if not callable(finish) or self._stats_finish_task is not None:
+            return
+
+        async def sample() -> None:
+            try:
+                await finish("commit")
+            except Exception:
+                self._timing.mark("rtp_stats_unavailable")
+
+        # Diagnostics are never a prerequisite for hearing or ownership commit.
+        self._stats_finish_task = asyncio.create_task(sample())
 
     def no_phone_audio_expired(self, now: float, maximum: float) -> bool:
         if self._closed or self._direct_replaced or self.no_phone_audio or self._inner is None:
@@ -316,8 +336,12 @@ class SwitchableInboundEndpoint:
         except asyncio.CancelledError:
             reply(None, "MEDIA_ENDED")
             raise
-        except Exception:
+        except Exception as error:
             self.failed = True
+            self._timing.record_observation("direct_media_transition", {
+                "operation": "livekit_connect", "accepted": False, "reason": "LIVEKIT_SETUP_FAILED",
+                "errorType": type(error).__name__,
+            })
             self.request.switch_failed()
             reply(None, "LIVEKIT_SETUP_FAILED")
             if cold is not None:
@@ -334,6 +358,8 @@ class SwitchableInboundEndpoint:
         await asyncio.shield(self._close_task)
 
     async def _close(self) -> None:
+        if self._stats_finish_task is not None:
+            await asyncio.gather(self._stats_finish_task, return_exceptions=True)
         tasks = [task for task in (self._direct_connect, self._watch_task) if task is not None]
         for task in tasks:
             task.cancel()
@@ -350,6 +376,9 @@ class SwitchableInboundEndpoint:
         result: dict[str, Any] | None = await self._inner.next_command(timeout)
         if result is not None and result.get("type") == "client_timing":
             self._timing.receive_client(result)
+            return None
+        if result is not None and result.get("type") == "client_rtp_stats":
+            self._timing.receive_rtp(result)
             return None
         return result
 

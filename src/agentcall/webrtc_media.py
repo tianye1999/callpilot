@@ -27,6 +27,9 @@ _FRAME_SAMPLES = REMOTE_AUDIO_RATE // 50
 _FRAME_BYTES = _FRAME_SAMPLES * 2
 _MAX_CONTROL_BYTES = 4096
 _MAX_CONTROL_BUFFER = 64 * 1024
+_RTP_STATS_INTERVAL_SECONDS = 2.0
+_RTP_STATS_MAX_SAMPLES = 10
+_RTP_STATS_READ_MAX_SECONDS = 1.0  # Diagnostics cannot stall teardown or ownership commit.
 _warm_lock = threading.Lock()
 _warm_future: Future[Any] | None = None
 _stack: Any = None
@@ -50,6 +53,7 @@ def warm_webrtc_stack() -> Future[Any]:
             importlib.import_module("pylibsrtp")
             importlib.import_module("aioice")
             streams = importlib.import_module("aiortc.mediastreams")
+            sdp = importlib.import_module("aiortc.sdp")
             ice_adapter = importlib.import_module("agentcall.webrtc_ice")
 
             async def initialize() -> None:
@@ -68,7 +72,7 @@ def warm_webrtc_stack() -> Future[Any]:
                     await pc.close()
 
             asyncio.run(initialize())
-            _stack = SimpleNamespace(rtc=rtc, av=av, streams=streams, ice=ice_adapter)
+            _stack = SimpleNamespace(rtc=rtc, av=av, streams=streams, ice=ice_adapter, sdp=sdp)
             logger.info("webrtc stack warmed in %.2fs", time.monotonic() - started)
             future.set_result(_stack)
         except Exception as error:
@@ -104,6 +108,8 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
             self._next_at: float | None = None
             self._pts = 0
             self.stats = PcmFlowStats("downlink1_direct_publish")
+            self.frames = 0
+            self.silence_frames = 0
 
         async def recv(self) -> Any:
             if self.readyState != "live":
@@ -120,15 +126,54 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
                 self.stats.add(pcm)
             except asyncio.QueueEmpty:
                 pcm = bytes(_FRAME_BYTES)
+                self.silence_frames += 1
             frame = _stack.av.AudioFrame(format="s16", layout="mono", samples=_FRAME_SAMPLES)
             frame.planes[0].update(pcm)
             frame.sample_rate = REMOTE_AUDIO_RATE
             frame.pts = self._pts
             frame.time_base = Fraction(1, REMOTE_AUDIO_RATE)
             self._pts += _FRAME_SAMPLES
+            self.frames += 1
+            self.stats.maybe_log(senderFrames=self.frames, senderSilenceFrames=self.silence_frames,
+                                 queued=source.qsize())
             return frame
 
     return ModemTrack()
+
+
+def _sdp_summary(pc: Any) -> dict[str, Any]:
+    """Extract only negotiation shape, never addresses, SSRC, fingerprints or credentials."""
+    description = _stack.sdp.SessionDescription.parse(pc.localDescription.sdp)
+    directions = {t.mid: t.currentDirection for t in pc.getTransceivers()}
+    bundled = {mid for group in description.group if group.semantic == "BUNDLE" for mid in group.items}
+    lines = []
+    for index, media in enumerate(description.media[:8]):
+        mid = media.rtp.muxId
+        direction = directions.get(mid)
+        codecs = [{"mimeType": codec.mimeType if codec.mimeType.lower() in {
+            "audio/opus", "audio/pcmu", "audio/pcma", "audio/g722", "audio/telephone-event",
+            "video/vp8", "video/vp9", "video/h264", "video/rtx"} else "other",
+                   "pt": codec.payloadType, "clockRate": codec.clockRate, "channels": codec.channels}
+                  for codec in media.rtp.codecs[:16]]
+        lines.append({"mLine": index,
+                      "mid": mid if isinstance(mid, str) and mid.isascii() and mid.isdecimal()
+                      and len(mid) <= 8 else None,
+                      "kind": media.kind if media.kind in {"audio", "video", "application"} else "other",
+                      "currentDirection": direction if direction in {
+                          "sendrecv", "sendonly", "recvonly", "inactive"} else None,
+                      "codecs": codecs, "rtcpMux": bool(media.rtcp_mux),
+                      "bundle": mid in bundled, "extmapCount": len(media.rtp.headerExtensions)})
+    return {"v": 1, "mLines": lines}
+
+
+def _selected_pair(pc: Any) -> dict[str, str] | None:
+    for connection in _stack.ice.peer_connections(pc):
+        for pair in getattr(connection, "_nominated", {}).values():
+            local, remote = pair.local_candidate.type, pair.remote_candidate.type
+            types = {"host", "srflx", "prflx", "relay"}
+            if local in types and remote in types and pair.state.name == "SUCCEEDED":
+                return {"localCandidate": local, "remoteCandidate": remote, "state": "succeeded"}
+    return None
 
 
 class WebRtcRemoteMediaEndpoint:
@@ -160,6 +205,12 @@ class WebRtcRemoteMediaEndpoint:
         self._phone_track: Any = None
         self._track_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._stats_task: asyncio.Task[None] | None = None
+        self._stats_finish_task: asyncio.Task[None] | None = None
+        self._stats_lock = asyncio.Lock()
+        self._stats_seq = 0
+        self._stats_stopped = False
+        self._stats_terminal = False
         self._connected = False
         self._received_audio = False
         self._first_audio_received = False
@@ -226,6 +277,10 @@ class WebRtcRemoteMediaEndpoint:
                     self.direct_connected_at = time.monotonic()
                 self._timing.mark("direct_connected")
                 self._timing.mark("phone_joined")
+                if self._stats_task is None and not self._stats_stopped:
+                    self._stats_task = asyncio.create_task(self._sample_rtp_loop())
+            elif pc.connectionState == "failed" and not self._stats_stopped and self._stats_finish_task is None:
+                self._stats_finish_task = asyncio.create_task(self.finish_rtp_stats("failed"))
             self._mark_ready()
 
         @pc.on("datachannel")
@@ -255,6 +310,10 @@ class WebRtcRemoteMediaEndpoint:
                 if command.get("type") == "client_timing":
                     if len(payload) <= MAX_TIMING_BYTES:
                         self._timing.receive_client(command)
+                    return
+                if command.get("type") == "client_rtp_stats":
+                    if len(payload) <= 512:
+                        self._timing.receive_rtp(command)
                     return
                 if command.get("type") == "hangup":
                     if self._hangup_command is None:
@@ -287,11 +346,73 @@ class WebRtcRemoteMediaEndpoint:
             await pc.setLocalDescription(answer)
             await self._check_current(pc)
             self._answer = {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp}
+            if callable(getattr(pc, "getTransceivers", None)):
+                try:
+                    self._timing.record_observation("direct_sdp_summary", _sdp_summary(pc))
+                except Exception as error:
+                    logger.debug("Direct SDP summary unavailable: %s", type(error).__name__)
             self._timing.mark("direct_answer_ready")
             self._timing.mark("endpoint_connect_return")
         except BaseException:
             await self.close()
             raise
+
+    async def _sample_rtp_loop(self) -> None:
+        while not self._stats_stopped and self._stats_seq < _RTP_STATS_MAX_SAMPLES - 1:
+            await asyncio.sleep(_RTP_STATS_INTERVAL_SECONDS)
+            if not self._stats_stopped:
+                await self._sample_rtp_stats(terminal=False, reason="periodic")
+
+    async def _sample_rtp_stats(self, *, terminal: bool, reason: str) -> None:
+        async with self._stats_lock:
+            if (self._stats_terminal or self._pc is None
+                    or self._stats_seq >= _RTP_STATS_MAX_SAMPLES - (0 if terminal else 1)
+                    or not callable(getattr(self._pc, "getStats", None))):
+                return
+            self._stats_seq += 1
+            self._stats_terminal = terminal
+            try:
+                try:
+                    async with asyncio.timeout(_RTP_STATS_READ_MAX_SECONDS):
+                        stats = list((await self._pc.getStats()).values())
+                except Exception as error:
+                    logger.debug("Direct RTP stats read unavailable: %s", type(error).__name__)
+                    stats = []
+                outgoing = [s for s in stats if s.type == "outbound-rtp" and s.kind == "audio"]
+                incoming = [s for s in stats if s.type == "inbound-rtp" and s.kind == "audio"]
+                remote = [s for s in stats if s.type == "remote-inbound-rtp" and s.kind == "audio"]
+                states = [s.dtlsState for s in stats if s.type == "transport" and s.dtlsState in {
+                    "new", "connecting", "connected", "closed", "failed"}]
+                rtts = [s.roundTripTime * 1000 for s in remote
+                        if isinstance(getattr(s, "roundTripTime", None), (int, float))
+                        and math.isfinite(s.roundTripTime) and s.roundTripTime >= 0]
+                origin = self.direct_connected_at
+                self._timing.record_observation("edge_rtp_stats", {
+                    "v": 1, "seq": self._stats_seq, "terminal": terminal,
+                    "reason": reason if reason in {"periodic", "commit", "close", "failed"} else "close",
+                    "elapsedMs": min(60_000, max(0, round((time.monotonic() - origin) * 1000))) if origin else 0,
+                    "outPackets": sum(s.packetsSent for s in outgoing) if outgoing else None,
+                    "outBytes": sum(s.bytesSent for s in outgoing) if outgoing else None,
+                    "inPackets": sum(s.packetsReceived for s in incoming) if incoming else None,
+                    "inBytes": None,  # aiortc inbound-rtp does not expose bytesReceived.
+                    "lost": sum(s.packetsLost for s in incoming) if incoming else None,
+                    "rttMs": max(rtts) if rtts else None,
+                    "dtlsState": "connected" if "connected" in states else next(iter(states), None),
+                    "selectedCandidatePair": _selected_pair(self._pc),
+                    "senderFrames": getattr(self._local_track, "frames", 0),
+                    "senderSilenceFrames": getattr(self._local_track, "silence_frames", 0),
+                })
+            except Exception as error:
+                logger.debug("Direct RTP stats unavailable: %s", type(error).__name__)
+
+    async def finish_rtp_stats(self, reason: str = "commit") -> None:
+        """Capture the fast-success/failure sample before disposing sender counters."""
+        self._stats_stopped = True
+        task = self._stats_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._sample_rtp_stats(terminal=True, reason=reason)
 
     async def _pump_phone_audio(self, track: Any) -> None:
         resampler = _stack.av.AudioResampler(format="s16", layout="mono", rate=REMOTE_AUDIO_RATE,
@@ -330,6 +451,9 @@ class WebRtcRemoteMediaEndpoint:
         await asyncio.shield(self._close_task)
 
     async def _close(self) -> None:
+        await self.finish_rtp_stats("close")
+        if self._stats_finish_task is not None:
+            await asyncio.gather(self._stats_finish_task, return_exceptions=True)
         if self._track_task is not None:
             self._track_task.cancel()
         if self._local_track is not None:

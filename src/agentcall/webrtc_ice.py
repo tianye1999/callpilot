@@ -236,6 +236,36 @@ async def stop_connection_checks(connection: Any) -> None:
     if tasks:
         # Transaction.run finally cancels its retry timer before socket close.
         await asyncio.gather(*tasks, return_exceptions=True)
+    # Upstream gather uses detached srflx tasks: cancelling gather while it is
+    # awaiting asyncio.wait leaves them outside both _check_list and our gathers.
+    # Their STUN futures, rather than the candidate/check lists, own the retries.
+    await _drain_protocol_transactions(connection._protocols)
+
+
+async def _drain_protocol_transactions(protocols: list[Any]) -> None:
+    tasks: set[asyncio.Task[Any]] = set()
+    for protocol in protocols:
+        for transaction in list(getattr(protocol, "transactions", {}).values()):
+            future = getattr(transaction, "_Transaction__future", None)
+            timer = getattr(transaction, "_Transaction__timeout_handle", None)
+            if (not aioice.__version__.startswith("0.11.") or not isinstance(future, asyncio.Future)
+                    or not hasattr(future, "_callbacks") or (timer is not None
+                    and not isinstance(timer, asyncio.TimerHandle))):
+                logger.warning("Direct STUN transaction adapter unsupported; using upstream close")
+                continue
+            # CPython Task's wakeup callback identifies the coroutine awaiting
+            # this exact transaction; never cancel unrelated loop tasks.
+            for callback, _context in future._callbacks or ():
+                owner = getattr(callback, "__self__", None)
+                if isinstance(owner, asyncio.Task) and owner is not asyncio.current_task():
+                    tasks.add(owner)
+            if timer is not None:
+                timer.cancel()
+            future.cancel()
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def stop_peer_checks(pc: Any) -> None:
@@ -271,6 +301,9 @@ def configure_turn_transport(transport: Any) -> None:
             except (TimeoutError, OSError):
                 logger.debug("Direct TURN delete unavailable; closing local allocation socket")
         finally:
-            inner.transport.close()
+            try:
+                await _drain_protocol_transactions([inner])
+            finally:
+                inner.transport.close()
 
     setattr(transport, "_close", close_turn)

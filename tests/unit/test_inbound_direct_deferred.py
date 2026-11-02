@@ -32,6 +32,32 @@ async def settle():
         await asyncio.sleep(0)
 
 
+def test_commit_does_not_wait_for_diagnostic_snapshot_but_close_drains_it():
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        inner = Endpoint()
+        inner.media_ready = True
+
+        async def finish(reason):
+            assert reason == "commit"
+            entered.set()
+            await release.wait()
+
+        inner.finish_rtp_stats = finish
+        endpoint = SwitchableInboundEndpoint(InboundDirectRequest("offer", "claim", "sdp", [], lambda *_: None))
+        endpoint._inner = inner
+        await endpoint.finish_rtp_stats()
+        await entered.wait()
+        assert endpoint.seal(), "A pending diagnostic read must not delay the mobile commit"
+        await endpoint.finish_rtp_stats()
+        assert not endpoint._stats_finish_task.done()
+        release.set()
+        await endpoint.close()
+        assert endpoint._stats_finish_task.done() and inner.closed
+
+    asyncio.run(run())
+
+
 def test_timing_from_retiring_transport_is_received_before_fallback_finishes():
     async def run():
         entered, release = asyncio.Event(), asyncio.Event()

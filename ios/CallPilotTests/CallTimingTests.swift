@@ -4,6 +4,100 @@ import XCTest
 
 @MainActor
 final class CallTimingTests: XCTestCase {
+    func testRtpSamplerUsesEventsStopsAtTenAndTakesFastTerminalSample() async {
+        var instant: TimeInterval = 0
+        var requests: [(Int, Int)] = []
+        var continuation: CheckedContinuation<Void, Never>?
+        let ticks = (0..<9).map { expectation(description: "sampler awaits tick \($0)") }
+        var tickIndex = 0
+        let sampler = CallRtpSampler(now: { instant }, sleep: { duration in
+            XCTAssertEqual(duration, .seconds(2))
+            await withCheckedContinuation { value in
+                continuation = value
+                ticks[tickIndex].fulfill()
+                tickIndex += 1
+            }
+        }, request: { requests.append(($0, $1)) })
+        sampler.start()
+        XCTAssertEqual(requests.count, 1)
+        for index in 0..<8 {
+            await fulfillment(of: [ticks[index]], timeout: 1)
+            instant += 2
+            continuation?.resume()
+        }
+        await fulfillment(of: [ticks[8]], timeout: 1)
+        sampler.finish()
+        XCTAssertEqual(requests.map(\.0), Array(1...10))
+        XCTAssertEqual(requests.last?.1, 16_000)
+        continuation?.resume()
+        sampler.finish()
+        sampler.start()
+        XCTAssertEqual(requests.count, 10)
+
+        var fast: [Int] = []
+        let quick = CallRtpSampler(sleep: { _ in XCTFail("commit before first periodic tick") },
+                                  request: { seq, _ in fast.append(seq) })
+        quick.start()
+        quick.finish()
+        XCTAssertEqual(fast, [1, 2])
+        var early: [Int] = []
+        let beforeContinuation = CallRtpSampler(sleep: { _ in XCTFail("terminal sampler cannot restart") },
+                                               request: { seq, _ in early.append(seq) })
+        beforeContinuation.finish()
+        beforeContinuation.start()
+        XCTAssertEqual(early, [1])
+    }
+
+    func testRtpReportKeepsOnlyAudioCountersAndSelectedPairWithoutIdentifiers() throws {
+        let packet = try XCTUnwrap(CallRtpStats.packet(reports: [
+            CallRtpReport(id: "out", type: "outbound-rtp", values: ["kind": "audio", "packetsSent": 8, "bytesSent": 160]),
+            CallRtpReport(id: "video", type: "outbound-rtp", values: ["kind": "video", "packetsSent": 999]),
+            CallRtpReport(id: "in", type: "inbound-rtp", values: ["kind": "audio", "packetsReceived": 7, "bytesReceived": 140, "packetsLost": -1]),
+            CallRtpReport(id: "remote", type: "remote-inbound-rtp", values: ["kind": "audio", "roundTripTime": 0.025]),
+            CallRtpReport(id: "transport", type: "transport", values: ["selectedCandidatePairId": "pair-private"]),
+            CallRtpReport(id: "pair-private", type: "candidate-pair", values: ["localCandidateId": "local-private", "remoteCandidateId": "remote-private", "state": "succeeded"]),
+            CallRtpReport(id: "local-private", type: "local-candidate", values: ["candidateType": "relay", "address": "198.51.100.7", "port": 9999]),
+            CallRtpReport(id: "remote-private", type: "remote-candidate", values: ["candidateType": "host"]),
+        ], sequence: 1, elapsedMs: 2000))
+        XCTAssertLessThanOrEqual(packet.count, 512)
+        let object = try decode(packet)
+        XCTAssertEqual(object["outPackets"] as? Int, 8)
+        XCTAssertEqual(object["inPackets"] as? Int, 7)
+        XCTAssertEqual(object["lost"] as? Int, -1)
+        XCTAssertEqual(object["rttMs"] as? Double, 25)
+        XCTAssertEqual(object["localCandidate"] as? String, "relay")
+        XCTAssertEqual(object["pairState"] as? String, "succeeded")
+        let text = String(decoding: packet, as: UTF8.self)
+        XCTAssertFalse(text.contains("private"))
+        XCTAssertFalse(text.contains("198.51.100"))
+        XCTAssertFalse(text.contains("9999"))
+    }
+
+    func testRtpMissingOrUnsafeValuesStayNullWithinPacketLimit() throws {
+        let object = try decode(XCTUnwrap(CallRtpStats.packet(reports: [
+            CallRtpReport(id: "out", type: "outbound-rtp", values: ["kind": "audio", "packetsSent": -1,
+                "bytesSent": 9_007_199_254_740_992.0]),
+        ], sequence: 10, elapsedMs: 60_000)))
+        for key in ["outPackets", "outBytes", "inPackets", "inBytes", "lost", "rttMs", "localCandidate", "remoteCandidate", "pairState"] {
+            XCTAssertTrue(object[key] is NSNull, key)
+        }
+        XCTAssertNil(CallRtpStats.packet(reports: [], sequence: 11, elapsedMs: 1))
+    }
+
+    func testPrepareAudioGateDoesNotActivateOrResetAnAlreadyActivatedOwner() throws {
+        let gate = CallDirectAudioGate(), owner = UUID()
+        XCTAssertTrue(try gate.prepare(owner))
+        XCTAssertFalse(gate.active)
+        try gate.activate(owner)
+        XCTAssertTrue(gate.active)
+        XCTAssertFalse(try gate.prepare(owner))
+        XCTAssertTrue(gate.active)
+        XCTAssertThrowsError(try gate.prepare(UUID()))
+        XCTAssertTrue(gate.release(owner))
+        XCTAssertFalse(gate.active)
+        XCTAssertTrue(try gate.prepare(UUID()), "pending old peer close is not a registration lock")
+    }
+
     func testHTTPReplaysAlreadyPublishedMarksWithEngineSnapshotWithinBodyBudget() throws {
         let timing = CallTiming(now: { 0 })
         timing.startClaim()
@@ -14,9 +108,14 @@ final class CallTimingTests: XCTestCase {
             inputMuted: false, muteMode: -1))
         while timing.nextBatch() != nil {}
         let lastSequence = timing.sequence
-        let batches = try timing.httpBatches().map(decode)
+        let batches = try timing.httpBatches(reservingBytes: 512).map(decode)
         XCTAssertLessThanOrEqual(batches.count, 8)
-        let body = try JSONSerialization.data(withJSONObject: ["claimId": "claim_abcdefghijkl", "clientTiming": batches])
+        let rtp = try decode(XCTUnwrap(CallRtpStats.packet(reports: [
+            CallRtpReport(id: "out", type: "outbound-rtp", values: ["kind": "audio", "packetsSent": 9_007_199_254_740_991, "bytesSent": 9_007_199_254_740_991]),
+            CallRtpReport(id: "in", type: "inbound-rtp", values: ["kind": "audio", "packetsReceived": 9_007_199_254_740_991, "bytesReceived": 9_007_199_254_740_991, "packetsLost": -9_007_199_254_740_991]),
+            CallRtpReport(id: "remote", type: "remote-inbound-rtp", values: ["kind": "audio", "roundTripTime": 1e300]),
+        ], sequence: 10, elapsedMs: 60_000)))
+        let body = try JSONSerialization.data(withJSONObject: ["claimId": "claim_abcdefghijkl", "clientTiming": batches, "clientRtpStats": rtp])
         XCTAssertLessThanOrEqual(body.count, 4096)
         var received = Set<String>()
         for batch in batches {

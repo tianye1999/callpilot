@@ -12,6 +12,8 @@ private final class FakeDirectTransport: CallDirectMediaTransport {
     var failure = false
     var audioFailure = false
     var packets: [Data] = []
+    var latestRtpStats: Data?
+    var statsFinished = 0
     var prepareGate: ManualGate?
     var connectGate: ManualGate?
     var disconnectGate: ManualGate?
@@ -26,6 +28,7 @@ private final class FakeDirectTransport: CallDirectMediaTransport {
     }
     func activateDirectAudio() throws { activations += 1 }
     func stopDirectAudio() { audioStopped = true }
+    func finishRtpSampling() { statsFinished += 1 }
     func connect(url: String, token: String, enableMicrophone: Bool) async throws { XCTFail("not LiveKit") }
     func setMicrophone(enabled: Bool) async throws {
         if enabled {
@@ -48,6 +51,94 @@ private final class FakeDirectTransport: CallDirectMediaTransport {
 
 @MainActor
 final class CallMediaSessionTests: XCTestCase {
+    func testV2AudioReadbackFailureAfterCommitTerminatesInsteadOfLeavingMutedCall() async throws {
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        let client = try makeDirectClient(onFallback: { XCTFail("committed claim cannot switch transports") })
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct })
+        _ = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true, onConnected: {})
+        let handler = direct.eventHandler
+        // RTP can commit while the independent audio readback is still pending.
+        await handler?(.data(Data(#"{"type":"status","status":"connected"}"#.utf8), topic: CallPilotTopic.status))
+        guard case .inCall = states.last else { return XCTFail("fixture must commit before readback failure") }
+        await handler?(.audioEngine(FakeDirectTransport.snapshot(ready: false), failed: true))
+        guard case let .failed(_, _, code) = states.last else {
+            XCTFail("post-commit audio failure must be terminal")
+            await media.stop()
+            return
+        }
+        XCTAssertEqual(code, "AUDIO_ENGINE_FAILED")
+        XCTAssertTrue(direct.audioStopped)
+        XCTAssertTrue(livekit.connectedTokens.isEmpty)
+        let terminal = states
+        await handler?(.audioEngine(FakeDirectTransport.snapshot(ready: true), failed: false))
+        XCTAssertEqual(states, terminal, "late readback cannot resurrect a failed call")
+        await media.stop()
+    }
+
+    func testV2CommitFinishesStatsWithoutRevokingWorkingAudio() async throws {
+        let direct = FakeDirectTransport()
+        let client = try makeDirectClient()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct })
+        _ = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true, onConnected: {})
+        XCTAssertFalse(direct.audioStopped)
+        media.handleConnected(label: "")
+        XCTAssertEqual(direct.statsFinished, 1)
+        XCTAssertFalse(direct.audioStopped)
+        await media.stop()
+        XCTAssertTrue(direct.audioStopped)
+    }
+
+    func testV2FallbackAndEndCarryLatestRtpEvenWhenChannelNeverOpens() async throws {
+        for ending in [false, true] {
+            let requestSeen = expectation(description: "HTTP carries private-safe last RTP sample")
+            let stats = try XCTUnwrap(CallRtpStats.packet(reports: [], sequence: 1, elapsedMs: 1))
+            let direct = FakeDirectTransport()
+            direct.latestRtpStats = stats
+            let client = try makeDirectClient(onFallbackBody: { body in
+                if !ending {
+                    XCTAssertEqual((body["clientRtpStats"] as? [String: Any])?["seq"] as? Int, 1)
+                    requestSeen.fulfill()
+                }
+            }, onEndBody: { body in
+                if ending {
+                    XCTAssertEqual((body["clientRtpStats"] as? [String: Any])?["seq"] as? Int, 1)
+                    requestSeen.fulfill()
+                }
+            })
+            let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+                audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+                directTransportFactory: { direct })
+            _ = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true, onConnected: {})
+            if ending { _ = media.requestHangup() }
+            else { await direct.eventHandler?(.data(Data(#"{"type":"media_failed"}"#.utf8), topic: CallPilotTopic.status)) }
+            await fulfillment(of: [requestSeen], timeout: 1)
+            XCTAssertGreaterThan(direct.statsFinished, 0)
+            await media.stop()
+        }
+    }
+
+    func testOversizedOrMalformedDiagnosticsCannotBlockControlEnd() async throws {
+        var requests = 0
+        MediaMockURLProtocol.requestHandler = { request in
+            requests += 1
+            let body = try Self.directRequestFields(request)
+            XCTAssertEqual(body["claimId"] as? String, "claim_abcdefghijkl")
+            XCTAssertNil(body["clientRtpStats"])
+            XCTAssertLessThanOrEqual(try JSONSerialization.data(withJSONObject: body).count, 4096)
+            return Self.httpResponse(for: request, statusCode: 202, json: #"{"accepted":true}"#)
+        }
+        let client = try makeClient()
+        try await client.endInboundClaim(offerId: "offer_abcdefghijkl", claimId: "claim_abcdefghijkl",
+            clientTiming: [Data(repeating: 65, count: 5000), Data("not json".utf8), Data(#"{"type":"wrong"}"#.utf8)],
+            clientRtpStats: Data(repeating: 65, count: 513))
+        XCTAssertEqual(requests, 1)
+    }
+
     func testV2ChannelOpenSendsTimingBeforeConnectReturns() async throws {
         let direct = FakeDirectTransport(), gate = ManualGate()
         direct.connectGate = gate
@@ -543,7 +634,8 @@ final class CallMediaSessionTests: XCTestCase {
     private func makeDirectClient(includeAnswer: Bool = true, iceUnavailable: Bool = false, rejectClaim: Bool = false,
                                   onFallback: (() -> Void)? = nil, onClaim: ((Bool) -> Void)? = nil,
                                   onSupplement: (() -> Void)? = nil, onEnd: (() -> Void)? = nil,
-                                  onFallbackBody: (([String: Any]) throws -> Void)? = nil) throws -> HostedCloudClient {
+                                  onFallbackBody: (([String: Any]) throws -> Void)? = nil,
+                                  onEndBody: (([String: Any]) throws -> Void)? = nil) throws -> HostedCloudClient {
         var claims = 0
         var supplements = 0
         MediaMockURLProtocol.requestHandler = { request in
@@ -564,6 +656,7 @@ final class CallMediaSessionTests: XCTestCase {
             }
             let body = try Self.directRequestFields(request)
             if path.hasSuffix("/media/end") {
+                try onEndBody?(body)
                 XCTAssertEqual(body["claimId"] as? String, "claim_abcdefghijkl")
                 onEnd?()
                 return Self.httpResponse(for: request, statusCode: 202,

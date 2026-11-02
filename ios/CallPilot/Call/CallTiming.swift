@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import OSLog
 
 enum CallTimingMark: String, CaseIterable, Sendable {
@@ -134,16 +135,157 @@ final class CallTiming {
 
     // A successful data-channel send is not a receipt. Repack the complete
     // bounded milestone set with fresh sequence numbers for the HTTP fallback.
-    func httpBatches() -> [Data] {
+    func httpBatches(reservingBytes: Int = 0) -> [Data] {
         sent.removeAll()
         sentCloudDurations.removeAll()
         var result: [Data] = []
         var bytes = 128 // claimId, envelope, and array separators
         while result.count < 8, let packet = nextBatch(isHTTPReplay: true) {
-            guard bytes + packet.count + 1 <= 4096 else { break }
+            guard bytes + packet.count + 1 <= 4096 - max(0, reservingBytes) else { break }
             result.append(packet)
             bytes += packet.count + 1
         }
         return result
+    }
+}
+
+// The SDK report is consumed locally. Only this explicit allowlist reaches the
+// wire; candidate identifiers, addresses, SSRC and raw SDP never leave it.
+struct CallRtpReport {
+    let id: String
+    let type: String
+    let values: [String: Any]
+}
+
+enum CallRtpStats {
+    static let maxBytes = 512
+    private static let maxInteger = 9_007_199_254_740_991.0
+
+    static func packet(reports: [CallRtpReport], sequence: Int, elapsedMs: Int) -> Data? {
+        guard (1...10).contains(sequence), (0...60_000).contains(elapsedMs) else { return nil }
+        let audio = reports.filter { ($0.values["kind"] as? String ?? $0.values["mediaType"] as? String) == "audio" }
+        let outbound = audio.filter { $0.type == "outbound-rtp" }
+        let inbound = audio.filter { $0.type == "inbound-rtp" }
+        let remote = audio.filter { $0.type == "remote-inbound-rtp" }
+        let pairID = reports.first(where: { $0.type == "transport" && $0.values["selectedCandidatePairId"] is String })?.values["selectedCandidatePairId"] as? String
+        let pair = reports.first(where: { $0.type == "candidate-pair" && $0.id == pairID }) ?? reports.first(where: {
+            $0.type == "candidate-pair" && (($0.values["selected"] as? Bool == true) ||
+                ($0.values["nominated"] as? Bool == true && $0.values["state"] as? String == "succeeded"))
+        })
+        let localID = pair?.values["localCandidateId"] as? String
+        let remoteID = pair?.values["remoteCandidateId"] as? String
+        let candidates = Set(["host", "srflx", "prflx", "relay"])
+        let states = Set(["frozen", "waiting", "in-progress", "failed", "succeeded"])
+        let rtt = remote.compactMap { finiteNumber($0.values["roundTripTime"], minimum: 0) }.first
+        let fields: [String: Any] = [
+            "type": "client_rtp_stats", "v": 1, "seq": sequence, "elapsedMs": elapsedMs,
+            "outPackets": sum(outbound, "packetsSent") ?? NSNull(),
+            "outBytes": sum(outbound, "bytesSent") ?? NSNull(),
+            "inPackets": sum(inbound, "packetsReceived") ?? NSNull(),
+            "inBytes": sum(inbound, "bytesReceived") ?? NSNull(),
+            "lost": sum(inbound, "packetsLost", signed: true) ?? NSNull(),
+            "rttMs": rtt.flatMap { $0 * 1000 <= Double.greatestFiniteMagnitude ? $0 * 1000 : nil } as Any? ?? NSNull(),
+            "localCandidate": allowed(reports.first(where: { $0.id == localID })?.values["candidateType"], in: candidates) ?? NSNull(),
+            "remoteCandidate": allowed(reports.first(where: { $0.id == remoteID })?.values["candidateType"], in: candidates) ?? NSNull(),
+            "pairState": allowed(pair?.values["state"], in: states) ?? NSNull(),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
+              data.count <= maxBytes else { return nil }
+        return data
+    }
+
+    static func validatedObject(_ data: Data?) -> [String: Any]? {
+        guard let data, data.count <= maxBytes,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == ["type", "v", "seq", "elapsedMs", "outPackets", "outBytes", "inPackets", "inBytes", "lost", "rttMs", "localCandidate", "remoteCandidate", "pairState"],
+              object["type"] as? String == "client_rtp_stats",
+              finiteNumber(object["v"], minimum: 1) == 1,
+              let sequence = finiteNumber(object["seq"], minimum: 1), sequence <= 10, sequence.rounded(.towardZero) == sequence,
+              let elapsed = finiteNumber(object["elapsedMs"], minimum: 0), elapsed <= 60_000, elapsed.rounded(.towardZero) == elapsed else { return nil }
+        for name in ["outPackets", "outBytes", "inPackets", "inBytes", "lost"] {
+            if object[name] is NSNull { continue }
+            guard let value = finiteNumber(object[name], minimum: name == "lost" ? -maxInteger : 0),
+                  value <= maxInteger, value.rounded(.towardZero) == value else { return nil }
+        }
+        if !(object["rttMs"] is NSNull), finiteNumber(object["rttMs"], minimum: 0) == nil { return nil }
+        for name in ["localCandidate", "remoteCandidate"] {
+            if !(object[name] is NSNull), allowed(object[name], in: ["host", "srflx", "prflx", "relay"]) == nil { return nil }
+        }
+        if !(object["pairState"] is NSNull), allowed(object["pairState"], in: ["frozen", "waiting", "in-progress", "failed", "succeeded"]) == nil { return nil }
+        return object
+    }
+
+    private static func finiteNumber(_ value: Any?, minimum: Double) -> Double? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let value = number.doubleValue
+        return value.isFinite && value >= minimum ? value : nil
+    }
+
+    private static func sum(_ reports: [CallRtpReport], _ key: String, signed: Bool = false) -> Any? {
+        guard !reports.isEmpty else { return nil }
+        var total = 0.0
+        for report in reports {
+            guard let value = finiteNumber(report.values[key], minimum: signed ? -maxInteger : 0),
+                  abs(value) <= maxInteger, value.rounded(.towardZero) == value else { return nil }
+            total += value
+            guard abs(total) <= maxInteger else { return nil }
+        }
+        return Int64(total)
+    }
+
+    private static func allowed(_ value: Any?, in choices: Set<String>) -> Any? {
+        guard let value = value as? String, choices.contains(value) else { return nil }
+        return value
+    }
+}
+
+@MainActor
+final class CallRtpSampler {
+    static let interval: Duration = .seconds(2)
+    private let now: () -> TimeInterval
+    private let sleep: (Duration) async throws -> Void
+    private let request: (Int, Int) -> Void
+    private var task: Task<Void, Never>?
+    private var origin: TimeInterval?
+    private var sequence = 0
+    private var finished = false
+
+    init(now: @escaping () -> TimeInterval = CallMonotonic.now,
+         sleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+         request: @escaping (Int, Int) -> Void) {
+        self.now = now
+        self.sleep = sleep
+        self.request = request
+    }
+
+    func start() {
+        guard origin == nil, !finished else { return }
+        origin = now()
+        sample()
+        task = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled, !finished, sequence < 10 {
+                do { try await sleep(Self.interval) } catch { return }
+                guard !Task.isCancelled, !finished else { return }
+                sample()
+            }
+        }
+    }
+
+    func finish() {
+        guard !finished else { return }
+        finished = true
+        task?.cancel()
+        task = nil
+        // A commit callback can win the main-actor race against the connected
+        // continuation. It still needs a terminal observation, never a timer.
+        if origin == nil { origin = now() }
+        sample()
+    }
+
+    private func sample() {
+        guard let origin, sequence < 10 else { return }
+        sequence += 1
+        request(sequence, Int(min(60_000, max(0, (now() - origin) * 1000))))
     }
 }
