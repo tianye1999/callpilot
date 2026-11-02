@@ -1,6 +1,6 @@
 import { generateKeyPairSync } from "node:crypto";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildVoipPayload,
@@ -12,6 +12,8 @@ import {
 } from "../src/voip-push";
 import type { Env } from "../src/types";
 import { buildAlertPayload, dispatchAlertPushes } from "../src/alert-push";
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("VoIP push security boundary", () => {
   it.each(["sandbox", "production"] as const)("sends alerts using the %s host and base topic", async (environment) => {
@@ -185,6 +187,99 @@ describe("VoIP push security boundary", () => {
     }, async () => Response.json({ reason: "BadDeviceToken" }, { status: 400 }));
 
     expect(deleted).toEqual(["device_abcdefghijkl"]);
+  });
+
+  it.each(["accepted", "rejected", "invalid", "thrown"] as const)(
+    "logs the %s VoIP result without exposing the device token", async (outcome) => {
+      const token = "9a".repeat(32);
+      const key = crypto.getRandomValues(new Uint8Array(32));
+      const encrypted = await encryptPushToken(token, key);
+      const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+      const deleted: string[] = [];
+      const env = pushEnv({ key, privateKeyPEM: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+        deleted, rows: [{ device_id: "device_abcdefghijkl",
+          token_ciphertext: encrypted.ciphertext, token_nonce: encrypted.nonce, environment: "production" }] });
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      await dispatchInboundOfferPushes(env, {
+        edgeId: "edge_abcdefghijkl",
+        offerId: "offer_abcdefghijkl",
+        callUUID: "12345678-1234-4abc-8def-1234567890ab",
+        expiresAtUnixMs: 1_800_000_000_000
+      }, async (url) => {
+        if (outcome === "thrown") throw new TypeError(`fetch failed: ${String(url)}`);
+        if (outcome === "accepted") return new Response(null, { status: 200 });
+        return Response.json(
+          { reason: outcome === "invalid" ? "BadDeviceToken" : "DeviceTokenNotForTopic" },
+          { status: 400 }
+        );
+      });
+
+      if (outcome === "accepted") expect(log).toHaveBeenCalledWith("VoIP push accepted", "production");
+      if (outcome === "rejected") expect(warn).toHaveBeenCalledWith("VoIP push rejected", 400, "DeviceTokenNotForTopic");
+      if (outcome === "invalid") expect(warn).toHaveBeenCalledWith("VoIP push rejected", 400, "BadDeviceToken");
+      if (outcome === "thrown") expect(warn).toHaveBeenCalledWith("VoIP push failed", "TypeError");
+      expect(deleted).toEqual(outcome === "invalid" ? ["device_abcdefghijkl"] : []);
+      expect(JSON.stringify([...log.mock.calls, ...warn.mock.calls])).not.toContain(token);
+    }
+  );
+
+  it("logs a failed VoIP target without waiting for a hung sibling", async () => {
+    const key = crypto.getRandomValues(new Uint8Array(32));
+    const failing = await encryptPushToken("aa".repeat(32), key);
+    const hanging = await encryptPushToken("bb".repeat(32), key);
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const env = pushEnv({ key, privateKeyPEM: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      deleted: [], rows: [
+        { device_id: "device_failingabcde", token_ciphertext: failing.ciphertext,
+          token_nonce: failing.nonce, environment: "production" },
+        { device_id: "device_hangingabcde", token_ciphertext: hanging.ciphertext,
+          token_nonce: hanging.nonce, environment: "production" }
+      ] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let release: (response: Response) => void = () => {};
+    const hung = new Promise<Response>((resolve) => { release = resolve; });
+
+    const dispatched = dispatchInboundOfferPushes(env, {
+      edgeId: "edge_abcdefghijkl",
+      offerId: "offer_abcdefghijkl",
+      callUUID: "12345678-1234-4abc-8def-1234567890ab",
+      expiresAtUnixMs: 1_800_000_000_000
+    }, async (url) => {
+      if (String(url).includes("aa".repeat(32))) throw new TypeError("fetch failed");
+      return hung;
+    });
+
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith("VoIP push failed", "TypeError"));
+    release(new Response(null, { status: 200 }));
+    await dispatched;
+  });
+
+  it("logs when VoIP push is disabled without calling APNs", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const env = { ...pushEnv({ key: crypto.getRandomValues(new Uint8Array(32)), privateKeyPEM: "unused",
+      deleted: [], rows: [] }), VOIP_PUSH_ENABLED: "false" } as Env;
+    await dispatchInboundOfferPushes(env, {
+      edgeId: "edge_abcdefghijkl",
+      offerId: "offer_abcdefghijkl",
+      callUUID: "12345678-1234-4abc-8def-1234567890ab",
+      expiresAtUnixMs: 1_800_000_000_000
+    }, async () => { throw new Error("APNs must not be called"); });
+    expect(log).toHaveBeenCalledWith("VoIP push skipped: disabled");
+  });
+
+  it("logs when no device has a VoIP token", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const env = pushEnv({ key: crypto.getRandomValues(new Uint8Array(32)), privateKeyPEM: "unused",
+      deleted: [], rows: [] });
+    await dispatchInboundOfferPushes(env, {
+      edgeId: "edge_abcdefghijkl",
+      offerId: "offer_abcdefghijkl",
+      callUUID: "12345678-1234-4abc-8def-1234567890ab",
+      expiresAtUnixMs: 1_800_000_000_000
+    }, async () => { throw new Error("APNs must not be called"); });
+    expect(log).toHaveBeenCalledWith("VoIP push skipped: no registered devices");
   });
 });
 

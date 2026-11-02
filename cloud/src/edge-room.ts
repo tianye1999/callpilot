@@ -13,7 +13,7 @@ import {
 import { edgeMessageSchema } from "./schemas";
 import { HttpError } from "./http";
 import type { EdgePresence, Env } from "./types";
-import { dispatchInboundOfferPushes } from "./voip-push";
+import { dispatchInboundOfferPushes, errorName } from "./voip-push";
 
 interface SocketAttachment {
   edgeId: string;
@@ -255,7 +255,7 @@ export class EdgeRoom extends DurableObject<Env> {
           offerId: result.data.offerId,
           callUUID,
           expiresAtUnixMs: result.data.expiresAtUnixMs
-        }).catch(() => undefined));
+        }).catch((error: unknown) => { console.warn("VoIP push dispatch failed", errorName(error)); }));
       }
       return;
     }

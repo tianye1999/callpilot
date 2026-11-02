@@ -107,7 +107,10 @@ export async function dispatchInboundOfferPushes(
   input: InboundPushInput,
   fetcher: Fetcher = fetch
 ): Promise<void> {
-  if (!voipPushEnabled(env.VOIP_PUSH_ENABLED)) return;
+  if (!voipPushEnabled(env.VOIP_PUSH_ENABLED)) {
+    console.log("VoIP push skipped: disabled");
+    return;
+  }
   await dispatchApnsPushes(env, {
     edgeId: input.edgeId,
     pushType: "voip",
@@ -131,7 +134,10 @@ export async function dispatchApnsPushes(
   const targets = await env.DB.prepare(
     `SELECT push.device_id, push.token_ciphertext, push.token_nonce, push.environment FROM ${table} AS push JOIN devices ON devices.device_id = push.device_id WHERE devices.edge_id = ?1 AND devices.revoked_at IS NULL`
   ).bind(input.edgeId).all<PushTarget>();
-  if (!targets.results?.length) return;
+  if (!targets.results?.length) {
+    if (input.pushType === "voip") console.log("VoIP push skipped: no registered devices");
+    return;
+  }
 
   const authorization = await createApnsProviderToken({
     keyId: config.keyId,
@@ -159,8 +165,13 @@ export async function dispatchApnsPushes(
       },
       body: JSON.stringify(input.payload)
     });
-    if (response.ok) return;
+    if (response.ok) {
+      if (input.pushType === "voip") console.log("VoIP push accepted", target.environment);
+      return;
+    }
     const reason = await apnsReason(response);
+    // Status and APNs reason only; the token is part of the request URL.
+    if (input.pushType === "voip") console.warn("VoIP push rejected", response.status, reason ?? "unknown");
     if (response.status === 410 || (response.status === 400 && reason === "BadDeviceToken")) {
       if (input.pushType === "alert") {
         await env.DB.prepare(`DELETE FROM ${table} WHERE device_id = ?1 AND token_ciphertext = ?2`)
@@ -172,7 +183,11 @@ export async function dispatchApnsPushes(
     } else if (input.pushType === "alert") {
       console.warn("Alert push rejected", response.status);
     }
-  }));
+  }).map((pending) => pending.catch((error: unknown) => {
+    // Log as each target fails; a hung sibling must not hide this result.
+    if (input.pushType === "voip") console.warn("VoIP push failed", errorName(error));
+    throw error;
+  })));
   if (input.pushType === "alert" && outcomes.some((outcome) => outcome.status === "rejected")) {
     console.warn("Alert push delivery failed");
   }
@@ -232,6 +247,11 @@ function decodeBase64URL(value: string): Uint8Array {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("Invalid base64url value");
   const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
   return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+}
+
+// Error messages may echo the APNs URL, which contains the device token.
+export function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : "unknown";
 }
 
 async function apnsReason(response: Response): Promise<string | undefined> {

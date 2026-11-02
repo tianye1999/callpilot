@@ -309,3 +309,22 @@ describe("EdgeRoom content rate limits", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 });
+
+describe("EdgeRoom VoIP push diagnostics", () => {
+  it("logs a dispatch failure before sending and still accepts the offer", async () => {
+    const socket = edgeSocket();
+    const { room, state, run } = edgeRoom([socket], { VOIP_PUSH_ENABLED: "true" });
+    run.mockResolvedValue({ meta: { changes: 1 } });
+    const background: Promise<unknown>[] = [];
+    Object.assign(state, { waitUntil: vi.fn((promise: Promise<unknown>) => { background.push(promise); }) });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // No APNs credentials: dispatch throws before any request is sent.
+    await room.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({
+      v: 1, type: "inbound.offer", offerId: "offer_abcdefghijkl", callId: "call_abcdefghijkl",
+      generation: 0, nonce: "n".repeat(16), expiresAtUnixMs: Date.now() + 15_000
+    }));
+    expect(background).toHaveLength(1);
+    await expect(Promise.all(background)).resolves.toBeDefined();
+    expect(warn).toHaveBeenCalledWith("VoIP push dispatch failed", "Error");
+  });
+});
