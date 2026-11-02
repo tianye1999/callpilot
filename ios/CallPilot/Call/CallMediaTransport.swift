@@ -6,6 +6,38 @@ enum CallMediaTransportEvent: Equatable, Sendable {
     case timing(CallTimingMark, at: TimeInterval)
     case permissionsReady(Bool)
     case tracksChanged
+    case audioEngine(CallAudioEngineSnapshot, failed: Bool)
+}
+
+struct CallAudioEngineSnapshot: Codable, Equatable, Sendable {
+    let running: Bool
+    let recording: Bool
+    let playing: Bool
+    let inputEnabled: Bool
+    let inputRunning: Bool
+    let outputEnabled: Bool
+    let outputRunning: Bool
+    let inputMuted: Bool
+    let muteMode: Int
+
+    // platformDefault uses a VoIP AudioUnit, not AVAudioEngine. Its valid
+    // readiness evidence is recording/playing; engineState is diagnostic only.
+    var platformAudioReady: Bool { recording && playing }
+}
+
+@MainActor
+enum CallDirectAudioStartup {
+    static let maximum: Duration = .milliseconds(200)
+
+    static func verify(snapshot: () -> CallAudioEngineSnapshot,
+                       repair: () -> Bool,
+                       wait: (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) async throws -> CallAudioEngineSnapshot {
+        if snapshot().platformAudioReady { return snapshot() }
+        guard repair() else { throw CallAudioError.answerExpired }
+        if !snapshot().platformAudioReady { try await wait(maximum) }
+        try Task.checkCancellation()
+        return snapshot()
+    }
 }
 
 @MainActor

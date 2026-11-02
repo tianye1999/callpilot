@@ -10,6 +10,8 @@ private final class FakeDirectTransport: CallDirectMediaTransport {
     var microphones = 0
     var audioStopped = false
     var failure = false
+    var audioFailure = false
+    var packets: [Data] = []
     var prepareGate: ManualGate?
     var connectGate: ManualGate?
     var disconnectGate: ManualGate?
@@ -25,14 +27,106 @@ private final class FakeDirectTransport: CallDirectMediaTransport {
     func activateDirectAudio() throws { activations += 1 }
     func stopDirectAudio() { audioStopped = true }
     func connect(url: String, token: String, enableMicrophone: Bool) async throws { XCTFail("not LiveKit") }
-    func setMicrophone(enabled: Bool) async throws { if enabled { microphones += 1 } }
-    func publishControl(_ data: Data) async throws {}
+    func setMicrophone(enabled: Bool) async throws {
+        if enabled {
+            microphones += 1
+            if audioFailure {
+                await eventHandler?(.audioEngine(Self.snapshot(ready: false), failed: true))
+                throw CallAudioError.answerExpired
+            }
+        }
+    }
+    static func snapshot(ready: Bool) -> CallAudioEngineSnapshot {
+        CallAudioEngineSnapshot(running: false, recording: ready, playing: ready,
+            inputEnabled: false, inputRunning: false, outputEnabled: false,
+            outputRunning: false, inputMuted: false, muteMode: -1)
+    }
+    func publishControl(_ data: Data) async throws { packets.append(data) }
     func disconnect() async { await disconnectGate?.wait() }
     func setSpeakerphone(_ enabled: Bool) {}
 }
 
 @MainActor
 final class CallMediaSessionTests: XCTestCase {
+    func testV2ChannelOpenSendsTimingBeforeConnectReturns() async throws {
+        let direct = FakeDirectTransport(), gate = ManualGate()
+        direct.connectGate = gate
+        let client = try makeDirectClient()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct })
+        let answer = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onConnected: {}) }
+        await waitUntil { gate.didStart }
+        await direct.eventHandler?(.timing(.directControlReady, at: CallMonotonic.now()))
+        await waitUntil { !direct.packets.isEmpty }
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: direct.packets[0]) as? [String: Any])
+        let marks = try XCTUnwrap(payload["marks"] as? [String: Double])
+        XCTAssertNotNil(marks["claim_start"])
+        XCTAssertNotNil(marks["direct_control_ready"])
+        XCTAssertNil(marks["room_connected"])
+        gate.open()
+        _ = await answer.value
+        await media.stop()
+    }
+
+    func testV2EngineFailureAndMediaFailedImmediatelyFallbackWithTiming() async throws {
+        for engineFailure in [true, false] {
+            let fallback = expectation(description: "event-driven fallback")
+            let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+            direct.audioFailure = engineFailure
+            let client = try makeDirectClient(onFallback: { fallback.fulfill() }, onFallbackBody: { body in
+                let batches = try XCTUnwrap(body["clientTiming"] as? [[String: Any]])
+                XCTAssertFalse(batches.isEmpty)
+                var marks: [String: Double] = [:]
+                for batch in batches {
+                    for (name, value) in batch["marks"] as? [String: Double] ?? [:] { marks[name] = value }
+                }
+                XCTAssertNotNil(marks["claim_start"])
+                if engineFailure { XCTAssertNotNil(marks["audio_engine_failed"]) }
+            })
+            let media = CallMediaSession(onState: { _ in }, transportFactory: { livekit },
+                audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+                directTransportFactory: { direct })
+            _ = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+                usesCallKit: true, onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {})
+            if engineFailure { try media.activateCallKitAudio() }
+            else {
+                await direct.eventHandler?(.data(Data(#"{"type":"media_failed","reason":"no_phone_audio"}"#.utf8),
+                                                 topic: CallPilotTopic.status))
+            }
+            await fulfillment(of: [fallback], timeout: 1)
+            await waitUntil { livekit.connectedTokens == ["fallback-token"] }
+            XCTAssertTrue(direct.audioStopped)
+            await media.stop()
+        }
+    }
+
+    func testAudioUnitReadinessDoesNotRequireAVAudioEngine() {
+        XCTAssertTrue(FakeDirectTransport.snapshot(ready: true).platformAudioReady)
+        XCTAssertFalse(FakeDirectTransport.snapshot(ready: false).platformAudioReady)
+    }
+
+    func testAudioStartupBoundUsesReadbackAndDoesNotWaitWhenRepairFails() async throws {
+        var waits = 0, repairs = 0
+        let failed = try await CallDirectAudioStartup.verify(snapshot: { FakeDirectTransport.snapshot(ready: false) },
+            repair: { repairs += 1; return true }, wait: { duration in
+                XCTAssertEqual(duration, .milliseconds(200)); waits += 1
+            })
+        XCTAssertFalse(failed.platformAudioReady)
+        XCTAssertEqual(waits, 1)
+        XCTAssertEqual(repairs, 1)
+        do {
+            _ = try await CallDirectAudioStartup.verify(snapshot: { FakeDirectTransport.snapshot(ready: false) },
+                repair: { false }, wait: { _ in XCTFail("explicit start failure is immediate") })
+            XCTFail("explicit start failure must throw")
+        } catch {}
+        let ready = try await CallDirectAudioStartup.verify(snapshot: { FakeDirectTransport.snapshot(ready: true) },
+            repair: { XCTFail("working manual audio must not be restarted"); return false },
+            wait: { _ in XCTFail("working audio never waits") })
+        XCTAssertTrue(ready.platformAudioReady)
+    }
+
     func testV2ControlEndRetriesRelayFailureButNotOwnershipRejection() async throws {
         for (status, code, expectedRequests) in [(503, "MEDIA_RELAY_UNAVAILABLE", 2),
                                                 (409, "OFFER_UNAVAILABLE", 1),
@@ -448,7 +542,8 @@ final class CallMediaSessionTests: XCTestCase {
 
     private func makeDirectClient(includeAnswer: Bool = true, iceUnavailable: Bool = false, rejectClaim: Bool = false,
                                   onFallback: (() -> Void)? = nil, onClaim: ((Bool) -> Void)? = nil,
-                                  onSupplement: (() -> Void)? = nil, onEnd: (() -> Void)? = nil) throws -> HostedCloudClient {
+                                  onSupplement: (() -> Void)? = nil, onEnd: (() -> Void)? = nil,
+                                  onFallbackBody: (([String: Any]) throws -> Void)? = nil) throws -> HostedCloudClient {
         var claims = 0
         var supplements = 0
         MediaMockURLProtocol.requestHandler = { request in
@@ -462,6 +557,7 @@ final class CallMediaSessionTests: XCTestCase {
                     json: #"{"iceServers":[{"urls":["turn:relay.example:3478"],"username":"test","credential":"test"}],"expiresAt":9999}"#)
             }
             if path.hasSuffix("/media/livekit") {
+                try onFallbackBody?(Self.directRequestFields(request))
                 onFallback?()
                 return Self.httpResponse(for: request, statusCode: 202,
                     json: #"{"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl","url":"wss://lk.example.com","token":"fallback-token","expiresAt":9999}"#)

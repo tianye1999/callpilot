@@ -12,14 +12,53 @@ const inboundSessionSchema = z.object({
   sessionId: opaqueId, roomName: z.string().min(1).max(128), browserIdentity: opaqueId,
   edgeIdentity: opaqueId, livekitUrl: z.string().url(), token: z.string().min(1).max(4096)
 }).strict();
+
+// Match Edge's bounded client clock vocabulary. Never accept arbitrary labels
+// or native device descriptions in telemetry carried over authenticated HTTP.
+const clientTimingMarks = new Set([
+  "answer_action", "dial_start", "claim_start", "claim_response", "configure_start",
+  "configure_end", "fulfill", "did_activate", "activate_return", "connect_start",
+  "connect_return", "room_connected", "audio_activated", "mic_enable_start",
+  "mic_enable_return", "downlink_subscribed", "downlink_first_frame", "edge_connected",
+  "hangup_intent", "hangup_publish_start", "hangup_publish_end", "hangup_publish_error",
+  "hangup_retry_start", "hangup_retry_end", "hangup_retry_error", "hangup_ack", "disconnect",
+  "claim_dns_start", "claim_dns_end", "claim_connect_start", "claim_connect_end",
+  "claim_tls_start", "claim_tls_end", "claim_request_start", "claim_first_byte",
+  "claim_connection_reused", "prewarm_start", "prewarm_end",
+  "push_received", "prepare_start", "prepare_response", "preconnect_start", "preconnect_ready",
+  "permission_ready", "transport_adopted", "cold_fallback", "claim_response_end",
+  "audio_lease_start", "audio_lease_end", "sdp_submit_start", "sdp_submit_response",
+  "cloud_cas_ms", "cloud_turn_ms", "cloud_sdp_relay_ms", "cloud_claim_finalize_ms", "cloud_total_ms",
+  "cloud_edge_reserve_ms", "audio_engine_running", "audio_engine_failed", "direct_control_ready"
+]);
+const audioEngineSchema = z.object({
+  running: z.boolean(), recording: z.boolean(), playing: z.boolean(),
+  inputEnabled: z.boolean(), inputRunning: z.boolean(), outputEnabled: z.boolean(), outputRunning: z.boolean(),
+  inputMuted: z.boolean(), muteMode: z.number().int().min(-1).max(2)
+}).strict();
+export const clientTimingSchema = z.object({
+  type: z.literal("client_timing"), v: z.literal(1),
+  attempt: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i),
+  seq: z.number().int().min(1).max(64),
+  marks: z.record(z.string(), z.number().min(-60_000).max(86_400_000)).refine(marks => {
+    const names = Object.keys(marks);
+    return names.length >= 1 && names.length <= 16 && names.every(name => clientTimingMarks.has(name));
+  }),
+  audioEngine: audioEngineSchema.optional()
+}).strict().refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 2048);
+const clientTimingBatchesSchema = z.array(clientTimingSchema).max(8)
+  .refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 4096);
+
 export const inboundMediaCommandSchema = z.object({
   v: z.literal(1), type: z.enum(["inbound.claim", "inbound.media.sdp", "inbound.media.livekit", "inbound.media.end"]),
   commandId: opaqueId, offerId: opaqueId, callId: opaqueId, claimId: opaqueId,
   generation: z.number().int().nonnegative(), nonce: z.string().min(16).max(128), session: inboundSessionSchema,
   direct: z.union([z.object({ deferred: z.literal(true) }).strict(),
-    z.object({ sdpOffer: sdp, iceServers: z.array(iceServerSchema).max(16) }).strict()]).optional()
+    z.object({ sdpOffer: sdp, iceServers: z.array(iceServerSchema).max(16) }).strict()]).optional(),
+  clientTiming: clientTimingBatchesSchema.optional()
 }).strict().refine(value => value.type === "inbound.claim" ? value.direct !== undefined && "deferred" in value.direct
-  : value.type === "inbound.media.sdp" ? value.direct !== undefined && "sdpOffer" in value.direct : value.direct === undefined);
+  : value.type === "inbound.media.sdp" ? value.direct !== undefined && "sdpOffer" in value.direct : value.direct === undefined)
+  .refine(value => value.clientTiming === undefined || ["inbound.media.livekit", "inbound.media.end"].includes(value.type));
 export const inboundAnswerSchema = z.object({
   v: z.literal(1), type: z.literal("inbound.answer"), commandId: opaqueId,
   offerId: opaqueId, callId: opaqueId, claimId: opaqueId,
@@ -123,7 +162,7 @@ export const claimInboundOfferSchema = z.object({
   sdpOffer: sdp.optional()
 }).strict();
 
-export const inboundFallbackSchema = z.object({ claimId: opaqueId }).strict();
+export const inboundFallbackSchema = z.object({ claimId: opaqueId, clientTiming: clientTimingBatchesSchema.optional() }).strict();
 export const inboundSdpSchema = z.object({ claimId: opaqueId, sdpOffer: sdp }).strict();
 
 export const prepareInboundOfferSchema = z.object({ offerId: opaqueId }).strict();

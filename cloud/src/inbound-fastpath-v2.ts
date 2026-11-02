@@ -195,7 +195,7 @@ export async function endInboundMedia(request: Request, env: Env, offerId: strin
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
   if (env.INBOUND_FASTPATH_V2_ENABLED !== "true") throw new HttpError("FEATURE_DISABLED", "Direct media is disabled", 403);
   const device = await authenticateDevice(request, env);
-  const input = inboundFallbackSchema.parse(await readJson(request));
+  const input = inboundFallbackSchema.parse(await readJson(request, 4096));
   const offer = await env.DB.prepare(`SELECT * FROM inbound_offers WHERE offer_id = ?1 AND claim_id = ?2
     AND claimed_device_id = ?3 AND edge_id = ?4 AND status IN ('claimed', 'edge_ready', 'revoked')
     AND media_transport IN ('direct_pending', 'direct', 'livekit_pending', 'livekit')`)
@@ -203,7 +203,8 @@ export async function endInboundMedia(request: Request, env: Env, offerId: strin
   if (!offer) throw unavailable();
   if (offer.status !== "revoked") {
     const token = await issueParticipantToken(env, offer.room_name!, offer.edge_identity!);
-    const accepted = await relayAnswer(env, offer, mediaCommand(offer, env, token, "inbound.media.end"));
+    const accepted = await relayAnswer(env, offer, { ...mediaCommand(offer, env, token, "inbound.media.end"),
+      ...(input.clientTiming === undefined ? {} : { clientTiming: input.clientTiming }) });
     if (!accepted) throw new HttpError("MEDIA_RELAY_UNAVAILABLE", "Media end response is unavailable", 503);
   }
   // Edge can independently publish revoke before its end answer reaches us.
@@ -220,7 +221,7 @@ export async function fallbackInboundLivekit(request: Request, env: Env, offerId
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
   if (env.INBOUND_FASTPATH_V2_ENABLED !== "true") throw new HttpError("FEATURE_DISABLED", "Direct media is disabled", 403);
   const device = await authenticateDevice(request, env);
-  const input = inboundFallbackSchema.parse(await readJson(request));
+  const input = inboundFallbackSchema.parse(await readJson(request, 4096));
   const offer = await env.DB.prepare(`SELECT * FROM inbound_offers WHERE offer_id = ?1 AND claim_id = ?2
     AND claimed_device_id = ?3 AND edge_id = ?4 AND status IN ('claimed', 'edge_ready') AND media_transport IS NOT NULL`)
     .bind(offerId, input.claimId, device.device_id, device.edge_id).first<InboundOfferRecord>();
@@ -234,7 +235,8 @@ export async function fallbackInboundLivekit(request: Request, env: Env, offerId
       WHERE offer_id = ?1 AND claim_id = ?2 AND status IN ('claimed', 'edge_ready')
         AND media_transport IN ('direct', 'direct_pending', 'livekit_pending') RETURNING offer_id`).bind(offerId, input.claimId).first();
     if (!reserved) throw unavailable();
-    const command = mediaCommand(offer, env, edgeToken, "inbound.media.livekit");
+    const command = { ...mediaCommand(offer, env, edgeToken, "inbound.media.livekit"),
+      ...(input.clientTiming === undefined ? {} : { clientTiming: input.clientTiming }) };
     // A lost DO response leaves this same claim pending. Repeating the command
     // must be idempotent at Edge; never give another phone a fresh claim.
     const response = await edgeRoom(env, offer.edge_id).fetch("https://edge-room/inbound-media-relay", {

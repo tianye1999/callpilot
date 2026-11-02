@@ -162,6 +162,8 @@ class WebRtcRemoteMediaEndpoint:
         self._close_task: asyncio.Task[None] | None = None
         self._connected = False
         self._received_audio = False
+        self._first_audio_received = False
+        self.direct_connected_at: float | None = None
         self._closed = False
         self._started = False
         self._answer: dict[str, str] | None = None
@@ -181,6 +183,10 @@ class WebRtcRemoteMediaEndpoint:
     @property
     def browser_connected(self) -> bool:
         return not self._closed and self._connected
+
+    @property
+    def phone_audio_received(self) -> bool:
+        return self._first_audio_received
 
     def set_timing(self, timing: CallTiming) -> None:
         self._timing = timing
@@ -216,6 +222,8 @@ class WebRtcRemoteMediaEndpoint:
                 return
             self._connected = pc.connectionState == "connected"
             if self._connected:
+                if self.direct_connected_at is None:
+                    self.direct_connected_at = time.monotonic()
                 self._timing.mark("direct_connected")
                 self._timing.mark("phone_joined")
             self._mark_ready()
@@ -298,6 +306,7 @@ class WebRtcRemoteMediaEndpoint:
                     if len(pcm) != _FRAME_BYTES:
                         continue
                     self._received_audio = True
+                    self._first_audio_received = True
                     self._timing.mark("phone_first_frame")
                     self._timing.mark("direct_audio_ready")
                     self._browser_in_stats.add(pcm)

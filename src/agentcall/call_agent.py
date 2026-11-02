@@ -258,6 +258,7 @@ class CallSession:
         self._phone_first_answered = False
         self._phone_first_answer_event = False
         self._phone_first_early_answer = False
+        self._phone_first_provisional_ai = False
         self._phone_first_pcm_enable_info: dict | None = None
         self._phone_first_closers: list[asyncio.Task[None]] = []
         self._inbound_direct_request: InboundDirectRequest | None = None
@@ -503,6 +504,7 @@ class CallSession:
         self._phone_first_claimed_at = None
         self._phone_first_offer_id = None
         self._phone_first_closers = []
+        self._phone_first_provisional_ai = False
         self._inbound_direct_request = None
         self._inbound_direct_ice = None
         self._pcm_pre_ata_probe_lease = None
@@ -713,7 +715,11 @@ class CallSession:
         status = "completed"
         try:
             if self._phone_first_lease is not None:
-                outcome = await self._handle_phone_first(record)
+                outcome = await self._handle_phone_first(record, transcripts)
+                if outcome == "ai_completed":
+                    phone_first_only = False
+                    status = "completed"
+                    return
                 if outcome != "ai":
                     status = outcome
                     return
@@ -2092,10 +2098,11 @@ class CallSession:
             self._takeover_resume_pending = False
             self._takeover_ai_fallback_notified = True
 
-    async def _handle_phone_first(self, record: CallRecord | None) -> str:
+    async def _handle_phone_first(self, record: CallRecord | None,
+                                 transcripts: list[tuple[str, str]] | None = None) -> str:
         preconnect = InboundPreconnect()
         try:
-            return await self._handle_phone_first_preconnect(record, preconnect)
+            return await self._handle_phone_first_preconnect(record, preconnect, transcripts)
         finally:
             await preconnect.close()
             if not preconnect.reported:
@@ -2110,7 +2117,8 @@ class CallSession:
                 self._takeover_prepare = None
                 self._inbound_direct_ice = None
 
-    async def _handle_phone_first_preconnect(self, record: CallRecord | None, preconnect: InboundPreconnect) -> str:
+    async def _handle_phone_first_preconnect(self, record: CallRecord | None, preconnect: InboundPreconnect,
+                                           transcripts: list[tuple[str, str]] | None = None) -> str:
         fastpath_v2 = config.get_bool("INBOUND_FASTPATH_V2_ENABLED")
         lease = self._phone_first_lease
         coordinator = self._takeover_coordinator
@@ -2186,6 +2194,36 @@ class CallSession:
         connected_wait_logged = False
         media_ready_logged = False
         committed = False
+        provisional_agent: VoiceAgent | None = None
+        provisional_task: asyncio.Task[AudioBridge] | None = None
+        provisional_transcripts = transcripts if transcripts is not None else []
+
+        async def run_provisional_ai(agent: VoiceAgent, active_bridge: AudioBridge) -> AudioBridge:
+            self._configure_call_agent(agent, lambda: active_bridge, record, provisional_transcripts,
+                                       "inbound", self.current_caller, time.monotonic())
+            await agent.start(self._make_agent_audio_handler(agent, active_bridge, record))
+            timing.mark("provisional_ai_started")
+            await agent.say(self._opening_instructions("inbound"))
+            self._drain_agent_audio(active_bridge)
+            timing.mark("provisional_ai_opening")
+            return await self._run_agent_loop(agent, active_bridge, record, provisional_transcripts)
+
+        async def stop_provisional_ai() -> None:
+            nonlocal provisional_agent, provisional_task
+            # Fence callbacks before awaiting provider shutdown or mobile commit.
+            self._phone_first_provisional_ai = False
+            if provisional_task is not None:
+                provisional_task.cancel()
+                await asyncio.gather(provisional_task, return_exceptions=True)
+                provisional_task = None
+            if provisional_agent is not None:
+                await self._stop_agent_resources(provisional_agent, None)
+                if self._hangup_agent is provisional_agent:
+                    self._hangup_agent = None
+                provisional_agent = None
+            self._clear_outgoing_audio()
+            if bridge is not None and hasattr(bridge, "discard_pending_output"):
+                bridge.discard_pending_output()
 
         def waiting_current() -> bool:
             # PCM preparation holds the serial lock in its worker. Never wait for
@@ -2288,7 +2326,7 @@ class CallSession:
                     outcome = answering.result()
                     if outcome is not None:
                         return outcome
-                if early_answer and bridge is not None:
+                if early_answer and bridge is not None and provisional_task is None:
                     # Some bridges wait for the next frame and never return an
                     # empty chunk on a live stream. Drain backlog off-loop, but
                     # give connection/deadline checks a turn every 50 ms.
@@ -2296,6 +2334,46 @@ class CallSession:
                     while await self._threaded_modem_call(bridge.read_modem_chunk):
                         if self._phone_first_clock() >= drain_deadline:
                             break
+                if (fastpath_v2 and isinstance(endpoint, SwitchableInboundEndpoint)
+                        and endpoint.no_phone_audio_expired(self._phone_first_clock(),
+                                                            _EARLY_ANSWER_CONNECTED_WAIT_SECONDS)):
+                    if await endpoint.fail_no_phone_audio() and record is not None:
+                        record.log_event("takeover_rollback", reason="NO_PHONE_AUDIO", provisional=True,
+                                         generation=generation)
+                if (isinstance(endpoint, SwitchableInboundEndpoint) and endpoint.no_phone_audio
+                        and provisional_agent is None and bridge is not None):
+                    if not coordinator.begin_provisional_ai(claimed.fence).accepted:
+                        raise RuntimeError("provisional_ai_fence_rejected")
+                    self._phone_first_provisional_ai = True
+                    provisional_agent = self._local_prepared_agent or create_agent(self.provider)
+                    provisional_task = asyncio.create_task(run_provisional_ai(provisional_agent, bridge))
+                if provisional_task is not None and provisional_task.done():
+                    try:
+                        provisional_task.result()
+                    except Exception as exc:
+                        if record is not None:
+                            record.log_event("provisional_ai_failed", error_type=type(exc).__name__)
+                        self._set_active(False)
+                        return "failed"
+                    if self.is_active:
+                        self._set_active(False)
+                    return "ai_completed"
+                repair_failed = isinstance(endpoint, SwitchableInboundEndpoint) and endpoint.failed
+                if (self._phone_first_clock() >= deadline or repair_failed) and provisional_task is not None:
+                    # The same speaking agent becomes final owner; never restart
+                    # it or reopen PCM just because the repair lease expired.
+                    self._phone_first_fallback("NO_PHONE_AUDIO", generation)
+                    self._phone_first_provisional_ai = False
+                    assert endpoint is not None
+                    await self._close_phone_first_endpoint(endpoint)
+                    try:
+                        await provisional_task
+                    except Exception as exc:
+                        if record is not None:
+                            record.log_event("provisional_ai_failed", error_type=type(exc).__name__)
+                        self._set_active(False)
+                        return "failed"
+                    return "ai_completed"
                 if self._phone_first_clock() >= deadline or connected_silence_expired():
                     raise RuntimeError("media_prepare_timeout")
                 if connecting.done():
@@ -2305,6 +2383,8 @@ class CallSession:
                         raise RuntimeError("livekit_fallback_failed")
                     if fastpath_v2:
                         pending_control = await endpoint.next_command(timeout=0.001)
+                        if pending_control is not None and pending_control.get("type") == "client_timing":
+                            timing.receive_client(pending_control)
                         if pending_control is not None and pending_control.get("type") == "hangup":
                             await timing.acknowledge_hangup(pending_control, endpoint.send_event)
                             raise RuntimeError("owner_cancelled")
@@ -2312,6 +2392,8 @@ class CallSession:
                     if early_answer and endpoint.media_ready:
                         mark_media_ready()
                     if endpoint.media_ready and (answering is None or answering.done()):
+                        if provisional_agent is not None:
+                            await stop_provisional_ai()
                         if isinstance(endpoint, SwitchableInboundEndpoint) and not endpoint.seal():
                             continue
                         break
@@ -2386,6 +2468,8 @@ class CallSession:
             return "ai"
         finally:
             abandoned = True
+            if provisional_agent is not None:
+                await stop_provisional_ai()
             if answering is not None:
                 await asyncio.gather(answering, return_exceptions=True)
             log_connected_wait()
@@ -4486,6 +4570,9 @@ class CallSession:
             coordinator = self._takeover_coordinator
             if self._takeover_resuming:
                 return False
+            if (self._phone_first_provisional_ai and coordinator is not None
+                    and coordinator.state is TakeoverState.WAITING_OWNER):
+                return True
             hold_allowed = (
                 self._takeover_hold_generation == generation
                 and not self._takeover_hold_done
@@ -4989,6 +5076,9 @@ class CallSession:
                     or command["generation"] != request.generation or command["nonce"] != request.nonce
                     or command["claimId"] != direct.claim_id or request.generation != self._session_generation):
                 return False
+            if (self._phone_first_claim_deadline is None
+                    or self._phone_first_clock() >= self._phone_first_claim_deadline):
+                return False
             return direct.fallback(issued, reply)
 
     def prepare_inbound_direct(self, command: dict[str, Any]) -> bool:
@@ -5033,6 +5123,18 @@ class CallSession:
                     and command["generation"] == request.generation == self._session_generation
                     and command["nonce"] == request.nonce and command["claimId"] == direct.claim_id):
                 self._mobile_timing.mark(stage)
+
+    def receive_inbound_client_timing(self, command: dict[str, Any]) -> None:
+        with self._takeover_lock:
+            request, direct = self._takeover_request, self._inbound_direct_request
+            if (not config.get_bool("INBOUND_FASTPATH_V2_ENABLED") or request is None or direct is None
+                    or not self.is_active or self._mobile_timing is None
+                    or command["offerId"] != request.offer_id or command["callId"] != request.call_id
+                    or command["generation"] != request.generation or command["nonce"] != request.nonce
+                    or command["claimId"] != direct.claim_id or request.generation != self._session_generation):
+                return
+            for batch in command.get("clientTiming", []):
+                self._mobile_timing.receive_client(batch)
 
     def end_inbound_direct(self, command: dict[str, Any]) -> bool:
         with self._takeover_lock:
@@ -5938,6 +6040,9 @@ class CallAgentService:
 
     def mark_inbound_direct(self, command: dict[str, Any], stage: str) -> None:
         self.session.mark_inbound_direct(command, stage)
+
+    def receive_inbound_client_timing(self, command: dict[str, Any]) -> None:
+        self.session.receive_inbound_client_timing(command)
 
     def supply_inbound_direct_sdp(self, command: dict[str, Any], reply: Reply) -> bool:
         return self.session.supply_inbound_direct_sdp(command, reply)

@@ -29,6 +29,7 @@ final class CallMediaSession {
     private var directSetupFailure: Error?
     private var edgeCommitted = false
     private var directFallbackStarted = false
+    private var directControlOpen = false
     private var directFallbackHandler: (() -> Void)?
     // A resource lease, not a network-speed threshold or a warm/cold heuristic.
     static let directSetupMax: Duration = .seconds(20)
@@ -241,6 +242,7 @@ final class CallMediaSession {
     }
 
     private func detachDirect(_ connection: any CallDirectMediaTransport) {
+        directControlOpen = false
         connection.stopDirectAudio()
         connection.eventHandler = nil
         if transport === connection { transport = nil }
@@ -315,6 +317,7 @@ final class CallMediaSession {
                 }
             }
             try activateAudioIfReady()
+            if directFallbackStarted { return }
             if let answer = mediaSession.sdpAnswer, let direct = transport as? any CallDirectMediaTransport {
                 do {
                     timing.mark(.connectStart)
@@ -355,9 +358,11 @@ final class CallMediaSession {
         audioActivated = false
         // A successful CAS is never repeated. The fallback route keeps its fence.
         let fallback = session.directAttempted
-            ? try await client.fallbackInboundLiveKit(offerId: offerId, claimId: session.sessionId)
+            ? try await client.fallbackInboundLiveKit(offerId: offerId, claimId: session.sessionId,
+                                                     clientTiming: timing.httpBatches())
             : session
         try checkCurrent(attempt)
+        if mode == .callKit { try audio.configureCallKitSession(ownerID) }
         try activateAudioIfReady()
         try await connect(fallback, for: attempt)
     }
@@ -504,7 +509,15 @@ final class CallMediaSession {
         guard activationRequested, claimAccepted, !reusingTransport || permissionReady else { return }
         guard !audioActivated else { return }
         if directTransportFactory != nil && !directFallbackStarted && transport == nil { return }
-        if let direct = transport as? any CallDirectMediaTransport { try direct.activateDirectAudio() }
+        if let direct = transport as? any CallDirectMediaTransport {
+            do { try direct.activateDirectAudio() }
+            catch {
+                timing.mark(.audioEngineFailed)
+                scheduleTiming()
+                directFallbackHandler?()
+                return
+            }
+        }
         else { try audio.activate(ownerID) }
         timing.mark(.activateReturn)
         audioActivated = true
@@ -559,6 +572,10 @@ final class CallMediaSession {
             let result = await task.result
             guard let self, isCurrent(attempt), transport === activeTransport else { return }
             if case .failure = result {
+                if activeTransport is any CallDirectMediaTransport, !edgeCommitted {
+                    directFallbackHandler?()
+                    return
+                }
                 fail(reason: L10n.text("call.audio.failed"), code: "MICROPHONE_PUBLISH_FAILED")
             }
         }
@@ -660,7 +677,8 @@ final class CallMediaSession {
         // Independent of media teardown and its cancellation. The server checks
         // the device/claim fence even when RTP and the data channel never opened.
         controlEndTask = Task {
-            _ = try? await client.endInboundClaim(offerId: offerId, claimId: claimId)
+            _ = try? await client.endInboundClaim(offerId: offerId, claimId: claimId,
+                                                clientTiming: timing.httpBatches())
         }
     }
 
@@ -724,6 +742,12 @@ final class CallMediaSession {
             }
         case let .data(data, topic):
             guard topic == CallPilotTopic.status else { return }
+            if connection is any CallDirectMediaTransport, !edgeCommitted,
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               object["type"] as? String == "media_failed" {
+                directFallbackHandler?()
+                return
+            }
             if CallSignaling.supportsClientTiming(data) {
                 supportsClientTiming = true
                 scheduleTiming()
@@ -758,17 +782,28 @@ final class CallMediaSession {
             terminate(state: .ended(label: activeLabel ?? "", reason: reason))
         case let .timing(mark, instant):
             timing.mark(mark, at: instant)
+            if mark == .directControlReady {
+                directControlOpen = true
+                supportsClientTiming = true
+            }
             scheduleTiming()
+        case let .audioEngine(snapshot, failed):
+            timing.recordAudioEngine(snapshot)
+            timing.mark(failed ? .audioEngineFailed : .audioEngineRunning)
+            scheduleTiming()
+            if failed, !edgeCommitted { directFallbackHandler?() }
         }
     }
 
     private func scheduleTiming() {
-        guard !isStopped, roomConnected, supportsClientTiming, timingTask == nil,
+        guard !isStopped, (roomConnected || directControlOpen), supportsClientTiming, timingTask == nil,
               let transport else { return }
         timingTask = Task { [weak self] in
             defer { self?.timingTask = nil }
-            do { try await Task.sleep(for: .milliseconds(30)) } catch { return }
             guard let self else { return }
+            if !directControlOpen {
+                do { try await Task.sleep(for: .milliseconds(30)) } catch { return }
+            }
             while !isStopped, !Task.isCancelled, let packet = timing.nextBatch() {
                 do { try await transport.publishControl(packet) } catch { return }
             }

@@ -245,11 +245,11 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         return session
     }
 
-    func endInboundClaim(offerId: String, claimId: String) async throws {
+    func endInboundClaim(offerId: String, claimId: String, clientTiming: [Data] = []) async throws {
         guard offerId.wholeMatch(of: Self.offerIdRE) != nil, claimId.wholeMatch(of: Self.claimIdRE) != nil else {
             throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Invalid claim")
         }
-        let body = try JSONSerialization.data(withJSONObject: ["claimId": claimId])
+        let body = try Self.mediaRequestBody(claimId: claimId, clientTiming: clientTiming)
         let path = "v1/inbound-offers/\(offerId)/media/end"
         do { _ = try await request("POST", path, body: body) }
         catch let error as HostedCloudError where error.statusCode == 503 && error.code == "MEDIA_RELAY_UNAVAILABLE" {
@@ -323,11 +323,26 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         }
     }
 
-    func fallbackInboundLiveKit(offerId: String, claimId: String) async throws -> HostedCallSession {
+    private static func mediaRequestBody(claimId: String, clientTiming: [Data]) throws -> Data {
+        var object: [String: Any] = ["claimId": claimId]
+        if !clientTiming.isEmpty {
+            guard clientTiming.count <= 8, clientTiming.allSatisfy({ $0.count <= 2048 }) else {
+                throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Timing payload too large")
+            }
+            object["clientTiming"] = try clientTiming.map { try JSONSerialization.jsonObject(with: $0) }
+        }
+        let data = try JSONSerialization.data(withJSONObject: object)
+        guard data.count <= 4096 else {
+            throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Timing payload too large")
+        }
+        return data
+    }
+
+    func fallbackInboundLiveKit(offerId: String, claimId: String, clientTiming: [Data] = []) async throws -> HostedCallSession {
         guard offerId.wholeMatch(of: Self.offerIdRE) != nil, claimId.wholeMatch(of: Self.claimIdRE) != nil else {
             throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Invalid claim")
         }
-        let body = try JSONSerialization.data(withJSONObject: ["claimId": claimId])
+        let body = try Self.mediaRequestBody(claimId: claimId, clientTiming: clientTiming)
         let path = "v1/inbound-offers/\(offerId)/media/livekit"
         let result: ([String: Any], HTTPURLResponse)
         do { result = try await request("POST", path, body: body) }

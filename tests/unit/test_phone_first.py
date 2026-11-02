@@ -1870,6 +1870,196 @@ def test_v2_owner_hangup_before_commit_ends_call_instead_of_starting_ai(rig, mon
     assert {"type": "hangup.ack", "commandId": command_id} in rig.endpoint.events
 
 
+def test_v2_client_timing_survives_failure_before_media_ready(rig, monkeypatch):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+    rig.endpoint.media_ready = False
+    commands = [
+        {"type": "client_timing", "v": 1, "attempt": "00000000-0000-4000-8000-000000000001",
+         "seq": 1, "marks": {"answer_action": 0, "claim_start": 1, "claim_response": 50}},
+        {"type": "hangup", "commandId": "00000000-0000-4000-8000-000000000002"},
+    ]
+
+    async def next_command(timeout):
+        return commands.pop(0) if commands else None
+
+    rig.endpoint.next_command = next_command
+    rig.ring()
+    rig.session._initialize_takeover_context("inbound")
+
+    def claim():
+        rig.clock.tick = lambda: None
+        offer = rig.session.next_takeover_offer()
+        direct = InboundDirectRequest(offer.offer_id, "claim_timing", "v=0", [], lambda *_: None)
+        assert rig.session.accept_takeover_claim(
+            offer_id=offer.offer_id, call_id=offer.call_id, claim_id="claim_timing",
+            generation=offer.generation, nonce=offer.nonce, issued=replace(rig.issued, direct=direct),
+        ).accepted
+
+    rig.clock.tick = claim
+    assert asyncio.run(rig.session._handle_phone_first(None)) in {"completed", "not_connected"}
+    assert rig.session._mobile_timing.summary()["client_claim_http_ms"] == 49
+
+
+def test_http_client_timing_is_same_winner_fenced_and_received_before_end(rig, monkeypatch):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+    session = rig.session
+    rig.ring()
+    session._initialize_takeover_context("inbound")
+    batch = {"type": "client_timing", "v": 1, "attempt": "00000000-0000-4000-8000-000000000001",
+             "seq": 1, "marks": {"claim_start": 1, "claim_response": 20}}
+
+    def claim():
+        rig.clock.tick = lambda: None
+        offer = session.next_takeover_offer()
+        direct = InboundDirectRequest(offer.offer_id, "claim_timing", None, [], lambda *_: None)
+        assert session.accept_takeover_claim(
+            offer_id=offer.offer_id, call_id=offer.call_id, claim_id="claim_timing",
+            generation=offer.generation, nonce=offer.nonce, issued=replace(rig.issued, direct=direct),
+        ).accepted
+        command = dict(offerId=offer.offer_id, callId=offer.call_id, claimId="claim_timing",
+                       generation=offer.generation, nonce=offer.nonce, clientTiming=[batch])
+        rig.service.receive_inbound_client_timing({**command, "claimId": "wrong-claim"})
+        assert session._mobile_timing.summary()["client_claim_http_ms"] is None
+        rig.service.receive_inbound_client_timing(command)
+        assert session._mobile_timing.summary()["client_claim_http_ms"] == 19
+        assert rig.service.end_inbound_direct(command)
+        rig.service.receive_inbound_client_timing({**command, "clientTiming": [
+            {**batch, "seq": 2, "marks": {"connect_start": 1, "connect_return": 2}},
+        ]})
+        assert session._mobile_timing.summary()["client_connect_ms"] is None
+
+    rig.clock.tick = claim
+    assert asyncio.run(session._handle_phone_first(None)) == "not_connected"
+
+
+@pytest.mark.parametrize("outcome", ["lease", "repair", "repair_failed", "hangup"])
+def test_no_phone_audio_starts_ai_at_eight_seconds_and_preserves_same_claim_pcm(rig, monkeypatch, outcome):
+    from agentcall.inbound_direct import SwitchableInboundEndpoint
+
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+    monkeypatch.setenv("MODEM_ANSWER_GREETING", "")
+    session = rig.session
+    fence, requests, ai_times = {}, [], []
+    failed, spoken, finalized = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    agent = FakeAgent()
+    created = []
+
+    def create(_):
+        created.append(agent)
+        return agent
+
+    monkeypatch.setattr("agentcall.call_agent.create_agent", create)
+    original_say = agent.say
+
+    async def say(instructions):
+        ai_times.append(rig.clock.now)
+        await original_say(instructions)
+        spoken.set()
+
+    agent.say = say
+    original_fallback = session._phone_first_fallback
+
+    def finalize(reason, generation):
+        original_fallback(reason, generation)
+        if reason == "NO_PHONE_AUDIO":
+            finalized.set()
+
+    monkeypatch.setattr(session, "_phone_first_fallback", finalize)
+
+    async def ai_loop(*_):
+        if outcome in {"repair", "hangup"}:
+            await asyncio.Event().wait()
+        await finalized.wait()
+        assert session.takeover_state is TakeoverState.AI_ACTIVE
+        assert len(created) == len(agent.said) == 1 and not agent.stopped
+        session._set_active(False)
+        return rig.bridge
+
+    monkeypatch.setattr(session, "_run_agent_loop", ai_loop)
+    direct = rig.endpoint
+    direct.media_ready = False
+    direct.phone_audio_received = False
+    direct.browser_connected = True
+    direct.answer = {"sdp": "answer"}
+
+    async def connect():
+        direct.direct_connected_at = rig.clock.now
+
+    direct.connect = connect
+    original_send = direct.send_event
+
+    async def send(value):
+        await original_send(value)
+        if value.get("type") == "media_failed":
+            failed.set()
+
+    direct.send_event = send
+    cold = SimpleNamespace(media_ready=True, browser_connected=True, closed=False)
+
+    async def cold_connect():
+        assert agent.started and agent.said and rig.bridge.downlink
+        if outcome == "repair_failed":
+            raise ConnectionError("fake LiveKit failure")
+
+    async def cold_close():
+        cold.closed = True
+
+    cold.connect, cold.close, cold.send_event, cold.next_command = (
+        cold_connect, cold_close, original_send, direct.next_command,
+    )
+    session._takeover_endpoint_factory = lambda issued: SwitchableInboundEndpoint(
+        issued.direct, direct_factory=lambda *_args, **_kw: direct, livekit_factory=lambda _: cold,
+    )
+
+    async def pump(*_):
+        assert agent.stopped and session.takeover_state is TakeoverState.MOBILE_ACTIVE
+        assert rig.bridge.max_writers == 1
+
+    monkeypatch.setattr(session, "_pump_mobile_media", pump)
+
+    async def sleep(seconds):
+        rig.clock.sleep_sync(seconds if rig.bridge.started else 0)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(session, "_phone_first_sleep", sleep)
+    rig.ring()
+
+    def claim():
+        rig.clock.tick = lambda: None
+        offer = session.next_takeover_offer()
+        fence.update(offerId=offer.offer_id, callId=offer.call_id, claimId="claim_no_audio",
+                     generation=offer.generation, nonce=offer.nonce)
+        request = InboundDirectRequest(offer.offer_id, fence["claimId"], "sdp", [], lambda *_: None)
+        requests.append(request)
+        assert session.accept_takeover_claim(
+            offer_id=offer.offer_id, call_id=offer.call_id, claim_id=fence["claimId"],
+            generation=offer.generation, nonce=offer.nonce, issued=replace(rig.issued, direct=request),
+        ).accepted
+
+    rig.clock.tick = claim
+
+    async def scenario():
+        running = asyncio.create_task(session._handle_call())
+        await failed.wait()
+        await spoken.wait()
+        assert 8 <= ai_times[0] - direct.direct_connected_at < 8.2
+        assert session.takeover_state is TakeoverState.WAITING_OWNER
+        if outcome in {"repair", "repair_failed"}:
+            assert rig.service.fallback_inbound_direct(fence, rig.issued, lambda *_: None)
+        elif outcome == "hangup":
+            assert rig.service.end_inbound_direct(fence)
+        await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+    assert len(created) == len(agent.said) == 1 and agent.stopped
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+    assert rig.bridge.max_writers == 1 and rig.bridge.downlink
+    if outcome == "lease":
+        assert finalized.is_set() and rig.clock.now >= session._phone_first_claim_deadline
+    elif outcome == "repair_failed":
+        assert finalized.is_set() and rig.clock.now < session._phone_first_claim_deadline
+
+
 @pytest.mark.parametrize("media_state", ["no_sdp", "ice_stalled", "livekit_connecting"])
 def test_v2_connected_silence_is_state_bounded_and_ai_reuses_pcm(rig, monkeypatch, media_state):
     from agentcall.inbound_direct import SwitchableInboundEndpoint

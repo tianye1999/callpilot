@@ -19,6 +19,35 @@ def packet(**changes):
             "seq": 1, "marks": {"claim_start": 0, "answer_action": -50}, **changes}
 
 
+def engine_snapshot(**changes):
+    return {"running": True, "recording": True, "playing": True, "inputEnabled": True,
+            "inputRunning": True, "outputEnabled": True, "outputRunning": True, "inputMuted": False,
+            "muteMode": 0, **changes}
+
+
+def test_audio_engine_evidence_survives_binding_and_http_replay():
+    timing = CallTiming()
+    message = packet(marks={"direct_control_ready": 100, "audio_engine_running": 120},
+                     audioEngine=engine_snapshot())
+    timing.receive_client(message)
+    record = Record()
+    timing.bind(record)
+    timing.receive_client(message)
+    assert timing.summary()["client_audio_engine_running_ms"] == 120
+    assert [event for event in record.events if event["type"] == "client_audio_engine_state"] == [
+        {"type": "client_audio_engine_state", "seq": 1, "audioEngine": engine_snapshot()},
+    ]
+
+
+@pytest.mark.parametrize("snapshot", [engine_snapshot(running="yes"), engine_snapshot(muteMode=True),
+    engine_snapshot(muteMode=3), engine_snapshot(deviceName="must-not-log"), {}, None])
+def test_audio_engine_snapshot_is_strict_and_never_logs_free_text(snapshot):
+    record = Record()
+    timing = CallTiming(record)
+    timing.receive_client(packet(marks={"audio_engine_failed": 200}, audioEngine=snapshot))
+    assert record.events == []
+
+
 def test_client_timing_buffers_until_record_and_deduplicates():
     timing = CallTiming()
     message = packet()
@@ -155,6 +184,18 @@ def test_edge_marks_use_local_clock_and_only_emit_once():
     clock[0] = 12
     timing.mark("media_ready")
     assert record.events == [{"type": "latency", "stage": "edge_media_ready", "ms": 125.0}]
+
+
+def test_no_audio_summary_uses_only_edge_clock():
+    clock = [10.0]
+    timing = CallTiming(clock=lambda: clock[0])
+    timing.mark("direct_connected")
+    clock[0] = 18.0
+    timing.mark("no_phone_audio")
+    clock[0] = 18.25
+    timing.mark("provisional_ai_opening")
+    assert timing.summary()["edge_connected_to_no_audio_ms"] == 8000
+    assert timing.summary()["edge_no_audio_to_ai_ms"] == 250
 
 
 def test_ack_timeout_is_bounded_and_duplicate_is_not_another_hangup(monkeypatch):

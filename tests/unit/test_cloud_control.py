@@ -1028,3 +1028,37 @@ def test_cloud_api_redacts_structured_http_failure(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="EDGE_REVOKED") as caught:
         CloudControlApi("https://api.bondings.ai")._request("GET", "/v1/test")
     assert "sensitive detail" not in str(caught.value)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_http_timing_is_dispatched_before_end_only_for_v2(monkeypatch, enabled):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", str(enabled).lower())
+    service = _Service()
+    order = []
+    service.receive_inbound_client_timing = lambda command: order.append(("timing", command["clientTiming"]))
+    service.end_inbound_direct = lambda _command: order.append(("end", None)) or True
+    batch = {"type": "client_timing", "v": 1, "attempt": "00000000-0000-4000-8000-000000000001",
+             "seq": 1, "marks": {"audio_engine_failed": 200}}
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    client.handle_message(json.dumps(_takeover_claim(type="inbound.media.end", clientTiming=[batch])), lambda _: None)
+    assert order == ([("timing", [batch]), ("end", None)] if enabled else [])
+
+
+@pytest.mark.parametrize("batches", [None, {}, [{}], [None] * 9,
+    [{"type": "client_timing", "v": 1, "attempt": "00000000-0000-4000-8000-000000000001",
+      "seq": 1, "marks": {"device_name": 1}}],
+    [{"type": "client_timing", "v": 1, "attempt": "00000000-0000-4000-8000-000000000001",
+      "seq": 1, "marks": {"audio_engine_failed": True}}],
+])
+def test_invalid_http_timing_rejects_entire_control_command(batches):
+    from agentcall.cloud_control import _parse_cloud_command
+
+    with pytest.raises(ValueError, match="client timing"):
+        _parse_cloud_command(json.dumps(_takeover_claim(type="inbound.media.end", clientTiming=batches)))
+
+
+def test_http_timing_cannot_be_smuggled_onto_claim():
+    from agentcall.cloud_control import _parse_cloud_command
+
+    with pytest.raises(ValueError):
+        _parse_cloud_command(json.dumps(_takeover_claim(clientTiming=[])))

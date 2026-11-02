@@ -25,12 +25,17 @@ CLIENT_MARKS = frozenset({
     "sdp_submit_start", "sdp_submit_response",
     "cloud_cas_ms", "cloud_turn_ms", "cloud_sdp_relay_ms", "cloud_claim_finalize_ms", "cloud_total_ms",
     "cloud_edge_reserve_ms",
+    "audio_engine_running", "audio_engine_failed", "direct_control_ready",
 })
 MAX_TIMING_BYTES = 2048
 MAX_TIMING_BATCH_MARKS = 16
 MAX_TIMING_BATCHES = 64
 MAX_TIMING_MARKS = 96
 HANGUP_ACK_TIMEOUT = 0.25
+MAX_HTTP_TIMING_BATCHES = 8
+MAX_HTTP_TIMING_BYTES = 4096
+_ENGINE_FLAGS = frozenset({"running", "recording", "playing", "inputEnabled", "inputRunning",
+                           "outputEnabled", "outputRunning", "inputMuted"})
 
 
 class TimingRecord(Protocol):
@@ -46,6 +51,40 @@ def valid_command_id(value: Any) -> bool:
         return False
 
 
+def valid_client_timing(command: Any) -> bool:
+    """Validate a bounded telemetry envelope without advancing its sequence."""
+    if not isinstance(command, dict) or set(command) - {"audioEngine"} != {"type", "v", "attempt", "seq", "marks"}:
+        return False
+    if command["type"] != "client_timing" or type(command["v"]) is not int or command["v"] != 1:
+        return False
+    if (not valid_command_id(command["attempt"]) or type(command["seq"]) is not int
+            or not 1 <= command["seq"] <= MAX_TIMING_BATCHES):
+        return False
+    marks = command["marks"]
+    if not isinstance(marks, dict) or not 1 <= len(marks) <= MAX_TIMING_BATCH_MARKS:
+        return False
+    for name, value in marks.items():
+        if (not isinstance(name, str) or type(value) not in (int, float)
+                or not -60_000 <= value <= 86_400_000 or not math.isfinite(value)):
+            return False
+    if "audioEngine" in command:
+        engine = command["audioEngine"]
+        if (not isinstance(engine, dict) or set(engine) != _ENGINE_FLAGS | {"muteMode"}
+                or any(type(engine[key]) is not bool for key in _ENGINE_FLAGS)
+                or type(engine["muteMode"]) is not int or not -1 <= engine["muteMode"] <= 2):
+            return False
+    try:
+        return len(json.dumps(command, separators=(",", ":")).encode()) <= MAX_TIMING_BYTES
+    except (TypeError, ValueError):
+        return False
+
+
+def valid_http_client_timing(batches: Any) -> bool:
+    return (isinstance(batches, list) and len(batches) <= MAX_HTTP_TIMING_BATCHES
+            and all(valid_client_timing(batch) and set(batch["marks"]) <= CLIENT_MARKS for batch in batches)
+            and len(json.dumps(batches, separators=(",", ":")).encode()) <= MAX_HTTP_TIMING_BYTES)
+
+
 class CallTiming:
     def __init__(self, record: TimingRecord | None = None, *,
                  clock: Callable[[], float] = time.monotonic, origin: float | None = None) -> None:
@@ -56,6 +95,7 @@ class CallTiming:
         self._pending: list[tuple[str, float]] = []
         self._attempt: str | None = None
         self._seq = 0
+        self._pending_engines: list[dict[str, Any]] = []
         self.hangup_received = False
 
     def bind(self, record: TimingRecord | None) -> None:
@@ -64,6 +104,9 @@ class CallTiming:
             for stage, ms in self._pending:
                 record.log_event("latency", stage=stage, ms=ms)
             self._pending.clear()
+            for observation in self._pending_engines:
+                record.log_event("client_audio_engine_state", **observation)
+            self._pending_engines.clear()
 
     def _emit(self, stage: str, ms: float) -> None:
         if stage in self._marks or len(self._marks) >= MAX_TIMING_MARKS:
@@ -95,6 +138,8 @@ class CallTiming:
             "edge_direct_sdp_handled_ms": ("edge_claim_received", "edge_direct_sdp_handled"),
             "edge_sdp_exchange_ms": ("edge_direct_sdp_received", "edge_direct_answer_ready"),
             "edge_direct_ice_ms": ("edge_direct_answer_ready", "edge_direct_connected"),
+            "edge_connected_to_no_audio_ms": ("edge_direct_connected", "edge_no_phone_audio"),
+            "edge_no_audio_to_ai_ms": ("edge_no_phone_audio", "edge_provisional_ai_opening"),
             "edge_claim_to_phone_frame_ms": ("edge_claim_received", "edge_phone_first_frame"),
         }
         result = {name: round(self._marks[end] - self._marks[start], 3)
@@ -103,6 +148,8 @@ class CallTiming:
         for name in ("cloud_cas_ms", "cloud_edge_reserve_ms", "cloud_turn_ms", "cloud_sdp_relay_ms",
                      "cloud_claim_finalize_ms", "cloud_total_ms"):
             result[name] = self._marks.get("client_" + name)
+        for name in ("audio_engine_running", "audio_engine_failed", "direct_control_ready"):
+            result["client_" + name + "_ms"] = self._marks.get("client_" + name)
         return result
 
     def include_preconnect(self, other: CallTiming) -> None:
@@ -110,29 +157,21 @@ class CallTiming:
             self._emit(stage, round(ms + (other._origin - self._origin) * 1000, 3))
 
     def receive_client(self, command: dict[str, Any]) -> None:
-        if set(command) != {"type", "v", "attempt", "seq", "marks"}:
-            return
-        if command["type"] != "client_timing" or type(command["v"]) is not int or command["v"] != 1:
+        if not valid_client_timing(command):
             return
         attempt, seq, marks = command["attempt"], command["seq"], command["marks"]
-        if (not valid_command_id(attempt) or type(seq) is not int or not 1 <= seq <= MAX_TIMING_BATCHES
-                or seq <= self._seq or (self._attempt is not None and attempt != self._attempt)):
-            return
-        if not isinstance(marks, dict) or not 1 <= len(marks) <= MAX_TIMING_BATCH_MARKS:
-            return
-        for name, value in marks.items():
-            if (not isinstance(name, str) or type(value) not in (int, float)
-                    or not -60_000 <= value <= 86_400_000 or not math.isfinite(value)):
-                return
-        try:
-            if len(json.dumps(command, separators=(",", ":")).encode()) > MAX_TIMING_BYTES:
-                return
-        except (TypeError, ValueError):
+        if seq <= self._seq or (self._attempt is not None and attempt != self._attempt):
             return
         self._attempt, self._seq = attempt, seq
         for name, value in marks.items():
             if name in CLIENT_MARKS:
                 self._emit("client_" + name, value)
+        if "audioEngine" in command:
+            observation = {"seq": seq, "audioEngine": dict(command["audioEngine"])}
+            if self._record is not None:
+                self._record.log_event("client_audio_engine_state", **observation)
+            else:
+                self._pending_engines.append(observation)
 
     async def acknowledge_hangup(self, command: dict[str, Any],
                                  send: Callable[[dict[str, Any]], Any]) -> bool:

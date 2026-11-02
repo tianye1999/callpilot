@@ -21,6 +21,8 @@ enum CallTimingMark: String, CaseIterable, Sendable {
     case didActivate = "did_activate", activateReturn = "activate_return"
     case connectStart = "connect_start", connectReturn = "connect_return"
     case roomConnected = "room_connected", audioActivated = "audio_activated"
+    case directControlReady = "direct_control_ready"
+    case audioEngineRunning = "audio_engine_running", audioEngineFailed = "audio_engine_failed"
     case micEnableStart = "mic_enable_start", micEnableReturn = "mic_enable_return"
     case downlinkSubscribed = "downlink_subscribed", downlinkFirstFrame = "downlink_first_frame"
     case edgeConnected = "edge_connected", hangupIntent = "hangup_intent"
@@ -52,6 +54,7 @@ final class CallTiming {
     private var cloudDurations: [String: Double] = [:]
     private var sentCloudDurations = Set<String>()
     private(set) var sequence = 0
+    private var audioEngine: CallAudioEngineSnapshot?
     private let logger = Logger(subsystem: "ai.bondings.callpilot.sim", category: "CallTiming")
 
     init(now: @escaping () -> TimeInterval = CallMonotonic.now) {
@@ -99,8 +102,11 @@ final class CallTiming {
         }
     }
 
-    func nextBatch() -> Data? {
-        guard sequence < Self.maxBatches else { return nil }
+    func nextBatch(isHTTPReplay: Bool = false) -> Data? {
+        // Reserve two complete snapshots for fallback and terminal HTTP. A
+        // milestone-per-packet channel must not exhaust the shared seq limit.
+        let reserved = !isHTTPReplay && marks[.directControlReady] != nil ? 8 : 0
+        guard sequence < Self.maxBatches - reserved else { return nil }
         let keys = CallTimingMark.allCases.filter { marks[$0] != nil && !sent.contains($0) }
             .prefix(Self.maxBatchMarks)
         let cloudKeys = cloudDurations.keys.sorted().filter { !sentCloudDurations.contains($0) }
@@ -110,13 +116,34 @@ final class CallTiming {
             ($0.rawValue, min(86_400_000, max(-60_000, (marks[$0]! - origin) * 1000)))
         })
         for key in cloudKeys { values[key] = cloudDurations[key] }
-        guard let data = try? JSONSerialization.data(withJSONObject: [
+        var envelope: [String: Any] = [
             "type": "client_timing", "v": 1, "attempt": attempt,
             "seq": sequence + 1, "marks": values,
-        ], options: [.sortedKeys]), data.count <= Self.maxBatchBytes else { return nil }
+        ]
+        if let audioEngine, let encoded = try? JSONEncoder().encode(audioEngine),
+           let object = try? JSONSerialization.jsonObject(with: encoded) { envelope["audioEngine"] = object }
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope,
+            options: [.sortedKeys]), data.count <= Self.maxBatchBytes else { return nil }
         sequence += 1
         sent.formUnion(keys)
         sentCloudDurations.formUnion(cloudKeys)
         return data
+    }
+
+    func recordAudioEngine(_ snapshot: CallAudioEngineSnapshot) { audioEngine = snapshot }
+
+    // A successful data-channel send is not a receipt. Repack the complete
+    // bounded milestone set with fresh sequence numbers for the HTTP fallback.
+    func httpBatches() -> [Data] {
+        sent.removeAll()
+        sentCloudDurations.removeAll()
+        var result: [Data] = []
+        var bytes = 128 // claimId, envelope, and array separators
+        while result.count < 8, let packet = nextBatch(isHTTPReplay: true) {
+            guard bytes + packet.count + 1 <= 4096 else { break }
+            result.append(packet)
+            bytes += packet.count + 1
+        }
+        return result
     }
 }

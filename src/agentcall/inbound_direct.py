@@ -72,6 +72,13 @@ class InboundDirectRequest:
             self._state = "expired"
             return True
 
+    def fail_no_phone_audio(self) -> bool:
+        with self._lock:
+            if self._state != "preparing":
+                return False
+            self._state = "direct_failed"
+            return True
+
     def reply(self, sdp: str | None, error: str | None) -> None:
         with self._lock:
             if self._answered:
@@ -98,7 +105,7 @@ class InboundDirectRequest:
                     return True
                 ready = True
                 wake = None
-            elif self._state != "preparing":
+            elif self._state not in {"preparing", "direct_failed"}:
                 return False
             else:
                 ready = False
@@ -179,6 +186,7 @@ class SwitchableInboundEndpoint:
         self._switching = False
         self._direct_replaced = False
         self.failed = False
+        self.no_phone_audio = False
         self._direct_connect: asyncio.Task[None] | None = None
         self._watch_task: asyncio.Task[None] | None = None
         self._retire_task: asyncio.Task[None] | None = None
@@ -198,6 +206,26 @@ class SwitchableInboundEndpoint:
     @property
     def browser_connected(self) -> bool:
         return bool(not self._closed and self._inner is not None and self._inner.browser_connected)
+
+    def no_phone_audio_expired(self, now: float, maximum: float) -> bool:
+        if self._closed or self._direct_replaced or self.no_phone_audio or self._inner is None:
+            return False
+        connected_at = getattr(self._inner, "direct_connected_at", None)
+        return bool(connected_at is not None and not getattr(self._inner, "phone_audio_received", False)
+                    and now >= connected_at + maximum)
+
+    async def fail_no_phone_audio(self) -> bool:
+        if not self.request.fail_no_phone_audio():
+            return False
+        self.no_phone_audio = True
+        self._timing.mark("no_phone_audio")
+        try:
+            await self.send_event({"type": "media_failed", "reason": "no_phone_audio"})
+        except Exception:
+            # A dead phone cannot hold the caller silent or revoke the claim's
+            # remaining HTTP fallback opportunity.
+            self._timing.mark("media_failed_delivery_failed")
+        return True
 
     async def connect(self) -> None:
         if self._closed:
@@ -320,6 +348,9 @@ class SwitchableInboundEndpoint:
             await asyncio.sleep(timeout)
             return None
         result: dict[str, Any] | None = await self._inner.next_command(timeout)
+        if result is not None and result.get("type") == "client_timing":
+            self._timing.receive_client(result)
+            return None
         return result
 
     def take_browser_audio(self, max_chunks: int = 10) -> list[bytes]:

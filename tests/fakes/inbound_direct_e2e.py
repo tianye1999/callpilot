@@ -2,6 +2,7 @@
 
 Run: .venv/bin/python tests/fakes/inbound_direct_e2e.py
 Modes: inline SDP (default), --deferred-sdp, --cancel-before-sdp, --cancel-during-ice.
+No-audio recovery: --no-audio fallback or --no-audio ai (the LiveKit leg is fake).
 Only TURN credential generation and physical modem/PCM are fixtures. This is
 host-candidate loopback evidence, not a TURN, carrier, or iPhone acceptance test.
 Generated enrollment keys/cookies stay in memory; temporary D1 is removed.
@@ -49,7 +50,7 @@ from agentcall.cloud_credentials import CloudCredentialStore, EdgeCredential  # 
 from agentcall.modem import Sim7600Modem  # noqa: E402
 from agentcall.takeover_coordinator import TakeoverState  # noqa: E402
 from agentcall.webrtc_media import ice_servers_config  # noqa: E402
-from fakes import FakeAudioBridge  # noqa: E402
+from fakes import FakeAgent, FakeAudioBridge  # noqa: E402
 
 CLOUD = ROOT / "cloud"
 ORIGIN = "https://direct.test"
@@ -117,6 +118,46 @@ class SyntheticMicrophone(AudioStreamTrack):
         frame = await super().recv()
         frame.planes[0].update(tone(440))
         return frame
+
+
+class UnstartedMicrophone(AudioStreamTrack):
+    """Negotiated audio track, but no captured frame, like a stopped iPhone ADM."""
+
+    async def recv(self):
+        await asyncio.Event().wait()
+
+
+class SyntheticFallbackEndpoint:
+    """Only the LiveKit media leg is fake; authenticated fallback signaling is real."""
+
+    def __init__(self, _issued, events, timeline):
+        self.events, self.timeline = events, timeline
+        self.commands: asyncio.Queue[dict] = asyncio.Queue()
+        self.media_ready = self.browser_connected = False
+        self.received_modem_audio = asyncio.Event()
+
+    async def connect(self):
+        self.media_ready = self.browser_connected = True
+        self.timeline.mark("livekit_fake_connected")
+
+    async def close(self):
+        self.media_ready = self.browser_connected = False
+
+    async def next_command(self, timeout):
+        try:
+            return await asyncio.wait_for(self.commands.get(), timeout)
+        except TimeoutError:
+            return None
+
+    def take_browser_audio(self, max_chunks=10):
+        return [tone(440)] if self.media_ready else []
+
+    def push_modem_audio(self, pcm):
+        if pcm:
+            self.received_modem_audio.set()
+
+    async def send_event(self, event):
+        self.events.put_nowait(event)
 
 
 class IceBlackhole(asyncio.DatagramProtocol):
@@ -215,7 +256,7 @@ async def eventually(predicate, *, timeout: float = 15) -> None:
 
 
 async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool = False,
-              cancel_during_ice: bool = False) -> dict:
+              cancel_during_ice: bool = False, no_audio: str | None = None) -> dict:
     timeline = Timeline()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as http:
         async def request(method: str, path: str, body=None, headers=None, expected=200):
@@ -272,14 +313,32 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
             blackhole_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
                 lambda: blackhole, local_addr=("127.0.0.1", 0))
         ai_attempts = 0
+        ai_started, ai_spoke = asyncio.Event(), asyncio.Event()
+        fallback_endpoint = SyntheticFallbackEndpoint(None, events, timeline)
+
+        class TracedAgent(FakeAgent):
+            async def start(self, on_audio_out):
+                await super().start(on_audio_out)
+                timeline.mark("ai_started")
+                ai_started.set()
+
+            async def say(self, instructions):
+                await super().say(instructions)
+                timeline.mark("ai_spoke")
+                ai_spoke.set()
+
+        ai = TracedAgent()
 
         def no_ai(*_args, **_kwargs):
             nonlocal ai_attempts
             ai_attempts += 1
+            if no_audio is not None:
+                return ai
             raise AssertionError("AI_MUST_NOT_START_FOR_OWNER_CLAIM")
 
         with patch("agentcall.call_agent.create_audio_bridge", return_value=bridge), \
-             patch("agentcall.call_agent.create_agent", side_effect=no_ai):
+             patch("agentcall.call_agent.create_agent", side_effect=no_ai), \
+             patch("agentcall.livekit_media.LiveKitRemoteMediaEndpoint", return_value=fallback_endpoint):
             try:
                 control.start()
                 await eventually(lambda: control.status().connected)
@@ -307,7 +366,7 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                 ice, _ = await request("POST", f"/v1/inbound-offers/{offer_id}/ice", {}, phone_headers)
                 timeline.mark("phone_ice_received")
                 phone = RTCPeerConnection(ice_servers_config(ice["iceServers"]))
-                phone.addTrack(SyntheticMicrophone())
+                phone.addTrack(UnstartedMicrophone() if no_audio else SyntheticMicrophone())
                 channel = phone.createDataChannel("callpilot.control")
 
                 @channel.on("message")
@@ -347,6 +406,12 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                     name, _, value = item.strip().partition(";dur=")
                     if value:
                         cloud_timing[name] = float(value)
+                cancel_timing = {"type": "client_timing", "v": 1, "attempt": str(uuid4()), "seq": 1,
+                    "marks": {"answer_action": 0, "claim_start": 0,
+                              "claim_response": timeline.marks["phone_claim_response"] - timeline.marks["phone_answer"],
+                              **{f"cloud_{stage}_ms": cloud_timing[stage]
+                                 for stage in ("cas", "edge_reserve", "turn", "sdp_relay", "claim_finalize", "total")
+                                 if stage in cloud_timing}}}
                 if deferred_sdp:
                     assert claim.get("directAttempted") is True and claim.get("sdpPending") is True
                     assert phone.localDescription is None, "PHONE_GATHER_MUST_NOT_PRECEDE_RESERVATION"
@@ -358,7 +423,8 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                         assert session.is_active and not call_task.done()
                         timeline.mark("phone_control_end_start")
                         for _ in range(2):
-                            ended, _ = await request("POST", end_path, {"claimId": claim["claimId"]},
+                            ended, _ = await request("POST", end_path,
+                                                     {"claimId": claim["claimId"], "clientTiming": [cancel_timing]},
                                                      phone_headers, 202)
                             assert ended["accepted"] is True
                         timeline.mark("phone_control_end_response")
@@ -367,6 +433,7 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                         assert ai_attempts == 0
                         assert modem.commands.count("HANGUP") == 1
                         assert bridge.stopped and channel.readyState != "open"
+                        assert session._mobile_timing.summary()["client_claim_http_ms"] is not None
                         await phone.setLocalDescription(await phone.createOffer())
                         await request("POST", f"/v1/inbound-offers/{offer_id}/media/sdp", {
                             "claimId": claim["claimId"], "sdpOffer": phone.localDescription.sdp,
@@ -398,11 +465,12 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                     assert session.takeover_state is TakeoverState.WAITING_OWNER
                     timeline.mark("phone_control_end_start")
                     await request("POST", f"/v1/inbound-offers/{offer_id}/media/end",
-                                  {"claimId": claim["claimId"]}, phone_headers, 202)
+                                  {"claimId": claim["claimId"], "clientTiming": [cancel_timing]}, phone_headers, 202)
                     timeline.mark("phone_control_end_response")
                     await asyncio.wait_for(call_task, 10)
                     assert session.takeover_state is TakeoverState.ENDED and not session.is_active
                     assert ai_attempts == 0 and bridge.stopped
+                    assert session._mobile_timing.summary()["client_claim_http_ms"] is not None
                     assert (modem.commands.count("ATA") == modem.commands.count("PCM")
                             == modem.commands.count("HANGUP") == 1)
                     await eventually(lambda: "edge_revoke_sent" in timeline.marks)
@@ -420,6 +488,70 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                         await asyncio.sleep(0.02)
 
                 feed_task = asyncio.create_task(feed())
+                if no_audio:
+                    opened = asyncio.Event()
+                    channel.on("open", opened.set)
+                    if channel.readyState == "open":
+                        opened.set()
+                    await asyncio.wait_for(opened.wait(), 15)
+                    attempt = str(uuid4())
+                    initial_timing = {"type": "client_timing", "v": 1, "attempt": attempt, "seq": 1,
+                        "marks": {"answer_action": 0, "claim_start": 0,
+                                  "claim_response": timeline.marks["phone_claim_response"]
+                                  - timeline.marks["phone_answer"],
+                                  "direct_control_ready": round((time.monotonic() - timeline.origin) * 1000, 3)
+                                  - timeline.marks["phone_answer"],
+                                  **{f"cloud_{stage}_ms": cloud_timing[stage]
+                                     for stage in ("cas", "edge_reserve", "turn", "sdp_relay",
+                                                   "claim_finalize", "total")
+                                     if stage in cloud_timing}}}
+                    channel.send(json.dumps(initial_timing))
+                    async with asyncio.timeout(20):
+                        while True:
+                            event = await events.get()
+                            if event.get("type") == "media_failed":
+                                assert event["reason"] == "no_phone_audio"
+                                timeline.mark("phone_media_failed")
+                                break
+                    await asyncio.wait_for(ai_started.wait(), 5)
+                    await asyncio.wait_for(ai_spoke.wait(), 5)
+                    assert session._mobile_timing.summary()["client_claim_http_ms"] is not None
+                    assert "edge_phone_first_frame" not in session._mobile_timing._marks
+                    elapsed = (timeline.marks["phone_media_failed"] - timeline.marks["edge_reservation_ack"]
+                               - session._mobile_timing._marks["edge_direct_connected"])
+                    assert 7500 <= elapsed < 15000, "NO_AUDIO_MUST_NOT_WAIT_FOR_30S_LEASE"
+                    if no_audio == "fallback":
+                        # The HTTP happens AFTER AI startup, not synchronously inside Edge.send_event.
+                        await phone.close()
+                        snapshot = {"running": False, "recording": False, "playing": False,
+                                    "inputEnabled": False, "inputRunning": False, "outputEnabled": False,
+                                    "outputRunning": False, "inputMuted": False, "muteMode": 0}
+                        late_timing = {"type": "client_timing", "v": 1, "attempt": attempt, "seq": 2,
+                                       "marks": {"audio_engine_failed": timeline.marks["phone_media_failed"]
+                                                 - timeline.marks["phone_answer"]}, "audioEngine": snapshot}
+                        await request("POST", f"/v1/inbound-offers/{offer_id}/media/livekit", {
+                            "claimId": claim["claimId"], "clientTiming": [initial_timing, late_timing],
+                        }, phone_headers, 202)
+                        await eventually(lambda: session.takeover_state is TakeoverState.MOBILE_ACTIVE)
+                        assert ai.stopped, "AI_MUST_STOP_BEFORE_MOBILE_COMMIT"
+                        await asyncio.wait_for(fallback_endpoint.received_modem_audio.wait(), 5)
+                        assert (session._mobile_timing.summary()["client_audio_engine_failed_ms"]
+                                == late_timing["marks"]["audio_engine_failed"])
+                        timeline.mark("fallback_owner_committed")
+                        await fallback_endpoint.commands.put({"type": "hangup", "commandId": str(uuid4())})
+                    else:
+                        assert bridge.downlink, "AI_MUST_WRITE_AUDIO_WITHOUT_WAITING_FOR_THE_LEASE"
+                        session.stop()
+                    await asyncio.wait_for(call_task, 10)
+                    assert (modem.commands.count("ATA") == modem.commands.count("PCM")
+                            == modem.commands.count("HANGUP") == 1)
+                    return {"type": "inbound_direct_e2e", "status": "passed",
+                            "path": ("host_candidates_fake_livekit" if no_audio == "fallback"
+                                     else "host_candidates_only"),
+                            "signaling": "no_audio_" + no_audio, "milestones_ms": timeline.marks,
+                            "cloud_claim_ms": cloud_timing, "edge_summary": session._mobile_timing.summary(),
+                            "ata_count": 1, "pcm_prepare_count": 1, "hangup_count": 1,
+                            "ai_start_count": ai_attempts, "no_audio_failure_ms": round(elapsed, 3)}
                 await eventually(lambda: session.takeover_state is TakeoverState.MOBILE_ACTIVE
                                  and channel.readyState == "open")
                 timeline.mark("owner_media_committed")
@@ -487,9 +619,13 @@ def main() -> None:
                         help="Claim without SDP, then cancel over authenticated control HTTP")
     parser.add_argument("--cancel-during-ice", action="store_true",
                         help="Cancel only after an actual Edge ICE check reaches a blackhole UDP socket")
+    parser.add_argument("--no-audio", choices=("fallback", "ai"),
+                        help="Connect without audio capture, then follow or ignore media_failed")
     args = parser.parse_args()
     if args.cancel_during_ice and (args.deferred_sdp or args.cancel_before_sdp):
         parser.error("--cancel-during-ice is an independent inline SDP mode")
+    if args.no_audio and (args.cancel_during_ice or args.deferred_sdp or args.cancel_before_sdp):
+        parser.error("--no-audio is an independent inline SDP mode")
     failures: list[str] = []
 
     class ErrorCapture(logging.Handler):
@@ -508,7 +644,8 @@ def main() -> None:
     async def checked_run(base: str) -> dict:
         asyncio.get_running_loop().set_exception_handler(lambda _loop, _context: failures.append("asyncio"))
         result = await run(base, deferred_sdp=args.deferred_sdp or args.cancel_before_sdp,
-                           cancel_before_sdp=args.cancel_before_sdp, cancel_during_ice=args.cancel_during_ice)
+                           cancel_before_sdp=args.cancel_before_sdp, cancel_during_ice=args.cancel_during_ice,
+                           no_audio=args.no_audio)
         # Assert before asyncio.run cancels remaining tasks: teardown itself must retire retries.
         for transaction in transactions:
             assert getattr(transaction, "_Transaction__future").done(), "ICE_TRANSACTION_LEFT_PENDING"

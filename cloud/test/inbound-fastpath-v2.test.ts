@@ -11,6 +11,7 @@ import worker from "../src/index";
 import { EdgeRoom, INBOUND_MEDIA_RELAY_MAX_MS } from "../src/edge-room";
 import { issueIceServers, TURN_REQUEST_MAX_MS } from "../src/turn";
 import { sha256 } from "../src/security";
+import { inboundMediaCommandSchema } from "../src/schemas";
 
 const databases: DatabaseSync[] = [];
 const edge = "edge_abcdefghijkl";
@@ -96,9 +97,63 @@ const icePath = `/v1/inbound-offers/${offer}/ice`;
 const fallbackPath = `/v1/inbound-offers/${offer}/media/livekit`;
 const sdpPath = `/v1/inbound-offers/${offer}/media/sdp`;
 const endPath = `/v1/inbound-offers/${offer}/media/end`;
+const clientTiming = [{ type: "client_timing", v: 1, attempt: "497f6eca-6276-4993-bfeb-53cbbbba6f08", seq: 1,
+  marks: { answer_action: -5, audio_engine_failed: 8, direct_control_ready: 7 },
+  audioEngine: { running: false, recording: false, playing: false, inputEnabled: true, inputRunning: false,
+    outputEnabled: true, outputRunning: false, inputMuted: false, muteMode: 0 } }];
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); databases.splice(0).forEach(db => db.close()); });
 
 describe("direct inbound fastpath V2", () => {
+  it.each([fallbackPath, endPath])("forwards bounded client timing on %s without persisting telemetry", async path => {
+    const f = await fixture();
+    const claimed = await (await f.request(claimPath, { offerId: offer, mediaTransport: "webrtc" })).json() as { claimId: string };
+    const response = await f.request(path, { claimId: claimed.claimId, clientTiming });
+    expect(response.status).toBe(202);
+    const type = path === endPath ? "inbound.media.end" : "inbound.media.livekit";
+    const command = f.relay.mock.calls.map(([, init]) => init?.body ? JSON.parse(init.body as string) : null)
+      .find(value => value?.type === type);
+    expect(command?.clientTiming).toEqual(clientTiming);
+    expect(inboundMediaCommandSchema.safeParse(command).success).toBe(true);
+    expect(inboundMediaCommandSchema.safeParse({ ...command, type: "inbound.media.sdp",
+      direct: { sdpOffer: sdp, iceServers: [] } }).success).toBe(false);
+    expect(JSON.stringify(f.db.prepare("SELECT * FROM inbound_offers").get())).not.toContain("audio_engine");
+    await Promise.all(f.background);
+  });
+
+  it.each([fallbackPath, endPath])("enforces the 4 KiB HTTP boundary on %s", async path => {
+    const f = await fixture();
+    const claimed = await (await f.request(claimPath, { offerId: offer, mediaTransport: "webrtc" })).json() as { claimId: string };
+    const before = f.relay.mock.calls.length;
+    const response = await f.request(path, { claimId: claimed.claimId, padding: "x".repeat(4096) });
+    expect(response.status).toBe(413);
+    expect(f.relay.mock.calls).toHaveLength(before);
+    await Promise.all(f.background);
+  });
+
+  it.each([
+    ["too many batches", Array.from({ length: 9 }, () => clientTiming[0])],
+    ["invalid attempt", [{ ...clientTiming[0], attempt: "device-name" }]],
+    ["invalid sequence", [{ ...clientTiming[0], seq: 65 }]],
+    ["empty marks", [{ ...clientTiming[0], marks: {} }]],
+    ["too many marks", [{ ...clientTiming[0], marks: Object.fromEntries([
+      "answer_action", "dial_start", "claim_start", "claim_response", "configure_start", "configure_end",
+      "fulfill", "did_activate", "activate_return", "connect_start", "connect_return", "room_connected",
+      "audio_activated", "mic_enable_start", "mic_enable_return", "downlink_subscribed", "downlink_first_frame"
+    ].map(name => [name, 1])) }]],
+    ["unknown mark", [{ ...clientTiming[0], marks: { private_name: 1 } }]],
+    ["out of range", [{ ...clientTiming[0], marks: { answer_action: -60001 } }]],
+    ["engine free text", [{ ...clientTiming[0], audioEngine: { ...clientTiming[0]!.audioEngine, deviceName: "private" } }]],
+    ["engine invalid enum", [{ ...clientTiming[0], audioEngine: { ...clientTiming[0]!.audioEngine, muteMode: 3 } }]],
+    ["non numeric timing", [{ ...clientTiming[0], marks: { audio_engine_failed: "failed" } }]]
+  ])("rejects invalid client timing: %s", async (_name, timing) => {
+    const f = await fixture();
+    const claimed = await (await f.request(claimPath, { offerId: offer, mediaTransport: "webrtc" })).json() as { claimId: string };
+    const before = f.relay.mock.calls.length;
+    expect((await f.request(fallbackPath, { claimId: claimed.claimId, clientTiming: timing })).status).toBe(400);
+    expect(f.relay.mock.calls).toHaveLength(before);
+    await Promise.all(f.background);
+  });
+
   it("pipelines inline SDP before the reservation acknowledgement without changing the winning claim", async () => {
     const f = await fixture();
     const original = f.relay.getMockImplementation()!;

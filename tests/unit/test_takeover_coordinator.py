@@ -122,6 +122,21 @@ def _reach_state(
     assert target is TakeoverState.MOBILE_RECONNECTING
 
 
+def test_provisional_ai_preserves_winner_and_never_overwrites_mobile_owner():
+    coordinator, router, _ = _coordinator()
+    _reach_waiting_owner(coordinator)
+    fence = _claim_primary(coordinator)
+    wrong = ClaimFence("call-current", 7, "other-claim", "device-primary")
+    assert not coordinator.begin_provisional_ai(wrong).accepted
+    assert coordinator.begin_provisional_ai(fence).accepted
+    assert router.owner is MediaOwner.AI
+    assert coordinator.state is TakeoverState.WAITING_OWNER and coordinator.active_fence == fence
+    assert coordinator.mark_mobile_media_ready(fence).accepted
+    assert coordinator.commit_mobile(fence).accepted
+    assert not coordinator.begin_provisional_ai(fence).accepted
+    assert router.owner is MediaOwner.MOBILE
+
+
 def test_happy_path_covers_state_table_and_disconnect_notice_then_hangup() -> None:
     coordinator, router, _clock = _coordinator()
 

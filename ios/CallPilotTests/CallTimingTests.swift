@@ -4,6 +4,31 @@ import XCTest
 
 @MainActor
 final class CallTimingTests: XCTestCase {
+    func testHTTPReplaysAlreadyPublishedMarksWithEngineSnapshotWithinBodyBudget() throws {
+        let timing = CallTiming(now: { 0 })
+        timing.startClaim()
+        for mark in CallTimingMark.allCases { timing.mark(mark, at: 86_399.99999999999) }
+        timing.recordCloudDurations("cas;dur=86399999.99999999, edge_reserve;dur=86399999.99999999, turn;dur=86399999.99999999, sdp_relay;dur=86399999.99999999, claim_finalize;dur=86399999.99999999, total;dur=86399999.99999999")
+        timing.recordAudioEngine(CallAudioEngineSnapshot(running: false, recording: true, playing: true,
+            inputEnabled: false, inputRunning: false, outputEnabled: false, outputRunning: false,
+            inputMuted: false, muteMode: -1))
+        while timing.nextBatch() != nil {}
+        let lastSequence = timing.sequence
+        let batches = try timing.httpBatches().map(decode)
+        XCTAssertLessThanOrEqual(batches.count, 8)
+        let body = try JSONSerialization.data(withJSONObject: ["claimId": "claim_abcdefghijkl", "clientTiming": batches])
+        XCTAssertLessThanOrEqual(body.count, 4096)
+        var received = Set<String>()
+        for batch in batches {
+            XCTAssertGreaterThan(try XCTUnwrap(batch["seq"] as? Int), lastSequence)
+            received.formUnion(try XCTUnwrap(batch["marks"] as? [String: Double]).keys)
+            let engine = try XCTUnwrap(batch["audioEngine"] as? [String: Any])
+            XCTAssertEqual(engine["recording"] as? Bool, true)
+            XCTAssertEqual(engine["running"] as? Bool, false)
+        }
+        XCTAssertTrue(Set(CallTimingMark.allCases.map(\.rawValue)).isSubset(of: received))
+    }
+
     func testCloudDurationsRemainDurationsAcrossClientOriginChanges() throws {
         var now: TimeInterval = 100
         let timing = CallTiming(now: { now })

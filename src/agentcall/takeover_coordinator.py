@@ -344,6 +344,17 @@ class InboundTakeoverCoordinator:
             self._active_fence = repeated_fence
             return TakeoverResult.success()
 
+    def begin_provisional_ai(self, fence: ClaimFence) -> TakeoverResult:
+        """Speak while a claimed phone repairs media, without releasing its fence."""
+        with self._lock:
+            if self._state is not TakeoverState.WAITING_OWNER:
+                return TakeoverResult.reject(TakeoverRejection.INVALID_STATE)
+            rejection = self._validate_fence(fence)
+            if rejection is not None:
+                return TakeoverResult.reject(rejection)
+            self._router.switch_owner(MediaOwner.AI)
+            return TakeoverResult.success()
+
     def mark_mobile_media_ready(self, fence: ClaimFence) -> TakeoverResult:
         with self._lock:
             if self._state is TakeoverState.MOBILE_MEDIA_READY:

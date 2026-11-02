@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentcall.call_timing import CallTiming
 from agentcall.inbound_direct import InboundDirectRequest, SwitchableInboundEndpoint
 
 
@@ -31,12 +32,71 @@ async def settle():
         await asyncio.sleep(0)
 
 
+def test_timing_from_retiring_transport_is_received_before_fallback_finishes():
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        batch = {"type": "client_timing", "v": 1, "attempt": "00000000-0000-4000-8000-000000000001",
+                 "seq": 1, "marks": {"answer_action": 0, "claim_start": 1, "claim_response": 20}}
+
+        async def next_command(timeout):
+            entered.set()
+            await release.wait()
+            return batch
+
+        request = InboundDirectRequest("offer", "claim", None, [], lambda *_: None)
+        endpoint = SwitchableInboundEndpoint(request)
+        endpoint._inner = SimpleNamespace(next_command=next_command)
+        timing = CallTiming()
+        endpoint.set_timing(timing)
+        reading = asyncio.create_task(endpoint.next_command(1))
+        await entered.wait()
+        endpoint._inner = None  # The fallback detached the old transport while its read was in flight.
+        release.set()
+        assert await reading is None
+        assert timing.summary()["client_claim_http_ms"] == 19
+
+    asyncio.run(run())
+
+
 def test_initial_silence_expiry_fences_late_sdp_and_fallback():
     request = InboundDirectRequest("offer", "claim", None, [], lambda *_: None)
     assert request.expire_initial_sdp_wait()
     assert not request.supply_sdp("v=0", [], lambda *_: pytest.fail("Late SDP revived expired claim"))
     assert not request.fallback(SimpleNamespace(), lambda *_: pytest.fail("Late fallback revived expired claim"))
     assert request.media_offer() is None and not request.can_commit
+
+
+def test_no_audio_failure_retains_claim_for_fallback_but_cannot_commit_direct():
+    async def run():
+        events = []
+        request = InboundDirectRequest("offer", "claim", "sdp", [], lambda *_: None)
+        endpoint = SwitchableInboundEndpoint(request)
+
+        async def send(value):
+            events.append(value)
+
+        endpoint._inner = SimpleNamespace(direct_connected_at=100.0, phone_audio_received=False,
+                                          media_ready=True, send_event=send)
+        assert not endpoint.no_phone_audio_expired(107.999, 8)
+        assert endpoint.no_phone_audio_expired(108, 8)
+        assert await endpoint.fail_no_phone_audio()
+        assert not endpoint.media_ready and not request.can_commit
+        assert events == [{"type": "media_failed", "reason": "no_phone_audio"}]
+        assert not await endpoint.fail_no_phone_audio()
+        assert request.fallback(SimpleNamespace(), lambda *_: None)
+        assert not request.supply_sdp("sdp", [], lambda *_: None)
+
+    asyncio.run(run())
+
+
+def test_any_first_audio_frame_or_existing_fallback_disables_no_audio_deadline():
+    request = InboundDirectRequest("offer", "claim", "sdp", [], lambda *_: None)
+    endpoint = SwitchableInboundEndpoint(request)
+    endpoint._inner = SimpleNamespace(direct_connected_at=100.0, phone_audio_received=True)
+    assert not endpoint.no_phone_audio_expired(1000, 8)
+    endpoint._inner.phone_audio_received = False
+    endpoint._direct_replaced = True
+    assert not endpoint.no_phone_audio_expired(1000, 8)
 
 
 @pytest.mark.parametrize("progress", ["sdp", "fallback_pending", "livekit"])
