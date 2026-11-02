@@ -1,5 +1,6 @@
 type ClaimStage = "auth" | "offer_read" | "cas" | "edge_token" | "edge_send" | "phone_token" | "audit"
-  | "permission" | "prepare_read" | "claim_finalize" | "cleanup_queue" | "claim_check" | "candidates";
+  | "permission" | "prepare_read" | "claim_finalize" | "cleanup_queue" | "claim_check" | "candidates"
+  | "presence" | "prepare_batch";
 
 export class ClaimTiming {
   private readonly started = performance.now();

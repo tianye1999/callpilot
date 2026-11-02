@@ -11,6 +11,7 @@ import { sha256 } from "../src/security";
 import type { Env } from "../src/types";
 import { invalidateCandidates, queueParticipantCleanup, sweepPreconnect } from "../src/inbound-preconnect";
 import { participantRequest } from "../src/livekit";
+import * as livekit from "../src/livekit";
 import { EdgeRoom } from "../src/edge-room";
 
 const databases: DatabaseSync[] = [];
@@ -40,11 +41,23 @@ async function fixture(beforeCleanupMigration = false) {
   const relay = vi.fn(async (_url: string, _init?: RequestInit) => Response.json({ connected: true, inboundPreconnectV1: true }));
   const queries: { sql: string; plan: string[]; changes: number }[] = [];
   const env = {
-    DB: { prepare: (sql: string) => ({ bind: (...values: SQLInputValue[]) => {
+    DB: { batch: vi.fn(async (statements: D1PreparedStatement[]) => {
+      db.exec("BEGIN");
+      try {
+        const results = [];
+        for (const statement of statements) results.push((statement as unknown as { execute: () => unknown }).execute());
+        db.exec("COMMIT");
+        return results;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    }), prepare: (sql: string) => ({ bind: (...values: SQLInputValue[]) => {
       const params = Object.fromEntries(values.map((v, i) => [String(i + 1), v]));
       const query = { sql, changes: 0, plan: db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(params).map(row => String(row.detail)) };
       queries.push(query);
       return {
+        execute: () => ({ results: db.prepare(sql).all(params) }),
         first: async () => db.prepare(sql).get(params) ?? null,
         all: async () => ({ results: db.prepare(sql).all(params) }),
         run: async () => {
@@ -87,6 +100,214 @@ async function roomFixture() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); databases.splice(0).forEach(db => db.close()); });
 
 describe("inbound preconnect", () => {
+  it("prepares in one D1 batch alongside presence and emits identifier-free stage timings", async () => {
+    const f = await fixture();
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.relay.mockImplementation(async () => { await gate; return Response.json({ connected: true, inboundPreconnectV1: true }); });
+    const pending = f.request("prepare", { offerId: offer });
+    await vi.waitFor(() => expect(f.env.DB.batch).toHaveBeenCalledOnce());
+    release();
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Server-Timing")).toMatch(/prepare_batch;dur=/);
+    const line = JSON.parse(log.mock.calls[0]![0] as string);
+    expect(Object.keys(line).sort()).toEqual(["auth", "phone_token", "prepare_batch", "presence", "total"]);
+    expect(Object.values(line).every(value => typeof value === "number" && value >= 0)).toBe(true);
+    expect(JSON.stringify(line)).not.toMatch(/device_|offer_|web_|testsecret/);
+    await Promise.all(f.background);
+  });
+
+  it("uses the fast adjudication with the fast flag off and reads candidates alongside CAS", async () => {
+    const f = await fixture();
+    const a = await (await f.request("prepare", { offerId: offer })).json() as Record<string, string>;
+    f.env.INBOUND_CLAIM_FAST_PATH_ENABLED = "false";
+    const original = f.env.DB.prepare.bind(f.env.DB);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let casStarted = false;
+    let candidateRead = false;
+    vi.spyOn(f.env.DB, "prepare").mockImplementation(sql => {
+      const statement = original(sql);
+      const bind = statement.bind.bind(statement);
+      statement.bind = (...values) => {
+        const bound = bind(...values);
+        if (sql.startsWith("SELECT * FROM inbound_preparations")) candidateRead = true;
+        if (sql.startsWith("UPDATE inbound_offers SET status = 'claimed'")) {
+          const first = bound.first.bind(bound);
+          bound.first = (async () => { casStarted = true; await gate; return first(); }) as typeof bound.first;
+        }
+        return bound;
+      };
+      return statement;
+    });
+    const admin = vi.fn(async () => Response.json({}));
+    vi.stubGlobal("fetch", admin);
+    f.queries.length = 0;
+    const pending = f.request("claim", { offerId: offer, prepareId: a.prepareId });
+    await vi.waitFor(() => expect(casStarted && candidateRead).toBe(true));
+    expect(admin).not.toHaveBeenCalled();
+    expect(f.relay.mock.calls.filter(args => String(args[0]).endsWith("/command"))).toHaveLength(0);
+    release();
+    const response = await pending;
+    expect(response.status).toBe(202);
+    expect(response.headers.get("Server-Timing")).not.toContain("offer_read;");
+    expect(f.queries.filter(q => q.sql.startsWith("SELECT offer_id FROM inbound_offers WHERE offer_id"))).toHaveLength(0);
+    await Promise.all(f.background);
+  });
+
+  it("returns before audit and cleanup execution, but only after durable cleanup and Edge delivery", async () => {
+    const f = await fixture();
+    f.env.INBOUND_CLAIM_FAST_PATH_ENABLED = "false";
+    const a = await (await f.request("prepare", { offerId: offer })).json() as Record<string, string>;
+    const original = f.env.DB.prepare.bind(f.env.DB);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(f.env.DB, "prepare").mockImplementation(sql => {
+      const statement = original(sql);
+      if (!sql.startsWith("INSERT INTO audit_events")) return statement;
+      const bind = statement.bind.bind(statement);
+      statement.bind = (...values) => {
+        const bound = bind(...values);
+        const run = bound.run.bind(bound);
+        bound.run = async () => { await gate; return run(); };
+        return bound;
+      };
+      return statement;
+    });
+    f.relay.mockImplementation(async url => {
+      if (url.endsWith("/command")) {
+        expect(f.relay.mock.calls.filter(args => String(args[0]).endsWith("/preconnect-cleanup"))).toHaveLength(0);
+      }
+      if (url.endsWith("/preconnect-cleanup")) await gate;
+      return Response.json({ connected: true, inboundPreconnectV1: true });
+    });
+    const pending = f.request("claim", { offerId: offer }, "device_otherabcdefg");
+    let response: Response | undefined;
+    void pending.then(value => { response = value; });
+    await vi.waitFor(() => expect(response?.status).toBe(202));
+    expect(f.db.prepare("SELECT * FROM audit_events").all()).toHaveLength(0);
+    expect(f.db.prepare("SELECT state FROM inbound_preparations WHERE prepare_id = ?").get(a.prepareId!)?.state).toBe("invalid");
+    expect(f.db.prepare("SELECT * FROM inbound_participant_cleanup").all()).toHaveLength(2);
+    expect(f.relay.mock.calls.filter(args => String(args[0]).endsWith("/command"))).toHaveLength(1);
+    release();
+    await Promise.all(f.background);
+    expect(f.db.prepare("SELECT * FROM audit_events").all()).toHaveLength(1);
+  });
+
+  it("does not send or return while the durable finalization batch is pending", async () => {
+    const f = await fixture();
+    await f.request("prepare", { offerId: offer });
+    const batch = f.env.DB.batch.bind(f.env.DB);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.mocked(f.env.DB.batch).mockClear().mockImplementationOnce(async statements => {
+      await gate;
+      return batch(statements);
+    });
+    const pending = f.request("claim", { offerId: offer }, "device_otherabcdefg");
+    let response: Response | undefined;
+    void pending.then(value => { response = value; });
+    await vi.waitFor(() => expect(f.env.DB.batch).toHaveBeenCalledOnce());
+    expect(response).toBeUndefined();
+    expect(f.relay.mock.calls.filter(args => String(args[0]).endsWith("/command"))).toHaveLength(0);
+    release();
+    expect((await pending).status).toBe(202);
+    expect(vi.mocked(f.env.DB.batch).mock.calls[0]![0]).toHaveLength(4);
+    expect(f.db.prepare("SELECT * FROM inbound_participant_cleanup").all()).toHaveLength(2);
+    await Promise.all(f.background);
+  });
+
+  it("rolls back finalization if a cleanup insert fails, then fails closed without delivery", async () => {
+    const f = await fixture();
+    await f.request("prepare", { offerId: offer });
+    f.db.exec(`CREATE TEMP TRIGGER reject_cold_phone BEFORE INSERT ON inbound_participant_cleanup
+      WHEN NEW.participant_identity LIKE 'web_%'
+      BEGIN SELECT RAISE(ABORT, 'synthetic queue failure'); END`);
+    const batch = f.env.DB.batch.bind(f.env.DB);
+    let rolledBack = false;
+    vi.mocked(f.env.DB.batch).mockImplementationOnce(async statements => {
+      try { return await batch(statements); }
+      catch (error) {
+        expect(f.db.prepare("SELECT state FROM inbound_preparations").get()?.state).toBe("prepared");
+        expect(f.db.prepare("SELECT * FROM inbound_participant_cleanup").all()).toHaveLength(0);
+        rolledBack = true;
+        throw error;
+      }
+    });
+    expect((await f.request("claim", { offerId: offer }, "device_otherabcdefg")).status).toBe(500);
+    expect(rolledBack).toBe(true);
+    expect(f.db.prepare("SELECT status FROM inbound_offers").get()?.status).toBe("failed");
+    expect(f.relay.mock.calls.filter(args => String(args[0]).endsWith("/command"))).toHaveLength(0);
+    await Promise.all(f.background);
+  });
+
+  it.each(["revoked", "failed"])("still rejects a %s offer during Edge delivery instead of deferring claim_check", async status => {
+    const f = await fixture();
+    const a = await (await f.request("prepare", { offerId: offer })).json() as Record<string, string>;
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({})));
+    f.relay.mockImplementation(async url => {
+      if (url.endsWith("/command")) f.db.prepare("UPDATE inbound_offers SET status = ?").run(status);
+      return Response.json({ connected: true, inboundPreconnectV1: true });
+    });
+    expect((await f.request("claim", { offerId: offer, prepareId: a.prepareId })).status).toBe(409);
+    expect(f.db.prepare("SELECT * FROM audit_events").all()).toHaveLength(0);
+    expect(f.db.prepare("SELECT state FROM inbound_preparations").get()?.state).toBe("invalid");
+    await Promise.all(f.background);
+  });
+
+  it("the alarm removes losers even when the background cleanup wake fails", async () => {
+    const f = await roomFixture();
+    await f.state.storage.put("preconnectEdge", edge);
+    const a = await (await f.request("prepare", { offerId: offer })).json() as Record<string, string>;
+    const b = await (await f.request("prepare", { offerId: offer }, "device_otherabcdefg")).json() as Record<string, string>;
+    const admin = vi.fn(async () => Response.json({}));
+    vi.stubGlobal("fetch", admin);
+    f.relay.mockImplementation(async url => {
+      if (url.endsWith("/preconnect-cleanup")) throw new Error("synthetic interrupted wake");
+      return Response.json({ connected: true, inboundPreconnectV1: true });
+    });
+    expect((await f.request("claim", { offerId: offer, prepareId: a.prepareId })).status).toBe(202);
+    await Promise.all(f.background);
+    await f.room.alarm();
+    const removals = vi.mocked(fetch).mock.calls.filter(args => String(args[0]).endsWith("/RemoveParticipant"))
+      .map(args => JSON.parse(args[1]!.body as string).identity);
+    expect(removals).toContain(b.participantIdentity);
+    expect(removals).not.toContain(a.participantIdentity);
+  });
+
+  it.each(["revoked", "expired"])("a %s offer cannot be claimed or promoted", async status => {
+    const f = await fixture();
+    const a = await (await f.request("prepare", { offerId: offer })).json() as Record<string, string>;
+    if (status === "expired") f.db.prepare("UPDATE inbound_offers SET expires_at = ?").run(Date.now() - 1);
+    else f.db.prepare("UPDATE inbound_offers SET status = 'revoked'").run();
+    const admin = vi.fn(async () => Response.json({}));
+    vi.stubGlobal("fetch", admin);
+    expect((await f.request("claim", { offerId: offer, prepareId: a.prepareId })).status).toBe(409);
+    expect(admin).not.toHaveBeenCalled();
+    expect(f.relay.mock.calls.filter(args => String(args[0]).endsWith("/command"))).toHaveLength(0);
+    await Promise.all(f.background);
+  });
+
+  it("signs reuse tokens during permission but delivers neither credentials nor commands before permission completes", async () => {
+    const f = await fixture();
+    const a = await (await f.request("prepare", { offerId: offer })).json() as Record<string, string>;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async () => { await gate; return Response.json({}); }));
+    const signing = vi.spyOn(livekit, "issueParticipantToken");
+    const pending = f.request("claim", { offerId: offer, prepareId: a.prepareId });
+    let response: Response | undefined;
+    void pending.then(value => { response = value; });
+    await vi.waitFor(() => expect(signing).toHaveBeenCalledTimes(2));
+    expect(response).toBeUndefined();
+    expect(f.relay.mock.calls.filter(args => String(args[0]).endsWith("/command"))).toHaveLength(0);
+    release();
+    expect(await (await pending).json()).toMatchObject({ mode: "reuse" });
+    await Promise.all(f.background);
+  });
+
   it("unchanged sweeps write zero rows and never scan completed history", async () => {
     const f = await fixture();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({})));
@@ -480,8 +701,9 @@ describe("inbound preconnect", () => {
     expect(f.db.prepare("SELECT status FROM inbound_offers").get()?.status).toBe("offered");
   });
 
-  it("grants only the CAS winner, sends only after adjudication, and removes losers", async () => {
+  it.each(["true", "false", undefined])("grants only the CAS winner and removes losers with fast flag %s", async fastFlag => {
     const f = await fixture();
+    f.env.INBOUND_CLAIM_FAST_PATH_ENABLED = fastFlag;
     const a = await (await f.request("prepare", { offerId: offer })).json() as Record<string, string>;
     const b = await (await f.request("prepare", { offerId: offer }, "device_otherabcdefg")).json() as Record<string, string>;
     const admin = vi.fn(async (_url: URL, init: RequestInit) => {

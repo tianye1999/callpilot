@@ -1,4 +1,5 @@
 import { HttpError } from "./http";
+import { ClaimTiming } from "./claim-timing";
 import { issueParticipantToken, LiveKitParticipantError, participantRequest } from "./livekit";
 import { randomId } from "./security";
 import type { DeviceRecord, EdgePresence, Env, InboundOfferRecord } from "./types";
@@ -17,26 +18,35 @@ export interface Preparation {
   state: string;
 }
 
-export async function prepareInbound(env: Env, device: DeviceRecord, offerId: string) {
+export async function prepareInbound(env: Env, device: DeviceRecord, offerId: string, timing = new ClaimTiming()) {
   if (env.INBOUND_PRECONNECT_ENABLED !== "true") throw unavailable();
-  const presence = await env.EDGE_ROOMS.get(env.EDGE_ROOMS.idFromName(device.edge_id))
-    .fetch("https://edge-room/presence");
-  const capability = await presence.json() as EdgePresence;
-  if (!capability.connected || !capability.inboundPreconnectV1) throw unavailable();
-  // INSERT SELECT and the final read both fence against a racing claim/revoke.
-  await env.DB.prepare(`INSERT OR IGNORE INTO inbound_preparations
+  // Presence and the fenced DB transaction are independent. A capability failure
+  // may leave a restricted candidate row, but never issues a token; the alarm
+  // retires that row when the offer ends. The batch reads its own insert.
+  const [capability, results] = await Promise.all([
+    timing.measure("presence", async () => {
+      const response = await env.EDGE_ROOMS.get(env.EDGE_ROOMS.idFromName(device.edge_id))
+        .fetch("https://edge-room/presence");
+      return await response.json() as EdgePresence;
+    }),
+    timing.measure("prepare_batch", () => env.DB.batch<Preparation>([
+      env.DB.prepare(`INSERT OR IGNORE INTO inbound_preparations
     (prepare_id, offer_id, device_id, room_name, participant_identity, expires_at)
     SELECT ?1, offer_id, ?2, room_name, ?3, expires_at FROM inbound_offers
     WHERE offer_id = ?4 AND edge_id = ?5 AND status = 'offered' AND expires_at > ?6
       AND preconnect_enabled = 1`)
-    .bind(randomId("prepare"), device.device_id, randomId("web", 12), offerId, device.edge_id, Date.now()).run();
-  const row = await env.DB.prepare(`SELECT p.* FROM inbound_preparations p JOIN inbound_offers o ON o.offer_id = p.offer_id
+        .bind(randomId("prepare"), device.device_id, randomId("web", 12), offerId, device.edge_id, Date.now()),
+      env.DB.prepare(`SELECT p.* FROM inbound_preparations p JOIN inbound_offers o ON o.offer_id = p.offer_id
     WHERE p.offer_id = ?1 AND p.device_id = ?2 AND p.state = 'prepared'
       AND o.edge_id = ?3 AND o.status = 'offered' AND o.expires_at > ?4`)
-    .bind(offerId, device.device_id, device.edge_id, Date.now()).first<Preparation>();
-  if (!row) throw new HttpError("OFFER_UNAVAILABLE", "Offer is not available for preparation", 409);
-  const token = await issueParticipantToken(env, row.room_name, row.participant_identity,
-    Math.max(1, Math.ceil((row.expires_at - Date.now()) / 1000)), true);
+        .bind(offerId, device.device_id, device.edge_id, Date.now())
+    ]))
+  ]);
+  if (!capability.connected || !capability.inboundPreconnectV1) throw unavailable();
+  const row = results[1]?.results[0];
+  if (!row || row.expires_at <= Date.now()) throw new HttpError("OFFER_UNAVAILABLE", "Offer is not available for preparation", 409);
+  const token = await timing.measure("phone_token", () => issueParticipantToken(env, row.room_name, row.participant_identity,
+    Math.max(1, Math.ceil((row.expires_at - Date.now()) / 1000)), true));
   return { prepareId: row.prepare_id, roomName: row.room_name, participantIdentity: row.participant_identity,
     url: env.LIVEKIT_URL, token, expiresAt: row.expires_at };
 }
@@ -46,18 +56,26 @@ function unavailable() {
 }
 
 export async function queueParticipantCleanup(env: Env, offer: Pick<InboundOfferRecord, "edge_id" | "offer_id" | "expires_at">, room: string, identity: string) {
+  await participantCleanupStatement(env, offer, room, identity).run();
+}
+
+export function participantCleanupStatement(env: Env, offer: Pick<InboundOfferRecord, "edge_id" | "offer_id" | "expires_at">, room: string, identity: string) {
   // A reused Edge identity can receive a five-minute token when claimed just
   // before offer expiry. Persist that bound instead of extending it every sweep.
-  await env.DB.prepare(`INSERT OR IGNORE INTO inbound_participant_cleanup
+  return env.DB.prepare(`INSERT OR IGNORE INTO inbound_participant_cleanup
     (edge_id, offer_id, room_name, participant_identity, retry_until) VALUES (?1, ?2, ?3, ?4, ?5)`)
-    .bind(offer.edge_id, offer.offer_id, room, identity, Math.max(offer.expires_at, Date.now()) + 360_000).run();
+    .bind(offer.edge_id, offer.offer_id, room, identity, Math.max(offer.expires_at, Date.now()) + 360_000);
 }
 
 export async function invalidateCandidates(env: Env, offerId: string, winner?: string) {
-  await env.DB.prepare(`UPDATE inbound_preparations SET state = CASE
+  await invalidateCandidatesStatement(env, offerId, winner).run();
+}
+
+export function invalidateCandidatesStatement(env: Env, offerId: string, winner?: string) {
+  return env.DB.prepare(`UPDATE inbound_preparations SET state = CASE
     WHEN prepare_id = ?2 THEN 'winner' ELSE 'invalid' END WHERE offer_id = ?1
       AND state != 'invalid' AND (state != 'winner' OR prepare_id IS NOT ?2)`)
-    .bind(offerId, winner ?? null).run();
+    .bind(offerId, winner ?? null);
 }
 
 // The DO alarm retries removals, including late joins with still-valid JWTs.

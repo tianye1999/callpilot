@@ -19,7 +19,7 @@ import { liveKitConnectSources } from "./csp";
 import { EdgeRoom } from "./edge-room";
 import { error, HttpError, json, readJson, requireSameOrigin } from "./http";
 import { issueParticipantToken, participantRequest } from "./livekit";
-import { invalidateCandidates, prepareInbound, queueParticipantCleanup, type Preparation } from "./inbound-preconnect";
+import { invalidateCandidates, invalidateCandidatesStatement, participantCleanupStatement, prepareInbound, queueParticipantCleanup, type Preparation } from "./inbound-preconnect";
 import {
   appReviewPairingEnabled,
   PairingPolicyError,
@@ -51,7 +51,7 @@ const COOKIE_MAX_AGE = 180 * 24 * 60 * 60;
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
-    const timing = request.method === "POST" && path.replace(/\/$/, "") === "/v1/inbound-offers/claim"
+    const timing = request.method === "POST" && ["/v1/inbound-offers/claim", "/v1/inbound-offers/prepare"].includes(path.replace(/\/$/, ""))
       ? new ClaimTiming() : undefined;
     const requestId = randomId(
       path.startsWith("/v1/messages") || path.startsWith("/v1/call-records") ? "request" : "req",
@@ -114,9 +114,9 @@ async function route(request: Request, env: Env, requestId: string, timing?: Cla
   }
   if (path === "/v1/inbound-offers/prepare" && request.method === "POST") {
     requireSameOrigin(request, env.PUBLIC_ORIGIN);
-    const device = await authenticateDevice(request, env, ctx);
+    const device = await timing!.measure("auth", () => authenticateDevice(request, env, ctx));
     const input = prepareInboundOfferSchema.parse(await readJson(request));
-    return json(await prepareInbound(env, device, input.offerId));
+    return json(await prepareInbound(env, device, input.offerId, timing));
   }
   if (path === "/v1/messages" && request.method === "GET") {
     return relayContentRead(request, env, "messages.list", undefined);
@@ -476,7 +476,11 @@ async function listInboundOffers(request: Request, env: Env): Promise<Response> 
 
 async function claimInboundOffer(request: Request, env: Env, timing: ClaimTiming, ctx?: ExecutionContext): Promise<Response> {
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
-  const fast = env.INBOUND_CLAIM_FAST_PATH_ENABLED === "true";
+  // Preconnect uses the existing atomic fast path without changing deployment
+  // flags. With preconnect disabled the legacy/explicit-fast selection is intact.
+  const fast = env.INBOUND_CLAIM_FAST_PATH_ENABLED === "true" || env.INBOUND_PRECONNECT_ENABLED === "true";
+  // Only last_used_at bookkeeping is deferred by auth's context; credential and
+  // revocation checks still finish before any speculative lookup or CAS.
   const device = await timing.measure("auth", () => authenticateDevice(request, env, fast ? ctx : undefined));
   const input = claimInboundOfferSchema.parse(await readJson(request));
   if (!fast) {
@@ -496,18 +500,35 @@ async function claimInboundOffer(request: Request, env: Env, timing: ClaimTiming
   let edgeIdentity = randomId("edgepart", 12);
   // First-claim-wins: the conditional UPDATE is the atomic arbiter. A loser
   // (double claim, expired or revoked offer) changes zero rows.
-  const offer = await timing.measure("cas", () => env.DB.prepare(
+  // These reads do not grant permissions or send commands. Run them alongside
+  // CAS, but only the CAS winner may act on their results. Lookup/presence errors
+  // make reuse unavailable, not the independent cold path.
+  const preparation = input.prepareId && env.INBOUND_PRECONNECT_ENABLED === "true"
+    ? Promise.all([
+      timing.measure("prepare_read", () => env.DB.prepare(`SELECT * FROM inbound_preparations WHERE prepare_id = ?1
+        AND offer_id = ?2 AND device_id = ?3 AND state = 'prepared' AND expires_at > ?4`)
+        .bind(input.prepareId, input.offerId, device.device_id, now).first<Preparation>()),
+      timing.measure("presence", async () => {
+        const response = await edgeRoom(env, device.edge_id).fetch("https://edge-room/presence");
+        return await response.json() as { connected?: boolean; inboundPreconnectV1?: boolean };
+      })
+    ]).then(([candidate, capability]) => capability.connected && capability.inboundPreconnectV1 ? candidate : null)
+      .catch(() => null)
+    : Promise.resolve(null);
+  const [offer, prepared] = await Promise.all([timing.measure("cas", () => env.DB.prepare(
     `UPDATE inbound_offers SET status = 'claimed', claim_id = ?1, claimed_device_id = ?2, updated_at = ?3,
       room_name = CASE WHEN ?9 = 1 THEN room_name ELSE ?6 END,
       phone_identity = ?7, edge_identity = CASE WHEN ?9 = 1 THEN edge_identity ELSE ?8 END
       WHERE offer_id = ?4 AND edge_id = ?5 AND status = 'offered' AND expires_at > ?3 RETURNING *`
   ).bind(claimId, device.device_id, now, input.offerId, device.edge_id, roomName, phoneIdentity, edgeIdentity,
-    input.prepareId && env.INBOUND_PRECONNECT_ENABLED === "true" ? 1 : 0).first<InboundOfferRecord>());
+    input.prepareId && env.INBOUND_PRECONNECT_ENABLED === "true" ? 1 : 0).first<InboundOfferRecord>()), preparation]);
   const recordAudit = async (outcome: "allowed" | "rejected") => {
     const operation = audit(env, "phone", device.device_id, "inbound_offer.claim", input.offerId, outcome);
-    if (fast) {
+    if (fast && ctx) {
+      // Audit is best-effort accounting, never an authorization or delivery gate.
+      // Keep it alive after the response; callers without a context must await it.
       const background = operation.catch(() => { console.warn("Inbound claim audit failed"); });
-      ctx?.waitUntil(background);
+      ctx.waitUntil(background);
     } else await operation;
   };
   if (!offer) {
@@ -522,21 +543,23 @@ async function claimInboundOffer(request: Request, env: Env, timing: ClaimTiming
   // Past the atomic UPDATE the row is 'claimed'; any failure below must mark it
   // failed instead of stranding an unclaimable row.
   try {
-    let candidate: Preparation | null = null;
-    if (input.prepareId && env.INBOUND_PRECONNECT_ENABLED === "true" && offer.preconnect_enabled) {
-      candidate = await timing.measure("prepare_read", () => env.DB.prepare(`SELECT * FROM inbound_preparations WHERE prepare_id = ?1
-        AND offer_id = ?2 AND device_id = ?3 AND state = 'prepared' AND expires_at > ?4`)
-        .bind(input.prepareId, input.offerId, device.device_id, now).first<Preparation>());
-      const presence = await edgeRoom(env, offer.edge_id).fetch("https://edge-room/presence");
-      const capability = await presence.json() as { connected?: boolean; inboundPreconnectV1?: boolean };
-      if (!capability.connected || !capability.inboundPreconnectV1) candidate = null;
-    }
+    const candidate = offer.preconnect_enabled ? prepared : null;
     let reuse = false;
+    let reuseTokens: [string, string] | undefined;
     if (candidate && offer.edge_identity && candidate.room_name === offer.room_name) {
-      try {
-        await timing.measure("permission", () => participantRequest(env, "UpdateParticipant", candidate.room_name, candidate.participant_identity, true));
+      // Local signing is independent of the admin API. Keep tokens private until
+      // permission, durable finalization and delivery succeed. Settle all work so
+      // even a signing error cannot leave promotion running past cold fallback.
+      const [permission, edgeToken, phoneToken] = await Promise.allSettled([
+        timing.measure("permission", () => participantRequest(env, "UpdateParticipant", candidate.room_name, candidate.participant_identity, true)),
+        timing.measure("edge_token", () => issueParticipantToken(env, candidate.room_name, offer.edge_identity!)),
+        timing.measure("phone_token", () => issueParticipantToken(env, candidate.room_name, candidate.participant_identity))
+      ]);
+      if (permission.status === "fulfilled" && edgeToken.status === "fulfilled" && phoneToken.status === "fulfilled") {
         reuse = true;
-      } catch { /* An ambiguous timeout must never reuse this identity. */ }
+        reuseTokens = [edgeToken.value, phoneToken.value];
+      }
+      // An ambiguous timeout must never reuse this identity.
     }
     if (reuse && candidate) {
       roomName = candidate.room_name;
@@ -544,24 +567,25 @@ async function claimInboundOffer(request: Request, env: Env, timing: ClaimTiming
       edgeIdentity = offer.edge_identity!;
     }
     // A revoke/failed Edge ACK racing the admin API must win over its late result.
-    const current = !input.prepareId || await timing.measure("claim_finalize", () => env.DB.prepare(`UPDATE inbound_offers SET room_name = ?1, phone_identity = ?2, edge_identity = ?3
+    const finalize = () => env.DB.prepare(`UPDATE inbound_offers SET room_name = ?1, phone_identity = ?2, edge_identity = ?3
       WHERE offer_id = ?4 AND claim_id = ?5 AND status = 'claimed' RETURNING offer_id`)
-      .bind(roomName, phoneIdentity, edgeIdentity, offer.offer_id, claimId).first());
+      .bind(roomName, phoneIdentity, edgeIdentity, offer.offer_id, claimId);
+    // Do not defer these writes: the alarm needs durable loser states and cold
+    // identities even if waitUntil is interrupted. One transaction also prevents
+    // a sweep from observing a winner state without its finalized identities.
+    const current = offer.preconnect_enabled
+      ? (await timing.measure("claim_finalize", () => env.DB.batch([
+        finalize(),
+        invalidateCandidatesStatement(env, offer.offer_id, reuse ? candidate!.prepare_id : undefined),
+        ...(!reuse ? [participantCleanupStatement(env, offer, roomName, edgeIdentity),
+          participantCleanupStatement(env, offer, roomName, phoneIdentity)] : [])
+      ])))[0]?.results[0]
+      : !input.prepareId || await timing.measure("claim_finalize", () => finalize().first());
     if (!current) throw new HttpError("OFFER_UNAVAILABLE", "Offer ended during claim", 409);
-    if (offer.preconnect_enabled) {
-      await timing.measure("candidates", () => invalidateCandidates(env, offer.offer_id, reuse ? candidate!.prepare_id : undefined));
-      ctx?.waitUntil(edgeRoom(env, offer.edge_id).fetch("https://edge-room/preconnect-cleanup", { method: "POST" }));
-    }
-    const [edgeToken, signedPhoneToken] = fast ? await Promise.all([
+    const [edgeToken, signedPhoneToken] = reuseTokens ?? (fast ? await Promise.all([
       timing.measure("edge_token", () => issueParticipantToken(env, roomName, edgeIdentity)),
       timing.measure("phone_token", () => issueParticipantToken(env, roomName, phoneIdentity))
-    ]) : [await timing.measure("edge_token", () => issueParticipantToken(env, roomName, edgeIdentity)), null];
-    if (offer.preconnect_enabled && !reuse) {
-      await timing.measure("cleanup_queue", () => Promise.all([
-        queueParticipantCleanup(env, offer, roomName, edgeIdentity),
-        queueParticipantCleanup(env, offer, roomName, phoneIdentity)
-      ]));
-    }
+    ]) : [await timing.measure("edge_token", () => issueParticipantToken(env, roomName, edgeIdentity)), null]);
     const command = {
       v: 1,
       type: "inbound.claim",
@@ -589,12 +613,23 @@ async function claimInboundOffer(request: Request, env: Env, timing: ClaimTiming
     }
     const phoneToken = signedPhoneToken ?? await timing.measure("phone_token", () => issueParticipantToken(env, roomName, phoneIdentity));
     if (offer.preconnect_enabled) {
+      // This is a response correctness fence, not accounting: a revoke/failed
+      // ACK during Edge delivery must still return 409, never a usable session.
       const active = await timing.measure("claim_check", () => env.DB.prepare(`SELECT offer_id FROM inbound_offers
         WHERE offer_id = ?1 AND claim_id = ?2 AND status IN ('claimed', 'edge_ready')`)
         .bind(offer.offer_id, claimId).first());
       if (!active) throw new HttpError("OFFER_UNAVAILABLE", "Offer ended during claim", 409);
     }
     await timing.measure("audit", () => recordAudit("allowed"));
+    if (offer.preconnect_enabled) {
+      // Only execution is deferred: durable cleanup above plus the offer's
+      // already-armed DO alarm guarantee retry if this eager sweep is interrupted.
+      // Start after delivery/check so the sweep does not contend with the claim.
+      const cleanup = edgeRoom(env, offer.edge_id).fetch("https://edge-room/preconnect-cleanup", { method: "POST" })
+        .catch(() => { console.warn("Inbound claim cleanup wake failed"); });
+      if (ctx) ctx.waitUntil(cleanup);
+      else await cleanup;
+    }
     return json({
       claimId,
       offerId: offer.offer_id,
