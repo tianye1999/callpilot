@@ -26,10 +26,14 @@ final class CallMediaSession {
     private var activationRequested = false
     private var microphoneStarted = false
     private var setupTask: Task<Void, Error>?
+    // Answer setup replaces setupTask; retain silent work for cancellation and drain.
+    private var silentSetupTask: Task<Void, Error>?
+    private var silentPreconnectPending = false
     private var microphoneTask: Task<Void, Error>?
     private var controlTasks: [UUID: Task<Void, Error>] = [:]
     private var cleanupTask: Task<Void, Never>?
     static let hangupBudget: Duration = .milliseconds(2500)
+    static let preconnectWaitTimeout: Duration = .seconds(3)
     private let hangupBudget: Duration
     let timing: CallTiming
     private var timingTask: Task<Void, Never>?
@@ -54,7 +58,9 @@ final class CallMediaSession {
     func startSilentPreconnect(client: HostedCloudClient, offer: InboundOffer) async {
         guard let attempt = beginAttempt(label: L10n.text("call.takeover.label"), mode: .callKit) else { return }
         silentOfferId = offer.offerId
+        silentPreconnectPending = true
         let task = Task {
+            defer { silentPreconnectPending = false }
             try checkCurrent(attempt)
             async let acquiring: Void = acquireSilentAudioLease(for: attempt)
             // Start the request before the lease's synchronous native audio preparation.
@@ -91,9 +97,23 @@ final class CallMediaSession {
             preconnectReady = true
             timing.mark(.preconnectReady)
         }
+        silentSetupTask = task
         setupTask = task
         _ = await task.result
+        silentSetupTask = nil
         // Failure is silent. Answer can still use the cold path, with the same lease.
+    }
+
+    private func waitForSilentPreconnect(for attempt: UInt64) async throws {
+        let deadline = ContinuousClock.now.advanced(by: Self.preconnectWaitTimeout)
+        // Do not await the SDK task directly: it may ignore cancellation.
+        while silentPreconnectPending && !preconnectReady {
+            try checkCurrent(attempt)
+            let remaining = ContinuousClock.now.duration(to: deadline)
+            guard remaining > .zero else { break }
+            try await Task.sleep(for: min(.milliseconds(20), remaining))
+        }
+        try checkCurrent(attempt)
     }
 
     private func acquireSilentAudioLease(for attempt: UInt64) async throws {
@@ -179,10 +199,13 @@ final class CallMediaSession {
         claimStarted = true
         connectedHandler = onConnected
         let task = Task {
+            if silentTask != nil { try await waitForSilentPreconnect(for: attempt) }
+            try checkCurrent(attempt)
             let candidate = preconnectReady ? preparation : nil
             if silentOfferId != nil && candidate == nil {
                 timing.mark(.coldFallback)
                 await closeSilentTransport(silentTask)
+                try checkCurrent(attempt)
             }
             if !audioLeaseAcquired {
                 timing.mark(.audioLeaseStart)
@@ -463,6 +486,8 @@ final class CallMediaSession {
         case let .disconnected(reason):
             if silentOfferId != nil && !claimAccepted {
                 preconnectReady = false
+                silentPreconnectPending = false
+                silentSetupTask?.cancel()
                 if !claimStarted {
                     onSilentDisconnect?()
                     terminate(state: nil)
@@ -516,15 +541,18 @@ final class CallMediaSession {
         isStopped = true
         generation &+= 1
         let setup = setupTask
+        let silentSetup = silentSetupTask
         let microphone = microphoneTask
         let controls = Array(controlTasks.values)
         let telemetry = timingTask
         telemetry?.cancel()
         timingTask = nil
         setup?.cancel()
+        silentSetup?.cancel()
         microphone?.cancel()
         controls.forEach { $0.cancel() }
         setupTask = nil
+        silentSetupTask = nil
         microphoneTask = nil
         controlTasks.removeAll()
         connectedHandler = nil
@@ -545,6 +573,7 @@ final class CallMediaSession {
             // Disconnect unblocks SDK waits; cancellation alone cannot cancel
             // the SDK's unstructured concurrent-mic child task.
             _ = await setup?.result
+            _ = await silentSetup?.result
             _ = await microphone?.result
             for control in controls { _ = await control.result }
             await telemetry?.value

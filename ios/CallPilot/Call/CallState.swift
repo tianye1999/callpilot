@@ -26,8 +26,7 @@ enum CallState: Equatable {
         }
     }
 
-    /// Keeps the call surface visible through terminal states until the user
-    /// explicitly acknowledges the result.
+    /// Keeps the call surface visible until the result is dismissed.
     var isCallPresented: Bool {
         self != .idle
     }
@@ -59,6 +58,11 @@ struct CallAttemptStateMachine {
     func isWaitingForMedia(_ attempt: CallAttempt) -> Bool {
         guard isCurrent(attempt), case .waitingMedia = state else { return false }
         return true
+    }
+
+    func isCurrentEndedResult(_ expectedState: CallState, for attempt: CallAttempt) -> Bool {
+        guard isCurrent(attempt), case .ended = state else { return false }
+        return state == expectedState
     }
 
     @discardableResult

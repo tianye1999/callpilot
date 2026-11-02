@@ -26,6 +26,8 @@ final class AppModel: ObservableObject {
     private var dismissedOffers = Set<String>()
     private var media: CallMediaSession?
     private var mediaTimeoutTask: Task<Void, Never>?
+    private var callResultTask: Task<Void, Never>?
+    private let endedResultDisplayDuration: Duration = .seconds(5)
     private var callKitOfferId: String?
     private var pendingAudioAttempt: (attempt: CallAttempt, label: String)?
     private var callAttempts = CallAttemptStateMachine()
@@ -329,8 +331,23 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func scheduleCallResultDismissal(for attempt: CallAttempt, state: CallState) {
+        callResultTask?.cancel()
+        callResultTask = nil
+        guard case .ended = state else { return }
+        let duration = endedResultDisplayDuration
+        callResultTask = Task { [weak self] in
+            do { try await Task.sleep(for: duration) }
+            catch { return }
+            guard let self, callAttempts.isCurrentEndedResult(state, for: attempt) else { return }
+            dismissCallResult()
+        }
+    }
+
     func dismissCallResult() {
         guard callAttempts.resetTerminal() else { return }
+        callResultTask?.cancel()
+        callResultTask = nil
         callState = .idle
         media = nil
         callKitOfferId = nil
@@ -358,6 +375,8 @@ final class AppModel: ObservableObject {
 
     private func beginCallAttempt(with initialState: CallState) -> CallAttempt {
         mediaTimeoutTask?.cancel()
+        callResultTask?.cancel()
+        callResultTask = nil
         callKitOfferId = nil
         let attempt = callAttempts.begin(with: initialState)
         speakerphoneEnabled = false
@@ -423,6 +442,7 @@ final class AppModel: ObservableObject {
             for: attempt
         ) else { return false }
         callState = nextState
+        scheduleCallResultDismissal(for: attempt, state: nextState)
         switch nextState {
         case .failed, .ended, .inCall:
             mediaTimeoutTask?.cancel()
@@ -464,6 +484,8 @@ extension AppModel: CallKitCoordinatorDelegate {
     }
 
     func callKitDidReceiveOffer(_ offer: InboundOffer) {
+        // A background CallKit hangup leaves the result unacknowledged.
+        dismissCallResult()
         guard callKitCanAcceptIncomingCall,
               !dismissedOffers.contains(offer.offerId) else { return }
         incomingOffer = offer
@@ -495,6 +517,7 @@ extension AppModel: CallKitCoordinatorDelegate {
     }
 
     func callKitDidRequestAnswer(_ offer: InboundOffer) {
+        dismissCallResult()
         guard callKitCanAcceptIncomingCall else {
             callKit.finishActiveCall(reason: .failed)
             return

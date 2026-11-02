@@ -2,6 +2,59 @@ import XCTest
 @testable import CallPilot
 
 final class CallStateTests: XCTestCase {
+    func testEndedDismissalRequiresSameAttemptAndExactEndedState() {
+        var machine = CallAttemptStateMachine()
+        let ended = CallState.ended(label: "previous", reason: "local_hangup")
+        let attempt = machine.begin(with: ended)
+        XCTAssertTrue(machine.isCurrentEndedResult(ended, for: attempt))
+        XCTAssertTrue(machine.transition(to: .ended(label: "previous", reason: "remote_hangup"), for: attempt))
+        XCTAssertFalse(machine.isCurrentEndedResult(ended, for: attempt))
+        let failed = CallState.failed(label: "previous", reason: "network", code: nil)
+        XCTAssertTrue(machine.transition(to: failed, for: attempt))
+        XCTAssertFalse(machine.isCurrentEndedResult(failed, for: attempt))
+        XCTAssertFalse(machine.isCurrentEndedResult(ended, for: attempt))
+    }
+
+    func testEndedDismissalCannotAffectManualResetOrReplacementCall() {
+        for resetBeforeNextCall in [false, true] {
+            var machine = CallAttemptStateMachine()
+            let ended = CallState.ended(label: "call", reason: "ended")
+            let old = machine.begin(with: ended)
+            if resetBeforeNextCall {
+                XCTAssertTrue(machine.resetTerminal())
+                XCTAssertFalse(machine.isCurrentEndedResult(ended, for: old))
+            }
+            let next = machine.begin(with: .preparing(label: "call"))
+            XCTAssertFalse(machine.isCurrentEndedResult(ended, for: old))
+            XCTAssertTrue(machine.transition(to: ended, for: next))
+            XCTAssertFalse(machine.isCurrentEndedResult(ended, for: old))
+            XCTAssertTrue(machine.isCurrentEndedResult(ended, for: next))
+        }
+    }
+
+    func testIncomingResetOnlyClearsTerminalStatesAndFencesTheirCallbacks() {
+        let states: [CallState] = [
+            .idle, .preparing(label: "previous"), .waitingMedia(label: "previous"),
+            .dialing(number: "test-number"), .inCall(label: "previous"),
+            .ended(label: "previous", reason: "local_hangup"),
+            .failed(label: "previous", reason: "timeout", code: "MEDIA_TIMEOUT"),
+        ]
+        for state in states {
+            var machine = CallAttemptStateMachine()
+            let previous = machine.begin(with: state)
+            XCTAssertEqual(machine.resetTerminal(), state.isTerminal, "\(state)")
+            XCTAssertEqual(machine.state, state.isTerminal ? .idle : state)
+            XCTAssertEqual(machine.isCurrent(previous), !state.isTerminal)
+            XCTAssertEqual(machine.state == .idle, !state.isActive)
+            if state.isTerminal {
+                XCTAssertFalse(machine.state.isCallPresented)
+                XCTAssertFalse(machine.transition(to: state, for: previous))
+                let incoming = machine.begin(with: .preparing(label: "incoming"))
+                XCTAssertTrue(machine.isCurrent(incoming))
+            }
+        }
+    }
+
     func testTerminalStatesAreNotActive() {
         // Android parity: CallManagerTest uses the same active-state gate before every startCall.
         XCTAssertFalse(CallState.idle.isActive)

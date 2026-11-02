@@ -2,6 +2,59 @@ import Foundation
 import XCTest
 
 final class CallKitConfigurationTests: XCTestCase {
+    func testEndedResultTimerUsesFiveSecondsAndFencesDismissal() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("let endedResultDisplayDuration: Duration = .seconds(5)"))
+        let timer = try section(source, from: "private func scheduleCallResultDismissal", to: "func dismissCallResult()")
+        try assertBefore("callResultTask?.cancel()", "guard case .ended = state else { return }", in: timer)
+        XCTAssertTrue(timer.contains("Task { [weak self]"))
+        XCTAssertTrue(timer.contains("let duration = endedResultDisplayDuration"))
+        try assertBefore("try await Task.sleep(for: duration)", "callAttempts.isCurrentEndedResult(state, for: attempt)", in: timer)
+        try assertBefore("callAttempts.isCurrentEndedResult(state, for: attempt)", "dismissCallResult()", in: timer)
+        let apply = try section(source, from: "private func apply(", to: "private func registerCurrentVoipToken")
+        try assertBefore("callState = nextState", "scheduleCallResultDismissal(for: attempt, state: nextState)", in: apply)
+        let reset = try section(source, from: "func dismissCallResult()", to: "func hangup()")
+        XCTAssertTrue(reset.contains("callResultTask?.cancel()"))
+        let begin = try section(source, from: "private func beginCallAttempt", to: "private func canBeginAudio")
+        XCTAssertTrue(begin.contains("callResultTask?.cancel()"))
+    }
+
+    func testIncomingOfferResetsTerminalResultBeforeAdmissionAndPreconnectDecision() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8
+        )
+        let offer = try section(source, from: "func callKitDidReceiveOffer", to: "func callKitDidRequestAnswer")
+        try assertBefore("dismissCallResult()", "guard callKitCanAcceptIncomingCall", in: offer)
+        try assertBefore("guard callKitCanAcceptIncomingCall", "incomingOffer = offer", in: offer)
+        try assertBefore("incomingOffer = offer", "if claimPrewarmer.canPreconnect", in: offer)
+        XCTAssertTrue(offer.contains("session.startSilentPreconnect(client: client, offer: offer)"))
+        XCTAssertTrue(offer.contains("claimPrewarmer.receive(offer)"))
+    }
+
+    func testAnswerResetsTerminalResultBeforeFailureGuardAndTakeover() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8
+        )
+        let answer = try section(source, from: "func callKitDidRequestAnswer", to: "func callKitDidRequestDecline")
+        try assertBefore("dismissCallResult()", "guard callKitCanAcceptIncomingCall", in: answer)
+        try assertBefore("guard callKitCanAcceptIncomingCall", "callKit.finishActiveCall(reason: .failed)", in: answer)
+        XCTAssertTrue(answer.contains("performTakeover(offer, usesCallKit: true, timing: timing)"))
+
+        let acceptance = try section(source, from: "var callKitCanAcceptIncomingCall:", to: "func callKitDidUpdateToken")
+        XCTAssertTrue(acceptance.contains("pairing != nil && client != nil && callState == .idle"))
+        let reset = try section(source, from: "func dismissCallResult()", to: "func hangup()")
+        try assertBefore("guard callAttempts.resetTerminal() else { return }", "callState = .idle", in: reset)
+        for assignment in ["media = nil", "callKitOfferId = nil", "speakerphoneEnabled = false"] {
+            XCTAssertTrue(reset.contains(assignment))
+        }
+        XCTAssertFalse(reset.contains("media?.cancel"))
+        XCTAssertFalse(reset.contains("mediaTimeoutTask?.cancel"))
+        XCTAssertFalse(reset.contains(".stop("))
+        XCTAssertFalse(reset.contains("finishActiveCall"))
+    }
+
     func testAppHangupRegistersIntentWithoutAnAsynchronousActorHop() throws {
         let source = try String(
             contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8
