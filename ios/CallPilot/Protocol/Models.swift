@@ -50,6 +50,13 @@ enum ApnsEnvironment: String, Equatable {
 struct HostedDeviceStatus: Equatable {
     let connected: Bool
     let modemOnline: Bool
+    let claimPrewarm: Bool
+
+    init(connected: Bool, modemOnline: Bool, claimPrewarm: Bool = false) {
+        self.connected = connected
+        self.modemOnline = modemOnline
+        self.claimPrewarm = claimPrewarm
+    }
 
     /// 是否允许拨号/接管:电脑端在线且模组在线(对齐 Android connected && modemOnline)。
     var lineReady: Bool { connected && modemOnline }

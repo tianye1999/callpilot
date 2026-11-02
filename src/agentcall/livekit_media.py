@@ -220,6 +220,7 @@ class LiveKitRemoteMediaEndpoint:
             self._issued.edge_token,
             rtc.RoomOptions(connect_timeout=self._connect_timeout_seconds),
         )
+        self._timing.mark("room_connect_return")
 
         source = rtc.AudioSource(
             REMOTE_AUDIO_RATE,
@@ -230,6 +231,7 @@ class LiveKitRemoteMediaEndpoint:
         track = rtc.LocalAudioTrack.create_audio_track("phone-downlink", source)
         options = rtc.TrackPublishOptions()
         options.source = rtc.TrackSource.SOURCE_MICROPHONE
+        self._timing.mark("downlink_publish_start")
         await room.local_participant.publish_track(track, options)
         self._timing.mark("downlink_published")
         self._publisher_task = asyncio.create_task(self._publish_modem_audio())

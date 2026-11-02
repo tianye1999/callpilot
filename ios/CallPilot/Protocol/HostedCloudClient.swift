@@ -74,7 +74,19 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         let edge = payload["edge"] as? [String: Any]
         let connected = edge?["connected"] as? Bool ?? false
         let modemOnline = edge?["modemOnline"] as? Bool ?? false
-        return HostedDeviceStatus(connected: connected, modemOnline: modemOnline)
+        let features = payload["features"] as? [String: Any]
+        let prewarm = features?["claimPrewarm"] as? NSNumber
+        let enabled = prewarm.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
+        return HostedDeviceStatus(connected: connected, modemOnline: modemOnline, claimPrewarm: enabled)
+    }
+
+    func prewarmClaimConnection() async {
+        var request = URLRequest(url: base.appendingPathComponent("healthz"),
+                                 cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
+        request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        _ = try? await urlSession.data(for: request)
     }
 
     // MARK: - PushKit token
@@ -184,12 +196,18 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     }
 
     /// claim 一个 offer,成功即拿到入房凭证(first-claim-wins,输家 409)。
-    func claimInboundOffer(offerId: String) async throws -> HostedCallSession {
+    func claimInboundOffer(offerId: String, timing: CallTiming? = nil) async throws -> HostedCallSession {
         guard offerId.wholeMatch(of: Self.offerIdRE) != nil else {
             throw HostedCloudError(statusCode: 0, code: "BAD_OFFER_ID", message: "offer id 格式不合法")
         }
         let body = try JSONSerialization.data(withJSONObject: ["offerId": offerId])
-        let (payload, response) = try await request("POST", "v1/inbound-offers/claim", body: body)
+        let metrics = timing.map { _ in ClaimNetworkMetrics() }
+        defer {
+            if let timing, let metrics {
+                for (stage, instant) in metrics.marks { timing.mark(stage, at: instant) }
+            }
+        }
+        let (payload, response) = try await request("POST", "v1/inbound-offers/claim", body: body, metrics: metrics)
         guard let claimId = payload["claimId"] as? String,
               claimId.wholeMatch(of: Self.claimIdRE) != nil,
               let echoed = payload["offerId"] as? String, echoed == offerId,
@@ -291,7 +309,7 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     // MARK: - 内部
 
     private func request(
-        _ method: String, _ path: String, body: Data? = nil
+        _ method: String, _ path: String, body: Data? = nil, metrics: ClaimNetworkMetrics? = nil
     ) async throws -> ([String: Any], HTTPURLResponse) {
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = method
@@ -305,7 +323,7 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = body
         }
-        let (data, http) = try await perform(req)
+        let (data, http) = try await perform(req, metrics: metrics)
         let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         return (obj, http)
     }
@@ -358,8 +376,8 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         }
     }
 
-    private func perform(_ req: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let (data, response) = try await urlSession.data(for: req)
+    private func perform(_ req: URLRequest, metrics: ClaimNetworkMetrics? = nil) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await urlSession.data(for: req, delegate: metrics)
         guard let http = response as? HTTPURLResponse else {
             throw HostedCloudError(statusCode: 0, code: "NO_HTTP_RESPONSE", message: "无 HTTP 响应")
         }

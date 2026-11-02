@@ -85,7 +85,7 @@ final class CallMediaSession {
             try await audio.acquire(ownerID, mode: mode)
             try checkCurrent(attempt)
             timing.startClaim()
-            let session = try await client.claimInboundOffer(offerId: offerId)
+            let session = try await client.claimInboundOffer(offerId: offerId, timing: timing)
             timing.mark(.claimResponse)
             try checkCurrent(attempt)
             preparedSession = session

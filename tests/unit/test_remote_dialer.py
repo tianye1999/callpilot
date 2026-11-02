@@ -944,13 +944,63 @@ def test_livekit_records_connect_publish_join_subscription_and_first_frame_once(
             await _wait_for(lambda: any(event["stage"] == "edge_phone_first_frame" for event in events))
 
             assert [event["stage"] for event in events] == [
-                "edge_endpoint_connect_start", "edge_downlink_published", "edge_endpoint_connect_return",
+                "edge_endpoint_connect_start", "edge_room_connect_return", "edge_downlink_publish_start",
+                "edge_downlink_published", "edge_endpoint_connect_return",
                 "edge_phone_joined", "edge_phone_track_subscribed", "edge_media_ready", "edge_phone_first_frame",
             ]
             assert all(set(event) == {"type", "stage", "ms"} for event in events)
             assert [event["ms"] for event in events] == sorted(event["ms"] for event in events)
             assert endpoint.media_ready
         finally:
+            await endpoint.close()
+
+    asyncio.run(run())
+
+
+def test_livekit_room_connect_and_downlink_publish_marks_match_await_boundaries(monkeypatch) -> None:
+    async def run() -> None:
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud", api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32", public_url="https://dial.callpilot.example/",
+        )
+        events = []
+        record = SimpleNamespace(log_event=lambda event_type, **fields: events.append({"type": event_type, **fields}))
+        room_entered, room_release = asyncio.Event(), asyncio.Event()
+        publish_entered, publish_release = asyncio.Event(), asyncio.Event()
+        connect = _FakeLiveKitRoom.connect
+        publish_track = _FakeLiveKitParticipant.publish_track
+
+        async def blocked_connect(room, url, token, options):
+            await connect(room, url, token, options)
+            room_entered.set()
+            await room_release.wait()
+
+        async def blocked_publish(participant, track, options):
+            publish_entered.set()
+            await publish_release.wait()
+            await publish_track(participant, track, options)
+
+        monkeypatch.setattr(_FakeLiveKitRoom, "connect", blocked_connect)
+        monkeypatch.setattr(_FakeLiveKitParticipant, "publish_track", blocked_publish)
+        endpoint = LiveKitRemoteMediaEndpoint(issued, rtc_module=_fake_rtc_module())
+        endpoint.set_timing(CallTiming(record))
+        task = asyncio.create_task(endpoint.connect())
+        try:
+            await asyncio.wait_for(room_entered.wait(), timeout=0.5)
+            assert [event["stage"] for event in events] == ["edge_endpoint_connect_start"]
+            room_release.set()
+            await asyncio.wait_for(publish_entered.wait(), timeout=0.5)
+            assert [event["stage"] for event in events] == [
+                "edge_endpoint_connect_start", "edge_room_connect_return", "edge_downlink_publish_start",
+            ]
+            publish_release.set()
+            await asyncio.wait_for(task, timeout=0.5)
+            assert [event["stage"] for event in events][-2:] == [
+                "edge_downlink_published", "edge_endpoint_connect_return",
+            ]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
             await endpoint.close()
 
     asyncio.run(run())

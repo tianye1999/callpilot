@@ -14,6 +14,7 @@ export interface Env {
   APP_REVIEW_PAIRING_ENABLED?: string;
   VOIP_PUSH_ENABLED?: string;
   ALERT_PUSH_ENABLED?: string;
+  CLAIM_PREWARM_ENABLED?: string;
   APNS_TEAM_ID?: string;
   APNS_KEY_ID?: string;
   APNS_PRIVATE_KEY?: string;

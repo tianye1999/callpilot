@@ -33,6 +33,7 @@ final class AppModel: ObservableObject {
     private let callHistoryStore = FileCallHistoryCacheStore()
     private var deviceStatusMachine = DeviceStatusStateMachine()
     private let callKit = CallKitCoordinator()
+    private let claimPrewarmer = ClaimPrewarmer()
 
     // 接管媒体超时(对齐 Android takeoverMediaTimeoutMs;真机实证:失败会话不复位会挡后续 offer)。
     private let takeoverMediaTimeout: Duration = .seconds(20)
@@ -50,11 +51,13 @@ final class AppModel: ObservableObject {
     private func rebuildClient() {
         resetDeviceStatus()
         guard let p = pairing else {
+            claimPrewarmer.clear()
             client = nil
             messageInbox = nil
             callHistory = nil
             return
         }
+        claimPrewarmer.bind(gatewayURL: p.gatewayURL, deviceId: p.credential.deviceId)
         client = try? HostedCloudClient(baseURL: p.gatewayURL).also { $0.credential = p.credential }
         if let client {
             messageInbox = MessageInboxModel(
@@ -106,6 +109,7 @@ final class AppModel: ObservableObject {
         messageInbox?.clearLocalData()
         callHistory?.clearLocalData()
         store.clear()
+        claimPrewarmer.clear()
         pairing = nil
         client = nil
         messageInbox = nil
@@ -189,6 +193,7 @@ final class AppModel: ObservableObject {
             let status = try await currentClient.deviceStatus()
             guard currentClient === client,
                   deviceStatusMachine.succeed(status, for: refresh) else { return }
+            claimPrewarmer.setEnabled(status.claimPrewarm)
         } catch {
             guard currentClient === client else { return }
             if error is CancellationError
@@ -429,6 +434,9 @@ extension AppModel: CallKitCoordinatorDelegate {
         guard callKitCanAcceptIncomingCall,
               !dismissedOffers.contains(offer.offerId) else { return }
         incomingOffer = offer
+        if let client {
+            claimPrewarmer.receive(offer) { await client.prewarmClaimConnection() }
+        }
     }
 
     func callKitDidRequestAnswer(_ offer: InboundOffer) {
@@ -436,7 +444,7 @@ extension AppModel: CallKitCoordinatorDelegate {
             callKit.finishActiveCall(reason: .failed)
             return
         }
-        let timing = CallTiming()
+        let timing = claimPrewarmer.timing(for: offer.offerId) ?? CallTiming()
         timing.mark(.answerAction)
         Task { await performTakeover(offer, usesCallKit: true, timing: timing) }
     }

@@ -750,7 +750,7 @@ try {
   assert.equal(revokedInFlight.status, 401);
   assert.equal((await revokedInFlight.json()).error.code, "UNAUTHORIZED");
   const afterRevoke = await fetch(`${base}/api/device`, { headers: { Cookie: cookie } });
-  assert.deepEqual(await afterRevoke.json(), { ok: true, paired: false });
+  assert.deepEqual(await afterRevoke.json(), { ok: true, paired: false, features: { claimPrewarm: false } });
 
   const revokedContentRead = await fetch(`${base}/v1/messages`, {
     headers: { Cookie: cookie }

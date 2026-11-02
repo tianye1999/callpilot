@@ -1,4 +1,5 @@
 import { authenticateDevice, authenticateEdge } from "./auth";
+import { ClaimTiming } from "./claim-timing";
 import {
   contentReadEnabled,
   contentRelayTimeoutMs
@@ -48,24 +49,30 @@ const COOKIE_MAX_AGE = 180 * 24 * 60 * 60;
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
+    const timing = request.method === "POST" && path.replace(/\/$/, "") === "/v1/inbound-offers/claim"
+      ? new ClaimTiming() : undefined;
     const requestId = randomId(
       path.startsWith("/v1/messages") || path.startsWith("/v1/call-records") ? "request" : "req",
       12
     );
+    let response: Response;
     try {
-      return await route(request, env, requestId);
+      response = await route(request, env, requestId, timing);
     } catch (caught) {
       if (caught instanceof HttpError) {
-        return error(caught.code, caught.message, caught.status, requestId, caught.headers);
+        response = error(caught.code, caught.message, caught.status, requestId, caught.headers);
+      } else if (caught instanceof ZodError) {
+        response = error("VALIDATION_ERROR", "Request fields are invalid", 400, requestId);
+      } else {
+        console.error(JSON.stringify({ requestId, errorType: caught instanceof Error ? caught.name : "unknown" }));
+        response = error("INTERNAL_ERROR", "The request could not be completed", 500, requestId);
       }
-      if (caught instanceof ZodError) return error("VALIDATION_ERROR", "Request fields are invalid", 400, requestId);
-      console.error(JSON.stringify({ requestId, errorType: caught instanceof Error ? caught.name : "unknown" }));
-      return error("INTERNAL_ERROR", "The request could not be completed", 500, requestId);
     }
+    return timing ? timing.finish(response) : response;
   }
 };
 
-async function route(request: Request, env: Env, requestId: string): Promise<Response> {
+async function route(request: Request, env: Env, requestId: string, timing?: ClaimTiming): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/$/, "") || "/";
 
@@ -101,7 +108,7 @@ async function route(request: Request, env: Env, requestId: string): Promise<Res
     return listInboundOffers(request, env);
   }
   if (path === "/v1/inbound-offers/claim" && request.method === "POST") {
-    return claimInboundOffer(request, env);
+    return claimInboundOffer(request, env, timing!);
   }
   if (path === "/v1/messages" && request.method === "GET") {
     return relayContentRead(request, env, "messages.list", undefined);
@@ -264,18 +271,20 @@ async function claimPairing(request: Request, env: Env): Promise<Response> {
 }
 
 async function getDevice(request: Request, env: Env): Promise<Response> {
+  const features = { claimPrewarm: env.CLAIM_PREWARM_ENABLED === "true" };
   try {
     const device = await authenticateDevice(request, env);
     const response = await edgeRoom(env, device.edge_id).fetch("https://edge-room/presence");
     return json({
       ok: true,
       paired: true,
+      features,
       capabilities: await contentCapabilities(env, device.edge_id),
       device: { deviceId: device.device_id, edgeId: device.edge_id, displayName: device.display_name },
       edge: await response.json()
     });
   } catch (caught) {
-    if (caught instanceof HttpError && caught.status === 401) return json({ ok: true, paired: false });
+    if (caught instanceof HttpError && caught.status === 401) return json({ ok: true, paired: false, features });
     throw caught;
   }
 }
@@ -457,14 +466,14 @@ async function listInboundOffers(request: Request, env: Env): Promise<Response> 
   });
 }
 
-async function claimInboundOffer(request: Request, env: Env): Promise<Response> {
+async function claimInboundOffer(request: Request, env: Env, timing: ClaimTiming): Promise<Response> {
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
-  const device = await authenticateDevice(request, env);
+  const device = await timing.measure("auth", () => authenticateDevice(request, env));
   const input = claimInboundOfferSchema.parse(await readJson(request));
 
-  const offer = await env.DB.prepare(
+  const offer = await timing.measure("offer_read", () => env.DB.prepare(
     "SELECT * FROM inbound_offers WHERE offer_id = ?1"
-  ).bind(input.offerId).first<InboundOfferRecord>();
+  ).bind(input.offerId).first<InboundOfferRecord>());
   if (!offer || offer.edge_id !== device.edge_id) {
     throw new HttpError("NOT_FOUND", "Offer not found", 404);
   }
@@ -479,18 +488,18 @@ async function claimInboundOffer(request: Request, env: Env): Promise<Response> 
   const edgeIdentity = randomId("edgepart", 12);
   // First-claim-wins: the conditional UPDATE is the atomic arbiter. A loser
   // (double claim, expired or revoked offer) changes zero rows.
-  const claimed = await env.DB.prepare(
+  const claimed = await timing.measure("cas", () => env.DB.prepare(
     "UPDATE inbound_offers SET status = 'claimed', claim_id = ?1, claimed_device_id = ?2, room_name = ?3, phone_identity = ?4, edge_identity = ?5, updated_at = ?6 WHERE offer_id = ?7 AND status = 'offered' AND expires_at > ?6"
-  ).bind(claimId, device.device_id, roomName, phoneIdentity, edgeIdentity, now, input.offerId).run();
+  ).bind(claimId, device.device_id, roomName, phoneIdentity, edgeIdentity, now, input.offerId).run());
   if (!claimed.meta.changes) {
-    await audit(env, "phone", device.device_id, "inbound_offer.claim", input.offerId, "rejected");
+    await timing.measure("audit", () => audit(env, "phone", device.device_id, "inbound_offer.claim", input.offerId, "rejected"));
     throw new HttpError("OFFER_UNAVAILABLE", "Offer already claimed, expired or revoked", 409);
   }
 
   // Past the atomic UPDATE the row is 'claimed'; any failure below must mark it
   // failed instead of stranding an unclaimable row.
   try {
-    const edgeToken = await issueParticipantToken(env, roomName, edgeIdentity);
+    const edgeToken = await timing.measure("edge_token", () => issueParticipantToken(env, roomName, edgeIdentity));
     const command = {
       v: 1,
       type: "inbound.claim",
@@ -509,15 +518,15 @@ async function claimInboundOffer(request: Request, env: Env): Promise<Response> 
         token: edgeToken
       }
     };
-    const delivered = await edgeRoom(env, offer.edge_id).fetch("https://edge-room/command", {
+    const delivered = await timing.measure("edge_send", () => edgeRoom(env, offer.edge_id).fetch("https://edge-room/command", {
       method: "POST",
       body: JSON.stringify(command)
-    });
+    }));
     if (!delivered.ok) {
       throw new HttpError("EDGE_OFFLINE", "Edge disconnected before takeover could start", 409);
     }
-    const phoneToken = await issueParticipantToken(env, roomName, phoneIdentity);
-    await audit(env, "phone", device.device_id, "inbound_offer.claim", offer.offer_id, "allowed");
+    const phoneToken = await timing.measure("phone_token", () => issueParticipantToken(env, roomName, phoneIdentity));
+    await timing.measure("audit", () => audit(env, "phone", device.device_id, "inbound_offer.claim", offer.offer_id, "allowed"));
     return json({
       claimId,
       offerId: offer.offer_id,

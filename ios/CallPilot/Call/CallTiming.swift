@@ -4,6 +4,12 @@ import OSLog
 enum CallTimingMark: String, CaseIterable, Sendable {
     case answerAction = "answer_action", dialStart = "dial_start"
     case claimStart = "claim_start", claimResponse = "claim_response"
+    case claimDNSStart = "claim_dns_start", claimDNSEnd = "claim_dns_end"
+    case claimConnectStart = "claim_connect_start", claimConnectEnd = "claim_connect_end"
+    case claimTLSStart = "claim_tls_start", claimTLSEnd = "claim_tls_end"
+    case claimRequestStart = "claim_request_start", claimFirstByte = "claim_first_byte"
+    case claimConnectionReused = "claim_connection_reused"
+    case prewarmStart = "prewarm_start", prewarmEnd = "prewarm_end"
     case configureStart = "configure_start", configureEnd = "configure_end", fulfill
     case didActivate = "did_activate", activateReturn = "activate_return"
     case connectStart = "connect_start", connectReturn = "connect_return"

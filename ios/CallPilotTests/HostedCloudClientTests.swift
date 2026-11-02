@@ -108,6 +108,51 @@ final class HostedCloudClientTests: XCTestCase {
         )])
     }
 
+    func testDeviceStatusOnlyEnablesPrewarmForJSONTrue() async throws {
+        for value in ["true", "false", "1", "0", "\"true\"", "null"] {
+            let client = try makeClient { request in
+                Self.response(for: request, json: """
+                {"edge":{"connected":true,"modemOnline":true},"features":{"claimPrewarm":\(value),"future":true}}
+                """)
+            }
+            let status = try await client.deviceStatus()
+            XCTAssertEqual(status.claimPrewarm, value == "true")
+            XCTAssertTrue(status.lineReady)
+        }
+    }
+
+    func testPrewarmUsesSameClientTransportWithoutCacheOrCredentials() async throws {
+        var paths: [String] = []
+        let client = try makeClient { request in
+            paths.append(request.url!.path)
+            if request.url?.path == "/healthz" {
+                XCTAssertEqual(request.httpMethod, "GET")
+                XCTAssertEqual(request.timeoutInterval, 3)
+                XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Cache-Control"), "no-store")
+                XCTAssertNil(request.value(forHTTPHeaderField: "Cookie"))
+                XCTAssertFalse(request.httpShouldHandleCookies)
+                return Self.response(for: request, json: #"{"ok":true}"#)
+            }
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Cookie"), "__Host-callpilot-device=device_abcdefghijkl.secret-value")
+            return Self.response(for: request, json: #"{"edge":{}}"#)
+        }
+        client.credential = DeviceCredential(deviceId: "device_abcdefghijkl", secret: "secret-value")
+        await client.prewarmClaimConnection()
+        _ = try await client.deviceStatus()
+        XCTAssertEqual(paths, ["/healthz", "/v1/device"])
+    }
+
+    func testPrewarmNetworkFailureReturnsSilently() async throws {
+        var requests = 0
+        let client = try makeClient { _ in
+            requests += 1
+            throw URLError(.timedOut)
+        }
+        await client.prewarmClaimConnection()
+        XCTAssertEqual(requests, 1)
+    }
+
     func testListInboundOffersAcceptsZeroAndOneButRejectsBooleanTimestamps() async throws {
         // Foundation bridges JSON 0/1 and false/true through NSNumber. The
         // protocol accepts only integer timestamps, never JSON booleans.

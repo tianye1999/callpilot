@@ -26,6 +26,7 @@ def main():
     sources = [
         "Protocol/Models.swift", "Protocol/ContentModels.swift", "Protocol/CallContentModels.swift",
         "Protocol/HostedCloudClient.swift", "Protocol/VoipPushPayload.swift", "Protocol/CallSignaling.swift",
+        "Protocol/ClaimNetworkMetrics.swift", "Call/ClaimPrewarmer.swift",
         "Support/Localization.swift", "Support/AppLinks.swift", "Support/ErrorCopy.swift",
         "Call/CallState.swift", "Call/CallStatusReducer.swift", "Call/CallKitCallRegistry.swift",
         "Call/CallAudioOwner.swift", "Call/CallKitAnswerController.swift",
@@ -45,6 +46,7 @@ def main():
         "AlertPushTests",
         "CallAudioOwnerTests", "CallKitAnswerControllerTests", "CallMediaSessionTests", "CallTimingTests",
         "CallFirstFrameRendererRemovalTests",
+        "ClaimNetworkMetricsTests", "ClaimPrewarmerTests",
     ]
     for language in ["en", "zh-Hans"]:
         destination = RESOURCES / (language + ".lproj")

@@ -16,6 +16,9 @@ CLIENT_MARKS = frozenset({
     "mic_enable_return", "downlink_subscribed", "downlink_first_frame", "edge_connected",
     "hangup_intent", "hangup_publish_start", "hangup_publish_end", "hangup_publish_error",
     "hangup_retry_start", "hangup_retry_end", "hangup_retry_error", "hangup_ack", "disconnect",
+    "claim_dns_start", "claim_dns_end", "claim_connect_start", "claim_connect_end",
+    "claim_tls_start", "claim_tls_end", "claim_request_start", "claim_first_byte",
+    "claim_connection_reused", "prewarm_start", "prewarm_end",
 })
 MAX_TIMING_BYTES = 2048
 MAX_TIMING_BATCH_MARKS = 16
@@ -79,7 +82,7 @@ class CallTiming:
         if not isinstance(marks, dict) or not 1 <= len(marks) <= MAX_TIMING_BATCH_MARKS:
             return
         for name, value in marks.items():
-            if (name not in CLIENT_MARKS or type(value) not in (int, float)
+            if (not isinstance(name, str) or type(value) not in (int, float)
                     or not -60_000 <= value <= 86_400_000 or not math.isfinite(value)):
                 return
         try:
@@ -89,7 +92,8 @@ class CallTiming:
             return
         self._attempt, self._seq = attempt, seq
         for name, value in marks.items():
-            self._emit("client_" + name, value)
+            if name in CLIENT_MARKS:
+                self._emit("client_" + name, value)
 
     async def acknowledge_hangup(self, command: dict[str, Any],
                                  send: Callable[[dict[str, Any]], Any]) -> bool:
