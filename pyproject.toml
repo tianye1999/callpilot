@@ -18,6 +18,9 @@ dependencies = [
     "livekit>=1.1.13,<2",
     "livekit-api>=1.1,<2",
     "aiortc>=1.9,<2",
+    # webrtc_ice.py 适配的是 aioice 0.11 的半私有布局（版本守卫不符会退回上游 5 s 收集）；
+    # 0.12 改了 relayed_candidate 签名。升级前先复验适配层与回环/探针。
+    "aioice>=0.11,<0.12",
     "keyring>=25,<27",
     "cryptography>=43,<50",
     "rumps>=0.4.0; sys_platform == 'darwin'",
