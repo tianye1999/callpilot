@@ -919,7 +919,8 @@ def test_owner_cancels_media_preparation_then_ai_answers(rig, monkeypatch, after
     rig.clock.tick = tick
     asyncio.run(rig.session._handle_call())
     assert agent.started and rig.commands.count("ATA") == 1
-    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text().splitlines()]
+    events_text = (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in events_text.splitlines()]
     assert sum(event["type"] == "takeover_owner_cancelled_precommit" for event in events) == 1
     assert sum(event.get("stage") == "edge_hangup_during_prepare" for event in events) == 1
     assert not any(event["type"] == "takeover_owner_hangup" for event in events)
@@ -999,7 +1000,8 @@ def test_direct_mobile_uses_existing_duplex_pump_and_disconnect_policy(rig, monk
     assert sent == [b"caller-to-owner"]
     assert rig.commands.count("ATA") == rig.commands.count("HANGUP") == 1
     assert rig.endpoint.closed and rig.bridge.stopped
-    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text().splitlines()]
+    events_text = (rig.session._record.path / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in events_text.splitlines()]
     stages = [event["stage"] for event in events if event["type"] == "latency"]
     assert stages.count("edge_first_phone_to_modem") == stages.count("edge_first_modem_to_phone") == 1
     assert stages.index("edge_pcm_ready") < stages.index("edge_first_phone_to_modem")
