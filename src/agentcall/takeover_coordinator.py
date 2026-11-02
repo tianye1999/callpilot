@@ -110,6 +110,7 @@ class InboundTakeoverOfferRequest:
     generation: int
     created_at: float
     expires_at: float
+    phone_first: bool = False
 
     def __post_init__(self) -> None:
         _require_identifier(self.offer_id, "offer_id")

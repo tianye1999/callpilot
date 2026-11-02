@@ -19,10 +19,13 @@ CLIENT_MARKS = frozenset({
     "claim_dns_start", "claim_dns_end", "claim_connect_start", "claim_connect_end",
     "claim_tls_start", "claim_tls_end", "claim_request_start", "claim_first_byte",
     "claim_connection_reused", "prewarm_start", "prewarm_end",
+    "push_received", "prepare_start", "prepare_response", "preconnect_start", "preconnect_ready",
+    "permission_ready", "transport_adopted", "cold_fallback", "claim_response_end",
 })
 MAX_TIMING_BYTES = 2048
 MAX_TIMING_BATCH_MARKS = 16
 MAX_TIMING_BATCHES = 64
+MAX_TIMING_MARKS = 96
 HANGUP_ACK_TIMEOUT = 0.25
 
 
@@ -59,7 +62,7 @@ class CallTiming:
             self._pending.clear()
 
     def _emit(self, stage: str, ms: float) -> None:
-        if stage in self._marks or len(self._marks) >= 64:
+        if stage in self._marks or len(self._marks) >= MAX_TIMING_MARKS:
             return
         self._marks[stage] = ms
         if self._record is None:
@@ -69,6 +72,10 @@ class CallTiming:
 
     def mark(self, stage: str) -> None:
         self._emit("edge_" + stage, round((self._clock() - self._origin) * 1000, 3))
+
+    def include_preconnect(self, other: CallTiming) -> None:
+        for stage, ms in other._marks.items():
+            self._emit(stage, round(ms + (other._origin - self._origin) * 1000, 3))
 
     def receive_client(self, command: dict[str, Any]) -> None:
         if set(command) != {"type", "v", "attempt", "seq", "marks"}:

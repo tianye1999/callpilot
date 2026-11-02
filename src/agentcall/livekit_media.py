@@ -92,6 +92,9 @@ class LiveKitRemoteMediaEndpoint:
         self._browser_connected = False
         self._media_ready = False
         self._closed = False
+        self._silent = False
+        self._connected = False
+        self._subscribe_track: Any = None
         self._downlink_gain = config.get_float("REMOTE_DOWNLINK_GAIN")
         if not math.isfinite(self._downlink_gain) or self._downlink_gain <= 0:
             logger.warning(
@@ -119,6 +122,15 @@ class LiveKitRemoteMediaEndpoint:
         self._timing = timing
 
     async def connect(self) -> None:
+        await self._connect_room()
+        await self.bind_winner(self._issued)
+
+    async def preconnect(self) -> None:
+        self._silent = True
+        await self._connect_room()
+        self._timing.mark("preconnect_ready")
+
+    async def _connect_room(self) -> None:
         self._timing.mark("endpoint_connect_start")
         rtc = self._rtc
         if rtc is None:
@@ -132,7 +144,7 @@ class LiveKitRemoteMediaEndpoint:
 
         @room.on("participant_connected")
         def on_participant_connected(participant) -> None:
-            if participant.identity == self._issued.browser_identity:
+            if not self._silent and participant.identity == self._issued.browser_identity:
                 self._browser_connected = True
                 self._timing.mark("phone_joined")
 
@@ -146,7 +158,7 @@ class LiveKitRemoteMediaEndpoint:
         @room.on("track_subscribed")
         def on_track_subscribed(track, _publication, participant) -> None:
             if (
-                participant.identity != self._issued.browser_identity
+                self._closed or self._silent or participant.identity != self._issued.browser_identity
                 or track.kind != rtc.TrackKind.KIND_AUDIO
             ):
                 return
@@ -166,6 +178,13 @@ class LiveKitRemoteMediaEndpoint:
             self._browser_audio_task = asyncio.create_task(
                 self._pump_browser_audio(stream)
             )
+
+        self._subscribe_track = on_track_subscribed
+
+        @room.on("track_published")
+        def on_track_published(publication, participant) -> None:
+            if not self._closed and not self._silent and participant.identity == self._issued.browser_identity:
+                publication.set_subscribed(True)
 
         @room.on("track_unsubscribed")
         def on_track_unsubscribed(_track, _publication, participant) -> None:
@@ -190,7 +209,7 @@ class LiveKitRemoteMediaEndpoint:
         def on_data_received(packet) -> None:
             participant = packet.participant
             if (
-                participant is None
+                self._closed or self._silent or participant is None
                 or participant.identity != self._issued.browser_identity
                 or packet.topic != REMOTE_CONTROL_TOPIC
             ):
@@ -212,16 +231,37 @@ class LiveKitRemoteMediaEndpoint:
 
         @room.on("disconnected")
         def on_disconnected(_reason) -> None:
+            self._connected = False
             self._browser_connected = False
             self._media_ready = False
 
         await room.connect(
             self._issued.livekit_url,
             self._issued.edge_token,
-            rtc.RoomOptions(connect_timeout=self._connect_timeout_seconds),
+            rtc.RoomOptions(connect_timeout=self._connect_timeout_seconds, auto_subscribe=not self._silent),
         )
+        if self._closed:
+            await room.disconnect()
+            raise asyncio.CancelledError()
+        self._connected = True
         self._timing.mark("room_connect_return")
 
+    async def bind_winner(self, issued: IssuedLiveKitSession) -> None:
+        if self._closed or not self._connected or issued.room_name != self._issued.room_name:
+            raise ConnectionError("prepared room unavailable")
+        self._issued = issued
+        if self._silent:
+            self._timing.mark("winner_bound")
+        self._silent = False
+        room, rtc = self._room, self._rtc
+        participant = room.remote_participants.get(issued.browser_identity)
+        if participant is not None:
+            self._browser_connected = True
+            self._timing.mark("phone_joined")
+            for publication in participant.track_publications.values():
+                publication.set_subscribed(True)
+                if publication.track is not None:
+                    self._subscribe_track(publication.track, publication, participant)
         source = rtc.AudioSource(
             REMOTE_AUDIO_RATE,
             1,
@@ -247,6 +287,8 @@ class LiveKitRemoteMediaEndpoint:
         if self._closed:
             return
         self._closed = True
+        self._connected = False
+        self._timing.mark("preconnect_closed")
         browser_audio_task = self._browser_audio_task
         self._cancel_browser_audio_task()
         tasks = [
@@ -320,7 +362,7 @@ class LiveKitRemoteMediaEndpoint:
         return chunks
 
     def push_modem_audio(self, pcm: bytes) -> None:
-        if not pcm:
+        if self._silent or self._closed or not pcm:
             return
         # Keep int16 samples aligned and publish fixed 20 ms frames.
         self._modem_buffer.extend(pcm[: len(pcm) - (len(pcm) % 2)])

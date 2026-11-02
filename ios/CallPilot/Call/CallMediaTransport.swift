@@ -4,16 +4,25 @@ enum CallMediaTransportEvent: Equatable, Sendable {
     case data(Data, topic: String)
     case disconnected(reason: String)
     case timing(CallTimingMark, at: TimeInterval)
+    case permissionsReady(Bool)
+    case tracksChanged
 }
 
 @MainActor
 protocol CallMediaTransport: AnyObject {
     var eventHandler: ((CallMediaTransportEvent) async -> Void)? { get set }
     func connect(url: String, token: String, enableMicrophone: Bool) async throws
+    func connectSilent(url: String, token: String) async throws
+    func subscribeToEdge(_ identity: String) async throws
     func setMicrophone(enabled: Bool) async throws
     func publishControl(_ data: Data) async throws
     func disconnect() async
     func setSpeakerphone(_ enabled: Bool)
+}
+
+extension CallMediaTransport {
+    func connectSilent(url: String, token: String) async throws { throw CallAudioError.busy }
+    func subscribeToEdge(_ identity: String) async throws { throw CallAudioError.busy }
 }
 
 final class CallFirstFrameRendererRemoval: @unchecked Sendable {

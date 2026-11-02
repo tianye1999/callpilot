@@ -23,6 +23,7 @@ def test_phone_first_configuration_defaults_and_example(monkeypatch):
     example = dotenv_values(Path(__file__).parents[2] / ".env.example", encoding="utf-8")
     for key, default in (
         ("INBOUND_PHONE_FIRST_ENABLED", "false"),
+        ("INBOUND_PRECONNECT_ENABLED", "false"),
         ("INBOUND_PHONE_FIRST_RING_SECONDS", "15"),
         ("INBOUND_PHONE_FIRST_MEDIA_SECONDS", "20"),
     ):
@@ -285,6 +286,69 @@ def rig(monkeypatch):
         service=service, session=session, modem=modem, commands=commands, clock=clock,
         ring=ring, claim=claim, issued=issued, endpoint=endpoint, bridge=bridge, notifications=notifications,
     )
+
+
+@pytest.mark.parametrize("outcome", ["reuse", "failure", "timeout", "hangup"])
+def test_silent_prepare_is_fenced_and_never_touches_modem_before_claim(rig, monkeypatch, outcome):
+    monkeypatch.setenv("INBOUND_PRECONNECT_ENABLED", "true")
+    rig.ring()
+    session = rig.session
+    session._initialize_takeover_context("inbound")
+    operations = []
+
+    async def prepare():
+        operations.append("prepare")
+        assert not rig.commands and not rig.bridge.started
+        if outcome == "failure":
+            raise ConnectionError("synthetic")
+
+    async def bind(issued):
+        operations.append("bind")
+        assert issued == rig.issued
+        assert not rig.commands and not rig.bridge.started
+
+    async def connect():
+        operations.append("cold")
+
+    rig.endpoint.preconnect, rig.endpoint.bind_winner, rig.endpoint.connect = prepare, bind, connect
+    ticks = 0
+
+    def tick():
+        nonlocal ticks
+        ticks += 1
+        request = session._takeover_request
+        if ticks == 1:
+            command = {"offerId": request.offer_id, "callId": request.call_id, "generation": request.generation,
+                "nonce": request.nonce, "session": {"sessionId": "session_test", "roomName": rig.issued.room_name,
+                    "browserIdentity": rig.issued.browser_identity, "edgeIdentity": rig.issued.edge_identity,
+                    "livekitUrl": rig.issued.livekit_url, "token": rig.issued.edge_token}}
+            for field, value in (("nonce", "wrong"), ("generation", request.generation + 1), ("callId", "wrong")):
+                assert not session.prepare_takeover({**command, field: value})
+            before = list(rig.commands)
+            assert session.prepare_takeover(command)
+            assert session.prepare_takeover(command)
+            assert rig.commands == before
+        elif ticks == 4:
+            if outcome in ("reuse", "failure"):
+                assert rig.claim().accepted
+            elif outcome == "timeout":
+                rig.clock.now = session._phone_first_deadline
+            else:
+                session._active = False
+            rig.clock.tick = lambda: None
+
+    rig.clock.tick = tick
+    result = asyncio.run(session._handle_phone_first(None))
+    assert operations.count("prepare") == 1
+    assert rig.endpoint.closed
+    if outcome in ("reuse", "failure"):
+        assert result == "completed"
+        assert rig.commands.count("ATA") == 1
+        assert ("bind" in operations) == (outcome == "reuse")
+        assert ("cold" in operations) == (outcome == "failure")
+    else:
+        assert result == ("ai" if outcome == "timeout" else "not_connected")
+        assert not rig.commands and not rig.bridge.started
 
 
 @pytest.mark.parametrize("delay", [8, 12, 19])

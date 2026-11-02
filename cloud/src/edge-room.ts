@@ -13,6 +13,9 @@ import {
 import { edgeMessageSchema } from "./schemas";
 import { HttpError } from "./http";
 import type { EdgePresence, Env } from "./types";
+import { randomId } from "./security";
+import { issueParticipantToken } from "./livekit";
+import { invalidateCandidates, queueParticipantCleanup, sweepPreconnect } from "./inbound-preconnect";
 import { dispatchInboundOfferPushes, errorName } from "./voip-push";
 
 interface SocketAttachment {
@@ -44,6 +47,10 @@ export class EdgeRoom extends DurableObject<Env> {
     if (url.pathname === "/connect") return this.acceptConnection(request);
     if (url.pathname === "/presence" && request.method === "GET") return this.presence();
     if (url.pathname === "/command" && request.method === "POST") return this.sendCommand(request);
+    if (url.pathname === "/preconnect-cleanup" && request.method === "POST") {
+      await this.alarm();
+      return Response.json({ ok: true });
+    }
     if (url.pathname === "/content-relay" && request.method === "POST") return this.relayContent(request);
     return new Response("Not found", { status: 404 });
   }
@@ -193,6 +200,7 @@ export class EdgeRoom extends DurableObject<Env> {
       return;
     }
     const attachment = ws.deserializeAttachment() as SocketAttachment;
+    if (this.currentConnection() !== ws) return;
     const now = Date.now();
     if (result.data.type === "device.notify") {
       // Identity comes only from the authenticated connection, never the payload.
@@ -214,7 +222,8 @@ export class EdgeRoom extends DurableObject<Env> {
         lastSeenAt: now,
         modemOnline: result.data.status.modemOnline,
         lineBusy: result.data.status.lineBusy,
-        version: result.data.status.version
+        version: result.data.status.version,
+        inboundPreconnectV1: result.data.status.inboundPreconnectV1 === true
       };
       await Promise.all([
         this.ctx.storage.put("presence", presence),
@@ -230,6 +239,7 @@ export class EdgeRoom extends DurableObject<Env> {
         await this.env.DB.prepare(
           "UPDATE inbound_offers SET status = ?1, error_code = ?2, updated_at = ?3 WHERE offer_id = ?4 AND edge_id = ?5 AND status = 'claimed'"
         ).bind(offerStatus, errorCode, now, result.data.offerId, attachment.edgeId).run();
+        if (offerStatus === "failed") this.ctx.waitUntil(this.alarm());
         return;
       }
       const status = result.data.status === "accepted" ? "ready" : "failed";
@@ -242,12 +252,17 @@ export class EdgeRoom extends DurableObject<Env> {
       // Offers are insert-once; a duplicate offerId from a reconnect replay is
       // ignored rather than resurrecting a consumed offer.
       const callUUID = crypto.randomUUID();
+      const presence = await this.ctx.storage.get<EdgePresence>("presence");
+      const preconnect = this.env.INBOUND_PRECONNECT_ENABLED === "true"
+        && presence?.inboundPreconnectV1 === true && result.data.mode === "phone_first";
+      const roomName = randomId("callpilot");
+      const edgeIdentity = randomId("edgepart", 12);
       const inserted = await this.env.DB.prepare(
-        "INSERT OR IGNORE INTO inbound_offers(offer_id, edge_id, call_id, generation, nonce, status, created_at, expires_at, updated_at, call_uuid) VALUES (?1, ?2, ?3, ?4, ?5, 'offered', ?6, ?7, ?6, ?8)"
+        "INSERT OR IGNORE INTO inbound_offers(offer_id, edge_id, call_id, generation, nonce, status, created_at, expires_at, updated_at, call_uuid, room_name, edge_identity, preconnect_enabled, preconnect_room) VALUES (?1, ?2, ?3, ?4, ?5, 'offered', ?6, ?7, ?6, ?8, ?9, ?10, ?11, ?12)"
       ).bind(
         result.data.offerId, attachment.edgeId, result.data.callId,
         result.data.generation, result.data.nonce, now, result.data.expiresAtUnixMs,
-        callUUID
+        callUUID, roomName, edgeIdentity, preconnect ? 1 : 0, preconnect ? roomName : null
       ).run();
       if (inserted.meta.changes) {
         this.ctx.waitUntil(dispatchInboundOfferPushes(this.env, {
@@ -256,6 +271,23 @@ export class EdgeRoom extends DurableObject<Env> {
           callUUID,
           expiresAtUnixMs: result.data.expiresAtUnixMs
         }).catch((error: unknown) => { console.warn("VoIP push dispatch failed", errorName(error)); }));
+        if (preconnect) {
+          await this.ctx.storage.put("preconnectEdge", attachment.edgeId);
+          await this.ctx.storage.setAlarm(now + 1000);
+          const offer = result.data;
+          await queueParticipantCleanup(this.env, { edge_id: attachment.edgeId, offer_id: offer.offerId,
+            expires_at: offer.expiresAtUnixMs }, roomName, edgeIdentity);
+          const token = await issueParticipantToken(this.env, roomName, edgeIdentity,
+            Math.max(1, Math.ceil((offer.expiresAtUnixMs - Date.now()) / 1000)));
+          // The Edge validates this fence again before allocating any transport.
+          ws.send(JSON.stringify({
+            v: 1, type: "inbound.prepare", commandId: randomId("command"),
+            offerId: offer.offerId, callId: offer.callId, generation: offer.generation,
+            nonce: offer.nonce, expiresAtUnixMs: offer.expiresAtUnixMs, mode: "phone_first",
+            session: { sessionId: randomId("session"), roomName, edgeIdentity,
+              browserIdentity: randomId("web", 12), livekitUrl: this.env.LIVEKIT_URL, token }
+          }));
+        }
       }
       return;
     }
@@ -263,6 +295,8 @@ export class EdgeRoom extends DurableObject<Env> {
       await this.env.DB.prepare(
         "UPDATE inbound_offers SET status = 'revoked', error_code = ?1, updated_at = ?2 WHERE offer_id = ?3 AND edge_id = ?4 AND status IN ('offered', 'claimed', 'edge_ready')"
       ).bind(result.data.reason, now, result.data.offerId, attachment.edgeId).run();
+      await invalidateCandidates(this.env, result.data.offerId);
+      this.ctx.waitUntil(this.alarm());
       return;
     }
     await this.env.DB.prepare(
@@ -273,6 +307,8 @@ export class EdgeRoom extends DurableObject<Env> {
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     this.failRelaysForSocket(ws, "EDGE_OFFLINE", 503);
     const attachment = ws.deserializeAttachment() as SocketAttachment | null;
+    const current = this.currentConnection();
+    if (attachment?.replaced || (current && current !== ws)) { ws.close(code, reason); return; }
     await this.ctx.storage.put<EdgePresence>("presence", {
       ...(await this.ctx.storage.get<EdgePresence>("presence")),
       connected: false,
@@ -280,6 +316,7 @@ export class EdgeRoom extends DurableObject<Env> {
     });
     ws.close(code, reason);
     if (attachment) {
+      await this.disconnectPreconnect(attachment.edgeId);
       await this.updateLastSeen(attachment.edgeId, Date.now());
     }
   }
@@ -287,6 +324,24 @@ export class EdgeRoom extends DurableObject<Env> {
   override async webSocketError(ws: WebSocket): Promise<void> {
     this.failRelaysForSocket(ws, "EDGE_OFFLINE", 503);
     ws.close(1011, "WebSocket error");
+    const attachment = ws.deserializeAttachment() as SocketAttachment | null;
+    if (attachment && !attachment.replaced) await this.disconnectPreconnect(attachment.edgeId);
+  }
+
+  private async disconnectPreconnect(edgeId: string) {
+    if (await this.ctx.storage.get("preconnectEdge") !== edgeId) return;
+    await this.env.DB.prepare(`UPDATE inbound_offers SET status = 'revoked', updated_at = ?1
+      WHERE edge_id = ?2 AND preconnect_enabled = 1 AND status IN ('offered', 'claimed', 'edge_ready')`)
+      .bind(Date.now(), edgeId).run();
+    await this.alarm();
+  }
+
+  override async alarm(): Promise<void> {
+    const edgeId = await this.ctx.storage.get<string>("preconnectEdge");
+    if (!edgeId || typeof edgeId !== "string") return;
+    // Arm before I/O so a failed D1/admin request is retried after hibernation.
+    await this.ctx.storage.setAlarm(Date.now() + 3000);
+    if (!await sweepPreconnect(this.env, edgeId)) await this.ctx.storage.deleteAlarm();
   }
 
   private async updateLastSeen(edgeId: string, now: number, heartbeat = false): Promise<void> {

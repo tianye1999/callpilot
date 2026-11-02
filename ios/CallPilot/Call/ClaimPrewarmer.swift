@@ -10,6 +10,8 @@ final class ClaimPrewarmer {
     private var seen: [String: Int64] = [:]
     private var entries: [String: (timing: CallTiming, task: Task<Void, Never>)] = [:]
     private(set) var enabled = false
+    private(set) var preconnectEnabled = false
+    var canPreconnect: Bool { preconnectEnabled }
 
     init(defaults: UserDefaults = .standard, nowMilliseconds: @escaping () -> Int64 = {
         Int64(Date().timeIntervalSince1970 * 1_000)
@@ -28,6 +30,7 @@ final class ClaimPrewarmer {
         let cached = defaults.dictionary(forKey: Self.cacheKey)
         let matches = cached?["gatewayURL"] as? String == gatewayURL && cached?["deviceId"] as? String == deviceId
         enabled = matches && cached?["enabled"] as? Bool == true
+        preconnectEnabled = matches && cached?["preconnect"] as? Bool == true
         if matches, let offers = cached?["seen"] as? [String: Int64] {
             seen = offers.filter { $0.value > nowMilliseconds() }
         }
@@ -36,6 +39,11 @@ final class ClaimPrewarmer {
     func setEnabled(_ enabled: Bool) {
         self.enabled = enabled
         if !enabled { entries.values.forEach { $0.task.cancel() } }
+        persist()
+    }
+
+    func setPreconnectEnabled(_ enabled: Bool) {
+        preconnectEnabled = enabled
         persist()
     }
 
@@ -70,6 +78,7 @@ final class ClaimPrewarmer {
         gatewayURL = nil
         deviceId = nil
         enabled = false
+        preconnectEnabled = false
         defaults.removeObject(forKey: Self.cacheKey)
     }
 
@@ -77,6 +86,7 @@ final class ClaimPrewarmer {
         guard let gatewayURL, let deviceId else { return }
         defaults.set([
             "gatewayURL": gatewayURL, "deviceId": deviceId, "enabled": enabled, "seen": seen,
+            "preconnect": preconnectEnabled,
         ], forKey: Self.cacheKey)
     }
 }

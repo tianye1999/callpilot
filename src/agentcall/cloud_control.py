@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from . import config
 from .cloud_credentials import CloudCredentialStore, EdgeCredential
 from .content_sync import ContentSyncError
 from .remote_dialer import IssuedLiveKitSession, RemoteDialerInvite
@@ -254,6 +255,13 @@ class CloudEdgeClient:
             self._handle_data_request(command, send)
             return
 
+        if command["type"] == "inbound.prepare":
+            prepare = getattr(self.service, "prepare_inbound_takeover", None)
+            if config.get_bool("INBOUND_PRECONNECT_ENABLED") and callable(prepare):
+                prepare(command)
+            # Prepare is not a claim ACK and cannot transition D1 to edge_ready.
+            return
+
         command_id = command["commandId"]
         call_id = command["callId"]
         offer_id: str | None = None
@@ -406,6 +414,8 @@ class CloudEdgeClient:
                         "generation": request.generation,
                         "nonce": request.nonce,
                         "expiresAtUnixMs": round(request.expires_at * 1000),
+                        **({"mode": "phone_first"} if request.phone_first
+                           and config.get_bool("INBOUND_PRECONNECT_ENABLED") else {}),
                     },
                     separators=(",", ":"),
                 )
@@ -496,6 +506,7 @@ class CloudEdgeClient:
             "status": {
                 "modemOnline": bool(self.service.modem_connected),
                 "lineBusy": self.service.line_busy(),
+                **({"inboundPreconnectV1": True} if config.get_bool("INBOUND_PRECONNECT_ENABLED") else {}),
             },
         }
         return json.dumps(payload, separators=(",", ":"))
@@ -523,6 +534,18 @@ def _parse_cloud_command(raw: str) -> dict[str, Any]:
         return _validate_session_command(value)
     if command_type == "inbound.claim":
         return _validate_inbound_claim(value)
+    if command_type == "inbound.prepare":
+        if value.get("mode") != "phone_first":
+            raise ValueError("invalid prepare mode")
+        expiry = value.get("expiresAtUnixMs")
+        if type(expiry) is not int or not time.time() * 1000 < expiry <= (time.time() + 60) * 1000:
+            raise ValueError("invalid prepare expiry")
+        claim = {k: v for k, v in value.items() if k not in {"expiresAtUnixMs", "mode"}}
+        claim.update(type="inbound.claim", claimId="claim_prepareplaceholder")
+        _validate_inbound_claim(claim)
+        if "claimId" in value:
+            raise ValueError("invalid prepare")
+        return value
     if command_type == "data.request":
         return _validate_data_request(value)
     raise ValueError("invalid command")

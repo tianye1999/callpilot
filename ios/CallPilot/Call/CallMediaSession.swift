@@ -6,7 +6,7 @@ final class CallMediaSession {
     typealias TransportFactory = @MainActor () -> any CallMediaTransport
     typealias StateHandler = @MainActor (CallState) -> Void
 
-    private let onState: StateHandler
+    private var onState: StateHandler
     private let transportFactory: TransportFactory
     private let audio: CallAudioOwner
     private let ownerID = UUID()
@@ -22,6 +22,7 @@ final class CallMediaSession {
     private var mode: CallAudioMode = .standalone
     private var roomConnected = false
     private var audioActivated = false
+    private var activationRequested = false
     private var microphoneStarted = false
     private var setupTask: Task<Void, Error>?
     private var microphoneTask: Task<Void, Error>?
@@ -36,6 +37,59 @@ final class CallMediaSession {
     private var hangupCommandID: String?
     private var hangupAcknowledged = false
     private var hangupDeadline: ContinuousClock.Instant?
+    private var silentOfferId: String?
+    private var preparation: InboundPreparation?
+    private var preconnectReady = false
+    private var audioLeaseAcquired = false
+    private var claimStarted = false
+    private var claimAccepted = false
+    private var permissionReady = false
+    private var reusingTransport = false
+    private var edgeIdentity: String?
+    var onSilentDisconnect: (() -> Void)?
+
+    func setStateHandler(_ handler: @escaping StateHandler) { onState = handler }
+
+    func startSilentPreconnect(client: HostedCloudClient, offer: InboundOffer) async {
+        guard let attempt = beginAttempt(label: L10n.text("call.takeover.label"), mode: .callKit) else { return }
+        silentOfferId = offer.offerId
+        let task = Task {
+            try await audio.acquire(ownerID, mode: .callKit)
+            audioLeaseAcquired = true
+            try checkCurrent(attempt)
+            timing.mark(.prepareStart)
+            let candidate = try await client.prepareInboundOffer(offerId: offer.offerId)
+            timing.mark(.prepareResponse)
+            try checkCurrent(attempt)
+            preparation = candidate
+            let connection = transportFactory()
+            transport = connection
+            connection.eventHandler = { [weak self] event in
+                await self?.handleTransportEvent(event, for: attempt)
+            }
+            timing.mark(.preconnectStart)
+            try await connection.connectSilent(url: candidate.session.livekitURL, token: candidate.session.token)
+            try checkCurrent(attempt)
+            preconnectReady = true
+            timing.mark(.preconnectReady)
+        }
+        setupTask = task
+        _ = await task.result
+        // Failure is silent. Answer can still use the cold path, with the same lease.
+    }
+
+    private func closeSilentTransport(_ pending: Task<Void, Error>?) async {
+        preconnectReady = false
+        permissionReady = false
+        preparation = nil
+        pending?.cancel()
+        let old = transport
+        old?.eventHandler = nil
+        await old?.disconnect()
+        _ = await pending?.result
+        await old?.disconnect()
+        transport = nil
+    }
 
     init(onState: @escaping StateHandler,
          transportFactory: @escaping TransportFactory,
@@ -77,21 +131,58 @@ final class CallMediaSession {
         onClaimed: @escaping () throws -> Void = {},
         onConnected: @escaping () -> Void
     ) async -> Bool {
-        guard let attempt = beginAttempt(
-            label: L10n.text("call.takeover.label"), mode: usesCallKit ? .callKit : .standalone
-        ) else { return false }
+        guard !claimStarted, !isStopped else { return false }
+        let attempt: UInt64
+        let silentTask: Task<Void, Error>?
+        if silentOfferId == offerId, usesCallKit {
+            attempt = generation
+            silentTask = setupTask
+        } else {
+            guard let value = beginAttempt(label: L10n.text("call.takeover.label"),
+                                           mode: usesCallKit ? .callKit : .standalone) else { return false }
+            attempt = value
+            silentTask = nil
+        }
+        claimStarted = true
         connectedHandler = onConnected
         let task = Task {
-            try await audio.acquire(ownerID, mode: mode)
+            let candidate = preconnectReady ? preparation : nil
+            if silentOfferId != nil && candidate == nil {
+                timing.mark(.coldFallback)
+                await closeSilentTransport(silentTask)
+            }
+            if !audioLeaseAcquired {
+                try await audio.acquire(ownerID, mode: mode)
+                audioLeaseAcquired = true
+            }
             try checkCurrent(attempt)
             timing.startClaim()
-            let session = try await client.claimInboundOffer(offerId: offerId, timing: timing)
+            let session = try await client.claimInboundOffer(offerId: offerId, timing: timing, preparation: candidate)
             timing.mark(.claimResponse)
             try checkCurrent(attempt)
             preparedSession = session
+            claimAccepted = true
+            if session.mode == "reuse", candidate != nil, preconnectReady {
+                reusingTransport = true
+                edgeIdentity = session.edgeIdentity
+                roomConnected = true
+                timing.mark(.transportAdopted)
+                try onClaimed()
+                try checkCurrent(attempt)
+                try activateAudioIfReady()
+                startMicrophoneIfReady(for: attempt)
+                return
+            }
+            if candidate != nil {
+                timing.mark(.coldFallback)
+                await closeSilentTransport(silentTask)
+                try checkCurrent(attempt)
+            }
+            silentOfferId = nil
             // Configure + fulfill before starting any media connection.
             try onClaimed()
             try checkCurrent(attempt)
+            try activateAudioIfReady()
             try await connect(session, for: attempt)
         }
         setupTask = task
@@ -109,6 +200,12 @@ final class CallMediaSession {
     func activateCallKitAudio() throws {
         timing.mark(.didActivate)
         guard !isStopped, mode == .callKit else { throw CancellationError() }
+        activationRequested = true
+        try activateAudioIfReady()
+    }
+
+    private func activateAudioIfReady() throws {
+        guard activationRequested, claimAccepted, !reusingTransport || permissionReady else { return }
         guard !audioActivated else { return }
         try audio.activate(ownerID)
         timing.mark(.activateReturn)
@@ -143,10 +240,15 @@ final class CallMediaSession {
 
     private func startMicrophoneIfReady(for attempt: UInt64) {
         guard isCurrent(attempt), mode == .callKit, roomConnected, audioActivated,
+              claimAccepted, (!reusingTransport || permissionReady),
               !microphoneStarted, let activeTransport = transport else { return }
         microphoneStarted = true
         let task = Task {
             try checkCurrent(attempt)
+            if reusingTransport, let edgeIdentity {
+                try await activeTransport.subscribeToEdge(edgeIdentity)
+                try checkCurrent(attempt)
+            }
             timing.mark(.micEnableStart)
             try await activeTransport.setMicrophone(enabled: true)
             timing.mark(.micEnableReturn)
@@ -252,6 +354,10 @@ final class CallMediaSession {
         await cleanupTask?.value
     }
 
+    func cancelSilently() {
+        terminate(state: nil)
+    }
+
     func finishCallKitAudioDrain() {
         terminate(state: .ended(label: activeLabel ?? "", reason: "callkit_ended"))
         // Native cleanup may still be settling. Stop only this lease; acquisition
@@ -287,6 +393,17 @@ final class CallMediaSession {
         }
         guard isCurrent(attempt) else { return }
         switch event {
+        case let .permissionsReady(ready):
+            permissionReady = ready
+            if ready { timing.mark(.permissionReady) }
+            do { try activateAudioIfReady() }
+            catch { fail(reason: L10n.text("call.audio.failed"), code: "AUDIO_ACTIVATION_FAILED") }
+            startMicrophoneIfReady(for: attempt)
+        case .tracksChanged:
+            if reusingTransport, claimAccepted, permissionReady, audioActivated,
+               let edgeIdentity, let transport {
+                try? await transport.subscribeToEdge(edgeIdentity)
+            }
         case let .data(data, topic):
             guard topic == CallPilotTopic.status else { return }
             if CallSignaling.supportsClientTiming(data) {
@@ -305,6 +422,14 @@ final class CallMediaSession {
                 }
             }
         case let .disconnected(reason):
+            if silentOfferId != nil && !claimAccepted {
+                preconnectReady = false
+                if !claimStarted {
+                    onSilentDisconnect?()
+                    terminate(state: nil)
+                }
+                return
+            }
             terminate(state: .ended(label: activeLabel ?? "", reason: reason))
         case let .timing(mark, instant):
             timing.mark(mark, at: instant)

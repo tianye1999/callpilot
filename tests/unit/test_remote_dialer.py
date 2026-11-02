@@ -10,7 +10,7 @@ import json
 import struct
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +26,7 @@ from agentcall.audio_bridge import (
 from agentcall.call_log import CallLogger
 from agentcall.call_timing import CallTiming
 from agentcall.dial_guard import DialGuardFailure
+from agentcall.inbound_preconnect import InboundPreconnect
 from agentcall.livekit_media import LiveKitRemoteMediaEndpoint, _decode_control_payload
 from agentcall.remote_dialer import (
     REMOTE_AUDIO_RATE,
@@ -217,6 +218,7 @@ class _FakeLiveKitRoom:
 @dataclass
 class _FakeRoomOptions:
     connect_timeout: float | None = None
+    auto_subscribe: bool = True
 
 
 class _FakeTrackPublishOptions:
@@ -244,6 +246,104 @@ def _fake_rtc_module():
         TrackKind=SimpleNamespace(KIND_AUDIO="audio"),
         AudioFrame=_FakeAudioFrame,
     )
+
+
+def test_preconnect_has_no_audio_and_binds_tracks_that_arrived_before_winner() -> None:
+    async def run() -> None:
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud", api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32", public_url="https://dial.example/",
+        )
+        endpoint = LiveKitRemoteMediaEndpoint(issued, rtc_module=_fake_rtc_module())
+        await endpoint.preconnect()
+        room = _FakeLiveKitRoom.latest
+        assert room is not None and room.connected is not None
+        assert room.connected[2].auto_subscribe is False
+        assert not room.local_participant.published
+        assert not _FakeLiveKitAudioSource.instances
+        assert not _FakeLiveKitAudioStream.instances
+        subscriptions = []
+        track = SimpleNamespace(kind="audio")
+        publication = SimpleNamespace(track=track, set_subscribed=subscriptions.append)
+        winner = replace(issued, browser_identity="web_winnerabcdefghijkl")
+        phone = SimpleNamespace(identity=winner.browser_identity, track_publications={"track": publication})
+        room.remote_participants[phone.identity] = phone
+        room.callbacks["track_subscribed"](track, publication, phone)
+        endpoint.push_modem_audio(b"\x00\x00" * 160)
+        assert not endpoint.media_ready and not _FakeLiveKitAudioStream.instances
+        assert endpoint._modem_audio.empty()
+        await endpoint.bind_winner(winner)
+        assert subscriptions == [True]
+        assert endpoint.media_ready
+        assert len(room.local_participant.published) == 1
+        loser = SimpleNamespace(identity="web_loserabcdefghijkl")
+        room.callbacks["track_subscribed"](track, publication, loser)
+        assert len(_FakeLiveKitAudioStream.instances) == 1
+        await endpoint.close()
+        assert room.disconnected
+        room.callbacks["track_subscribed"](track, publication, phone)
+        assert len(_FakeLiveKitAudioStream.instances) == 1
+
+        later = LiveKitRemoteMediaEndpoint(issued, rtc_module=_fake_rtc_module())
+        await later.preconnect()
+        await later.bind_winner(winner)
+        late_room = _FakeLiveKitRoom.latest
+        late_room.callbacks["track_published"](publication, phone)
+        late_room.callbacks["track_subscribed"](track, publication, phone)
+        assert later.media_ready and subscriptions == [True, True]
+        await later.close()
+    asyncio.run(run())
+
+
+def test_preconnect_unfinished_failed_and_unclaimed_transports_are_closed() -> None:
+    async def run() -> None:
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud", api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32", public_url="https://dial.example/",
+        )
+        for state in ("pending", "failed", "unclaimed"):
+            endpoint = SimpleNamespace(closed=False)
+            async def preconnect():
+                if state == "pending":
+                    await asyncio.Event().wait()
+                if state == "failed":
+                    raise ConnectionError("synthetic")
+            async def close():
+                endpoint.closed = True
+            endpoint.preconnect, endpoint.close = preconnect, close
+            owner = InboundPreconnect()
+            owner.start(issued, lambda _: endpoint)
+            await asyncio.sleep(0)
+            if state == "unclaimed":
+                await owner.close()
+            else:
+                assert await owner.adopt(issued, CallTiming()) is None
+            assert endpoint.closed and owner.endpoint is None and owner.task is None
+    asyncio.run(run())
+
+
+def test_silent_connection_returning_after_close_disconnects_again(monkeypatch) -> None:
+    async def run() -> None:
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud", api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32", public_url="https://dial.example/",
+        )
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def connect(room, url, token, options):
+            entered.set()
+            await release.wait()
+            room.disconnected = False
+        monkeypatch.setattr(_FakeLiveKitRoom, "connect", connect)
+        endpoint = LiveKitRemoteMediaEndpoint(issued, rtc_module=_fake_rtc_module())
+        task = asyncio.create_task(endpoint.preconnect())
+        await entered.wait()
+        await endpoint.close()
+        release.set()
+        result = await asyncio.gather(task, return_exceptions=True)
+        assert isinstance(result[0], asyncio.CancelledError)
+        assert _FakeLiveKitRoom.latest.disconnected
+        assert not _FakeLiveKitAudioSource.instances
+    asyncio.run(run())
 
 
 async def _wait_for(predicate, timeout: float = 1.0) -> None:

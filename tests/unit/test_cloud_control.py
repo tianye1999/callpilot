@@ -330,6 +330,28 @@ def test_cloud_client_accepts_strict_inbound_claim_and_acks_offer() -> None:
     ]
 
 
+def test_silent_prepare_has_separate_dispatch_and_no_claim_ack(monkeypatch):
+    service = _Service()
+    prepared = []
+    service.prepare_inbound_takeover = prepared.append
+    client = CloudEdgeClient("https://cloud.example.test", service, _Store())
+    command = _takeover_claim()
+    command.pop("claimId")
+    command.update(type="inbound.prepare", mode="phone_first", expiresAtUnixMs=round(time.time() * 1000) + 15000)
+    sent = []
+    monkeypatch.setenv("INBOUND_PRECONNECT_ENABLED", "false")
+    client.handle_message(json.dumps(command), sent.append)
+    assert not prepared and not service.claims and not sent
+    assert "inboundPreconnectV1" not in json.loads(client._heartbeat())["status"]
+    monkeypatch.setenv("INBOUND_PRECONNECT_ENABLED", "true")
+    client.handle_message(json.dumps(command), sent.append)
+    assert len(prepared) == 1 and not service.claims and not sent
+    assert json.loads(client._heartbeat())["status"]["inboundPreconnectV1"] is True
+    for mutation in ({"mode": "ai"}, {"expiresAtUnixMs": 0}, {"unexpected": True}):
+        client.handle_message(json.dumps({**command, **mutation}), sent.append)
+    assert len(prepared) == 1 and not sent
+
+
 def test_inbound_claim_rejection_preserves_stable_fence_code() -> None:
     class _RejectingService(_Service):
         def accept_inbound_takeover_claim(self, **fields) -> TakeoverResult:

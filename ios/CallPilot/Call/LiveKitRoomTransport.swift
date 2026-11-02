@@ -7,6 +7,7 @@ final class LiveKitRoomTransport: CallMediaTransport {
     static func connectOptions(enableMicrophone: Bool) -> ConnectOptions {
         ConnectOptions(enableMicrophone: enableMicrophone)
     }
+    static let silentConnectOptions = ConnectOptions(autoSubscribe: false, enableMicrophone: false)
     static let controlPublishOptions = DataPublishOptions(
         topic: CallPilotTopic.control,
         reliable: true
@@ -40,6 +41,27 @@ final class LiveKitRoomTransport: CallMediaTransport {
     func setMicrophone(enabled: Bool) async throws {
         try Task.checkCancellation()
         try await room.localParticipant.setMicrophone(enabled: enabled)
+    }
+
+    func connectSilent(url: String, token: String) async throws {
+        try await room.connect(url: url, token: token, connectOptions: Self.silentConnectOptions)
+        await eventTarget.emit(.permissionsReady(Self.mediaAllowed(room.localParticipant.permissions)))
+    }
+
+    func subscribeToEdge(_ identity: String) async throws {
+        for participant in room.remoteParticipants.values where participant.identity?.stringValue == identity {
+            for publication in participant.trackPublications.values {
+                guard let remote = publication as? RemoteTrackPublication,
+                      remote.name == "phone-downlink", remote.kind == .audio else { continue }
+                try Task.checkCancellation()
+                try await remote.set(subscribed: true)
+            }
+        }
+    }
+
+    nonisolated static func mediaAllowed(_ permission: ParticipantPermissions) -> Bool {
+        permission.canPublish && permission.canSubscribe && permission.canPublishData
+            && permission.canPublishSources == [Track.Source.microphone.rawValue]
     }
 
     func publishControl(_ data: Data) async throws {
@@ -95,6 +117,15 @@ private final class LiveKitRoomDelegateProxy: NSObject, RoomDelegate, AudioRende
     func room(_ room: Room, didDisconnectWithError error: LiveKitError?) {
         let reason = error?.localizedDescription ?? "media_disconnected"
         relay.yield(.disconnected(reason: reason))
+    }
+
+    func room(_ room: Room, participant: Participant, didUpdatePermissions permissions: ParticipantPermissions) {
+        guard participant is LocalParticipant else { return }
+        relay.yield(.permissionsReady(LiveKitRoomTransport.mediaAllowed(permissions)))
+    }
+
+    func room(_ room: Room, participant: RemoteParticipant, didPublishTrack publication: RemoteTrackPublication) {
+        relay.yield(.tracksChanged)
     }
 
     func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {

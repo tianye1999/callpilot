@@ -16,7 +16,7 @@ const now = 1_800_000_000_000;
 const deviceId = "device_abcdefghijkl";
 const edgeId = "edge_abcdefghijkl";
 const offerId = "offer_abcdefghijkl";
-const stages = ["auth", "offer_read", "cas", "edge_token", "edge_send", "phone_token", "audit", "total"];
+const stages = ["auth", "cas", "edge_token", "phone_token", "edge_send", "audit", "total"];
 
 async function fixture() {
   vi.spyOn(Date, "now").mockReturnValue(now);
@@ -46,9 +46,11 @@ async function fixture() {
   }));
   const relay = vi.fn(async () => Response.json({ connected: true, modemOnline: true }, { status: 202 }));
   const env = {
-    DB: { prepare }, PUBLIC_ORIGIN: "https://relay", LIVEKIT_URL: "wss://media.example.test",
+    DB: { prepare }, PUBLIC_ORIGIN: "https://relay", LIVEKIT_URL: "wss://media.example.test", INBOUND_CLAIM_FAST_PATH_ENABLED: "true",
     EDGE_ROOMS: { idFromName: (id: string) => id, get: () => ({ fetch: relay }) }
   } as unknown as Env;
+  const background: Promise<unknown>[] = [];
+  const ctx = { waitUntil: (promise: Promise<unknown>) => { background.push(promise); } } as ExecutionContext;
   const claim = (id = offerId, authenticated = true) => worker.fetch(new Request("https://relay/v1/inbound-offers/claim", {
     method: "POST",
     headers: {
@@ -56,11 +58,11 @@ async function fixture() {
       ...(authenticated ? { Cookie: `__Host-callpilot-device=${deviceId}.synthetic-secret` } : {})
     },
     body: JSON.stringify({ offerId: id })
-  }), env);
+  }), env, ctx);
   const device = (authenticated = true) => worker.fetch(new Request("https://relay/v1/device", {
     headers: authenticated ? { Cookie: `__Host-callpilot-device=${deviceId}.synthetic-secret` } : {}
   }), env);
-  return { db, prepare, relay, env, claim, device, log };
+  return { db, prepare, relay, env, claim, device, log, background };
 }
 
 function assertTiming(response: Response, expected: string[], log: ReturnType<typeof vi.spyOn>) {
@@ -97,6 +99,57 @@ afterEach(() => {
 });
 
 describe("inbound claim timing", () => {
+  it("returns before background audit and uses one successful adjudication round trip", async () => {
+    const f = await fixture();
+    const original = f.prepare.getMockImplementation()!;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.prepare.mockImplementation(sql => {
+      const statement = original(sql);
+      if (!sql.startsWith("INSERT INTO audit_events")) return statement;
+      return { bind: (...args) => {
+        const bound = statement.bind(...args);
+        return { ...bound, run: async () => { await gate; return bound.run(); } };
+      } };
+    });
+    const response = await f.claim();
+    expect(response.status).toBe(202);
+    expect(f.background).toHaveLength(1);
+    expect(f.db.prepare("SELECT * FROM audit_events").all()).toHaveLength(0);
+    expect(f.prepare.mock.calls.filter(([sql]) => sql.startsWith("SELECT") && sql.includes("inbound_offers"))).toHaveLength(0);
+    release!();
+    await Promise.all(f.background);
+    expect(f.db.prepare("SELECT * FROM audit_events").all()).toHaveLength(1);
+  });
+
+  it.each([undefined, "false", "TRUE"])("keeps the legacy serial path when fast flag is %s", async value => {
+    const f = await fixture();
+    f.env.INBOUND_CLAIM_FAST_PATH_ENABLED = value;
+    const response = await f.claim();
+    expect(response.status).toBe(202);
+    assertTiming(response, ["auth", "offer_read", "cas", "edge_token", "edge_send", "phone_token", "audit", "total"], f.log);
+  });
+
+  it("never delivers a command while the atomic decision is pending", async () => {
+    const f = await fixture();
+    const original = f.prepare.getMockImplementation()!;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.prepare.mockImplementation(sql => {
+      const statement = original(sql);
+      if (!sql.startsWith("UPDATE inbound_offers SET status = 'claimed'")) return statement;
+      return { bind: (...args) => {
+        const bound = statement.bind(...args);
+        return { ...bound, first: async () => { await gate; return bound.first(); } };
+      } };
+    });
+    const response = f.claim();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(f.relay).not.toHaveBeenCalled();
+    release!();
+    expect((await response).status).toBe(202);
+  });
+
   it("reports all successful stages as durations in the header and one identifier-free log", async () => {
     const f = await fixture();
     const response = await f.claim();
@@ -115,7 +168,7 @@ describe("inbound claim timing", () => {
     const f = await fixture();
     const response = await f.claim("offer_missingabcde");
     expect(response.status).toBe(404);
-    assertTiming(response, ["auth", "offer_read", "total"], f.log);
+    assertTiming(response, ["auth", "cas", "offer_read", "total"], f.log);
   });
 
   it.each(["claimed", "revoked"])("reports an unavailable %s offer through CAS and rejection audit", async (status) => {
@@ -123,7 +176,7 @@ describe("inbound claim timing", () => {
     f.db.prepare("UPDATE inbound_offers SET status = ? WHERE offer_id = ?").run(status, offerId);
     const response = await f.claim();
     expect(response.status).toBe(409);
-    assertTiming(response, ["auth", "offer_read", "cas", "audit", "total"], f.log);
+    assertTiming(response, ["auth", "cas", "offer_read", "audit", "total"], f.log);
   });
 
   it("reports an expired offer through CAS and rejection audit", async () => {
@@ -131,7 +184,7 @@ describe("inbound claim timing", () => {
     f.db.prepare("UPDATE inbound_offers SET expires_at = ? WHERE offer_id = ?").run(now - 1, offerId);
     const response = await f.claim();
     expect(response.status).toBe(409);
-    assertTiming(response, ["auth", "offer_read", "cas", "audit", "total"], f.log);
+    assertTiming(response, ["auth", "cas", "offer_read", "audit", "total"], f.log);
   });
 
   it("includes the failed Edge token stage and preserves failed-offer cleanup", async () => {
@@ -139,16 +192,16 @@ describe("inbound claim timing", () => {
     vi.mocked(issueParticipantToken).mockRejectedValueOnce(new Error("synthetic private error"));
     const response = await f.claim();
     expect(response.status).toBe(500);
-    assertTiming(response, ["auth", "offer_read", "cas", "edge_token", "total"], f.log);
+    assertTiming(response, ["auth", "cas", "edge_token", "phone_token", "total"], f.log);
     expect(f.db.prepare("SELECT status FROM inbound_offers WHERE offer_id = ?").get(offerId)?.status).toBe("failed");
   });
 
-  it("includes failed command delivery without later phone-token or audit stages", async () => {
+  it("includes failed delivery after parallel signing without an allowed audit", async () => {
     const f = await fixture();
     f.relay.mockResolvedValue(Response.json({ error: "EDGE_OFFLINE" }, { status: 503 }));
     const response = await f.claim();
     expect(response.status).toBe(409);
-    assertTiming(response, ["auth", "offer_read", "cas", "edge_token", "edge_send", "total"], f.log);
+    assertTiming(response, ["auth", "cas", "edge_token", "phone_token", "edge_send", "total"], f.log);
   });
 
   it("includes a failed phone token stage", async () => {
@@ -157,10 +210,10 @@ describe("inbound claim timing", () => {
       .mockRejectedValueOnce(new Error("synthetic phone token error"));
     const response = await f.claim();
     expect(response.status).toBe(500);
-    assertTiming(response, stages.filter((stage) => stage !== "audit"), f.log);
+    assertTiming(response, stages.filter((stage) => stage !== "audit" && stage !== "edge_send"), f.log);
   });
 
-  it("includes a failed audit stage without logging the error message", async () => {
+  it("keeps best-effort audit failures out of the claim result", async () => {
     const f = await fixture();
     const prepare = f.prepare.getMockImplementation()!;
     f.prepare.mockImplementation((sql) => {
@@ -168,7 +221,7 @@ describe("inbound claim timing", () => {
       return prepare(sql);
     });
     const response = await f.claim();
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(202);
     assertTiming(response, stages, f.log);
   });
 });
@@ -191,7 +244,7 @@ describe("device claim prewarm feature", () => {
     const unpaired = await f.device(false);
     expect(unpaired.status).toBe(200);
     expect(await unpaired.json()).toEqual({
-      ok: true, paired: false, features: { claimPrewarm: value === "true" }
+      ok: true, paired: false, features: { claimPrewarm: value === "true", preconnect: false }
     });
     expect(f.log).not.toHaveBeenCalled();
   });

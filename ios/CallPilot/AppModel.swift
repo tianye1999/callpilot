@@ -34,6 +34,20 @@ final class AppModel: ObservableObject {
     private var deviceStatusMachine = DeviceStatusStateMachine()
     private let callKit = CallKitCoordinator()
     private let claimPrewarmer = ClaimPrewarmer()
+    private var silentIncoming: (offer: InboundOffer, session: CallMediaSession)?
+    private var silentIncomingTask: Task<Void, Never>?
+    private var silentExpiryTask: Task<Void, Never>?
+
+    private func closeSilentIncoming() {
+        silentIncomingTask?.cancel()
+        silentIncomingTask = nil
+        silentExpiryTask?.cancel()
+        silentExpiryTask = nil
+        let session = silentIncoming?.session
+        silentIncoming = nil
+        // Register cancellation before another call can acquire the audio lease.
+        session?.cancelSilently()
+    }
 
     // 接管媒体超时(对齐 Android takeoverMediaTimeoutMs;真机实证:失败会话不复位会挡后续 offer)。
     private let takeoverMediaTimeout: Duration = .seconds(20)
@@ -101,6 +115,7 @@ final class AppModel: ObservableObject {
     }
 
     func unpair() {
+        closeSilentIncoming()
         let pairedClient = client
         Task {
             try? await pairedClient?.unregisterVoipToken()
@@ -157,6 +172,9 @@ final class AppModel: ObservableObject {
         while !Task.isCancelled {
             if let c = client {
                 if let offers = try? await c.listInboundOffers() {
+                    if let pending = silentIncoming, !offers.contains(where: { $0.offerId == pending.offer.offerId }) {
+                        closeSilentIncoming()
+                    }
                     callKit.reconcile(
                         openOffers: offers,
                         nowUnixMs: Int64(Date().timeIntervalSince1970 * 1_000)
@@ -194,6 +212,8 @@ final class AppModel: ObservableObject {
             guard currentClient === client,
                   deviceStatusMachine.succeed(status, for: refresh) else { return }
             claimPrewarmer.setEnabled(status.claimPrewarm)
+            claimPrewarmer.setPreconnectEnabled(status.preconnect)
+            if !claimPrewarmer.canPreconnect { closeSilentIncoming() }
         } catch {
             guard currentClient === client else { return }
             if error is CancellationError
@@ -211,6 +231,7 @@ final class AppModel: ObservableObject {
     }
 
     func dismissOffer(_ offer: InboundOffer) {
+        if silentIncoming?.offer.offerId == offer.offerId { closeSilentIncoming() }
         dismissedOffers.insert(offer.offerId)
         incomingOffer = nil
         Task { _ = await callKit.requestEndIfManaged(offer) }
@@ -220,6 +241,7 @@ final class AppModel: ObservableObject {
 
     func startCall(number: String) async {
         guard let c = client, let p = pairing, callState == .idle else { return }
+        closeSilentIncoming()
         let timing = CallTiming()
         timing.mark(.dialStart)
         let attempt = beginCallAttempt(with: .preparing(label: number))
@@ -254,9 +276,20 @@ final class AppModel: ObservableObject {
         guard await canBeginAudio(label: label, attempt: attempt) else { return }
         if usesCallKit, !callKit.isAnswering(offerId: offer.offerId) { return }
         _ = apply(.waitingMedia(label: label), for: attempt)
-        let session = CallMediaSession(onState: { [weak self] st in
-            _ = self?.apply(st, for: attempt)
-        }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner, timing: timing)
+        let session: CallMediaSession
+        if usesCallKit, let pending = silentIncoming, pending.offer.offerId == offer.offerId {
+            session = pending.session
+            silentIncoming = nil
+            silentIncomingTask = nil
+            silentExpiryTask?.cancel()
+            silentExpiryTask = nil
+            session.setStateHandler { [weak self] st in _ = self?.apply(st, for: attempt) }
+        } else {
+            closeSilentIncoming()
+            session = CallMediaSession(onState: { [weak self] st in
+                _ = self?.apply(st, for: attempt)
+            }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner, timing: timing)
+        }
         media = session
         scheduleMediaTimeout(for: attempt, session: session, duration: takeoverMediaTimeout)
         await session.startTakeover(
@@ -435,7 +468,29 @@ extension AppModel: CallKitCoordinatorDelegate {
               !dismissedOffers.contains(offer.offerId) else { return }
         incomingOffer = offer
         if let client {
-            claimPrewarmer.receive(offer) { await client.prewarmClaimConnection() }
+            if claimPrewarmer.canPreconnect {
+                guard silentIncoming == nil else { return }
+                let timing = CallTiming()
+                timing.mark(.pushReceived, at: offer.pushReceivedAt)
+                let session = CallMediaSession(onState: { _ in }, transportFactory: { LiveKitRoomTransport() },
+                                               audio: LiveKitAudioDevice.owner, timing: timing)
+                session.onSilentDisconnect = { [weak self] in
+                    guard let self, silentIncoming?.offer.offerId == offer.offerId else { return }
+                    closeSilentIncoming()
+                    incomingOffer = nil
+                    callKit.finishRingingOffer(offerId: offer.offerId)
+                }
+                silentIncoming = (offer, session)
+                silentIncomingTask = Task { await session.startSilentPreconnect(client: client, offer: offer) }
+                silentExpiryTask = Task {
+                    do { try await Task.sleep(for: .milliseconds(max(0, offer.expiresAt - Int64(Date().timeIntervalSince1970 * 1000)))) }
+                    catch { return }
+                    if self.silentIncoming?.offer.offerId == offer.offerId { self.closeSilentIncoming() }
+                }
+            } else {
+                claimPrewarmer.receive(offer) { await client.prewarmClaimConnection() }
+                claimPrewarmer.timing(for: offer.offerId)?.mark(.pushReceived, at: offer.pushReceivedAt)
+            }
         }
     }
 
@@ -444,17 +499,19 @@ extension AppModel: CallKitCoordinatorDelegate {
             callKit.finishActiveCall(reason: .failed)
             return
         }
-        let timing = claimPrewarmer.timing(for: offer.offerId) ?? CallTiming()
+        let timing = silentIncoming?.session.timing ?? claimPrewarmer.timing(for: offer.offerId) ?? CallTiming()
         timing.mark(.answerAction)
         Task { await performTakeover(offer, usesCallKit: true, timing: timing) }
     }
 
     func callKitDidRequestDecline(_ offer: InboundOffer) {
+        if silentIncoming?.offer.offerId == offer.offerId { closeSilentIncoming() }
         dismissedOffers.insert(offer.offerId)
         if incomingOffer?.offerId == offer.offerId { incomingOffer = nil }
     }
 
     func callKitDidRequestHangup(offerId: String) {
+        if silentIncoming?.offer.offerId == offerId { closeSilentIncoming() }
         guard callKitOfferId == offerId else { return }
         if let pending = pendingAudioAttempt {
             _ = apply(.ended(label: pending.label, reason: "local_hangup"), for: pending.attempt)
@@ -474,6 +531,7 @@ extension AppModel: CallKitCoordinatorDelegate {
     }
 
     func callKitDidFail(offerId: String, code: String) {
+        if silentIncoming?.offer.offerId == offerId { closeSilentIncoming() }
         guard callKitOfferId == offerId else { return }
         if let pending = pendingAudioAttempt {
             _ = apply(.failed(label: pending.label, reason: L10n.text("call.audio.failed"), code: code),

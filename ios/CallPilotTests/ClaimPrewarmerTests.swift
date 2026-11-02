@@ -4,6 +4,75 @@ import XCTest
 
 @MainActor
 final class ClaimPrewarmerTests: XCTestCase {
+    func testSilentPreconnectUsesCachedServerFeatureWithoutLaunchArguments() throws {
+        let (defaults, suite) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = ClaimPrewarmer(defaults: defaults)
+        first.bind(gatewayURL: "https://relay", deviceId: "device_a")
+        XCTAssertFalse(first.canPreconnect)
+        first.setPreconnectEnabled(true)
+        XCTAssertTrue(first.canPreconnect)
+        let restored = ClaimPrewarmer(defaults: defaults)
+        restored.bind(gatewayURL: "https://relay", deviceId: "device_a")
+        XCTAssertTrue(restored.canPreconnect)
+        restored.setPreconnectEnabled(false)
+        let disabled = ClaimPrewarmer(defaults: defaults)
+        disabled.bind(gatewayURL: "https://relay", deviceId: "device_a")
+        XCTAssertFalse(disabled.canPreconnect)
+        restored.setPreconnectEnabled(true)
+        restored.bind(gatewayURL: "https://relay", deviceId: "device_b")
+        XCTAssertFalse(restored.canPreconnect)
+        restored.clear()
+        XCTAssertFalse(restored.preconnectEnabled)
+    }
+
+    func testLegacyLocalPreconnectSettingCannotOverrideServerFeature() throws {
+        let (defaults, suite) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let prewarmer = ClaimPrewarmer(defaults: defaults)
+        prewarmer.bind(gatewayURL: "https://relay", deviceId: "device_a")
+        defaults.set(true, forKey: "inboundPreconnectEnabled")
+        XCTAssertFalse(prewarmer.canPreconnect)
+        defaults.set(false, forKey: "inboundPreconnectEnabled")
+        prewarmer.setPreconnectEnabled(true)
+        XCTAssertTrue(prewarmer.canPreconnect)
+        prewarmer.bind(gatewayURL: "https://other-relay", deviceId: "device_a")
+        XCTAssertFalse(prewarmer.canPreconnect)
+    }
+
+    func testSilentTransportOptionsAndAudioLeaseKeepEngineUnavailable() throws {
+        let transport = try source("Call/LiveKitRoomTransport.swift")
+        XCTAssertTrue(transport.contains("ConnectOptions(autoSubscribe: false, enableMicrophone: false)"))
+        XCTAssertFalse(transport.contains("withPreConnectAudio"))
+        let audio = try source("Call/LiveKitAudioDevice.swift")
+        let prepare = try section(audio, from: "func prepare(", to: "func configureCallKitSession")
+        XCTAssertTrue(prepare.contains("try stop()"))
+        XCTAssertTrue(prepare.contains("isAutomaticConfigurationEnabled = mode == .standalone"))
+        XCTAssertTrue(prepare.contains("if mode == .standalone"))
+        XCTAssertTrue(audio.contains("setEngineAvailability(.none)"))
+        let media = try source("Call/CallMediaSession.swift")
+        let silent = try section(media, from: "func startSilentPreconnect", to: "private func closeSilentTransport")
+        XCTAssertTrue(silent.contains("audio.acquire(ownerID, mode: .callKit)"))
+        for forbidden in ["configureCallKitSession", "setMicrophone", "subscribeToEdge", "audio.activate"] {
+            XCTAssertFalse(silent.contains(forbidden))
+        }
+    }
+
+    func testSilentCleanupIsWiredToDeclineTimeoutResetAndNewOutbound() throws {
+        let app = try source("AppModel.swift")
+        for (start, end) in [("func dismissOffer", "// MARK: - 外呼"),
+                             ("func callKitDidRequestDecline", "func callKitDidRequestHangup"),
+                             ("func callKitDidRequestHangup", "func callKitPrepareToAnswer"),
+                             ("func startCall(number", "// MARK: - 来电接管")] {
+            XCTAssertTrue(try section(app, from: start, to: end).contains("closeSilentIncoming()"))
+        }
+        XCTAssertTrue(app.contains("silentExpiryTask = Task"))
+        XCTAssertTrue(app.contains("!offers.contains(where:"))
+        let close = try section(app, from: "private func closeSilentIncoming", to: "// 接管媒体超时")
+        XCTAssertTrue(close.contains("session?.cancelSilently()"))
+        XCTAssertFalse(close.contains("requestHangup()"))
+    }
+
     func testPushReportsCallKitBeforeSchedulingNonblockingPrewarm() throws {
         let coordinator = try source("Call/CallKitCoordinator.swift")
         let push = try section(coordinator, from: "didReceiveIncomingPushWith payload",
@@ -39,7 +108,7 @@ final class ClaimPrewarmerTests: XCTestCase {
         let media = try source("Call/CallMediaSession.swift")
         let takeover = try section(media, from: "func startTakeover(", to: "func prepareCallKitAnswer")
         let baseline = try XCTUnwrap(takeover.range(of: "timing.startClaim()"))
-        let claim = try XCTUnwrap(takeover.range(of: "client.claimInboundOffer(offerId: offerId, timing: timing)"))
+        let claim = try XCTUnwrap(takeover.range(of: "client.claimInboundOffer(offerId: offerId, timing: timing, preparation: candidate)"))
         XCTAssertLessThan(baseline.lowerBound, claim.lowerBound)
     }
 

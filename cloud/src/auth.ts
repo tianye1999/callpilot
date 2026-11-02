@@ -14,7 +14,7 @@ export async function authenticateEdge(request: Request, env: Env): Promise<Edge
   return edge;
 }
 
-export async function authenticateDevice(request: Request, env: Env): Promise<DeviceRecord> {
+export async function authenticateDevice(request: Request, env: Env, ctx?: ExecutionContext): Promise<DeviceRecord> {
   const credential = cookieCredential(request);
   if (!credential || !credential[0].startsWith("device_")) throw unauthorized();
   const [deviceId, secret] = credential;
@@ -25,13 +25,13 @@ export async function authenticateDevice(request: Request, env: Env): Promise<De
   const now = Date.now();
   const cutoff = now - 10 * 60_000;
   if (device.last_used_at === null || device.last_used_at <= cutoff) {
-    try {
-      await env.DB.prepare(
+    const update = env.DB.prepare(
         "UPDATE devices SET last_used_at = ?1 WHERE device_id = ?2 AND (last_used_at IS NULL OR last_used_at <= ?3)"
-      ).bind(now, deviceId, cutoff).run();
-    } catch {
+      ).bind(now, deviceId, cutoff).run().catch(() => {
       console.warn("Device last-used update failed");
-    }
+    });
+    if (ctx) ctx.waitUntil(update);
+    else await update;
   }
   return device;
 }

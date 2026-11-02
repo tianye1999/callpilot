@@ -77,7 +77,9 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         let features = payload["features"] as? [String: Any]
         let prewarm = features?["claimPrewarm"] as? NSNumber
         let enabled = prewarm.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
-        return HostedDeviceStatus(connected: connected, modemOnline: modemOnline, claimPrewarm: enabled)
+        let preconnect = features?["preconnect"] as? NSNumber
+        let silent = preconnect.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
+        return HostedDeviceStatus(connected: connected, modemOnline: modemOnline, claimPrewarm: enabled, preconnect: silent)
     }
 
     func prewarmClaimConnection() async {
@@ -196,11 +198,14 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     }
 
     /// claim 一个 offer,成功即拿到入房凭证(first-claim-wins,输家 409)。
-    func claimInboundOffer(offerId: String, timing: CallTiming? = nil) async throws -> HostedCallSession {
+    func claimInboundOffer(offerId: String, timing: CallTiming? = nil,
+                           preparation: InboundPreparation? = nil) async throws -> HostedCallSession {
         guard offerId.wholeMatch(of: Self.offerIdRE) != nil else {
             throw HostedCloudError(statusCode: 0, code: "BAD_OFFER_ID", message: "offer id 格式不合法")
         }
-        let body = try JSONSerialization.data(withJSONObject: ["offerId": offerId])
+        var fields = ["offerId": offerId]
+        if let preparation { fields["prepareId"] = preparation.prepareId }
+        let body = try JSONSerialization.data(withJSONObject: fields)
         let metrics = timing.map { _ in ClaimNetworkMetrics() }
         defer {
             if let timing, let metrics {
@@ -219,12 +224,42 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         }
         let session = HostedSessionPayload(livekitURL: url, token: token, expiresAt: expiresAt)
         try validateSession(session, statusCode: response.statusCode)
+        let mode = payload["mode"] as? String ?? "cold"
+        if mode == "reuse" {
+            guard let preparation, payload["roomName"] as? String == preparation.roomName,
+                  payload["participantIdentity"] as? String == preparation.participantIdentity,
+                  let edgeIdentity = payload["edgeIdentity"] as? String,
+                  edgeIdentity.wholeMatch(of: /^edgepart_[A-Za-z0-9_-]{12,80}$/) != nil else {
+                throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid prepared claim")
+            }
+        } else {
+            guard mode == "cold" else { throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid claim mode") }
+        }
         return HostedCallSession(
             sessionId: claimId,
             livekitURL: session.livekitURL,
             token: session.token,
-            expiresAt: session.expiresAt
+            expiresAt: session.expiresAt,
+            mode: mode, edgeIdentity: payload["edgeIdentity"] as? String
         )
+    }
+
+    func prepareInboundOffer(offerId: String) async throws -> InboundPreparation {
+        let body = try JSONSerialization.data(withJSONObject: ["offerId": offerId])
+        let (payload, response) = try await request("POST", "v1/inbound-offers/prepare", body: body)
+        guard let prepareId = payload["prepareId"] as? String,
+              prepareId.wholeMatch(of: /^prepare_[A-Za-z0-9_-]{12,80}$/) != nil,
+              let room = payload["roomName"] as? String,
+              room.wholeMatch(of: /^callpilot_[A-Za-z0-9_-]{12,80}$/) != nil,
+              let identity = payload["participantIdentity"] as? String,
+              identity.wholeMatch(of: /^web_[A-Za-z0-9_-]{12,80}$/) != nil,
+              let url = payload["url"] as? String, let token = payload["token"] as? String,
+              let expires = Self.jsonInt64(payload["expiresAt"]) else {
+            throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid prepare response")
+        }
+        try validateSession(HostedSessionPayload(livekitURL: url, token: token, expiresAt: expires), statusCode: response.statusCode)
+        return InboundPreparation(prepareId: prepareId, roomName: room, participantIdentity: identity,
+            session: HostedCallSession(sessionId: prepareId, livekitURL: url, token: token, expiresAt: expires))
     }
 
     // MARK: - 只读内容同步(#99)

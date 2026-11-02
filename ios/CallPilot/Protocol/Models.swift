@@ -19,6 +19,8 @@ struct HostedCallSession: Equatable, CustomStringConvertible, CustomDebugStringC
     let livekitURL: String
     let token: String
     let expiresAt: Int64
+    var mode: String = "cold"
+    var edgeIdentity: String? = nil
 
     /// Keep one-time room credentials out of logs and crash reports.
     var description: String {
@@ -28,11 +30,19 @@ struct HostedCallSession: Equatable, CustomStringConvertible, CustomDebugStringC
     var debugDescription: String { description }
 }
 
+struct InboundPreparation {
+    let prepareId: String
+    let roomName: String
+    let participantIdentity: String
+    let session: HostedCallSession
+}
+
 /// #95 一条可接管的来电 offer;云端只暴露 opaque id、CallKit UUID 与过期时间。
 struct InboundOffer: Equatable {
     let offerId: String
     let callUUID: UUID?
     let expiresAt: Int64
+    var pushReceivedAt: TimeInterval? = nil
 
     init(offerId: String, callUUID: UUID? = nil, expiresAt: Int64) {
         self.offerId = offerId
@@ -51,11 +61,13 @@ struct HostedDeviceStatus: Equatable {
     let connected: Bool
     let modemOnline: Bool
     let claimPrewarm: Bool
+    let preconnect: Bool
 
-    init(connected: Bool, modemOnline: Bool, claimPrewarm: Bool = false) {
+    init(connected: Bool, modemOnline: Bool, claimPrewarm: Bool = false, preconnect: Bool = false) {
         self.connected = connected
         self.modemOnline = modemOnline
         self.claimPrewarm = claimPrewarm
+        self.preconnect = preconnect
     }
 
     /// 是否允许拨号/接管:电脑端在线且模组在线(对齐 Android connected && modemOnline)。

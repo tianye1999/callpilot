@@ -142,6 +142,11 @@ final class CallKitCoordinator: NSObject {
         finish(callUUID: callUUID, reason: reason)
     }
 
+    func finishRingingOffer(offerId: String) {
+        guard let id = calls.callUUID(offerId: offerId), calls.phase(callUUID: id) == .ringing else { return }
+        finish(callUUID: id, reason: .remoteEnded)
+    }
+
     func reconcile(openOffers: [InboundOffer], nowUnixMs: Int64) {
         let stale = calls.reconcile(
             openOfferIds: Set(openOffers.map(\.offerId)),
@@ -154,6 +159,7 @@ final class CallKitCoordinator: NSObject {
     }
 
     private func report(_ payload: VoipPushPayload, completion: PushCompletion) {
+        let pushReceivedAt = CallMonotonic.now()
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         guard calls.register(payload, nowUnixMs: now) else {
             completion.call()
@@ -174,11 +180,12 @@ final class CallKitCoordinator: NSObject {
                     return
                 }
                 if error == nil {
-                    let offer = InboundOffer(
+                    var offer = InboundOffer(
                         offerId: payload.offerId,
                         callUUID: payload.callUUID,
                         expiresAt: payload.expiresAtUnixMs
                     )
+                    offer.pushReceivedAt = pushReceivedAt
                     self.delegate?.callKitDidReceiveOffer(offer)
                     self.scheduleExpiration(payload)
                 } else {

@@ -122,6 +122,20 @@ def test_client_timing_pins_attempt_and_first_mark():
     assert len(record.events) == 2
 
 
+def test_new_client_marks_leave_room_for_edge_and_teardown_observations():
+    from agentcall.call_timing import CLIENT_MARKS, MAX_TIMING_MARKS
+
+    timing = CallTiming()
+    names = sorted(CLIENT_MARKS)
+    attempt = str(uuid.uuid4())
+    for index in range(0, len(names), 16):
+        timing.receive_client(packet(attempt=attempt, seq=index // 16 + 1,
+                                     marks={name: 0 for name in names[index:index + 16]}))
+    for index in range(32):
+        timing.mark(f"local_{index}")
+    assert len(timing._marks) == len(names) + 32 <= MAX_TIMING_MARKS
+
+
 def test_edge_marks_use_local_clock_and_only_emit_once():
     record = Record()
     clock = [10.0]

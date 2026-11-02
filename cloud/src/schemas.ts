@@ -43,6 +43,7 @@ export const edgeMessageSchema = z.union([
     status: z.object({
       modemOnline: z.boolean(),
       lineBusy: z.boolean(),
+      inboundPreconnectV1: z.boolean().optional(),
       version: z.string().max(64).optional()
     }).strict()
   }).strict(),
@@ -73,7 +74,8 @@ export const edgeMessageSchema = z.union([
     callId: opaqueId,
     generation: z.number().int().min(0),
     nonce: z.string().min(16).max(128),
-    expiresAtUnixMs: z.number().int().positive()
+    expiresAtUnixMs: z.number().int().positive(),
+    mode: z.literal("phone_first").optional()
   }).strict(),
   z.object({
     v: z.literal(1),
@@ -86,8 +88,11 @@ export const edgeMessageSchema = z.union([
 ]);
 
 export const claimInboundOfferSchema = z.object({
-  offerId: opaqueId
+  offerId: opaqueId,
+  prepareId: opaqueId.optional()
 }).strict();
+
+export const prepareInboundOfferSchema = z.object({ offerId: opaqueId }).strict();
 
 export const registerVoipTokenSchema = z.object({
   // Apple explicitly treats device-token length as variable. Keep the wire

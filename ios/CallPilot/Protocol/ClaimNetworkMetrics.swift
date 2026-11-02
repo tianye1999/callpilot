@@ -10,6 +10,7 @@ final class ClaimNetworkMetrics: NSObject, URLSessionTaskDelegate, @unchecked Se
         var tlsEnd: Date?
         var requestStart: Date?
         var firstByte: Date?
+        var responseEnd: Date?
         var fetchStart: Date?
         var reused = false
     }
@@ -41,6 +42,7 @@ final class ClaimNetworkMetrics: NSObject, URLSessionTaskDelegate, @unchecked Se
             (.claimConnectStart, transaction.connectStart), (.claimConnectEnd, transaction.connectEnd),
             (.claimTLSStart, transaction.tlsStart), (.claimTLSEnd, transaction.tlsEnd),
             (.claimRequestStart, transaction.requestStart), (.claimFirstByte, transaction.firstByte),
+            (.claimResponseEnd, transaction.responseEnd),
             (.claimConnectionReused, transaction.reused ? transaction.requestStart ?? transaction.fetchStart : nil),
         ]
         for (stage, date) in dates {
@@ -59,6 +61,7 @@ final class ClaimNetworkMetrics: NSObject, URLSessionTaskDelegate, @unchecked Se
             connectStart: first.connectStartDate, connectEnd: first.connectEndDate,
             tlsStart: first.secureConnectionStartDate, tlsEnd: first.secureConnectionEndDate,
             requestStart: first.requestStartDate, firstByte: first.responseStartDate,
+            responseEnd: first.responseEndDate,
             fetchStart: first.fetchStartDate, reused: first.isReusedConnection
         ))
     }

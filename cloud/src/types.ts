@@ -15,6 +15,8 @@ export interface Env {
   VOIP_PUSH_ENABLED?: string;
   ALERT_PUSH_ENABLED?: string;
   CLAIM_PREWARM_ENABLED?: string;
+  INBOUND_PRECONNECT_ENABLED?: string;
+  INBOUND_CLAIM_FAST_PATH_ENABLED?: string;
   APNS_TEAM_ID?: string;
   APNS_KEY_ID?: string;
   APNS_PRIVATE_KEY?: string;
@@ -74,6 +76,8 @@ export interface InboundOfferRecord {
   expires_at: number;
   updated_at: number;
   call_uuid: string | null;
+  preconnect_enabled: number;
+  preconnect_room: string | null;
 }
 
 export interface EdgePresence {
@@ -82,4 +86,5 @@ export interface EdgePresence {
   modemOnline?: boolean;
   lineBusy?: boolean;
   version?: string;
+  inboundPreconnectV1?: boolean;
 }

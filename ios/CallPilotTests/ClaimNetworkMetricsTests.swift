@@ -3,6 +3,13 @@ import XCTest
 @testable import CallPilot
 
 final class ClaimNetworkMetricsTests: XCTestCase {
+    func testResponseEndIsSeparateFromFirstByteAndUsesSameClock() {
+        let origin = Date(timeIntervalSince1970: 1_000)
+        let metrics = ClaimNetworkMetrics(wallTime: origin, monotonicTime: 10)
+        metrics.record(.init(firstByte: origin.addingTimeInterval(1.33), responseEnd: origin.addingTimeInterval(2.66)))
+        XCTAssertEqual(metrics.marks[.claimFirstByte]!, 11.33, accuracy: 0.001)
+        XCTAssertEqual(metrics.marks[.claimResponseEnd]!, 12.66, accuracy: 0.001)
+    }
     func testTransactionDatesProjectOntoTheSameMonotonicClock() throws {
         let wall = Date(timeIntervalSince1970: 1_000)
         let metrics = ClaimNetworkMetrics(wallTime: wall, monotonicTime: 50)

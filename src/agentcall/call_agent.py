@@ -15,7 +15,7 @@ from array import array
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from queue import Empty, Full, Queue
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from . import call_playbooks, config, modem_hardware, platforms
 from .agents.base import VoiceAgent
@@ -47,6 +47,7 @@ from .dtmf import dtmf_tone
 from .dtmf_followup import extract_spoken_dtmf
 from .dtmf_judge import DtmfActionLedger, DtmfJudge, WindowMode
 from .events import EventHub
+from .inbound_preconnect import InboundPreconnect
 from .modem import IncomingReservation, SerialModem, Sim7600Modem, create_modem
 from .monitor_playback import MonitorPlayback
 from .number_profiles import lookup_profile, lookup_profile_by_id
@@ -374,6 +375,7 @@ class CallSession:
         )
         self._takeover_revoke_queue: Queue[InboundTakeoverRevoke] = Queue(maxsize=1)
         self._takeover_session_queue: Queue[InboundTakeoverSession] = Queue(maxsize=1)
+        self._takeover_prepare: tuple[str, IssuedLiveKitSession] | None = None
         self._takeover_hold_generation: int | None = None
         self._takeover_hold_done = False
         self._takeover_hold_audio_at: float | None = None
@@ -2013,6 +2015,17 @@ class CallSession:
             self._takeover_ai_fallback_notified = True
 
     async def _handle_phone_first(self, record: CallRecord | None) -> str:
+        preconnect = InboundPreconnect()
+        try:
+            return await self._handle_phone_first_preconnect(record, preconnect)
+        finally:
+            await preconnect.close()
+            if not preconnect.reported:
+                preconnect.timing.bind(record)
+            with self._takeover_lock:
+                self._takeover_prepare = None
+
+    async def _handle_phone_first_preconnect(self, record: CallRecord | None, preconnect: InboundPreconnect) -> str:
         lease = self._phone_first_lease
         coordinator = self._takeover_coordinator
         assert lease is not None and coordinator is not None
@@ -2032,6 +2045,7 @@ class CallSession:
             offer_id=f"offer_{secrets.token_urlsafe(18)}", nonce=secrets.token_urlsafe(24),
             call_id=coordinator.call_id, generation=generation,
             created_at=created_at, expires_at=created_at + remaining,
+            phone_first=True,
         )
         with self._takeover_lock:
             self._takeover_request = request
@@ -2048,9 +2062,16 @@ class CallSession:
             record.log_event("phone_first_ringing", generation=generation)
         claimed: InboundTakeoverSession | None = None
         while current():
+            if preconnect.task is not None and not config.get_bool("INBOUND_PRECONNECT_ENABLED"):
+                await preconnect.close()
             # A claim and the timeout compete under the same lock. Once claimed,
             # its independent media budget cannot be reset by repeats.
             with self._takeover_lock:
+                prepared = self._takeover_prepare
+                if (prepared is not None and prepared[0] == request.offer_id
+                        and self._takeover_endpoint_factory is not None
+                        and config.get_bool("INBOUND_PRECONNECT_ENABLED")):
+                    preconnect.start(prepared[1], self._takeover_endpoint_factory)
                 if not self._phone_first_cloud_ready():
                     self._phone_first_fallback("ENDPOINT_UNAVAILABLE", generation)
                     return "ai"
@@ -2075,21 +2096,29 @@ class CallSession:
             factory = self._takeover_endpoint_factory
             if factory is None:
                 raise RuntimeError("endpoint_unavailable")
-            endpoint = factory(claimed.issued)
-            attach_endpoint_timing(endpoint, timing)
             timing.mark("endpoint_connect_start")
-            connecting = asyncio.create_task(endpoint.connect())
+
+            async def connect_claim() -> None:
+                nonlocal endpoint
+                endpoint = await preconnect.adopt(claimed.issued, timing)
+                if endpoint is None:
+                    endpoint = factory(claimed.issued)
+                    attach_endpoint_timing(endpoint, timing)
+                    await endpoint.connect()
+
+            connecting = asyncio.create_task(connect_claim())
             deadline = self._phone_first_claim_deadline
             assert deadline is not None
             while current() and self._phone_first_cloud_ready() and self._phone_first_clock() < deadline:
                 if connecting.done():
                     connecting.result()
+                    assert endpoint is not None
                     timing.mark("endpoint_connect_return")
                     if endpoint.media_ready:
                         break
                 await self._phone_first_sleep(0.05)
             if (not current() or not self._phone_first_cloud_ready() or not connecting.done()
-                    or not endpoint.media_ready or self._phone_first_clock() >= deadline):
+                    or endpoint is None or not endpoint.media_ready or self._phone_first_clock() >= deadline):
                 raise RuntimeError("media_prepare_failed")
             timing.mark("media_ready")
             if record is not None and self._phone_first_claimed_at is not None:
@@ -4724,6 +4753,29 @@ class CallSession:
         )
         return self.provide_takeover_session(claimed)
 
+    def prepare_takeover(self, command: dict[str, Any]) -> bool:
+        if not config.get_bool("INBOUND_PRECONNECT_ENABLED"):
+            return False
+        with self._takeover_lock:
+            request = self._takeover_request
+            if (request is None or not request.phone_first or not self.is_active
+                    or request.offer_id != self._phone_first_offer_id
+                    or request.offer_id != command["offerId"] or request.call_id != command["callId"]
+                    or request.generation != command["generation"] or request.nonce != command["nonce"]
+                    or request.generation != self._session_generation
+                    or time.time() >= request.expires_at or self._phone_first_claim_deadline is not None):
+                return False
+            if self._takeover_prepare is not None:
+                return self._takeover_prepare[0] == request.offer_id
+            session = command["session"]
+            self._takeover_prepare = (request.offer_id, IssuedLiveKitSession(
+                invite=RemoteDialerInvite(session_id=session["sessionId"], url="", expires_at=request.expires_at),
+                room_name=session["roomName"], browser_identity=session["browserIdentity"],
+                edge_identity=session["edgeIdentity"], browser_token="", edge_token=session["token"],
+                livekit_url=session["livekitUrl"],
+            ))
+            return True
+
     def take_takeover_session(self) -> InboundTakeoverSession | None:
         with self._takeover_lock:
             queue = self._takeover_session_queue
@@ -5592,6 +5644,9 @@ class CallAgentService:
 
     def take_inbound_takeover_session(self) -> InboundTakeoverSession | None:
         return self.session.take_takeover_session()
+
+    def prepare_inbound_takeover(self, command: dict[str, Any]) -> bool:
+        return self.session.prepare_takeover(command)
 
     def cancel_remote_dialer(self) -> tuple[bool, str | None]:
         with self._remote_setup_lock:
