@@ -215,6 +215,8 @@ final class AppModel: ObservableObject {
 
     func startCall(number: String) async {
         guard let c = client, let p = pairing, callState == .idle else { return }
+        let timing = CallTiming()
+        timing.mark(.dialStart)
         let attempt = beginCallAttempt(with: .preparing(label: number))
         guard await canBeginAudio(label: number, attempt: attempt) else { return }
         // createSession → LiveKit 媒体 → 号码经 Dongle SIM ATD(dial 在 media_ready 后发)。
@@ -222,7 +224,7 @@ final class AppModel: ObservableObject {
         _ = apply(.waitingMedia(label: number), for: attempt)
         let session = CallMediaSession(onState: { [weak self] st in
             _ = self?.apply(st, for: attempt)
-        }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner)
+        }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner, timing: timing)
         media = session
         scheduleMediaTimeout(for: attempt, session: session, duration: .seconds(30))
         await session.startOutbound(client: c, edgeId: p.edgeId, number: number)
@@ -236,7 +238,8 @@ final class AppModel: ObservableObject {
         await performTakeover(offer)
     }
 
-    private func performTakeover(_ offer: InboundOffer, usesCallKit: Bool = false) async {
+    private func performTakeover(_ offer: InboundOffer, usesCallKit: Bool = false,
+                                 timing: CallTiming = CallTiming()) async {
         if usesCallKit, !callKit.isAnswering(offerId: offer.offerId) { return }
         guard let c = client, callState == .idle else { return }
         incomingOffer = nil
@@ -248,7 +251,7 @@ final class AppModel: ObservableObject {
         _ = apply(.waitingMedia(label: label), for: attempt)
         let session = CallMediaSession(onState: { [weak self] st in
             _ = self?.apply(st, for: attempt)
-        }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner)
+        }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner, timing: timing)
         media = session
         scheduleMediaTimeout(for: attempt, session: session, duration: takeoverMediaTimeout)
         await session.startTakeover(
@@ -257,7 +260,10 @@ final class AppModel: ObservableObject {
             usesCallKit: usesCallKit,
             onClaimed: { [weak self] in
                 guard let self, callAttempts.isCurrent(attempt) else { throw CancellationError() }
-                if usesCallKit { try callKit.markClaimed(offerId: offer.offerId) }
+                if usesCallKit {
+                    try callKit.markClaimed(offerId: offer.offerId)
+                    timing.mark(.fulfill)
+                }
             },
             onConnected: { [weak self] in
                 guard let self, callAttempts.isCurrent(attempt) else { return }
@@ -294,16 +300,11 @@ final class AppModel: ObservableObject {
     }
 
     func hangup() {
+        if callKit.requestEndActiveIfManaged() { return }
         if let pending = pendingAudioAttempt {
             _ = apply(.ended(label: pending.label, reason: "local_hangup"), for: pending.attempt)
-            return
         }
-        let activeMedia = media
-        Task { [weak self] in
-            guard let self else { return }
-            if await self.callKit.requestEndActiveIfManaged() { return }
-            await activeMedia?.hangup()
-        }
+        media?.requestHangup()
     }
 
     func sendDTMF(_ digit: String) {
@@ -395,8 +396,8 @@ final class AppModel: ObservableObject {
         switch nextState {
         case .failed:
             callKit.finishActiveCall(reason: .failed)
-        case .ended:
-            callKit.finishActiveCall(reason: .remoteEnded)
+        case let .ended(_, reason):
+            if reason != "local_hangup" { callKit.finishActiveCall(reason: .remoteEnded) }
         case .idle, .preparing, .waitingMedia, .dialing, .inCall:
             break
         }
@@ -435,7 +436,9 @@ extension AppModel: CallKitCoordinatorDelegate {
             callKit.finishActiveCall(reason: .failed)
             return
         }
-        Task { await performTakeover(offer, usesCallKit: true) }
+        let timing = CallTiming()
+        timing.mark(.answerAction)
+        Task { await performTakeover(offer, usesCallKit: true, timing: timing) }
     }
 
     func callKitDidRequestDecline(_ offer: InboundOffer) {
@@ -449,8 +452,7 @@ extension AppModel: CallKitCoordinatorDelegate {
             _ = apply(.ended(label: pending.label, reason: "local_hangup"), for: pending.attempt)
             return
         }
-        let activeMedia = media
-        Task { await activeMedia?.hangup() }
+        media?.requestHangup()
     }
 
     func callKitPrepareToAnswer(offerId: String) throws {

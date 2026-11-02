@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 enum CallPilotTopic {
     static let control = "callpilot.control"
@@ -44,8 +45,22 @@ enum CallSignaling {
         return encode(["type": "dtmf", "digits": digits])
     }
 
-    static func encodeHangup() -> Data {
-        encode(["type": "hangup"])
+    static func encodeHangup(commandId: String = UUID().uuidString) -> Data {
+        encode(["type": "hangup", "commandId": commandId])
+    }
+
+    static func decodeHangupAck(_ data: Data) -> String? {
+        guard let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              fields["type"] as? String == "hangup.ack",
+              let id = fields["commandId"] as? String, UUID(uuidString: id) != nil else { return nil }
+        return id
+    }
+
+    static func supportsClientTiming(_ data: Data) -> Bool {
+        guard let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              fields["type"] as? String == "status",
+              let version = fields["clientTimingVersion"] as? NSNumber else { return false }
+        return CFGetTypeID(version) != CFBooleanGetTypeID() && version == 1
     }
 
     static func decodeEvent(_ data: Data) -> EdgeCallEvent? {

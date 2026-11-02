@@ -25,6 +25,7 @@ from . import config
 from .audio_bridge import MODEM_RATE, create_audio_bridge
 from .bluetooth_modem import BluetoothModem
 from .call_log import CallLogger, CallRecord
+from .call_timing import CallTiming, attach_endpoint_timing
 from .dial_guard import DialGuardFailure
 from .dtmf import dtmf_tone
 from .modem import SerialModem
@@ -273,6 +274,8 @@ class RemoteWebDialerCoordinator:
         self._call_task: asyncio.Task[None] | None = None
         self._bridge: AudioBridgeLike | None = None
         self._record: CallRecord | None = None
+        self._timing = CallTiming()
+        attach_endpoint_timing(endpoint, self._timing)
         self._line_reserved = False
         self._dial_attempted = False
         self._idempotency_key: str | None = None
@@ -317,7 +320,9 @@ class RemoteWebDialerCoordinator:
         disconnect_since: float | None = None
         prev_connected_phase = False
         try:
+            self._timing.mark("endpoint_connect_start")
             await self.endpoint.connect()
+            self._timing.mark("endpoint_connect_return")
             self.edge_ready.set()
             await self._send_status("waiting_for_phone")
             while not self._stop_requested.is_set():
@@ -329,6 +334,7 @@ class RemoteWebDialerCoordinator:
                     break
 
                 if self.endpoint.media_ready and not media_was_ready:
+                    self._timing.mark("media_ready")
                     media_was_ready = True
                     await self._send_status("media_ready")
                 elif not self.endpoint.media_ready and media_was_ready:
@@ -404,11 +410,15 @@ class RemoteWebDialerCoordinator:
         if command_type == "dial":
             await self._handle_dial(command)
         elif command_type == "hangup":
+            if not await self._timing.acknowledge_hangup(command, self.endpoint.send_event):
+                return
             if self._call_task is None:
                 await self._send_status("ended", reason="user_hangup")
                 self._stop_requested.set()
             else:
                 self.request_call_stop("user_hangup")
+        elif command_type == "client_timing":
+            self._timing.receive_client(command)
         elif command_type == "dtmf":
             await self._handle_dtmf(command)
         elif command_type == "ping":
@@ -578,6 +588,7 @@ class RemoteWebDialerCoordinator:
 
             record = self._begin_record(number)
             self._record = record
+            self._timing.bind(record)
             if record is not None:
                 record.log_event("remote_session", source=REMOTE_CALL_SOURCE)
 
@@ -618,6 +629,8 @@ class RemoteWebDialerCoordinator:
             self.modem.initialize_for_voice(self.runtime.audio_mode)
             # 与本地链路同款 pcm_enable 事件（WIL-95 D 组无声通指纹）。
             enable_info = getattr(self.modem, "last_voice_enable", None)
+            if not isinstance(enable_info, dict) or enable_info.get("ok") is not False:
+                self._timing.mark("pcm_ready")
             if record is not None and isinstance(enable_info, dict):
                 record.log_event("pcm_enable", **enable_info)
             bridge = self.bridge_factory(
@@ -665,6 +678,7 @@ class RemoteWebDialerCoordinator:
                         for chunk in browser_chunks:
                             record.write_downlink(chunk)
                     bridge.write_modem_chunks(browser_chunks)
+                    self._timing.mark("first_phone_to_modem")
                     for chunk in browser_chunks:
                         take_stats.add(chunk)
                 if take_stats.due():  # 到期才取 pending，避免每 10ms 拿一次桥锁
@@ -679,6 +693,7 @@ class RemoteWebDialerCoordinator:
                     if record is not None:
                         record.write_uplink(modem_pcm)
                     self.endpoint.push_modem_audio(modem_pcm)
+                    self._timing.mark("first_modem_to_phone")
 
                 await asyncio.sleep(0.01)
 
@@ -704,6 +719,7 @@ class RemoteWebDialerCoordinator:
             if self._line_reserved:
                 try:
                     self.modem.hangup()
+                    self._timing.mark("ath_complete")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("远程通话挂断模组失败: %s", type(exc).__name__)
             if release_report is not None and isinstance(self.modem, SerialModem):

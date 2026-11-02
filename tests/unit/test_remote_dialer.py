@@ -24,6 +24,7 @@ from agentcall.audio_bridge import (
     create_audio_bridge,
 )
 from agentcall.call_log import CallLogger
+from agentcall.call_timing import CallTiming
 from agentcall.dial_guard import DialGuardFailure
 from agentcall.livekit_media import LiveKitRemoteMediaEndpoint, _decode_control_payload
 from agentcall.remote_dialer import (
@@ -511,6 +512,110 @@ def test_duplicate_dial_command_never_dials_twice() -> None:
     asyncio.run(run())
 
 
+def test_remote_hangup_ack_precedes_physical_hangup() -> None:
+    async def run() -> None:
+        modem = FakeModem()
+        bridge = FakeBridge()
+        command_id = "cb438043-cdca-456a-82da-2f29a4cf5640"
+
+        class AckEndpoint(FakeRemoteEndpoint):
+            async def send_event(self, event):
+                if event.get("type") == "hangup.ack":
+                    assert not any(name == "hangup" for name, _args in modem.calls)
+                    assert not bridge.stopped
+                await super().send_event(event)
+
+        endpoint = AckEndpoint()
+        coordinator = _coordinator(endpoint, modem, bridge)
+        task = asyncio.create_task(coordinator.run())
+        await endpoint.commands.put({"type": "dial", "number": "10000", "idempotency_key": "ack-order"})
+        await _wait_for(lambda: any(event.get("status") == "connected" for event in endpoint.events))
+        await endpoint.commands.put({"type": "hangup", "commandId": command_id})
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert {"type": "hangup.ack", "commandId": command_id} in endpoint.events
+        assert sum(name == "hangup" for name, _args in modem.calls) == 1
+        assert bridge.stopped and endpoint.closed
+
+    asyncio.run(run())
+
+
+def test_remote_duplicate_hangup_reacks_without_repeating_terminal_status() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        coordinator = _coordinator(endpoint, FakeModem(), FakeBridge())
+        command_id = "0b7caa35-ac98-49ca-b9a8-a4a3f1c9d05d"
+        command = {"type": "hangup", "commandId": command_id}
+        await coordinator._handle_command(command)
+        await coordinator._handle_command(command)
+
+        assert coordinator._stop_requested.is_set()
+        assert sum(event.get("status") == "ended" for event in endpoint.events) == 1
+        assert endpoint.events.count({"type": "hangup.ack", "commandId": command_id}) == 2
+
+    asyncio.run(run())
+
+
+def test_remote_hangup_ack_failure_does_not_prevent_local_stop() -> None:
+    async def run() -> None:
+        attempts = []
+
+        class BrokenAckEndpoint(FakeRemoteEndpoint):
+            async def send_event(self, event):
+                if event.get("type") == "hangup.ack":
+                    attempts.append(event)
+                    raise RuntimeError("simulated data channel failure")
+                await super().send_event(event)
+
+        endpoint = BrokenAckEndpoint()
+        coordinator = _coordinator(endpoint, FakeModem(), FakeBridge())
+        command_id = "8c4b62ae-6f46-45f7-ad37-879ab798f002"
+        await coordinator._handle_command({"type": "hangup", "commandId": command_id})
+
+        assert attempts == [{"type": "hangup.ack", "commandId": command_id}]
+        assert coordinator._stop_requested.is_set()
+        assert endpoint.events[-1].get("reason") == "user_hangup"
+
+    asyncio.run(run())
+
+
+def test_remote_legacy_hangup_still_ends_without_ack() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        coordinator = _coordinator(endpoint, FakeModem(), FakeBridge())
+        await coordinator._handle_command({"type": "hangup"})
+
+        assert coordinator._stop_requested.is_set()
+        assert endpoint.events[-1].get("reason") == "user_hangup"
+        assert all(event.get("type") != "hangup.ack" for event in endpoint.events)
+
+    asyncio.run(run())
+
+
+def test_remote_client_timing_is_explicitly_accepted_and_bound_to_own_record() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint()
+        coordinator = _coordinator(endpoint, FakeModem(), FakeBridge())
+        events = []
+        record = SimpleNamespace(log_event=lambda event_type, **fields: events.append({"type": event_type, **fields}))
+        command = {
+            "type": "client_timing", "v": 1,
+            "attempt": "acac6c3b-53d0-4a0b-92b4-874864866127", "seq": 1,
+            "marks": {"dial_start": 0, "connect_return": 2160.25},
+        }
+        await coordinator._handle_command(command)
+        await coordinator._handle_command(command)
+        coordinator._timing.bind(record)
+
+        assert endpoint.events == []
+        assert events == [
+            {"type": "latency", "stage": "client_dial_start", "ms": 0},
+            {"type": "latency", "stage": "client_connect_return", "ms": 2160.25},
+        ]
+
+    asyncio.run(run())
+
+
 def test_full_duplex_audio_recording_and_dtmf(tmp_path: Path) -> None:
     async def run() -> None:
         endpoint = FakeRemoteEndpoint()
@@ -708,6 +813,147 @@ def test_livekit_control_payload_is_bounded_and_must_be_object() -> None:
     assert _decode_control_payload(b"not-json") is None
     assert _decode_control_payload(b"x" * 4097) is None
     assert _decode_control_payload(b'{"type":42}') is None
+
+
+def test_livekit_hangup_preempts_full_control_queue_and_ack_targets_phone() -> None:
+    async def run() -> None:
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud",
+            api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32",
+            public_url="https://dial.callpilot.example/",
+        )
+        endpoint = LiveKitRemoteMediaEndpoint(issued, rtc_module=_fake_rtc_module())
+        await endpoint.connect()
+        try:
+            room = _FakeLiveKitRoom.latest
+            assert room is not None
+            phone = SimpleNamespace(identity=issued.browser_identity)
+            room.callbacks["participant_connected"](phone)
+
+            def receive(command):
+                room.callbacks["data_received"](SimpleNamespace(
+                    participant=phone, topic="callpilot.control",
+                    data=json.dumps(command).encode("utf-8"),
+                ))
+
+            for _ in range(64):
+                receive({"type": "ping"})
+            command_id = "c244412e-dd6b-4a83-926c-b7b7188c4787"
+            hangup = {"type": "hangup", "commandId": command_id}
+            receive(hangup)
+            for _ in range(64):
+                receive({"type": "client_timing"})
+            assert await endpoint.next_command(0.01) == hangup
+
+            ack = {"type": "hangup.ack", "commandId": command_id}
+            await endpoint.send_event(ack)
+            payload, options = room.local_participant.data[-1]
+            assert json.loads(payload) == ack
+            assert options["destination_identities"] == [issued.browser_identity]
+            assert options["topic"] == "callpilot.status"
+            assert options["reliable"] is True
+            await endpoint.send_event({"type": "status", "status": "connected"})
+            assert json.loads(room.local_participant.data[-1][0]) == {
+                "type": "status", "status": "connected", "clientTimingVersion": 1,
+            }
+        finally:
+            await endpoint.close()
+
+    asyncio.run(run())
+
+
+def test_livekit_client_timing_filters_identity_and_bypasses_full_command_queue() -> None:
+    async def run() -> None:
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud", api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32", public_url="https://dial.callpilot.example/",
+        )
+        endpoint = LiveKitRemoteMediaEndpoint(issued, rtc_module=_fake_rtc_module())
+        events = []
+        record = SimpleNamespace(log_event=lambda event_type, **fields: events.append({"type": event_type, **fields}))
+        endpoint.set_timing(CallTiming(record))
+        await endpoint.connect()
+        try:
+            room = _FakeLiveKitRoom.latest
+            assert room is not None
+
+            def receive(command, identity=issued.browser_identity, topic="callpilot.control"):
+                room.callbacks["data_received"](SimpleNamespace(
+                    participant=SimpleNamespace(identity=identity), topic=topic,
+                    data=json.dumps(command).encode("utf-8"),
+                ))
+
+            for _ in range(64):
+                receive({"type": "ping"})
+            queued = endpoint._commands.qsize()
+            timing = {
+                "type": "client_timing", "v": 1,
+                "attempt": "c04b927f-acb0-4fd7-9e80-1ef725ed96f6", "seq": 1,
+                "marks": {"claim_start": 0, "claim_response": 430.5},
+            }
+            receive(timing, identity="untrusted-phone")
+            receive(timing, topic="wrong.topic")
+            assert all(not event["stage"].startswith("client_") for event in events)
+            room.callbacks["data_received"](SimpleNamespace(
+                participant=SimpleNamespace(identity=issued.browser_identity), topic="callpilot.control",
+                data=json.dumps(timing).encode() + b" " * 2048,
+            ))
+            assert all(not event["stage"].startswith("client_") for event in events)
+            receive(timing)
+            receive(timing)
+            receive({**timing, "seq": 2, "marks": {"mic_enable_return": 800}, "recordId": "other-call"})
+
+            assert endpoint._commands.qsize() == queued
+            assert [event for event in events if event["stage"].startswith("client_")] == [
+                {"type": "latency", "stage": "client_claim_start", "ms": 0},
+                {"type": "latency", "stage": "client_claim_response", "ms": 430.5},
+            ]
+        finally:
+            await endpoint.close()
+
+    asyncio.run(run())
+
+
+def test_livekit_records_connect_publish_join_subscription_and_first_frame_once() -> None:
+    async def run() -> None:
+        issued = issue_livekit_session(
+            livekit_url="wss://example.livekit.cloud", api_key="test-key",
+            api_secret="test-secret-with-enough-entropy-32", public_url="https://dial.callpilot.example/",
+        )
+        rtc = _fake_rtc_module()
+
+        async def frames():
+            yield SimpleNamespace(frame=SimpleNamespace(data=b"\x00\x00" * 160))
+            yield SimpleNamespace(frame=SimpleNamespace(data=b"\x01\x00" * 160))
+
+        rtc.AudioStream = SimpleNamespace(from_track=lambda **_kwargs: frames())
+        events = []
+        record = SimpleNamespace(log_event=lambda event_type, **fields: events.append({"type": event_type, **fields}))
+        ticks = iter(range(20))
+        endpoint = LiveKitRemoteMediaEndpoint(issued, rtc_module=rtc)
+        endpoint.set_timing(CallTiming(record, clock=lambda: float(next(ticks))))
+        await endpoint.connect()
+        try:
+            room = _FakeLiveKitRoom.latest
+            assert room is not None
+            phone = SimpleNamespace(identity=issued.browser_identity)
+            room.callbacks["participant_connected"](phone)
+            track = SimpleNamespace(kind="audio")
+            room.callbacks["track_subscribed"](track, SimpleNamespace(track=track), phone)
+            await _wait_for(lambda: any(event["stage"] == "edge_phone_first_frame" for event in events))
+
+            assert [event["stage"] for event in events] == [
+                "edge_endpoint_connect_start", "edge_downlink_published", "edge_endpoint_connect_return",
+                "edge_phone_joined", "edge_phone_track_subscribed", "edge_media_ready", "edge_phone_first_frame",
+            ]
+            assert all(set(event) == {"type", "stage", "ms"} for event in events)
+            assert [event["ms"] for event in events] == sorted(event["ms"] for event in events)
+            assert endpoint.media_ready
+        finally:
+            await endpoint.close()
+
+    asyncio.run(run())
 
 
 def test_livekit_modem_audio_queue_is_bounded_to_latest_frames() -> None:

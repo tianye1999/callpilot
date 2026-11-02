@@ -37,6 +37,7 @@ from .audio_bridge import (
 from .bluetooth_audio import BluetoothAudioBridge
 from .bluetooth_modem import BluetoothModem
 from .call_log import CallLogger, CallRecord
+from .call_timing import CallTiming, attach_endpoint_timing
 from .call_tools import CallTools
 from .cloud_credentials import CloudCredentialStore
 from .contacts import is_reply_target_allowed, known_contact_numbers
@@ -249,6 +250,7 @@ class CallSession:
         self._phone_first_deadline = 0.0
         self._phone_first_claim_deadline: float | None = None
         self._phone_first_claimed_at: float | None = None
+        self._mobile_timing: CallTiming | None = None
         self._phone_first_offer_id: str | None = None
         self._phone_first_answered = False
         self._phone_first_answer_event = False
@@ -808,6 +810,8 @@ class CallSession:
             if phone_first_lease is not None:
                 try:
                     await self._threaded_modem_call(self.modem.finish_reserved_incoming, phone_first_lease)
+                    if self._mobile_timing is not None and self._phone_first_answered:
+                        self._mobile_timing.mark("ath_complete")
                 except Exception:
                     status = "failed"
                     logger.warning("Phone-first modem cleanup failed", exc_info=True)
@@ -2060,6 +2064,8 @@ class CallSession:
         if claimed is None or not current():
             return "not_connected"
 
+        timing = self._mobile_observations(record)
+
         endpoint: RemoteMediaEndpoint | None = None
         bridge: AudioBridge | None = None
         connecting: asyncio.Task | None = None
@@ -2070,30 +2076,41 @@ class CallSession:
             if factory is None:
                 raise RuntimeError("endpoint_unavailable")
             endpoint = factory(claimed.issued)
+            attach_endpoint_timing(endpoint, timing)
+            timing.mark("endpoint_connect_start")
             connecting = asyncio.create_task(endpoint.connect())
             deadline = self._phone_first_claim_deadline
             assert deadline is not None
             while current() and self._phone_first_cloud_ready() and self._phone_first_clock() < deadline:
                 if connecting.done():
                     connecting.result()
+                    timing.mark("endpoint_connect_return")
                     if endpoint.media_ready:
                         break
                 await self._phone_first_sleep(0.05)
             if (not current() or not self._phone_first_cloud_ready() or not connecting.done()
                     or not endpoint.media_ready or self._phone_first_clock() >= deadline):
                 raise RuntimeError("media_prepare_failed")
+            timing.mark("media_ready")
             if record is not None and self._phone_first_claimed_at is not None:
                 record.log_latency(
                     "phone_first_media_ready_ms",
                     (self._phone_first_clock() - self._phone_first_claimed_at) * 1000,
                 )
             command = await endpoint.next_command(timeout=0.001)
+            if command is not None and command.get("type") == "client_timing":
+                timing.receive_client(command)
             if command is not None and command.get("type") == "hangup":
+                timing.mark("hangup_during_prepare")
+                if record is not None:
+                    record.log_event("takeover_owner_cancelled_precommit")
                 raise RuntimeError("owner_cancelled")
             if self._phone_first_clock() >= deadline:
                 raise RuntimeError("media_prepare_timeout")
+            timing.mark("ata_start")
             if not await self._answer_phone_first(generation, lease):
                 return "not_connected"
+            timing.mark("ata_return")
             if record is not None:
                 record.log_event("answered", owner=True)
             self._phone_first_answer_event = True
@@ -2108,6 +2125,7 @@ class CallSession:
             enable_info = getattr(self.modem, "last_voice_enable", None)
             if isinstance(enable_info, dict) and enable_info.get("ok") is False:
                 return "failed"
+            timing.mark("pcm_ready")
             bridge = create_audio_bridge(
                 modem=self.modem, mode=self.audio_mode, device_keyword=self.audio_keyword,
                 pcm_port=self.pcm_port, pcm_baudrate=self.pcm_baudrate, tx_gain=self.tx_gain,
@@ -2116,7 +2134,12 @@ class CallSession:
                 bridge.set_ready_check(self.modem.pcm_ready)
             self._start_hangup_bridge(bridge)
             command = await endpoint.next_command(timeout=0.001)
+            if command is not None and command.get("type") == "client_timing":
+                timing.receive_client(command)
             if command is not None and command.get("type") == "hangup":
+                timing.mark("hangup_during_prepare")
+                if record is not None:
+                    record.log_event("takeover_owner_cancelled_precommit")
                 raise RuntimeError("owner_cancelled")
             if not current() or not self._phone_first_cloud_ready() or not endpoint.media_ready:
                 raise RuntimeError("call_ended_before_commit")
@@ -2186,8 +2209,11 @@ class CallSession:
         committed = False
         old_stopped = False
         connect_timeout_reason: str | None = None
+        timing = self._mobile_observations(record)
         try:
             endpoint = factory(claimed.issued)
+            attach_endpoint_timing(endpoint, timing)
+            timing.mark("endpoint_connect_start")
             owner_deadline = self._takeover_deadline
             now = time.monotonic()
             deadline = min(
@@ -2206,6 +2232,7 @@ class CallSession:
             try:
                 async with connect_timeout:
                     await endpoint.connect()
+                    timing.mark("endpoint_connect_return")
             except TimeoutError:
                 if connect_timeout.expired():
                     # Timers can fire a clock tick early; classify the budget, not a later clock read.
@@ -2215,6 +2242,7 @@ class CallSession:
                 await asyncio.sleep(0.05)
             if not endpoint.media_ready:
                 raise RuntimeError("takeover_media_not_ready")
+            timing.mark("media_ready")
             if not self._agent_generation_current(generation) or time.monotonic() >= deadline:
                 raise TimeoutError("takeover_deadline")
 
@@ -2313,6 +2341,12 @@ class CallSession:
         except asyncio.CancelledError:
             pass
 
+    def _mobile_observations(self, record: CallRecord | None) -> CallTiming:
+        if self._mobile_timing is None:
+            self._mobile_timing = CallTiming()
+        self._mobile_timing.bind(record)
+        return self._mobile_timing
+
     async def _pump_mobile_media(
         self,
         endpoint: RemoteMediaEndpoint,
@@ -2321,11 +2355,16 @@ class CallSession:
         claimed: InboundTakeoverSession,
     ) -> AudioBridge:
         fence = claimed.fence
+        timing = self._mobile_observations(record)
         disconnected_at: float | None = None
         while self._active and self.modem.is_call_connected():
             # Keep control responsive without stretching the 10 ms media cadence.
             command = await endpoint.next_command(timeout=0.001)
+            if command is not None and command.get("type") == "client_timing":
+                timing.receive_client(command)
             if command is not None and command.get("type") == "hangup":
+                if not await timing.acknowledge_hangup(command, endpoint.send_event):
+                    break
                 self._takeover_coordinator.end_call("owner_hangup")  # type: ignore[union-attr]
                 if record is not None:
                     record.log_event("takeover_owner_hangup")
@@ -2340,11 +2379,13 @@ class CallSession:
                         for chunk in browser_chunks:
                             record.write_downlink(chunk)
                     bridge.write_modem_chunks(browser_chunks)
+                    timing.mark("first_phone_to_modem")
                 modem_pcm = bridge.read_modem_chunk()
                 if modem_pcm:
                     if record is not None:
                         record.write_uplink(modem_pcm)
                     endpoint.push_modem_audio(modem_pcm)
+                    timing.mark("first_modem_to_phone")
             else:
                 if self.takeover_state is TakeoverState.MOBILE_ACTIVE:
                     self._takeover_coordinator.mark_mobile_disconnected(fence)  # type: ignore[union-attr]
@@ -4243,6 +4284,7 @@ class CallSession:
             return coordinator.active_fence if coordinator is not None else None
 
     def _initialize_takeover_context(self, direction: str) -> None:
+        self._mobile_timing = None
         with self._takeover_lock:
             self._takeover_offer_queue = Queue(maxsize=1)
             self._takeover_revoke_queue = Queue(maxsize=1)
@@ -4627,6 +4669,8 @@ class CallSession:
             )
             if not result.accepted or result.idempotent:
                 return result
+            self._mobile_timing = CallTiming(record=self._record)
+            self._mobile_timing.mark("claim_received")
             try:
                 self._takeover_session_queue.put_nowait(claimed)
             except Full:
@@ -4754,6 +4798,8 @@ class CallSession:
                 await self._cleanup_step("modem_hangup", self._threaded_modem_call(self.modem.hangup))
             else:
                 self.modem.hangup()
+            if self._mobile_timing is not None:
+                self._mobile_timing.mark("ath_complete")
         except Exception as exc:  # noqa: BLE001
             logger.warning("挂断物理通话出错: %s", exc)
         logger.info("通话 Agent 会话已结束")

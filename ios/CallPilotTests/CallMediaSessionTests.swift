@@ -4,6 +4,188 @@ import XCTest
 
 @MainActor
 final class CallMediaSessionTests: XCTestCase {
+    func testTelemetryWaitsForEdgeCapabilityAndThenFlushesCachedMarks() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport })
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "1")
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertFalse(transport.operations.contains { operation in
+            guard case let .publish(data) = operation,
+                  let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            return fields["type"] as? String == "client_timing"
+        })
+        await transport.emit(.data(Data(#"{"type":"status","status":"connected","clientTimingVersion":1}"#.utf8),
+                                   topic: CallPilotTopic.status))
+        await waitUntil {
+            transport.operations.contains { operation in
+                guard case let .publish(data) = operation,
+                      let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+                return fields["type"] as? String == "client_timing"
+            }
+        }
+        await media.stop()
+    }
+
+    func testLocalHangupSurvivesCallKitDrainBeforeHangupTaskRuns() async throws {
+        let client = try makeTakeoverClient()
+        let transport = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport })
+        await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+                                  onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {})
+        let packet = media.requestHangup()
+        media.finishCallKitAudioDrain()
+        await waitUntil { transport.hangupPackets.count == 1 }
+        XCTAssertFalse(transport.operations.contains(.disconnect))
+        try await acknowledge(packet, on: transport)
+        await media.stop()
+        XCTAssertEqual(transport.hangupPackets, [packet])
+        XCTAssertTrue(transport.operations.contains(.disconnect))
+    }
+
+    func testHangupKeepsControlUntilMatchingAcknowledgementAndEndsUIImmediately() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { transport })
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086")
+
+        let packet = media.requestHangup()
+        XCTAssertEqual(states.last, .ended(label: "10086", reason: "local_hangup"))
+        await waitUntil { transport.hangupPackets.count == 1 }
+        let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: packet) as? [String: String])
+        XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(fields["commandId"])))
+        await transport.emit(.data(Data(#"{"type":"hangup.ack","commandId":"wrong-command"}"#.utf8),
+                                   topic: CallPilotTopic.status))
+        await transport.emit(.data(Data(#"{"type":"status","status":"connected"}"#.utf8),
+                                   topic: CallPilotTopic.status))
+        XCTAssertFalse(transport.operations.contains(.disconnect))
+        XCTAssertEqual(states.filter(\.isTerminal).count, 1)
+        try await acknowledge(packet, on: transport)
+        await waitUntil { transport.operations.contains(.disconnect) }
+        await media.stop()
+        XCTAssertEqual(transport.hangupPackets.count, 1)
+        XCTAssertEqual(states.last, .ended(label: "10086", reason: "local_hangup"))
+    }
+
+    func testOldEdgeWithoutAcknowledgementDisconnectsAtBudgetWithoutUIError() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { transport },
+                                    hangupBudget: .milliseconds(40))
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086")
+        let began = ContinuousClock.now
+        _ = await media.hangup()
+        XCTAssertGreaterThanOrEqual(began.duration(to: .now), .milliseconds(35))
+        XCTAssertLessThan(began.duration(to: .now), .seconds(1))
+        XCTAssertTrue(transport.operations.contains(.disconnect))
+        XCTAssertEqual(transport.hangupPackets.count, 1)
+        XCTAssertEqual(states.last, .ended(label: "10086", reason: "local_hangup"))
+    }
+
+    func testHangupRetriesFailedPublishOnceWithSameCommandID() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        transport.hangupFailuresRemaining = 1
+        transport.acknowledgeHangup = true
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport })
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086")
+        let packet = await media.hangup()
+        XCTAssertEqual(transport.hangupAttempts, [packet, packet])
+        XCTAssertEqual(transport.hangupPackets, [packet])
+        XCTAssertTrue(transport.operations.contains(.disconnect))
+    }
+
+    func testRepeatedLocalHangupReusesOneCommandAndOneTask() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport })
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086")
+        let first = media.requestHangup()
+        let second = media.requestHangup()
+        XCTAssertEqual(first, second)
+        await waitUntil { transport.hangupPackets.count == 1 }
+        try await acknowledge(first, on: transport)
+        let third = await media.hangup()
+        XCTAssertEqual(first, third)
+        XCTAssertEqual(transport.hangupAttempts.count, 1)
+    }
+
+    func testHangupStopsRetryingAfterSecondFailureAndStillDisconnects() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        transport.hangupFailuresRemaining = 3
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { transport },
+                                    hangupBudget: .milliseconds(40))
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086")
+        let packet = await media.hangup()
+        XCTAssertEqual(transport.hangupAttempts, [packet, packet])
+        XCTAssertTrue(transport.hangupPackets.isEmpty)
+        XCTAssertTrue(transport.operations.contains(.disconnect))
+        XCTAssertEqual(states.last, .ended(label: "10086", reason: "local_hangup"))
+    }
+
+    func testHangupBudgetBoundsAStuckPublish() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        let gate = PublishGate()
+        transport.hangupPublishGate = gate
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport },
+                                    hangupBudget: .milliseconds(40))
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086")
+        media.requestHangup()
+        await waitUntil { gate.didStart }
+        await waitUntil { transport.operations.contains(.disconnect) }
+        await media.stop()
+        XCTAssertTrue(transport.hangupPackets.isEmpty)
+    }
+
+    func testHangupDisconnectsBeforeJoiningSDKPublishThatIgnoresCancellation() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        let gate = ConnectGate()
+        transport.hangupDisconnectGate = gate
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { transport },
+                                    hangupBudget: .milliseconds(40))
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086")
+        media.requestHangup()
+        await waitUntil { gate.didStart }
+        await waitUntil { transport.operations.contains(.disconnect) }
+        // Also release on failure so a regression reports an assertion instead of hanging XCTest.
+        gate.open()
+        await media.stop()
+        XCTAssertEqual(transport.hangupAttempts.count, 1)
+        XCTAssertTrue(transport.hangupPackets.isEmpty)
+    }
+
+    func testSynchronousHangupDuringConnectDoesNotReviveOrPublishDial() async throws {
+        let client = try makeOutboundClient()
+        let transport = FakeCallMediaTransport()
+        let gate = ConnectGate()
+        transport.connectGate = gate
+        transport.acknowledgeHangup = true
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { transport })
+        let setup = Task { await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086") }
+        await waitUntil { gate.didStart }
+        media.requestHangup()
+        XCTAssertTrue(states.last?.isTerminal == true)
+        await waitUntil { transport.operations.contains(.disconnect) }
+        gate.open()
+        await setup.value
+        await media.stop()
+        XCTAssertEqual(transport.hangupPackets.count, 1)
+        XCTAssertEqual(states.filter(\.isTerminal).count, 1)
+        XCTAssertFalse(transport.operations.contains { operation in
+            guard case let .publish(data) = operation,
+                  let fields = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+            else { return false }
+            return fields["type"] == "dial"
+        })
+    }
+
     func testExpiredCallKitDrainStopsOldSessionWithoutStoppingReplacementOutbound() async throws {
         let client = try makeTakeoverClient()
         let device = TestCallAudioDevice()
@@ -45,7 +227,7 @@ final class CallMediaSessionTests: XCTestCase {
         await waitUntil { gate.didStart }
         await media.stop()
         await sending.value
-        XCTAssertFalse(transport.operations.contains { if case .publish = $0 { return true }; return false })
+        XCTAssertTrue(transport.controlPackets.isEmpty)
     }
 
     func testCancelledSetupEndsUIAndCannotBeRevivedByLateConnect() async throws {
@@ -254,7 +436,9 @@ final class CallMediaSessionTests: XCTestCase {
         )
 
         XCTAssertEqual(dtmfFields, ["type": "dtmf", "digits": "2"])
-        XCTAssertEqual(hangupFields, ["type": "hangup"])
+        XCTAssertEqual(hangupFields["type"], "hangup")
+        XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(hangupFields["commandId"])))
+        XCTAssertEqual(Set(hangupFields.keys), ["type", "commandId"])
         XCTAssertThrowsError(try CallSignaling.encodeDTMF("invalid"))
     }
 
@@ -351,10 +535,7 @@ final class CallMediaSessionTests: XCTestCase {
             .data(Data(#"{"type":"status","status":"media_ready"}"#.utf8), topic: CallPilotTopic.status)
         )
 
-        let published = transport.operations.compactMap { operation -> Data? in
-            guard case let .publish(data) = operation else { return nil }
-            return data
-        }
+        let published = transport.controlPackets
         XCTAssertEqual(published.count, 1)
         let dial = try XCTUnwrap(JSONSerialization.jsonObject(with: published[0]) as? [String: String])
         XCTAssertEqual(dial["type"], "dial")
@@ -386,10 +567,7 @@ final class CallMediaSessionTests: XCTestCase {
         let label = L10n.text("call.takeover.label")
         XCTAssertEqual(states, [.waitingMedia(label: label), .inCall(label: label)])
         XCTAssertEqual(connectedCount, 1)
-        XCTAssertFalse(transport.operations.contains { operation in
-            if case .publish = operation { return true }
-            return false
-        })
+        XCTAssertTrue(transport.controlPackets.isEmpty)
     }
 
     func testDTMFPublishesOnlyValidatedControlPackets() async throws {
@@ -402,10 +580,7 @@ final class CallMediaSessionTests: XCTestCase {
         await media.sendDTMF("2")
         await media.sendDTMF("invalid")
 
-        let published = transport.operations.compactMap { operation -> Data? in
-            guard case let .publish(data) = operation else { return nil }
-            return data
-        }
+        let published = transport.controlPackets
         XCTAssertEqual(published.count, 1)
         let packet = try XCTUnwrap(JSONSerialization.jsonObject(with: published[0]) as? [String: String])
         XCTAssertEqual(packet, ["type": "dtmf", "digits": "2"])
@@ -650,6 +825,15 @@ final class CallMediaSessionTests: XCTestCase {
         )
     }
 
+    private func acknowledge(_ packet: Data, on transport: FakeCallMediaTransport) async throws {
+        let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: packet) as? [String: String])
+        let commandID = try XCTUnwrap(fields["commandId"])
+        let acknowledgement = try JSONSerialization.data(withJSONObject: [
+            "type": "hangup.ack", "commandId": commandID,
+        ])
+        await transport.emit(.data(acknowledgement, topic: CallPilotTopic.status))
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(1),
         condition: @escaping @MainActor () -> Bool
@@ -723,6 +907,29 @@ private final class FakeCallMediaTransport: CallMediaTransport {
     var concurrentMicrophone: Bool?
     var microphoneEnableCount = 0
     var microphoneGate: PublishGate?
+    var hangupPublishGate: PublishGate?
+    var hangupDisconnectGate: ConnectGate?
+    var hangupFailuresRemaining = 0
+    var hangupAttempts: [Data] = []
+    var acknowledgeHangup = false
+
+    var controlPackets: [Data] {
+        operations.compactMap { operation in
+            guard case let .publish(data) = operation,
+                  let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  fields["type"] as? String != "client_timing" else { return nil }
+            return data
+        }
+    }
+
+    var hangupPackets: [Data] {
+        operations.compactMap { operation in
+            guard case let .publish(data) = operation,
+                  let fields = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+                  fields["type"] == "hangup" else { return nil }
+            return data
+        }
+    }
 
     func connect(url: String, token: String, enableMicrophone: Bool) async throws {
         concurrentMicrophone = enableMicrophone
@@ -741,6 +948,16 @@ private final class FakeCallMediaTransport: CallMediaTransport {
     }
 
     func publishControl(_ data: Data) async throws {
+        let fields = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+        if fields?["type"] == "hangup" {
+            hangupAttempts.append(data)
+            if hangupFailuresRemaining > 0 {
+                hangupFailuresRemaining -= 1
+                throw URLError(.networkConnectionLost)
+            }
+            if let hangupPublishGate { try await hangupPublishGate.wait() }
+            if let hangupDisconnectGate { await hangupDisconnectGate.wait() }
+        }
         if let fields = try? JSONSerialization.jsonObject(with: data) as? [String: String],
            fields["type"] == "dtmf", let dtmfPublishGate {
             try await dtmfPublishGate.wait()
@@ -752,10 +969,17 @@ private final class FakeCallMediaTransport: CallMediaTransport {
         }
         try Task.checkCancellation()
         operations.append(.publish(data))
+        if acknowledgeHangup, fields?["type"] == "hangup", let commandID = fields?["commandId"] {
+            let acknowledgement = try JSONSerialization.data(withJSONObject: [
+                "type": "hangup.ack", "commandId": commandID,
+            ])
+            await eventHandler?(.data(acknowledgement, topic: CallPilotTopic.status))
+        }
     }
 
     func disconnect() async {
         operations.append(.disconnect)
+        hangupDisconnectGate?.open()
     }
 
     func setSpeakerphone(_ enabled: Bool) {
@@ -771,10 +995,12 @@ private final class FakeCallMediaTransport: CallMediaTransport {
 private extension CallMediaSession {
     convenience init(
         onState: @escaping StateHandler,
-        transportFactory: @escaping TransportFactory = { FakeCallMediaTransport() }
+        transportFactory: @escaping TransportFactory = { FakeCallMediaTransport() },
+        hangupBudget: Duration = .milliseconds(100)
     ) {
         self.init(onState: onState, transportFactory: transportFactory,
-                  audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }))
+                  audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+                  hangupBudget: hangupBudget)
     }
 }
 

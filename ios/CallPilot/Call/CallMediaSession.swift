@@ -27,22 +27,38 @@ final class CallMediaSession {
     private var microphoneTask: Task<Void, Error>?
     private var controlTasks: [UUID: Task<Void, Error>] = [:]
     private var cleanupTask: Task<Void, Never>?
+    static let hangupBudget: Duration = .milliseconds(2500)
+    private let hangupBudget: Duration
+    let timing: CallTiming
+    private var timingTask: Task<Void, Never>?
+    private var supportsClientTiming = false
+    private var hangupPacket: Data?
+    private var hangupCommandID: String?
+    private var hangupAcknowledged = false
+    private var hangupDeadline: ContinuousClock.Instant?
 
     init(onState: @escaping StateHandler,
          transportFactory: @escaping TransportFactory,
-         audio: CallAudioOwner) {
+         audio: CallAudioOwner,
+         hangupBudget: Duration = CallMediaSession.hangupBudget,
+         timing: CallTiming = CallTiming()) {
         self.onState = onState
         self.transportFactory = transportFactory
         self.audio = audio
+        self.hangupBudget = hangupBudget
+        self.timing = timing
     }
 
     func startOutbound(client: HostedCloudClient, edgeId: String, number: String) async {
         guard let attempt = beginAttempt(label: number, mode: .standalone) else { return }
+        timing.mark(.dialStart)
         let task = Task {
             try await audio.acquire(ownerID, mode: .standalone)
             try checkCurrent(attempt)
             let packet = try CallSignaling.encodeDial(number: number, idempotencyKey: UUID().uuidString)
+            timing.mark(.claimStart)
             let session = try await client.createSession(edgeId: edgeId)
+            timing.mark(.claimResponse)
             try checkCurrent(attempt)
             preparedSession = session
             pendingDialPacket = packet
@@ -68,7 +84,9 @@ final class CallMediaSession {
         let task = Task {
             try await audio.acquire(ownerID, mode: mode)
             try checkCurrent(attempt)
+            timing.startClaim()
             let session = try await client.claimInboundOffer(offerId: offerId)
+            timing.mark(.claimResponse)
             try checkCurrent(attempt)
             preparedSession = session
             // Configure + fulfill before starting any media connection.
@@ -83,14 +101,20 @@ final class CallMediaSession {
 
     func prepareCallKitAnswer() throws {
         guard !isStopped, mode == .callKit else { throw CancellationError() }
+        timing.mark(.configureStart)
         try audio.configureCallKitSession(ownerID)
+        timing.mark(.configureEnd)
     }
 
     func activateCallKitAudio() throws {
+        timing.mark(.didActivate)
         guard !isStopped, mode == .callKit else { throw CancellationError() }
         guard !audioActivated else { return }
         try audio.activate(ownerID)
+        timing.mark(.activateReturn)
         audioActivated = true
+        timing.mark(.audioActivated)
+        scheduleTiming()
         startMicrophoneIfReady(for: generation)
     }
 
@@ -102,12 +126,18 @@ final class CallMediaSession {
         }
         activeTransport.setSpeakerphone(speakerphoneEnabled)
         onState(.waitingMedia(label: activeLabel ?? ""))
+        timing.mark(.connectStart)
+        if mode == .standalone { timing.mark(.micEnableStart) }
         // Standalone calls retain the tested low-latency concurrent mic path.
         try await activeTransport.connect(
             url: session.livekitURL, token: session.token, enableMicrophone: mode == .standalone
         )
+        timing.mark(.connectReturn)
         try checkCurrent(attempt)
         roomConnected = true
+        timing.mark(.roomConnected)
+        if mode == .standalone { timing.mark(.micEnableReturn) }
+        scheduleTiming()
         startMicrophoneIfReady(for: attempt)
     }
 
@@ -117,7 +147,10 @@ final class CallMediaSession {
         microphoneStarted = true
         let task = Task {
             try checkCurrent(attempt)
+            timing.mark(.micEnableStart)
             try await activeTransport.setMicrophone(enabled: true)
+            timing.mark(.micEnableReturn)
+            scheduleTiming()
             try checkCurrent(attempt)
         }
         microphoneTask = task
@@ -153,6 +186,8 @@ final class CallMediaSession {
 
     func handleConnected(label: String) {
         guard !isStopped else { return }
+        timing.mark(.edgeConnected)
+        scheduleTiming()
         connectedHandler?()
         connectedHandler = nil
         onState(.inCall(label: label))
@@ -194,9 +229,21 @@ final class CallMediaSession {
 
     @discardableResult
     func hangup() async -> Data {
-        let packet = CallSignaling.encodeHangup()
-        terminate(state: .ended(label: activeLabel ?? "", reason: "local_hangup"), hangup: packet)
+        let packet = requestHangup()
         await cleanupTask?.value
+        return packet
+    }
+
+    @discardableResult
+    func requestHangup() -> Data {
+        if let hangupPacket { return hangupPacket }
+        let id = UUID().uuidString
+        let packet = CallSignaling.encodeHangup(commandId: id)
+        hangupCommandID = id
+        hangupPacket = packet
+        hangupDeadline = ContinuousClock.now.advanced(by: hangupBudget)
+        timing.mark(.hangupIntent)
+        terminate(state: .ended(label: activeLabel ?? "", reason: "local_hangup"), hangup: packet)
         return packet
     }
 
@@ -232,10 +279,20 @@ final class CallMediaSession {
     }
 
     private func handleTransportEvent(_ event: CallMediaTransportEvent, for attempt: UInt64) async {
+        if case let .data(data, topic) = event, topic == CallPilotTopic.status,
+           let id = CallSignaling.decodeHangupAck(data), id == hangupCommandID {
+            hangupAcknowledged = true
+            timing.mark(.hangupAck)
+            return
+        }
         guard isCurrent(attempt) else { return }
         switch event {
         case let .data(data, topic):
             guard topic == CallPilotTopic.status else { return }
+            if CallSignaling.supportsClientTiming(data) {
+                supportsClientTiming = true
+                scheduleTiming()
+            }
             let action = handleEdgePayload(data, label: activeLabel ?? "")
             if case .mediaReady = action,
                isCurrent(attempt), let activeTransport = transport,
@@ -249,6 +306,22 @@ final class CallMediaSession {
             }
         case let .disconnected(reason):
             terminate(state: .ended(label: activeLabel ?? "", reason: reason))
+        case let .timing(mark, instant):
+            timing.mark(mark, at: instant)
+            scheduleTiming()
+        }
+    }
+
+    private func scheduleTiming() {
+        guard !isStopped, roomConnected, supportsClientTiming, timingTask == nil,
+              let transport else { return }
+        timingTask = Task { [weak self] in
+            defer { self?.timingTask = nil }
+            do { try await Task.sleep(for: .milliseconds(30)) } catch { return }
+            guard let self else { return }
+            while !isStopped, !Task.isCancelled, let packet = timing.nextBatch() {
+                do { try await transport.publishControl(packet) } catch { return }
+            }
         }
     }
 
@@ -281,6 +354,9 @@ final class CallMediaSession {
         let setup = setupTask
         let microphone = microphoneTask
         let controls = Array(controlTasks.values)
+        let telemetry = timingTask
+        telemetry?.cancel()
+        timingTask = nil
         setup?.cancel()
         microphone?.cancel()
         controls.forEach { $0.cancel() }
@@ -291,34 +367,62 @@ final class CallMediaSession {
         preparedSession = nil
         pendingDialPacket = nil
         let activeTransport = transport
-        activeTransport?.eventHandler = nil
+        if hangup == nil { activeTransport?.eventHandler = nil }
         transport = nil
         cleanupTask = audio.release(ownerID) {
             if let hangup, let activeTransport {
-                await Self.sendHangup(hangup, using: activeTransport)
+                await self.sendHangup(hangup, using: activeTransport)
             }
+            self.timing.mark(.disconnect)
+            activeTransport?.eventHandler = nil
             await activeTransport?.disconnect()
             // Disconnect unblocks SDK waits; cancellation alone cannot cancel
             // the SDK's unstructured concurrent-mic child task.
             _ = await setup?.result
             _ = await microphone?.result
             for control in controls { _ = await control.result }
+            await telemetry?.value
             // A late connect may have completed after the first disconnect.
             await activeTransport?.disconnect()
         }
         if let state { onState(state) }
     }
 
-    private static func sendHangup(_ packet: Data, using transport: any CallMediaTransport) async {
-        let send = Task { try? await transport.publishControl(packet) }
-        let deadline = Task {
-            do { try await Task.sleep(for: .seconds(1)) }
-            catch { return }
-            send.cancel()
-            await transport.disconnect()
+    private func sendHangup(_ packet: Data, using transport: any CallMediaTransport) async {
+        let deadline = hangupDeadline ?? ContinuousClock.now.advanced(by: hangupBudget)
+        let send = Task {
+            for index in 0..<2 {
+                guard !Task.isCancelled, ContinuousClock.now < deadline else { return }
+                timing.mark(index == 0 ? .hangupPublishStart : .hangupRetryStart)
+                do {
+                    try await transport.publishControl(packet)
+                    timing.mark(index == 0 ? .hangupPublishEnd : .hangupRetryEnd)
+                    return
+                } catch {
+                    timing.mark(index == 0 ? .hangupPublishError : .hangupRetryError)
+                }
+            }
         }
+        // Separate from SDK publication: cancellation alone may not unblock an SDK wait.
+        while !hangupAcknowledged, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        send.cancel()
+        timing.mark(.disconnect)
+        // Best effort only; final telemetry must never extend the hangup budget.
+        let finalTiming = Task {
+            while supportsClientTiming, !Task.isCancelled, let batch = timing.nextBatch() {
+                try? await transport.publishControl(batch)
+            }
+        }
+        if hangupAcknowledged {
+            let flushDeadline = min(deadline, ContinuousClock.now.advanced(by: .milliseconds(30)))
+            while ContinuousClock.now < flushDeadline { try? await Task.sleep(for: .milliseconds(5)) }
+        }
+        finalTiming.cancel()
+        transport.eventHandler = nil
+        await transport.disconnect()
         await send.value
-        deadline.cancel()
-        await deadline.value
+        await finalTiming.value
     }
 }

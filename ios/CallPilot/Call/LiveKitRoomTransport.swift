@@ -1,5 +1,6 @@
 import Foundation
 import LiveKit
+import AVFAudio
 
 @MainActor
 final class LiveKitRoomTransport: CallMediaTransport {
@@ -68,8 +69,11 @@ private final class LiveKitRoomEventTarget {
     }
 }
 
-private final class LiveKitRoomDelegateProxy: NSObject, RoomDelegate, @unchecked Sendable {
+private final class LiveKitRoomDelegateProxy: NSObject, RoomDelegate, AudioRenderer, @unchecked Sendable {
     private let relay: CallMediaEventRelay
+    private let lock = NSLock()
+    private var rendererRemoval: CallFirstFrameRendererRemoval?
+    private var finished = false
 
     init(target: LiveKitRoomEventTarget) {
         relay = CallMediaEventRelay { [weak target] event in
@@ -93,7 +97,36 @@ private final class LiveKitRoomDelegateProxy: NSObject, RoomDelegate, @unchecked
         relay.yield(.disconnected(reason: reason))
     }
 
+    func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
+        guard let track = publication.track as? RemoteAudioTrack, track.name == "phone-downlink" else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished, rendererRemoval == nil else { return }
+        rendererRemoval = CallFirstFrameRendererRemoval { [weak self] in
+            guard let self else { return }
+            track.remove(audioRenderer: self)
+        }
+        relay.yield(.timing(.downlinkSubscribed, at: CallMonotonic.now()))
+        track.add(audioRenderer: self)
+    }
+
+    func render(pcmBuffer: AVAudioPCMBuffer) {
+        guard pcmBuffer.frameLength > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return }
+        rendererRemoval?.recordFirstFrame {
+            relay.yield(.timing(.downlinkFirstFrame, at: CallMonotonic.now()))
+        }
+    }
+
     func finish() {
+        lock.lock()
+        finished = true
+        let removal = rendererRemoval
+        rendererRemoval = nil
+        lock.unlock()
+        removal?.remove()
         relay.finish()
     }
 }

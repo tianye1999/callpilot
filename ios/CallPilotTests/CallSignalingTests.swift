@@ -30,7 +30,8 @@ final class CallSignalingTests: XCTestCase {
         let fields = try jsonFields(CallSignaling.encodeHangup())
 
         XCTAssertEqual(fields["type"] as? String, "hangup")
-        XCTAssertEqual(fields.count, 1)
+        XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(fields["commandId"] as? String)))
+        XCTAssertEqual(fields.count, 2)
     }
 
     func testDialPacketMatchesEdgeSchemaAndValidation() throws {

@@ -91,23 +91,31 @@ final class CallKitCoordinator: NSObject {
 
     func requestEndIfManaged(_ offer: InboundOffer) async -> Bool {
         guard let callUUID = calls.callUUID(offerId: offer.offerId) else { return false }
+        let phase = calls.phase(callUUID: callUUID)
+        if phase == .active || phase == .answering {
+            delegate?.callKitDidRequestHangup(offerId: offer.offerId)
+        }
         do {
             try await request(CXEndCallAction(call: callUUID))
         } catch {
-            finish(callUUID: callUUID, reason: .failed)
             delegate?.callKitDidRequestHangup(offerId: offer.offerId)
+            finish(callUUID: callUUID, reason: .failed)
         }
         return true
     }
 
-    func requestEndActiveIfManaged() async -> Bool {
+    func requestEndActiveIfManaged() -> Bool {
         guard let callUUID = pendingOrActiveCallUUID(),
               let payload = calls.payload(callUUID: callUUID) else { return false }
-        do {
-            try await request(CXEndCallAction(call: callUUID))
-        } catch {
-            finish(callUUID: callUUID, reason: .failed)
-            delegate?.callKitDidRequestHangup(offerId: payload.offerId)
+        // Capture this call and register intent before the UI can admit a replacement.
+        delegate?.callKitDidRequestHangup(offerId: payload.offerId)
+        Task {
+            do {
+                try await request(CXEndCallAction(call: callUUID))
+            } catch {
+                delegate?.callKitDidRequestHangup(offerId: payload.offerId)
+                finish(callUUID: callUUID, reason: .failed)
+            }
         }
         return true
     }
@@ -295,13 +303,13 @@ extension CallKitCoordinator: PKPushRegistryDelegate {
 extension CallKitCoordinator: CXProviderDelegate {
     nonisolated func providerDidReset(_ provider: CXProvider) {
         MainActor.assumeIsolated {
-            self.answers.reset()
             self.expirationTasks.values.forEach { $0.cancel() }
             self.expirationTasks.removeAll()
             let removed = self.calls.removeAll()
             for payload in removed {
                 self.delegate?.callKitDidRequestHangup(offerId: payload.offerId)
             }
+            self.answers.reset()
         }
     }
 
@@ -329,7 +337,6 @@ extension CallKitCoordinator: CXProviderDelegate {
                 return
             }
             self.expirationTasks.removeValue(forKey: action.callUUID)?.cancel()
-            _ = self.answers.end(callID: action.callUUID)
             if phase == .active || phase == .answering {
                 self.delegate?.callKitDidRequestHangup(offerId: payload.offerId)
             } else {
@@ -339,6 +346,7 @@ extension CallKitCoordinator: CXProviderDelegate {
                     expiresAt: payload.expiresAtUnixMs
                 ))
             }
+            _ = self.answers.end(callID: action.callUUID)
             if !action.isComplete, Date() < action.timeoutDate { action.fulfill() }
         }
     }

@@ -3,6 +3,7 @@ import Foundation
 enum CallMediaTransportEvent: Equatable, Sendable {
     case data(Data, topic: String)
     case disconnected(reason: String)
+    case timing(CallTimingMark, at: TimeInterval)
 }
 
 @MainActor
@@ -13,6 +14,37 @@ protocol CallMediaTransport: AnyObject {
     func publishControl(_ data: Data) async throws
     func disconnect() async
     func setSpeakerphone(_ enabled: Bool)
+}
+
+final class CallFirstFrameRendererRemoval: @unchecked Sendable {
+    private let lock = NSLock()
+    private var removal: (@Sendable () -> Void)?
+    private var receivedFrame = false
+
+    init(removal: @escaping @Sendable () -> Void) {
+        self.removal = removal
+    }
+
+    func recordFirstFrame(_ record: () -> Void) {
+        lock.lock()
+        guard removal != nil, !receivedFrame else {
+            lock.unlock()
+            return
+        }
+        receivedFrame = true
+        record()
+        lock.unlock()
+        // SDK removal can take the renderer callback lock; leave that thread first.
+        DispatchQueue.main.async { self.remove() }
+    }
+
+    func remove() {
+        lock.lock()
+        let removal = removal
+        self.removal = nil
+        lock.unlock()
+        removal?()
+    }
 }
 
 /// Keeps SDK callbacks FIFO while crossing to the call's main-actor state.

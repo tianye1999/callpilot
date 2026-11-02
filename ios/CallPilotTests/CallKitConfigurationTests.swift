@@ -2,6 +2,54 @@ import Foundation
 import XCTest
 
 final class CallKitConfigurationTests: XCTestCase {
+    func testAppHangupRegistersIntentWithoutAnAsynchronousActorHop() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8
+        )
+        let button = try section(source, from: "func hangup()", to: "func sendDTMF")
+        XCTAssertTrue(button.contains("callKit.requestEndActiveIfManaged()"))
+        XCTAssertTrue(button.contains("media?.requestHangup()"))
+        XCTAssertFalse(button.contains("Task {"))
+        XCTAssertFalse(button.contains("await "))
+        let delegate = try section(source, from: "func callKitDidRequestHangup", to: "func callKitPrepareToAnswer")
+        XCTAssertTrue(delegate.contains("guard callKitOfferId == offerId"))
+        XCTAssertTrue(delegate.contains("media?.requestHangup()"))
+        XCTAssertFalse(delegate.contains("Task {"))
+    }
+
+    func testCallKitEndAndResetRegisterIntentBeforeAudioDrainAndFulfill() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/CallKitCoordinator.swift"),
+            encoding: .utf8
+        )
+        let ending = try section(source, from: "perform action: CXEndCallAction", to: "didActivate audioSession")
+        try assertBefore("callKitDidRequestHangup", "answers.end(", in: ending)
+        try assertBefore("callKitDidRequestHangup", "action.fulfill()", in: ending)
+        let reset = try section(source, from: "func providerDidReset", to: "perform action: CXAnswerCallAction")
+        try assertBefore("callKitDidRequestHangup", "answers.reset()", in: reset)
+    }
+
+    func testEndRequestsCaptureThisCallAndRegisterBeforeTransactionOrFailureCleanup() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/CallKitCoordinator.swift"),
+            encoding: .utf8
+        )
+        let active = try section(source, from: "func requestEndActiveIfManaged", to: "func markConnected")
+        XCTAssertTrue(active.hasPrefix("func requestEndActiveIfManaged() -> Bool"))
+        try assertBefore("let callUUID = pendingOrActiveCallUUID()", "Task {", in: active)
+        try assertBefore("callKitDidRequestHangup", "Task {", in: active)
+        let activeTask = try XCTUnwrap(active.components(separatedBy: "Task {").last)
+        XCTAssertFalse(activeTask.contains("pendingOrActiveCallUUID()"))
+        XCTAssertTrue(activeTask.contains("CXEndCallAction(call: callUUID)"))
+
+        let managed = try section(source, from: "func requestEndIfManaged", to: "func requestEndActiveIfManaged")
+        try assertBefore("callKitDidRequestHangup", "try await request(", in: managed)
+        for method in [active, managed] {
+            let failure = try XCTUnwrap(method.components(separatedBy: "} catch {").last)
+            try assertBefore("callKitDidRequestHangup", "finish(callUUID:", in: failure)
+        }
+    }
+
     func testIncomingAndOutboundAdmissionAwaitDrainInsteadOfRejectingIncomingPush() throws {
         let source = try String(
             contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8
@@ -73,6 +121,19 @@ final class CallKitConfigurationTests: XCTestCase {
         XCTAssertTrue(callback.contains("MainActor.assumeIsolated"))
         XCTAssertFalse(callback.contains("Task { @MainActor"))
         XCTAssertTrue(callback.contains("self.report(decoded, completion: completionBox)"))
+    }
+
+    private func section(_ source: String, from start: String, to end: String) throws -> String {
+        let startRange = try XCTUnwrap(source.range(of: start))
+        let endRange = try XCTUnwrap(source.range(of: end, range: startRange.upperBound..<source.endIndex))
+        return String(source[startRange.lowerBound..<endRange.lowerBound])
+    }
+
+    private func assertBefore(_ first: String, _ second: String, in source: String,
+                              file: StaticString = #filePath, line: UInt = #line) throws {
+        let firstRange = try XCTUnwrap(source.range(of: first), file: file, line: line)
+        let secondRange = try XCTUnwrap(source.range(of: second), file: file, line: line)
+        XCTAssertLessThan(firstRange.lowerBound, secondRange.lowerBound, file: file, line: line)
     }
 
     private func plist(_ path: String) throws -> [String: Any] {

@@ -324,6 +324,14 @@ def test_delayed_media_ready_records_both_latencies(rig, monkeypatch, delay):
     latencies = {event["stage"]: event["ms"] for event in events if event["type"] == "latency"}
     assert delay * 1000 <= latencies["phone_first_media_ready_ms"] < delay * 1000 + 51
     assert latencies["phone_first_ata_ms"] == pytest.approx(300)
+    edge_stages = [event["stage"] for event in events
+                   if event["type"] == "latency" and event["stage"].startswith("edge_")]
+    assert edge_stages == [
+        "edge_claim_received", "edge_endpoint_connect_start", "edge_endpoint_connect_return",
+        "edge_media_ready", "edge_ata_start", "edge_ata_return", "edge_pcm_ready", "edge_ath_complete",
+    ]
+    assert all(latencies[stage] >= 0 for stage in edge_stages)
+    assert [latencies[stage] for stage in edge_stages] == sorted(latencies[stage] for stage in edge_stages)
 
 
 def test_full_offer_queue_falls_back_to_ai(rig, monkeypatch, caplog):
@@ -877,18 +885,29 @@ def test_media_cleanup_cannot_delay_ai_fallback(rig, monkeypatch):
     assert rig.endpoint.closed
 
 
-def test_owner_cancels_media_preparation_before_ata_then_ai_answers(rig, monkeypatch):
+@pytest.mark.parametrize("after_pcm", [False, True])
+@pytest.mark.parametrize("with_command_id", [False, True])
+def test_owner_cancels_media_preparation_then_ai_answers(rig, monkeypatch, after_pcm, with_command_id):
     rig.ring()
     agent = FakeAgent()
     monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
 
+    reads = 0
+
     async def next_command(timeout):
-        assert "ATA" not in rig.commands
-        return {"type": "hangup"}
+        nonlocal reads
+        reads += 1
+        if after_pcm and reads == 1:
+            return None
+        assert ("ATA" in rig.commands) is after_pcm
+        assert ("PCM" in rig.commands) is after_pcm
+        return {"type": "hangup", **({"commandId": "32e5a14a-d2ad-4365-9908-7b071ec4db62"}
+                                    if with_command_id else {})}
 
     rig.endpoint.next_command = next_command
 
     async def loop(*args):
+        assert rig.session.takeover_state is TakeoverState.AI_ACTIVE
         return rig.bridge
 
     monkeypatch.setattr(rig.session, "_run_agent_loop", loop)
@@ -900,6 +919,11 @@ def test_owner_cancels_media_preparation_before_ata_then_ai_answers(rig, monkeyp
     rig.clock.tick = tick
     asyncio.run(rig.session._handle_call())
     assert agent.started and rig.commands.count("ATA") == 1
+    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text().splitlines()]
+    assert sum(event["type"] == "takeover_owner_cancelled_precommit" for event in events) == 1
+    assert sum(event.get("stage") == "edge_hangup_during_prepare" for event in events) == 1
+    assert not any(event["type"] == "takeover_owner_hangup" for event in events)
+    assert not any(event.get("type") == "hangup.ack" for event in rig.endpoint.events)
 
 
 def test_late_duplicate_claim_cannot_revoke_winner_media_grace(rig, monkeypatch):
@@ -975,6 +999,12 @@ def test_direct_mobile_uses_existing_duplex_pump_and_disconnect_policy(rig, monk
     assert sent == [b"caller-to-owner"]
     assert rig.commands.count("ATA") == rig.commands.count("HANGUP") == 1
     assert rig.endpoint.closed and rig.bridge.stopped
+    events = [json.loads(line) for line in (rig.session._record.path / "events.jsonl").read_text().splitlines()]
+    stages = [event["stage"] for event in events if event["type"] == "latency"]
+    assert stages.count("edge_first_phone_to_modem") == stages.count("edge_first_modem_to_phone") == 1
+    assert stages.index("edge_pcm_ready") < stages.index("edge_first_phone_to_modem")
+    assert stages.index("edge_first_phone_to_modem") < stages.index("edge_ath_complete")
+    assert stages.count("edge_hangup_received") == (1 if ending == "hangup" else 0)
 
 
 def test_later_ai_takeover_does_not_inherit_expired_phone_first_window(rig):

@@ -424,7 +424,12 @@ def test_postcommit_media_loss_expires_to_notice_then_hangup(monkeypatch) -> Non
 
     assert session.takeover_state is TakeoverState.ENDED
     assert coordinator.end_reason == "mobile_reconnect_timeout"
-    assert record.events == [{"type": "takeover_notice_then_hangup"}]
+    assert [event for event in record.events if event["type"] != "latency"] == [
+        {"type": "takeover_notice_then_hangup"},
+    ]
+    assert [event["stage"] for event in record.events if event["type"] == "latency"] == [
+        "edge_claim_received",
+    ]
 
 
 def test_owner_hangup_command_ends_without_disconnect_notice(monkeypatch) -> None:
@@ -455,5 +460,87 @@ def test_owner_hangup_command_ends_without_disconnect_notice(monkeypatch) -> Non
 
     assert session.takeover_state is TakeoverState.ENDED
     assert coordinator.end_reason == "owner_hangup"
-    assert record.events == [{"type": "takeover_owner_hangup"}]
+    assert [event for event in record.events if event["type"] != "latency"] == [
+        {"type": "takeover_owner_hangup"},
+    ]
+    assert [event["stage"] for event in record.events if event["type"] == "latency"] == [
+        "edge_claim_received", "edge_hangup_received",
+    ]
+    assert endpoint.events == []
     assert session.modem.calls == []
+
+
+@pytest.mark.parametrize("ack_fails", [False, True])
+def test_owner_hangup_ack_precedes_takeover_end_even_if_send_fails(monkeypatch, ack_fails) -> None:
+    service = _service()
+    session = service.session
+    claimed = _claimed(service, monkeypatch)
+    coordinator = session._takeover_coordinator
+    assert coordinator is not None
+    assert coordinator.mark_mobile_media_ready(claimed.fence).accepted
+    assert coordinator.commit_mobile(claimed.fence).accepted
+    endpoint = FakeEndpoint(session)
+    command_id = "8c72d1c3-2ab5-47ea-afed-5b575da75a83"
+    endpoint.commands.append({"type": "hangup", "commandId": command_id})
+    session.modem.connected_flag.set()
+    ack_attempts = []
+    states_at_ack = []
+
+    async def send_event(event):
+        ack_attempts.append(event)
+        states_at_ack.append((session.takeover_state, list(session.modem.calls)))
+        if ack_fails:
+            raise RuntimeError("simulated data channel failure")
+
+    monkeypatch.setattr(endpoint, "send_event", send_event)
+    record = FakeRecord()
+    asyncio.run(asyncio.wait_for(
+        session._pump_mobile_media(endpoint, FakeAudioBridge(), record, claimed),  # type: ignore[arg-type]
+        timeout=0.5,
+    ))
+
+    assert ack_attempts == [{"type": "hangup.ack", "commandId": command_id}]
+    assert states_at_ack == [(TakeoverState.MOBILE_ACTIVE, [])]
+    assert session.takeover_state is TakeoverState.ENDED
+    assert coordinator.end_reason == "owner_hangup"
+    assert sum(event["type"] == "takeover_owner_hangup" for event in record.events) == 1
+    assert not any(event["type"] == "takeover_notice_then_hangup" for event in record.events)
+
+
+def test_repeated_owner_hangup_reacks_without_ending_takeover_twice(monkeypatch) -> None:
+    service = _service()
+    session = service.session
+    claimed = _claimed(service, monkeypatch)
+    coordinator = session._takeover_coordinator
+    assert coordinator is not None
+    assert coordinator.mark_mobile_media_ready(claimed.fence).accepted
+    assert coordinator.commit_mobile(claimed.fence).accepted
+    endpoint = FakeEndpoint(session)
+    command_id = "4a9f247e-6981-497c-b21a-a2d0ef93ebc0"
+    command = {"type": "hangup", "commandId": command_id}
+    session.modem.connected_flag.set()
+    record = FakeRecord()
+    endings = []
+    end_call = coordinator.end_call
+
+    def counted_end(reason):
+        endings.append(reason)
+        return end_call(reason)
+
+    monkeypatch.setattr(coordinator, "end_call", counted_end)
+
+    async def run():
+        for _ in range(2):
+            endpoint.commands.append(command)
+            await asyncio.wait_for(
+                session._pump_mobile_media(endpoint, FakeAudioBridge(), record, claimed),  # type: ignore[arg-type]
+                timeout=0.5,
+            )
+
+    asyncio.run(run())
+    assert endings == ["owner_hangup"]
+    assert endpoint.events == [{"type": "hangup.ack", "commandId": command_id}] * 2
+    assert sum(event["type"] == "takeover_owner_hangup" for event in record.events) == 1
+    assert [event["stage"] for event in record.events if event["type"] == "latency"] == [
+        "edge_claim_received", "edge_hangup_received", "edge_hangup_ack_sent",
+    ]

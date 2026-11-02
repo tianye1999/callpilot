@@ -10,6 +10,7 @@ from typing import Any
 
 from . import config
 from .audio_bridge import apply_pcm_gain
+from .call_timing import MAX_TIMING_BYTES, CallTiming
 from .pcm_stats import PcmFlowStats
 from .remote_dialer import (
     REMOTE_AUDIO_RATE,
@@ -71,6 +72,9 @@ class LiveKitRemoteMediaEndpoint:
         self._commands: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
             maxsize=_MAX_COMMANDS
         )
+        self._hangup_command: dict[str, Any] | None = None
+        self._command_ready = asyncio.Event()
+        self._timing = CallTiming()
         self._browser_audio: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=self._queue_max_chunks
         )
@@ -111,7 +115,11 @@ class LiveKitRemoteMediaEndpoint:
     def browser_connected(self) -> bool:
         return self._browser_connected
 
+    def set_timing(self, timing: CallTiming) -> None:
+        self._timing = timing
+
     async def connect(self) -> None:
+        self._timing.mark("endpoint_connect_start")
         rtc = self._rtc
         if rtc is None:
             from livekit import rtc as livekit_rtc
@@ -126,6 +134,7 @@ class LiveKitRemoteMediaEndpoint:
         def on_participant_connected(participant) -> None:
             if participant.identity == self._issued.browser_identity:
                 self._browser_connected = True
+                self._timing.mark("phone_joined")
 
         @room.on("participant_disconnected")
         def on_participant_disconnected(participant) -> None:
@@ -152,6 +161,8 @@ class LiveKitRemoteMediaEndpoint:
             self._audio_stream = stream
             self._browser_connected = True
             self._media_ready = True
+            self._timing.mark("phone_track_subscribed")
+            self._timing.mark("media_ready")
             self._browser_audio_task = asyncio.create_task(
                 self._pump_browser_audio(stream)
             )
@@ -185,9 +196,19 @@ class LiveKitRemoteMediaEndpoint:
             ):
                 return
             command = _decode_control_payload(packet.data)
-            if command is None or self._commands.full():
+            if command is None:
                 return
-            self._commands.put_nowait(command)
+            if command.get("type") == "client_timing":
+                if len(packet.data) <= MAX_TIMING_BYTES:
+                    self._timing.receive_client(command)
+                return
+            if command.get("type") == "hangup":
+                # A reserved slot cannot be displaced by ordinary controls or telemetry.
+                if self._hangup_command is None:
+                    self._hangup_command = command
+            elif not self._commands.full():
+                self._commands.put_nowait(command)
+            self._command_ready.set()
 
         @room.on("disconnected")
         def on_disconnected(_reason) -> None:
@@ -210,12 +231,15 @@ class LiveKitRemoteMediaEndpoint:
         options = rtc.TrackPublishOptions()
         options.source = rtc.TrackSource.SOURCE_MICROPHONE
         await room.local_participant.publish_track(track, options)
+        self._timing.mark("downlink_published")
         self._publisher_task = asyncio.create_task(self._publish_modem_audio())
         self._modem_stats_task = asyncio.create_task(self._log_modem_publish_stats())
 
         participant = room.remote_participants.get(self._issued.browser_identity)
         if participant is not None:
             self._browser_connected = True
+            self._timing.mark("phone_joined")
+        self._timing.mark("endpoint_connect_return")
 
     async def close(self) -> None:
         if self._closed:
@@ -266,9 +290,19 @@ class LiveKitRemoteMediaEndpoint:
 
     async def next_command(self, timeout: float) -> dict[str, Any] | None:
         try:
-            return await asyncio.wait_for(self._commands.get(), timeout)
+            await asyncio.wait_for(self._command_ready.wait(), timeout)
         except TimeoutError:
             return None
+        if self._hangup_command is not None:
+            command, self._hangup_command = self._hangup_command, None
+        else:
+            try:
+                command = self._commands.get_nowait()
+            except asyncio.QueueEmpty:
+                command = None
+        if self._hangup_command is None and self._commands.empty():
+            self._command_ready.clear()
+        return command
 
     def take_browser_audio(self, max_chunks: int = 10) -> list[bytes]:
         chunks: list[bytes] = []
@@ -296,7 +330,11 @@ class LiveKitRemoteMediaEndpoint:
     async def send_event(self, event: dict[str, Any]) -> None:
         room = self._room
         if room is None or not self._browser_connected:
+            if event.get("type") == "hangup.ack":
+                raise ConnectionError("control channel unavailable")
             return
+        if event.get("type") == "status":
+            event = {**event, "clientTimingVersion": 1}
         payload = json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode(
             "utf-8"
         )
@@ -314,6 +352,7 @@ class LiveKitRemoteMediaEndpoint:
             async for event in stream:
                 pcm = bytes(event.frame.data)
                 if pcm:
+                    self._timing.mark("phone_first_frame")
                     self._browser_in_stats.add(pcm)
                     _put_latest(self._browser_audio, pcm)
         except asyncio.CancelledError:
