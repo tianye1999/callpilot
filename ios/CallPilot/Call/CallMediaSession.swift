@@ -12,6 +12,7 @@ final class CallMediaSession {
     private let ownerID = UUID()
     private var connectedHandler: (() -> Void)?
     private var transport: (any CallMediaTransport)?
+    private var silentTransport: (any CallMediaTransport)?
     private(set) var preparedSession: HostedCallSession?
     private(set) var pendingDialPacket: Data?
     private var activeLabel: String?
@@ -54,22 +55,39 @@ final class CallMediaSession {
         guard let attempt = beginAttempt(label: L10n.text("call.takeover.label"), mode: .callKit) else { return }
         silentOfferId = offer.offerId
         let task = Task {
-            try await audio.acquire(ownerID, mode: .callKit)
-            audioLeaseAcquired = true
             try checkCurrent(attempt)
+            async let acquiring: Void = acquireSilentAudioLease(for: attempt)
+            // Start the request before the lease's synchronous native audio preparation.
             timing.mark(.prepareStart)
             let candidate = try await client.prepareInboundOffer(offerId: offer.offerId)
-            timing.mark(.prepareResponse)
             try checkCurrent(attempt)
-            preparation = candidate
+            timing.mark(.prepareResponse)
+            try await acquiring
+            try checkCurrent(attempt)
             let connection = transportFactory()
+            // The factory is synchronous, but may reenter session cancellation.
+            do { try checkCurrent(attempt) }
+            catch {
+                await connection.disconnect()
+                throw error
+            }
+            silentTransport = connection
+            preparation = candidate
             transport = connection
-            connection.eventHandler = { [weak self] event in
-                await self?.handleTransportEvent(event, for: attempt)
+            connection.eventHandler = { [weak self, weak connection] event in
+                guard let connection else { return }
+                await self?.handleTransportEvent(event, from: connection, for: attempt)
             }
             timing.mark(.preconnectStart)
-            try await connection.connectSilent(url: candidate.session.livekitURL, token: candidate.session.token)
-            try checkCurrent(attempt)
+            do {
+                try await connection.connectSilent(url: candidate.session.livekitURL, token: candidate.session.token)
+                try checkCurrent(attempt)
+            } catch {
+                connection.eventHandler = nil
+                if transport === connection { transport = nil }
+                await connection.disconnect()
+                throw error
+            }
             preconnectReady = true
             timing.mark(.preconnectReady)
         }
@@ -78,17 +96,32 @@ final class CallMediaSession {
         // Failure is silent. Answer can still use the cold path, with the same lease.
     }
 
+    private func acquireSilentAudioLease(for attempt: UInt64) async throws {
+        try checkCurrent(attempt)
+        timing.mark(.audioLeaseStart)
+        try await audio.acquire(ownerID, mode: .callKit)
+        // Record ownership even if cancellation arrived as acquire returned.
+        audioLeaseAcquired = true
+        timing.mark(.audioLeaseEnd)
+        try checkCurrent(attempt)
+    }
+
     private func closeSilentTransport(_ pending: Task<Void, Error>?) async {
         preconnectReady = false
         permissionReady = false
         preparation = nil
         pending?.cancel()
-        let old = transport
+        let old = silentTransport
+        if let old, transport === old { transport = nil }
         old?.eventHandler = nil
         await old?.disconnect()
         _ = await pending?.result
-        await old?.disconnect()
-        transport = nil
+        // Re-read after draining: clean up the actual silent connection, never a cold one.
+        let settled = silentTransport
+        if let settled, transport === settled { transport = nil }
+        settled?.eventHandler = nil
+        await settled?.disconnect()
+        silentTransport = nil
     }
 
     init(onState: @escaping StateHandler,
@@ -152,8 +185,10 @@ final class CallMediaSession {
                 await closeSilentTransport(silentTask)
             }
             if !audioLeaseAcquired {
+                timing.mark(.audioLeaseStart)
                 try await audio.acquire(ownerID, mode: mode)
                 audioLeaseAcquired = true
+                timing.mark(.audioLeaseEnd)
             }
             try checkCurrent(attempt)
             timing.startClaim()
@@ -218,8 +253,9 @@ final class CallMediaSession {
     private func connect(_ session: HostedCallSession, for attempt: UInt64) async throws {
         let activeTransport = transportFactory()
         transport = activeTransport
-        activeTransport.eventHandler = { [weak self] event in
-            await self?.handleTransportEvent(event, for: attempt)
+        activeTransport.eventHandler = { [weak self, weak activeTransport] event in
+            guard let activeTransport else { return }
+            await self?.handleTransportEvent(event, from: activeTransport, for: attempt)
         }
         activeTransport.setSpeakerphone(speakerphoneEnabled)
         onState(.waitingMedia(label: activeLabel ?? ""))
@@ -384,7 +420,10 @@ final class CallMediaSession {
         return generation
     }
 
-    private func handleTransportEvent(_ event: CallMediaTransportEvent, for attempt: UInt64) async {
+    private func handleTransportEvent(
+        _ event: CallMediaTransportEvent, from connection: any CallMediaTransport, for attempt: UInt64
+    ) async {
+        guard transport === connection else { return }
         if case let .data(data, topic) = event, topic == CallPilotTopic.status,
            let id = CallSignaling.decodeHangupAck(data), id == hangupCommandID {
             hangupAcknowledged = true
@@ -492,8 +531,10 @@ final class CallMediaSession {
         preparedSession = nil
         pendingDialPacket = nil
         let activeTransport = transport
-        if hangup == nil { activeTransport?.eventHandler = nil }
-        transport = nil
+        if hangup == nil {
+            activeTransport?.eventHandler = nil
+            transport = nil
+        }
         cleanupTask = audio.release(ownerID) {
             if let hangup, let activeTransport {
                 await self.sendHangup(hangup, using: activeTransport)
@@ -509,6 +550,8 @@ final class CallMediaSession {
             await telemetry?.value
             // A late connect may have completed after the first disconnect.
             await activeTransport?.disconnect()
+            self.transport = nil
+            self.silentTransport = nil
         }
         if let state { onState(state) }
     }

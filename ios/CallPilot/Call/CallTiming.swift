@@ -6,6 +6,7 @@ enum CallTimingMark: String, CaseIterable, Sendable {
     case claimStart = "claim_start", claimResponse = "claim_response"
     case claimResponseEnd = "claim_response_end", pushReceived = "push_received"
     case prepareStart = "prepare_start", prepareResponse = "prepare_response"
+    case audioLeaseStart = "audio_lease_start", audioLeaseEnd = "audio_lease_end"
     case preconnectStart = "preconnect_start", preconnectReady = "preconnect_ready"
     case permissionReady = "permission_ready", transportAdopted = "transport_adopted"
     case coldFallback = "cold_fallback"

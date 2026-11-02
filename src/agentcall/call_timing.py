@@ -21,6 +21,7 @@ CLIENT_MARKS = frozenset({
     "claim_connection_reused", "prewarm_start", "prewarm_end",
     "push_received", "prepare_start", "prepare_response", "preconnect_start", "preconnect_ready",
     "permission_ready", "transport_adopted", "cold_fallback", "claim_response_end",
+    "audio_lease_start", "audio_lease_end",
 })
 MAX_TIMING_BYTES = 2048
 MAX_TIMING_BATCH_MARKS = 16

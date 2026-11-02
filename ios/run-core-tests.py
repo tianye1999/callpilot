@@ -44,7 +44,9 @@ def main():
         "RootPresentationTests", "ContentModelsTests", "CallContentModelsTests", "PrivacyManifestTests",
         "CallHistoryModelTests", "MessageInboxModelTests",
         "AlertPushTests",
-        "CallAudioOwnerTests", "CallKitAnswerControllerTests", "CallMediaSessionTests", "CallTimingTests",
+        "CallAudioOwnerTests", "CallKitAnswerControllerTests",
+        "CallMediaSessionTests",  # Includes silent-preconnect cancellation and stale-event regressions.
+        "CallTimingTests",
         "CallFirstFrameRendererRemovalTests",
         "ClaimNetworkMetricsTests", "ClaimPrewarmerTests",
     ]

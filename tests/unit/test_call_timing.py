@@ -44,6 +44,16 @@ def test_client_timing_accepts_claim_network_and_prewarm_stages(stage):
     assert record.events == [{"type": "latency", "stage": "client_" + stage, "ms": 1}]
 
 
+def test_client_timing_accepts_audio_lease_wait_marks():
+    record = Record()
+    timing = CallTiming(record=record)
+    timing.receive_client(packet(marks={"audio_lease_start": -6500, "audio_lease_end": -10}))
+    assert record.events == [
+        {"type": "latency", "stage": "client_audio_lease_start", "ms": -6500},
+        {"type": "latency", "stage": "client_audio_lease_end", "ms": -10},
+    ]
+
+
 def test_client_timing_skips_unknown_stage_without_losing_known_marks():
     record = Record()
     timing = CallTiming(record=record)
