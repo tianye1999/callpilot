@@ -1103,11 +1103,21 @@ def enable_early_answer(rig, monkeypatch):
     monkeypatch.setenv("INBOUND_EARLY_ANSWER_ENABLED", "true")
     monkeypatch.setenv("MODEM_ANSWER_GREETING", "")
     rig.modem.last_voice_enable = {"ok": True, "attempts": 1}
+    rig.advance_early_clock = False
+    rig.early_bridge_started = threading.Event()
+    original_start = rig.bridge.start
+
+    def start():
+        original_start()
+        rig.early_bridge_started.set()
+
+    monkeypatch.setattr(rig.bridge, "start", start)
 
     async def sleep(seconds):
-        rig.clock.sleep_sync(seconds)
-        # Give real modem workers a turn without spending the fake media budget.
-        await asyncio.sleep(0.001)
+        # Only timeout tests advance time, after their prerequisites are ready.
+        # Worker scheduling must not consume a call's fake media budget.
+        rig.clock.sleep_sync(seconds if rig.advance_early_clock else 0)
+        await asyncio.sleep(0)
 
     rig.session._phone_first_sleep = sleep
     rig.ring()
@@ -1117,6 +1127,11 @@ def enable_early_answer(rig, monkeypatch):
         assert rig.claim().accepted
 
     rig.clock.tick = claim_once
+
+
+async def wait_early_event(event):
+    # A deadlock watchdog, not a delay used to establish ordering.
+    assert await asyncio.to_thread(event.wait, 5), "early-answer checkpoint was not reached"
 
 
 def phone_first_events(rig):
@@ -1130,21 +1145,27 @@ def test_early_answer_pcm_precedes_late_media_and_discards_waiting_audio(rig, mo
     rig.endpoint.media_ready = False
     order = []
     original_start = rig.bridge.start
+    original_read = rig.bridge.read_modem_chunk
+    drained = threading.Event()
 
     def start():
         original_start()
         order.append("pcm")
         rig.bridge.feed_uplink(b"old caller audio")
+        rig.bridge.feed_uplink(b"more old caller audio")
+
+    def read():
+        chunk = original_read()
+        if rig.bridge.started and not chunk:
+            drained.set()
+        return chunk
 
     monkeypatch.setattr(rig.bridge, "start", start)
+    monkeypatch.setattr(rig.bridge, "read_modem_chunk", read)
 
     async def connect():
-        for _ in range(200):
-            if rig.bridge.started:
-                break
-            await asyncio.sleep(0.001)
+        await wait_early_event(drained)
         assert rig.bridge.started, "PCM must start without waiting for phone media"
-        await asyncio.sleep(0.005)
         assert rig.bridge.read_modem_chunk() == b""
         assert rig.session.takeover_state is not TakeoverState.MOBILE_ACTIVE
         assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
@@ -1174,13 +1195,15 @@ def test_early_answer_media_ready_still_waits_for_pcm_without_serial_lock(rig, m
     entered, release = threading.Event(), threading.Event()
     original_initialize = rig.modem.initialize_for_voice
     original_reserved = rig.modem.incoming_reserved
+    original_guard = rig.session._phone_first_guard
     loop_thread = threading.get_ident()
     progress = []
+    checked_while_locked = threading.Event()
 
     def initialize(mode):
         with rig.modem._serial_lock:
             entered.set()
-            assert release.wait(2), "event loop blocked behind modem serial lock"
+            assert release.wait(5), "event loop blocked behind modem serial lock"
             original_initialize(mode)
 
     def reserved(lease):
@@ -1188,25 +1211,27 @@ def test_early_answer_media_ready_still_waits_for_pcm_without_serial_lock(rig, m
             assert threading.get_ident() != loop_thread, "serial-lock check on event loop"
         return original_reserved(lease)
 
+    def guard():
+        if threading.get_ident() == loop_thread and entered.is_set() and not release.is_set():
+            assert rig.session.takeover_state is not TakeoverState.MOBILE_ACTIVE
+            progress.append(True)
+            if len(progress) >= 3:
+                checked_while_locked.set()
+        return original_guard()
+
     async def connect():
-        for _ in range(200):
-            if entered.is_set():
-                break
-            await asyncio.sleep(0.001)
-        assert entered.is_set()
         try:
-            for _ in range(3):
-                assert rig.session.takeover_state is not TakeoverState.MOBILE_ACTIVE
-                progress.append(True)
-                await asyncio.sleep(0.001)
+            await wait_early_event(entered)
+            await wait_early_event(checked_while_locked)
         finally:
             release.set()
 
     monkeypatch.setattr(rig.modem, "initialize_for_voice", initialize)
     monkeypatch.setattr(rig.modem, "incoming_reserved", reserved)
+    monkeypatch.setattr(rig.session, "_phone_first_guard", guard)
     rig.endpoint.connect = connect
     asyncio.run(rig.session._handle_call())
-    assert len(progress) == 3
+    assert len(progress) >= 3
     assert rig.session._record.source == "remote_web_dialer"
     assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
 
@@ -1242,14 +1267,15 @@ def test_early_answer_fallback_reuses_pcm(rig, monkeypatch, parallel, failure):
         rig.endpoint.media_ready = False
 
     async def connect():
-        while not rig.bridge.started:
-            await asyncio.sleep(0.001)
+        await wait_early_event(rig.early_bridge_started)
         if failure == "connect_error":
             # The reuse event must use the original result, not a later snapshot.
             rig.modem.last_voice_enable = {"ok": False, "attempts": 9}
             raise ConnectionError("synthetic")
         if failure == "commit_rejected":
             rig.session._takeover_coordinator.commit_mobile = lambda fence: SimpleNamespace(accepted=False)
+        if failure in {"timeout", "claim_timeout"}:
+            rig.advance_early_clock = True
 
     async def next_command(timeout):
         if failure == "owner_cancelled":
@@ -1277,7 +1303,8 @@ def test_early_answer_fallback_reuses_pcm(rig, monkeypatch, parallel, failure):
         assert 8 <= rig.clock.now - pcm_at[0] < 8.1
         assert rig.clock.now < rig.session._phone_first_claim_deadline
     if failure == "claim_timeout":
-        assert 0 < waits[0]["ms"] < 5000
+        expected_ms = (rig.session._phone_first_claim_deadline - pcm_at[0]) * 1000
+        assert expected_ms <= waits[0]["ms"] < expected_ms + 51
         assert rig.session._phone_first_claim_deadline <= rig.clock.now < rig.session._phone_first_claim_deadline + 0.1
     if failure == "owner_cancelled":
         assert sum(event["type"] == "takeover_owner_cancelled_precommit" for event in events) == 1
@@ -1291,8 +1318,7 @@ def test_early_answer_caller_ends_while_waiting_for_media(rig, monkeypatch):
     rig.endpoint.media_ready = False
 
     async def connect():
-        while not rig.bridge.started:
-            await asyncio.sleep(0.001)
+        await wait_early_event(rig.early_bridge_started)
         rig.modem._invalidate_reserved_incoming()
         rig.modem._on_hangup()
 
@@ -1331,6 +1357,14 @@ def test_early_answer_adopts_ready_preconnect_before_pcm(rig, monkeypatch):
     monkeypatch.setattr("agentcall.call_agent.create_agent", lambda *args: pytest.fail("unexpected AI"))
     operations = []
     session = rig.session
+    bound = threading.Event()
+    original_initialize = rig.modem.initialize_for_voice
+
+    def initialize(mode):
+        assert bound.wait(5)
+        original_initialize(mode)
+
+    monkeypatch.setattr(rig.modem, "initialize_for_voice", initialize)
 
     async def prepare():
         operations.append("prepare")
@@ -1340,6 +1374,7 @@ def test_early_answer_adopts_ready_preconnect_before_pcm(rig, monkeypatch):
         operations.append("bind")
         assert "PCM" not in rig.commands
         assert session.takeover_state is not TakeoverState.MOBILE_ACTIVE
+        bound.set()
 
     async def connect():
         pytest.fail("ready preconnect must be reused")
@@ -1398,70 +1433,179 @@ def test_early_answer_setting_is_frozen_at_claim_and_reset_for_next_call(rig, mo
 
 
 @pytest.mark.parametrize("ending", ["connect_error", "cancel", "hangup"])
-def test_early_answer_joins_pcm_worker_before_cleanup_and_never_builds_late_bridge(rig, monkeypatch, ending):
+@pytest.mark.parametrize("order", ["abandon_first", "pcm_first"])
+def test_early_answer_joins_pcm_worker_before_cleanup_and_never_builds_late_bridge(rig, monkeypatch, ending, order):
     enable_early_answer(rig, monkeypatch)
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     original_initialize = rig.modem.initialize_for_voice
-    starts = []
-    original_start = rig.bridge.start
+    original_sleep = rig.session._phone_first_sleep
+    original_threaded = rig.session._threaded_modem_call
+    original_gather = asyncio.gather
+    original_close = rig.endpoint.close
     agent = FakeAgent()
+    rig.endpoint.media_ready = False
+    main_task = answer_task = None
+    checkpoints = asyncio.Queue()
+    fail_connect, connect_failed = asyncio.Event(), asyncio.Event()
+    abandoned, early_started = asyncio.Event(), asyncio.Event()
+    bridges = {}
+    lifecycle = []
+    writers = max_writers = 0
 
     def create_agent(provider):
         assert ending == "connect_error" and finished.is_set()
         return agent
 
-    monkeypatch.setattr("agentcall.call_agent.create_agent", create_agent)
-
     def initialize(mode):
         with rig.modem._serial_lock:
             entered.set()
-            assert release.wait(2)
+            assert release.wait(5)
             original_initialize(mode)
-            finished.set()
 
-    def start():
-        assert finished.is_set()
-        starts.append(True)
-        original_start()
+    async def threaded(operation, *args):
+        nonlocal answer_task
+        if operation == rig.modem.prepare_reserved_voice:
+            answer_task = asyncio.current_task()
+            try:
+                return await original_threaded(operation, *args)
+            finally:
+                lifecycle.append("pcm_finished")
+                finished.set()
+        return await original_threaded(operation, *args)
 
-    async def loop(*args):
-        return rig.bridge
+    def gather(*tasks, **kwargs):
+        # Both failure and cancellation join the answer task only after setting
+        # abandoned. Observe that real boundary, not the earlier error signal.
+        if asyncio.current_task() is main_task and answer_task is not None and answer_task in tasks:
+            if not abandoned.is_set():
+                lifecycle.append("abandoned")
+                abandoned.set()
+        return original_gather(*tasks, **kwargs)
+
+    async def sleep(seconds):
+        await original_sleep(seconds)
+        if asyncio.current_task() is main_task and rig.session._phone_first_claim_deadline is not None:
+            checkpoint = asyncio.get_running_loop().create_future()
+            checkpoints.put_nowait(checkpoint)
+            await checkpoint
+
+    def create_bridge(**kwargs):
+        owner = "ai" if rig.session.takeover_state is TakeoverState.AI_ACTIVE else "early"
+        lifecycle.append(f"{owner}_create")
+        assert finished.is_set(), "a bridge was created before PCM worker completion"
+        bridge = FakeAudioBridge()
+        assert owner not in bridges
+        bridges[owner] = bridge
+
+        def start():
+            nonlocal writers, max_writers
+            lifecycle.append(f"{owner}_start")
+            assert finished.is_set(), "a bridge started before PCM worker completion"
+            if owner == "early":
+                assert not abandoned.is_set(), "early bridge started after abandonment"
+                early_started.set()
+            else:
+                assert abandoned.is_set()
+                assert "early" not in bridges or bridges["early"].stopped
+            bridge.started = True
+            writers += 1
+            max_writers = max(writers, max_writers)
+            assert writers <= 1
+
+        def stop():
+            nonlocal writers
+            lifecycle.append(f"{owner}_stop")
+            assert finished.is_set()
+            if bridge.started and not bridge.stopped:
+                writers -= 1
+            bridge.stopped = True
+
+        bridge.start, bridge.stop = start, stop
+        return bridge
+
+    async def close():
+        lifecycle.append("endpoint_close")
+        assert finished.is_set(), "endpoint closed before PCM worker completion"
+        assert "early" not in bridges or bridges["early"].stopped
+        await original_close()
+
+    async def loop(agent, bridge, *args):
+        return bridge
 
     async def connect():
-        while not entered.is_set():
-            await asyncio.sleep(0.001)
         if ending == "connect_error":
+            await fail_connect.wait()
+            connect_failed.set()
             raise ConnectionError("synthetic")
         await asyncio.Event().wait()
 
     async def exercise():
-        task = asyncio.create_task(rig.session._handle_call())
+        nonlocal main_task
+        main_task = asyncio.create_task(rig.session._handle_call())
         try:
-            assert await asyncio.to_thread(entered.wait, 2)
-            if ending == "cancel":
-                task.cancel()
-            elif ending == "hangup":
-                rig.session._set_active(False)
-            await asyncio.sleep(0.01)
-            assert not task.done() and not rig.endpoint.closed and not starts
+            async with asyncio.timeout(5):
+                # First release the ringing loop, then hold the claimed main
+                # loop while its independent answer task enters PCM preparation.
+                (await checkpoints.get()).set_result(None)
+                waiting = await checkpoints.get()
+                await wait_early_event(entered)
+                assert not finished.is_set() and not bridges and not rig.endpoint.closed
+                if ending == "connect_error":
+                    fail_connect.set()
+                    await connect_failed.wait()
+                if order == "pcm_first":
+                    release.set()
+                    await early_started.wait()
+                    assert finished.is_set() and not abandoned.is_set()
+                    assert not bridges["early"].stopped and not rig.endpoint.closed
+                if ending == "cancel":
+                    main_task.cancel()
+                else:
+                    if ending == "hangup":
+                        rig.session._set_active(False)
+                    waiting.set_result(None)
+                await abandoned.wait()
+                if order == "abandon_first":
+                    assert not finished.is_set() and not bridges and not rig.endpoint.closed
+                    assert not main_task.done()
+                    release.set()
+                if ending == "cancel":
+                    with pytest.raises(asyncio.CancelledError):
+                        await main_task
+                else:
+                    await main_task
         finally:
             release.set()
-        if ending == "cancel":
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        else:
-            await task
+            if not main_task.done():
+                main_task.cancel()
+            await original_gather(main_task, return_exceptions=True)
 
+    monkeypatch.setattr("agentcall.call_agent.create_agent", create_agent)
+    monkeypatch.setattr("agentcall.call_agent.create_audio_bridge", create_bridge)
     monkeypatch.setattr(rig.modem, "initialize_for_voice", initialize)
-    monkeypatch.setattr(rig.bridge, "start", start)
+    monkeypatch.setattr(rig.session, "_threaded_modem_call", threaded)
+    monkeypatch.setattr(rig.session, "_phone_first_sleep", sleep)
     monkeypatch.setattr(rig.session, "_run_agent_loop", loop)
+    monkeypatch.setattr(asyncio, "gather", gather)
     rig.endpoint.connect = connect
+    rig.endpoint.close = close
     asyncio.run(exercise())
     assert finished.is_set() and rig.endpoint.closed
-    assert len(starts) == int(ending == "connect_error")
+    assert all(bridge.stopped for bridge in bridges.values())
+    assert lifecycle.index("pcm_finished") < lifecycle.index("endpoint_close")
+    for owner in bridges:
+        assert lifecycle.index("pcm_finished") < lifecycle.index(f"{owner}_create")
+    if order == "pcm_first":
+        assert lifecycle.index("early_start") < lifecycle.index("abandoned") < lifecycle.index("early_stop")
+        assert lifecycle.index("early_stop") < lifecycle.index("endpoint_close")
+        if ending == "connect_error":
+            assert lifecycle.index("early_stop") < lifecycle.index("ai_start")
+    else:
+        assert lifecycle.index("abandoned") < lifecycle.index("pcm_finished")
+        assert "early_create" not in lifecycle and "early_start" not in lifecycle
     assert agent.started is (ending == "connect_error")
     assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
-    assert rig.bridge.max_writers <= 1
+    assert max_writers <= 1 and writers == 0
 
 
 @pytest.mark.parametrize("ready", [False, True])
@@ -1472,18 +1616,21 @@ def test_early_answer_continuous_uplink_cannot_block_media_or_timeout(rig, monke
     monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
     loop_thread = threading.get_ident()
     reads = []
+    first_read, connect_observed = threading.Event(), threading.Event()
 
     def read():
         assert threading.get_ident() != loop_thread
         reads.append(True)
+        first_read.set()
+        assert connect_observed.wait(5)
         rig.clock.now += 0.01
         assert len(reads) < 1000, "continuous PCM must not trap the drain loop"
         return b"live caller audio"
 
     async def connect():
-        while not reads:
-            await asyncio.sleep(0.001)
+        await wait_early_event(first_read)
         rig.endpoint.media_ready = ready
+        connect_observed.set()
 
     async def loop(*args):
         return rig.bridge
