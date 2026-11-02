@@ -10,13 +10,15 @@ import {
   type ContentResource,
   type DataResponse
 } from "./content-sync";
-import { edgeMessageSchema } from "./schemas";
+import { edgeMessageSchema, inboundAnswerSchema, inboundIceRequestSchema, inboundMediaCommandSchema } from "./schemas";
+import type { z } from "zod";
 import { HttpError } from "./http";
 import type { EdgePresence, Env } from "./types";
 import { randomId } from "./security";
 import { issueParticipantToken } from "./livekit";
 import { invalidateCandidates, PRECONNECT_CLEANUP_INTERVAL_MS, queueParticipantCleanup, sweepPreconnect } from "./inbound-preconnect";
 import { dispatchInboundOfferPushes, errorName } from "./voip-push";
+import { issueIceServers, type IceCredentials } from "./turn";
 
 interface SocketAttachment {
   edgeId: string;
@@ -32,8 +34,31 @@ interface PendingRelay {
   resolve: (response: Response) => void;
 }
 
+export const INBOUND_MEDIA_RELAY_MAX_MS = 15_000;
+// Reservation is a synchronous control acknowledgement, not media setup.
+export const INBOUND_CLAIM_RESERVE_MAX_MS = 5_000;
+interface PendingMediaRelay {
+  offerId: string;
+  callId: string;
+  claimId: string;
+  expectsSdp: boolean;
+  socket: WebSocket;
+  deadline: number;
+  timeout: ReturnType<typeof setTimeout>;
+  resolve: (response: Response) => void;
+}
+interface WarmInboundIce {
+  generation: number;
+  nonce: string;
+  expiresAt: number;
+  pending: Promise<IceCredentials>;
+  invalidated: boolean;
+}
+
 export class EdgeRoom extends DurableObject<Env> {
   private readonly pendingRelays = new Map<string, PendingRelay>();
+  private readonly pendingMediaRelays = new Map<string, PendingMediaRelay>();
+  private readonly warmInboundIce = new Map<string, WarmInboundIce>();
   private readonly contentRateLimiter = new ContentReadRateLimiter();
   private lastSeenAttemptAt: number | undefined;
 
@@ -47,6 +72,8 @@ export class EdgeRoom extends DurableObject<Env> {
     if (url.pathname === "/connect") return this.acceptConnection(request);
     if (url.pathname === "/presence" && request.method === "GET") return this.presence();
     if (url.pathname === "/command" && request.method === "POST") return this.sendCommand(request);
+    if (url.pathname === "/inbound-media-relay" && request.method === "POST") return this.relayInboundMedia(request);
+    if (url.pathname === "/inbound-ice" && request.method === "POST") return this.inboundIce(request);
     if (url.pathname === "/preconnect-cleanup" && request.method === "POST") {
       await this.alarm();
       return Response.json({ ok: true });
@@ -172,6 +199,68 @@ export class EdgeRoom extends DurableObject<Env> {
     });
   }
 
+  private async relayInboundMedia(request: Request): Promise<Response> {
+    const text = await request.text();
+    if (serializedByteLength(text) > CONTENT_WIRE_LIMIT_BYTES) return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
+    let parsed: unknown;
+    try { parsed = JSON.parse(text); } catch { return Response.json({ error: "INVALID_REQUEST" }, { status: 400 }); }
+    const command = inboundMediaCommandSchema.safeParse(parsed);
+    if (!command.success || this.pendingMediaRelays.has(command.data.commandId)) {
+      return Response.json({ error: "INVALID_REQUEST" }, { status: 400 });
+    }
+    if (this.pendingMediaRelays.size >= 4) return Response.json({ error: "BUSY" }, { status: 429 });
+    const socket = this.currentConnection();
+    if (!socket) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
+    return new Promise<Response>(resolve => {
+      const { commandId, offerId, callId, claimId, direct } = command.data;
+      const maxMs = command.data.type === "inbound.claim" ? INBOUND_CLAIM_RESERVE_MAX_MS : INBOUND_MEDIA_RELAY_MAX_MS;
+      const timeout = setTimeout(() => {
+        this.pendingMediaRelays.delete(commandId);
+        resolve(Response.json({ error: "TIMEOUT" }, { status: 504 }));
+      }, maxMs);
+      this.pendingMediaRelays.set(commandId, { offerId, callId, claimId, expectsSdp: direct !== undefined && "sdpOffer" in direct,
+        socket, deadline: Date.now() + maxMs, timeout, resolve });
+      try { socket.send(text); }
+      catch {
+        clearTimeout(timeout);
+        this.pendingMediaRelays.delete(commandId);
+        resolve(Response.json({ error: "EDGE_OFFLINE" }, { status: 503 }));
+      }
+    });
+  }
+
+  private async inboundIce(request: Request): Promise<Response> {
+    const input = inboundIceRequestSchema.safeParse(await request.json().catch(() => null));
+    // A winner may finish gathering after the ringing deadline. This bounded
+    // retention is independent of Edge's shorter media lease and cannot extend it.
+    if (!input.success || input.data.expiresAt + (input.data.mode === "get" ? 60_000 : 0) <= Date.now()
+      || input.data.expiresAt > Date.now() + 60_000) {
+      return Response.json({ error: "OFFER_UNAVAILABLE" }, { status: 409 });
+    }
+    const { offerId, generation, nonce, expiresAt, mode } = input.data;
+    for (const [id, cached] of this.warmInboundIce) if (cached.expiresAt + 60_000 <= Date.now()) this.warmInboundIce.delete(id);
+    let cached = this.warmInboundIce.get(offerId);
+    if (cached && (cached.invalidated || cached.generation !== generation || cached.nonce !== nonce || cached.expiresAt !== expiresAt)) {
+      return Response.json({ error: "OFFER_UNAVAILABLE" }, { status: 409 });
+    }
+    if (!cached) {
+      if (this.warmInboundIce.size >= 8) return Response.json({ error: "BUSY" }, { status: 429 });
+      const pending = issueIceServers(this.env);
+      cached = { generation, nonce, expiresAt, pending, invalidated: false };
+      this.warmInboundIce.set(offerId, cached);
+      this.ctx.waitUntil(pending.catch(() => {
+        const current = this.warmInboundIce.get(offerId);
+        if (current?.pending === pending && !current.invalidated) this.warmInboundIce.delete(offerId);
+      }));
+    }
+    if (mode === "warm") return Response.json({ accepted: true }, { status: 202 });
+    try {
+      const credentials = await cached.pending;
+      if (cached.invalidated) return Response.json({ error: "OFFER_UNAVAILABLE" }, { status: 409 });
+      return Response.json(credentials);
+    } catch { return Response.json({ error: "TURN_UNAVAILABLE" }, { status: 503 }); }
+  }
+
   override async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
     if (typeof message !== "string") {
       this.failRelaysForSocket(ws, "EDGE_OFFLINE", 503);
@@ -201,6 +290,10 @@ export class EdgeRoom extends DurableObject<Env> {
     }
     const attachment = ws.deserializeAttachment() as SocketAttachment;
     if (this.currentConnection() !== ws) return;
+    if (result.data.type === "inbound.answer") {
+      this.acceptMediaAnswer(ws, result.data);
+      return;
+    }
     const now = Date.now();
     if (result.data.type === "device.notify") {
       // Identity comes only from the authenticated connection, never the payload.
@@ -223,7 +316,8 @@ export class EdgeRoom extends DurableObject<Env> {
         modemOnline: result.data.status.modemOnline,
         lineBusy: result.data.status.lineBusy,
         version: result.data.status.version,
-        inboundPreconnectV1: result.data.status.inboundPreconnectV1 === true
+        inboundPreconnectV1: result.data.status.inboundPreconnectV1 === true,
+        inboundFastpathV2: result.data.status.inboundFastpathV2 === true
       };
       await Promise.all([
         this.ctx.storage.put("presence", presence),
@@ -232,12 +326,14 @@ export class EdgeRoom extends DurableObject<Env> {
       return;
     }
     if (result.data.type === "command.ack") {
+      // Direct SDP is complete only after a correlated inbound.answer.
+      if (this.pendingMediaRelays.has(result.data.commandId)) return;
       const errorCode = result.data.status === "rejected" ? (result.data.errorCode ?? null) : null;
       if (result.data.offerId) {
         // Ack for an inbound takeover claim command (#95).
         const offerStatus = result.data.status === "accepted" ? "edge_ready" : "failed";
         await this.env.DB.prepare(
-          "UPDATE inbound_offers SET status = ?1, error_code = ?2, updated_at = ?3 WHERE offer_id = ?4 AND edge_id = ?5 AND status = 'claimed'"
+          "UPDATE inbound_offers SET status = ?1, error_code = ?2, updated_at = ?3 WHERE offer_id = ?4 AND edge_id = ?5 AND status = 'claimed' AND (media_transport IS NULL OR media_transport IN ('direct_eligible', 'livekit'))"
         ).bind(offerStatus, errorCode, now, result.data.offerId, attachment.edgeId).run();
         if (offerStatus === "failed") this.ctx.waitUntil(this.alarm());
         return;
@@ -253,18 +349,36 @@ export class EdgeRoom extends DurableObject<Env> {
       // ignored rather than resurrecting a consumed offer.
       const callUUID = crypto.randomUUID();
       const presence = await this.ctx.storage.get<EdgePresence>("presence");
-      const preconnect = this.env.INBOUND_PRECONNECT_ENABLED === "true"
+      const preconnect = this.env.INBOUND_FASTPATH_V2_ENABLED !== "true" && this.env.INBOUND_PRECONNECT_ENABLED === "true"
         && presence?.inboundPreconnectV1 === true && result.data.mode === "phone_first";
+      const direct = this.env.INBOUND_FASTPATH_V2_ENABLED === "true"
+        && presence?.inboundFastpathV2 === true && result.data.mode === "phone_first";
       const roomName = randomId("callpilot");
       const edgeIdentity = randomId("edgepart", 12);
       const inserted = await this.env.DB.prepare(
-        "INSERT OR IGNORE INTO inbound_offers(offer_id, edge_id, call_id, generation, nonce, status, created_at, expires_at, updated_at, call_uuid, room_name, edge_identity, preconnect_enabled, preconnect_room) VALUES (?1, ?2, ?3, ?4, ?5, 'offered', ?6, ?7, ?6, ?8, ?9, ?10, ?11, ?12)"
+        "INSERT OR IGNORE INTO inbound_offers(offer_id, edge_id, call_id, generation, nonce, status, created_at, expires_at, updated_at, call_uuid, room_name, edge_identity, preconnect_enabled, preconnect_room, media_transport) VALUES (?1, ?2, ?3, ?4, ?5, 'offered', ?6, ?7, ?6, ?8, ?9, ?10, ?11, ?12, ?13)"
       ).bind(
         result.data.offerId, attachment.edgeId, result.data.callId,
         result.data.generation, result.data.nonce, now, result.data.expiresAtUnixMs,
-        callUUID, roomName, edgeIdentity, preconnect ? 1 : 0, preconnect ? roomName : null
+        callUUID, roomName, edgeIdentity, preconnect ? 1 : 0, preconnect ? roomName : null, direct ? "direct_eligible" : null
       ).run();
       if (inserted.meta.changes) {
+        if (direct) {
+          const offer = result.data;
+          this.ctx.waitUntil((async () => {
+            const response = await this.inboundIce(new Request("https://edge-room/inbound-ice", {
+              method: "POST", body: JSON.stringify({ offerId: offer.offerId, generation: offer.generation,
+                nonce: offer.nonce, expiresAt: offer.expiresAtUnixMs, mode: "get" })
+            }));
+            const cached = this.warmInboundIce.get(offer.offerId);
+            if (!response.ok || !cached || cached.invalidated || offer.expiresAtUnixMs <= Date.now()
+              || this.currentConnection() !== ws) return;
+            const credentials = await response.json() as IceCredentials;
+            ws.send(JSON.stringify({ v: 1, type: "inbound.prepare", commandId: randomId("command"),
+              offerId: offer.offerId, callId: offer.callId, generation: offer.generation, nonce: offer.nonce,
+              expiresAtUnixMs: offer.expiresAtUnixMs, mode: "phone_first", direct: { iceServers: credentials.iceServers } }));
+          })().catch(() => { console.warn("Inbound direct warming unavailable"); }));
+        }
         this.ctx.waitUntil(dispatchInboundOfferPushes(this.env, {
           edgeId: attachment.edgeId,
           offerId: result.data.offerId,
@@ -292,6 +406,8 @@ export class EdgeRoom extends DurableObject<Env> {
       return;
     }
     if (result.data.type === "inbound.offer.revoke") {
+      const cached = this.warmInboundIce.get(result.data.offerId);
+      if (cached) cached.invalidated = true;
       await this.env.DB.prepare(
         "UPDATE inbound_offers SET status = 'revoked', error_code = ?1, updated_at = ?2 WHERE offer_id = ?3 AND edge_id = ?4 AND status IN ('offered', 'claimed', 'edge_ready')"
       ).bind(result.data.reason, now, result.data.offerId, attachment.edgeId).run();
@@ -379,11 +495,27 @@ export class EdgeRoom extends DurableObject<Env> {
   }
 
   private failRelaysForSocket(ws: WebSocket, code: string, status: number): void {
+    for (const [commandId, pending] of this.pendingMediaRelays) {
+      if (pending.socket !== ws) continue;
+      clearTimeout(pending.timeout);
+      this.pendingMediaRelays.delete(commandId);
+      pending.resolve(Response.json({ error: code }, { status }));
+    }
     for (const [requestId, pending] of this.pendingRelays) {
       if (pending.socket !== ws) continue;
       clearTimeout(pending.timeout);
       this.pendingRelays.delete(requestId);
       pending.resolve(Response.json({ error: code }, { status }));
     }
+  }
+
+  private acceptMediaAnswer(ws: WebSocket, answer: z.infer<typeof inboundAnswerSchema>): void {
+    const pending = this.pendingMediaRelays.get(answer.commandId);
+    if (!pending || pending.socket !== ws || pending.deadline <= Date.now()
+        || pending.offerId !== answer.offerId || pending.callId !== answer.callId || pending.claimId !== answer.claimId
+        || (answer.status === "accepted" && pending.expectsSdp && !answer.sdpAnswer)) return;
+    clearTimeout(pending.timeout);
+    this.pendingMediaRelays.delete(answer.commandId);
+    pending.resolve(Response.json(answer, { status: answer.status === "accepted" ? 200 : 409 }));
   }
 }

@@ -57,6 +57,13 @@ for _livekit_package in ("livekit.rtc", "livekit.api"):
 datas += copy_metadata("livekit")
 datas += copy_metadata("livekit-api")
 
+# Direct WebRTC includes native codec and SRTP libraries not found by import scanning.
+for _direct_package in ("aiortc", "av", "pylibsrtp"):
+    _rtc_datas, _rtc_binaries, _rtc_hidden = collect_all(_direct_package)
+    datas += _rtc_datas
+    binaries += _rtc_binaries
+    hiddenimports += _rtc_hidden
+
 # Hosted control-plane credentials use platform-native Keychain/Credential Manager.
 # keyring discovers its backend dynamically, so collect the package explicitly.
 _keyring_datas, _keyring_binaries, _keyring_hidden = collect_all("keyring")

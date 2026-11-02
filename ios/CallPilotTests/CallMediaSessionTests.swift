@@ -3,7 +3,523 @@ import XCTest
 @testable import CallPilot
 
 @MainActor
+private final class FakeDirectTransport: CallDirectMediaTransport {
+    var eventHandler: ((CallMediaTransportEvent) async -> Void)?
+    var prepares = 0
+    var activations = 0
+    var microphones = 0
+    var audioStopped = false
+    var failure = false
+    var prepareGate: ManualGate?
+    var connectGate: ManualGate?
+    var disconnectGate: ManualGate?
+    func prepareDirect(servers: [CallIceServer]) async throws -> String {
+        prepares += 1
+        await prepareGate?.wait()
+        return "v=0\r\noffer"
+    }
+    func connectDirect(answer: String) async throws {
+        await connectGate?.wait()
+        if failure { throw URLError(.cannotConnectToHost) }
+    }
+    func activateDirectAudio() throws { activations += 1 }
+    func stopDirectAudio() { audioStopped = true }
+    func connect(url: String, token: String, enableMicrophone: Bool) async throws { XCTFail("not LiveKit") }
+    func setMicrophone(enabled: Bool) async throws { if enabled { microphones += 1 } }
+    func publishControl(_ data: Data) async throws {}
+    func disconnect() async { await disconnectGate?.wait() }
+    func setSpeakerphone(_ enabled: Bool) {}
+}
+
+@MainActor
 final class CallMediaSessionTests: XCTestCase {
+    func testV2ControlEndRetriesRelayFailureButNotOwnershipRejection() async throws {
+        for (status, code, expectedRequests) in [(503, "MEDIA_RELAY_UNAVAILABLE", 2),
+                                                (409, "OFFER_UNAVAILABLE", 1),
+                                                (401, "UNAUTHORIZED", 1)] {
+            var requests = 0
+            MediaMockURLProtocol.requestHandler = { request in
+                requests += 1
+                XCTAssertTrue(request.url?.path.hasSuffix("/media/end") == true)
+                XCTAssertEqual(try Self.directRequestFields(request)["claimId"] as? String, "claim_abcdefghijkl")
+                return Self.httpResponse(for: request, statusCode: status,
+                    json: "{\"error\":{\"code\":\"\(code)\",\"message\":\"Unavailable\"}}")
+            }
+            let client = try makeClient()
+            do {
+                try await client.endInboundClaim(offerId: "offer_abcdefghijkl", claimId: "claim_abcdefghijkl")
+                XCTFail("expected end rejection")
+            } catch let error as HostedCloudError { XCTAssertEqual(error.code, code) }
+            XCTAssertEqual(requests, expectedRequests)
+        }
+    }
+
+    func testV2HangupAfterReservationEndsClaimBeforeSDPExists() async throws {
+        let reserved = expectation(description: "claim reserved"), ended = expectation(description: "control plane end")
+        let client = try makeDirectClient(onSupplement: { XCTFail("ended claim must not submit SDP") },
+                                          onEnd: { ended.fulfill() })
+        let direct = FakeDirectTransport(), gate = ManualGate()
+        direct.prepareGate = gate
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            hangupBudget: .milliseconds(20), directTransportFactory: { direct })
+        let preparing = Task { await media.startDirectPreparation(client: client,
+            offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
+        await waitUntil { gate.didStart }
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onClaimed: { reserved.fulfill() }, onConnected: {}) }
+        await fulfillment(of: [reserved], timeout: 1)
+        _ = media.requestHangup()
+        await fulfillment(of: [ended], timeout: 1)
+        gate.open()
+        await preparing.value
+        let accepted = await answering.value
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(direct.microphones, 0)
+        await media.stop()
+    }
+
+    func testV2HangupWhileClaimInFlightEndsLateWinnerWithoutRevivingMedia() async throws {
+        let claimed = expectation(description: "claim request arrived"), ended = expectation(description: "late winner ended")
+        let reply = DispatchSemaphore(value: 0)
+        let client = try makeDirectClient(onClaim: { _ in claimed.fulfill(); reply.wait() },
+            onSupplement: { XCTFail("late winner must not negotiate media") }, onEnd: { ended.fulfill() })
+        let direct = FakeDirectTransport(), gate = ManualGate()
+        direct.prepareGate = gate
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            hangupBudget: .milliseconds(20), directTransportFactory: { direct })
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+            onClaimed: { XCTFail("hung-up answer must not fulfill") }, onConnected: {}) }
+        await fulfillment(of: [claimed], timeout: 1)
+        _ = media.requestHangup()
+        let afterHangup = states
+        reply.signal()
+        await fulfillment(of: [ended], timeout: 1)
+        gate.open()
+        let accepted = await answering.value
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(states, afterHangup)
+        XCTAssertEqual(direct.activations, 0)
+        XCTAssertEqual(direct.microphones, 0)
+        await media.stop()
+    }
+
+    func testV2LosingClaimNeverEndsAnotherWinner() async throws {
+        let claimed = expectation(description: "losing claim request"), ended = expectation(description: "must not end winner")
+        ended.isInverted = true
+        let reply = DispatchSemaphore(value: 0)
+        let client = try makeDirectClient(rejectClaim: true, onClaim: { _ in claimed.fulfill(); reply.wait() },
+                                          onEnd: { ended.fulfill() })
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            hangupBudget: .milliseconds(20), directTransportFactory: { FakeDirectTransport() })
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+                                                        usesCallKit: true, onConnected: {}) }
+        await fulfillment(of: [claimed], timeout: 1)
+        _ = media.requestHangup()
+        reply.signal()
+        let accepted = await answering.value
+        XCTAssertFalse(accepted)
+        await fulfillment(of: [ended], timeout: 0.05)
+        await media.stop()
+    }
+
+    func testV2ClaimDoesNotWaitForOldAudioDrainOrLease() async throws {
+        let claimed = expectation(description: "claim before old audio is released")
+        let client = try makeDirectClient(onClaim: { hasSDP in XCTAssertFalse(hasSDP); claimed.fulfill() })
+        let owner = CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in })
+        let oldOwner = UUID(), cleanup = ManualGate(), drain = ManualGate()
+        try await owner.acquire(oldOwner, mode: .callKit)
+        let releasing = owner.release(oldOwner) { await cleanup.wait() }
+        await waitUntil { cleanup.didStart }
+        let direct = FakeDirectTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+                                     audio: owner, directTransportFactory: { direct })
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, prepareReservedAudio: { await drain.wait() },
+            onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {}) }
+        await fulfillment(of: [claimed], timeout: 1)
+        XCTAssertEqual(owner.owner, oldOwner)
+        XCTAssertEqual(direct.prepares, 0)
+        cleanup.open()
+        drain.open()
+        await releasing.value
+        let accepted = await answering.value
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(direct.prepares, 1)
+        await media.stop()
+    }
+
+    func testV2CancelledGatherCannotSubmitLateSDPOrReactivate() async throws {
+        let reserved = expectation(description: "reserved before cancellation")
+        let client = try makeDirectClient(onSupplement: { XCTFail("cancelled gather must not submit SDP") })
+        let direct = FakeDirectTransport(), gate = ManualGate()
+        direct.prepareGate = gate
+        var states: [CallState] = []
+        let owner = CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in })
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { FakeCallMediaTransport() },
+                                     audio: owner, directTransportFactory: { direct })
+        let preparing = Task { await media.startDirectPreparation(client: client,
+            offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
+        await waitUntil { gate.didStart }
+        let handler = direct.eventHandler
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onClaimed: { reserved.fulfill() }, onConnected: {}) }
+        await fulfillment(of: [reserved], timeout: 1)
+        await media.stop()
+        let before = states
+        XCTAssertNil(owner.owner)
+        gate.open()
+        await preparing.value
+        let accepted = await answering.value
+        XCTAssertFalse(accepted)
+        await handler?(.data(Data(#"{"type":"status","status":"connected"}"#.utf8), topic: CallPilotTopic.status))
+        XCTAssertEqual(states, before)
+        XCTAssertEqual(direct.microphones, 0)
+        XCTAssertTrue(direct.audioStopped)
+    }
+
+    func testV2TURNFailureAfterReservationFallsBackWithinSameClaim() async throws {
+        let fallback = expectation(description: "same claim fallback after TURN failure")
+        let client = try makeDirectClient(iceUnavailable: true, onFallback: { fallback.fulfill() },
+                                          onSupplement: { XCTFail("no SDP exists") })
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }), directTransportFactory: { direct })
+        let accepted = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {})
+        XCTAssertTrue(accepted)
+        await fulfillment(of: [fallback], timeout: 1)
+        XCTAssertEqual(direct.prepares, 0)
+        XCTAssertEqual(livekit.connectedTokens, ["fallback-token"])
+        await media.stop()
+    }
+
+    func testV2FallbackRetriesOnlyExplicitRelayFailureOnce() async throws {
+        for (status, code, expectedRequests) in [(504, "MEDIA_RELAY_TIMEOUT", 2),
+                                                (503, "MEDIA_RELAY_UNAVAILABLE", 2),
+                                                (409, "OFFER_UNAVAILABLE", 1),
+                                                (401, "UNAUTHORIZED", 1)] {
+            var requests = 0
+            MediaMockURLProtocol.requestHandler = { request in
+                requests += 1
+                XCTAssertTrue(request.url?.path.hasSuffix("/media/livekit") == true)
+                return Self.httpResponse(for: request, statusCode: status,
+                    json: "{\"error\":{\"code\":\"\(code)\",\"message\":\"Unavailable\"}}")
+            }
+            let client = try makeClient()
+            do {
+                _ = try await client.fallbackInboundLiveKit(offerId: "offer_abcdefghijkl", claimId: "claim_abcdefghijkl")
+                XCTFail("expected relay rejection")
+            } catch let error as HostedCloudError { XCTAssertEqual(error.code, code) }
+            XCTAssertEqual(requests, expectedRequests)
+        }
+    }
+
+    func testV2DirectDisconnectBeforeEdgeCommitUsesSameClaimFallback() async throws {
+        let fallback = expectation(description: "fallback before ownership commit")
+        let client = try makeDirectClient(onFallback: { fallback.fulfill() })
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct })
+        let accepted = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onClaimed: { try media.prepareCallKitAnswer(); try media.activateCallKitAudio() },
+            onConnected: {})
+        XCTAssertTrue(accepted)
+        await waitUntil { direct.microphones == 1 }
+        await direct.eventHandler?(.disconnected(reason: "ICE failed after connect"))
+        await fulfillment(of: [fallback], timeout: 1)
+        await waitUntil { livekit.connectedTokens == ["fallback-token"] }
+        XCTAssertFalse(states.contains { $0.isTerminal })
+        XCTAssertTrue(direct.audioStopped)
+        await media.stop()
+    }
+
+    func testV2DirectDisconnectAfterEdgeCommitDoesNotReplaceMedia() async throws {
+        let client = try makeDirectClient(onFallback: { XCTFail("committed calls must not renegotiate ownership") })
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct })
+        let accepted = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onConnected: {})
+        XCTAssertTrue(accepted)
+        await direct.eventHandler?(.data(Data(#"{"type":"status","status":"connected"}"#.utf8),
+                                           topic: CallPilotTopic.status))
+        await direct.eventHandler?(.disconnected(reason: "ICE failed after commit"))
+        XCTAssertTrue(states.last?.isTerminal == true)
+        XCTAssertTrue(livekit.connectedTokens.isEmpty)
+        await media.stop()
+    }
+
+    func testV2ICEAcceptsSixteenServersAndSecureSTUN() async throws {
+        MediaMockURLProtocol.requestHandler = { request in
+            let rows = Array(repeating: #"{"urls":["stuns:relay.example:5349"]}"#, count: 16).joined(separator: ",")
+            return Self.httpResponse(for: request, statusCode: 200, json: "{\"iceServers\":[\(rows)]}")
+        }
+        let client = try makeClient()
+        let servers = try await client.inboundIceServers(offerId: "offer_abcdefghijkl")
+        XCTAssertEqual(servers.count, 16)
+        XCTAssertEqual(servers.first?.urls, ["stuns:relay.example:5349"])
+    }
+
+    func testV2AnswerReusesInFlightGatherWithoutAnotherPeer() async throws {
+        let claimed = expectation(description: "claim arrives while gather is held")
+        let fulfilled = expectation(description: "CallKit claim completion does not wait for gather")
+        let client = try makeDirectClient(onClaim: { hasSDP in XCTAssertFalse(hasSDP); claimed.fulfill() })
+        let direct = FakeDirectTransport(), gate = ManualGate()
+        direct.prepareGate = gate
+        var peers = 0
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { peers += 1; return direct })
+        let preparing = Task { await media.startDirectPreparation(client: client,
+            offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
+        await waitUntil { gate.didStart }
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onClaimed: { try media.prepareCallKitAnswer(); fulfilled.fulfill() }, onConnected: {}) }
+        await fulfillment(of: [claimed, fulfilled], timeout: 1)
+        gate.open()
+        await preparing.value
+        let accepted = await answering.value
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(peers, 1)
+        XCTAssertEqual(direct.prepares, 1)
+        await media.stop()
+    }
+
+    func testV2AcceptedClaimWithoutAnswerCallsFallbackInsteadOfReclaiming() async throws {
+        let fallback = expectation(description: "fallback after accepted relay failure")
+        let client = try makeDirectClient(includeAnswer: false, onFallback: { fallback.fulfill() })
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct })
+        let accepted = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onConnected: {})
+        XCTAssertTrue(accepted)
+        await fulfillment(of: [fallback], timeout: 1)
+        XCTAssertTrue(direct.audioStopped)
+        XCTAssertEqual(livekit.connectedTokens, ["fallback-token"])
+        await media.stop()
+    }
+
+    func testV2DirectActivationBeforeAndAfterAnswer() async throws {
+        for activateEarly in [false, true] {
+            let client = try makeDirectClient(onClaim: { XCTAssertTrue($0) },
+                                              onSupplement: { XCTFail("ready SDP belongs in the only claim HTTP") })
+            let direct = FakeDirectTransport()
+            let livekit = FakeCallMediaTransport()
+            let device = TestCallAudioDevice()
+            let media = CallMediaSession(onState: { _ in }, transportFactory: { livekit },
+                audio: CallAudioOwner(device: device, onCleanupError: { _ in }), directTransportFactory: { direct })
+            await media.startDirectPreparation(client: client, offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999))
+            XCTAssertEqual(direct.prepares, 1)
+            XCTAssertEqual(direct.activations, 0)
+            XCTAssertEqual(direct.microphones, 0)
+            if activateEarly { try media.activateCallKitAudio() }
+            let accepted = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+                onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {})
+            XCTAssertTrue(accepted)
+            if !activateEarly { try media.activateCallKitAudio() }
+            await waitUntil { direct.microphones == 1 }
+            XCTAssertEqual(direct.activations, 1)
+            XCTAssertEqual(direct.prepares, 1)
+            XCTAssertEqual(device.activateCount, 0, "Direct must not start LiveKit's ADM")
+            XCTAssertFalse(livekit.operations.contains(.connect))
+            await media.stop()
+        }
+    }
+
+    func testV2FailedICEFallsBackOnceWithoutReclaiming() async throws {
+        let fallback = expectation(description: "fallback route")
+        let client = try makeDirectClient(onFallback: { fallback.fulfill() })
+        let direct = FakeDirectTransport()
+        direct.failure = true
+        let livekit = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }), directTransportFactory: { direct })
+        await media.startDirectPreparation(client: client, offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999))
+        let accepted = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+            onClaimed: { try media.prepareCallKitAnswer(); try media.activateCallKitAudio() }, onConnected: {})
+        XCTAssertTrue(accepted)
+        await fulfillment(of: [fallback], timeout: 1)
+        XCTAssertTrue(direct.audioStopped)
+        XCTAssertEqual(livekit.connectedTokens, ["fallback-token"])
+        await media.stop()
+    }
+
+    func testV2WatchdogDoesNotWaitForUncooperativeDisconnectOrLateConnect() async throws {
+        let client = try makeDirectClient()
+        let direct = FakeDirectTransport()
+        let connectionGate = ManualGate(), teardownGate = ManualGate()
+        direct.connectGate = connectionGate
+        direct.disconnectGate = teardownGate
+        let livekit = FakeCallMediaTransport()
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct }, directSetupMax: .milliseconds(30))
+        await media.startDirectPreparation(client: client, offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999))
+        let oldHandler = direct.eventHandler
+        let accepted = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true,
+            onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {})
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(livekit.connectedTokens, ["fallback-token"])
+        XCTAssertTrue(direct.audioStopped)
+        let before = states
+        await oldHandler?(.disconnected(reason: "late"))
+        await oldHandler?(.data(Data(#"{"type":"status","status":"connected"}"#.utf8), topic: CallPilotTopic.status))
+        XCTAssertEqual(states, before)
+        connectionGate.open()
+        teardownGate.open()
+        await media.stop()
+    }
+
+    func testV2StopReleasesLeaseEvenWhenDirectSDKIgnoresCancellation() async throws {
+        let client = try makeDirectClient()
+        let direct = FakeDirectTransport()
+        let gate = ManualGate(), teardown = ManualGate()
+        direct.connectGate = gate
+        direct.disconnectGate = teardown
+        let owner = CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in })
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+                                     audio: owner, directTransportFactory: { direct })
+        await media.startDirectPreparation(client: client, offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999))
+        let answering = Task { await media.startTakeover(client: client,
+            offerId: "offer_abcdefghijkl", usesCallKit: true, onConnected: {}) }
+        await waitUntil { gate.didStart }
+        await media.stop()
+        XCTAssertTrue(direct.audioStopped)
+        XCTAssertNil(owner.owner)
+        gate.open()
+        teardown.open()
+        let accepted = await answering.value
+        XCTAssertFalse(accepted)
+    }
+
+    func testV2TURNUnavailableUsesLegacyClaimWithoutSDP() async throws {
+        let claimed = expectation(description: "legacy claim")
+        MediaMockURLProtocol.requestHandler = { request in
+            if request.url?.path.hasSuffix("/ice") == true {
+                return Self.httpResponse(for: request, statusCode: 503,
+                    json: #"{"error":{"code":"TURN_UNAVAILABLE","message":"Unavailable"}}"#)
+            }
+            XCTAssertEqual(request.url?.path, "/v1/inbound-offers/claim")
+            claimed.fulfill()
+            return Self.httpResponse(for: request, statusCode: 202,
+                json: #"{"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl","url":"wss://lk.example.com","token":"legacy-token","expiresAt":9999}"#)
+        }
+        let client = try makeClient()
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }), directTransportFactory: { direct })
+        await media.startDirectPreparation(client: client, offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999))
+        let accepted = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true, onConnected: {})
+        XCTAssertTrue(accepted)
+        await fulfillment(of: [claimed], timeout: 1)
+        XCTAssertEqual(direct.prepares, 0)
+        XCTAssertEqual(livekit.connectedTokens, ["legacy-token"])
+        await media.stop()
+    }
+
+    func testV2RejectedICEOfferDoesNotReclaimOrFallback() async throws {
+        MediaMockURLProtocol.requestHandler = { request in
+            XCTAssertTrue(request.url?.path.hasSuffix("/ice") == true)
+            return Self.httpResponse(for: request, statusCode: 409,
+                json: #"{"error":{"code":"OFFER_UNAVAILABLE","message":"Ended"}}"#)
+        }
+        let client = try makeClient()
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }), directTransportFactory: { direct })
+        await media.startDirectPreparation(client: client, offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999))
+        let accepted = await media.startTakeover(client: client, offerId: "offer_abcdefghijkl", usesCallKit: true, onConnected: {})
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(direct.prepares, 0)
+        XCTAssertFalse(livekit.operations.contains(.connect))
+        await media.stop()
+    }
+
+    private func makeDirectClient(includeAnswer: Bool = true, iceUnavailable: Bool = false, rejectClaim: Bool = false,
+                                  onFallback: (() -> Void)? = nil, onClaim: ((Bool) -> Void)? = nil,
+                                  onSupplement: (() -> Void)? = nil, onEnd: (() -> Void)? = nil) throws -> HostedCloudClient {
+        var claims = 0
+        var supplements = 0
+        MediaMockURLProtocol.requestHandler = { request in
+            let path = request.url?.path ?? ""
+            if path.hasSuffix("/ice") {
+                if iceUnavailable {
+                    return Self.httpResponse(for: request, statusCode: 503,
+                        json: #"{"error":{"code":"TURN_UNAVAILABLE","message":"Unavailable"}}"#)
+                }
+                return Self.httpResponse(for: request, statusCode: 200,
+                    json: #"{"iceServers":[{"urls":["turn:relay.example:3478"],"username":"test","credential":"test"}],"expiresAt":9999}"#)
+            }
+            if path.hasSuffix("/media/livekit") {
+                onFallback?()
+                return Self.httpResponse(for: request, statusCode: 202,
+                    json: #"{"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl","url":"wss://lk.example.com","token":"fallback-token","expiresAt":9999}"#)
+            }
+            let body = try Self.directRequestFields(request)
+            if path.hasSuffix("/media/end") {
+                XCTAssertEqual(body["claimId"] as? String, "claim_abcdefghijkl")
+                onEnd?()
+                return Self.httpResponse(for: request, statusCode: 202,
+                    json: #"{"accepted":true,"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl"}"#)
+            }
+            if path.hasSuffix("/media/sdp") {
+                onSupplement?()
+                supplements += 1
+                XCTAssertEqual(supplements, 1)
+                XCTAssertEqual(body["claimId"] as? String, "claim_abcdefghijkl")
+                XCTAssertNotNil(body["sdpOffer"])
+            } else {
+                XCTAssertEqual(path, "/v1/inbound-offers/claim")
+                claims += 1
+                XCTAssertEqual(claims, 1, "An accepted claim must never be retried")
+                XCTAssertEqual(body["mediaTransport"] as? String, "webrtc")
+                onClaim?(body["sdpOffer"] != nil)
+                if rejectClaim {
+                    return Self.httpResponse(for: request, statusCode: 409,
+                        json: #"{"error":{"code":"OFFER_UNAVAILABLE","message":"Another device won"}}"#)
+                }
+                if includeAnswer && body["sdpOffer"] == nil {
+                    return Self.httpResponse(for: request, statusCode: 202,
+                        json: #"{"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl","url":"wss://lk.example.com","token":"unused-token","expiresAt":9999,"directAttempted":true,"sdpPending":true,"transports":[{"kind":"livekit","url":"wss://lk.example.com","token":"unused-token"}]}"#)
+                }
+            }
+            if !includeAnswer {
+                return Self.httpResponse(for: request, statusCode: 202,
+                    json: #"{"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl","url":"wss://lk.example.com","token":"unused-token","expiresAt":9999,"directAttempted":true,"transports":[{"kind":"livekit","url":"wss://lk.example.com","token":"unused-token"}]}"#)
+            }
+            return Self.httpResponse(for: request, statusCode: 202,
+                json: #"{"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl","url":"wss://lk.example.com","token":"unused-token","expiresAt":9999,"directAttempted":true,"transports":[{"kind":"webrtc","sdpAnswer":"v=0\\r\\nanswer"},{"kind":"livekit","url":"wss://lk.example.com","token":"unused-token"}]}"#)
+        }
+        return try makeClient()
+    }
+
+    nonisolated private static func directRequestFields(_ request: URLRequest) throws -> [String: Any] {
+        var data = request.httpBody ?? Data()
+        if request.httpBody == nil, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 1024)
+            while true {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count < 0 { throw try XCTUnwrap(stream.streamError) }
+                if count == 0 { break }
+                data.append(buffer, count: count)
+            }
+        }
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
     func testColdClaimAfterEightSecondsDoesNotWaitForStuckSilentTeardown() async throws {
         try await assertDetachedSilentTeardown(stopBeforeDrain: false)
     }

@@ -19,7 +19,7 @@ export interface Preparation {
 }
 
 export async function prepareInbound(env: Env, device: DeviceRecord, offerId: string, timing = new ClaimTiming()) {
-  if (env.INBOUND_PRECONNECT_ENABLED !== "true") throw unavailable();
+  if (env.INBOUND_FASTPATH_V2_ENABLED === "true" || env.INBOUND_PRECONNECT_ENABLED !== "true") throw unavailable();
   // Presence and the fenced DB transaction are independent. A capability failure
   // may leave a restricted candidate row, but never issues a token; the alarm
   // retires that row when the offer ends. The batch reads its own insert.

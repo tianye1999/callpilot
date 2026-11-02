@@ -55,3 +55,6 @@ ios/Pods/
 
 # 浏览器自动化截图等临时产物（曾有截图带真实号码误提交）
 output/
+
+# 本机验证日志（codex / 测试运行产物）
+cloud/.validation/

@@ -4,6 +4,38 @@ import XCTest
 
 @MainActor
 final class CallTimingTests: XCTestCase {
+    func testCloudDurationsRemainDurationsAcrossClientOriginChanges() throws {
+        var now: TimeInterval = 100
+        let timing = CallTiming(now: { now })
+        timing.recordCloudDurations("cas;dur=12.5, edge_reserve;dur=90, turn;dur=250, sdp_relay;dur=800, claim_finalize;dur=3, total;dur=999")
+        now = 200
+        timing.startClaim()
+        let batch = try decode(XCTUnwrap(timing.nextBatch()))
+        let marks = try XCTUnwrap(batch["marks"] as? [String: Double])
+        XCTAssertEqual(marks["cloud_cas_ms"], 12.5)
+        XCTAssertEqual(marks["cloud_edge_reserve_ms"], 90)
+        XCTAssertEqual(marks["cloud_turn_ms"], 250)
+        XCTAssertEqual(marks["cloud_sdp_relay_ms"], 800)
+        XCTAssertEqual(marks["cloud_claim_finalize_ms"], 3)
+        XCTAssertEqual(marks["cloud_total_ms"], 999)
+        XCTAssertEqual(marks["claim_start"], 0)
+        XCTAssertNil(timing.nextBatch())
+    }
+
+    func testCloudTimingRejectsMalformedUnknownNonfiniteAndOutOfBoundsValues() throws {
+        let timing = CallTiming(now: { 0 })
+        timing.recordCloudDurations("cas;dur=nan, turn;dur=inf, total;dur=-1, sdp_relay;dur=86400001, unknown;dur=20, claim_finalize;dur=oops")
+        XCTAssertNil(timing.nextBatch())
+        timing.recordCloudDurations("cas;dur=7;dur=8, total;dur=5, total;dur=9, turn;desc=\"ignored\";dur=20")
+        let batch = try decode(XCTUnwrap(timing.nextBatch()))
+        let marks = try XCTUnwrap(batch["marks"] as? [String: Double])
+        XCTAssertNil(marks["cloud_cas_ms"])
+        XCTAssertEqual(marks["cloud_total_ms"], 5)
+        XCTAssertEqual(marks["cloud_turn_ms"], 20)
+        timing.recordCloudDurations("total;dur=99")
+        XCTAssertNil(timing.nextBatch())
+    }
+
     func testClaimOriginPreservesEarlierAnswerAsNegativeOffset() throws {
         var now: TimeInterval = 10
         let timing = CallTiming(now: { now })

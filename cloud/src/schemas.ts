@@ -3,6 +3,33 @@ import { z } from "zod";
 import { dataResponseSchema } from "./content-sync";
 
 const opaqueId = z.string().regex(/^[a-z]+_[A-Za-z0-9_-]{12,80}$/);
+const sdp = z.string().startsWith("v=0").max(16 * 1024).refine(value => new TextEncoder().encode(value).byteLength <= 16 * 1024);
+export const iceServerSchema = z.object({
+  urls: z.array(z.string().min(1).max(512)).min(1).max(16),
+  username: z.string().max(1024).optional(), credential: z.string().max(1024).optional()
+}).strict();
+const inboundSessionSchema = z.object({
+  sessionId: opaqueId, roomName: z.string().min(1).max(128), browserIdentity: opaqueId,
+  edgeIdentity: opaqueId, livekitUrl: z.string().url(), token: z.string().min(1).max(4096)
+}).strict();
+export const inboundMediaCommandSchema = z.object({
+  v: z.literal(1), type: z.enum(["inbound.claim", "inbound.media.sdp", "inbound.media.livekit", "inbound.media.end"]),
+  commandId: opaqueId, offerId: opaqueId, callId: opaqueId, claimId: opaqueId,
+  generation: z.number().int().nonnegative(), nonce: z.string().min(16).max(128), session: inboundSessionSchema,
+  direct: z.union([z.object({ deferred: z.literal(true) }).strict(),
+    z.object({ sdpOffer: sdp, iceServers: z.array(iceServerSchema).max(16) }).strict()]).optional()
+}).strict().refine(value => value.type === "inbound.claim" ? value.direct !== undefined && "deferred" in value.direct
+  : value.type === "inbound.media.sdp" ? value.direct !== undefined && "sdpOffer" in value.direct : value.direct === undefined);
+export const inboundAnswerSchema = z.object({
+  v: z.literal(1), type: z.literal("inbound.answer"), commandId: opaqueId,
+  offerId: opaqueId, callId: opaqueId, claimId: opaqueId,
+  status: z.enum(["accepted", "rejected"]), sdpAnswer: sdp.optional(),
+  errorCode: z.string().regex(/^[A-Z][A-Z0-9_]{2,63}$/).optional()
+}).strict();
+export const inboundIceRequestSchema = z.object({
+  offerId: opaqueId, generation: z.number().int().nonnegative(), nonce: z.string().min(16).max(128),
+  expiresAt: z.number().int().positive(), mode: z.enum(["warm", "get"])
+}).strict();
 
 export const createEnrollmentInviteSchema = z.object({
   ttlSeconds: z.number().int().min(60).max(86400).default(3600)
@@ -44,6 +71,7 @@ export const edgeMessageSchema = z.union([
       modemOnline: z.boolean(),
       lineBusy: z.boolean(),
       inboundPreconnectV1: z.boolean().optional(),
+      inboundFastpathV2: z.boolean().optional(),
       version: z.string().max(64).optional()
     }).strict()
   }).strict(),
@@ -84,13 +112,19 @@ export const edgeMessageSchema = z.union([
     callId: opaqueId,
     reason: z.string().regex(/^[A-Z][A-Z0-9_]{2,63}$/)
   }).strict(),
-  dataResponseSchema
+  dataResponseSchema,
+  inboundAnswerSchema
 ]);
 
 export const claimInboundOfferSchema = z.object({
   offerId: opaqueId,
-  prepareId: opaqueId.optional()
+  prepareId: opaqueId.optional(),
+  mediaTransport: z.literal("webrtc").optional(),
+  sdpOffer: sdp.optional()
 }).strict();
+
+export const inboundFallbackSchema = z.object({ claimId: opaqueId }).strict();
+export const inboundSdpSchema = z.object({ claimId: opaqueId, sdpOffer: sdp }).strict();
 
 export const prepareInboundOfferSchema = z.object({ offerId: opaqueId }).strict();
 

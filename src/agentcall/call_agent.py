@@ -47,6 +47,7 @@ from .dtmf import dtmf_tone
 from .dtmf_followup import extract_spoken_dtmf
 from .dtmf_judge import DtmfActionLedger, DtmfJudge, WindowMode
 from .events import EventHub
+from .inbound_direct import DIRECT_MEDIA_LEASE_SECONDS, InboundDirectRequest, Reply, SwitchableInboundEndpoint
 from .inbound_preconnect import InboundPreconnect
 from .modem import IncomingReservation, SerialModem, Sim7600Modem, create_modem
 from .monitor_playback import MonitorPlayback
@@ -259,6 +260,8 @@ class CallSession:
         self._phone_first_early_answer = False
         self._phone_first_pcm_enable_info: dict | None = None
         self._phone_first_closers: list[asyncio.Task[None]] = []
+        self._inbound_direct_request: InboundDirectRequest | None = None
+        self._inbound_direct_ice: tuple[str, list[dict[str, Any]]] | None = None
         self.current_caller: str | None = None
         self.call_started_at: float | None = None
         self._outbound_number: str | None = None
@@ -499,6 +502,8 @@ class CallSession:
         self._phone_first_claimed_at = None
         self._phone_first_offer_id = None
         self._phone_first_closers = []
+        self._inbound_direct_request = None
+        self._inbound_direct_ice = None
         if phone_first_seconds is not None:
             self._phone_first_deadline = self._phone_first_clock() + phone_first_seconds
             self._phone_first_lease = self.modem.reserve_incoming()
@@ -2037,10 +2042,18 @@ class CallSession:
             await preconnect.close()
             if not preconnect.reported:
                 preconnect.timing.bind(record)
+            if (config.get_bool("INBOUND_FASTPATH_V2_ENABLED") and record is not None
+                    and self._mobile_timing is not None):
+                direct = self._inbound_direct_request
+                record.log_event("inbound_timing_summary", version=2,
+                                 claim_id=direct.claim_id if direct is not None else None,
+                                 **self._mobile_timing.summary())
             with self._takeover_lock:
                 self._takeover_prepare = None
+                self._inbound_direct_ice = None
 
     async def _handle_phone_first_preconnect(self, record: CallRecord | None, preconnect: InboundPreconnect) -> str:
+        fastpath_v2 = config.get_bool("INBOUND_FASTPATH_V2_ENABLED")
         lease = self._phone_first_lease
         coordinator = self._takeover_coordinator
         assert lease is not None and coordinator is not None
@@ -2077,7 +2090,7 @@ class CallSession:
             record.log_event("phone_first_ringing", generation=generation)
         claimed: InboundTakeoverSession | None = None
         while current():
-            if preconnect.task is not None and not config.get_bool("INBOUND_PRECONNECT_ENABLED"):
+            if preconnect.task is not None and (fastpath_v2 or not config.get_bool("INBOUND_PRECONNECT_ENABLED")):
                 await preconnect.close()
             # A claim and the timeout compete under the same lock. Once claimed,
             # its independent media budget cannot be reset by repeats.
@@ -2085,7 +2098,7 @@ class CallSession:
                 prepared = self._takeover_prepare
                 if (prepared is not None and prepared[0] == request.offer_id
                         and self._takeover_endpoint_factory is not None
-                        and config.get_bool("INBOUND_PRECONNECT_ENABLED")):
+                        and not fastpath_v2 and config.get_bool("INBOUND_PRECONNECT_ENABLED")):
                     preconnect.start(prepared[1], self._takeover_endpoint_factory)
                 if not self._phone_first_cloud_ready():
                     self._phone_first_fallback("ENDPOINT_UNAVAILABLE", generation)
@@ -2099,6 +2112,8 @@ class CallSession:
             await self._phone_first_sleep(0.05)
         if claimed is None or not current():
             return "not_connected"
+
+        fastpath_v2 = fastpath_v2 and claimed.issued.direct is not None
 
         timing = self._mobile_observations(record)
 
@@ -2120,6 +2135,17 @@ class CallSession:
             return (self.is_active and generation == self._session_generation
                     and self._phone_first_lease is lease and lease.valid
                     and self._phone_first_guard())
+
+        def connected_silence_expired() -> bool:
+            if (pcm_ready_at is None
+                    or self._phone_first_clock() < pcm_ready_at + _EARLY_ANSWER_CONNECTED_WAIT_SECONDS):
+                return False
+            if not fastpath_v2:
+                return True
+            assert claimed.issued.direct is not None
+            # An accepted SDP or fallback exempts only this initial silence cap,
+            # never the total media lease. The state fence also rejects late SDP.
+            return claimed.issued.direct.expire_initial_sdp_wait()
 
         def log_connected_wait() -> None:
             nonlocal connected_wait_logged
@@ -2186,7 +2212,7 @@ class CallSession:
 
             async def connect_claim() -> None:
                 nonlocal endpoint
-                endpoint = await preconnect.adopt(claimed.issued, timing)
+                endpoint = await preconnect.adopt(claimed.issued, timing, retain_inflight=fastpath_v2)
                 if endpoint is None:
                     endpoint = factory(claimed.issued)
                     attach_endpoint_timing(endpoint, timing)
@@ -2212,18 +2238,24 @@ class CallSession:
                     while await self._threaded_modem_call(bridge.read_modem_chunk):
                         if self._phone_first_clock() >= drain_deadline:
                             break
-                if (self._phone_first_clock() >= deadline or (
-                    pcm_ready_at is not None
-                    and self._phone_first_clock() >= pcm_ready_at + _EARLY_ANSWER_CONNECTED_WAIT_SECONDS
-                )):
+                if self._phone_first_clock() >= deadline or connected_silence_expired():
                     raise RuntimeError("media_prepare_timeout")
                 if connecting.done():
                     connecting.result()
                     assert endpoint is not None
+                    if isinstance(endpoint, SwitchableInboundEndpoint) and endpoint.failed:
+                        raise RuntimeError("livekit_fallback_failed")
+                    if fastpath_v2:
+                        pending_control = await endpoint.next_command(timeout=0.001)
+                        if pending_control is not None and pending_control.get("type") == "hangup":
+                            await timing.acknowledge_hangup(pending_control, endpoint.send_event)
+                            raise RuntimeError("owner_cancelled")
                     timing.mark("endpoint_connect_return")
                     if early_answer and endpoint.media_ready:
                         mark_media_ready()
                     if endpoint.media_ready and (answering is None or answering.done()):
+                        if isinstance(endpoint, SwitchableInboundEndpoint) and not endpoint.seal():
+                            continue
                         break
                 await self._phone_first_sleep(0.05)
             if answering is not None and not answering.done():
@@ -2237,6 +2269,8 @@ class CallSession:
                 timing.receive_client(command)
             if command is not None and command.get("type") == "hangup":
                 timing.mark("hangup_during_prepare")
+                if fastpath_v2:
+                    await timing.acknowledge_hangup(command, endpoint.send_event)
                 if record is not None:
                     record.log_event("takeover_owner_cancelled_precommit")
                 raise RuntimeError("owner_cancelled")
@@ -2251,15 +2285,14 @@ class CallSession:
                 timing.receive_client(command)
             if command is not None and command.get("type") == "hangup":
                 timing.mark("hangup_during_prepare")
+                if fastpath_v2:
+                    await timing.acknowledge_hangup(command, endpoint.send_event)
                 if record is not None:
                     record.log_event("takeover_owner_cancelled_precommit")
                 raise RuntimeError("owner_cancelled")
             if not current() or not self._phone_first_cloud_ready() or not endpoint.media_ready:
                 raise RuntimeError("call_ended_before_commit")
-            if early_answer and (self._phone_first_clock() >= deadline or (
-                pcm_ready_at is not None
-                and self._phone_first_clock() >= pcm_ready_at + _EARLY_ANSWER_CONNECTED_WAIT_SECONDS
-            )):
+            if early_answer and (self._phone_first_clock() >= deadline or connected_silence_expired()):
                 raise RuntimeError("media_prepare_timeout")
             ready = coordinator.mark_mobile_media_ready(claimed.fence)
             if not ready.accepted or not coordinator.commit_mobile(claimed.fence).accepted:
@@ -2278,6 +2311,9 @@ class CallSession:
         except Exception as exc:
             logger.warning("Phone-first media failed: %s", type(exc).__name__)
             abandoned = True
+            if fastpath_v2 and str(exc) == "owner_cancelled":
+                coordinator.end_call("owner_hangup")
+                return "completed"
             if answering is not None:
                 # Join before current(): even that reservation check takes the
                 # serial lock. Preserve a successful PCM enable for AI fallback.
@@ -4800,6 +4836,7 @@ class CallSession:
             )
             if not result.accepted or result.idempotent:
                 return result
+            self._inbound_direct_request = claimed.issued.direct
             self._mobile_timing = CallTiming(record=self._record)
             self._mobile_timing.mark("claim_received")
             try:
@@ -4815,8 +4852,13 @@ class CallSession:
                     media_seconds = _PHONE_FIRST_MEDIA_TIMEOUT_SECONDS
                     logger.warning("Invalid INBOUND_PHONE_FIRST_MEDIA_SECONDS; using default %g seconds", media_seconds)
                 self._phone_first_claimed_at = self._phone_first_clock()
+                if claimed.issued.direct is not None:
+                    # Total allocation lease, including one LiveKit fallback, not
+                    # a warm/cold network heuristic. It is never reset by retry.
+                    media_seconds = DIRECT_MEDIA_LEASE_SECONDS
                 self._phone_first_claim_deadline = self._phone_first_claimed_at + media_seconds
-                self._phone_first_early_answer = config.get_bool("INBOUND_EARLY_ANSWER_ENABLED")
+                self._phone_first_early_answer = (claimed.issued.direct is not None
+                                                  or config.get_bool("INBOUND_EARLY_ANSWER_ENABLED"))
             return result
 
     def accept_takeover_claim(
@@ -4857,7 +4899,7 @@ class CallSession:
         return self.provide_takeover_session(claimed)
 
     def prepare_takeover(self, command: dict[str, Any]) -> bool:
-        if not config.get_bool("INBOUND_PRECONNECT_ENABLED"):
+        if config.get_bool("INBOUND_FASTPATH_V2_ENABLED") or not config.get_bool("INBOUND_PRECONNECT_ENABLED"):
             return False
         with self._takeover_lock:
             request = self._takeover_request
@@ -4877,6 +4919,67 @@ class CallSession:
                 edge_identity=session["edgeIdentity"], browser_token="", edge_token=session["token"],
                 livekit_url=session["livekitUrl"],
             ))
+            return True
+
+    def fallback_inbound_direct(self, command: dict[str, Any], issued: IssuedLiveKitSession, reply: Reply) -> bool:
+        with self._takeover_lock:
+            request = self._takeover_request
+            direct = self._inbound_direct_request
+            if (not config.get_bool("INBOUND_FASTPATH_V2_ENABLED") or request is None or direct is None
+                    or not self.is_active or self.takeover_state is not TakeoverState.WAITING_OWNER
+                    or command["offerId"] != request.offer_id or command["callId"] != request.call_id
+                    or command["generation"] != request.generation or command["nonce"] != request.nonce
+                    or command["claimId"] != direct.claim_id or request.generation != self._session_generation):
+                return False
+            return direct.fallback(issued, reply)
+
+    def prepare_inbound_direct(self, command: dict[str, Any]) -> bool:
+        with self._takeover_lock:
+            request = self._takeover_request
+            if (not config.get_bool("INBOUND_FASTPATH_V2_ENABLED") or request is None or not self.is_active
+                    or not request.phone_first or request.offer_id != command["offerId"]
+                    or request.call_id != command["callId"] or request.generation != command["generation"]
+                    or request.nonce != command["nonce"] or request.generation != self._session_generation
+                    or time.time() >= request.expires_at):
+                return False
+            self._inbound_direct_ice = (request.offer_id, command["direct"]["iceServers"])
+            return True
+
+    def supply_inbound_direct_sdp(self, command: dict[str, Any], reply: Reply) -> bool:
+        with self._takeover_lock:
+            request = self._takeover_request
+            direct = self._inbound_direct_request
+            if (not config.get_bool("INBOUND_FASTPATH_V2_ENABLED") or request is None or direct is None
+                    or not self.is_active or self.takeover_state is not TakeoverState.WAITING_OWNER
+                    or command["offerId"] != request.offer_id or command["callId"] != request.call_id
+                    or command["generation"] != request.generation or command["nonce"] != request.nonce
+                    or command["claimId"] != direct.claim_id or request.generation != self._session_generation):
+                return False
+            if (self._phone_first_claim_deadline is None
+                    or self._phone_first_clock() >= self._phone_first_claim_deadline):
+                return False
+            payload = command["direct"]
+            return direct.supply_sdp(payload["sdpOffer"], payload["iceServers"], reply)
+
+    def end_inbound_direct(self, command: dict[str, Any]) -> bool:
+        with self._takeover_lock:
+            request = self._takeover_request
+            direct = self._inbound_direct_request
+            coordinator = self._takeover_coordinator
+            if (not config.get_bool("INBOUND_FASTPATH_V2_ENABLED") or request is None or direct is None
+                    or coordinator is None or command["offerId"] != request.offer_id
+                    or command["callId"] != request.call_id or command["generation"] != request.generation
+                    or command["nonce"] != request.nonce or command["claimId"] != direct.claim_id
+                    or request.generation != self._session_generation):
+                return False
+            if coordinator.state is TakeoverState.ENDED:
+                return True
+            if not self.is_active or coordinator.state not in {
+                    TakeoverState.WAITING_OWNER, TakeoverState.MOBILE_ACTIVE, TakeoverState.MOBILE_RECONNECTING}:
+                return False
+            coordinator.end_call("owner_hangup")
+            self._set_active(False)
+            direct.close()
             return True
 
     def take_takeover_session(self) -> InboundTakeoverSession | None:
@@ -5751,6 +5854,18 @@ class CallAgentService:
     def prepare_inbound_takeover(self, command: dict[str, Any]) -> bool:
         return self.session.prepare_takeover(command)
 
+    def fallback_inbound_direct(self, command: dict[str, Any], issued: IssuedLiveKitSession, reply: Reply) -> bool:
+        return self.session.fallback_inbound_direct(command, issued, reply)
+
+    def prepare_inbound_direct(self, command: dict[str, Any]) -> bool:
+        return self.session.prepare_inbound_direct(command)
+
+    def supply_inbound_direct_sdp(self, command: dict[str, Any], reply: Reply) -> bool:
+        return self.session.supply_inbound_direct_sdp(command, reply)
+
+    def end_inbound_direct(self, command: dict[str, Any]) -> bool:
+        return self.session.end_inbound_direct(command)
+
     def cancel_remote_dialer(self) -> tuple[bool, str | None]:
         with self._remote_setup_lock:
             worker = self._remote_worker
@@ -5823,6 +5938,8 @@ class CallAgentService:
 
         from .livekit_media import LiveKitRemoteMediaEndpoint
 
+        if issued.direct is not None:
+            return SwitchableInboundEndpoint(issued.direct)
         return LiveKitRemoteMediaEndpoint(issued)
 
     def _reserve_remote_line(

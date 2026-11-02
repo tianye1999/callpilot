@@ -31,8 +31,19 @@ class InboundPreconnect:
         attach_endpoint_timing(self.endpoint, self.timing)
         await self.endpoint.preconnect()
 
-    async def adopt(self, issued: IssuedLiveKitSession, timing: CallTiming) -> Any:
+    async def adopt(self, issued: IssuedLiveKitSession, timing: CallTiming, *,
+                    retain_inflight: bool = False) -> Any:
         task, endpoint = self.task, self.endpoint
+        if (retain_inflight and task is not None and self.issued is not None
+                and issued.room_name == self.issued.room_name
+                and issued.edge_identity == self.issued.edge_identity):
+            # Ownership follows the connection, not its completion time at answer.
+            # The call's outer lease bounds setup; there is no warm/cold timer here.
+            try:
+                await asyncio.shield(task)
+            except Exception:
+                pass
+            endpoint = self.endpoint
         if (task is not None and task.done() and not task.cancelled()
                 and task.exception() is None and self.issued is not None
                 and issued.room_name == self.issued.room_name

@@ -79,7 +79,10 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         let enabled = prewarm.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
         let preconnect = features?["preconnect"] as? NSNumber
         let silent = preconnect.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
-        return HostedDeviceStatus(connected: connected, modemOnline: modemOnline, claimPrewarm: enabled, preconnect: silent)
+        let direct = features?["inboundFastpathV2"] as? NSNumber
+        let v2 = direct.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
+        return HostedDeviceStatus(connected: connected, modemOnline: modemOnline, claimPrewarm: enabled,
+                                  preconnect: silent, inboundFastpathV2: v2)
     }
 
     func prewarmClaimConnection() async {
@@ -199,12 +202,20 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
 
     /// claim 一个 offer,成功即拿到入房凭证(first-claim-wins,输家 409)。
     func claimInboundOffer(offerId: String, timing: CallTiming? = nil,
-                           preparation: InboundPreparation? = nil) async throws -> HostedCallSession {
+                           preparation: InboundPreparation? = nil, sdpOffer: String? = nil,
+                           directRequested: Bool = false) async throws -> HostedCallSession {
         guard offerId.wholeMatch(of: Self.offerIdRE) != nil else {
             throw HostedCloudError(statusCode: 0, code: "BAD_OFFER_ID", message: "offer id 格式不合法")
         }
         var fields = ["offerId": offerId]
+        if directRequested { fields["mediaTransport"] = "webrtc" }
         if let preparation { fields["prepareId"] = preparation.prepareId }
+        if let sdpOffer {
+            guard !sdpOffer.isEmpty, sdpOffer.utf8.count <= 16 * 1024 else {
+                throw HostedCloudError(statusCode: 0, code: "INVALID_SDP", message: "Invalid SDP offer")
+            }
+            fields["sdpOffer"] = sdpOffer
+        }
         let body = try JSONSerialization.data(withJSONObject: fields)
         let metrics = timing.map { _ in ClaimNetworkMetrics() }
         defer {
@@ -213,6 +224,42 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
             }
         }
         let (payload, response) = try await request("POST", "v1/inbound-offers/claim", body: body, metrics: metrics)
+        if directRequested || sdpOffer != nil { timing?.recordCloudDurations(response.value(forHTTPHeaderField: "Server-Timing")) }
+        return try decodeInboundSession(payload, response: response, offerId: offerId,
+                                        preparation: preparation, offeredSDP: sdpOffer != nil,
+                                        directRequested: directRequested)
+    }
+
+    func completeInboundSDP(offerId: String, claimId: String, sdpOffer: String) async throws -> HostedCallSession {
+        guard offerId.wholeMatch(of: Self.offerIdRE) != nil, claimId.wholeMatch(of: Self.claimIdRE) != nil,
+              !sdpOffer.isEmpty, sdpOffer.utf8.count <= 16 * 1024 else {
+            throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Invalid claimed SDP")
+        }
+        let body = try JSONSerialization.data(withJSONObject: ["claimId": claimId, "sdpOffer": sdpOffer])
+        let (payload, response) = try await request("POST", "v1/inbound-offers/\(offerId)/media/sdp", body: body)
+        let session = try decodeInboundSession(payload, response: response, offerId: offerId,
+                                                offeredSDP: true, directRequested: true)
+        guard session.sessionId == claimId, !session.sdpPending else {
+            throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Mismatched SDP claim")
+        }
+        return session
+    }
+
+    func endInboundClaim(offerId: String, claimId: String) async throws {
+        guard offerId.wholeMatch(of: Self.offerIdRE) != nil, claimId.wholeMatch(of: Self.claimIdRE) != nil else {
+            throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Invalid claim")
+        }
+        let body = try JSONSerialization.data(withJSONObject: ["claimId": claimId])
+        let path = "v1/inbound-offers/\(offerId)/media/end"
+        do { _ = try await request("POST", path, body: body) }
+        catch let error as HostedCloudError where error.statusCode == 503 && error.code == "MEDIA_RELAY_UNAVAILABLE" {
+            _ = try await request("POST", path, body: body)
+        }
+    }
+
+    private func decodeInboundSession(_ payload: [String: Any], response: HTTPURLResponse,
+                                      offerId: String, preparation: InboundPreparation? = nil,
+                                      offeredSDP: Bool, directRequested: Bool) throws -> HostedCallSession {
         guard let claimId = payload["claimId"] as? String,
               claimId.wholeMatch(of: Self.claimIdRE) != nil,
               let echoed = payload["offerId"] as? String, echoed == offerId,
@@ -235,13 +282,71 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         } else {
             guard mode == "cold" else { throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid claim mode") }
         }
+        let directAttempted = payload["directAttempted"] as? Bool ?? false
+        let sdpPending = payload["sdpPending"] as? Bool ?? false
+        let transports = payload["transports"] as? [[String: Any]] ?? []
+        let answer = transports.first { $0["kind"] as? String == "webrtc" }?["sdpAnswer"] as? String
+        if let answer {
+            guard offeredSDP, directAttempted, !answer.isEmpty, answer.utf8.count <= 16 * 1024 else {
+                throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid SDP answer")
+            }
+        }
+        guard !sdpPending || (directRequested && directAttempted && answer == nil) else {
+            throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid pending SDP")
+        }
         return HostedCallSession(
             sessionId: claimId,
             livekitURL: session.livekitURL,
             token: session.token,
             expiresAt: session.expiresAt,
-            mode: mode, edgeIdentity: payload["edgeIdentity"] as? String
+            mode: mode, edgeIdentity: payload["edgeIdentity"] as? String,
+            directAttempted: directAttempted, sdpAnswer: answer, sdpPending: sdpPending
         )
+    }
+
+    func inboundIceServers(offerId: String) async throws -> [CallIceServer] {
+        guard offerId.wholeMatch(of: Self.offerIdRE) != nil else {
+            throw HostedCloudError(statusCode: 0, code: "BAD_OFFER_ID", message: "Invalid offer")
+        }
+        let (payload, response) = try await request("POST", "v1/inbound-offers/\(offerId)/ice")
+        guard let rows = payload["iceServers"] as? [[String: Any]], !rows.isEmpty, rows.count <= 16 else {
+            throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid ICE servers")
+        }
+        return try rows.map { row in
+            let urls = (row["urls"] as? [String]) ?? (row["urls"] as? String).map { [$0] } ?? []
+            guard !urls.isEmpty, urls.count <= 16, urls.allSatisfy({
+                $0.utf8.count <= 512 && ($0.hasPrefix("stun:") || $0.hasPrefix("stuns:") || $0.hasPrefix("turn:") || $0.hasPrefix("turns:"))
+            }) else {
+                throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid ICE URL")
+            }
+            return CallIceServer(urls: urls, username: row["username"] as? String, credential: row["credential"] as? String)
+        }
+    }
+
+    func fallbackInboundLiveKit(offerId: String, claimId: String) async throws -> HostedCallSession {
+        guard offerId.wholeMatch(of: Self.offerIdRE) != nil, claimId.wholeMatch(of: Self.claimIdRE) != nil else {
+            throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Invalid claim")
+        }
+        let body = try JSONSerialization.data(withJSONObject: ["claimId": claimId])
+        let path = "v1/inbound-offers/\(offerId)/media/livekit"
+        let result: ([String: Any], HTTPURLResponse)
+        do { result = try await request("POST", path, body: body) }
+        catch let error as HostedCloudError where
+            (error.statusCode == 503 && error.code == "MEDIA_RELAY_UNAVAILABLE") ||
+            (error.statusCode == 504 && error.code == "MEDIA_RELAY_TIMEOUT") {
+            // The relay explicitly retains the same claim and LiveKit identity.
+            // Retry that operation once, never repeat the ownership CAS.
+            try Task.checkCancellation()
+            result = try await request("POST", path, body: body)
+        }
+        let (payload, response) = result
+        guard payload["claimId"] as? String == claimId, payload["offerId"] as? String == offerId,
+              let url = payload["url"] as? String, let token = payload["token"] as? String,
+              let expiresAt = Self.jsonInt64(payload["expiresAt"]) else {
+            throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid fallback session")
+        }
+        try validateSession(HostedSessionPayload(livekitURL: url, token: token, expiresAt: expiresAt), statusCode: response.statusCode)
+        return HostedCallSession(sessionId: claimId, livekitURL: url, token: token, expiresAt: expiresAt)
     }
 
     func prepareInboundOffer(offerId: String) async throws -> InboundPreparation {

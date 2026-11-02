@@ -1,5 +1,7 @@
 import { authenticateDevice, authenticateEdge } from "./auth";
 import { ClaimTiming } from "./claim-timing";
+import { claimInboundFastpathV2, fallbackInboundLivekit, inboundIce, completeInboundSdp, endInboundMedia } from "./inbound-fastpath-v2";
+import { turnConfigured } from "./turn";
 import {
   contentReadEnabled,
   contentRelayTimeoutMs
@@ -36,7 +38,7 @@ import {
   registerVoipTokenSchema
 } from "./schemas";
 import { constantTimeEqual, randomId, randomPairingCode, randomSecret, sha256 } from "./security";
-import type { CallRecord, DeviceRecord, Env, InboundOfferRecord } from "./types";
+import type { CallRecord, DeviceRecord, EdgePresence, Env, InboundOfferRecord } from "./types";
 import {
   decodeEncryptionKey,
   encryptPushToken,
@@ -110,7 +112,23 @@ async function route(request: Request, env: Env, requestId: string, timing?: Cla
     return listInboundOffers(request, env);
   }
   if (path === "/v1/inbound-offers/claim" && request.method === "POST") {
+    if (env.INBOUND_FASTPATH_V2_ENABLED === "true") {
+      const input = claimInboundOfferSchema.parse(await readJson(request.clone(), 32 * 1024));
+      if (input.mediaTransport === "webrtc" && turnConfigured(env)) {
+        const direct = await claimInboundFastpathV2(request.clone(), env, timing!, ctx);
+        if (direct) return direct;
+      }
+      // A V2 rollout never activates the old restricted-room preparation path.
+      return claimInboundOffer(request, { ...env, INBOUND_PRECONNECT_ENABLED: "false", INBOUND_CLAIM_FAST_PATH_ENABLED: "false" }, timing!, ctx);
+    }
     return claimInboundOffer(request, env, timing!, ctx);
+  }
+  const inboundMedia = path.match(/^\/v1\/inbound-offers\/(offer_[A-Za-z0-9_-]{12,80})\/(ice|media\/livekit|media\/sdp|media\/end)$/);
+  if (inboundMedia && request.method === "POST") {
+    return inboundMedia[2] === "ice" ? inboundIce(request, env, inboundMedia[1]!, ctx)
+      : inboundMedia[2] === "media/sdp" ? completeInboundSdp(request, env, inboundMedia[1]!)
+      : inboundMedia[2] === "media/end" ? endInboundMedia(request, env, inboundMedia[1]!)
+      : fallbackInboundLivekit(request, env, inboundMedia[1]!);
   }
   if (path === "/v1/inbound-offers/prepare" && request.method === "POST") {
     requireSameOrigin(request, env.PUBLIC_ORIGIN);
@@ -279,17 +297,21 @@ async function claimPairing(request: Request, env: Env): Promise<Response> {
 }
 
 async function getDevice(request: Request, env: Env): Promise<Response> {
-  const features = { claimPrewarm: env.CLAIM_PREWARM_ENABLED === "true", preconnect: env.INBOUND_PRECONNECT_ENABLED === "true" };
+  const v2 = env.INBOUND_FASTPATH_V2_ENABLED === "true";
+  const features = { claimPrewarm: env.CLAIM_PREWARM_ENABLED === "true", preconnect: !v2 && env.INBOUND_PRECONNECT_ENABLED === "true",
+    ...(v2 ? { inboundFastpathV2: false } : {}) };
   try {
     const device = await authenticateDevice(request, env);
     const response = await edgeRoom(env, device.edge_id).fetch("https://edge-room/presence");
+    const presence = await response.json() as EdgePresence;
+    if (v2) features.inboundFastpathV2 = turnConfigured(env) && presence.connected && presence.inboundFastpathV2 === true;
     return json({
       ok: true,
       paired: true,
       features,
       capabilities: await contentCapabilities(env, device.edge_id),
       device: { deviceId: device.device_id, edgeId: device.edge_id, displayName: device.display_name },
-      edge: await response.json()
+      edge: presence
     });
   } catch (caught) {
     if (caught instanceof HttpError && caught.status === 401) return json({ ok: true, paired: false, features });
@@ -482,7 +504,7 @@ async function claimInboundOffer(request: Request, env: Env, timing: ClaimTiming
   // Only last_used_at bookkeeping is deferred by auth's context; credential and
   // revocation checks still finish before any speculative lookup or CAS.
   const device = await timing.measure("auth", () => authenticateDevice(request, env, fast ? ctx : undefined));
-  const input = claimInboundOfferSchema.parse(await readJson(request));
+  const input = claimInboundOfferSchema.parse(await readJson(request, env.INBOUND_FASTPATH_V2_ENABLED === "true" ? 32 * 1024 : 16 * 1024));
   if (!fast) {
     const existing = await timing.measure("offer_read", () => env.DB.prepare(
       "SELECT offer_id FROM inbound_offers WHERE offer_id = ?1 AND edge_id = ?2"

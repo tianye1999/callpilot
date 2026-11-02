@@ -248,6 +248,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("INBOUND_TAKEOVER_TIMEOUT_SECONDS", "来电真人接管等待时限（秒）", "float", "20"),
     ConfigSpec("INBOUND_PHONE_FIRST_ENABLED", "串口模组来电先响手机（依赖真人接管）", "bool", "false"),
     ConfigSpec("INBOUND_PRECONNECT_ENABLED", "来电响铃时静默预连媒体房间", "bool", "false"),
+    ConfigSpec("INBOUND_FASTPATH_V2_ENABLED", "来电接管 V2 实验路径", "bool", "false"),
     ConfigSpec("INBOUND_EARLY_ANSWER_ENABLED", "认领后立即接通运营商通话（与手机连媒体并行）", "bool", "false"),
     ConfigSpec("INBOUND_PHONE_FIRST_RING_SECONDS", "串口模组先响手机等待（1–15 秒）", "int", "15"),
     ConfigSpec("INBOUND_PHONE_FIRST_MEDIA_SECONDS", "认领后等手机音轨就绪（5–30 秒）", "int", "20"),

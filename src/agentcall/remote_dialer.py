@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from datetime import timedelta
 from queue import Empty, Full, Queue
-from typing import Any, Callable, Iterable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Protocol
 from urllib.parse import urlparse
 
 from . import config
@@ -30,6 +30,9 @@ from .dial_guard import DialGuardFailure
 from .dtmf import dtmf_tone
 from .modem import SerialModem
 from .pcm_stats import PcmFlowStats
+
+if TYPE_CHECKING:
+    from .inbound_direct import InboundDirectRequest
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +108,7 @@ class IssuedLiveKitSession:
     browser_token: str
     edge_token: str
     livekit_url: str
+    direct: InboundDirectRequest | None = None
 
 
 @dataclass(frozen=True)

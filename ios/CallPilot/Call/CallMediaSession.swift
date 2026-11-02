@@ -1,14 +1,37 @@
 import Foundation
 
+@MainActor
+private final class DirectSetupOutcome {
+    var result: Result<Void, Error>?
+}
+
 /// Owns one call attempt, including setup, microphone publication and teardown.
 @MainActor
 final class CallMediaSession {
     typealias TransportFactory = @MainActor () -> any CallMediaTransport
+    typealias DirectTransportFactory = @MainActor () -> any CallDirectMediaTransport
     typealias StateHandler = @MainActor (CallState) -> Void
 
     private var onState: StateHandler
     private let transportFactory: TransportFactory
     private let audio: CallAudioOwner
+    private let directTransportFactory: DirectTransportFactory?
+    private let directSetupMax: Duration
+    private var directOfferId: String?
+    private var directPreparationTask: Task<String?, Error>?
+    private var directPreparedOffer: String?
+    private var directPreparationRejection: HostedCloudError?
+    private var directClaimTask: Task<HostedCallSession, Error>?
+    private var directClaimClient: HostedCloudClient?
+    private var directClaimID: String?
+    private var ownerHangupRequested = false
+    private var controlEndTask: Task<Void, Never>?
+    private var directSetupFailure: Error?
+    private var edgeCommitted = false
+    private var directFallbackStarted = false
+    private var directFallbackHandler: (() -> Void)?
+    // A resource lease, not a network-speed threshold or a warm/cold heuristic.
+    static let directSetupMax: Duration = .seconds(20)
     private let ownerID = UUID()
     private var connectedHandler: (() -> Void)?
     private var transport: (any CallMediaTransport)?
@@ -153,12 +176,209 @@ final class CallMediaSession {
          transportFactory: @escaping TransportFactory,
          audio: CallAudioOwner,
          hangupBudget: Duration = CallMediaSession.hangupBudget,
-         timing: CallTiming = CallTiming()) {
+         timing: CallTiming = CallTiming(),
+         directTransportFactory: DirectTransportFactory? = nil,
+         directSetupMax: Duration = CallMediaSession.directSetupMax) {
         self.onState = onState
         self.transportFactory = transportFactory
         self.audio = audio
         self.hangupBudget = hangupBudget
         self.timing = timing
+        self.directTransportFactory = directTransportFactory
+        self.directSetupMax = directSetupMax
+    }
+
+    /// The same task survives Answer; no elapsed-ringing-time branch discards it.
+    func startDirectPreparation(client: HostedCloudClient, offer: InboundOffer) async {
+        beginDirectPreparation(client: client, offer: offer)
+        _ = await directPreparationTask?.result
+    }
+
+    private func beginDirectPreparation(client: HostedCloudClient, offer: InboundOffer) {
+        guard directTransportFactory != nil, directPreparationTask == nil,
+              let attempt = beginAttempt(label: L10n.text("call.takeover.label"), mode: .callKit) else { return }
+        directOfferId = offer.offerId
+        let acquiring = Task { try await acquireSilentAudioLease(for: attempt) }
+        silentAudioLeaseTask = acquiring
+        let task = Task<String?, Error> {
+            timing.mark(.prepareStart)
+            let servers: [CallIceServer]
+            do { servers = try await client.inboundIceServers(offerId: offer.offerId) }
+            catch let error as HostedCloudError where error.statusCode == 401 || error.statusCode == 409 {
+                directPreparationRejection = error
+                throw error
+            } catch { return nil }
+            try checkCurrent(attempt)
+            timing.mark(.prepareResponse)
+            try await acquiring.value
+            try checkCurrent(attempt)
+            guard let directTransportFactory else { return nil }
+            let connection = directTransportFactory()
+            transport = connection
+            installEvents(connection, attempt: attempt)
+            timing.mark(.preconnectStart)
+            do {
+                let offer = try await connection.prepareDirect(servers: servers)
+                try checkCurrent(attempt)
+                directPreparedOffer = offer
+                timing.mark(.preconnectReady)
+                return offer
+            } catch {
+                try checkCurrent(attempt)
+                detachDirect(connection)
+                return nil
+            }
+        }
+        directPreparationTask = task
+    }
+
+    private func installEvents(_ connection: any CallMediaTransport, attempt: UInt64) {
+        connection.eventHandler = { [weak self, weak connection] event in
+            guard let connection else { return }
+            await self?.handleTransportEvent(event, from: connection, for: attempt)
+        }
+        connection.setSpeakerphone(speakerphoneEnabled)
+    }
+
+    private func detachDirect(_ connection: any CallDirectMediaTransport) {
+        connection.stopDirectAudio()
+        connection.eventHandler = nil
+        if transport === connection { transport = nil }
+        // A stalled SDK disconnect must not hold the fallback connection hostage.
+        Task { await connection.disconnect() }
+    }
+
+    private func startDirectTakeover(client: HostedCloudClient, offerId: String,
+                                     prepareReservedAudio: (() async throws -> Void)?,
+                                     onClaimed: @escaping () throws -> Void,
+                                     onConnected: @escaping () -> Void) async -> Bool {
+        if directPreparationTask == nil {
+            // No push prewarm (for example, a foreground offer); begin immediately.
+            beginDirectPreparation(client: client, offer: InboundOffer(offerId: offerId, expiresAt: 0))
+        }
+        guard !claimStarted, !isStopped, directOfferId == offerId else { return false }
+        claimStarted = true
+        connectedHandler = onConnected
+        let attempt = generation
+        let task = Task {
+            try checkCurrent(attempt)
+            if let directPreparationRejection { throw directPreparationRejection }
+            timing.startClaim()
+            directClaimClient = client
+            let claim = Task {
+                // A canceled UI/setup must still learn the CAS outcome so an
+                // explicit hangup can end that exact winner, never another call.
+                let session = try await client.claimInboundOffer(offerId: offerId, timing: timing,
+                                                                 sdpOffer: directPreparedOffer, directRequested: true)
+                directClaimID = session.sessionId
+                endReservedClaimIfRequested()
+                return session
+            }
+            directClaimTask = claim
+            let session = try await claim.value
+            timing.mark(.claimResponse)
+            try checkCurrent(attempt)
+            preparedSession = session
+            claimAccepted = true
+            // Ownership reaches Edge before any TURN, gather, or audio-lease wait.
+            // CallKit configuration still requires this attempt's audio lease.
+            try await prepareReservedAudio?()
+            try checkCurrent(attempt)
+            try await silentAudioLeaseTask?.value
+            try checkCurrent(attempt)
+            directFallbackHandler = { [weak self] in
+                guard let self, isCurrent(attempt), !edgeCommitted, !directFallbackStarted else { return }
+                directFallbackHandler = nil
+                let fallback = Task { try await self.connectFallback(client: client, session: session, attempt: attempt) }
+                setupTask = fallback
+                Task { await self.finishSetup(fallback, attempt: attempt) }
+            }
+            try onClaimed()
+            try checkCurrent(attempt)
+            var mediaSession = session
+            if session.sdpPending {
+                do {
+                    if let offer = try await directPreparationTask?.value {
+                        try checkCurrent(attempt)
+                        timing.mark(.sdpSubmitStart)
+                        mediaSession = try await client.completeInboundSDP(offerId: offerId,
+                            claimId: session.sessionId, sdpOffer: offer)
+                        timing.mark(.sdpSubmitResponse)
+                        try checkCurrent(attempt)
+                        preparedSession = mediaSession
+                    }
+                } catch let error as HostedCloudError where error.statusCode == 401 || error.statusCode == 409 {
+                    throw error
+                } catch {
+                    try checkCurrent(attempt)
+                    timing.mark(.coldFallback)
+                }
+            }
+            try activateAudioIfReady()
+            if let answer = mediaSession.sdpAnswer, let direct = transport as? any CallDirectMediaTransport {
+                do {
+                    timing.mark(.connectStart)
+                    try await connectDirect(direct, answer: answer, attempt: attempt)
+                    timing.mark(.connectReturn)
+                    try checkCurrent(attempt)
+                    roomConnected = true
+                    timing.mark(.roomConnected)
+                    startMicrophoneIfReady(for: attempt)
+                    scheduleTiming()
+                    return
+                } catch {
+                    try checkCurrent(attempt)
+                    timing.mark(.coldFallback)
+                    detachDirect(direct)
+                }
+            } else if let direct = transport as? any CallDirectMediaTransport {
+                detachDirect(direct)
+            }
+            try await connectFallback(client: client, session: session, attempt: attempt)
+        }
+        setupTask = task
+        await finishSetup(task, attempt: attempt)
+        return isCurrent(attempt)
+    }
+
+    private func connectFallback(client: HostedCloudClient, session: HostedCallSession,
+                                 attempt: UInt64) async throws {
+        try checkCurrent(attempt)
+        guard !edgeCommitted, !directFallbackStarted, let offerId = directOfferId else { return }
+        directFallbackStarted = true
+        directFallbackHandler = nil
+        directPreparationTask?.cancel()
+        if let direct = transport as? any CallDirectMediaTransport { detachDirect(direct) }
+        microphoneTask?.cancel()
+        microphoneStarted = false
+        roomConnected = false
+        audioActivated = false
+        // A successful CAS is never repeated. The fallback route keeps its fence.
+        let fallback = session.directAttempted
+            ? try await client.fallbackInboundLiveKit(offerId: offerId, claimId: session.sessionId)
+            : session
+        try checkCurrent(attempt)
+        try activateAudioIfReady()
+        try await connect(fallback, for: attempt)
+    }
+
+    private func connectDirect(_ connection: any CallDirectMediaTransport, answer: String,
+                               attempt: UInt64) async throws {
+        let outcome = DirectSetupOutcome()
+        directSetupFailure = nil
+        let operation = Task {
+            do { try await connection.connectDirect(answer: answer); outcome.result = .success(()) }
+            catch { outcome.result = .failure(error) }
+        }
+        defer { operation.cancel() }
+        let deadline = ContinuousClock.now.advanced(by: directSetupMax)
+        while outcome.result == nil {
+            try checkCurrent(attempt)
+            if let directSetupFailure { throw directSetupFailure }
+            guard ContinuousClock.now < deadline else { throw CallAudioError.answerExpired }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try outcome.result?.get()
     }
 
     func startOutbound(client: HostedCloudClient, edgeId: String, number: String) async {
@@ -186,9 +406,15 @@ final class CallMediaSession {
         client: HostedCloudClient,
         offerId: String,
         usesCallKit: Bool = false,
+        prepareReservedAudio: (() async throws -> Void)? = nil,
         onClaimed: @escaping () throws -> Void = {},
         onConnected: @escaping () -> Void
     ) async -> Bool {
+        if directTransportFactory != nil, usesCallKit {
+            return await startDirectTakeover(client: client, offerId: offerId,
+                                             prepareReservedAudio: prepareReservedAudio,
+                                             onClaimed: onClaimed, onConnected: onConnected)
+        }
         guard !claimStarted, !isStopped else { return false }
         let attempt: UInt64
         let silentTask: Task<Void, Error>?
@@ -277,7 +503,9 @@ final class CallMediaSession {
     private func activateAudioIfReady() throws {
         guard activationRequested, claimAccepted, !reusingTransport || permissionReady else { return }
         guard !audioActivated else { return }
-        try audio.activate(ownerID)
+        if directTransportFactory != nil && !directFallbackStarted && transport == nil { return }
+        if let direct = transport as? any CallDirectMediaTransport { try direct.activateDirectAudio() }
+        else { try audio.activate(ownerID) }
         timing.mark(.activateReturn)
         audioActivated = true
         timing.mark(.audioActivated)
@@ -329,7 +557,7 @@ final class CallMediaSession {
         microphoneTask = task
         Task { [weak self] in
             let result = await task.result
-            guard let self, isCurrent(attempt) else { return }
+            guard let self, isCurrent(attempt), transport === activeTransport else { return }
             if case .failure = result {
                 fail(reason: L10n.text("call.audio.failed"), code: "MICROPHONE_PUBLISH_FAILED")
             }
@@ -359,6 +587,8 @@ final class CallMediaSession {
 
     func handleConnected(label: String) {
         guard !isStopped else { return }
+        edgeCommitted = true
+        directFallbackHandler = nil
         timing.mark(.edgeConnected)
         scheduleTiming()
         connectedHandler?()
@@ -410,6 +640,10 @@ final class CallMediaSession {
     @discardableResult
     func requestHangup() -> Data {
         if let hangupPacket { return hangupPacket }
+        if directTransportFactory != nil {
+            ownerHangupRequested = true
+            endReservedClaimIfRequested()
+        }
         let id = UUID().uuidString
         let packet = CallSignaling.encodeHangup(commandId: id)
         hangupCommandID = id
@@ -418,6 +652,16 @@ final class CallMediaSession {
         timing.mark(.hangupIntent)
         terminate(state: .ended(label: activeLabel ?? "", reason: "local_hangup"), hangup: packet)
         return packet
+    }
+
+    private func endReservedClaimIfRequested() {
+        guard ownerHangupRequested, controlEndTask == nil, let client = directClaimClient,
+              let offerId = directOfferId, let claimId = directClaimID else { return }
+        // Independent of media teardown and its cancellation. The server checks
+        // the device/claim fence even when RTP and the data channel never opened.
+        controlEndTask = Task {
+            _ = try? await client.endInboundClaim(offerId: offerId, claimId: claimId)
+        }
     }
 
     func stop() async {
@@ -496,6 +740,11 @@ final class CallMediaSession {
                 }
             }
         case let .disconnected(reason):
+            if connection is any CallDirectMediaTransport, !edgeCommitted {
+                directSetupFailure = CallAudioError.answerExpired
+                if roomConnected { directFallbackHandler?() }
+                return
+            }
             if silentOfferId != nil && !claimAccepted {
                 preconnectReady = false
                 silentPreconnectPending = false
@@ -553,6 +802,10 @@ final class CallMediaSession {
         isStopped = true
         generation &+= 1
         let setup = setupTask
+        directPreparationTask?.cancel()
+        let directPreparation = directPreparationTask
+        directPreparationTask = nil
+        (transport as? any CallDirectMediaTransport)?.stopDirectAudio()
         let silentSetup = silentSetupTask
         let silentAudioLease = silentAudioLeaseTask
         let silentTeardown = silentTeardownTask
@@ -567,6 +820,7 @@ final class CallMediaSession {
         microphone?.cancel()
         controls.forEach { $0.cancel() }
         setupTask = nil
+        directFallbackHandler = nil
         silentSetupTask = nil
         silentAudioLeaseTask = nil
         silentTeardownTask = nil
@@ -580,6 +834,23 @@ final class CallMediaSession {
             activeTransport?.eventHandler = nil
             transport = nil
         }
+        if directTransportFactory != nil,
+           activeTransport == nil || activeTransport is any CallDirectMediaTransport {
+            // Direct audio is synchronously revoked above. Reaping a stuck peer
+            // must not hold the process-wide audio lease or a subsequent call.
+            cleanupTask = audio.release(ownerID) {
+                Task {
+                    if let hangup, let activeTransport { await self.sendHangup(hangup, using: activeTransport) }
+                    activeTransport?.eventHandler = nil
+                    await activeTransport?.disconnect()
+                    _ = await directPreparation?.result
+                    await activeTransport?.disconnect()
+                }
+                self.transport = nil
+            }
+            if let state { onState(state) }
+            return
+        }
         cleanupTask = audio.release(ownerID) {
             if let hangup, let activeTransport {
                 await self.sendHangup(hangup, using: activeTransport)
@@ -590,6 +861,7 @@ final class CallMediaSession {
             // Disconnect unblocks SDK waits; cancellation alone cannot cancel
             // the SDK's unstructured concurrent-mic child task.
             _ = await setup?.result
+            _ = await directPreparation?.result
             _ = await silentSetup?.result
             _ = await silentAudioLease?.result
             await silentTeardown?.value

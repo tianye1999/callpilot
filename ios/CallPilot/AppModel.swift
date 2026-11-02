@@ -215,7 +215,7 @@ final class AppModel: ObservableObject {
                   deviceStatusMachine.succeed(status, for: refresh) else { return }
             claimPrewarmer.setEnabled(status.claimPrewarm)
             claimPrewarmer.setPreconnectEnabled(status.preconnect)
-            if !claimPrewarmer.canPreconnect { closeSilentIncoming() }
+            if !claimPrewarmer.canPreconnect && !status.inboundFastpathV2 { closeSilentIncoming() }
         } catch {
             guard currentClient === client else { return }
             if error is CancellationError
@@ -275,7 +275,10 @@ final class AppModel: ObservableObject {
         let label = L10n.text("call.takeover.label")
         let attempt = beginCallAttempt(with: .preparing(label: label))
         callKitOfferId = usesCallKit ? offer.offerId : nil
-        guard await canBeginAudio(label: label, attempt: attempt) else { return }
+        let directTakeover = usesCallKit && deviceStatus?.inboundFastpathV2 == true
+        if !directTakeover {
+            guard await canBeginAudio(label: label, attempt: attempt) else { return }
+        }
         if usesCallKit, !callKit.isAnswering(offerId: offer.offerId) { return }
         _ = apply(.waitingMedia(label: label), for: attempt)
         let session: CallMediaSession
@@ -290,14 +293,24 @@ final class AppModel: ObservableObject {
             closeSilentIncoming()
             session = CallMediaSession(onState: { [weak self] st in
                 _ = self?.apply(st, for: attempt)
-            }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner, timing: timing)
+            }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner, timing: timing,
+               directTransportFactory: inboundDirectTransportFactory)
         }
         media = session
-        scheduleMediaTimeout(for: attempt, session: session, duration: takeoverMediaTimeout)
+        // V2 owns a single total resource lease including direct and one fallback.
+        scheduleMediaTimeout(for: attempt, session: session,
+                             duration: deviceStatus?.inboundFastpathV2 == true ? .seconds(60) : takeoverMediaTimeout)
         await session.startTakeover(
             client: c,
             offerId: offer.offerId,
             usesCallKit: usesCallKit,
+            prepareReservedAudio: { [weak self] in
+                guard let self, directTakeover else { return }
+                guard await callKit.waitUntilAudioDrained(offerId: offer.offerId),
+                      callAttempts.isCurrent(attempt), callKit.isAnswering(offerId: offer.offerId) else {
+                    throw CancellationError()
+                }
+            },
             onClaimed: { [weak self] in
                 guard let self, callAttempts.isCurrent(attempt) else { throw CancellationError() }
                 if usesCallKit {
@@ -469,6 +482,11 @@ final class AppModel: ObservableObject {
 }
 
 extension AppModel: CallKitCoordinatorDelegate {
+    private var inboundDirectTransportFactory: CallMediaSession.DirectTransportFactory? {
+        guard deviceStatus?.inboundFastpathV2 == true else { return nil }
+        return { WebRtcDirectTransport() }
+    }
+
     var callKitCanAcceptIncomingCall: Bool {
         pairing != nil && client != nil && callState == .idle
     }
@@ -490,12 +508,13 @@ extension AppModel: CallKitCoordinatorDelegate {
               !dismissedOffers.contains(offer.offerId) else { return }
         incomingOffer = offer
         if let client {
-            if claimPrewarmer.canPreconnect {
+            if claimPrewarmer.canPreconnect || deviceStatus?.inboundFastpathV2 == true {
                 guard silentIncoming == nil else { return }
                 let timing = CallTiming()
                 timing.mark(.pushReceived, at: offer.pushReceivedAt)
                 let session = CallMediaSession(onState: { _ in }, transportFactory: { LiveKitRoomTransport() },
-                                               audio: LiveKitAudioDevice.owner, timing: timing)
+                                               audio: LiveKitAudioDevice.owner, timing: timing,
+                                               directTransportFactory: inboundDirectTransportFactory)
                 session.onSilentDisconnect = { [weak self] in
                     guard let self, silentIncoming?.offer.offerId == offer.offerId else { return }
                     closeSilentIncoming()
@@ -503,7 +522,11 @@ extension AppModel: CallKitCoordinatorDelegate {
                     callKit.finishRingingOffer(offerId: offer.offerId)
                 }
                 silentIncoming = (offer, session)
-                silentIncomingTask = Task { await session.startSilentPreconnect(client: client, offer: offer) }
+                if deviceStatus?.inboundFastpathV2 == true {
+                    silentIncomingTask = Task { await session.startDirectPreparation(client: client, offer: offer) }
+                } else {
+                    silentIncomingTask = Task { await session.startSilentPreconnect(client: client, offer: offer) }
+                }
                 silentExpiryTask = Task {
                     do { try await Task.sleep(for: .milliseconds(max(0, offer.expiresAt - Int64(Date().timeIntervalSince1970 * 1000)))) }
                     catch { return }

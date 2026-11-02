@@ -4,6 +4,7 @@ import OSLog
 enum CallTimingMark: String, CaseIterable, Sendable {
     case answerAction = "answer_action", dialStart = "dial_start"
     case claimStart = "claim_start", claimResponse = "claim_response"
+    case sdpSubmitStart = "sdp_submit_start", sdpSubmitResponse = "sdp_submit_response"
     case claimResponseEnd = "claim_response_end", pushReceived = "push_received"
     case prepareStart = "prepare_start", prepareResponse = "prepare_response"
     case audioLeaseStart = "audio_lease_start", audioLeaseEnd = "audio_lease_end"
@@ -48,6 +49,8 @@ final class CallTiming {
     private var baselineKnown = false
     private var marks: [CallTimingMark: TimeInterval] = [:]
     private var sent = Set<CallTimingMark>()
+    private var cloudDurations: [String: Double] = [:]
+    private var sentCloudDurations = Set<String>()
     private(set) var sequence = 0
     private let logger = Logger(subsystem: "ai.bondings.callpilot.sim", category: "CallTiming")
 
@@ -79,20 +82,41 @@ final class CallTiming {
         mark(.claimStart, at: origin)
     }
 
+    func recordCloudDurations(_ header: String?) {
+        guard let header, header.utf8.count <= 4096 else { return }
+        let allowed: Set<String> = ["cas", "edge_reserve", "turn", "sdp_relay", "claim_finalize", "total"]
+        for metric in header.split(separator: ",") {
+            let parts = metric.split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard let name = parts.first, allowed.contains(name) else { continue }
+            let values = parts.dropFirst().compactMap { parameter -> String? in
+                let pair = parameter.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+                return pair.count == 2 && pair[0] == "dur" ? pair[1] : nil
+            }
+            guard values.count == 1, let value = Double(values[0]), value.isFinite,
+                  (0...86_400_000).contains(value) else { continue }
+            let key = "cloud_\(name)_ms"
+            if cloudDurations[key] == nil { cloudDurations[key] = value }
+        }
+    }
+
     func nextBatch() -> Data? {
         guard sequence < Self.maxBatches else { return nil }
         let keys = CallTimingMark.allCases.filter { marks[$0] != nil && !sent.contains($0) }
             .prefix(Self.maxBatchMarks)
-        guard !keys.isEmpty else { return nil }
-        let values = Dictionary(uniqueKeysWithValues: keys.map {
+        let cloudKeys = cloudDurations.keys.sorted().filter { !sentCloudDurations.contains($0) }
+            .prefix(Self.maxBatchMarks - keys.count)
+        guard !keys.isEmpty || !cloudKeys.isEmpty else { return nil }
+        var values = Dictionary(uniqueKeysWithValues: keys.map {
             ($0.rawValue, min(86_400_000, max(-60_000, (marks[$0]! - origin) * 1000)))
         })
+        for key in cloudKeys { values[key] = cloudDurations[key] }
         guard let data = try? JSONSerialization.data(withJSONObject: [
             "type": "client_timing", "v": 1, "attempt": attempt,
             "seq": sequence + 1, "marks": values,
         ], options: [.sortedKeys]), data.count <= Self.maxBatchBytes else { return nil }
         sequence += 1
         sent.formUnion(keys)
+        sentCloudDurations.formUnion(cloudKeys)
         return data
     }
 }

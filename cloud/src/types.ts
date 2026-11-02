@@ -17,6 +17,9 @@ export interface Env {
   CLAIM_PREWARM_ENABLED?: string;
   INBOUND_PRECONNECT_ENABLED?: string;
   INBOUND_CLAIM_FAST_PATH_ENABLED?: string;
+  INBOUND_FASTPATH_V2_ENABLED?: string;
+  TURN_KEY_ID?: string;
+  TURN_API_TOKEN?: string;
   APNS_TEAM_ID?: string;
   APNS_KEY_ID?: string;
   APNS_PRIVATE_KEY?: string;
@@ -78,6 +81,7 @@ export interface InboundOfferRecord {
   call_uuid: string | null;
   preconnect_enabled: number;
   preconnect_room: string | null;
+  media_transport?: "direct_eligible" | "direct_pending" | "direct" | "livekit_pending" | "livekit" | null;
 }
 
 export interface EdgePresence {
@@ -87,4 +91,5 @@ export interface EdgePresence {
   lineBusy?: boolean;
   version?: string;
   inboundPreconnectV1?: boolean;
+  inboundFastpathV2?: boolean;
 }

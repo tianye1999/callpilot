@@ -25,6 +25,15 @@ extension CallMediaTransport {
     func subscribeToEdge(_ identity: String) async throws { throw CallAudioError.busy }
 }
 
+@MainActor
+protocol CallDirectMediaTransport: CallMediaTransport {
+    func prepareDirect(servers: [CallIceServer]) async throws -> String
+    func connectDirect(answer: String) async throws
+    func activateDirectAudio() throws
+    // Synchronous revocation fences audio before an uncooperative SDK teardown.
+    func stopDirectAudio()
+}
+
 final class CallFirstFrameRendererRemoval: @unchecked Sendable {
     private let lock = NSLock()
     private var removal: (@Sendable () -> Void)?

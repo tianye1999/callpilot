@@ -18,6 +18,7 @@ from typing import Any, Protocol
 from . import config
 from .cloud_credentials import CloudCredentialStore, EdgeCredential
 from .content_sync import ContentSyncError
+from .inbound_direct import InboundDirectRequest
 from .remote_dialer import IssuedLiveKitSession, RemoteDialerInvite
 from .takeover_coordinator import (
     InboundTakeoverOfferRequest,
@@ -256,8 +257,14 @@ class CloudEdgeClient:
             return
 
         if command["type"] == "inbound.prepare":
+            if "direct" in command:
+                prepare_direct = getattr(self.service, "prepare_inbound_direct", None)
+                if config.get_bool("INBOUND_FASTPATH_V2_ENABLED") and callable(prepare_direct):
+                    prepare_direct(command)
+                return
             prepare = getattr(self.service, "prepare_inbound_takeover", None)
-            if config.get_bool("INBOUND_PRECONNECT_ENABLED") and callable(prepare):
+            if (not config.get_bool("INBOUND_FASTPATH_V2_ENABLED")
+                    and config.get_bool("INBOUND_PRECONNECT_ENABLED") and callable(prepare)):
                 prepare(command)
             # Prepare is not a claim ACK and cannot transition D1 to edge_ready.
             return
@@ -270,6 +277,34 @@ class CloudEdgeClient:
         else:
             offer_id = command["offerId"]
             session = command["session"]
+
+            def reply(sdp: str | None, error_code: str | None) -> None:
+                answer = {key: command[key] for key in ("commandId", "offerId", "callId", "claimId")}
+                answer.update(v=1, type="inbound.answer", status="rejected" if error_code else "accepted")
+                if sdp is not None:
+                    answer["sdpAnswer"] = sdp
+                if error_code:
+                    answer["errorCode"] = error_code
+                try:
+                    send(json.dumps(answer, separators=(",", ":")))
+                except Exception:
+                    # SDP and TURN credentials must never reach logs on failure.
+                    logger.warning("Inbound media answer delivery failed")
+
+            direct = command.get("direct")
+            if direct is not None and not config.get_bool("INBOUND_FASTPATH_V2_ENABLED"):
+                reply(None, "DIRECT_DISABLED")
+                return
+            if command["type"] == "inbound.media.end":
+                end = getattr(self.service, "end_inbound_direct", None)
+                accepted = (config.get_bool("INBOUND_FASTPATH_V2_ENABLED") and callable(end) and end(command))
+                reply(None, None if accepted else "MEDIA_END_REJECTED")
+                return
+            if command["type"] == "inbound.media.sdp":
+                supply_sdp = getattr(self.service, "supply_inbound_direct_sdp", None)
+                if not callable(supply_sdp) or not supply_sdp(command, reply):
+                    reply(None, "MEDIA_SDP_REJECTED")
+                return
             issued = IssuedLiveKitSession(
                 invite=RemoteDialerInvite(
                     session_id=session["sessionId"],
@@ -282,7 +317,17 @@ class CloudEdgeClient:
                 browser_token="",
                 edge_token=session["token"],
                 livekit_url=session["livekitUrl"],
+                direct=InboundDirectRequest(offer_id, command["claimId"], direct.get("sdpOffer"),
+                                            direct.get("iceServers", []),
+                                            (lambda *_: None) if direct.get("deferred") else reply)
+                if direct is not None else None,
             )
+            if command["type"] == "inbound.media.livekit":
+                fallback = getattr(self.service, "fallback_inbound_direct", None)
+                if (not config.get_bool("INBOUND_FASTPATH_V2_ENABLED") or not callable(fallback)
+                        or not fallback(command, issued, reply)):
+                    reply(None, "MEDIA_FALLBACK_REJECTED")
+                return
             result = self.service.accept_inbound_takeover_claim(
                 offer_id=offer_id,
                 call_id=call_id,
@@ -293,6 +338,12 @@ class CloudEdgeClient:
             )
             accepted = result.accepted
             error = result.code.value if result.code is not None else None
+            if not accepted and direct is not None:
+                reply(None, error or "CLAIM_REJECTED")
+            if direct is not None:
+                if accepted and direct.get("deferred"):
+                    reply(None, None)
+                return
         response: dict[str, Any] = {
             "v": 1,
             "type": "command.ack",
@@ -415,7 +466,8 @@ class CloudEdgeClient:
                         "nonce": request.nonce,
                         "expiresAtUnixMs": round(request.expires_at * 1000),
                         **({"mode": "phone_first"} if request.phone_first
-                           and config.get_bool("INBOUND_PRECONNECT_ENABLED") else {}),
+                           and (config.get_bool("INBOUND_PRECONNECT_ENABLED")
+                                or config.get_bool("INBOUND_FASTPATH_V2_ENABLED")) else {}),
                     },
                     separators=(",", ":"),
                 )
@@ -506,7 +558,9 @@ class CloudEdgeClient:
             "status": {
                 "modemOnline": bool(self.service.modem_connected),
                 "lineBusy": self.service.line_busy(),
-                **({"inboundPreconnectV1": True} if config.get_bool("INBOUND_PRECONNECT_ENABLED") else {}),
+                **({"inboundPreconnectV1": True} if config.get_bool("INBOUND_PRECONNECT_ENABLED")
+                   and not config.get_bool("INBOUND_FASTPATH_V2_ENABLED") else {}),
+                **({"inboundFastpathV2": True} if config.get_bool("INBOUND_FASTPATH_V2_ENABLED") else {}),
             },
         }
         return json.dumps(payload, separators=(",", ":"))
@@ -521,7 +575,7 @@ class CloudEdgeClient:
 
 
 def _parse_cloud_command(raw: str) -> dict[str, Any]:
-    if not isinstance(raw, str) or not raw or len(raw.encode("utf-8")) > _MAX_JSON_BYTES:
+    if not isinstance(raw, str) or not raw or len(raw.encode("utf-8")) > 64 * 1024:
         raise ValueError("invalid command")
     try:
         value = json.loads(raw)
@@ -529,17 +583,43 @@ def _parse_cloud_command(raw: str) -> dict[str, Any]:
         raise ValueError("invalid command") from exc
     if not isinstance(value, dict):
         raise ValueError("invalid command")
+    if "direct" not in value and len(raw.encode("utf-8")) > _MAX_JSON_BYTES:
+        raise ValueError("invalid command")
     command_type = value.get("type")
     if command_type == "session.start":
         return _validate_session_command(value)
     if command_type == "inbound.claim":
         return _validate_inbound_claim(value)
+    if command_type == "inbound.media.sdp":
+        _validate_inbound_claim({**value, "type": "inbound.claim"})
+        if not isinstance(value.get("direct"), dict) or "sdpOffer" not in value["direct"]:
+            raise ValueError("invalid SDP command")
+        return value
+    if command_type in {"inbound.media.livekit", "inbound.media.end"}:
+        _validate_inbound_claim({**value, "type": "inbound.claim"})
+        if "direct" in value:
+            raise ValueError("invalid fallback")
+        return value
     if command_type == "inbound.prepare":
         if value.get("mode") != "phone_first":
             raise ValueError("invalid prepare mode")
         expiry = value.get("expiresAtUnixMs")
         if type(expiry) is not int or not time.time() * 1000 < expiry <= (time.time() + 60) * 1000:
             raise ValueError("invalid prepare expiry")
+        if "direct" in value:
+            if set(value) != {"v", "type", "commandId", "offerId", "callId", "generation", "nonce",
+                              "mode", "expiresAtUnixMs", "direct"}:
+                raise ValueError("invalid direct prepare")
+            if value.get("v") != 1 or any(not _valid_id(value.get(key), prefix) for key, prefix in (
+                    ("commandId", "command"), ("offerId", "offer"), ("callId", "call"))):
+                raise ValueError("invalid direct prepare scope")
+            if (type(value.get("generation")) is not int or value["generation"] < 0
+                    or not isinstance(value.get("nonce"), str) or not 16 <= len(value["nonce"]) <= 128):
+                raise ValueError("invalid direct prepare fence")
+            if not isinstance(value["direct"], dict) or set(value["direct"]) != {"iceServers"}:
+                raise ValueError("invalid direct prepare media")
+            _validate_ice_servers(value["direct"]["iceServers"])
+            return value
         claim = {k: v for k, v in value.items() if k not in {"expiresAtUnixMs", "mode"}}
         claim.update(type="inbound.claim", claimId="claim_prepareplaceholder")
         _validate_inbound_claim(claim)
@@ -578,7 +658,7 @@ def _validate_session_command(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_inbound_claim(value: dict[str, Any]) -> dict[str, Any]:
-    if set(value) != {
+    if set(value) - {"direct"} != {
         "v",
         "type",
         "commandId",
@@ -607,7 +687,33 @@ def _validate_inbound_claim(value: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(nonce, str) or not 16 <= len(nonce) <= 128:
         raise ValueError("invalid command")
     _validate_issued_session(value.get("session"))
+    if "direct" in value:
+        direct = value["direct"]
+        if isinstance(direct, dict) and set(direct) == {"deferred"} and direct["deferred"] is True:
+            return value
+        if not isinstance(direct, dict) or set(direct) != {"sdpOffer", "iceServers"}:
+            raise ValueError("invalid direct media")
+        sdp = direct["sdpOffer"]
+        if not isinstance(sdp, str) or not sdp.startswith("v=0") or len(sdp.encode("utf-8")) > 16 * 1024:
+            raise ValueError("invalid SDP")
+        _validate_ice_servers(direct["iceServers"])
     return value
+
+
+def _validate_ice_servers(servers: Any) -> None:
+    if not isinstance(servers, list) or len(servers) > 16:
+        raise ValueError("invalid ICE servers")
+    for server in servers:
+        if not isinstance(server, dict) or set(server) - {"urls", "username", "credential"}:
+            raise ValueError("invalid ICE server")
+        urls = server.get("urls")
+        if (not isinstance(urls, list) or not 1 <= len(urls) <= 16
+                or any(not isinstance(url, str) or len(url) > 512
+                       or not url.startswith(("stun:", "stuns:", "turn:", "turns:")) for url in urls)):
+            raise ValueError("invalid ICE URLs")
+        if any(not isinstance(server.get(key, ""), str) or len(server.get(key, "")) > 1024
+               for key in ("username", "credential")):
+            raise ValueError("invalid ICE credentials")
 
 
 def _validate_data_request(value: dict[str, Any]) -> dict[str, Any]:

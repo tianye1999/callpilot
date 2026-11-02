@@ -22,6 +22,9 @@ CLIENT_MARKS = frozenset({
     "push_received", "prepare_start", "prepare_response", "preconnect_start", "preconnect_ready",
     "permission_ready", "transport_adopted", "cold_fallback", "claim_response_end",
     "audio_lease_start", "audio_lease_end",
+    "sdp_submit_start", "sdp_submit_response",
+    "cloud_cas_ms", "cloud_turn_ms", "cloud_sdp_relay_ms", "cloud_claim_finalize_ms", "cloud_total_ms",
+    "cloud_edge_reserve_ms",
 })
 MAX_TIMING_BYTES = 2048
 MAX_TIMING_BATCH_MARKS = 16
@@ -73,6 +76,32 @@ class CallTiming:
 
     def mark(self, stage: str) -> None:
         self._emit("edge_" + stage, round((self._clock() - self._origin) * 1000, 3))
+
+    def summary(self) -> dict[str, float | None]:
+        """Durations only within one clock domain; a renderer frame may be silent."""
+        intervals = {
+            "client_answer_to_claim_ms": ("client_answer_action", "client_claim_start"),
+            "client_claim_http_ms": ("client_claim_start", "client_claim_response"),
+            "client_sdp_http_ms": ("client_sdp_submit_start", "client_sdp_submit_response"),
+            "client_answer_to_track_frame_ms": ("client_answer_action", "client_downlink_first_frame"),
+            "client_connect_ms": ("client_connect_start", "client_connect_return"),
+            "client_microphone_ms": ("client_mic_enable_start", "client_mic_enable_return"),
+            "edge_claim_to_pcm_ms": ("edge_claim_received", "edge_pcm_ready"),
+            "edge_claim_to_modem_frame_ms": ("edge_claim_received", "edge_first_modem_to_phone"),
+            "edge_join_to_subscription_ms": ("edge_phone_joined", "edge_phone_track_subscribed"),
+            "edge_sdp_answer_ms": ("edge_claim_received", "edge_direct_answer_ready"),
+            "edge_claim_to_sdp_ms": ("edge_claim_received", "edge_direct_sdp_received"),
+            "edge_sdp_exchange_ms": ("edge_direct_sdp_received", "edge_direct_answer_ready"),
+            "edge_direct_ice_ms": ("edge_direct_answer_ready", "edge_direct_connected"),
+            "edge_claim_to_phone_frame_ms": ("edge_claim_received", "edge_phone_first_frame"),
+        }
+        result = {name: round(self._marks[end] - self._marks[start], 3)
+                  if start in self._marks and end in self._marks else None
+                  for name, (start, end) in intervals.items()}
+        for name in ("cloud_cas_ms", "cloud_edge_reserve_ms", "cloud_turn_ms", "cloud_sdp_relay_ms",
+                     "cloud_claim_finalize_ms", "cloud_total_ms"):
+            result[name] = self._marks.get("client_" + name)
+        return result
 
     def include_preconnect(self, other: CallTiming) -> None:
         for stage, ms in other._marks.items():

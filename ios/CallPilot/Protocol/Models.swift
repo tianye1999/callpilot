@@ -21,6 +21,9 @@ struct HostedCallSession: Equatable, CustomStringConvertible, CustomDebugStringC
     let expiresAt: Int64
     var mode: String = "cold"
     var edgeIdentity: String? = nil
+    var directAttempted: Bool = false
+    var sdpAnswer: String? = nil
+    var sdpPending: Bool = false
 
     /// Keep one-time room credentials out of logs and crash reports.
     var description: String {
@@ -35,6 +38,14 @@ struct InboundPreparation {
     let roomName: String
     let participantIdentity: String
     let session: HostedCallSession
+}
+
+struct CallIceServer: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    let urls: [String]
+    let username: String?
+    let credential: String?
+    var description: String { "CallIceServer(urls: \(urls), credentials: ***)" }
+    var debugDescription: String { description }
 }
 
 /// #95 一条可接管的来电 offer;云端只暴露 opaque id、CallKit UUID 与过期时间。
@@ -62,12 +73,15 @@ struct HostedDeviceStatus: Equatable {
     let modemOnline: Bool
     let claimPrewarm: Bool
     let preconnect: Bool
+    let inboundFastpathV2: Bool
 
-    init(connected: Bool, modemOnline: Bool, claimPrewarm: Bool = false, preconnect: Bool = false) {
+    init(connected: Bool, modemOnline: Bool, claimPrewarm: Bool = false, preconnect: Bool = false,
+         inboundFastpathV2: Bool = false) {
         self.connected = connected
         self.modemOnline = modemOnline
         self.claimPrewarm = claimPrewarm
         self.preconnect = preconnect
+        self.inboundFastpathV2 = inboundFastpathV2
     }
 
     /// 是否允许拨号/接管:电脑端在线且模组在线(对齐 Android connected && modemOnline)。

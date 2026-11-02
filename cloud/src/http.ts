@@ -23,11 +23,11 @@ export function error(
   return json({ error: { code, message, requestId } }, status, headers);
 }
 
-export async function readJson(request: Request): Promise<unknown> {
+export async function readJson(request: Request, limitBytes = 16 * 1024): Promise<unknown> {
   const contentLength = Number(request.headers.get("Content-Length") ?? "0");
-  if (contentLength > 16 * 1024) throw new HttpError("PAYLOAD_TOO_LARGE", "Request is too large", 413);
+  if (contentLength > limitBytes) throw new HttpError("PAYLOAD_TOO_LARGE", "Request is too large", 413);
   const raw = await request.arrayBuffer();
-  if (raw.byteLength > 16 * 1024) throw new HttpError("PAYLOAD_TOO_LARGE", "Request is too large", 413);
+  if (raw.byteLength > limitBytes) throw new HttpError("PAYLOAD_TOO_LARGE", "Request is too large", 413);
   try {
     return JSON.parse(new TextDecoder().decode(raw));
   } catch {
