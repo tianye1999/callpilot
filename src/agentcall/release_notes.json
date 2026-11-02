@@ -1,4 +1,4 @@
 {
-  "zh": "应用改名为「KinyAI-SIM助手」；改进来电转到手机接听。",
-  "en": "The app is now called KinyAI SIM Assistant; improved handing incoming calls to your phone."
+  "zh": "在手机上挂断后，电话会立即结束；修复了偶尔在通话结束后线路短暂掉线的问题。",
+  "en": "Hanging up on your phone now ends the call right away; fixed an occasional brief line dropout after a call."
 }
