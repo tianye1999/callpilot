@@ -21,6 +21,12 @@ const sdp = "v=0\r\ns=synthetic\r\n";
 const iceServers = [{ urls: ["turn:turn.example:3478?transport=udp", "turn:turn.example:53?transport=udp"],
   username: "temporary", credential: "temporary-password" }];
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
 async function fixture() {
   const db = new DatabaseSync(":memory:");
   databases.push(db);
@@ -74,7 +80,7 @@ async function fixture() {
     }
     return Response.json({ accepted: true }, { status: 202 });
   });
-  env.EDGE_ROOMS = { idFromName: (id: string) => id, get: () => ({ fetch: relay }) } as unknown as DurableObjectNamespace;
+  env.EDGE_ROOMS = { idFromName: (id: string) => id, get: vi.fn(() => ({ fetch: relay })) } as unknown as DurableObjectNamespace;
   const request = (path: string, body?: object, id = device) => worker.fetch(new Request(`https://relay${path}`, {
     method: body === undefined ? "GET" : "POST",
     headers: { Origin: "https://relay", "Content-Type": "application/json", Cookie: `__Host-callpilot-device=${id}.secret` },
@@ -93,6 +99,43 @@ const endPath = `/v1/inbound-offers/${offer}/media/end`;
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); databases.splice(0).forEach(db => db.close()); });
 
 describe("direct inbound fastpath V2", () => {
+  it("pipelines inline SDP before the reservation acknowledgement without changing the winning claim", async () => {
+    const f = await fixture();
+    const original = f.relay.getMockImplementation()!;
+    const reserveStarted = deferred<void>();
+    const releaseReserve = deferred<void>();
+    const sdpSent = deferred<void>();
+    let reserveAcknowledged = false;
+    f.relay.mockImplementation(async (url, init) => {
+      if (url.endsWith("/inbound-media-relay")) {
+        const command = JSON.parse(init!.body as string);
+        if (command.type === "inbound.claim") {
+          reserveStarted.resolve();
+          await releaseReserve.promise;
+          reserveAcknowledged = true;
+        } else if (command.type === "inbound.media.sdp") {
+          expect(reserveAcknowledged).toBe(false);
+          sdpSent.resolve();
+        }
+      }
+      return original(url, init);
+    });
+    let completed = false;
+    const pending = f.request(claimPath, { offerId: offer, mediaTransport: "webrtc", sdpOffer: sdp })
+      .then(response => { completed = true; return response; });
+    await reserveStarted.promise;
+    await sdpSent.promise;
+    expect(completed).toBe(false);
+    releaseReserve.resolve();
+    expect((await pending).status).toBe(202);
+    const commands = f.relay.mock.calls.filter(([url]) => url.endsWith("/inbound-media-relay"))
+      .map(([, init]) => JSON.parse(init!.body as string));
+    expect(commands.map(command => command.type)).toEqual(["inbound.claim", "inbound.media.sdp"]);
+    expect(commands[1].claimId).toBe(commands[0].claimId);
+    expect(f.env.EDGE_ROOMS.get).toHaveBeenCalledOnce();
+    await Promise.all(f.background);
+  });
+
   it.each(["timeout", "offline", "network", "invalid_answer"])("fails the claim with EDGE_OFFLINE when reservation is %s", async reason => {
     const f = await fixture();
     const original = f.relay.getMockImplementation()!;
@@ -109,9 +152,59 @@ describe("direct inbound fastpath V2", () => {
     expect(await response.json()).toMatchObject({ error: { code: "EDGE_OFFLINE" } });
     expect(f.db.prepare("SELECT status,claimed_device_id FROM inbound_offers").get())
       .toMatchObject({ status: "failed", claimed_device_id: device });
-    expect(f.turn).not.toHaveBeenCalled();
+    expect(f.turn).toHaveBeenCalledOnce();
     expect((await f.request(claimPath, { offerId: offer, mediaTransport: "webrtc" }, other)).status).toBe(409);
     await Promise.all(f.background);
+  });
+
+  it("returns reservation failure without awaiting in-flight SDP and observes a late SDP rejection", async () => {
+    const f = await fixture();
+    const original = f.relay.getMockImplementation()!;
+    const releaseReserve = deferred<void>();
+    const sdpSent = deferred<void>();
+    const releaseSdp = deferred<void>();
+    f.relay.mockImplementation(async (url, init) => {
+      if (url.endsWith("/inbound-media-relay")) {
+        const command = JSON.parse(init!.body as string);
+        if (command.type === "inbound.claim") {
+          await releaseReserve.promise;
+          return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
+        }
+        if (command.type === "inbound.media.sdp") {
+          sdpSent.resolve();
+          await releaseSdp.promise;
+          return Response.json({ error: "OFFER_UNAVAILABLE" }, { status: 409 });
+        }
+      }
+      return original(url, init);
+    });
+    const pending = f.request(claimPath, { offerId: offer, mediaTransport: "webrtc", sdpOffer: sdp });
+    await sdpSent.promise;
+    releaseReserve.resolve();
+    const response = await pending;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: { code: "EDGE_OFFLINE" } });
+    releaseSdp.resolve();
+    await Promise.all(f.background);
+    expect(f.db.prepare("SELECT status FROM inbound_offers").get()?.status).toBe("failed");
+  });
+
+  it("does not send late SDP when TURN finishes after reservation failure", async () => {
+    const f = await fixture();
+    const original = f.relay.getMockImplementation()!;
+    const turnStarted = deferred<void>();
+    const releaseTurn = deferred<Response>();
+    f.turn.mockImplementation(() => { turnStarted.resolve(); return releaseTurn.promise; });
+    f.relay.mockImplementation(async (url, init) => {
+      if (url.endsWith("/inbound-media-relay")) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
+      return original(url, init);
+    });
+    const pending = f.request(claimPath, { offerId: offer, mediaTransport: "webrtc", sdpOffer: sdp });
+    await turnStarted.promise;
+    expect((await pending).status).toBe(409);
+    releaseTurn.resolve(Response.json({ iceServers }));
+    await Promise.all(f.background);
+    expect(f.relay.mock.calls.filter(([url]) => url.endsWith("/inbound-media-relay"))).toHaveLength(1);
   });
 
   it("allows only the winning claim to end, replays successful end, and rejects late SDP", async () => {
@@ -510,6 +603,36 @@ describe("direct SDP DO relay", () => {
     const room = new EdgeRoom(state as unknown as DurableObjectState, env);
     return { room, socket, state };
   }
+
+  it("keeps claim before SDP through delayed body parsing without waiting for the claim answer", async () => {
+    const f = await fixture();
+    const { socket, room } = harness(f.env);
+    const reserve = { ...command(), type: "inbound.claim", direct: { deferred: true } };
+    const media = { ...command(), commandId: "command_sdpabcdefghijk" };
+    const bodyStarted = deferred<void>();
+    const releaseBody = deferred<string>();
+    const sentBoth = deferred<void>();
+    socket.send.mockImplementation(() => {
+      if (socket.send.mock.calls.length === 2) sentBoth.resolve();
+    });
+    const reserveRequest = new Request("https://edge-room/inbound-media-relay", { method: "POST", body: "delayed" });
+    vi.spyOn(reserveRequest, "text").mockImplementation(() => {
+      bodyStarted.resolve();
+      return releaseBody.promise;
+    });
+    const reservePending = room.fetch(reserveRequest);
+    await bodyStarted.promise;
+    const mediaPending = room.fetch(new Request("https://edge-room/inbound-media-relay", { method: "POST", body: JSON.stringify(media) }));
+    expect(socket.send).not.toHaveBeenCalled();
+    releaseBody.resolve(JSON.stringify(reserve));
+    await sentBoth.promise;
+    expect(socket.send.mock.calls.map(([text]) => JSON.parse(text).type)).toEqual(["inbound.claim", "inbound.media.sdp"]);
+    for (const message of [reserve, media]) await room.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({
+      v: 1, type: "inbound.answer", commandId: message.commandId, offerId: offer, callId: message.callId,
+      claimId: message.claimId, status: "accepted", ...(message.type === "inbound.media.sdp" ? { sdpAnswer: sdp } : {})
+    }));
+    expect((await Promise.all([reservePending, mediaPending])).map(response => response.status)).toEqual([200, 200]);
+  });
 
   it("expires reservation at five seconds, ignores its late answer, and leaves SDP pending until fifteen seconds", async () => {
     const f = await fixture();

@@ -7,6 +7,7 @@ vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
 vi.mock("../src/livekit", () => ({ issueParticipantToken: vi.fn() }));
 
 import worker from "../src/index";
+import { ClaimTiming } from "../src/claim-timing";
 import { issueParticipantToken } from "../src/livekit";
 import { sha256 } from "../src/security";
 import type { Env } from "../src/types";
@@ -17,6 +18,31 @@ const deviceId = "device_abcdefghijkl";
 const edgeId = "edge_abcdefghijkl";
 const offerId = "offer_abcdefghijkl";
 const stages = ["auth", "cas", "edge_token", "phone_token", "edge_send", "audit", "total"];
+
+it("logs direct-stage start offsets independently of overlapping stage durations", async () => {
+  let clock = 100;
+  vi.spyOn(performance, "now").mockImplementation(() => clock);
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const timing = new ClaimTiming();
+  let reserveDone!: () => void, sdpDone!: () => void;
+  clock = 110;
+  const reserve = timing.measure("edge_reserve", () => new Promise<void>(resolve => { reserveDone = resolve; }));
+  clock = 111;
+  await timing.measure("turn", async () => undefined);
+  clock = 112;
+  const sdp = timing.measure("sdp_relay", () => new Promise<void>(resolve => { sdpDone = resolve; }));
+  clock = 610;
+  reserveDone();
+  await reserve;
+  clock = 615;
+  sdpDone();
+  await sdp;
+  const response = timing.finish(new Response());
+  expect(JSON.parse(log.mock.calls[0]![0])).toMatchObject({ edge_reserve_start_ms: 10, turn_start_ms: 11,
+    sdp_relay_start_ms: 12, edge_reserve: 500, turn: 0, sdp_relay: 503 });
+  expect(response.headers.get("Server-Timing")).toContain("edge_reserve;dur=500.0");
+  expect(response.headers.get("Server-Timing")).not.toContain("start_ms");
+});
 
 async function fixture() {
   vi.spyOn(Date, "now").mockReturnValue(now);

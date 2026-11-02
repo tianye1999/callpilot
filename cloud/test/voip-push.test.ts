@@ -201,6 +201,7 @@ describe("VoIP push security boundary", () => {
           token_ciphertext: encrypted.ciphertext, token_nonce: encrypted.nonce, environment: "production" }] });
       const log = vi.spyOn(console, "log").mockImplementation(() => {});
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const accepted = vi.fn();
 
       await dispatchInboundOfferPushes(env, {
         edgeId: "edge_abcdefghijkl",
@@ -214,8 +215,9 @@ describe("VoIP push security boundary", () => {
           { reason: outcome === "invalid" ? "BadDeviceToken" : "DeviceTokenNotForTopic" },
           { status: 400 }
         );
-      });
+      }, accepted);
 
+      expect(accepted).toHaveBeenCalledTimes(outcome === "accepted" ? 1 : 0);
       if (outcome === "accepted") expect(log).toHaveBeenCalledWith("VoIP push accepted", "production");
       if (outcome === "rejected") expect(warn).toHaveBeenCalledWith("VoIP push rejected", 400, "DeviceTokenNotForTopic");
       if (outcome === "invalid") expect(warn).toHaveBeenCalledWith("VoIP push rejected", 400, "BadDeviceToken");
@@ -256,8 +258,32 @@ describe("VoIP push security boundary", () => {
     await dispatched;
   });
 
+  it("notifies the first APNs acceptance immediately and only once across two targets", async () => {
+    const key = crypto.getRandomValues(new Uint8Array(32));
+    const encrypted = await encryptPushToken("aa".repeat(32), key);
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const env = pushEnv({ key, privateKeyPEM: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      deleted: [], rows: ["device_firstabcdef", "device_secondabcde"].map(device_id => ({ device_id,
+        token_ciphertext: encrypted.ciphertext, token_nonce: encrypted.nonce, environment: "production" })) });
+    let notify!: () => void;
+    const notified = new Promise<void>(resolve => { notify = resolve; });
+    const accepted = vi.fn(notify);
+    let release!: (response: Response) => void;
+    const second = new Promise<Response>(resolve => { release = resolve; });
+    let requests = 0;
+    const pending = dispatchInboundOfferPushes(env, { edgeId: "edge_abcdefghijkl", offerId: "offer_abcdefghijkl",
+      callUUID: "12345678-1234-4abc-8def-1234567890ab", expiresAtUnixMs: 1_800_000_000_000 },
+    async () => ++requests === 1 ? new Response(null, { status: 200 }) : second, accepted);
+    await notified;
+    expect(accepted).toHaveBeenCalledOnce();
+    release(new Response(null, { status: 200 }));
+    await pending;
+    expect(accepted).toHaveBeenCalledOnce();
+  });
+
   it("logs when VoIP push is disabled without calling APNs", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const accepted = vi.fn();
     const env = { ...pushEnv({ key: crypto.getRandomValues(new Uint8Array(32)), privateKeyPEM: "unused",
       deleted: [], rows: [] }), VOIP_PUSH_ENABLED: "false" } as Env;
     await dispatchInboundOfferPushes(env, {
@@ -265,12 +291,14 @@ describe("VoIP push security boundary", () => {
       offerId: "offer_abcdefghijkl",
       callUUID: "12345678-1234-4abc-8def-1234567890ab",
       expiresAtUnixMs: 1_800_000_000_000
-    }, async () => { throw new Error("APNs must not be called"); });
+    }, async () => { throw new Error("APNs must not be called"); }, accepted);
+    expect(accepted).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith("VoIP push skipped: disabled");
   });
 
   it("logs when no device has a VoIP token", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const accepted = vi.fn();
     const env = pushEnv({ key: crypto.getRandomValues(new Uint8Array(32)), privateKeyPEM: "unused",
       deleted: [], rows: [] });
     await dispatchInboundOfferPushes(env, {
@@ -278,7 +306,8 @@ describe("VoIP push security boundary", () => {
       offerId: "offer_abcdefghijkl",
       callUUID: "12345678-1234-4abc-8def-1234567890ab",
       expiresAtUnixMs: 1_800_000_000_000
-    }, async () => { throw new Error("APNs must not be called"); });
+    }, async () => { throw new Error("APNs must not be called"); }, accepted);
+    expect(accepted).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith("VoIP push skipped: no registered devices");
   });
 });

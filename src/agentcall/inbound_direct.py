@@ -241,6 +241,7 @@ class SwitchableInboundEndpoint:
             return
         sdp, servers = media
         self._timing.mark("direct_sdp_received")
+        self._timing.mark("direct_sdp_connect_start")
         factory = self._direct_factory or WebRtcRemoteMediaEndpoint
         direct = factory({"type": "offer", "sdp": sdp}, servers, call_id=self.request.claim_id)
         self._inner = direct

@@ -262,6 +262,7 @@ class CallSession:
         self._phone_first_closers: list[asyncio.Task[None]] = []
         self._inbound_direct_request: InboundDirectRequest | None = None
         self._inbound_direct_ice: tuple[str, list[dict[str, Any]]] | None = None
+        self._pcm_pre_ata_probe_lease: IncomingReservation | None = None
         self.current_caller: str | None = None
         self.call_started_at: float | None = None
         self._outbound_number: str | None = None
@@ -504,6 +505,7 @@ class CallSession:
         self._phone_first_closers = []
         self._inbound_direct_request = None
         self._inbound_direct_ice = None
+        self._pcm_pre_ata_probe_lease = None
         if phone_first_seconds is not None:
             self._phone_first_deadline = self._phone_first_clock() + phone_first_seconds
             self._phone_first_lease = self.modem.reserve_incoming()
@@ -2025,7 +2027,63 @@ class CallSession:
             self._phone_first_answered = bool(answered)
             if answered and self._record is not None and lease.ata_ms is not None:
                 self._record.log_latency("phone_first_ata_ms", lease.ata_ms)
+        if answered and config.get_bool("INBOUND_PCM_PRE_ATA_PROBE_ENABLED"):
+            await self._threaded_modem_call(self._probe_pcm_after_ata, generation, lease)
         return bool(answered)
+
+    def inbound_offer_pushed(self, command: dict[str, Any]) -> None:
+        if not config.get_bool("INBOUND_PCM_PRE_ATA_PROBE_ENABLED") or not isinstance(self.modem, Sim7600Modem):
+            return
+        with self._takeover_lock:
+            request = self._takeover_request
+            lease = self._phone_first_lease
+            if (request is None or lease is None or not request.phone_first
+                    or any(command[key] != getattr(request, attr) for key, attr in (
+                        ("offerId", "offer_id"), ("callId", "call_id"), ("generation", "generation"),
+                        ("nonce", "nonce"))) or request.generation != self._session_generation):
+                return
+            record = self._record
+        threading.Thread(target=self._probe_pcm_pre_ata, args=(request.generation, lease, record),
+                         name="pcm-pre-ata-probe", daemon=True).start()
+
+    def _probe_pcm_pre_ata(self, generation: int, lease: IncomingReservation, record: CallRecord | None) -> None:
+        if not config.get_bool("INBOUND_PCM_PRE_ATA_PROBE_ENABLED") or not isinstance(self.modem, Sim7600Modem):
+            return
+        # The same serial lock fences ATA and stale reservation replacement. No
+        # voice-enable state is set: normal post-answer initialization still runs.
+        with self.modem._serial_lock:
+            if (not self._phone_first_current(generation, lease) or lease.ata_sent
+                    or self._pcm_pre_ata_probe_lease is lease):
+                return
+            self._pcm_pre_ata_probe_lease = lease
+            started = time.monotonic()
+            try:
+                response = self.modem._send("AT+CPCMREG=1")
+                result = "OK" if "OK" in response.split() else "ERROR"
+            except Exception as exc:  # noqa: BLE001
+                result = type(exc).__name__
+            if record is not None:
+                record.log_event("pcm_pre_ata_probe", phase="before_ata", result=result,
+                                 elapsed_ms=round((time.monotonic() - started) * 1000, 3))
+
+    def _probe_pcm_after_ata(self, generation: int, lease: IncomingReservation) -> None:
+        if not config.get_bool("INBOUND_PCM_PRE_ATA_PROBE_ENABLED") or not isinstance(self.modem, Sim7600Modem):
+            return
+        with self.modem._serial_lock:
+            if self._pcm_pre_ata_probe_lease is not lease or not self._phone_first_current(generation, lease):
+                return
+            started = time.monotonic()
+            state: int | None = None
+            try:
+                response = self.modem._send("AT+CPCMREG?")
+                match = re.search(r"(?:^|\n)\s*\+CPCMREG:\s*(\d+)\s*(?:\r?\n|$)", response)
+                state = int(match.group(1)) if match else None
+                result = "OK" if "OK" in response.split() else "ERROR"
+            except Exception as exc:  # noqa: BLE001
+                result = type(exc).__name__
+            if self._record is not None:
+                self._record.log_event("pcm_pre_ata_probe", phase="after_ata", result=result, state=state,
+                                       elapsed_ms=round((time.monotonic() - started) * 1000, 3))
 
     def _phone_first_fallback(self, reason: str, generation: int) -> None:
         with self._takeover_lock:
@@ -4959,7 +5017,22 @@ class CallSession:
                     or self._phone_first_clock() >= self._phone_first_claim_deadline):
                 return False
             payload = command["direct"]
-            return direct.supply_sdp(payload["sdpOffer"], payload["iceServers"], reply)
+            accepted = direct.supply_sdp(payload["sdpOffer"], payload["iceServers"], reply)
+            if self._mobile_timing is not None:
+                if accepted:
+                    self._mobile_timing.mark("direct_sdp_received")
+                self._mobile_timing.mark("direct_sdp_handled")
+            return accepted
+
+    def mark_inbound_direct(self, command: dict[str, Any], stage: str) -> None:
+        with self._takeover_lock:
+            request, direct = self._takeover_request, self._inbound_direct_request
+            if (stage == "claim_ack_sent" and request is not None and direct is not None
+                    and self._mobile_timing is not None and self.is_active
+                    and command["offerId"] == request.offer_id and command["callId"] == request.call_id
+                    and command["generation"] == request.generation == self._session_generation
+                    and command["nonce"] == request.nonce and command["claimId"] == direct.claim_id):
+                self._mobile_timing.mark(stage)
 
     def end_inbound_direct(self, command: dict[str, Any]) -> bool:
         with self._takeover_lock:
@@ -5860,6 +5933,12 @@ class CallAgentService:
     def prepare_inbound_direct(self, command: dict[str, Any]) -> bool:
         return self.session.prepare_inbound_direct(command)
 
+    def inbound_offer_pushed(self, command: dict[str, Any]) -> None:
+        self.session.inbound_offer_pushed(command)
+
+    def mark_inbound_direct(self, command: dict[str, Any], stage: str) -> None:
+        self.session.mark_inbound_direct(command, stage)
+
     def supply_inbound_direct_sdp(self, command: dict[str, Any], reply: Reply) -> bool:
         return self.session.supply_inbound_direct_sdp(command, reply)
 
@@ -6030,6 +6109,10 @@ class CallAgentService:
         supervisor 连上后自动开始接听。首次连上后，后续掉线由 modem 读循环
         的自愈重连（P0-1）接管。
         """
+        if config.get_bool("INBOUND_FASTPATH_V2_ENABLED"):
+            from .webrtc_media import warm_webrtc_stack
+
+            warm_webrtc_stack()
         try:
             purged = self.call_logger.purge_expired()
             if purged:

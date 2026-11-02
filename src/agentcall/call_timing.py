@@ -91,6 +91,8 @@ class CallTiming:
             "edge_join_to_subscription_ms": ("edge_phone_joined", "edge_phone_track_subscribed"),
             "edge_sdp_answer_ms": ("edge_claim_received", "edge_direct_answer_ready"),
             "edge_claim_to_sdp_ms": ("edge_claim_received", "edge_direct_sdp_received"),
+            "edge_claim_ack_ms": ("edge_claim_received", "edge_claim_ack_sent"),
+            "edge_direct_sdp_handled_ms": ("edge_claim_received", "edge_direct_sdp_handled"),
             "edge_sdp_exchange_ms": ("edge_direct_sdp_received", "edge_direct_answer_ready"),
             "edge_direct_ice_ms": ("edge_direct_answer_ready", "edge_direct_connected"),
             "edge_claim_to_phone_frame_ms": ("edge_claim_received", "edge_phone_first_frame"),

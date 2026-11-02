@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import math
+import threading
 import time
+from concurrent.futures import Future
 from fractions import Fraction
+from types import SimpleNamespace
 from typing import Any
 
 from . import config
@@ -23,28 +27,76 @@ _FRAME_SAMPLES = REMOTE_AUDIO_RATE // 50
 _FRAME_BYTES = _FRAME_SAMPLES * 2
 _MAX_CONTROL_BYTES = 4096
 _MAX_CONTROL_BUFFER = 64 * 1024
+_warm_lock = threading.Lock()
+_warm_future: Future[Any] | None = None
+_stack: Any = None
+
+
+def warm_webrtc_stack() -> Future[Any]:
+    """Start exactly one background import/codec/certificate warm-up, never block the caller."""
+    global _warm_future
+    with _warm_lock:
+        if _warm_future is not None:
+            return _warm_future
+        future: Future[Any] = Future()
+        _warm_future = future
+
+    def warm() -> None:
+        global _stack
+        started = time.monotonic()
+        try:
+            rtc = importlib.import_module("aiortc")
+            av = importlib.import_module("av")
+            importlib.import_module("pylibsrtp")
+            importlib.import_module("aioice")
+            streams = importlib.import_module("aiortc.mediastreams")
+            ice_adapter = importlib.import_module("agentcall.webrtc_ice")
+
+            async def initialize() -> None:
+                pc = rtc.RTCPeerConnection(rtc.RTCConfiguration(iceServers=[]))
+                try:
+                    pc.addTransceiver("audio")
+                    pc.createDataChannel(REMOTE_CONTROL_TOPIC)
+                    await pc.createOffer()
+                    # Exercise libav's resampling and Opus initialization off the call loop.
+                    frame = av.AudioFrame(format="s16", layout="mono", samples=_FRAME_SAMPLES)
+                    frame.planes[0].update(bytes(_FRAME_BYTES))
+                    frame.sample_rate, frame.pts, frame.time_base = REMOTE_AUDIO_RATE, 0, Fraction(1, REMOTE_AUDIO_RATE)
+                    opus = importlib.import_module("aiortc.codecs.opus")
+                    opus.OpusEncoder().encode(frame)
+                finally:
+                    await pc.close()
+
+            asyncio.run(initialize())
+            _stack = SimpleNamespace(rtc=rtc, av=av, streams=streams, ice=ice_adapter)
+            logger.info("webrtc stack warmed in %.2fs", time.monotonic() - started)
+            future.set_result(_stack)
+        except Exception as error:
+            logger.warning("WebRTC stack warm-up failed: %s", type(error).__name__)
+            future.set_exception(error)
+
+    threading.Thread(target=warm, name="webrtc-warmup", daemon=True).start()
+    return future
 
 
 def ice_servers_config(servers: list[dict[str, Any]]) -> Any:
-    from aiortc import RTCConfiguration, RTCIceServer
-
+    # Standalone probe/fake clients may use this helper before service startup.
+    stack = _stack if _stack is not None else warm_webrtc_stack().result()
     ice = []
     for server in servers:
         urls = server.get("urls")
         urls = [urls] if isinstance(urls, str) else urls
         if not isinstance(urls, list) or not urls or not all(isinstance(url, str) for url in urls):
             raise ValueError("Invalid ICE server URLs")
-        ice.append(RTCIceServer(urls=urls, username=server.get("username"), credential=server.get("credential")))
+        ice.append(stack.rtc.RTCIceServer(
+            urls=urls, username=server.get("username"), credential=server.get("credential"),
+        ))
     # An explicit empty list disables the SDK's default external STUN server.
-    return RTCConfiguration(iceServers=ice)
+    return stack.rtc.RTCConfiguration(iceServers=ice)
 
 
 def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
-    from aiortc import MediaStreamTrack
-    from aiortc.mediastreams import MediaStreamError
-    from av import AudioFrame
-
-    class ModemTrack(MediaStreamTrack):
+    class ModemTrack(_stack.rtc.MediaStreamTrack):
         kind = "audio"
 
         def __init__(self) -> None:
@@ -53,14 +105,14 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
             self._pts = 0
             self.stats = PcmFlowStats("downlink1_direct_publish")
 
-        async def recv(self) -> AudioFrame:
+        async def recv(self) -> Any:
             if self.readyState != "live":
-                raise MediaStreamError
+                raise _stack.streams.MediaStreamError
             now = time.monotonic()
             if self._next_at is not None:
                 await asyncio.sleep(max(0, self._next_at - now))
             if self.readyState != "live":
-                raise MediaStreamError
+                raise _stack.streams.MediaStreamError
             # Do not burst stale frames after an event-loop stall.
             self._next_at = time.monotonic() + 0.02
             try:
@@ -68,7 +120,7 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
                 self.stats.add(pcm)
             except asyncio.QueueEmpty:
                 pcm = bytes(_FRAME_BYTES)
-            frame = AudioFrame(format="s16", layout="mono", samples=_FRAME_SAMPLES)
+            frame = _stack.av.AudioFrame(format="s16", layout="mono", samples=_FRAME_SAMPLES)
             frame.planes[0].update(pcm)
             frame.sample_rate = REMOTE_AUDIO_RATE
             frame.pts = self._pts
@@ -139,21 +191,23 @@ class WebRtcRemoteMediaEndpoint:
 
     async def _check_current(self, pc: Any) -> None:
         if self._closed or self._pc is not pc:
-            await pc.close()
+            await self.close()
             raise asyncio.CancelledError
 
     async def connect(self) -> None:
         """Gather an answer; ICE/DTLS and microphone readiness continue asynchronously."""
-        from aiortc import RTCPeerConnection, RTCSessionDescription
-
         if self._closed:
             raise asyncio.CancelledError
         if self._started:
             raise RuntimeError("A direct endpoint can connect only once")
         self._started = True
         self._timing.mark("endpoint_connect_start")
+        # A first claim without prepare still loads on a worker thread, not the event loop.
+        stack = await asyncio.shield(asyncio.wrap_future(warm_webrtc_stack()))
+        if self._closed:
+            raise asyncio.CancelledError
         pc = (self._peer_factory(self._ice_servers) if self._peer_factory is not None
-              else RTCPeerConnection(ice_servers_config(self._ice_servers)))
+              else stack.rtc.RTCPeerConnection(ice_servers_config(self._ice_servers)))
         self._pc = pc
 
         @pc.on("connectionstatechange")
@@ -214,10 +268,11 @@ class WebRtcRemoteMediaEndpoint:
             self._track_task = asyncio.create_task(self._pump_phone_audio(track))
 
         try:
-            await pc.setRemoteDescription(RTCSessionDescription(**self._offer))
+            await pc.setRemoteDescription(stack.rtc.RTCSessionDescription(**self._offer))
             await self._check_current(pc)
             self._local_track = _modem_track(self._modem_audio, self._downlink_gain)
             pc.addTrack(self._local_track)
+            stack.ice.configure_peer(pc)
             answer = await pc.createAnswer()
             await self._check_current(pc)
             # aiortc gathers local candidates here, but does not wait for peer ICE.
@@ -231,9 +286,8 @@ class WebRtcRemoteMediaEndpoint:
             raise
 
     async def _pump_phone_audio(self, track: Any) -> None:
-        from av import AudioResampler
-
-        resampler = AudioResampler(format="s16", layout="mono", rate=REMOTE_AUDIO_RATE, frame_size=_FRAME_SAMPLES)
+        resampler = _stack.av.AudioResampler(format="s16", layout="mono", rate=REMOTE_AUDIO_RATE,
+                                           frame_size=_FRAME_SAMPLES)
         try:
             while not self._closed:
                 frame = await track.recv()
@@ -276,6 +330,8 @@ class WebRtcRemoteMediaEndpoint:
         if self._channel is not None:
             self._channel.close()
         if self._pc is not None:
+            if _stack is not None:
+                await _stack.ice.stop_peer_checks(self._pc)
             await self._pc.close()
         if self._track_task is not None:
             await asyncio.gather(self._track_task, return_exceptions=True)

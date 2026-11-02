@@ -75,6 +75,10 @@ def test_v2_reservation_acknowledges_before_sdp_and_never_reclaims(monkeypatch):
     monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
 
     class Service(_Service):
+        def mark_inbound_direct(self, command, stage):
+            assert len(messages) == 1, "ACK must be sent before its timing mark"
+            marked.append(stage)
+
         def supply_inbound_direct_sdp(self, command, reply):
             direct = self.claims[0]["issued"].direct
             return direct.supply_sdp(command["direct"]["sdpOffer"], command["direct"]["iceServers"], reply)
@@ -82,9 +86,11 @@ def test_v2_reservation_acknowledges_before_sdp_and_never_reclaims(monkeypatch):
     service = Service()
     client = CloudEdgeClient("https://relay.example.test", service, _Store())
     messages = []
+    marked = []
     reserve = _takeover_claim(direct={"deferred": True})
     client.handle_message(json.dumps(reserve), messages.append)
     assert len(service.claims) == len(messages) == 1
+    assert marked == ["claim_ack_sent"]
     ack = json.loads(messages[0])
     assert ack["type"] == "inbound.answer" and ack["status"] == "accepted"
     assert "sdpAnswer" not in ack
@@ -108,6 +114,8 @@ def test_v2_turn_prepare_is_scoped_and_never_claims(monkeypatch, enabled):
     monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", str(enabled).lower())
     service = _Service()
     prepared = []
+    warmed = []
+    monkeypatch.setattr("agentcall.webrtc_media.warm_webrtc_stack", lambda: warmed.append(True), raising=False)
     monkeypatch.setattr(service, "prepare_inbound_direct", prepared.append, raising=False)
     client = CloudEdgeClient("https://relay.example.test", service, _Store())
     value = _takeover_claim()
@@ -117,10 +125,41 @@ def test_v2_turn_prepare_is_scoped_and_never_claims(monkeypatch, enabled):
     sent = []
     client.handle_message(json.dumps(value), sent.append)
     assert len(prepared) == int(enabled)
+    assert len(warmed) == int(enabled)
     assert not sent and not service.claims
     value["nonce"] = "bad"
     client.handle_message(json.dumps(value), sent.append)
     assert len(prepared) == int(enabled)
+
+
+def test_reservation_send_failure_does_not_emit_ack_sent_mark(monkeypatch):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+    service = _Service()
+    marks = []
+    monkeypatch.setattr(service, "mark_inbound_direct", lambda *_: marks.append(True), raising=False)
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+
+    def broken_send(_):
+        raise OSError("closed")
+
+    client.handle_message(json.dumps(_takeover_claim(direct={"deferred": True})), broken_send)
+    assert not marks
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_push_receipt_is_strict_and_diagnostic_only(monkeypatch, enabled):
+    monkeypatch.setenv("INBOUND_PCM_PRE_ATA_PROBE_ENABLED", str(enabled).lower())
+    service = _Service()
+    pushed = []
+    monkeypatch.setattr(service, "inbound_offer_pushed", pushed.append, raising=False)
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    claim = _takeover_claim()
+    receipt = {key: claim[key] for key in ("v", "offerId", "callId", "generation", "nonce")}
+    receipt["type"] = "inbound.offer.pushed"
+    client.handle_message(json.dumps(receipt), lambda *_: pytest.fail("Receipt must not ACK"))
+    assert len(pushed) == int(enabled)
+    client.handle_message(json.dumps({**receipt, "nonce": "bad"}), lambda *_: None)
+    assert len(pushed) == int(enabled)
 
 
 @pytest.mark.parametrize("direct", [{"deferred": False}, {"deferred": "true"}, {"deferred": True, "sdpOffer": "v=0"}])

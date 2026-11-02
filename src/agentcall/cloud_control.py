@@ -256,10 +256,19 @@ class CloudEdgeClient:
             self._handle_data_request(command, send)
             return
 
+        if command["type"] == "inbound.offer.pushed":
+            pushed = getattr(self.service, "inbound_offer_pushed", None)
+            if config.get_bool("INBOUND_PCM_PRE_ATA_PROBE_ENABLED") and callable(pushed):
+                pushed(command)
+            return
+
         if command["type"] == "inbound.prepare":
             if "direct" in command:
                 prepare_direct = getattr(self.service, "prepare_inbound_direct", None)
                 if config.get_bool("INBOUND_FASTPATH_V2_ENABLED") and callable(prepare_direct):
+                    from .webrtc_media import warm_webrtc_stack
+
+                    warm_webrtc_stack()
                     prepare_direct(command)
                 return
             prepare = getattr(self.service, "prepare_inbound_takeover", None)
@@ -287,6 +296,11 @@ class CloudEdgeClient:
                     answer["errorCode"] = error_code
                 try:
                     send(json.dumps(answer, separators=(",", ":")))
+                    if (command["type"] == "inbound.claim" and error_code is None
+                            and command.get("direct", {}).get("deferred")):
+                        mark = getattr(self.service, "mark_inbound_direct", None)
+                        if callable(mark):
+                            mark(command, "claim_ack_sent")
                 except Exception:
                     # SDP and TURN credentials must never reach logs on failure.
                     logger.warning("Inbound media answer delivery failed")
@@ -586,6 +600,15 @@ def _parse_cloud_command(raw: str) -> dict[str, Any]:
     if "direct" not in value and len(raw.encode("utf-8")) > _MAX_JSON_BYTES:
         raise ValueError("invalid command")
     command_type = value.get("type")
+    if command_type == "inbound.offer.pushed":
+        if (set(value) != {"v", "type", "offerId", "callId", "generation", "nonce"}
+                or value.get("v") != 1
+                or not _valid_id(value.get("offerId"), "offer")
+                or not _valid_id(value.get("callId"), "call")
+                or type(value.get("generation")) is not int or value["generation"] < 0
+                or not isinstance(value.get("nonce"), str) or not 16 <= len(value["nonce"]) <= 128):
+            raise ValueError("invalid push receipt")
+        return value
     if command_type == "session.start":
         return _validate_session_command(value)
     if command_type == "inbound.claim":

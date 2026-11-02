@@ -58,6 +58,7 @@ interface WarmInboundIce {
 export class EdgeRoom extends DurableObject<Env> {
   private readonly pendingRelays = new Map<string, PendingRelay>();
   private readonly pendingMediaRelays = new Map<string, PendingMediaRelay>();
+  private mediaDispatchTail: Promise<void> = Promise.resolve();
   private readonly warmInboundIce = new Map<string, WarmInboundIce>();
   private readonly contentRateLimiter = new ContentReadRateLimiter();
   private lastSeenAttemptAt: number | undefined;
@@ -200,7 +201,19 @@ export class EdgeRoom extends DurableObject<Env> {
   }
 
   private async relayInboundMedia(request: Request): Promise<Response> {
-    const text = await request.text();
+    const previous = this.mediaDispatchTail;
+    let dispatched!: () => void;
+    this.mediaDispatchTail = new Promise<void>(resolve => { dispatched = resolve; });
+    await previous;
+    try {
+      // Serialize only parsing and WebSocket send, never the Edge reply.
+      return this.dispatchInboundMedia(await request.text());
+    } finally {
+      dispatched();
+    }
+  }
+
+  private dispatchInboundMedia(text: string): Response | Promise<Response> {
     if (serializedByteLength(text) > CONTENT_WIRE_LIMIT_BYTES) return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
     let parsed: unknown;
     try { parsed = JSON.parse(text); } catch { return Response.json({ error: "INVALID_REQUEST" }, { status: 400 }); }
@@ -379,12 +392,17 @@ export class EdgeRoom extends DurableObject<Env> {
               expiresAtUnixMs: offer.expiresAtUnixMs, mode: "phone_first", direct: { iceServers: credentials.iceServers } }));
           })().catch(() => { console.warn("Inbound direct warming unavailable"); }));
         }
+        const pushedOffer = result.data;
         this.ctx.waitUntil(dispatchInboundOfferPushes(this.env, {
           edgeId: attachment.edgeId,
           offerId: result.data.offerId,
           callUUID,
           expiresAtUnixMs: result.data.expiresAtUnixMs
-        }).catch((error: unknown) => { console.warn("VoIP push dispatch failed", errorName(error)); }));
+        }, fetch, direct ? () => {
+          if (this.currentConnection() !== ws || pushedOffer.expiresAtUnixMs <= Date.now()) return;
+          ws.send(JSON.stringify({ v: 1, type: "inbound.offer.pushed", offerId: pushedOffer.offerId,
+            callId: pushedOffer.callId, generation: pushedOffer.generation, nonce: pushedOffer.nonce }));
+        } : undefined).catch((error: unknown) => { console.warn("VoIP push dispatch failed", errorName(error)); }));
         if (preconnect) {
           await this.ctx.storage.put("preconnectEdge", attachment.edgeId);
           await this.ctx.storage.setAlarm(now + 1000);

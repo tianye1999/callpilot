@@ -27,6 +27,7 @@ def test_phone_first_configuration_defaults_and_example(monkeypatch):
         ("INBOUND_PHONE_FIRST_ENABLED", "false"),
         ("INBOUND_PRECONNECT_ENABLED", "false"),
         ("INBOUND_EARLY_ANSWER_ENABLED", "false"),
+        ("INBOUND_PCM_PRE_ATA_PROBE_ENABLED", "false"),
         ("INBOUND_PHONE_FIRST_RING_SECONDS", "15"),
         ("INBOUND_PHONE_FIRST_MEDIA_SECONDS", "20"),
     ):
@@ -103,6 +104,52 @@ def test_direct_claim_starts_pcm_without_waiting_for_sdp_and_rejects_postcommit_
     rig.ring()
     asyncio.run(rig.session._handle_call())
     assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_cloud_claim_then_immediate_sdp_uses_same_fenced_request(rig, monkeypatch, accepted):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+    session = rig.session
+    rig.ring()
+    session._initialize_takeover_context("inbound")
+    client = CloudEdgeClient("https://relay.example.test", rig.service, SimpleNamespace())
+    replies = []
+    requests = []
+
+    def tick():
+        rig.clock.tick = lambda: None
+        offer = session._takeover_request
+        command = dict(v=1, type="inbound.claim", commandId="command_abcdefghijkl", offerId=offer.offer_id,
+                       callId=offer.call_id, claimId="claim_abcdefghijkl", generation=offer.generation,
+                       nonce=offer.nonce if accepted else "nonce_wrong_abcdefghijkl", direct={"deferred": True},
+                       session=dict(sessionId="session_abcdefghijkl", roomName="callpilot_abcdefghijkl",
+                                    browserIdentity="web_abcdefghijkl", edgeIdentity="edgepart_abcdefghijkl",
+                                    livekitUrl="wss://invalid.example", token="test" * 12))
+        client.handle_message(json.dumps(command), replies.append)
+        direct = session._inbound_direct_request
+        client.handle_message(json.dumps({**command, "type": "inbound.media.sdp",
+            "commandId": "command_sdp_abcdefghijkl", "direct": {"sdpOffer": "v=0\r\n", "iceServers": []}}),
+            replies.append)
+        if accepted:
+            assert session._inbound_direct_request is direct
+            assert direct.media_offer() == ("v=0\r\n", [])
+            summary = session._mobile_timing.summary()
+            assert summary["edge_claim_ack_ms"] is not None
+            assert summary["edge_direct_sdp_handled_ms"] >= summary["edge_claim_ack_ms"]
+            requests.append(direct)
+        else:
+            assert direct is None and session._inbound_direct_request is None
+            assert json.loads(replies[-1])["errorCode"] == "MEDIA_SDP_REJECTED"
+            session._active = False
+
+    rig.clock.tick = tick
+    result = asyncio.run(session._handle_phone_first(None))
+    if accepted:
+        assert requests and result == "completed"
+        assert json.loads(replies[0])["status"] == "accepted"
+    else:
+        assert result == "not_connected"
+        assert not rig.commands, "Rejected SDP must not allocate peer or touch modem"
 
 
 def test_reserved_incoming_answer_is_once_and_old_lease_cannot_hangup(monkeypatch):
@@ -338,6 +385,88 @@ def rig(monkeypatch):
         service=service, session=session, modem=modem, commands=commands, clock=clock,
         ring=ring, claim=claim, issued=issued, endpoint=endpoint, bridge=bridge, notifications=notifications,
     )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_service_webrtc_warmup_is_v2_only_and_nonblocking(rig, monkeypatch, enabled):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", str(enabled).lower())
+    warmed = []
+    monkeypatch.setattr("agentcall.webrtc_media.warm_webrtc_stack", lambda: warmed.append(True), raising=False)
+    monkeypatch.setattr("agentcall.call_agent.threading.Thread", lambda **_: SimpleNamespace(start=lambda: None))
+    rig.service.start()
+    assert warmed == ([True] if enabled else [])
+
+
+@pytest.mark.parametrize("response", ["OK", "ERROR", RuntimeError("serial unavailable")])
+def test_pcm_pre_ata_probe_is_once_observational_and_queries_after_ata(rig, monkeypatch, response):
+    monkeypatch.setenv("INBOUND_PCM_PRE_ATA_PROBE_ENABLED", "true")
+    rig.ring()
+    session = rig.session
+    lease = session._phone_first_lease
+    generation = session._session_generation
+    events = []
+    record = SimpleNamespace(log_event=lambda event, **fields: events.append((event, fields)),
+                             log_latency=lambda *_: None)
+    session._record = record
+    original = rig.modem._send
+
+    def send(command):
+        if command in {"AT+CPCMREG=1", "AT+CPCMREG?"}:
+            rig.commands.append(command)
+            if command == "AT+CPCMREG?":
+                return "+CPCMREG: 1\r\nOK"
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return original(command)
+
+    monkeypatch.setattr(rig.modem, "_send", send)
+    session._probe_pcm_pre_ata(generation, lease, record)
+    session._probe_pcm_pre_ata(generation, lease, record)
+    assert rig.commands == ["AT+CPCMREG=1"]
+    assert not lease.answered and not lease.ata_sent
+    assert asyncio.run(session._answer_phone_first(generation, lease))
+    assert rig.commands.index("AT+CPCMREG=1") < rig.commands.index("ATA") < rig.commands.index("AT+CPCMREG?")
+    assert events[0][0] == events[1][0] == "pcm_pre_ata_probe"
+    assert events[0][1]["result"] == (type(response).__name__ if isinstance(response, Exception) else response)
+    assert events[1][1]["phase"] == "after_ata" and events[1][1]["state"] == 1
+    assert rig.commands.count("PCM") == 0, "Probe must not mark or replace ordinary PCM initialization"
+
+
+@pytest.mark.parametrize("blocked", ["disabled", "answered", "stale"])
+def test_pcm_pre_ata_probe_cannot_run_outside_opt_in_ringing_lease(rig, monkeypatch, blocked):
+    monkeypatch.setenv("INBOUND_PCM_PRE_ATA_PROBE_ENABLED", str(blocked != "disabled").lower())
+    rig.ring()
+    session = rig.session
+    lease = session._phone_first_lease
+    generation = session._session_generation
+    if blocked == "answered":
+        lease.ata_sent = True
+    elif blocked == "stale":
+        generation -= 1
+    session._probe_pcm_pre_ata(generation, lease, None)
+    session._probe_pcm_after_ata(generation, lease)
+    assert not rig.commands
+
+
+def test_pcm_probe_is_scheduled_only_after_fenced_push_receipt(rig, monkeypatch):
+    from agentcall.takeover_coordinator import InboundTakeoverOfferRequest
+
+    monkeypatch.setenv("INBOUND_PCM_PRE_ATA_PROBE_ENABLED", "true")
+    rig.ring()
+    session = rig.session
+    offer = InboundTakeoverOfferRequest("offer_test", "nonce_test_abcdefghijkl", "call_test",
+                                       session._session_generation, 1, 1000, phone_first=True)
+    session._takeover_request = offer
+    jobs = []
+    monkeypatch.setattr("agentcall.call_agent.threading.Thread", lambda **kw: SimpleNamespace(
+        start=lambda: jobs.append(kw)))
+    fence = dict(offerId=offer.offer_id, callId=offer.call_id, generation=offer.generation, nonce=offer.nonce)
+    session.inbound_offer_pushed({**fence, "nonce": "stale"})
+    assert not jobs and not rig.commands
+    session.inbound_offer_pushed(fence)
+    assert len(jobs) == 1 and jobs[0]["target"] == session._probe_pcm_pre_ata
+    assert not rig.commands, "WebSocket dispatch must not synchronously execute serial commands"
 
 
 @pytest.mark.parametrize("outcome", ["reuse", "failure", "timeout", "hangup"])

@@ -5,6 +5,7 @@ type ClaimStage = "auth" | "offer_read" | "cas" | "edge_token" | "edge_send" | "
 export class ClaimTiming {
   private readonly started = performance.now();
   private readonly stages: Partial<Record<ClaimStage | "total", number>> = {};
+  private readonly starts: Partial<Record<`${"edge_reserve" | "turn" | "sdp_relay"}_start_ms`, number>> = {};
   private claimId?: string;
 
   tagClaim(claimId: string): void {
@@ -13,6 +14,9 @@ export class ClaimTiming {
 
   async measure<T>(stage: ClaimStage, operation: () => Promise<T>): Promise<T> {
     const started = performance.now();
+    if (stage === "edge_reserve" || stage === "turn" || stage === "sdp_relay") {
+      this.starts[`${stage}_start_ms`] = this.elapsed(this.started);
+    }
     try {
       return await operation();
     } finally {
@@ -24,7 +28,7 @@ export class ClaimTiming {
     this.stages.total = this.elapsed(this.started);
     response.headers.set("Server-Timing", Object.entries(this.stages)
       .map(([stage, duration]) => `${stage};dur=${duration.toFixed(1)}`).join(", "));
-    console.log(JSON.stringify({ ...this.stages, ...(this.claimId ? { claimId: this.claimId } : {}) }));
+    console.log(JSON.stringify({ ...this.stages, ...this.starts, ...(this.claimId ? { claimId: this.claimId } : {}) }));
     return response;
   }
 

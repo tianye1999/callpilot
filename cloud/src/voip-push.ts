@@ -105,7 +105,8 @@ export async function createApnsProviderToken(input: ProviderTokenInput): Promis
 export async function dispatchInboundOfferPushes(
   env: Env,
   input: InboundPushInput,
-  fetcher: Fetcher = fetch
+  fetcher: Fetcher = fetch,
+  onAccepted?: () => void
 ): Promise<void> {
   if (!voipPushEnabled(env.VOIP_PUSH_ENABLED)) {
     console.log("VoIP push skipped: disabled");
@@ -115,6 +116,7 @@ export async function dispatchInboundOfferPushes(
     edgeId: input.edgeId,
     pushType: "voip",
     expiresAtUnixMs: input.expiresAtUnixMs,
+    onAccepted,
     payload: buildVoipPayload({
       offerId: input.offerId,
       callUUID: input.callUUID,
@@ -125,7 +127,7 @@ export async function dispatchInboundOfferPushes(
 
 export async function dispatchApnsPushes(
   env: Env,
-  input: { edgeId: string; pushType: "voip" | "alert"; expiresAtUnixMs: number; payload: unknown },
+  input: { edgeId: string; pushType: "voip" | "alert"; expiresAtUnixMs: number; payload: unknown; onAccepted?: () => void },
   fetcher: Fetcher = fetch
 ): Promise<void> {
   const config = readPushConfig(env);
@@ -144,6 +146,7 @@ export async function dispatchApnsPushes(
     teamId: config.teamId,
     privateKeyPEM: config.privateKey
   });
+  let notifiedAccepted = false;
   const outcomes = await Promise.allSettled(targets.results.map(async (target) => {
     const token = await decryptPushToken({
       ciphertext: target.token_ciphertext,
@@ -167,6 +170,11 @@ export async function dispatchApnsPushes(
     });
     if (response.ok) {
       if (input.pushType === "voip") console.log("VoIP push accepted", target.environment);
+      if (!notifiedAccepted) {
+        notifiedAccepted = true;
+        // A receipt failure must never turn an accepted push into a reported failure.
+        try { input.onAccepted?.(); } catch { console.warn("Push receipt delivery failed"); }
+      }
       return;
     }
     const reason = await apnsReason(response);

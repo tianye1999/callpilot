@@ -109,6 +109,98 @@ def test_answer_does_not_wait_for_connection_and_close_fences_late_events():
     asyncio.run(scenario())
 
 
+def test_stack_warmup_is_idempotent_and_connect_has_no_local_imports(monkeypatch):
+    import builtins
+    import sys
+
+    from agentcall.webrtc_media import warm_webrtc_stack
+
+    async def scenario():
+        first = warm_webrtc_stack()
+        assert warm_webrtc_stack() is first
+        await asyncio.wrap_future(first)
+        assert all(name in sys.modules for name in ("aiortc", "av", "pylibsrtp", "aioice"))
+        seen = []
+        original = builtins.__import__
+
+        def observe(name, globals=None, *args, **kwargs):
+            if globals and globals.get("__name__") == "agentcall.webrtc_media":
+                seen.append(name)
+            return original(name, globals, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", observe)
+        media = endpoint(FakePeer())
+        await media.connect()
+        await media.close()
+        assert seen == []
+
+    asyncio.run(scenario())
+
+
+def test_cold_stack_import_runs_off_event_loop(monkeypatch):
+    import threading
+
+    from agentcall import webrtc_media
+
+    async def scenario():
+        entered, release = threading.Event(), threading.Event()
+        original = webrtc_media.importlib.import_module
+        loop_thread = threading.get_ident()
+
+        def blocked_import(name):
+            if name == "aiortc":
+                assert threading.get_ident() != loop_thread
+                entered.set()
+                assert release.wait(5)
+            return original(name)
+
+        monkeypatch.setattr(webrtc_media, "_warm_future", None)
+        monkeypatch.setattr(webrtc_media.importlib, "import_module", blocked_import)
+        future = webrtc_media.warm_webrtc_stack()
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            assert not future.done()
+            assert webrtc_media.warm_webrtc_stack() is future
+        finally:
+            release.set()
+        await asyncio.wrap_future(future)
+
+    asyncio.run(scenario())
+
+
+def test_close_fence_cannot_bypass_check_drain(monkeypatch):
+    from agentcall import webrtc_media
+
+    async def scenario():
+        await asyncio.wrap_future(webrtc_media.warm_webrtc_stack())
+        draining, release = asyncio.Event(), asyncio.Event()
+
+        async def drain(_pc):
+            draining.set()
+            await release.wait()
+
+        monkeypatch.setattr(webrtc_media._stack.ice, "stop_peer_checks", drain)
+        peer = FakePeer()
+        peer.remote_gate = asyncio.Event()
+        media = endpoint(peer)
+        connecting = asyncio.create_task(media.connect())
+        await peer.entered.wait()
+        closing = asyncio.create_task(media.close())
+        await draining.wait()
+        peer.remote_gate.set()
+        checkpoint = asyncio.Event()
+        asyncio.get_running_loop().call_soon(checkpoint.set)
+        await checkpoint.wait()
+        assert peer.closed == 0
+        release.set()
+        await closing
+        with pytest.raises(asyncio.CancelledError):
+            await connecting
+        assert peer.closed == 1
+
+    asyncio.run(scenario())
+
+
 def test_close_during_uncancellable_connect_never_publishes_answer():
     async def scenario():
         peer = FakePeer()

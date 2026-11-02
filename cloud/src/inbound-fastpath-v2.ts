@@ -72,26 +72,39 @@ export async function claimInboundFastpathV2(request: Request, env: Env, timing:
       timing.measure("edge_token", () => issueParticipantToken(env, room, edgeIdentity)),
       timing.measure("phone_token", () => issueParticipantToken(env, room, phone))
     ]);
-    // Ownership reaches Edge before any dependency on TURN or SDP gathering.
+    // One stub preserves E-order at the DO; its dispatch gate preserves this
+    // order through body reads without serializing the Edge acknowledgements.
+    const stub = edgeRoom(env, offer.edge_id);
     const reserve = mediaCommand(offer, env, edgeToken, "inbound.claim");
-    const reserved = await timing.measure("edge_reserve", () => relayAnswer(env, offer, {
+    const reservation = timing.measure("edge_reserve", () => relayAnswer(env, offer, {
       ...reserve, direct: { deferred: true }
-    }));
-    if (!reserved) throw new HttpError("EDGE_OFFLINE", "Edge reservation was not acknowledged", 409);
+    }, stub));
     let iceServers: IceServer[] | undefined;
     let sdpAnswer: string | undefined;
-    if (input.sdpOffer) {
-      try {
-        iceServers = await timing.measure("turn", () => edgeIce(env, offer));
+    let reserveFailed = false;
+    const media = (async () => {
+      if (input.sdpOffer) {
+        iceServers = await timing.measure("turn", () => edgeIce(env, offer, stub));
+        if (reserveFailed) return;
         const command = mediaCommand(offer, env, edgeToken, "inbound.media.sdp");
         sdpAnswer = (await timing.measure("sdp_relay", () => relayAnswer(env, offer, {
           ...command, direct: { sdpOffer: input.sdpOffer, iceServers }
-        })))?.sdpAnswer;
-      } catch (error) {
-        if (error instanceof HttpError && error.status === 409) throw error;
-        // Only transport unavailability permits same-claim LiveKit fallback.
+        }, stub)))?.sdpAnswer;
       }
+    })().then(() => undefined, (error: unknown) => error);
+    // Observe a late media rejection even if reservation fails first. Its
+    // existing relay/TURN ceilings bound the background work, not claim HTTP.
+    if (ctx) ctx.waitUntil(media.then(() => undefined));
+    try {
+      const reserved = await reservation;
+      if (!reserved) throw new HttpError("EDGE_OFFLINE", "Edge reservation was not acknowledged", 409);
+    } catch (error) {
+      reserveFailed = true;
+      throw error;
     }
+    const mediaError = await media;
+    if (mediaError instanceof HttpError && mediaError.status === 409) throw mediaError;
+    // Only transport unavailability permits same-claim LiveKit fallback.
     const state = sdpAnswer ? "direct" : "direct_pending";
     const finalized = await timing.measure("claim_finalize", () => env.DB.batch([
       env.DB.prepare(`UPDATE inbound_offers SET media_transport = ?1, updated_at = ?2 WHERE offer_id = ?3
@@ -156,16 +169,17 @@ export async function completeInboundSdp(request: Request, env: Env, offerId: st
       { kind: "livekit", url: env.LIVEKIT_URL, token: phoneToken }] }, 202);
 }
 
-async function edgeIce(env: Env, offer: InboundOfferRecord): Promise<IceServer[]> {
-  const response = await edgeRoom(env, offer.edge_id).fetch("https://edge-room/inbound-ice", {
+async function edgeIce(env: Env, offer: InboundOfferRecord, stub = edgeRoom(env, offer.edge_id)): Promise<IceServer[]> {
+  const response = await stub.fetch("https://edge-room/inbound-ice", {
     method: "POST", body: JSON.stringify(iceRequest(offer, "get"))
   });
   if (!response.ok) throw new Error("ICE unavailable");
   return iceCredentialsSchema.parse(await response.json()).iceServers;
 }
 
-async function relayAnswer(env: Env, offer: InboundOfferRecord, command: { commandId: string; [key: string]: unknown }): Promise<ReturnType<typeof inboundAnswerSchema.parse> | null> {
-  const response = await edgeRoom(env, offer.edge_id).fetch("https://edge-room/inbound-media-relay", {
+async function relayAnswer(env: Env, offer: InboundOfferRecord, command: { commandId: string; [key: string]: unknown },
+  stub = edgeRoom(env, offer.edge_id)): Promise<ReturnType<typeof inboundAnswerSchema.parse> | null> {
+  const response = await stub.fetch("https://edge-room/inbound-media-relay", {
     method: "POST", body: JSON.stringify(command)
   }).catch(() => null);
   if (response?.status === 409) throw unavailable();

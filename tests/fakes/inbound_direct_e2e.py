@@ -1,9 +1,11 @@
 """Local workerd + production CloudEdgeClient/CallSession + aiortc phone acceptance.
 
 Run: .venv/bin/python tests/fakes/inbound_direct_e2e.py
+Modes: inline SDP (default), --deferred-sdp, --cancel-before-sdp, --cancel-during-ice.
 Only TURN credential generation and physical modem/PCM are fixtures. This is
 host-candidate loopback evidence, not a TURN, carrier, or iPhone acceptance test.
 Generated enrollment keys/cookies stay in memory; temporary D1 is removed.
+Every mode checks callback errors and retired STUN retry timers before loop shutdown.
 """
 
 from __future__ import annotations
@@ -30,8 +32,10 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import aiohttp
+from aioice.stun import Transaction
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import AudioStreamTrack
+from aiortc.sdp import SessionDescription
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from websockets.sync.client import connect as websocket_connect
 
@@ -115,6 +119,28 @@ class SyntheticMicrophone(AudioStreamTrack):
         return frame
 
 
+class IceBlackhole(asyncio.DatagramProtocol):
+    """Receipt proves a real ICE transaction is in flight; never answer it."""
+
+    def __init__(self) -> None:
+        self.check_received = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    def datagram_received(self, _data: bytes, _addr: tuple) -> None:
+        self.check_received.set()
+
+    def connection_lost(self, _exc: Exception | None) -> None:
+        self.closed.set()
+
+
+def blackhole_candidates(sdp: str, port: int) -> str:
+    description = SessionDescription.parse(sdp)
+    for media in description.media:
+        for candidate in media.ice_candidates:
+            candidate.ip, candidate.port = "127.0.0.1", port
+    return str(description)
+
+
 def tone(frequency: int) -> bytes:
     return struct.pack("<160h", *(int(6000 * math.sin(2 * math.pi * frequency * n / 8000)) for n in range(160)))
 
@@ -188,7 +214,8 @@ async def eventually(predicate, *, timeout: float = 15) -> None:
             await asyncio.sleep(0.01)
 
 
-async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool = False) -> dict:
+async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool = False,
+              cancel_during_ice: bool = False) -> dict:
     timeline = Timeline()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as http:
         async def request(method: str, path: str, body=None, headers=None, expected=200):
@@ -239,6 +266,11 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
         cloud_timing: dict[str, float] = {}
         phone_peak = 0
         events: asyncio.Queue[dict] = asyncio.Queue()
+        blackhole = IceBlackhole()
+        blackhole_transport = None
+        if cancel_during_ice:
+            blackhole_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: blackhole, local_addr=("127.0.0.1", 0))
         ai_attempts = 0
 
         def no_ai(*_args, **_kwargs):
@@ -305,6 +337,9 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                 if not deferred_sdp:
                     assert phone.localDescription is not None
                     claim_body["sdpOffer"] = phone.localDescription.sdp
+                    if blackhole_transport is not None:
+                        claim_body["sdpOffer"] = blackhole_candidates(
+                            claim_body["sdpOffer"], blackhole_transport.get_extra_info("sockname")[1])
                 claim, response_headers = await request("POST", "/v1/inbound-offers/claim",
                                                         claim_body, phone_headers, 202)
                 timeline.mark("phone_claim_response")
@@ -341,6 +376,7 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                         return {"type": "inbound_direct_e2e", "status": "passed",
                                 "path": "host_candidates_only", "signaling": "cancel_before_sdp",
                                 "milestones_ms": timeline.marks, "cloud_claim_ms": cloud_timing,
+                                "edge_summary": session._mobile_timing.summary(),
                                 "ata_count": 1, "pcm_prepare_count": 1, "hangup_count": 1,
                                 "ai_start_count": ai_attempts, "late_sdp_status": 409}
                     timeline.mark("phone_gather_start")
@@ -355,6 +391,27 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                     timeline.mark("phone_sdp_response")
                 direct = next((value for value in claim.get("transports", []) if value["kind"] == "webrtc"), None)
                 assert claim.get("directAttempted") is True and direct is not None, "DIRECT_SDP_RELAY_NOT_COMPLETED"
+                if cancel_during_ice:
+                    await asyncio.wait_for(blackhole.check_received.wait(), 10)
+                    timeline.mark("edge_ice_check_in_flight")
+                    assert channel.readyState != "open"
+                    assert session.takeover_state is TakeoverState.WAITING_OWNER
+                    timeline.mark("phone_control_end_start")
+                    await request("POST", f"/v1/inbound-offers/{offer_id}/media/end",
+                                  {"claimId": claim["claimId"]}, phone_headers, 202)
+                    timeline.mark("phone_control_end_response")
+                    await asyncio.wait_for(call_task, 10)
+                    assert session.takeover_state is TakeoverState.ENDED and not session.is_active
+                    assert ai_attempts == 0 and bridge.stopped
+                    assert (modem.commands.count("ATA") == modem.commands.count("PCM")
+                            == modem.commands.count("HANGUP") == 1)
+                    await eventually(lambda: "edge_revoke_sent" in timeline.marks)
+                    return {"type": "inbound_direct_e2e", "status": "passed",
+                            "path": "host_candidates_only", "signaling": "cancel_during_ice",
+                            "milestones_ms": timeline.marks, "cloud_claim_ms": cloud_timing,
+                            "edge_summary": session._mobile_timing.summary(),
+                            "ata_count": 1, "pcm_prepare_count": 1, "hangup_count": 1,
+                            "ai_start_count": ai_attempts}
                 await phone.setRemoteDescription(RTCSessionDescription(type="answer", sdp=direct["sdpAnswer"]))
 
                 async def feed():
@@ -415,6 +472,9 @@ async def run(base: str, *, deferred_sdp: bool = False, cancel_before_sdp: bool 
                                      return_exceptions=True)
                 if phone is not None:
                     await phone.close()
+                if blackhole_transport is not None:
+                    blackhole_transport.close()
+                    await blackhole.closed.wait()
                 await asyncio.to_thread(control.stop)
 
 
@@ -425,20 +485,53 @@ def main() -> None:
                         help="Claim before gathering; send SDP only after real Edge ATA/PCM readiness")
     parser.add_argument("--cancel-before-sdp", action="store_true",
                         help="Claim without SDP, then cancel over authenticated control HTTP")
+    parser.add_argument("--cancel-during-ice", action="store_true",
+                        help="Cancel only after an actual Edge ICE check reaches a blackhole UDP socket")
     args = parser.parse_args()
-    logging.disable(logging.CRITICAL)
+    if args.cancel_during_ice and (args.deferred_sdp or args.cancel_before_sdp):
+        parser.error("--cancel-during-ice is an independent inline SDP mode")
+    failures: list[str] = []
+
+    class ErrorCapture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.exc_info or "Traceback" in record.getMessage():
+                failures.append(record.name)
+
+    logging.basicConfig(level=logging.ERROR, handlers=[ErrorCapture()])
+    transactions: list[Transaction] = []
+    transaction_run = Transaction.run
+
+    async def traced_transaction(transaction: Transaction):
+        transactions.append(transaction)
+        return await transaction_run(transaction)
+
+    async def checked_run(base: str) -> dict:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, _context: failures.append("asyncio"))
+        result = await run(base, deferred_sdp=args.deferred_sdp or args.cancel_before_sdp,
+                           cancel_before_sdp=args.cancel_before_sdp, cancel_during_ice=args.cancel_during_ice)
+        # Assert before asyncio.run cancels remaining tasks: teardown itself must retire retries.
+        for transaction in transactions:
+            assert getattr(transaction, "_Transaction__future").done(), "ICE_TRANSACTION_LEFT_PENDING"
+            timer = getattr(transaction, "_Transaction__timeout_handle")
+            assert timer is None or timer.cancelled(), "ICE_RETRY_TIMER_LEFT_ACTIVE"
+        result["active_ice_transactions"] = 0
+        return result
     environment = {"INBOUND_FASTPATH_V2_ENABLED": "true", "INBOUND_PRECONNECT_ENABLED": "false",
                    "INBOUND_PHONE_FIRST_ENABLED": "true", "INBOUND_TAKEOVER_ENABLED": "true",
                    "REMOTE_WEB_DIALER_ENABLED": "true", "REMOTE_CLOUD_ENABLED": "true",
                    "MODEM_RESET_AFTER_CALL": "false", "MODEM_LOG_RELEASE_CAUSE": "false",
                    "MONITOR_AI_PLAYBACK": "false", "MONITOR_MODEM_UPLINK": "false",
                    "REMOTE_DOWNLINK_GAIN": "1", "PARALLEL_AGENT_CONNECT": "false"}
-    with patch.dict(os.environ, environment), local_worker() as base:
-        result = asyncio.run(run(base, deferred_sdp=args.deferred_sdp or args.cancel_before_sdp,
-                                 cancel_before_sdp=args.cancel_before_sdp))
+    with (patch.dict(os.environ, environment), patch.object(Transaction, "run", traced_transaction),
+          local_worker() as base):
+        result = asyncio.run(checked_run(base))
+    assert not failures, f"ASYNC_OR_LOGGED_EXCEPTIONS: {failures}"
+    result["traceback_count"] = len(failures)
+    summary = json.dumps({"type": "inbound_timing_summary", **result["edge_summary"]}, separators=(",", ":"))
     line = json.dumps(result, separators=(",", ":"), allow_nan=False)
     if args.output:
-        args.output.write_text(line + "\n", encoding="utf-8")
+        args.output.write_text(summary + "\n" + line + "\n", encoding="utf-8")
+    print(summary)
     print(line)
 
 
