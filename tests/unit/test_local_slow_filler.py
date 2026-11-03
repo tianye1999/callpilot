@@ -91,7 +91,7 @@ def test_slow_filler_at_endpoint_deadline_once_cached_and_not_in_history(rig, st
         assert r.agent._messages[-1]["content"] == "好的。"
         stages = {e["stage"]: e for e in r.events}
         assert stages["slow_filler"]["ms"] == 2500.0
-        assert stages["first_pcm_written"]["ms"] == 2500.0
+        assert stages["slow_filler_written"]["ms"] == 2500.0  # 垫话的写出单独计 stage
         assert "[local_slow_filler] played turn=1 waited_ms=2500" in caplog.text
 
 

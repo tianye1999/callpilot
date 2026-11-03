@@ -614,3 +614,22 @@ def test_inbound_owner_identity_is_not_impersonated_or_named():
     en = build_instructions("inbound", "the owner", "AI assistant", "", "en")
     assert "绝不自称机主本人，也不说出机主的姓名" in zh
     assert "Never claim to be the owner or disclose the owner's name" in en
+
+
+def test_dynamic_content_is_at_the_tail_so_the_static_prefix_is_cacheable(monkeypatch):
+    """LLM 前缀缓存按开头逐 token 匹配：时间与本通背景必须在最后，静态部分跨通一致。"""
+    from agentcall.prompts import agent_persona, build_instructions
+
+    def build(ctx, now):
+        monkeypatch.setattr("agentcall.prompts._now_str", lambda lang: now)
+        return build_instructions("inbound", "机主", agent_persona("zh"), None, "zh",
+                                  takeover_preference="熟人转给我", inbound_context=ctx)
+
+    a = build("先响了手机没人接", "2026年11月03日 12:00（星期二）")
+    b = build("机主选择交给你处理", "2026年11月03日 12:01（星期二）")
+    lines_a, lines_b = a.rstrip("\n").split("\n"), b.rstrip("\n").split("\n")
+    assert lines_a[-1].startswith("当前真实日期时间是") and lines_b[-1].startswith("当前真实日期时间是")
+    assert lines_a[-2].startswith("本通背景：") and lines_b[-2].startswith("本通背景：")
+    assert "\n".join(lines_a[:-2]) == "\n".join(lines_b[:-2])
+    outbound = build_instructions("outbound", "机主", agent_persona("zh"), "查话费", "zh")
+    assert outbound.rstrip("\n").split("\n")[-1].startswith("当前真实日期时间是")

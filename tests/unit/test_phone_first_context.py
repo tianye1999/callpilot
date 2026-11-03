@@ -31,8 +31,10 @@ def test_inbound_context_is_a_background_line_only_for_inbound() -> None:
     for lang, marker in (("zh", "本通背景："), ("en", "Context for this call:")):
         inbound = build_instructions("inbound", "机主", agent_persona(lang), None, lang,
                                      inbound_context="刚才响过手机", takeover_preference=PREFERENCE)
-        line = inbound.split("\n")[1]
-        assert marker in line and "刚才响过手机" in line, lang
+        lines = inbound.rstrip("\n").split("\n")
+        # Per-call content sits at the tail: context, then the live timestamp.
+        assert marker in lines[-2] and "刚才响过手机" in lines[-2], lang
+        assert ("当前真实日期时间" in lines[-1]) or ("current real date" in lines[-1]), lang
         outbound = build_instructions("outbound", "机主", agent_persona(lang), "查话费", lang,
                                       inbound_context="刚才响过手机")
         assert "刚才响过手机" not in outbound, lang

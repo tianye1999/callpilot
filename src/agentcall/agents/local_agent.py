@@ -50,6 +50,10 @@ _LLM_FATAL_FAILURES = 3
 _MAX_TOOL_ROUNDS = 3
 
 
+# 每轮三段计时的固定指标名（B6）：识别尾 / 首字 / 首句 / 首音频 / 首帧写出。
+_TURN_SUMMARY_STAGES = ("asr_tail", "llm_first_token", "first_clause_ready", "tts_first_audio", "first_pcm_written")
+
+
 def _positive_seconds(key: str) -> float:
     seconds = config.get_float(key)
     if not math.isfinite(seconds) or seconds <= 0:
@@ -96,6 +100,12 @@ class _Turn:
     sequence: int = 0
     cancelled: threading.Event = field(default_factory=threading.Event)
     stages: set[str] = field(default_factory=set)
+    marks: dict[str, float] = field(default_factory=dict)
+    # 强制切轮：对方还在说，模型只能执行工具（按键/挂断），不能出声盖住对方；
+    # 口头回复由下一次自然句末的轮次重新生成。
+    silent: bool = False
+    # 强制切轮之后的第一个停顿：没有新识别内容时，由它补上被压下的那句回复。
+    followup: bool = False
     is_user: bool = True
     reply_started: bool = False
 
@@ -402,6 +412,15 @@ class LocalPipelineAgent(VoiceAgent):
         self._deepseek = (DeepSeekChat() if llm_chat is None and llm_stream is None
                           and config.get_str("LOCAL_LLM_PROVIDER") == "deepseek" else None)
         self._streaming = config.get_bool("LOCAL_TTS_STREAMING")
+        # 外呼 IVR 循环播报没有句末：N 秒后把已识别的文本交给模型（0 = 关）。
+        self._max_turn_samples = 0
+        self._turn_speech_samples = 0
+        # 强制切轮后欠一个轮末：VAD 线程独占。对方停下且没有新内容时投递一个空的轮末标记，
+        # 走 ASR 队列（FIFO），不可能抢在更新的识别结果前面。
+        self._followup_owed = False
+        self._quiet_samples = 0
+        # 最近一个强制轮是否压下了口头回复：brain 线程独占，按队列顺序读写。
+        self._withheld_reply = False
         self._slow_filler_seconds = config.get_float("LOCAL_SLOW_REPLY_FILLER_SECONDS")
         if not math.isfinite(self._slow_filler_seconds) or self._slow_filler_seconds < 0:
             raise ValueError("LOCAL_SLOW_REPLY_FILLER_SECONDS 必须是有限非负数")
@@ -459,6 +478,10 @@ class LocalPipelineAgent(VoiceAgent):
         self._on_turn_event: Callable[[dict[str, Any]], None] | None = None
         self._opening_duration_ms: float | None = None
 
+    def configure_turn(self, *, max_seconds: float) -> None:
+        """对方持续说话（如循环播报）超过 max_seconds 仍无句末时强制切轮；0 关闭。"""
+        self._max_turn_samples = int(max(0.0, max_seconds) * self.input_rate) if math.isfinite(max_seconds) else 0
+
     def set_turn_event_handler(self, handler: Callable[[dict[str, Any]], None]) -> None:
         self._on_turn_event = handler
 
@@ -469,12 +492,12 @@ class LocalPipelineAgent(VoiceAgent):
             except Exception:  # noqa: BLE001 - 埋点不能影响语音
                 logger.debug("local 逐轮埋点失败", exc_info=True)
 
-    def _output_pcm(self, pcm: bytes, turn: _Turn) -> None:
+    def _output_pcm(self, pcm: bytes, turn: _Turn, *, stage: str = "first_pcm_written") -> None:
         if self._on_audio_out is None:
             return
         if self._metrics:
             tagged = AgentPcm(pcm)
-            tagged.on_written = lambda: self._mark_latency(turn, "first_pcm_written")
+            tagged.on_written = lambda: self._mark_latency(turn, stage)
             pcm = tagged
         self._on_audio_out(pcm)
 
@@ -846,8 +869,27 @@ class LocalPipelineAgent(VoiceAgent):
         for segment in segments:
             self._asr_pending = True
             self._asr_queue.put(segment)
+        if speaking or self._asr_pending:
+            # 从语音起点计时（吐段前的音频也算），轮末归零。
+            self._turn_speech_samples += len(pcm) // 2
+        self._quiet_samples = 0 if speaking else self._quiet_samples + len(pcm) // 2
+        if (self._followup_owed and not speaking and not self._asr_pending and not flush
+                and self._quiet_samples >= self._turn_silence_samples):
+            # 对方停下了，强制切轮之后又没有新内容：补一个空的轮末，brain 视需要补答。
+            self._followup_owed = False
+            turn = self._new_turn(time.monotonic())
+            turn.followup = True
+            self._asr_queue.put(_AsrEnd(turn))
         if flush:
             self._finish_asr_turn()
+        elif self._max_turn_samples and self._asr_pending and self._turn_speech_samples >= self._max_turn_samples:
+            # 循环播报 / 长独白：没有句末也把已识别的部分交给模型（只执行工具、不出声）；
+            # 切点处 VAD 还没吐出的音频归下一轮。
+            self._turn_event(type="local_turn", turn_id=self._turn_sequence + 1, stage="forced_endpoint",
+                             at=time.monotonic(), ms=round(self._turn_speech_samples * 1000 / self.input_rate, 1))
+            logger.info("[local_turn] forced endpoint after %.1fs of continuous speech",
+                        self._turn_speech_samples / self.input_rate)
+            self._finish_asr_turn(forced=True)
         elif speaking:
             self._silence_samples = 0
         elif self._asr_pending:
@@ -861,11 +903,16 @@ class LocalPipelineAgent(VoiceAgent):
                 self._finish_asr_turn()
         return len(segments)
 
-    def _finish_asr_turn(self) -> None:
+    def _finish_asr_turn(self, *, forced: bool = False) -> None:
         if self._asr_pending:
             self._asr_pending = False
             self._silence_samples = 0
-            self._asr_queue.put(_AsrEnd(self._new_turn(time.monotonic())))
+            self._turn_speech_samples = 0
+            turn = self._new_turn(time.monotonic())
+            turn.silent = forced
+            # 强制切轮欠一个轮末；自然句末本身就是那个轮末（带新内容正常回复）。
+            self._followup_owed = forced
+            self._asr_queue.put(_AsrEnd(turn))
 
     def _asr_worker(self) -> None:
         pipeline = self._pipeline
@@ -929,9 +976,14 @@ class LocalPipelineAgent(VoiceAgent):
                     utterances.append(follow)
                     turn = follow.turn
                 if isinstance(item, _RecognizedSpeech):
-                    self._handle_user_text("".join(
-                        u.text for u in utterances if isinstance(u, _RecognizedSpeech)
-                    ), turn)
+                    text = "".join(u.text for u in utterances if isinstance(u, _RecognizedSpeech))
+                    if not text and turn.followup:
+                        # 强制切轮后的空轮末：只有上一强制轮确实压下了口头回复才补答；
+                        # 按键/挂断这类静默收尾不补（按键后要保持沉默等下一段菜单）。
+                        if self._withheld_reply and not turn.cancelled.is_set():
+                            self._respond(turn)
+                    else:
+                        self._handle_user_text(text, turn)
                 elif not turn.cancelled.is_set():
                     self._handle_user_speech(b"".join(
                         u.pcm for u in utterances if isinstance(u, _UserSpeech)
@@ -976,11 +1028,28 @@ class LocalPipelineAgent(VoiceAgent):
             self._emit_output_complete()
 
     def _respond(self, turn: _Turn) -> None:
+        # 任何一次新的回复决定都替代此前压下的那句（brain 线程按队列顺序处理）。
+        self._withheld_reply = False
         response = self._chat_with_tools(turn)
         if response is None or turn.cancelled.is_set() or not self._running:
             return
         reply, batch = response
         if not reply.strip():
+            return
+        if turn.silent:
+            # 工具已在 _chat_with_tools 里执行；口头回复不播、也不留在历史里，
+            # 免得模型以为自己说过。下一轮自然句末会带着完整上下文重新回复。
+            self._discard_batch(batch)
+            with self._messages_lock:
+                last = self._messages[-1] if self._messages else None
+                unspoken = (last is not None and last.get("role") == "assistant"
+                            and last.get("content") == reply and not last.get("tool_calls"))
+                if unspoken:
+                    self._messages.pop()
+            logger.info("[local_turn] forced turn #%d: reply withheld (remote still speaking)", turn.sequence)
+            self._turn_event(type="local_turn", turn_id=turn.sequence, stage="reply_withheld", at=time.monotonic())
+            # 工具若已让本轮静默收尾（按键/挂断）_chat_with_tools 返回 None，不会走到这里。
+            self._withheld_reply = True
             return
         if self._suppressor.should_suppress(reply):
             logger.info("[local] 抑制复读: %s", reply)
@@ -1022,7 +1091,7 @@ class LocalPipelineAgent(VoiceAgent):
                     return
                 batch.received_text = True
                 self._mark_latency(turn, "llm_first_token")
-                if self._streaming:
+                if self._streaming and not turn.silent:
                     for clause in batch.splitter.feed(text):
                         self._queue_clause(clause, batch)
 
@@ -1147,9 +1216,19 @@ class LocalPipelineAgent(VoiceAgent):
             turn.stages.add(stage)
             measured_at = time.monotonic() if at is None else at
             elapsed = measured_at - turn.ended_at
+            ms = round(elapsed * 1000, 1)
+            turn.marks[stage] = ms
             self._turn_event(type="local_turn", turn_id=turn.sequence, stage=stage,
-                             at=measured_at, ms=round(elapsed * 1000, 1))
+                             at=measured_at, ms=ms)
             self._emit_latency(stage, round(max(0.0, elapsed) * 1000, 1))
+            if stage == "first_pcm_written":
+                # 固定指标名的单行汇总：一眼看出这轮慢在识别尾、首字、首句还是合成。
+                summary = {name: turn.marks.get(name) for name in _TURN_SUMMARY_STAGES}
+                # 每条逐轮事件都带 stage，消费方按 stage 过滤不必特判类型。
+                self._turn_event(type="local_turn_summary", turn_id=turn.sequence, stage="summary",
+                                 at=measured_at, kind="user" if turn.is_user else "say", **summary)
+                logger.info("[local_turn] #%d %s", turn.sequence, " ".join(
+                    f"{name}={int(value)}" for name, value in summary.items() if value is not None))
 
     def _discard_batch(self, batch: _SpeechBatch) -> None:
         with self._turn_lock:
@@ -1198,21 +1277,21 @@ class LocalPipelineAgent(VoiceAgent):
                 return
             turn = batch.turn
             now = time.monotonic()
-            if (not self._running or turn.cancelled.is_set()
+            if (not self._running or turn.cancelled.is_set() or turn.silent
                     or batch.cancelled.is_set() or turn.reply_started or turn.ended_at is None
                     or now - turn.ended_at < self._slow_filler_seconds
                     or now - self._last_slow_filler_at < 8.0
                     or not self._tts_cache.get(self._slow_filler)):
                 return
             # 这里只播放预合成 PCM，绝不在锁内运行模型，也不写 LLM 历史。
-            if self._speak(self._slow_filler, batch):
+            if self._speak(self._slow_filler, batch, filler=True):
                 self._last_slow_filler_at = now
                 self._emit_transcript("agent", self._slow_filler)
                 self._mark_latency(turn, "slow_filler", at=now)
                 logger.info("[local_slow_filler] played turn=%d waited_ms=%.0f",
                             turn.sequence, (now - turn.ended_at) * 1000)
 
-    def _speak(self, text: str, batch: _SpeechBatch) -> bool:
+    def _speak(self, text: str, batch: _SpeechBatch, *, filler: bool = False) -> bool:
         text = speech_text(text)
         if not text:
             return False
@@ -1222,7 +1301,8 @@ class LocalPipelineAgent(VoiceAgent):
             return False
         with self._turn_lock:
             batch.turn.reply_started = True
-            self._mark_latency(batch.turn, "first_clause_ready")
+            if not filler:
+                self._mark_latency(batch.turn, "first_clause_ready")
         try:
             pcm = self._tts_cache.get(text)
             if pcm is None:
@@ -1234,8 +1314,10 @@ class LocalPipelineAgent(VoiceAgent):
         # lock as cancellation so no stale output can cross the cancellation edge.
         with self._turn_lock:
             if pcm and self._running and not batch.cancelled.is_set() and not batch.turn.cancelled.is_set():
-                self._mark_latency(batch.turn, "tts_first_audio")
+                if not filler:
+                    self._mark_latency(batch.turn, "tts_first_audio")
                 batch.audio_emitted = True
-                self._output_pcm(pcm, batch.turn)
+                # 垫话的写出单独计 stage：轮次汇总等真正的回复写出时再发。
+                self._output_pcm(pcm, batch.turn, stage="slow_filler_written" if filler else "first_pcm_written")
                 return True
         return False

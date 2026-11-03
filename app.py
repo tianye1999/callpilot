@@ -291,8 +291,11 @@ def main() -> None:
 
     if provider == "local":
         from agentcall.agents.local_agent import start_model_preload
+        from agentcall.agents.local_llm import start_model_check
 
         start_model_preload()
+        # 模型名下线不该每通电话才发现：启动就核对，不通过时在界面提示。
+        start_model_check(lambda ok, message: None if ok else service.publish_system_message(message))
 
     remote_runner = None
     if remote_pairing_store is not None:

@@ -286,10 +286,14 @@ def _build_zh(
 ) -> str:
     style = config.get_str("VOICE_STYLE").strip()
     style_line = f"机主希望的说话风格：{style}。\n" if style else ""
-    common = (
+    # 每通都变的内容（时间、本通背景）放在最后：LLM 的前缀缓存按开头逐 token 匹配，
+    # 静态部分在前才能跨通命中（离线实测静态前缀约 900 token 命中、尾部约 200 token 未命中）。
+    time_line = (
         f"当前真实日期时间是 {_now_str('zh')}，这是准确信息；对方询问日期、时间、"
         "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份；"
         "不要主动报时间，只在对方明确问起日期或时间时才引用。\n"
+    )
+    common = (
         "语音风格：普通话，自然电话口吻，语速比正常稍慢，节奏从容，"
         "声音低沉、稳重、沉稳亲和，清晰但不要喊，不要播音腔、客服腔或机器人腔。\n"
         f"{style_line}"
@@ -310,7 +314,7 @@ def _build_zh(
         "查询最近收到的短信验证码(query_verification_code)。遇到需要按键的菜单，"
         "必须调用 send_dtmf 工具真正发送按键，不是只在话里说要按哪个键；"
         "调用前后不要口头宣布按键动作，发送后保持沉默，等待下一段菜单。"
-        "需要时主动调用其他对应工具，操作完成后用一句话口头确认结果。"
+        "需要时主动调用其他对应工具，操作完成后用一句话口头确认结果。\n"
     )
 
     if direction == "outbound":
@@ -369,6 +373,7 @@ def _build_zh(
             f"完整说完再挂断；不打算留言就直接挂断，不要预告。\n"
             f"你不是客服，别问“有什么可以帮您”，也别冒充{owner}本人。\n"
             + common
+            + time_line
         )
 
     preference = (takeover_preference or "").strip()[:2000]
@@ -420,7 +425,6 @@ def _build_zh(
     return (
         f"你是{owner}的{persona}，正在替{owner}接听打进来的电话，"
         f"{owner}现在不方便接。\n"
-        + context_text
         + task_line
         + "来电规则：\n"
         # 开场白只说「喂?」之后，主动表明身份就成了必需（WIL-91）：靠「被问才说」
@@ -447,6 +451,8 @@ def _build_zh(
         + triage_rules
         + takeover_rules
         + common
+        + context_text
+        + time_line
     )
 
 
@@ -514,11 +520,14 @@ def _build_en(
 ) -> str:
     style = config.get_str("VOICE_STYLE").strip()
     style_line = f"Preferred speaking style: {style}.\n" if style else ""
-    common = (
+    # Per-call content (time, call context) goes last so the static prefix stays cacheable.
+    time_line = (
         f"The current real date and time is {_now_str('en')}; this is accurate. "
         "When asked about the date, time, or day of week, answer from this, do not "
         "guess the year from memory; do not proactively state the time, and only "
         "refer to it when the other party explicitly asks about the date or time.\n"
+    )
+    common = (
         "Voice style: natural phone tone, a little slower than usual, unhurried, "
         "low and steady, warm and composed, clear but not shouting; no broadcaster, "
         "call-center, or robotic tone.\n"
@@ -553,7 +562,7 @@ def _build_en(
         "When a menu requires a key press, you must call send_dtmf to actually send "
         "the keypress, not merely say that you will press a key; do not announce the "
         "keypress before or after the tool call. After sending it, stay silent and "
-        "wait for the next menu prompt."
+        "wait for the next menu prompt.\n"
     )
 
     if direction == "outbound":
@@ -639,6 +648,7 @@ def _build_en(
             f"You are not a call-center agent — don't ask \"how can I "
             f"help you\", and never impersonate {owner} in person.\n"
             + common
+            + time_line
         )
 
     preference = (takeover_preference or "").strip()[:2000]
@@ -705,7 +715,6 @@ def _build_en(
     return (
         f"You are {owner}'s {persona}, answering an incoming call for {owner}, "
         f"who can't take it right now.\n"
-        + context_text
         + task_line
         + "Incoming-call rules:\n"
         # 与中文侧同步（WIL-91 / WIL-99）：身份主动说；且不要引用开场白原文，
@@ -732,6 +741,8 @@ def _build_en(
         + triage_rules
         + takeover_rules
         + common
+        + context_text
+        + time_line
     )
 
 

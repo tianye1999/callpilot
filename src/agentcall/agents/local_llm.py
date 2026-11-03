@@ -11,6 +11,7 @@ import socket
 import ssl
 import threading
 import time
+import urllib.request
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -371,3 +372,60 @@ class DeepSeekChat:
         if "error" in box:
             raise RuntimeError(f"DeepSeek 请求失败: {box['error']}") from box["error"]
         return dict(box["result"])
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """带着 API Key 的请求绝不跟随重定向（跨域 30x 会把 Authorization 转发出去）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
+
+
+_models_opener = urllib.request.build_opener(_NoRedirect())
+
+
+def verify_model(timeout: float = 8.0) -> tuple[bool, str]:
+    """启动时核对 LOCAL_LLM_MODEL 是否仍在供应方的模型列表里。
+
+    同事踩过的坑：模型名下线后每通电话都失败才发现。只读 GET /models，不计费；
+    网络不通视为「无法核对」而不是「模型不存在」；只对 DeepSeek 分支生效。
+    """
+    if config.get_str("LOCAL_LLM_PROVIDER").strip().lower() != "deepseek":
+        return True, "三段式 LLM 不是 DeepSeek，跳过模型名核对"
+    model = config.get_str("LOCAL_LLM_MODEL").strip()
+    endpoint = config.get_str("LOCAL_LLM_BASE_URL").rstrip("/")
+    key = config.get_str("DEEPSEEK_API_KEY").strip()
+    if not model or not endpoint or not key:
+        return False, "缺少 LOCAL_LLM_MODEL / LOCAL_LLM_BASE_URL / DEEPSEEK_API_KEY，无法核对模型名"
+    url = urlsplit(endpoint)
+    if url.scheme != "https" or not url.hostname or url.username or url.query or url.fragment:
+        return False, "LOCAL_LLM_BASE_URL 必须为 HTTPS API 根地址"
+    request = urllib.request.Request(endpoint + "/models", headers={"Authorization": f"Bearer {key}"})
+    try:
+        with _models_opener.open(request, timeout=timeout) as response:  # noqa: S310 - fixed https endpoint, no redirects
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - offline, redirect or auth failure: report, never block the service
+        return False, f"无法核对 LLM 模型名（{type(exc).__name__}）"
+    ids = {str(item.get("id", "")) for item in payload.get("data", []) if isinstance(item, dict)}
+    if not ids:
+        return False, "LLM 模型列表为空，无法核对"
+    if model in ids:
+        return True, f"LLM 模型 {model} 可用"
+    return False, f"LLM 模型 {model} 不在供应方列表里（可用：{', '.join(sorted(ids))}），通话会因此失败"
+
+
+def start_model_check(on_result: Callable[[bool, str], None] | None = None) -> threading.Thread:
+    """后台核对模型名；结果写日志，并交给调用方（如推送到界面）。"""
+
+    def run() -> None:
+        ok, message = verify_model()
+        (logger.info if ok else logger.warning)("[local_llm] %s", message)
+        if on_result is not None:
+            try:
+                on_result(ok, message)
+            except Exception:  # noqa: BLE001 - UI 推送失败不影响服务
+                logger.debug("模型核对结果推送失败", exc_info=True)
+
+    thread = threading.Thread(target=run, name="local-llm-model-check", daemon=True)
+    thread.start()
+    return thread

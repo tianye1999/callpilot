@@ -947,6 +947,10 @@ class CallSession:
             instructions if instructions is not None else self._build_agent_instructions(direction)
         )
         agent.set_session_instructions(session_instructions)
+        if direction == "outbound":
+            configure_turn = getattr(agent, "configure_turn", None)
+            if callable(configure_turn):
+                configure_turn(max_seconds=config.get_float("LOCAL_TURN_MAX_SECONDS_OUTBOUND"))
         if isinstance(agent, MossVoiceAgent) and direction == "outbound":
             agent.set_briefing_context(number or "对方", self._outbound_task(agent_language()))
         agent.set_transcript_handler(self._make_transcript_handler(record, transcripts, agent))
@@ -5879,6 +5883,10 @@ class CallAgentService:
     def _publish(self, event: dict) -> None:
         if self.hub:
             self.hub.publish(event)
+
+    def publish_system_message(self, text: str) -> None:
+        """给界面推一条系统提示（启动自检结果等），不触碰通话状态。"""
+        self._publish({"type": "system", "text": text})
 
     def _credential_errors(self) -> list[str]:
         provider = self.provider or config.get_str("AGENT_PROVIDER")

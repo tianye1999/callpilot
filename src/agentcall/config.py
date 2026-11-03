@@ -339,6 +339,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                requires_restart=True),
     ConfigSpec("LOCAL_TURN_SILENCE", "三段式轮末物理静音（秒，含切段等待）", "float", "0.6",
                requires_restart=True),
+    ConfigSpec("LOCAL_TURN_MAX_SECONDS_OUTBOUND", "外呼时对方连续说话 N 秒无句末即交给模型只执行工具（0 关）",
+               "float", "0"),
     ConfigSpec("LOCAL_TTS_MODEL", "三段式 TTS 模型", "str", "vits-icefall-zh-aishell3",
                requires_restart=True),
     ConfigSpec("LOCAL_TTS_SPEAKER_ID", "三段式 TTS 说话人", "int", "25", requires_restart=True),
