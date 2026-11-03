@@ -31,6 +31,7 @@ from agentcall import config
     ("LOCAL_SPECULATIVE_LLM", "true"),
     ("LOCAL_LATENCY_METRICS", "true"),
     ("PARALLEL_AGENT_CONNECT", "true"),
+    ("OUTBOUND_DIRECT_ENABLED", "true"),
 ])
 def test_local_config_defaults_and_env_sync(monkeypatch, key, default):
     monkeypatch.delenv(key, raising=False)

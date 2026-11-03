@@ -3,7 +3,7 @@ package ai.bondings.callpilot
 import ai.bondings.callpilot.call.CallGraph
 import ai.bondings.callpilot.call.CallDigestAlerts
 import ai.bondings.callpilot.call.CallState
-import ai.bondings.callpilot.call.DirectCallSettings
+import ai.bondings.callpilot.call.DirectCallCapabilities
 import ai.bondings.callpilot.call.OfferAlerts
 import ai.bondings.callpilot.call.OfferWatchService
 import ai.bondings.callpilot.call.SmsAlerts
@@ -153,6 +153,7 @@ class MainActivity : ComponentActivity() {
         handleSmsIntent(intent)
         enableEdgeToEdge()
         val store = CredentialStore(applicationContext)
+        DirectCallCapabilities.cache.activate(store.load())
         val manager = CallGraph.manager(applicationContext)
         val alerts = OfferAlerts.get(this)
         val permissionPrefs = getSharedPreferences("offer_permissions", MODE_PRIVATE)
@@ -168,6 +169,20 @@ class MainActivity : ComponentActivity() {
                     val callState by manager.state.collectAsState()
                     var incomingOffer by remember { mutableStateOf<InboundOffer?>(null) }
                     val current = pairing
+                    val directFeatures by DirectCallCapabilities.cache.features.collectAsState()
+                    val inboundDirect = current != null && directFeatures.inboundFastpathV2 &&
+                        DirectCallCapabilities.cache.cached(current).inboundFastpathV2
+                    LaunchedEffect(current) {
+                        DirectCallCapabilities.cache.activate(current)
+                        if (current?.protocol == PairingProtocol.HOSTED) {
+                            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                                while (true) {
+                                    DirectCallCapabilities.cache.refresh(current)
+                                    delay(OFFER_POLL_INTERVAL_MS)
+                                }
+                            }
+                        }
+                    }
                     val notificationPermission = rememberLauncherForActivityResult(
                         ActivityResultContracts.RequestPermission(),
                     ) { /* 拒绝后不反复打扰，设置页保留手动开启入口。 */ }
@@ -250,10 +265,10 @@ class MainActivity : ComponentActivity() {
 
                     val activeOffer = incomingOffer
                     // 直连开着时，来电一显示就开始准备连接；界面收起而没接听就放掉（接听时 CallManager 会接手）。
-                    DisposableEffect(activeOffer?.offerId) {
+                    DisposableEffect(current, activeOffer?.offerId, inboundDirect) {
                         val shown = activeOffer
                         val paired = current
-                        if (shown != null && paired != null && DirectCallSettings.enabled(this@MainActivity)) {
+                        if (shown != null && paired != null && inboundDirect) {
                             manager.prepareTakeover(paired, shown)
                         }
                         onDispose { shown?.let { manager.discardPrepared(it.offerId) } }
@@ -305,7 +320,7 @@ class MainActivity : ComponentActivity() {
                         ) {
                             alerts.dismiss(offer)
                             incomingOffer = null
-                            manager.answerTakeover(paired, offer.offerId, direct = DirectCallSettings.enabled(this@MainActivity))
+                            manager.answerTakeover(paired, offer.offerId, direct = DirectCallCapabilities.cache.cached(paired).inboundFastpathV2)
                         }
                     }
 
@@ -385,7 +400,7 @@ class MainActivity : ComponentActivity() {
                                                 manager.answerTakeover(
                                                     current,
                                                     presentation.offer.offerId,
-                                                    direct = DirectCallSettings.enabled(this@MainActivity),
+                                                    direct = DirectCallCapabilities.cache.cached(current).inboundFastpathV2,
                                                 )
                                             } else {
                                                 pendingMicrophoneOffer = presentation.offer

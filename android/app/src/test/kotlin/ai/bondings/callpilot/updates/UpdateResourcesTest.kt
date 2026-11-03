@@ -40,6 +40,8 @@ class UpdateResourcesTest {
         assertEquals("KinyAI SIM", strings("values", "launcher")["launcher_name"])
         listOf("values", "values-zh-rCN").forEach {
             val offer = strings(it, "offer_watch")
+            assertFalse(offer.containsKey("offer_direct_toggle"))
+            assertFalse(offer.containsKey("offer_direct_hint"))
             assertFalse(offer.getValue("offer_notification_body").contains("AI"))
             assertFalse(offer.getValue("offer_decline_hint").contains("AI"))
         }

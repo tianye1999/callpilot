@@ -462,6 +462,37 @@ class HostedCloudClientTest {
     }
 
     @Test
+    fun `direct capability lookup fails closed without failing the call`() = runTest {
+        val pairing = ai.bondings.callpilot.pairing.StoredPairing(
+            server.url("/").toString(), "test", DeviceCredential("device_abcdefghijkl", "secret"),
+            PairingProtocol.HOSTED, "edge_abcdefghijkl",
+        )
+        for (body in listOf("not-json", "{\"features\":[]}", "{}")) {
+            server.enqueue(MockResponse().setBody(body))
+            val status = ai.bondings.callpilot.call.DirectCallCapabilities.load(pairing)
+            assertFalse(status?.outboundDirectV1 == true)
+            assertFalse(status?.inboundFastpathV2 == true)
+        }
+        server.enqueue(MockResponse().setResponseCode(503).setBody("{}"))
+        assertEquals(null, ai.bondings.callpilot.call.DirectCallCapabilities.load(pairing))
+        assertEquals(null, ai.bondings.callpilot.call.DirectCallCapabilities.load(pairing.copy(protocol = PairingProtocol.TUNNEL)))
+    }
+
+    @Test
+    fun `direct capabilities require true JSON booleans`() {
+        for (value in listOf("true", "false", "null", "\"true\"", "{}", "[]")) {
+            server.enqueue(MockResponse().setBody("""{"features":{"outboundDirectV1":$value,"inboundFastpathV2":$value}}"""))
+            val status = client.deviceStatus()
+            assertEquals(value == "true", status.outboundDirectV1)
+            assertEquals(value == "true", status.inboundFastpathV2)
+        }
+        server.enqueue(MockResponse().setBody("""{}"""))
+        val missing = client.deviceStatus()
+        assertFalse(missing.outboundDirectV1)
+        assertFalse(missing.inboundFastpathV2)
+    }
+
+    @Test
     fun `deviceStatus 只认真布尔的 features`() {
         server.enqueue(
             MockResponse().setResponseCode(200)

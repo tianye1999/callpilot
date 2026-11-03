@@ -243,6 +243,7 @@ class CallManagerTest {
             directSessionFactory: (() -> DirectCapableSession)? = directSession?.let { { it } },
             gatewayFactory: (StoredPairing) -> InboundMediaGateway = { gateway ?: error("gateway should not be used") },
             outboundGateway: OutboundMediaGateway? = null,
+            outboundDirectProvider: (StoredPairing) -> Boolean = { outboundGateway != null },
             clockMs: () -> Long = { 1_000L },
             timingClockMs: () -> Double = { testScope.testScheduler.currentTime.toDouble() },
             inviteProvider: suspend (StoredPairing) -> Invite,
@@ -260,11 +261,82 @@ class CallManagerTest {
             directSessionFactory = directSessionFactory,
             mediaGatewayFactory = gatewayFactory,
             outboundGatewayFactory = { outboundGateway ?: error("outbound gateway should not be used") },
+            outboundDirectProvider = outboundDirectProvider,
             clockMs = clockMs,
             timingClockMs = timingClockMs,
         )
 
         fun close() = scope.cancel()
+    }
+
+    @Test
+    fun `cached capability routes immediately without waiting for refresh`() = runTest {
+        for (warm in listOf(true, false)) {
+            val h = Harness(this)
+            var requests = 0
+            val pendingRefresh = CompletableDeferred<ai.bondings.callpilot.protocol.HostedDeviceStatus?>()
+            val status = ai.bondings.callpilot.protocol.HostedDeviceStatus(
+                false, null, kotlinx.serialization.json.JsonObject(emptyMap()),
+                kotlinx.serialization.json.Json.parseToJsonElement("""{"outboundDirectV1":true,"inboundFastpathV2":true}""") as kotlinx.serialization.json.JsonObject,
+            )
+            val cache = DirectCapabilityCache(h.scope) {
+                requests++
+                if (requests == 1) {
+                    if (warm) status else null
+                } else pendingRefresh.await()
+            }
+            cache.activate(hosted)
+            runCurrent()
+            assertEquals(1, requests)
+            val legacy = FakeSession()
+            val direct = FakeDirectSession()
+            val manager = h.manager(
+                legacy,
+                hostedSessionProvider = { _, _ -> HostedCallSession("call_abcdefghijkl", "wss://lk.example.com", "legacy-token", 9_999_999L) },
+                directSession = direct,
+                outboundGateway = FakeOutboundGateway(),
+                outboundDirectProvider = { cache.cached(it).outboundDirectV1 },
+            ) { error("no tunnel") }
+            manager.startCall(hosted, "10086")
+            runCurrent()
+            assertEquals(warm, direct.prepared.isNotEmpty())
+            assertEquals(!warm, legacy.connected)
+            assertEquals(if (warm) 1 else 2, requests)
+            assertFalse(pendingRefresh.isCompleted)
+            h.close()
+        }
+    }
+
+    @Test
+    fun `outbound server capability true selects direct otherwise LiveKit`() = runTest {
+        for (value in listOf("true", "false", "null", "\"true\"", "missing", "unavailable")) {
+            val h = Harness(this)
+            val legacy = FakeSession()
+            val direct = FakeDirectSession()
+            val features = kotlinx.serialization.json.Json.parseToJsonElement(
+                if (value in listOf("missing", "unavailable")) "{}" else """{"outboundDirectV1":$value}""",
+            ) as kotlinx.serialization.json.JsonObject
+            val status = ai.bondings.callpilot.protocol.HostedDeviceStatus(
+                false, null, kotlinx.serialization.json.JsonObject(emptyMap()), features,
+            )
+            val manager = h.manager(
+                legacy,
+                hostedSessionProvider = { _, _ ->
+                    HostedCallSession("call_abcdefghijkl", "wss://lk.example.com", "legacy-token", 9_999_999L)
+                },
+                directSession = direct,
+                outboundGateway = FakeOutboundGateway(),
+                outboundDirectProvider = {
+                    if (value == "unavailable") error("device status unavailable")
+                    status.outboundDirectV1
+                },
+            ) { error("no tunnel") }
+            manager.startCall(hosted, "10086")
+            runCurrent()
+            assertEquals(value, value == "true", direct.prepared.isNotEmpty())
+            assertEquals(value, value != "true", legacy.connected)
+            h.close()
+        }
     }
 
     @Test
@@ -1244,7 +1316,7 @@ class CallManagerTest {
         val gateway = FakeOutboundGateway()
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
 
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
 
         assertEquals(listOf("ice", "create"), gateway.calls)
@@ -1269,7 +1341,7 @@ class CallManagerTest {
             hostedSessionProvider = { _, _ -> HostedCallSession("call_abcdefghijkl", "wss://lk.example.com", "legacy-token", 9_999_999L) },
         ) { error("no tunnel") }
 
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
 
         assertEquals(listOf("ice"), gateway.calls)
@@ -1290,7 +1362,7 @@ class CallManagerTest {
             hostedSessionProvider = { _, _ -> HostedCallSession("call_abcdefghijkl", "wss://lk.example.com", "legacy-token", 9_999_999L) },
         ) { error("no tunnel") }
 
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
 
         assertEquals(listOf("ice"), gateway.calls)
@@ -1306,7 +1378,7 @@ class CallManagerTest {
         val gateway = FakeOutboundGateway()
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
 
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
         direct.emit(SessionEvent.Disconnected("direct_failed"))
         runCurrent()
@@ -1328,7 +1400,7 @@ class CallManagerTest {
             val direct = FakeDirectSession()
             val gateway = FakeOutboundGateway(created)
             val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
-            manager.startCall(hosted, "10086", direct = true)
+            manager.startCall(hosted, "10086")
             runCurrent()
             assertEquals(listOf("ice", "create", expected), gateway.calls)
             assertEquals(null, direct.answer)
@@ -1344,7 +1416,7 @@ class CallManagerTest {
         val direct = FakeDirectSession()
         val gateway = FakeOutboundGateway()
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
         direct.emit(SessionEvent.Edge(Signaling.Event.Status("dialing")))
         runCurrent()
@@ -1365,7 +1437,7 @@ class CallManagerTest {
         val gateway = FakeOutboundGateway().also { it.createError = HostedCloudException(200, "LINE_BUSY", "云端呼叫创建失败") }
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
 
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
 
         val state = manager.state.value as CallState.Failed
@@ -1381,7 +1453,7 @@ class CallManagerTest {
         val direct = FakeDirectSession()
         val gateway = FakeOutboundGateway().also { it.createGate = CompletableDeferred() }
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
         assertEquals(listOf("ice", "create"), gateway.calls)
 
@@ -1402,7 +1474,7 @@ class CallManagerTest {
         val direct = FakeDirectSession()
         val gateway = FakeOutboundGateway()
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
         direct.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
         runCurrent()
@@ -1423,7 +1495,7 @@ class CallManagerTest {
         val direct = FakeDirectSession()
         val gateway = FakeOutboundGateway()
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
 
         direct.emit(SessionEvent.Edge(Signaling.Event.MediaFailed("no_phone_audio")))
@@ -1445,7 +1517,7 @@ class CallManagerTest {
         val h = Harness(this)
         val direct = FakeDirectSession()
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
         assertTrue(sentMarks(direct).containsAll(listOf("dial_start", "prepare_start", "prepare_response",
             "preconnect_start", "preconnect_ready", "claim_start", "claim_response", "connect_start", "connect_return",
@@ -1520,7 +1592,7 @@ class CallManagerTest {
         val h = Harness(this)
         val direct = GatedTimingSession()
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
         direct.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
         runCurrent()
@@ -1540,7 +1612,7 @@ class CallManagerTest {
         val h = Harness(this)
         val direct = GatedTimingSession()
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
 
         manager.hangup()
@@ -1561,7 +1633,7 @@ class CallManagerTest {
         val h = Harness(this)
         val direct = FakeDirectSession().also { it.failConnect = true }
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
         assertEquals("fallback-token", direct.connectedToken)
         assertTrue(sentMarks(direct).containsAll(listOf("connect_start", "connect_return", "cold_fallback", "room_connected")))
@@ -1601,7 +1673,7 @@ class CallManagerTest {
         val h = Harness(this)
         val direct = GatedTimingSession().also { it.autoAckHangup = false }
         val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
         manager.hangup()
         advanceTimeBy(1_499)
@@ -1648,7 +1720,7 @@ class CallManagerTest {
             }
             val manager = h.manager(legacy, directSession = direct, gateway = incoming, outboundGateway = outgoing) { invite() }
             if (inbound) manager.answerTakeover(hosted, "offer-A", direct = true)
-            else manager.startCall(hosted, "10086", direct = true)
+            else manager.startCall(hosted, "10086")
             runCurrent()
             direct.emit(SessionEvent.Edge(Signaling.Event.MediaFailed("no_phone_audio")))
             runCurrent()
@@ -1692,7 +1764,7 @@ class CallManagerTest {
         }.also { it.autoAckHangup = false }
         val next = FakeSession()
         manager = h.manager(next, directSession = old, outboundGateway = FakeOutboundGateway()) { invite() }
-        manager.startCall(hosted, "10086", direct = true)
+        manager.startCall(hosted, "10086")
         runCurrent()
         manager.hangup()
         advanceTimeBy(1_500)

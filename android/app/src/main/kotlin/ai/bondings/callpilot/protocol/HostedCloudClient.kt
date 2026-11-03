@@ -727,6 +727,8 @@ data class HostedDeviceStatus(
         get() = features.strictTrue("ownerDecline")
     val inboundFastpathV2: Boolean
         get() = features.strictTrue("inboundFastpathV2")
+    val outboundDirectV1: Boolean
+        get() = features.strictTrue("outboundDirectV1")
 
     private fun JsonObject.strictTrue(key: String): Boolean =
         (this[key] as? JsonPrimitive)?.let { !it.isString && it.booleanOrNull == true } ?: false

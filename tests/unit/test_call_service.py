@@ -1153,7 +1153,7 @@ def test_outbound_direct_session_uses_switchable_endpoint_and_one_fallback(monke
 def test_outbound_direct_requires_its_flag(monkeypatch):
     monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
     monkeypatch.setenv("REMOTE_CLOUD_ENABLED", "true")
-    monkeypatch.delenv("OUTBOUND_DIRECT_ENABLED", raising=False)
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "false")
     service = make_service(FakeModem())
     built: list[bool] = []
     monkeypatch.setattr(service, "_build_remote_worker_for_issued", lambda *_a, **_k: built.append(True))

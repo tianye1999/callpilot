@@ -95,12 +95,14 @@ class OfferWatchService : Service() {
             return START_NOT_STICKY
         }
         val alerts = OfferAlerts.get(this)
+        DirectCallCapabilities.cache.activate(paired)
         alerts.bindPairing(paired.credential.deviceId)
         val manager = CallGraph.manager(this)
         mutableRunning.value = true
         scope.launch {
             CredentialStore.changes.collect {
                 val current = runCatching { store.load() }.getOrNull()
+                DirectCallCapabilities.cache.activate(current)
                 if (current?.protocol != PairingProtocol.HOSTED) {
                     alerts.reset()
                     stopWatching()
@@ -315,15 +317,21 @@ class OfferWatchService : Service() {
             entry.value.job.cancel()
             iterator.remove()
         }
-        if (DirectCallSettings.enabled(this)) {
-            // 后台响铃也提前准备直连：用户解锁、点接听的几秒里连接已经备好。只备一通，
-            // 与前台默认显示的同一通（列表最新在前）；列表不变时 prepareTakeover 原样保留。
-            wanted.values.firstOrNull()?.let { CallGraph.manager(this).prepareTakeover(current, it) }
+        if (SystemClock.elapsedRealtime() >= ownerWatchPausedUntil) {
+            for ((offerId, offer) in wanted) {
+                if (offerId in ownerWatches) continue
+                ownerWatches[offerId] = OwnerWatch(current, scope.launch { watchOwnerState(current, offer, alerts, store) })
+            }
         }
-        if (SystemClock.elapsedRealtime() < ownerWatchPausedUntil) return
-        for ((offerId, offer) in wanted) {
-            if (offerId in ownerWatches) continue
-            ownerWatches[offerId] = OwnerWatch(current, scope.launch { watchOwnerState(current, offer, alerts, store) })
+        if (wanted.isEmpty()) return
+        val direct = DirectCallCapabilities.cache.cached(current).inboundFastpathV2
+        DirectCallCapabilities.cache.refresh(current)
+        if (store.load() != current || CallGraph.manager(this).state.value !is CallState.Idle) return
+        val pending = alerts.pendingWatch(System.currentTimeMillis())
+        if (direct) {
+            pending.firstOrNull()?.let { CallGraph.manager(this).prepareTakeover(current, it) }
+        } else {
+            wanted.values.forEach { CallGraph.manager(this).discardPrepared(it.offerId) }
         }
     }
 

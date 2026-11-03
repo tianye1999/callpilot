@@ -1347,7 +1347,7 @@ def test_outbound_direct_rejection_is_a_single_correlated_answer(monkeypatch) ->
 
 
 def test_outbound_direct_disabled_never_starts_a_session(monkeypatch) -> None:
-    monkeypatch.delenv("OUTBOUND_DIRECT_ENABLED", raising=False)
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "false")
     service = _OutboundService()
     client = CloudEdgeClient("https://relay.example.test", service, _Store())
     sent: list[dict] = []
@@ -1388,7 +1388,13 @@ def test_outbound_direct_parser_rejects_malformed_commands(monkeypatch, message)
 
 def test_heartbeat_advertises_outbound_direct_only_when_enabled(monkeypatch) -> None:
     client = CloudEdgeClient("https://relay.example.test", _Service(), _Store())
-    monkeypatch.delenv("OUTBOUND_DIRECT_ENABLED", raising=False)
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "false")
     assert "outboundDirectV1" not in json.loads(client._heartbeat())["status"]
     monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "true")
+    assert json.loads(client._heartbeat())["status"]["outboundDirectV1"] is True
+
+
+def test_heartbeat_advertises_outbound_direct_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("OUTBOUND_DIRECT_ENABLED", raising=False)
+    client = CloudEdgeClient("https://relay.example.test", _Service(), _Store())
     assert json.loads(client._heartbeat())["status"]["outboundDirectV1"] is True

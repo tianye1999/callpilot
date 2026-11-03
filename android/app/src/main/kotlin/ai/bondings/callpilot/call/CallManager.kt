@@ -96,6 +96,9 @@ class CallManager(
     private val directSetupMs: Long = 20_000L,
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val timingClockMs: () -> Double = { System.nanoTime() / 1_000_000.0 },
+    private val outboundDirectProvider: (StoredPairing) -> Boolean = {
+        DirectCallCapabilities.cache.cached(it).outboundDirectV1
+    },
 ) {
     // 单线程：建连、回落、挂断收尾、事件处理全部串行，没有「检查完再动手」的窗口。
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -167,7 +170,7 @@ class CallManager(
             it !is CallState.Idle && it !is CallState.Ended && it !is CallState.Failed
         }
 
-    fun startCall(pairing: StoredPairing, number: String, direct: Boolean = false) {
+    fun startCall(pairing: StoredPairing, number: String) {
         if (isActive) return
         synchronized(commandLock) {
             takeoverMediaTimeoutJob?.cancel()
@@ -179,7 +182,17 @@ class CallManager(
         timing = CallTiming(timingClockMs).also { it.restartAt(CallTiming.Mark.DIAL_START) }
         setupJob = scope.launch {
             try {
-                if (direct && pairing.protocol == PairingProtocol.HOSTED &&
+                val direct = if (pairing.protocol == PairingProtocol.HOSTED && directSessionFactory != null) {
+                    try {
+                        outboundDirectProvider(pairing)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        false
+                    }
+                } else false
+                currentCoroutineContext().ensureActive()
+                if (direct &&
                     startOutboundDirect(pairing, number, idempotencyKey)
                 ) {
                     setupJob = null

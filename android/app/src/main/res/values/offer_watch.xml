@@ -25,6 +25,4 @@
     <string name="offer_hosted_only">Background call transfers require cloud pairing.</string>
     <string name="offer_answered_elsewhere">Answered on another device</string>
     <string name="offer_declined_elsewhere">Declined on another device; the assistant is handling it</string>
-    <string name="offer_direct_toggle">Direct call audio (experimental)</string>
-    <string name="offer_direct_hint">When you answer or place a call, the phone and the desktop connect audio directly through the relay TURN server, which is faster; if that fails the call switches to the usual route. Off until verified on real calls.</string>
 </resources>

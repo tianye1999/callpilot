@@ -3,7 +3,6 @@ package ai.bondings.callpilot.ui
 import ai.bondings.callpilot.R
 import androidx.compose.ui.res.stringResource
 import ai.bondings.callpilot.call.CallManager
-import ai.bondings.callpilot.call.DirectCallSettings
 import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.DeviceStatus
 import ai.bondings.callpilot.protocol.GatewayClient
@@ -102,7 +101,7 @@ fun DialScreen(
     val micPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        if (granted) manager.startCall(pairing, number, direct = DirectCallSettings.enabled(context)) else message = "需要麦克风权限才能通话"
+        if (granted) manager.startCall(pairing, number) else message = "需要麦克风权限才能通话"
     }
 
     fun dial() {
@@ -111,7 +110,7 @@ fun DialScreen(
             context, Manifest.permission.RECORD_AUDIO,
         ) == PackageManager.PERMISSION_GRANTED
         if (granted) {
-            manager.startCall(pairing, number, direct = DirectCallSettings.enabled(context))
+            manager.startCall(pairing, number)
         } else {
             micPermission.launch(Manifest.permission.RECORD_AUDIO)
         }
