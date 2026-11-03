@@ -1,11 +1,13 @@
 package ai.bondings.callpilot.call
 
+import ai.bondings.callpilot.media.DirectCapableSession
 import ai.bondings.callpilot.media.RemoteSession
 import ai.bondings.callpilot.media.SessionEvent
 import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.DeviceCredential
 import ai.bondings.callpilot.protocol.HostedCallSession
 import ai.bondings.callpilot.protocol.HostedCloudException
+import ai.bondings.callpilot.protocol.IceServer
 import ai.bondings.callpilot.protocol.Invite
 import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.protocol.Signaling
@@ -16,6 +18,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
@@ -60,6 +63,66 @@ class CallManagerTest {
         suspend fun emit(event: SessionEvent) = _events.emit(event)
     }
 
+    private open class FakeDirectSession : FakeSession(), DirectCapableSession {
+        val prepared = mutableListOf<List<IceServer>>()
+        var answer: String? = null
+        var closedDirect = 0
+        var failPrepare = false
+        var failConnect = false
+        /** 不为 null 时 prepareDirect 挂起直到它完成（模拟 TURN 收集卡住）。 */
+        var prepareGate: CompletableDeferred<Unit>? = null
+
+        override suspend fun prepareDirect(iceServers: List<IceServer>): String {
+            prepared += iceServers
+            prepareGate?.await()
+            if (failPrepare) error("no relay candidate")
+            return "v=0\r\nfake-offer typ relay"
+        }
+
+        override suspend fun connectDirect(sdpAnswer: String) {
+            if (failConnect) error("ice failed")
+            answer = sdpAnswer
+        }
+
+        override fun closeDirect() {
+            closedDirect += 1
+        }
+    }
+
+    private class FakeGateway(
+        private val claimResult: HostedCallSession,
+        private val sdpResult: HostedCallSession? = null,
+    ) : InboundMediaGateway {
+        val calls = mutableListOf<String>()
+        var claimGate: CompletableDeferred<Unit>? = null
+        var fallbackGate: CompletableDeferred<Unit>? = null
+        override suspend fun claim(offerId: String, direct: Boolean): HostedCallSession {
+            calls += "claim:$direct"
+            claimGate?.await()
+            return claimResult
+        }
+
+        override suspend fun iceServers(offerId: String): List<IceServer> {
+            calls += "ice"
+            return listOf(IceServer(listOf("turn:turn.example:3478"), "u", "c"))
+        }
+
+        override suspend fun completeSdp(offerId: String, claimId: String, sdpOffer: String): HostedCallSession {
+            calls += "sdp"
+            return sdpResult ?: error("no sdp result")
+        }
+
+        override suspend fun fallbackLiveKit(offerId: String, claimId: String): HostedCallSession {
+            calls += "fallback"
+            fallbackGate?.await()
+            return claimResult.copy(token = "fallback-token", directAttempted = true, sdpPending = false)
+        }
+
+        override suspend fun end(offerId: String, claimId: String) {
+            calls += "end"
+        }
+    }
+
     private val pairing = StoredPairing(
         gatewayUrl = "https://gw.example.com",
         displayName = "Test",
@@ -101,6 +164,10 @@ class CallManagerTest {
             },
             takeoverMediaTimeoutMs: Long = 20_000L,
             takeoverFailureVisibleMs: Long = 2_000L,
+            directSession: DirectCapableSession? = null,
+            gateway: InboundMediaGateway? = null,
+            directSessionFactory: (() -> DirectCapableSession)? = directSession?.let { { it } },
+            gatewayFactory: (StoredPairing) -> InboundMediaGateway = { gateway ?: error("gateway should not be used") },
             inviteProvider: suspend (StoredPairing) -> Invite,
         ): CallManager = CallManager(
             sessionFactory = { session },
@@ -113,6 +180,8 @@ class CallManagerTest {
             ioDispatcher = dispatcher,
             takeoverMediaTimeoutMs = takeoverMediaTimeoutMs,
             takeoverFailureVisibleMs = takeoverFailureVisibleMs,
+            directSessionFactory = directSessionFactory,
+            mediaGatewayFactory = gatewayFactory,
         )
 
         fun close() = scope.cancel()
@@ -458,6 +527,354 @@ class CallManagerTest {
         advanceTimeBy(60_000)
         runCurrent()
         assertTrue(manager.state.value is CallState.InCall)
+        h.close()
+    }
+
+    @Test
+    fun `answerTakeover 他机已接或机主已拒绝按结束原因展示而不是失败`() = runTest {
+        for ((code, reason) in listOf(
+            "OFFER_ANSWERED_ELSEWHERE" to CallEndReasons.ANSWERED_ELSEWHERE,
+            "OFFER_OWNER_DECLINED" to CallEndReasons.OWNER_DECLINED,
+        )) {
+            val h = Harness(this)
+            val session = FakeSession()
+            val manager = h.manager(
+                session,
+                takeoverClaimProvider = { _, _ -> throw HostedCloudException(409, code, "elsewhere") },
+            ) { error("invite path should not run") }
+            val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
+
+            manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
+            runCurrent()
+
+            val state = manager.state.value
+            assertTrue("$code -> $state", state is CallState.Ended && state.reason == reason)
+            assertFalse(session.connected)
+            h.close()
+        }
+    }
+
+    @Test
+    fun `answerTakeover 其他 409 仍是失败并带错误码`() = runTest {
+        val h = Harness(this)
+        val manager = h.manager(
+            FakeSession(),
+            takeoverClaimProvider = { _, _ -> throw HostedCloudException(409, "OFFER_UNAVAILABLE", "gone") },
+        ) { error("invite path should not run") }
+        val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
+
+        manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
+        runCurrent()
+
+        val state = manager.state.value
+        assertTrue("$state", state is CallState.Failed && state.code == "OFFER_UNAVAILABLE")
+        h.close()
+    }
+
+    private fun v2Claim(sdpAnswer: String? = null) = HostedCallSession(
+        sessionId = "claim_abcdefghijkl",
+        livekitUrl = "wss://lk.example.com",
+        token = "tok",
+        expiresAt = 9_999_999_999_999,
+        directAttempted = true,
+        sdpPending = sdpAnswer == null,
+        sdpAnswer = sdpAnswer,
+    )
+
+    private val hosted = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
+
+    @Test
+    fun `直连 happy path claim 后取 TURN 补 SDP 连通 再由 Edge connected 推进 InCall`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer typ relay"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+
+        assertEquals(listOf("claim:true", "ice", "sdp"), gateway.calls)
+        assertEquals("v=0\r\nanswer typ relay", direct.answer)
+        assertFalse(direct.connected)
+        assertTrue(manager.state.value is CallState.WaitingMedia)
+
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("connected", null)))
+        runCurrent()
+        assertTrue(manager.state.value is CallState.InCall)
+
+        manager.hangup()
+        runCurrent()
+        assertTrue(gateway.calls.contains("end"))
+        assertTrue(direct.commands.any { it.contains("\"hangup\"") })
+        h.close()
+    }
+
+    @Test
+    fun `直连拿不到 answer 或连通失败时同 claim 回落 LiveKit`() = runTest {
+        for (mode in listOf("no-answer", "connect-fails")) {
+            val h = Harness(this)
+            val direct = FakeDirectSession().apply { failConnect = mode == "connect-fails" }
+            val sdp = if (mode == "no-answer") v2Claim().copy(sdpPending = false) else v2Claim(sdpAnswer = "v=0\r\nanswer")
+            val gateway = FakeGateway(v2Claim(), sdpResult = sdp)
+            val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+
+            manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+            runCurrent()
+
+            assertTrue("$mode ${gateway.calls}", gateway.calls.last() == "fallback")
+            assertTrue(mode, direct.connected)
+            assertTrue(mode, direct.closedDirect >= 0)
+            assertTrue(mode, manager.state.value is CallState.WaitingMedia)
+            h.close()
+        }
+    }
+
+    @Test
+    fun `直连提交前 media_failed 或断开触发回落 提交后断开才算结束`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+        assertFalse(gateway.calls.contains("fallback"))
+
+        direct.emit(SessionEvent.Edge(Signaling.Event.MediaFailed("no_phone_audio")))
+        runCurrent()
+        assertEquals(1, gateway.calls.count { it == "fallback" })
+        assertTrue(direct.connected)
+        assertTrue(direct.closedDirect >= 1)
+        // 旧对等连接的尾随断开事件与本通无关：不重复回落、也不结束通话。
+        direct.emit(SessionEvent.Disconnected("direct_failed"))
+        direct.emit(SessionEvent.Disconnected("channel_closed"))
+        runCurrent()
+        assertEquals(1, gateway.calls.count { it == "fallback" })
+        assertTrue(manager.state.value is CallState.WaitingMedia)
+        // 回落后的 LiveKit 房间断开才是真正结束。
+        direct.emit(SessionEvent.Disconnected("disconnected"))
+        runCurrent()
+        assertTrue(manager.state.value is CallState.Ended)
+        h.close()
+    }
+
+    @Test
+    fun `直连准备阶段超时回落而不是等整体超时`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession().apply { prepareGate = CompletableDeferred() }
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+        assertEquals(listOf("claim:true", "ice"), gateway.calls)
+
+        advanceTimeBy(20_001)
+        runCurrent()
+
+        assertEquals("fallback", gateway.calls.last())
+        assertTrue(direct.connected)
+        assertTrue(manager.state.value is CallState.WaitingMedia)
+        h.close()
+    }
+
+    @Test
+    fun `回落请求途中挂断 不再连房间`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer")).apply { fallbackGate = CompletableDeferred() }
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+        direct.emit(SessionEvent.Edge(Signaling.Event.MediaFailed("no_phone_audio")))
+        runCurrent()
+        assertEquals("fallback", gateway.calls.last())
+
+        manager.hangup()
+        runCurrent()
+        val ended = manager.state.value
+        assertTrue("$ended", ended is CallState.Ended && ended.reason == "local_hangup")
+        gateway.fallbackGate!!.complete(Unit)
+        runCurrent()
+
+        assertFalse(direct.connected)
+        assertTrue(gateway.calls.contains("end"))
+        h.close()
+    }
+
+    @Test
+    fun `回落 connect 进行中挂断 会话被断开且不再推进`() = runTest {
+        val h = Harness(this)
+        lateinit var manager: CallManager
+        val direct = object : FakeDirectSession() {
+            override suspend fun connect(livekitUrl: String, token: String) {
+                connected = true
+                // 房间正在连的瞬间机主挂断：挂断收尾必须断掉这个刚起的回落会话。
+                manager.hangup()
+            }
+        }
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim().copy(sdpPending = false))
+        manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+
+        val ended = manager.state.value
+        assertTrue("$ended", ended is CallState.Ended && ended.reason == "local_hangup")
+        assertTrue(direct.connected)
+        assertTrue(direct.disconnected)
+        assertTrue(gateway.calls.contains("end"))
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("connected", null)))
+        runCurrent()
+        assertTrue(manager.state.value is CallState.Ended)
+        h.close()
+    }
+
+    @Test
+    fun `上一通清理阻塞在断开时开始下一通 新通话的上下文不被旧清理清掉`() = runTest {
+        val h = Harness(this)
+        lateinit var manager: CallManager
+        val second = FakeDirectSession()
+        val secondGateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        var nextCall = 0
+        val first = object : FakeDirectSession() {
+            override fun disconnect() {
+                super.disconnect()
+                // 旧会话 disconnect 卡在 native 释放时，用户已从界面开始下一通。
+                if (nextCall == 0) {
+                    nextCall = 1
+                    manager.reset()
+                    manager.answerTakeover(hosted, "offer_abcdefghijkm", direct = true)
+                }
+            }
+        }
+        val firstGateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val sessions = listOf<DirectCapableSession>(first, second)
+        val gateways = listOf<InboundMediaGateway>(firstGateway, secondGateway)
+        var created = 0
+        manager = h.manager(
+            FakeSession(),
+            directSessionFactory = { sessions[created++] },
+            gatewayFactory = { gateways[if (nextCall == 0) 0 else 1] },
+        ) { error("invite path should not run") }
+
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+        assertTrue(manager.state.value is CallState.WaitingMedia)
+        // 第一通媒体超时 → Failed → cleanup → disconnect 中开始第二通。
+        advanceTimeBy(60_001)
+        runCurrent()
+        assertTrue(first.disconnected)
+
+        // 第二通正常建连，回落与结束都仍找得到自己的上下文。
+        assertTrue("${manager.state.value}", manager.state.value is CallState.WaitingMedia)
+        assertEquals(listOf("claim:true", "ice", "sdp"), secondGateway.calls)
+        second.emit(SessionEvent.Edge(Signaling.Event.MediaFailed("no_phone_audio")))
+        runCurrent()
+        assertEquals("fallback", secondGateway.calls.last())
+        assertTrue(second.connected)
+        manager.hangup()
+        runCurrent()
+        assertTrue("${secondGateway.calls}", secondGateway.calls.contains("end"))
+        assertFalse(firstGateway.calls.contains("fallback"))
+        h.close()
+    }
+
+    @Test
+    fun `看到媒体超时 Failed 立刻开始的下一通 不被超时清理碰到`() = runTest {
+        val h = Harness(this)
+        lateinit var manager: CallManager
+        val first = FakeDirectSession()
+        val second = FakeDirectSession()
+        val firstGateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val secondGateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        var created = 0
+        var calls = 0
+        manager = h.manager(
+            FakeSession(),
+            directSessionFactory = { listOf<DirectCapableSession>(first, second)[created++] },
+            gatewayFactory = { listOf<InboundMediaGateway>(firstGateway, secondGateway)[calls++] },
+        ) { error("invite path should not run") }
+        // 界面一看到 Failed 就返回并接下一通（与真机上用户的最快操作一致）。
+        val watcher = h.scope.launch {
+            manager.state.collect { state ->
+                if (state is CallState.Failed && state.code == "TAKEOVER_MEDIA_TIMEOUT") {
+                    manager.reset()
+                    manager.answerTakeover(hosted, "offer_abcdefghijkm", direct = true)
+                }
+            }
+        }
+
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+        advanceTimeBy(60_001)
+        runCurrent()
+
+        assertTrue(first.disconnected)
+        assertTrue("${manager.state.value}", manager.state.value is CallState.WaitingMedia)
+        assertEquals(listOf("claim:true", "ice", "sdp"), secondGateway.calls)
+        assertFalse(second.disconnected)
+        second.emit(SessionEvent.Edge(Signaling.Event.MediaFailed("no_phone_audio")))
+        runCurrent()
+        assertEquals("fallback", secondGateway.calls.last())
+        watcher.cancel()
+        h.close()
+    }
+
+    @Test
+    fun `claim 在挂断之后才成功也要通知中转结束`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim()).apply { claimGate = CompletableDeferred() }
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+        assertEquals(listOf("claim:true"), gateway.calls)
+
+        manager.hangup()
+        runCurrent()
+        assertFalse(gateway.calls.contains("end"))
+        gateway.claimGate!!.complete(Unit)
+        runCurrent()
+
+        assertTrue("${gateway.calls}", gateway.calls.contains("end"))
+        assertTrue(direct.prepared.isEmpty())
+        h.close()
+    }
+
+    @Test
+    fun `直连提交后 Edge ended 通知直接结束通话`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("connected", null)))
+        runCurrent()
+        assertTrue(manager.state.value is CallState.InCall)
+
+        direct.emit(SessionEvent.Edge(Signaling.Event.Ended("call_ended")))
+        runCurrent()
+
+        val state = manager.state.value
+        assertTrue("$state", state is CallState.Ended && state.reason == "call_ended")
+        assertTrue(direct.disconnected)
+        h.close()
+    }
+
+    @Test
+    fun `中转没走直连流程时即便开了直连也用 LiveKit 会话`() = runTest {
+        val h = Harness(this)
+        val legacy = FakeSession()
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim().copy(directAttempted = false, sdpPending = false))
+        val manager = h.manager(legacy, directSession = direct, gateway = gateway) { error("invite path should not run") }
+
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+
+        assertEquals(listOf("claim:true"), gateway.calls)
+        assertTrue(legacy.connected)
+        assertTrue(direct.prepared.isEmpty())
         h.close()
     }
 

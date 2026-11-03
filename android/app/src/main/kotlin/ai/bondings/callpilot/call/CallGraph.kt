@@ -2,6 +2,7 @@ package ai.bondings.callpilot.call
 
 import ai.bondings.callpilot.R
 import ai.bondings.callpilot.media.LiveKitSession
+import ai.bondings.callpilot.media.WebRtcDirectSession
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,6 +20,7 @@ object CallGraph {
         return manager ?: synchronized(this) {
             manager ?: CallManager(
                 sessionFactory = { LiveKitSession(app, sessionScope) },
+                directSessionFactory = { WebRtcDirectSession(app, sessionScope) { LiveKitSession(app, sessionScope) } },
                 incomingCallLabel = { app.getString(R.string.offer_notification_title) },
                 onForeground = { active ->
                     if (active) CallService.start(app) else CallService.stop(app)

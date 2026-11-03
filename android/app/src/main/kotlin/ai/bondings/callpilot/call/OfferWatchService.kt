@@ -4,8 +4,11 @@ import ai.bondings.callpilot.MainActivity
 import ai.bondings.callpilot.R
 import ai.bondings.callpilot.content.ProtectedJsonStore
 import ai.bondings.callpilot.pairing.CredentialStore
+import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.HostedCloudClient
 import ai.bondings.callpilot.protocol.HostedCloudException
+import ai.bondings.callpilot.protocol.InboundOffer
+import ai.bondings.callpilot.protocol.InboundOfferState
 import ai.bondings.callpilot.protocol.CallSummaryState
 import ai.bondings.callpilot.protocol.HttpClients
 import ai.bondings.callpilot.protocol.PairingProtocol
@@ -40,6 +43,10 @@ import kotlinx.coroutines.withContext
 class OfferWatchService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var polling: Job? = null
+    private val ownerWatches = mutableMapOf<String, OwnerWatch>()
+    private var ownerWatchPausedUntil = 0L
+
+    private class OwnerWatch(val pairing: StoredPairing, val job: Job)
     private var ready = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var renewWakeLockAt = 0L
@@ -97,6 +104,10 @@ class OfferWatchService : Service() {
                 if (current?.protocol != PairingProtocol.HOSTED) {
                     alerts.reset()
                     stopWatching()
+                } else {
+                    // 换了另一份云配对：旧配对的长轮询立刻取消（连带底层 HTTP），能力退避也重算。
+                    cancelOwnerWatches { it.pairing != current }
+                    ownerWatchPausedUntil = 0L
                 }
             }
         }
@@ -111,6 +122,8 @@ class OfferWatchService : Service() {
                 val idle = manager.state.value is CallState.Idle
                 alerts.tick(!idle)
                 updateWakeLock(idle)
+                // 拒绝 / 过期 / 进入通话都不等下一次列表轮询：立刻撤掉对应长轮询。
+                if (!idle) cancelOwnerWatches() else pruneOwnerWatches(alerts)
                 delay(1_000)
             }
         }
@@ -125,6 +138,7 @@ class OfferWatchService : Service() {
                         return@launch
                     }
                     alerts.bindPairing(current.credential.deviceId)
+                    if (manager.state.value !is CallState.Idle) cancelOwnerWatches()
                     if (manager.state.value is CallState.Idle) {
                         val client = HostedCloudClient(current.gatewayUrl, HttpClients.shared).also {
                             it.credential = current.credential
@@ -133,16 +147,10 @@ class OfferWatchService : Service() {
                             val offers = withContext(Dispatchers.IO) { client.listInboundOffers() }
                             if (store.load() == current && manager.state.value is CallState.Idle) {
                                 alerts.update(offers)
+                                syncOwnerWatches(current, alerts, store)
                             }
                         } catch (error: HostedCloudException) {
-                            if (error.statusCode == 401 && store.load() == current) {
-                                // 旧请求的 401 不得清掉用户刚完成的新配对。
-                                ProtectedJsonStore.clearAll(applicationContext)
-                                store.clear()
-                                alerts.reset()
-                                stopWatching()
-                                return@launch
-                            }
+                            if (error.statusCode == 401 && revokeIfCurrent(store, current, alerts)) return@launch
                         }
                     }
                 } catch (error: CancellationException) {
@@ -293,6 +301,94 @@ class OfferWatchService : Service() {
         }
     }
 
+    /**
+     * 对每个仍在响铃的 offer 向中转长轮询终态：他机接听、机主拒绝或来电结束时立刻收铃，
+     * 不等 3 s 轮询。中转或 Edge 未开此能力（404 FEATURE_DISABLED）时退回轮询，稍后再试。
+     */
+    private fun syncOwnerWatches(current: StoredPairing, alerts: OfferAlerts, store: CredentialStore) {
+        val wanted = alerts.pendingWatch(System.currentTimeMillis()).associateBy { it.offerId }
+        cancelOwnerWatches { watch -> watch.pairing != current || !watch.job.isActive }
+        val iterator = ownerWatches.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.key in wanted) continue
+            entry.value.job.cancel()
+            iterator.remove()
+        }
+        if (SystemClock.elapsedRealtime() < ownerWatchPausedUntil) return
+        for ((offerId, offer) in wanted) {
+            if (offerId in ownerWatches) continue
+            ownerWatches[offerId] = OwnerWatch(current, scope.launch { watchOwnerState(current, offer, alerts, store) })
+        }
+    }
+
+    private fun cancelOwnerWatches(predicate: (OwnerWatch) -> Boolean = { true }) {
+        val iterator = ownerWatches.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (!predicate(entry.value)) continue
+            if (entry.value.job.isActive) entry.value.job.cancel()
+            iterator.remove()
+        }
+    }
+
+    /** 被拒绝 / 已过期的 offer 不再值得盯：取消其长轮询（取消会一并取消底层 HTTP）。 */
+    private fun pruneOwnerWatches(alerts: OfferAlerts) {
+        val keep = alerts.pendingWatch(System.currentTimeMillis()).map { it.offerId }.toSet()
+        val iterator = ownerWatches.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.key in keep && entry.value.job.isActive) continue
+            if (entry.value.job.isActive) entry.value.job.cancel()
+            iterator.remove()
+        }
+    }
+
+    /** 旧请求的 401 不得清掉用户刚完成的新配对；只有仍是当前配对时才撤销。 */
+    private fun revokeIfCurrent(store: CredentialStore, current: StoredPairing, alerts: OfferAlerts): Boolean {
+        if (store.load() != current) return false
+        ProtectedJsonStore.clearAll(applicationContext)
+        store.clear()
+        alerts.reset()
+        stopWatching()
+        return true
+    }
+
+    private suspend fun watchOwnerState(
+        current: StoredPairing,
+        offer: InboundOffer,
+        alerts: OfferAlerts,
+        store: CredentialStore,
+    ) {
+        val client = HostedCloudClient(current.gatewayUrl).also { it.credential = current.credential }
+        while (offer.expiresAt > System.currentTimeMillis() && !alerts.isDismissed(offer.offerId)) {
+            // 配对换了或已进入通话：这条长轮询没有意义，直接退出。
+            if (store.load() != current || CallGraph.manager(this).state.value !is CallState.Idle) return
+            val state = try {
+                withContext(Dispatchers.IO) { client.watchInboundOfferCancellable(offer.offerId) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: HostedCloudException) {
+                if (error.statusCode == 404 || error.errorCode == "FEATURE_DISABLED") {
+                    ownerWatchPausedUntil = SystemClock.elapsedRealtime() + OWNER_WATCH_PAUSE_MS
+                    return
+                }
+                if (error.statusCode == 401) {
+                    revokeIfCurrent(store, current, alerts)
+                    return
+                }
+                delay(OWNER_WATCH_RETRY_MS)
+                continue
+            } catch (_: Exception) {
+                delay(OWNER_WATCH_RETRY_MS)
+                continue
+            }
+            if (state == InboundOfferState.OFFERED) continue
+            if (store.load() == current) alerts.resolve(offer.offerId, state)
+            return
+        }
+    }
+
     private fun updateWakeLock(waiting: Boolean) {
         if (!waiting) {
             releaseWakeLock()
@@ -314,6 +410,7 @@ class OfferWatchService : Service() {
     }
 
     private fun stopWatching() {
+        cancelOwnerWatches()
         scope.cancel()
         releaseWakeLock()
         mutableRunning.value = false
@@ -333,6 +430,8 @@ class OfferWatchService : Service() {
         private const val CHANNEL_ID = "callpilot_offer_watch"
         private const val NOTIFICATION_ID = 1002
         private const val POLL_INTERVAL_MS = 3_000L
+        private const val OWNER_WATCH_RETRY_MS = 1_000L
+        private const val OWNER_WATCH_PAUSE_MS = 300_000L
         private const val DIGEST_POLL_INTERVAL_MS = 30_000L
         private const val DIGEST_BACKOFF_MS = 300_000L
         private const val SMS_POLL_INTERVAL_MS = 15_000L

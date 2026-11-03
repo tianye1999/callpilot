@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.media
 
+import ai.bondings.callpilot.protocol.IceServer
 import ai.bondings.callpilot.protocol.Signaling
 import kotlinx.coroutines.flow.SharedFlow
 
@@ -21,6 +22,18 @@ interface RemoteSession {
     fun setSpeakerphone(enabled: Boolean)
 
     fun disconnect()
+}
+
+/** 支持直连的会话：先 TURN 建对等连接产出 offer，再用 Edge 的 answer 连通；失败后 `connect()` 回落 LiveKit。 */
+interface DirectCapableSession : RemoteSession {
+    /** 建对等连接与控制数据通道，返回含 relay 候选的本地 SDP（不超过 16 KiB）。 */
+    suspend fun prepareDirect(iceServers: List<IceServer>): String
+
+    /** 设置 Edge 的 answer，等到 ICE 连通且控制通道打开。 */
+    suspend fun connectDirect(sdpAnswer: String)
+
+    /** 放弃直连（回落前或收尾），不影响已建立的 LiveKit 回落会话。 */
+    fun closeDirect()
 }
 
 sealed interface SessionEvent {

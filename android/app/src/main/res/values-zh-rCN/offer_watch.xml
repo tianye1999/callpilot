@@ -7,7 +7,7 @@
     <string name="offer_notification_body">有一通电话需要你接听，接听后通话转到这台手机。</string>
     <string name="offer_accept">接听</string>
     <string name="offer_decline">拒绝</string>
-    <string name="offer_decline_hint">拒绝后不会在这台手机上接听。</string>
+    <string name="offer_decline_hint">拒绝后由助理立即接听，本通不再转给你。</string>
     <string name="pair_desktop_title">配对到电脑端</string>
     <string name="pair_desktop_hint">在电脑端点「配对手机」，复制配对链接后回到这里粘贴。</string>
     <string name="call_notification_title">%1$s 通话中</string>
@@ -23,4 +23,8 @@
     <string name="offer_notifications_disabled">通知未开启，无法显示来电提醒</string>
     <string name="offer_notification_settings">通知设置</string>
     <string name="offer_hosted_only">仅云端配对支持后台来电转接</string>
+    <string name="offer_answered_elsewhere">已在其他设备接听</string>
+    <string name="offer_declined_elsewhere">已在其他设备拒绝，由助理接听</string>
+    <string name="offer_direct_toggle">直连通话（实验）</string>
+    <string name="offer_direct_hint">接听后手机与电脑经中转 TURN 直接建立音频，接通更快；真机验证前默认关闭。</string>
 </resources>

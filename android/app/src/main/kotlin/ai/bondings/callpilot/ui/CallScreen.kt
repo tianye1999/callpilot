@@ -1,6 +1,8 @@
 package ai.bondings.callpilot.ui
 
 import ai.bondings.callpilot.call.CallManager
+import ai.bondings.callpilot.R
+import ai.bondings.callpilot.call.CallEndReasons
 import ai.bondings.callpilot.call.CallState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -21,6 +23,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.res.stringResource
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -56,7 +59,7 @@ fun CallScreen(state: CallState, manager: CallManager) {
         is CallState.WaitingMedia -> state.number to "媒体通道建立中…"
         is CallState.Dialing -> state.number to "拨号中…"
         is CallState.InCall -> state.number to "%02d:%02d".format(seconds / 60, seconds % 60)
-        is CallState.Ended -> state.number to "通话结束（${state.reason}）"
+        is CallState.Ended -> state.number to "通话结束（${endReasonText(state.reason)}）"
         is CallState.Failed -> state.number to "失败：${state.reason}"
         CallState.Idle -> "" to ""
     }
@@ -111,4 +114,12 @@ fun CallScreen(state: CallState, manager: CallManager) {
         }
         Spacer(Modifier.height(36.dp))
     }
+}
+
+/** 他机已接 / 机主已拒绝按本地化文案展示；其他原因沿用 Edge 给的原因码。 */
+@Composable
+private fun endReasonText(reason: String): String = when (reason) {
+    CallEndReasons.ANSWERED_ELSEWHERE -> stringResource(R.string.offer_answered_elsewhere)
+    CallEndReasons.OWNER_DECLINED -> stringResource(R.string.offer_declined_elsewhere)
+    else -> reason
 }

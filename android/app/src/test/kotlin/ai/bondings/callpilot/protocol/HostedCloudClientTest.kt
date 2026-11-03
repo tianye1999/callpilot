@@ -12,6 +12,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okio.Buffer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -416,6 +417,178 @@ class HostedCloudClientTest {
             client.claimInboundOffer("offer_abcdefghijkl")
         }
         assertEquals("OFFER_UNAVAILABLE", error.errorCode)
+    }
+
+    @Test
+    fun `watchInboundOffer 长轮询返回机主侧终态`() {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"state":"answered_elsewhere"}"""))
+
+        val state = client.watchInboundOffer("offer_abcdefghijkl")
+
+        assertEquals(InboundOfferState.ANSWERED_ELSEWHERE, state)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/v1/inbound-offers/offer_abcdefghijkl/watch", request.path)
+    }
+
+    @Test
+    fun `watchInboundOffer 未知状态与能力关闭都不被当成 offered`() {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"state":"something_new"}"""))
+        server.enqueue(
+            MockResponse().setResponseCode(404)
+                .setBody("""{"error":{"code":"FEATURE_DISABLED","message":"Feature disabled"}}"""),
+        )
+
+        val invalid = assertThrows(HostedCloudException::class.java) { client.watchInboundOffer("offer_abcdefghijkl") }
+        assertEquals("INVALID_RESPONSE", invalid.errorCode)
+        val disabled = assertThrows(HostedCloudException::class.java) { client.watchInboundOffer("offer_abcdefghijkl") }
+        assertEquals("FEATURE_DISABLED", disabled.errorCode)
+        assertEquals(404, disabled.statusCode)
+    }
+
+    @Test
+    fun `declineInboundOffer 成功幂等 409 带状态照常返回`() {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"state":"owner_declined"}"""))
+        server.enqueue(MockResponse().setResponseCode(409).setBody("""{"state":"claimed"}"""))
+        server.enqueue(
+            MockResponse().setResponseCode(409).setBody("""{"error":{"code":"FEATURE_DISABLED","message":"off"}}"""),
+        )
+
+        assertEquals(InboundOfferState.OWNER_DECLINED, client.declineInboundOffer("offer_abcdefghijkl"))
+        assertEquals("/v1/inbound-offers/offer_abcdefghijkl/decline", server.takeRequest().path)
+        assertEquals(InboundOfferState.CLAIMED, client.declineInboundOffer("offer_abcdefghijkl"))
+        val error = assertThrows(HostedCloudException::class.java) { client.declineInboundOffer("offer_abcdefghijkl") }
+        assertEquals("FEATURE_DISABLED", error.errorCode)
+    }
+
+    @Test
+    fun `deviceStatus 只认真布尔的 features`() {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody("""{"paired":false,"edge":{"connected":true},"features":{"multiDeviceStop":true,"ownerDecline":"true","inboundFastpathV2":false}}"""),
+        )
+
+        val status = client.deviceStatus()
+
+        assertTrue(status.multiDeviceStop)
+        assertFalse(status.ownerDecline)
+        assertFalse(status.inboundFastpathV2)
+    }
+
+    private val v2Claim = """{"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl","callId":"call_abcdefghijkl","roomName":"r","url":"wss://cloud.livekit.example","token":"a.b.c","participantIdentity":"p","edgeIdentity":"e","expiresAt":9999999999999,"directAttempted":true,"sdpPending":true,"transports":[{"kind":"livekit","url":"wss://cloud.livekit.example","token":"a.b.c"}]}"""
+
+    @Test
+    fun `claimInboundOffer direct 请求 webrtc 并解析 V2 响应`() {
+        server.enqueue(MockResponse().setResponseCode(202).setBody(v2Claim))
+
+        val session = client.claimInboundOffer("offer_abcdefghijkl", direct = true)
+
+        assertTrue(session.directAttempted)
+        assertTrue(session.sdpPending)
+        assertEquals(null, session.sdpAnswer)
+        assertEquals("wss://cloud.livekit.example", session.livekitUrl)
+        val body = server.takeRequest().body.readUtf8()
+        assertTrue(body.contains("\"mediaTransport\":\"webrtc\""))
+        assertFalse(body.contains("sdpOffer"))
+    }
+
+    @Test
+    fun `claimInboundOffer 旧响应没有 directAttempted 即走 LiveKit`() {
+        server.enqueue(
+            MockResponse().setResponseCode(202)
+                .setBody("""{"claimId":"claim_abcdefghijkl","offerId":"offer_abcdefghijkl","roomName":"r","url":"wss://cloud.livekit.example","token":"a.b.c","expiresAt":9999999999999}"""),
+        )
+
+        val session = client.claimInboundOffer("offer_abcdefghijkl", direct = true)
+
+        assertFalse(session.directAttempted)
+        assertFalse(session.sdpPending)
+    }
+
+    @Test
+    fun `completeInboundSdp 返回 Edge answer 且 claimId 必须匹配`() {
+        val answer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\na=candidate:1 1 udp 1 1.2.3.4 1 typ relay"
+        server.enqueue(
+            MockResponse().setResponseCode(202)
+                .setBody(v2Claim.replace("\"sdpPending\":true", "\"sdpPending\":false")
+                    .replace("\"transports\":[", "\"transports\":[{\"kind\":\"webrtc\",\"sdpAnswer\":\"$answer\",\"iceServers\":[{\"urls\":[\"turn:turn.example:3478\"],\"username\":\"u\",\"credential\":\"c\"}]},")),
+        )
+        server.enqueue(MockResponse().setResponseCode(202).setBody(v2Claim.replace("claim_abcdefghijkl", "claim_zzzzzzzzzzzz")))
+
+        val session = client.completeInboundSdp("offer_abcdefghijkl", "claim_abcdefghijkl", "v=0\r\nfake")
+
+        assertEquals("/v1/inbound-offers/offer_abcdefghijkl/media/sdp", server.takeRequest().path)
+        assertTrue(session.directAttempted)
+        assertFalse(session.sdpPending)
+        assertTrue(session.sdpAnswer!!.contains("typ relay"))
+        assertEquals(listOf("turn:turn.example:3478"), session.iceServers.single().urls)
+        val mismatch = assertThrows(HostedCloudException::class.java) {
+            client.completeInboundSdp("offer_abcdefghijkl", "claim_abcdefghijkl", "v=0\r\nfake")
+        }
+        assertEquals("INVALID_RESPONSE", mismatch.errorCode)
+    }
+
+    @Test
+    fun `没发 offer 却收到 answer 视为协议破坏`() {
+        server.enqueue(
+            MockResponse().setResponseCode(202)
+                .setBody(v2Claim.replace("\"sdpPending\":true", "\"sdpPending\":false")
+                    .replace("\"transports\":[", "\"transports\":[{\"kind\":\"webrtc\",\"sdpAnswer\":\"v=0 bogus\"},")),
+        )
+
+        val error = assertThrows(HostedCloudException::class.java) { client.claimInboundOffer("offer_abcdefghijkl", direct = true) }
+        assertEquals("INVALID_RESPONSE", error.errorCode)
+    }
+
+    @Test
+    fun `直连响应自相矛盾或布尔不严格都拒绝`() {
+        val cases = listOf(
+            v2Claim.replace("\"directAttempted\":true", "\"directAttempted\":false"),
+            v2Claim.replace("\"directAttempted\":true", "\"directAttempted\":\"true\""),
+        )
+        cases.forEach { server.enqueue(MockResponse().setResponseCode(202).setBody(it)) }
+        server.enqueue(MockResponse().setResponseCode(202).setBody(v2Claim))
+
+        cases.forEach {
+            val error = assertThrows(HostedCloudException::class.java) { client.claimInboundOffer("offer_abcdefghijkl", direct = true) }
+            assertEquals("INVALID_RESPONSE", error.errorCode)
+        }
+        // 没请求直连却收到直连字段同样不信。
+        val plain = assertThrows(HostedCloudException::class.java) { client.claimInboundOffer("offer_abcdefghijkl") }
+        assertEquals("INVALID_RESPONSE", plain.errorCode)
+    }
+
+    @Test
+    fun `fallbackInboundLiveKit 与 endInboundClaim 走同一 claim`() {
+        server.enqueue(MockResponse().setResponseCode(202).setBody(v2Claim.replace("\"sdpPending\":true", "\"sdpPending\":false")))
+        server.enqueue(MockResponse().setResponseCode(202).setBody("""{"accepted":true,"offerId":"offer_abcdefghijkl","claimId":"claim_abcdefghijkl"}"""))
+
+        val fallback = client.fallbackInboundLiveKit("offer_abcdefghijkl", "claim_abcdefghijkl")
+        client.endInboundClaim("offer_abcdefghijkl", "claim_abcdefghijkl")
+
+        assertEquals("a.b.c", fallback.token)
+        val first = server.takeRequest()
+        assertEquals("/v1/inbound-offers/offer_abcdefghijkl/media/livekit", first.path)
+        assertTrue(first.body.readUtf8().contains("\"claimId\":\"claim_abcdefghijkl\""))
+        assertEquals("/v1/inbound-offers/offer_abcdefghijkl/media/end", server.takeRequest().path)
+    }
+
+    @Test
+    fun `inboundIceServers 解析 TURN 凭证且空列表报错`() {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody("""{"iceServers":[{"urls":["stun:stun.example:3478"]},{"urls":["turn:turn.example:3478?transport=udp"],"username":"u","credential":"c"}],"expiresAt":9999999999999}"""),
+        )
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"iceServers":[],"expiresAt":1}"""))
+
+        val servers = client.inboundIceServers("offer_abcdefghijkl")
+
+        assertEquals("/v1/inbound-offers/offer_abcdefghijkl/ice", server.takeRequest().path)
+        assertEquals(2, servers.size)
+        assertEquals("c", servers[1].credential)
+        assertFalse(servers[1].toString().contains("c\""))
+        val empty = assertThrows(HostedCloudException::class.java) { client.inboundIceServers("offer_abcdefghijkl") }
+        assertEquals("INVALID_RESPONSE", empty.errorCode)
     }
 
     @Test

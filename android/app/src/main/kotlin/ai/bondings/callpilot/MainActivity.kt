@@ -3,6 +3,7 @@ package ai.bondings.callpilot
 import ai.bondings.callpilot.call.CallGraph
 import ai.bondings.callpilot.call.CallDigestAlerts
 import ai.bondings.callpilot.call.CallState
+import ai.bondings.callpilot.call.DirectCallSettings
 import ai.bondings.callpilot.call.OfferAlerts
 import ai.bondings.callpilot.call.OfferWatchService
 import ai.bondings.callpilot.call.SmsAlerts
@@ -13,6 +14,7 @@ import ai.bondings.callpilot.protocol.HostedCloudClient
 import ai.bondings.callpilot.protocol.HostedCloudException
 import ai.bondings.callpilot.protocol.ContentWireValidation
 import ai.bondings.callpilot.protocol.InboundOffer
+import ai.bondings.callpilot.protocol.InboundOfferState
 import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.ui.CallPilotTheme
 import ai.bondings.callpilot.ui.CallScreen
@@ -27,6 +29,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -99,6 +102,12 @@ class MainActivity : ComponentActivity() {
         offerLookupPending = fromOffer
         setOfferLockscreen(fromOffer)
         if (fromOffer) offerRefreshVersion++
+    }
+
+    private fun offerOutcomeNotice(state: InboundOfferState): Int? = when (state) {
+        InboundOfferState.ANSWERED_ELSEWHERE -> R.string.offer_answered_elsewhere
+        InboundOfferState.OWNER_DECLINED -> R.string.offer_declined_elsewhere
+        else -> null
     }
 
     private fun handleDigestIntent(intent: Intent) {
@@ -189,7 +198,8 @@ class MainActivity : ComponentActivity() {
                                 }
                                 while (true) {
                                     if (manager.state.value is CallState.Idle) {
-                                        val available = try {
+                                        // 一次网络抖动不能把正在响的来电界面收掉：出错时保持当前状态，等下一轮。
+                                        val available: List<InboundOffer>? = try {
                                             withContext(Dispatchers.IO) {
                                                 offerClient.listInboundOffers()
                                             }
@@ -200,21 +210,25 @@ class MainActivity : ComponentActivity() {
                                                 ProtectedJsonStore.clearAll(applicationContext)
                                                 store.clear()
                                                 OfferWatchService.stop(this@MainActivity)
+                                                emptyList()
+                                            } else {
+                                                null
                                             }
-                                            emptyList()
                                         } catch (_: Exception) {
-                                            emptyList()
+                                            null
                                         }
-                                        val valid = available.filter {
-                                            !alerts.isDismissed(it.offerId) &&
-                                                it.expiresAt > System.currentTimeMillis()
-                                        }
-                                        val offer = valid.firstOrNull {
-                                            it.offerId == intent.getStringExtra(OfferAlerts.EXTRA_OFFER_ID)
-                                        } ?: valid.firstOrNull()
-                                        if (store.load() == current && manager.state.value is CallState.Idle) {
-                                            offer?.let { alerts.presented(it) }
-                                            incomingOffer = offer
+                                        if (available != null) {
+                                            val valid = available.filter {
+                                                !alerts.isDismissed(it.offerId) &&
+                                                    it.expiresAt > System.currentTimeMillis()
+                                            }
+                                            val offer = valid.firstOrNull {
+                                                it.offerId == intent.getStringExtra(OfferAlerts.EXTRA_OFFER_ID)
+                                            } ?: valid.firstOrNull()
+                                            if (store.load() == current && manager.state.value is CallState.Idle) {
+                                                offer?.let { alerts.presented(it) }
+                                                incomingOffer = offer
+                                            }
                                         }
                                     } else {
                                         incomingOffer = null
@@ -245,6 +259,18 @@ class MainActivity : ComponentActivity() {
                         if (callState !is CallState.Idle) incomingOffer = null
                         else if (incomingOffer == null && !offerLookupPending) setOfferLockscreen(false)
                     }
+                    // 中转长轮询得知他机接听 / 机主拒绝 / 已结束：立刻收起响铃界面，不等 3 s 轮询。
+                    LaunchedEffect(current) {
+                        alerts.resolutions.collect { resolved ->
+                            val offer = incomingOffer ?: return@collect
+                            val state = resolved[offer.offerId] ?: return@collect
+                            incomingOffer = null
+                            if (manager.state.value is CallState.Idle) setOfferLockscreen(false)
+                            offerOutcomeNotice(state)?.let {
+                                Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
                     var pendingMicrophoneOffer by remember { mutableStateOf<InboundOffer?>(null) }
                     val micPermission = rememberLauncherForActivityResult(
                         ActivityResultContracts.RequestPermission(),
@@ -259,7 +285,7 @@ class MainActivity : ComponentActivity() {
                         ) {
                             alerts.dismiss(offer)
                             incomingOffer = null
-                            manager.answerTakeover(paired, offer.offerId)
+                            manager.answerTakeover(paired, offer.offerId, direct = DirectCallSettings.enabled(this@MainActivity))
                         }
                     }
 
@@ -339,6 +365,7 @@ class MainActivity : ComponentActivity() {
                                                 manager.answerTakeover(
                                                     current,
                                                     presentation.offer.offerId,
+                                                    direct = DirectCallSettings.enabled(this@MainActivity),
                                                 )
                                             } else {
                                                 pendingMicrophoneOffer = presentation.offer
@@ -349,6 +376,8 @@ class MainActivity : ComponentActivity() {
                                             alerts.dismiss(presentation.offer)
                                             incomingOffer = null
                                             setOfferLockscreen(false)
+                                            // 拒绝即交给 AI 接听（Edge 侧规则），同时让其他设备收铃。
+                                            alerts.declineOnRelay(current, presentation.offer.offerId)
                                         },
                                     )
                                 }

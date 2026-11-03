@@ -37,6 +37,16 @@ internal class OfferAlertPolicy(saved: Map<String, OfferAlertRecord> = emptyMap(
         handled[offer.offerId] = handled.getValue(offer.offerId).copy(dismissed = true)
     }
 
+    /**
+     * 中转告知 offer 已被他机接听 / 机主拒绝 / 结束：视同已处理，之后的列表快照不得再响；
+     * 返回是否正有通知在响（调用方据此取消）。
+     */
+    fun resolve(offerId: String, now: Long): Boolean {
+        val record = handled[offerId]
+        handled[offerId] = OfferAlertRecord(maxOf(record?.expiresAt ?: 0, now + RESOLVED_TTL_MS), dismissed = true)
+        return active.remove(offerId)
+    }
+
     fun update(
         offers: List<InboundOffer>,
         now: Long,
@@ -60,5 +70,9 @@ internal class OfferAlertPolicy(saved: Map<String, OfferAlertRecord> = emptyMap(
             active += it.offerId
         }
         return OfferAlertChanges(notify, cancel)
+    }
+
+    private companion object {
+        const val RESOLVED_TTL_MS = 60_000L
     }
 }

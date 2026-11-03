@@ -2,7 +2,11 @@ package ai.bondings.callpilot.call
 
 import ai.bondings.callpilot.MainActivity
 import ai.bondings.callpilot.R
+import ai.bondings.callpilot.pairing.StoredPairing
+import ai.bondings.callpilot.protocol.HostedCloudClient
+import ai.bondings.callpilot.protocol.HostedCloudException
 import ai.bondings.callpilot.protocol.InboundOffer
+import ai.bondings.callpilot.protocol.InboundOfferState
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
@@ -15,6 +19,15 @@ import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import androidx.annotation.MainThread
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -30,6 +43,12 @@ class OfferAlerts private constructor(private val context: Context) {
     private var offers = emptyList<InboundOffer>()
     private var foreground = false
     private var busy = false
+    private val mutableResolutions = MutableStateFlow<Map<String, InboundOfferState>>(emptyMap())
+    // 拒绝上报不随 Activity 销毁而取消（锁屏上拒绝后界面立刻收起）。
+    private val relayScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** 中转长轮询得知的 offer 终态（他机接听 / 机主拒绝 / 结束）；前台据此立即收起接听界面。 */
+    val resolutions: StateFlow<Map<String, InboundOfferState>> = mutableResolutions.asStateFlow()
 
     init {
         notifications.createNotificationChannel(
@@ -85,7 +104,48 @@ class OfferAlerts private constructor(private val context: Context) {
     fun reset() {
         clearNotifications()
         policy = OfferAlertPolicy()
+        mutableResolutions.value = emptyMap()
         persist()
+    }
+
+    /** 仍在响铃、需要向中转盯终态的 offer。 */
+    fun pendingWatch(now: Long): List<InboundOffer> =
+        offers.filter { it.expiresAt > now && !policy.isDismissed(it.offerId) }
+
+    /** 中转告知终态：立刻取消通知、让前台收起，并保证之后的列表快照不再响铃。 */
+    fun resolve(offerId: String, state: InboundOfferState) {
+        if (policy.resolve(offerId, System.currentTimeMillis())) notifications.cancel(offerId, ALERT_ID)
+        offers = offers.filterNot { it.offerId == offerId }
+        val updated = mutableResolutions.value + (offerId to state)
+        mutableResolutions.value = if (updated.size > RESOLUTIONS_KEPT) {
+            updated.entries.drop(updated.size - RESOLUTIONS_KEPT).associate { it.key to it.value }
+        } else {
+            updated
+        }
+        reconcile(allowNew = false)
+    }
+
+    /**
+     * 拒绝即告诉中转：Edge 立刻让 AI 接起，本通不再转回手机。最多重试 3 次；
+     * 409（已被接听 / 已结束）与 404（能力未开）是终态，不再重试。
+     */
+    fun declineOnRelay(pairing: StoredPairing, offerId: String) {
+        relayScope.launch {
+            val client = HostedCloudClient(pairing.gatewayUrl).also { it.credential = pairing.credential }
+            repeat(DECLINE_ATTEMPTS) { attempt ->
+                try {
+                    client.declineInboundOffer(offerId)
+                    return@launch
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: HostedCloudException) {
+                    if (error.statusCode == 409 || error.statusCode == 404 || error.statusCode == 401) return@launch
+                } catch (_: Exception) {
+                    // 网络抖动：下面重试。
+                }
+                if (attempt < DECLINE_ATTEMPTS - 1) delay(500L * (attempt + 1))
+            }
+        }
     }
 
     fun clearNotifications() {
@@ -154,6 +214,8 @@ class OfferAlerts private constructor(private val context: Context) {
         const val EXTRA_EXPIRES_AT = "offer_expires_at"
         private const val CHANNEL_ID = "callpilot_incoming_offers"
         private const val ALERT_ID = 1003
+        private const val RESOLUTIONS_KEPT = 8
+        private const val DECLINE_ATTEMPTS = 3
         // 只保存 applicationContext，不持有 Activity / Service。
         @SuppressLint("StaticFieldLeak")
         private var instance: OfferAlerts? = null

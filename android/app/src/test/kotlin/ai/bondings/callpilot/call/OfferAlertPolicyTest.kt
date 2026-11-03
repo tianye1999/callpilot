@@ -35,6 +35,21 @@ class OfferAlertPolicyTest {
     }
 
     @Test
+    fun `relay resolution cancels the ring and keeps later snapshots quiet`() {
+        val policy = OfferAlertPolicy()
+        assertEquals(listOf(offer), policy.update(listOf(offer), 1).notify)
+        assertTrue(policy.resolve(offer.offerId, 2))
+        assertTrue(policy.isDismissed(offer.offerId))
+        // 中转说已被他机接听后，列表快照里哪怕还带着它也不再响、也不再取消。
+        val later = policy.update(listOf(offer), 3)
+        assertTrue(later.notify.isEmpty())
+        assertTrue(later.cancel.isEmpty())
+        // 未曾响过的 offer 也能直接标记为已处理。
+        assertFalse(policy.resolve("offer_test_00000002", 4))
+        assertTrue(policy.isDismissed("offer_test_00000002"))
+    }
+
+    @Test
     fun `accept or decline cancels and suppresses stale results`() {
         val policy = OfferAlertPolicy()
         policy.update(listOf(offer), 1)

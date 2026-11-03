@@ -2,6 +2,7 @@ package ai.bondings.callpilot.protocol
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -54,6 +55,15 @@ object Signaling {
 
         /** `{"type":"remote_call","status":"dialing"|"connected"|...}` */
         data class RemoteCall(val status: String) : Event
+
+        /** `{"type":"ended","reason":...}`：Edge 收尾时尽力发出的结束通知。 */
+        data class Ended(val reason: String) : Event
+
+        /** `{"type":"media_failed","reason":"no_phone_audio"}`：直连已通但 Edge 收不到手机音频，应回落 LiveKit。 */
+        data class MediaFailed(val reason: String) : Event
+
+        /** `{"type":"hangup.ack"}`：Edge 已收到挂断命令。 */
+        data object HangupAck : Event
     }
 
     fun decodeEvent(raw: String): Event? {
@@ -62,14 +72,16 @@ object Signaling {
         } catch (_: Exception) {
             return null
         }
-        val type = obj["type"]?.jsonPrimitive?.content ?: return null
-        val status = obj["status"]?.jsonPrimitive?.content ?: return null
+        // 字段类型错（如 "type":[]）也只当成未知事件，绝不让异常越过 native 回调。
+        val type = (obj["type"] as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return null
+        val status = (obj["status"] as? JsonPrimitive)?.takeIf { it.isString }?.content
+        val reason = ((obj["reason"] ?: obj["code"]) as? JsonPrimitive)?.takeIf { it.isString }?.content
         return when (type) {
-            "status" -> Event.Status(
-                status,
-                reason = (obj["reason"] ?: obj["code"])?.jsonPrimitive?.content,
-            )
-            "remote_call" -> Event.RemoteCall(status)
+            "status" -> status?.let { Event.Status(it, reason = reason) }
+            "remote_call" -> status?.let { Event.RemoteCall(it) }
+            "ended" -> Event.Ended(reason ?: "ended")
+            "media_failed" -> Event.MediaFailed(reason ?: "media_failed")
+            "hangup.ack" -> Event.HangupAck
             else -> null
         }
     }
