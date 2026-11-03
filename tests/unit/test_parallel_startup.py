@@ -270,9 +270,11 @@ def test_native_greeting_hangup_or_cancel_joins_worker_without_pcm(native_call, 
     assert "AT+CHUP" in sent
 
 
-@pytest.mark.parametrize("phase", ["answer", "agent", "pcm"])
-def test_native_greeting_startup_failures_cleanup(native_call, monkeypatch, phase):
-    session, modem, bridge, agent, _base, sent = native_call
+@pytest.mark.parametrize("phase,media_first", [("answer", False), ("agent", False),
+                                              ("agent", True), ("pcm", False)])
+def test_native_greeting_startup_failures_cleanup(native_call, monkeypatch, phase, media_first):
+    session, modem, bridge, agent, base, sent = native_call
+    bridge_started = asyncio.Event()
 
     def fail(*_args):
         raise RuntimeError("fake startup failure")
@@ -281,16 +283,41 @@ def test_native_greeting_startup_failures_cleanup(native_call, monkeypatch, phas
         monkeypatch.setattr(modem, "answer", fail)
     elif phase == "agent":
         async def fail_connect(_callback):
+            if media_first:
+                await bridge_started.wait()
             fail()
         monkeypatch.setattr(agent, "start", fail_connect)
     else:
         monkeypatch.setattr(modem, "initialize_for_voice", fail)
-    with pytest.raises(RuntimeError, match="fake startup failure"):
-        asyncio.run(session._handle_call())
-    assert agent.stopped and not bridge.started
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        start_bridge = bridge.start
+
+        def start():
+            start_bridge()
+            loop.call_soon_threadsafe(bridge_started.set)
+
+        monkeypatch.setattr(bridge, "start", start)
+        with pytest.raises(RuntimeError, match="fake startup failure"):
+            await session._handle_call()
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+
+    asyncio.run(run())
+    assert agent.stopped and not session.is_active
+    if phase == "agent":
+        # Media and agent connect are parallel: failure may be observed after
+        # bridge startup. The invariant is complete cleanup, not who won the race.
+        assert not bridge.started or bridge.stopped
+        if media_first:
+            assert bridge.started and bridge.stopped
+    else:
+        assert not bridge.started
+    assert bridge.downlink == []
     assert "AT+CHUP" in sent
-    if phase in {"answer", "agent"}:
+    if phase == "answer":
         assert not any(cmd.startswith("AT+CTTS") for cmd in sent)
+    assert next(event for event in events(base) if event["type"] == "ended")["status"] == "failed"
 
 
 @pytest.mark.parametrize("parallel", [False, True])
