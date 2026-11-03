@@ -32,10 +32,11 @@ jobs:
             .github/workflows/ci.yml
       - name: Install packaging dependencies
         run: python -m pip install . "pyinstaller>=6.11,<7" "pyinstaller-hooks-contrib>=2025.1" "pillow>=11,<13" "pythonnet>=3,<4"
-      - name: Generate icon and build
+      - name: Build
         run: |
-          python scripts/windows/generate_icon.py
-          if ($LASTEXITCODE -ne 0) { throw "Icon generation failed" }
+          # CallPilot.ico is committed; its .icns source is a gitignored local asset
+          # (regenerate locally with scripts/windows/generate_icon.py when the icon changes).
+          if (-not (Test-Path packaging/CallPilot.ico)) { throw "packaging/CallPilot.ico missing" }
           $env:PYTHON = (Get-Command python).Source
           & scripts/windows/build_app.ps1
       - name: Relocated EXE headless selftest
