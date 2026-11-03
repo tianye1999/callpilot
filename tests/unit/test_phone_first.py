@@ -647,7 +647,8 @@ def test_delayed_media_ready_records_both_latencies(rig, monkeypatch, delay):
                    if event["type"] == "latency" and event["stage"].startswith("edge_")]
     assert edge_stages == [
         "edge_claim_received", "edge_endpoint_connect_start", "edge_endpoint_connect_return",
-        "edge_media_ready", "edge_ata_start", "edge_ata_return", "edge_pcm_ready", "edge_ath_complete",
+        "edge_media_ready", "edge_ata_start", "edge_ata_return", "edge_pcm_ready",
+        "edge_phone_ended_notice_sent", "edge_ath_complete",
     ]
     assert all(latencies[stage] >= 0 for stage in edge_stages)
     assert [latencies[stage] for stage in edge_stages] == sorted(latencies[stage] for stage in edge_stages)

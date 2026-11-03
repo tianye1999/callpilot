@@ -759,7 +759,8 @@ describe("direct SDP DO relay", () => {
     const socket = { readyState: WebSocket.OPEN as number, send: vi.fn(), close: vi.fn(),
       deserializeAttachment: () => ({ edgeId: edge, connectedAt: 1 }) };
     const state = { getWebSockets: () => [socket], setWebSocketAutoResponse: vi.fn(),
-      storage: { get: vi.fn(), put: vi.fn(), setAlarm: vi.fn(), deleteAlarm: vi.fn() }, waitUntil: vi.fn() };
+      storage: { get: vi.fn(), put: vi.fn(), list: vi.fn().mockResolvedValue(new Map()),
+        setAlarm: vi.fn(), deleteAlarm: vi.fn() }, waitUntil: vi.fn() };
     const room = new EdgeRoom(state as unknown as DurableObjectState, env);
     return { room, socket, state };
   }

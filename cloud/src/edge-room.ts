@@ -15,7 +15,7 @@ import type { z } from "zod";
 import { HttpError } from "./http";
 import type { EdgePresence, Env } from "./types";
 import { randomId } from "./security";
-import { issueParticipantToken } from "./livekit";
+import { issueParticipantToken, participantRequest } from "./livekit";
 import { invalidateCandidates, PRECONNECT_CLEANUP_INTERVAL_MS, queueParticipantCleanup, sweepPreconnect } from "./inbound-preconnect";
 import { dispatchInboundOfferPushes, errorName } from "./voip-push";
 import { issueIceServers, type IceCredentials } from "./turn";
@@ -384,7 +384,7 @@ export class EdgeRoom extends DurableObject<Env> {
       const preconnect = this.env.INBOUND_FASTPATH_V2_ENABLED !== "true" && this.env.INBOUND_PRECONNECT_ENABLED === "true"
         && presence?.inboundPreconnectV1 === true && result.data.mode === "phone_first";
       const direct = this.env.INBOUND_FASTPATH_V2_ENABLED === "true"
-        && presence?.inboundFastpathV2 === true && result.data.mode === "phone_first";
+        && presence?.inboundFastpathV2 === true;
       const roomName = randomId("callpilot");
       const edgeIdentity = randomId("edgepart", 12);
       const inserted = await this.env.DB.prepare(
@@ -443,12 +443,18 @@ export class EdgeRoom extends DurableObject<Env> {
       return;
     }
     if (result.data.type === "inbound.offer.revoke") {
+      const room = await this.env.DB.prepare(
+        "SELECT room_name FROM inbound_offers WHERE offer_id = ?1 AND edge_id = ?2"
+      ).bind(result.data.offerId, attachment.edgeId).first<{ room_name: string }>();
       const cached = this.warmInboundIce.get(result.data.offerId);
       if (cached) cached.invalidated = true;
       await this.env.DB.prepare(
         "UPDATE inbound_offers SET status = 'revoked', error_code = ?1, updated_at = ?2 WHERE offer_id = ?3 AND edge_id = ?4 AND status IN ('offered', 'claimed', 'edge_ready')"
       ).bind(result.data.reason, now, result.data.offerId, attachment.edgeId).run();
       await invalidateCandidates(this.env, result.data.offerId);
+      if (room?.room_name && this.env.LIVEKIT_API_KEY && this.env.LIVEKIT_API_SECRET) {
+        await this.ctx.storage.put(`ended-room/${room.room_name}`, room.room_name);
+      }
       this.ctx.waitUntil(this.alarm());
       return;
     }
@@ -502,16 +508,29 @@ export class EdgeRoom extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    const endedRooms = await this.ctx.storage.list<string>({ prefix: "ended-room/", limit: 16 });
+    let roomDeletePending = endedRooms.size >= 16;
+    if (endedRooms.size) await this.ctx.storage.setAlarm(Date.now() + PRECONNECT_CLEANUP_INTERVAL_MS);
+    await Promise.all([...endedRooms].map(async ([key, room]) => {
+      try {
+        await participantRequest(this.env, "DeleteRoom", room, "");
+        await this.ctx.storage.delete(key);
+      } catch {
+        roomDeletePending = true;
+        // Keep the scoped deletion intent across DO eviction and retry alarms.
+        console.warn("Ended inbound room cleanup pending");
+      }
+    }));
     const edgeId = await this.ctx.storage.get<string>("preconnectEdge");
     if (!edgeId || typeof edgeId !== "string") {
-      await this.ctx.storage.deleteAlarm();
+      if (!roomDeletePending) await this.ctx.storage.deleteAlarm();
       return;
     }
     // Arm before I/O so a failed D1/admin request is retried after hibernation.
     await this.ctx.storage.setAlarm(Date.now() + PRECONNECT_CLEANUP_INTERVAL_MS);
     const interval = await sweepPreconnect(this.env, edgeId);
-    if (interval === null) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(Date.now() + interval);
+    if (interval === null && !roomDeletePending) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(Date.now() + (interval ?? PRECONNECT_CLEANUP_INTERVAL_MS));
   }
 
   private async updateLastSeen(edgeId: string, now: number, heartbeat = false): Promise<LastSeenTiming> {

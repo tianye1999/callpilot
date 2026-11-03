@@ -119,6 +119,12 @@ private final class LiveKitRoomDelegateProxy: NSObject, RoomDelegate, AudioRende
         relay.yield(.disconnected(reason: reason))
     }
 
+    func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
+        if let identity = participant.identity?.stringValue {
+            relay.yield(.participantLeft(identity))
+        }
+    }
+
     func room(_ room: Room, participant: Participant, didUpdatePermissions permissions: ParticipantPermissions) {
         guard participant is LocalParticipant else { return }
         relay.yield(.permissionsReady(LiveKitRoomTransport.mediaAllowed(permissions)))

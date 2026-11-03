@@ -48,6 +48,16 @@ class TimingRecord(Protocol):
     def log_event(self, type: str, **fields: Any) -> None: ...  # noqa: A002
 
 
+async def notify_phone_ended(endpoint: Any, timing: CallTiming, reason: str = "call_ended") -> None:
+    """Bounded teardown notification, not a transport replacement signal."""
+    try:
+        await asyncio.wait_for(endpoint.send_event({"type": "ended", "reason": reason}), timeout=0.3)
+        timing.mark("phone_ended_notice_sent")
+        timing._observation("phone_ended_notice_sent", {"reason": reason})
+    except (Exception, asyncio.CancelledError):
+        timing.mark("phone_ended_notice_failed")
+
+
 def valid_command_id(value: Any) -> bool:
     if not isinstance(value, str) or len(value) != 36:
         return False

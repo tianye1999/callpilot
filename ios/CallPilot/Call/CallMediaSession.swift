@@ -534,6 +534,7 @@ final class CallMediaSession {
     }
 
     private func connect(_ session: HostedCallSession, for attempt: UInt64) async throws {
+        edgeIdentity = session.edgeIdentity
         let activeTransport = transportFactory()
         transport = activeTransport
         activeTransport.eventHandler = { [weak self, weak activeTransport] event in
@@ -742,6 +743,10 @@ final class CallMediaSession {
         }
         guard isCurrent(attempt) else { return }
         switch event {
+        case let .participantLeft(identity):
+            if identity == edgeIdentity {
+                terminate(state: .ended(label: activeLabel ?? "", reason: "edge_left"))
+            }
         case let .permissionsReady(ready):
             permissionReady = ready
             if ready { timing.mark(.permissionReady) }
@@ -755,6 +760,12 @@ final class CallMediaSession {
             }
         case let .data(data, topic):
             guard topic == CallPilotTopic.status else { return }
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               object["type"] as? String == "ended" {
+                let reason = (object["reason"] as? String).map { String($0.prefix(64)) } ?? "call_ended"
+                terminate(state: .ended(label: activeLabel ?? "", reason: reason))
+                return
+            }
             if connection is any CallDirectMediaTransport, !edgeCommitted,
                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                object["type"] as? String == "media_failed" {

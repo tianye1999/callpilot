@@ -14,6 +14,30 @@ class Record:
         self.events.append({"type": kind, **fields})
 
 
+def test_ended_notice_precedes_close_and_is_bounded():
+    from agentcall.call_timing import notify_phone_ended
+
+    async def check():
+        record = Record()
+        sent = []
+
+        class Endpoint:
+            async def send_event(self, event):
+                sent.append(event)
+
+        await notify_phone_ended(Endpoint(), CallTiming(record))
+        assert sent == [{"type": "ended", "reason": "call_ended"}]
+        assert record.events[-1] == {"type": "phone_ended_notice_sent", "reason": "call_ended"}
+
+        class Stalled:
+            async def send_event(self, event):
+                await asyncio.Event().wait()
+
+        await asyncio.wait_for(notify_phone_ended(Stalled(), CallTiming()), timeout=1)
+
+    asyncio.run(check())
+
+
 def packet(**changes):
     return {"type": "client_timing", "v": 1, "attempt": str(uuid.uuid4()),
             "seq": 1, "marks": {"claim_start": 0, "answer_action": -50}, **changes}

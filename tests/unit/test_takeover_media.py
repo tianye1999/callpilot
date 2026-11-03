@@ -148,7 +148,8 @@ def test_handoff_stops_old_writer_and_pumps_mobile_then_single_finalizer(monkeyp
     assert new_bridge.started
     assert new_bridge.downlink == [b"mobile-to-caller"]
     assert endpoint.connected and endpoint.closed
-    assert endpoint.events == [{"type": "status", "status": "connected"}]
+    assert endpoint.events == [{"type": "status", "status": "connected"},
+                               {"type": "ended", "reason": "call_ended"}]
     assert session.takeover_state is TakeoverState.MOBILE_ACTIVE
     assert session.modem.calls == []
 

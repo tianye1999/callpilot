@@ -90,6 +90,9 @@ async function roomFixture() {
     getWebSockets: () => [socket], setWebSocketAutoResponse: vi.fn(),
     waitUntil: (p: Promise<unknown>) => { f.background.push(p); },
     storage: { get: async (key: string) => storage.get(key), put: async (key: string, value: unknown) => { storage.set(key, value); },
+      delete: async (key: string) => storage.delete(key),
+      list: async (options: { prefix: string; limit: number }) =>
+        new Map([...storage].filter(([key]) => key.startsWith(options.prefix)).slice(0, options.limit)),
       setAlarm: vi.fn(), deleteAlarm: vi.fn() }
   };
   const room = new EdgeRoom(state as unknown as DurableObjectState, f.env);
@@ -802,6 +805,30 @@ describe("inbound preconnect", () => {
     vi.stubGlobal("fetch", admin);
     await participantRequest(f.env, "RemoveParticipant", "room", "identity");
     expect(String(vi.mocked(fetch).mock.calls[0]![0])).toBe("https://media.test/twirp/livekit.RoomService/RemoveParticipant");
+  });
+
+  it("deletes a scoped ended room without participant identity and tolerates an absent room", async () => {
+    const f = await fixture();
+    const admin = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({ code: "not_found" }, { status: 404 }));
+    vi.stubGlobal("fetch", admin);
+    await participantRequest(f.env, "DeleteRoom", "ended-room", "");
+    expect(String(admin.mock.calls[0]![0])).toContain("/DeleteRoom");
+    expect(JSON.parse((admin.mock.calls[0]![1] as RequestInit).body as string)).toEqual({ room: "ended-room" });
+  });
+
+  it("retains failed room deletion intent for the next durable alarm", async () => {
+    const f = await roomFixture();
+    await f.state.storage.put("ended-room/finished-room", "finished-room");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("unavailable")));
+    await f.room.alarm();
+    expect(await f.state.storage.get("ended-room/finished-room")).toBe("finished-room");
+    expect(f.state.storage.setAlarm).toHaveBeenCalled();
+    expect(f.state.storage.deleteAlarm).not.toHaveBeenCalled();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({})));
+    await f.room.alarm();
+    expect(await f.state.storage.get("ended-room/finished-room")).toBeUndefined();
+    expect(f.state.storage.deleteAlarm).toHaveBeenCalled();
   });
 
   it("atomically returns one restricted candidate per device, never shared identities", async () => {

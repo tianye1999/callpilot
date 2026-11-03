@@ -51,6 +51,28 @@ private final class FakeDirectTransport: CallDirectMediaTransport {
 
 @MainActor
 final class CallMediaSessionTests: XCTestCase {
+    func testEndedNoticeAndMatchingEdgeDepartureTerminateOnlyOnce() async throws {
+        for noticeFirst in [false, true] {
+            let transport = FakeCallMediaTransport()
+            var terminalCount = 0
+            let media = CallMediaSession(onState: { if $0.isTerminal { terminalCount += 1 } },
+                transportFactory: { transport },
+                audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }))
+            _ = await media.startTakeover(client: try makeTakeoverClient(), offerId: "offer_abcdefghijkl", usesCallKit: true,
+                onClaimed: { try media.prepareCallKitAnswer(); try media.activateCallKitAudio() }, onConnected: {})
+            let handler = try XCTUnwrap(transport.eventHandler)
+            await handler(.participantLeft("unrelated"))
+            XCTAssertEqual(terminalCount, 0)
+            let notice = CallMediaTransportEvent.data(Data(#"{"type":"ended","reason":"remote_hangup"}"#.utf8), topic: CallPilotTopic.status)
+            let departure = CallMediaTransportEvent.participantLeft("edgepart_abcdefghijkl")
+            await handler(noticeFirst ? notice : departure)
+            XCTAssertEqual(terminalCount, 1)
+            await handler(noticeFirst ? departure : notice)
+            XCTAssertEqual(terminalCount, 1)
+            await media.stop()
+        }
+    }
+
     func testV2AudioReadbackFailureAfterCommitTerminatesInsteadOfLeavingMutedCall() async throws {
         let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
         let client = try makeDirectClient(onFallback: { XCTFail("committed claim cannot switch transports") })
@@ -2208,7 +2230,7 @@ final class CallMediaSessionTests: XCTestCase {
             return Self.httpResponse(
                 for: request,
                 statusCode: 202,
-                json: #"{"claimId":"claim_abcdefghijkl","offerId":"\#(offerId)","url":"wss://lk.example.com","token":"jwt-token","expiresAt":9999}"#
+                json: #"{"claimId":"claim_abcdefghijkl","offerId":"\#(offerId)","edgeIdentity":"edgepart_abcdefghijkl","url":"wss://lk.example.com","token":"jwt-token","expiresAt":9999}"#
             )
         }
         return try makeClient()

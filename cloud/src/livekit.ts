@@ -44,14 +44,14 @@ export async function issueParticipantToken(
 // Use one abortable Twirp request, without SDK retry/failover extending the
 // claim budget. A timeout is ambiguous; the caller must quarantine the identity.
 export async function participantRequest(
-  env: Env, method: "UpdateParticipant" | "RemoveParticipant", room: string,
+  env: Env, method: "UpdateParticipant" | "RemoveParticipant" | "DeleteRoom", room: string,
   identity: string, grant = false, budgetMs = 1200
 ): Promise<void> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), budgetMs);
   try {
     const auth = new AccessToken(env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET, { ttl: 60 });
-    auth.addGrant({ room, roomAdmin: true });
+    auth.addGrant(method === "DeleteRoom" ? { roomCreate: true } : { room, roomAdmin: true });
     const token = await auth.toJwt();
     controller.signal.throwIfAborted();
     const url = new URL(env.LIVEKIT_URL);
@@ -61,7 +61,7 @@ export async function participantRequest(
     const response = await fetch(url, {
       method: "POST", signal: controller.signal,
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ room, identity, ...(method === "UpdateParticipant" ? {
+      body: JSON.stringify({ room, ...(method === "DeleteRoom" ? {} : { identity }), ...(method === "UpdateParticipant" ? {
         permission: {
           canPublish: grant, canSubscribe: grant, canPublishData: grant,
           canPublishSources: grant ? [TrackSource.MICROPHONE] : [],
@@ -71,10 +71,10 @@ export async function participantRequest(
       } : {}) })
     });
     const payload = await response.json().catch((error: unknown) => {
-      if (!response.ok && method === "RemoveParticipant") throw new LiveKitParticipantError(response.status, undefined);
+      if (!response.ok && method !== "UpdateParticipant") throw new LiveKitParticipantError(response.status, undefined);
       throw error;
     }) as { code?: string } | null;
-    if (!response.ok && !(method === "RemoveParticipant" && payload?.code === "not_found")) {
+    if (!response.ok && !(method !== "UpdateParticipant" && payload?.code === "not_found")) {
       if (method === "RemoveParticipant") throw new LiveKitParticipantError(response.status, payload?.code);
       throw new Error("LiveKit participant request failed");
     }

@@ -269,7 +269,7 @@ async def eventually(predicate, *, timeout: float = 15) -> None:
 
 
 async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel_before_sdp: bool = False,
-              cancel_during_ice: bool = False, no_audio: str | None = None) -> dict:
+              cancel_during_ice: bool = False, no_audio: str | None = None, transfer: bool = False) -> dict:
     timeline = Timeline()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as http:
         async def request(method: str, path: str, body=None, headers=None, expected=200):
@@ -332,6 +332,11 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
         fallback_endpoint = SyntheticFallbackEndpoint(None, events, timeline)
 
         class TracedAgent(FakeAgent):
+            async def send_audio(self, pcm):
+                await super().send_audio(pcm)
+                if transfer and self._on_audio_out:
+                    self._on_audio_out(self.reply_pcm)
+
             async def start(self, on_audio_out):
                 await super().start(on_audio_out)
                 timeline.mark("ai_started")
@@ -370,7 +375,7 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
         def no_ai(*_args, **_kwargs):
             nonlocal ai_attempts
             ai_attempts += 1
-            if no_audio is not None:
+            if no_audio is not None or transfer:
                 return ai
             raise AssertionError("AI_MUST_NOT_START_FOR_OWNER_CLAIM")
 
@@ -391,10 +396,17 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
                 timeline.mark("edge_authenticated")
                 # Use real session admission/reset, but run its coroutine on this test loop.
                 with patch.object(session, "_run", return_value=None):
-                    session.start(phone_first_seconds=15)
+                    session.start(phone_first_seconds=None if transfer else 15)
                     session._thread.join(timeout=1)
                 timeline.mark("ring")
                 call_task = asyncio.create_task(session._handle_call())
+                if transfer:
+                    await asyncio.wait_for(ai_started.wait(), 10)
+                    await eventually(lambda: bridge.started)
+                    result = session._request_owner_takeover(session._session_generation,
+                        bypass_enabled=True, endpoint_check=lambda: None)
+                    assert result["success"], result
+                    timeline.mark("ai_transfer_requested")
                 async with asyncio.timeout(10):
                     while True:
                         offers, _ = await request("GET", "/v1/inbound-offers", headers=phone_headers)
@@ -442,7 +454,10 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
                 if not deferred_sdp:
                     await phone.setLocalDescription(await phone.createOffer())
                     timeline.mark("phone_prepare_complete")
-                assert "ATA" not in modem.commands and not bridge.started
+                if not transfer:
+                    assert "ATA" not in modem.commands and not bridge.started
+                else:
+                    assert modem.commands.count("ATA") == modem.commands.count("PCM") == 1
                 timeline.mark("phone_answer")
                 claim_body = {"offerId": offer_id, "mediaTransport": "webrtc"}
                 if not deferred_sdp:
@@ -602,8 +617,18 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
                         assert (session._mobile_timing.summary()["client_audio_engine_failed_ms"]
                                 == late_timing["marks"]["audio_engine_failed"])
                         timeline.mark("fallback_owner_committed")
-                        await fallback_endpoint.commands.put({"type": "hangup", "commandId": str(uuid4())})
+                        started_end = time.monotonic()
+                        timeline.mark("edge_remote_hangup")
+                        modem._call_connected_event.clear()
+                        session.stop()
+                        async with asyncio.timeout(0.3):
+                            while (await events.get()).get("type") != "ended":
+                                pass
+                        timeline.mark("phone_ended_notice")
+                        assert time.monotonic() - started_end < 0.3
                     else:
+                        if transfer:
+                            assert not ai.stopped and len(ai.received_audio) > 5
                         assert bridge.downlink, "AI_MUST_WRITE_AUDIO_WITHOUT_WAITING_FOR_THE_LEASE"
                         channel.send(json.dumps(await phone_rtp_snapshot()))
                         await eventually(lambda: session._mobile_timing._rtp_seq == 1)
@@ -622,6 +647,8 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
                 await eventually(lambda: session.takeover_state is TakeoverState.MOBILE_ACTIVE
                                  and channel.readyState == "open")
                 timeline.mark("owner_media_committed")
+                if transfer:
+                    assert ai.stopped
                 await eventually(lambda: phone_peak > 500 and bool(bridge.downlink))
                 modem_peak = max(abs(value) for chunk in bridge.downlink for value in struct.unpack(
                     "<" + "h" * (len(chunk) // 2), chunk))
@@ -653,7 +680,7 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
                 await asyncio.wait_for(call_task, 10)
                 assert modem.commands.count("ATA") == modem.commands.count("PCM") == modem.commands.count("HANGUP") == 1
                 assert bridge.started and bridge.stopped
-                assert ai_attempts == 0
+                assert ai_attempts == int(transfer)
                 await eventually(lambda: "edge_revoke_sent" in timeline.marks)
                 offers, _ = await request("GET", "/v1/inbound-offers", headers=phone_headers)
                 assert not offers["offers"]
@@ -696,6 +723,7 @@ def main() -> None:
                         help="Cancel only after an actual Edge ICE check reaches a blackhole UDP socket")
     parser.add_argument("--no-audio", choices=("fallback", "ai"),
                         help="Connect without audio capture, then follow or ignore media_failed")
+    parser.add_argument("--transfer", action="store_true", help="Start AI first, then request owner takeover")
     args = parser.parse_args()
     if args.cancel_during_ice and (args.deferred_sdp or args.cancel_before_sdp):
         parser.error("--cancel-during-ice is an independent inline SDP mode")
@@ -720,13 +748,14 @@ def main() -> None:
         asyncio.get_running_loop().set_exception_handler(lambda _loop, _context: failures.append("asyncio"))
         result = await run(base, record_dir=Path(records), deferred_sdp=args.deferred_sdp or args.cancel_before_sdp,
                            cancel_before_sdp=args.cancel_before_sdp, cancel_during_ice=args.cancel_during_ice,
-                           no_audio=args.no_audio)
+                           no_audio=args.no_audio, transfer=args.transfer)
         # Assert before asyncio.run cancels remaining tasks: teardown itself must retire retries.
         for transaction in transactions:
             assert getattr(transaction, "_Transaction__future").done(), "ICE_TRANSACTION_LEFT_PENDING"
             timer = getattr(transaction, "_Transaction__timeout_handle")
             assert timer is None or timer.cancelled(), "ICE_RETRY_TIMER_LEFT_ACTIVE"
         result["active_ice_transactions"] = 0
+        result["ai_transfer"] = args.transfer
         return result
     environment = {"INBOUND_FASTPATH_V2_ENABLED": "true", "INBOUND_PRECONNECT_ENABLED": "false",
                    "INBOUND_PHONE_FIRST_ENABLED": "true", "INBOUND_TAKEOVER_ENABLED": "true",

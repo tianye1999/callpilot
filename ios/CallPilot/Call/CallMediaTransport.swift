@@ -8,6 +8,7 @@ enum CallMediaTransportEvent: Equatable, Sendable {
     case tracksChanged
     case audioEngine(CallAudioEngineSnapshot, failed: Bool)
     case rtpStats(Data)
+    case participantLeft(String)
 }
 
 @MainActor

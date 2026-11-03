@@ -25,7 +25,7 @@ from . import config
 from .audio_bridge import MODEM_RATE, create_audio_bridge
 from .bluetooth_modem import BluetoothModem
 from .call_log import CallLogger, CallRecord
-from .call_timing import CallTiming, attach_endpoint_timing
+from .call_timing import CallTiming, attach_endpoint_timing, notify_phone_ended
 from .dial_guard import DialGuardFailure
 from .dtmf import dtmf_tone
 from .modem import SerialModem
@@ -406,6 +406,7 @@ class RemoteWebDialerCoordinator:
                     self._call_task.cancel()
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("远程通话收尾失败: %s", type(exc).__name__)
+            await notify_phone_ended(self.endpoint, self._timing)
             await self.endpoint.close()
             self.finished.set()
 

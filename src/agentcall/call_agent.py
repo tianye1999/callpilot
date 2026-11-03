@@ -37,7 +37,7 @@ from .audio_bridge import (
 from .bluetooth_audio import BluetoothAudioBridge
 from .bluetooth_modem import BluetoothModem
 from .call_log import CallLogger, CallRecord
-from .call_timing import CallTiming, attach_endpoint_timing
+from .call_timing import CallTiming, attach_endpoint_timing, notify_phone_ended
 from .call_tools import CallTools
 from .cloud_credentials import CloudCredentialStore
 from .contacts import is_reply_target_allowed, known_contact_numbers
@@ -392,6 +392,7 @@ class CallSession:
         self._takeover_resume_pending = False
         self._takeover_ai_fallback_notified = False
         self._takeover_resuming = False
+        self._takeover_direct_precommit = False
         self._takeover_started_at: float | None = None
         self._takeover_deadline: float | None = None
         self._triage_judge: InboundTriageJudge | None = None
@@ -2496,8 +2497,8 @@ class CallSession:
                     else:
                         await self._close_phone_first_endpoint(endpoint)
 
-    @staticmethod
-    async def _close_phone_first_endpoint(endpoint: RemoteMediaEndpoint) -> None:
+    async def _close_phone_first_endpoint(self, endpoint: RemoteMediaEndpoint) -> None:
+        await notify_phone_ended(endpoint, self._mobile_observations(self._record))
         try:
             await asyncio.wait_for(endpoint.close(), timeout=2.0)
         except Exception:
@@ -2530,11 +2531,12 @@ class CallSession:
             endpoint = factory(claimed.issued)
             attach_endpoint_timing(endpoint, timing)
             timing.mark("endpoint_connect_start")
-            owner_deadline = self._takeover_deadline
+            direct = isinstance(endpoint, SwitchableInboundEndpoint)
+            owner_deadline = self._direct_media_deadline() if direct else self._takeover_deadline
             now = time.monotonic()
             deadline = min(
                 owner_deadline if owner_deadline is not None else now,
-                now + _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS,
+                now + (DIRECT_MEDIA_LEASE_SECONDS if direct else _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS),
             )
             deadline_reason = (
                 "OWNER_TIMEOUT" if owner_deadline is not None and deadline == owner_deadline
@@ -2547,7 +2549,11 @@ class CallSession:
             connect_timeout = asyncio.timeout(remaining)
             try:
                 async with connect_timeout:
-                    await endpoint.connect()
+                    if direct:
+                        assert isinstance(endpoint, SwitchableInboundEndpoint)
+                        await self._wait_direct_transfer(endpoint, agent, old_bridge, deadline, generation)
+                    else:
+                        await endpoint.connect()
                     timing.mark("endpoint_connect_return")
             except TimeoutError:
                 if connect_timeout.expired():
@@ -2565,6 +2571,11 @@ class CallSession:
             # No two writers: stop the AI bridge before creating the mobile bridge.
             old_bridge.stop()
             old_stopped = True
+            if direct:
+                assert isinstance(endpoint, SwitchableInboundEndpoint)
+                await endpoint.finish_rtp_stats()
+                if not endpoint.seal():
+                    raise RuntimeError("takeover_transport_changed")
             new_bridge = create_audio_bridge(
                 modem=self.modem,
                 mode=self.audio_mode,
@@ -2577,7 +2588,7 @@ class CallSession:
                 new_bridge.set_ready_check(self.modem.pcm_ready)
             self._start_hangup_bridge(new_bridge)
             if not self._agent_generation_current(generation) or (
-                self._takeover_deadline is not None and time.monotonic() >= self._takeover_deadline
+                time.monotonic() >= deadline
             ):
                 raise TimeoutError("takeover_deadline")
 
@@ -2634,11 +2645,53 @@ class CallSession:
             await self._resume_ai_after_takeover(agent, old_bridge, generation)
             return None
         finally:
+            self._takeover_direct_precommit = False
             if endpoint is not None:
+                await notify_phone_ended(endpoint, timing)
                 try:
                     await asyncio.wait_for(endpoint.close(), timeout=2.0)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("关闭接管媒体失败: error_type=%s", type(exc).__name__)
+
+    async def _wait_direct_transfer(self, endpoint: SwitchableInboundEndpoint, agent: VoiceAgent,
+                                    bridge: AudioBridge, deadline: float, generation: int) -> None:
+        """Keep the original AI/PCM owner alive until phone uplink proves ready."""
+        self._takeover_direct_precommit = True
+        connecting = asyncio.create_task(endpoint.connect())
+        timing = self._mobile_observations(self._record)
+        try:
+            while self._agent_generation_current(generation) and time.monotonic() < deadline:
+                if connecting.done():
+                    connecting.result()
+                command = await endpoint.next_command(timeout=0.001)
+                if command is not None and command.get("type") == "client_timing":
+                    timing.receive_client(command)
+                if command is not None and command.get("type") == "hangup":
+                    await timing.acknowledge_hangup(command, endpoint.send_event)
+                    if self._takeover_coordinator is not None:
+                        self._takeover_coordinator.end_call("owner_hangup")
+                    self._set_active(False)
+                    raise ConnectionError("owner_cancelled")
+                if endpoint.no_phone_audio_expired(time.monotonic(), _EARLY_ANSWER_CONNECTED_WAIT_SECONDS):
+                    await endpoint.fail_no_phone_audio()
+                    if self._record is not None:
+                        self._record.log_event("takeover_rollback", reason="NO_PHONE_AUDIO")
+                if endpoint.media_ready:
+                    return
+                self._drain_agent_audio(bridge)
+                pcm = bridge.read_modem_chunk()
+                if pcm:
+                    if endpoint.direct_preview_ready:
+                        endpoint.push_modem_audio(pcm)
+                        timing.mark("first_modem_to_phone")
+                    await agent.send_audio(bridge.modem_to_agent(pcm, agent.input_rate))
+                await asyncio.sleep(0.01)
+            raise TimeoutError("transfer_media_lease")
+        finally:
+            self._takeover_direct_precommit = False
+            if not connecting.done():
+                connecting.cancel()
+            await asyncio.gather(connecting, return_exceptions=True)
 
     @staticmethod
     async def _send_takeover_connected(endpoint: RemoteMediaEndpoint) -> None:
@@ -4580,6 +4633,9 @@ class CallSession:
             if (self._phone_first_provisional_ai and coordinator is not None
                     and coordinator.state is TakeoverState.WAITING_OWNER):
                 return True
+            if (self._takeover_direct_precommit and coordinator is not None
+                    and coordinator.state is TakeoverState.WAITING_OWNER):
+                return True
             hold_allowed = (
                 self._takeover_hold_generation == generation
                 and not self._takeover_hold_done
@@ -4989,6 +5045,9 @@ class CallSession:
             if not result.accepted or result.idempotent:
                 return result
             self._inbound_direct_request = claimed.issued.direct
+            if claimed.issued.direct is not None and not phone_first_offer:
+                self._phone_first_claimed_at = self._phone_first_clock()
+                self._takeover_deadline = self._direct_media_deadline()
             self._mobile_timing = CallTiming(record=self._record)
             self._mobile_timing.mark("claim_received")
             try:
@@ -5113,7 +5172,7 @@ class CallSession:
         with self._takeover_lock:
             request = self._takeover_request
             if (not config.get_bool("INBOUND_FASTPATH_V2_ENABLED") or request is None or not self.is_active
-                    or not request.phone_first or request.offer_id != command["offerId"]
+                    or request.offer_id != command["offerId"]
                     or request.call_id != command["callId"] or request.generation != command["generation"]
                     or request.nonce != command["nonce"] or request.generation != self._session_generation
                     or time.time() >= request.expires_at):
