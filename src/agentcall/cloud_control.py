@@ -659,11 +659,29 @@ class CloudEdgeClient:
             self._reconnect_started_at = None
             self._connect_attempt = 0
             next_heartbeat = 0.0
+            last_presence: tuple[bool, bool] | None = None
+            sampling_failed_since: float | None = None
             while not self._stop_event.is_set():
                 now = time.monotonic()
-                if now >= next_heartbeat:
-                    websocket.send(self._heartbeat())
-                    next_heartbeat = now + self._heartbeat_seconds
+                try:
+                    heartbeat = self._heartbeat()
+                    status = json.loads(heartbeat)["status"]
+                    presence = (status["lineBusy"], status["modemOnline"])
+                except Exception as exc:
+                    if sampling_failed_since is None:
+                        sampling_failed_since = now
+                        logger.warning("心跳状态采样失败，下一轮重试: %s", type(exc).__name__)
+                    elif now - sampling_failed_since > self._heartbeat_seconds:
+                        raise
+                else:
+                    if sampling_failed_since is not None:
+                        logger.info("心跳状态采样已恢复")
+                        sampling_failed_since = None
+                    if now >= next_heartbeat or presence != last_presence:
+                        websocket.send(heartbeat)
+                        # Track the values actually sent, not a second service sample.
+                        last_presence = presence
+                        next_heartbeat = now + self._heartbeat_seconds
                 self._drain_takeover_events(websocket.send)
                 from .remote_alert_push import drain
 

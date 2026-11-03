@@ -843,6 +843,166 @@ def test_cloud_api_creates_bounded_app_review_pairing(monkeypatch) -> None:
         api.create_pairing(credential, purpose="unexpected")
 
 
+@pytest.mark.parametrize(
+    "change, expected_times, expected_states",
+    [
+        ("idle", [100.0, 101.0, 116.0], [(True, True), (True, False), (True, False)]),
+        ("unchanged", [100.0, 115.0], [(True, True), (True, True)]),
+        ("offline", [100.0, 101.0, 116.0], [(True, True), (False, True), (False, True)]),
+        ("both", [100.0, 101.0, 116.0], [(True, True), (False, False), (False, False)]),
+        ("error", [100.0, 102.0, 117.0], [(True, True), (True, False), (True, False)]),
+        ("initial_error", [101.0, 116.0], [(True, False), (True, False)]),
+    ],
+)
+def test_cloud_websocket_reports_presence_changes_without_waiting_for_heartbeat(
+    monkeypatch, change, expected_times, expected_states,
+) -> None:
+    credential = EdgeCredential("edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40)
+    clock = [100.0]
+    sent = []
+    monkeypatch.setattr("agentcall.cloud_control.time.monotonic", lambda: clock[0])
+
+    class Service(_Service):
+        busy = True
+
+        def line_busy(self):
+            if (change == "error" and clock[0] == 101.0
+                    or change == "initial_error" and clock[0] == 100.0):
+                raise RuntimeError("temporary status failure")
+            return self.busy
+
+    service = Service()
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def send(self, message):
+            sent.append((clock[0], json.loads(message)))
+
+        def recv(self, *, timeout):
+            assert timeout == 1.0
+            clock[0] += timeout
+            if change in {"idle", "both", "error", "initial_error"}:
+                service.busy = False
+            if change in {"offline", "both"}:
+                service.modem_connected = False
+            if clock[0] >= 118.0:
+                client._stop_event.set()
+            raise TimeoutError(timeout)
+
+    client = CloudEdgeClient(
+        "https://relay.example.test", service, _Store(credential),
+        connect=lambda *_args, **_kwargs: Socket(), heartbeat_seconds=15,
+    )
+    client._run_connection(credential)
+
+    assert [at for at, _ in sent] == expected_times
+    assert [(message["status"]["modemOnline"], message["status"]["lineBusy"])
+            for _, message in sent] == expected_states
+    for _, message in sent:
+        assert set(message) == {"v", "type", "occurredAt", "status"}
+        assert message["v"] == 1 and message["type"] == "heartbeat"
+
+
+@pytest.mark.parametrize("failure_start", [100.0, 101.0])
+def test_cloud_heartbeat_sampling_failure_expires_and_propagates(monkeypatch, caplog, failure_start):
+    credential = EdgeCredential("edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40)
+    clock = [100.0]
+    samples = []
+    sent = []
+    closed = []
+    monkeypatch.setattr("agentcall.cloud_control.time.monotonic", lambda: clock[0])
+
+    class Service(_Service):
+        def line_busy(self):
+            samples.append(clock[0])
+            if clock[0] >= failure_start:
+                raise RuntimeError("private detail")
+            return False
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, *_args):
+            closed.append(exc_type)
+            return False
+
+        def send(self, message):
+            sent.append(clock[0])
+
+        def recv(self, *, timeout):
+            clock[0] += timeout
+            if clock[0] >= 120.0:
+                client._stop_event.set()
+            raise TimeoutError(timeout)
+
+    client = CloudEdgeClient(
+        "https://relay.example.test", Service(), _Store(credential),
+        connect=lambda *_args, **_kwargs: Socket(), heartbeat_seconds=15,
+    )
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError, match="private detail"):
+        client._run_connection(credential)
+
+    assert clock[0] == failure_start + 16.0
+    assert failure_start + 15.0 in samples
+    assert closed == [RuntimeError]
+    assert sent == ([] if failure_start == 100.0 else [100.0])
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0].message
+    assert warnings[0].exc_info is None
+    assert "private detail" not in caplog.text
+    assert "心跳状态采样已恢复" not in caplog.text
+
+
+def test_cloud_heartbeat_sampling_logs_once_per_failure_streak_and_recovery(monkeypatch, caplog):
+    credential = EdgeCredential("edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40)
+    clock = [100.0]
+    monkeypatch.setattr("agentcall.cloud_control.time.monotonic", lambda: clock[0])
+
+    class Service(_Service):
+        def line_busy(self):
+            if 101.0 <= clock[0] < 104.0 or 106.0 <= clock[0] < 108.0:
+                raise ValueError("private detail")
+            return False
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def send(self, message):
+            pass
+
+        def recv(self, *, timeout):
+            clock[0] += timeout
+            if clock[0] >= 110.0:
+                client._stop_event.set()
+            raise TimeoutError(timeout)
+
+    client = CloudEdgeClient(
+        "https://relay.example.test", Service(), _Store(credential),
+        connect=lambda *_args, **_kwargs: Socket(), heartbeat_seconds=15,
+    )
+    with caplog.at_level(logging.INFO):
+        client._run_connection(credential)
+
+    records = [r for r in caplog.records if "心跳状态采样" in r.message]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.INFO] * 2
+    for warning, recovery in zip(records[::2], records[1::2], strict=True):
+        assert "ValueError" in warning.message
+        assert warning.exc_info is None
+        assert recovery.message == "心跳状态采样已恢复"
+    assert "private detail" not in caplog.text
+
+
 def test_cloud_websocket_uses_product_user_agent() -> None:
     credential = EdgeCredential(
         "edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40
