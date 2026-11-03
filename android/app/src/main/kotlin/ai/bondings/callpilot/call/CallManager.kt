@@ -32,6 +32,8 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.withLock
 
 /** 接管未成功但不算失败的结束原因（与 iOS 一致：他机已接、机主已拒绝）。 */
 object CallEndReasons {
@@ -92,6 +94,7 @@ class CallManager(
     private val directMediaTimeoutMs: Long = 60_000L,
     private val directSetupMs: Long = 20_000L,
     private val clockMs: () -> Long = System::currentTimeMillis,
+    private val timingClockMs: () -> Double = { System.nanoTime() / 1_000_000.0 },
 ) {
     // 单线程：建连、回落、挂断收尾、事件处理全部串行，没有「检查完再动手」的窗口。
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -110,6 +113,9 @@ class CallManager(
 
     /** 等待 Edge media_ready 后才发出的 dial 命令（Edge 会拒绝抢跑的 dial）。 */
     private var pendingDial: String? = null
+
+    /** 本通客户端里程碑（G3）：经控制通道发给 Edge，写进本通 events.jsonl。 */
+    @Volatile private var timing = CallTiming(timingClockMs)
 
     /** 当前接管的 offer / claim 与媒体网关：挂断时通知中转结束、直连失败时同 claim 回落。 */
     private var takeover: TakeoverContext? = null
@@ -162,6 +168,7 @@ class CallManager(
         }
         _state.value = CallState.Preparing(number)
         val idempotencyKey = idempotencyKeyProvider()
+        timing = CallTiming(timingClockMs).also { it.restartAt(CallTiming.Mark.DIAL_START) }
         setupJob = scope.launch {
             try {
                 if (direct && pairing.protocol == PairingProtocol.HOSTED &&
@@ -189,9 +196,12 @@ class CallManager(
                     if (_state.value !is CallState.Preparing) throw CancellationException()
                     pendingDial = number
                 }
+                timing.mark(CallTiming.Mark.CONNECT_START)
                 s.connect(livekitUrl, token)
+                timing.mark(CallTiming.Mark.CONNECT_RETURN)
                 currentCoroutineContext().ensureActive()
                 _state.value = CallState.WaitingMedia(number)
+                flushTiming(s)
                 setupJob = null
             } catch (e: CancellationException) {
                 throw e
@@ -215,16 +225,18 @@ class CallManager(
         val edgeId = pairing.edgeId ?: return false
         val factory = directSessionFactory ?: return false
         val gateway = outboundGatewayFactory(pairing)
+        timing.mark(CallTiming.Mark.PREPARE_START)
         val servers = try {
-            gateway.iceServers(edgeId)
+            gateway.iceServers(edgeId).also { timing.mark(CallTiming.Mark.PREPARE_RESPONSE) }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             return false
         }
         val s = factory()
+        timing.mark(CallTiming.Mark.PRECONNECT_START)
         val offer = try {
-            withTimeout(directSetupMs) { s.prepareDirect(servers) }
+            withTimeout(directSetupMs) { s.prepareDirect(servers) }.also { timing.mark(CallTiming.Mark.PRECONNECT_READY) }
         } catch (e: TimeoutCancellationException) {
             s.disconnect()
             return false
@@ -247,7 +259,9 @@ class CallManager(
         }
         eventJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { s.events.collect { handleEvent(number, it) } }
         onForeground(true)
+        timing.mark(CallTiming.Mark.CLAIM_START)
         val created = gateway.create(edgeId, idempotencyKey, offer)
+        timing.mark(CallTiming.Mark.CLAIM_RESPONSE)
         context.callId = created.callId
         currentCoroutineContext().ensureActive()
         _state.value = CallState.WaitingMedia(number)
@@ -255,7 +269,11 @@ class CallManager(
         val answer = created.sdpAnswer
         when {
             answer != null -> try {
+                timing.mark(CallTiming.Mark.CONNECT_START)
                 withTimeout(directSetupMs) { s.connectDirect(answer) }
+                timing.mark(CallTiming.Mark.CONNECT_RETURN)
+                timing.mark(CallTiming.Mark.DIRECT_CONTROL_READY)
+                flushTiming(s)
             } catch (e: TimeoutCancellationException) {
                 // 阶段超时是直连失败，不是整通被取消：同一通回落。
                 outboundFallback(context)
@@ -270,7 +288,10 @@ class CallManager(
                 s.closeDirect()
                 val legacy = gateway.awaitSession(edgeId, created)
                 currentCoroutineContext().ensureActive()
+                timing.mark(CallTiming.Mark.CONNECT_START)
                 s.connect(legacy.livekitUrl, legacy.token)
+                timing.mark(CallTiming.Mark.CONNECT_RETURN)
+                flushTiming(s)
             }
         }
         return true
@@ -288,6 +309,7 @@ class CallManager(
             }
             context.fallbackStarted = true
         }
+        timing.mark(CallTiming.Mark.COLD_FALLBACK)
         context.session.closeDirect()
         val fallback = context.gateway.fallbackLiveKit(callId)
         currentCoroutineContext().ensureActive()
@@ -295,7 +317,12 @@ class CallManager(
             outbound === context && session === context.session && !hangupRequested && _state.value is CallState.WaitingMedia
         }
         if (!stillCurrent) return
+        // 每个里程碑只记首次（同 iOS）：直连已记过的 connect_start 保留，这里补齐缺的那端。
+        timing.mark(CallTiming.Mark.CONNECT_START)
         context.session.connect(fallback.livekitUrl, fallback.token)
+        timing.mark(CallTiming.Mark.CONNECT_RETURN)
+        timing.mark(CallTiming.Mark.ROOM_CONNECTED)
+        flushTiming(context.session)
     }
 
     private fun outboundFallbackIfPossible(context: OutboundContext, number: String, reason: String) {
@@ -392,6 +419,7 @@ class CallManager(
             pendingDial = null
         }
         _state.value = CallState.Preparing(label)
+        timing = CallTiming(timingClockMs).also { it.restartAt(CallTiming.Mark.ANSWER_ACTION) }
         val wantDirect = direct && directSessionFactory != null
         val prep = takePrepared(offerId)
         if (!wantDirect && prep != null) release(prep)
@@ -403,6 +431,7 @@ class CallManager(
             try {
                 // 先 claim（CAS 定归属），直连准备在 claim 之后与 Edge 并行进行。
                 val gateway = context.gateway
+                timing.restartAt(CallTiming.Mark.CLAIM_START)
                 val claimed = if (wantDirect && gateway != null) {
                     // claim 作为 scope 的独立子任务：挂断取消 setup 时它照常跑完，结果交给 hangup 收尾。
                     // 在锁内创建并发布（LAZY），挂断要么看见它、要么阻止它启动，不存在没人收尾的 claim。
@@ -419,6 +448,7 @@ class CallManager(
                     withContext(ioDispatcher) { takeoverClaimProvider(pairing, offerId) }
                 }
                 context.claimId = claimed.sessionId
+                timing.mark(CallTiming.Mark.CLAIM_RESPONSE)
                 val useDirect = wantDirect && claimed.directAttempted
                 if (!useDirect && ready != null) {
                     context.prepared = null
@@ -442,8 +472,12 @@ class CallManager(
                     context.direct = s
                     runDirect(context, claimed, s, label, ready?.offer)
                 } else {
+                    timing.mark(CallTiming.Mark.CONNECT_START)
                     s.connect(claimed.livekitUrl, claimed.token)
+                    timing.mark(CallTiming.Mark.CONNECT_RETURN)
+                    timing.mark(CallTiming.Mark.ROOM_CONNECTED)
                 }
+                flushTiming(s)
                 setupJob = null
             } catch (e: CancellationException) {
                 throw e
@@ -488,10 +522,15 @@ class CallManager(
                     withTimeout(directSetupMs) { s.prepareDirect(servers) }
                 }
                 currentCoroutineContext().ensureActive()
+                timing.mark(CallTiming.Mark.SDP_SUBMIT_START)
                 answer = gateway.completeSdp(context.offerId, claimed.sessionId, offer).sdpAnswer
+                timing.mark(CallTiming.Mark.SDP_SUBMIT_RESPONSE)
             }
             val sdp = answer ?: throw IllegalStateException("Edge 未给出直连 answer")
+            timing.mark(CallTiming.Mark.CONNECT_START)
             withTimeout(directSetupMs) { s.connectDirect(sdp) }
+            timing.mark(CallTiming.Mark.CONNECT_RETURN)
+            timing.mark(CallTiming.Mark.DIRECT_CONTROL_READY)
         } catch (e: TimeoutCancellationException) {
             // 阶段超时是直连失败，不是整通被取消：同 claim 回落。
             startFallback(context, s, label)
@@ -516,6 +555,7 @@ class CallManager(
             if (context.fallbackStarted || hangupRequested || takeover !== context || _state.value !is CallState.WaitingMedia) return
             context.fallbackStarted = true
         }
+        timing.mark(CallTiming.Mark.COLD_FALLBACK)
         s.closeDirect()
         val fallback = gateway.fallbackLiveKit(context.offerId, claimId)
         currentCoroutineContext().ensureActive()
@@ -523,7 +563,11 @@ class CallManager(
             takeover === context && session === s && !hangupRequested && _state.value is CallState.WaitingMedia
         }
         if (!stillCurrent) return
+        timing.mark(CallTiming.Mark.CONNECT_START)
         s.connect(fallback.livekitUrl, fallback.token)
+        timing.mark(CallTiming.Mark.CONNECT_RETURN)
+        timing.mark(CallTiming.Mark.ROOM_CONNECTED)
+        flushTiming(s)
     }
 
     private fun fallbackIfPossible(reason: String) {
@@ -601,8 +645,11 @@ class CallManager(
             dialJob = null
         }
         val s = session
+        val callTiming = timing.also { it.mark(CallTiming.Mark.HANGUP_INTENT) }
         takeover?.let { endClaimAfterHangup(it) }
         scope.launch {
+            // 里程碑尽力补发，有上限：不能拖慢挂断命令。
+            if (s != null) withTimeoutOrNull(HANGUP_TIMING_BUDGET_MS) { sendTiming(s, callTiming) }
             try {
                 s?.sendCommand(Signaling.encodeHangup())
             } catch (_: Exception) {
@@ -641,7 +688,10 @@ class CallManager(
                     Signaling.Event.HangupAck -> return
                 }
                 when (status) {
-                    "media_ready" -> firePendingDial()
+                    "media_ready" -> {
+                        session?.let { flushTiming(it) }
+                        firePendingDial()
+                    }
                     "dialing" -> _state.value = CallState.Dialing(number)
                     "connected" -> markConnected(number)
                     "ended", "hangup" -> {
@@ -755,11 +805,38 @@ class CallManager(
     }
 
     private fun markConnected(number: String) {
-        synchronized(commandLock) {
+        val s = synchronized(commandLock) {
             if (hangupRequested || !isActive) return
             takeoverMediaTimeoutJob?.cancel()
             takeoverMediaTimeoutJob = null
             _state.value = CallState.InCall(number)
+            session
+        }
+        timing.mark(CallTiming.Mark.EDGE_CONNECTED)
+        s?.let { flushTiming(it) }
+    }
+
+    /** 把还没发出的里程碑经控制通道补给 Edge（尽力而为；失败的下次重发，不影响通话）。 */
+    private fun flushTiming(s: RemoteSession) {
+        // 发起时就绑定本通的计时：协程晚跑时新一通可能已换了 timing，不能把新通的里程碑发到旧会话。
+        val callTiming = timing
+        scope.launch { sendTiming(s, callTiming) }
+    }
+
+    private suspend fun sendTiming(s: RemoteSession, callTiming: CallTiming) {
+        callTiming.sendLock.withLock {
+            while (true) {
+                val batch = callTiming.nextBatch() ?: return
+                try {
+                    s.sendCommand(batch.text)
+                } catch (e: CancellationException) {
+                    callTiming.unsend(batch)
+                    throw e
+                } catch (_: Exception) {
+                    callTiming.unsend(batch)
+                    return
+                }
+            }
         }
     }
 
@@ -829,6 +906,9 @@ class CallManager(
         captured.session?.disconnect()
     }
 }
+
+/** 挂断前补发里程碑的上限：只是诊断数据，不能推迟挂断命令。 */
+private const val HANGUP_TIMING_BUDGET_MS = 300L
 
 /** 预备在来电过期后再保留一小会儿：服务端时钟与本机略有偏差。 */
 private const val PREPARED_GRACE_MS = 2_000L

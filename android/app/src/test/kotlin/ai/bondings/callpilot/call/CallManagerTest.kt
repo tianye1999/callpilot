@@ -48,7 +48,14 @@ class CallManagerTest {
             connectedToken = token
         }
 
+        /** 客户端里程碑（client_timing）单独记，不混进业务命令。 */
+        val timings = mutableListOf<String>()
+
         override suspend fun sendCommand(json: String) {
+            if (json.contains("\"client_timing\"")) {
+                timings += json
+                return
+            }
             if (json.contains("\"dial\"")) {
                 dialStarted.complete(Unit)
                 dialRelease?.await()
@@ -1397,6 +1404,139 @@ class CallManagerTest {
         assertEquals(listOf("ice", "create", "fallback:call_abcdefghijkl"), gateway.calls)
         assertEquals("fallback-token", direct.connectedToken)
         assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
+        h.close()
+    }
+
+    private fun sentMarks(session: FakeSession): Set<String> = session.timings.flatMap { batch ->
+        kotlinx.serialization.json.Json.parseToJsonElement(batch)
+            .let { (it as kotlinx.serialization.json.JsonObject)["marks"] as kotlinx.serialization.json.JsonObject }.keys
+    }.toSet()
+
+    @Test
+    fun `外呼直连把客户端里程碑经控制通道交给 Edge 且不混进业务命令`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+        assertTrue(sentMarks(direct).containsAll(listOf("dial_start", "prepare_start", "prepare_response",
+            "preconnect_start", "preconnect_ready", "claim_start", "claim_response", "connect_start", "connect_return",
+            "direct_control_ready")))
+        assertTrue(direct.commands.isEmpty())
+
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
+        runCurrent()
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("connected")))
+        runCurrent()
+        assertTrue("edge_connected" in sentMarks(direct))
+        assertTrue(direct.commands.single().contains("10086"))
+
+        manager.hangup()
+        runCurrent()
+        assertTrue("hangup_intent" in sentMarks(direct))
+        assertTrue(direct.commands.last().contains("\"hangup\""))
+        val seqs = direct.timings.map {
+            (kotlinx.serialization.json.Json.parseToJsonElement(it) as kotlinx.serialization.json.JsonObject)["seq"].toString().toInt()
+        }
+        assertEquals(seqs.sorted(), seqs)
+        assertEquals(seqs.toSet().size, seqs.size)
+        h.close()
+    }
+
+    @Test
+    fun `LiveKit 外呼也上报拨号与入房里程碑`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(session) { invite() }
+        manager.startCall(pairing, "10000")
+        advanceUntilIdle()
+        assertTrue(sentMarks(session).containsAll(listOf("dial_start", "connect_start", "connect_return")))
+        assertTrue(session.commands.isEmpty())
+        h.close()
+    }
+
+    @Test
+    fun `来电直连接管的里程碑分段 SDP 补交与连接成对`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer typ relay"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+
+        assertTrue(sentMarks(direct).containsAll(listOf("answer_action", "claim_start", "claim_response",
+            "sdp_submit_start", "sdp_submit_response", "connect_start", "connect_return", "direct_control_ready")))
+        h.close()
+    }
+
+    /** 首批发送挂起时，后到的补发必须排队，不能抢先送出更大的 seq（Edge 只收更大的 seq）。 */
+    private class GatedTimingSession : FakeDirectSession() {
+        val gate = CompletableDeferred<Unit>()
+        val order = mutableListOf<Int>()
+        override suspend fun sendCommand(json: String) {
+            if (json.contains("\"client_timing\"")) {
+                val seq = kotlinx.serialization.json.Json.parseToJsonElement(json)
+                    .let { (it as kotlinx.serialization.json.JsonObject)["seq"].toString().toInt() }
+                if (seq == 1) gate.await()
+                order += seq
+                timings += json
+                return
+            }
+            super.sendCommand(json)
+        }
+    }
+
+    @Test
+    fun `里程碑补发串行 挂起的首批不会被后发的批次越过`() = runTest {
+        val h = Harness(this)
+        val direct = GatedTimingSession()
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
+        runCurrent()
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("connected")))
+        runCurrent()
+        assertTrue(direct.order.isEmpty())
+
+        direct.gate.complete(Unit)
+        runCurrent()
+        assertEquals(direct.order.sorted(), direct.order)
+        assertTrue("edge_connected" in sentMarks(direct))
+        h.close()
+    }
+
+    @Test
+    fun `里程碑发送卡住时挂断仍在上限内完成`() = runTest {
+        val h = Harness(this)
+        val direct = GatedTimingSession()
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+
+        manager.hangup()
+        runCurrent()
+        advanceTimeBy(299)
+        runCurrent()
+        assertTrue(direct.commands.none { it.contains("\"hangup\"") })
+
+        advanceTimeBy(2)
+        runCurrent()
+        assertEquals(CallState.Ended("10086", "local_hangup"), manager.state.value)
+        assertTrue(direct.commands.last().contains("\"hangup\""))
+        h.close()
+    }
+
+    @Test
+    fun `回落成功时补齐 connect 起止 让 Edge 能算出连接耗时`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession().also { it.failConnect = true }
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+        assertEquals("fallback-token", direct.connectedToken)
+        assertTrue(sentMarks(direct).containsAll(listOf("connect_start", "connect_return", "cold_fallback", "room_connected")))
         h.close()
     }
 }
