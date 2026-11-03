@@ -8,6 +8,14 @@ import org.w3c.dom.Element
 import org.xml.sax.InputSource
 
 class UpdateResourcesTest {
+    @Test fun `hangup progress has both locales without AI wording`() {
+        assertEquals("Ending call...", strings("values", "strings")["call_hanging_up"])
+        assertEquals("正在挂断...", strings("values-zh-rCN", "strings")["call_hanging_up"])
+        listOf("values", "values-zh-rCN").forEach {
+            assertFalse(strings(it, "strings").getValue("call_hanging_up").contains("AI"))
+        }
+    }
+
     private fun xml(path: String) = File(path).reader(Charsets.UTF_8).use {
         DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(InputSource(it))
     }

@@ -15,6 +15,7 @@ import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.protocol.Signaling
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -108,11 +109,18 @@ class CallManager(
     private var setupJob: Job? = null
     private var dialJob: Job? = null
     private var takeoverMediaTimeoutJob: Job? = null
-    private var hangupRequested = false
+    private val _hangingUp = MutableStateFlow(false)
+    val hangingUp: StateFlow<Boolean> = _hangingUp
+    private var hangupRequested: Boolean
+        get() = _hangingUp.value
+        set(value) { _hangingUp.value = value }
     private val commandLock = Any()
 
     /** 等待 Edge media_ready 后才发出的 dial 命令（Edge 会拒绝抢跑的 dial）。 */
     private var pendingDial: String? = null
+
+    /** 本地挂断等待中的 (commandId, 确认)；Edge 回带同一编号的 hangup.ack 时完成。commandLock 保护。 */
+    private var hangupAck: Pair<String, CompletableDeferred<Unit>>? = null
 
     /** 本通客户端里程碑（G3）：经控制通道发给 Edge，写进本通 events.jsonl。 */
     @Volatile private var timing = CallTiming(timingClockMs)
@@ -334,11 +342,12 @@ class CallManager(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val mine = synchronized(commandLock) { outbound === context && isActive }
-                if (mine) {
-                    cleanup()
+                val captured = synchronized(commandLock) {
+                    if (outbound !== context || hangupRequested || !isActive) return@launch
                     _state.value = CallState.Failed(number, e.message ?: reason, (e as? HostedCloudException)?.errorCode)
+                    captureForCleanupLocked()
                 }
+                release(captured)
             }
         }
     }
@@ -574,18 +583,19 @@ class CallManager(
         val context = takeover ?: return
         val direct = context.direct ?: return
         val label = currentNumber() ?: return
-        if (context.fallbackStarted || _state.value !is CallState.WaitingMedia) return
+        if (hangupRequested || context.fallbackStarted || _state.value !is CallState.WaitingMedia) return
         val job = scope.launch {
             try {
                 startFallback(context, direct, label)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val mine = synchronized(commandLock) { takeover === context && isActive }
-                if (mine) {
-                    cleanup()
+                val captured = synchronized(commandLock) {
+                    if (takeover !== context || hangupRequested || !isActive) return@launch
                     _state.value = CallState.Failed(label, e.message ?: reason, (e as? HostedCloudException)?.errorCode)
+                    captureForCleanupLocked()
                 }
+                release(captured)
             }
         }
         context.fallbackJob = job
@@ -635,29 +645,58 @@ class CallManager(
     }
 
     fun hangup() {
-        val number = currentNumber() ?: return
+        val deadline = timingClockMs() + HANGUP_ACK_BUDGET_MS
+        val commandId = UUID.randomUUID().toString()
+        val acknowledged = CompletableDeferred<Unit>()
+        val number: String
+        val s: RemoteSession?
+        val callTiming: CallTiming
         synchronized(commandLock) {
+            number = currentNumber() ?: return
             if (hangupRequested) return
             hangupRequested = true
+            s = session
+            callTiming = timing.also { it.mark(CallTiming.Mark.HANGUP_INTENT) }
+            hangupAck = commandId to acknowledged
             pendingDial = null
             setupJob?.cancel()
             setupJob = null
             dialJob?.cancel()
             dialJob = null
+            takeover?.fallbackJob?.cancel()
+            outbound?.fallbackJob?.cancel()
+            takeover?.let { endClaimAfterHangup(it) }
         }
-        val s = session
-        val callTiming = timing.also { it.mark(CallTiming.Mark.HANGUP_INTENT) }
-        takeover?.let { endClaimAfterHangup(it) }
         scope.launch {
-            // 里程碑尽力补发，有上限：不能拖慢挂断命令。
-            if (s != null) withTimeoutOrNull(HANGUP_TIMING_BUDGET_MS) { sendTiming(s, callTiming) }
-            try {
-                s?.sendCommand(Signaling.encodeHangup())
-            } catch (_: Exception) {
-                // 命令发不出去也要本地收尾；Edge 有断线 grace 兜底挂断
+            if (s != null) {
+                // 等 Edge 回 hangup.ack 再断开（同 iOS）：发完立刻断开房间时，LiveKit 的数据包常常还没发出去，
+                // Edge 只能等媒体断开再挂（11-03 真机）。没回就重发一次；总时长有上限，命令发不出去也照样本地收尾。
+                // 点击时即确定单调时钟 deadline：调度延迟、遥测、发送和确认共用预算。
+                withTimeoutOrNull((deadline - timingClockMs()).toLong().coerceAtLeast(0L)) {
+                    withTimeoutOrNull(HANGUP_TIMING_BUDGET_MS) { sendTiming(s, callTiming) }
+                    for (attempt in 0 until 2) {
+                        try {
+                            s.sendCommand(Signaling.encodeHangup(commandId))
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            // 下一次重发或超时后本地收尾；Edge 有断线 grace 兜底挂断。
+                        }
+                        if (withTimeoutOrNull(HANGUP_RETRY_MS) { acknowledged.await() } != null) return@withTimeoutOrNull
+                    }
+                    acknowledged.await()
+                }
+                if (acknowledged.isCompleted) callTiming.mark(CallTiming.Mark.HANGUP_ACK)
             }
-            cleanup()
-            _state.value = CallState.Ended(number, "local_hangup")
+            val captured = synchronized(commandLock) {
+                // 每通都有独立 timing，既作 generation 也覆盖尚未创建 session 的挂断。
+                if (timing !== callTiming || hangupAck?.second !== acknowledged) return@launch
+                hangupAck = null
+                hangupRequested = false
+                _state.value = CallState.Ended(number, "local_hangup")
+                captureForCleanupLocked()
+            }
+            release(captured)
         }
     }
 
@@ -667,6 +706,13 @@ class CallManager(
     }
 
     private fun handleEvent(number: String, event: SessionEvent) {
+        val ack = (event as? SessionEvent.Edge)?.event as? Signaling.Event.HangupAck
+        if (ack != null) {
+            // 挂断确认要在「已请求挂断」的过滤之前处理：它正是挂断之后才到的事件。
+            val pending = synchronized(commandLock) { hangupAck }
+            if (pending != null && ack.commandId == pending.first) pending.second.complete(Unit)
+            return
+        }
         if (!isActive || synchronized(commandLock) { hangupRequested }) return
         when (event) {
             is SessionEvent.Edge -> {
@@ -686,7 +732,7 @@ class CallManager(
                         if (out != null) outboundFallbackIfPossible(out, number, e.reason) else fallbackIfPossible(e.reason)
                         return
                     }
-                    Signaling.Event.HangupAck -> return
+                    is Signaling.Event.HangupAck -> return
                 }
                 when (status) {
                     "media_ready" -> {
@@ -907,6 +953,10 @@ class CallManager(
         captured.session?.disconnect()
     }
 }
+
+/** 挂断等 Edge 确认的总上限与重发间隔（iOS 为 2.5 s 预算、最多两次发送）。 */
+private const val HANGUP_ACK_BUDGET_MS = 1_500L
+private const val HANGUP_RETRY_MS = 400L
 
 /** 挂断前补发里程碑的上限：只是诊断数据，不能推迟挂断命令。 */
 private const val HANGUP_TIMING_BUDGET_MS = 300L

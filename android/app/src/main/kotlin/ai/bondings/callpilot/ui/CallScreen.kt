@@ -23,6 +23,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.res.stringResource
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -41,6 +42,7 @@ import kotlinx.coroutines.delay
 /** 通话页：号码 + 计时 + 12 键 DTMF（导航 IVR）+ 扬声器 + 挂断。 */
 @Composable
 fun CallScreen(state: CallState, manager: CallManager) {
+    val hangingUp by manager.hangingUp.collectAsState()
     var speaker by remember { mutableStateOf(false) }
     var seconds by remember { mutableIntStateOf(0) }
     val inCall = state is CallState.InCall
@@ -81,7 +83,7 @@ fun CallScreen(state: CallState, manager: CallManager) {
         Text(number, fontSize = 34.sp, fontFamily = FontFamily.Monospace)
         Spacer(Modifier.height(8.dp))
         Text(
-            statusText,
+            if (hangingUp) stringResource(R.string.call_hanging_up) else statusText,
             style = MaterialTheme.typography.titleMedium,
             color = if (state is CallState.Failed) MaterialTheme.colorScheme.error
             else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -107,8 +109,8 @@ fun CallScreen(state: CallState, manager: CallManager) {
             else -> Box(
                 modifier = Modifier
                     .size(70.dp)
-                    .background(Color(0xFFE5484D), CircleShape)
-                    .clickable { manager.hangup() },
+                    .background(if (hangingUp) Color(0xFF888888) else Color(0xFFE5484D), CircleShape)
+                    .clickable(enabled = !hangingUp) { manager.hangup() },
                 contentAlignment = Alignment.Center,
             ) { Text("✕", color = Color.White, fontSize = 26.sp) }
         }

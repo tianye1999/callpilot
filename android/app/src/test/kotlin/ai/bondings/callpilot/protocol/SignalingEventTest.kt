@@ -10,7 +10,7 @@ class SignalingEventTest {
         assertEquals(Signaling.Event.Status("connected", null), Signaling.decodeEvent("""{"type":"status","status":"connected","clientTimingVersion":1}"""))
         assertEquals(Signaling.Event.Ended("call_ended"), Signaling.decodeEvent("""{"type":"ended","reason":"call_ended"}"""))
         assertEquals(Signaling.Event.MediaFailed("no_phone_audio"), Signaling.decodeEvent("""{"type":"media_failed","reason":"no_phone_audio"}"""))
-        assertEquals(Signaling.Event.HangupAck, Signaling.decodeEvent("""{"type":"hangup.ack","commandId":"x"}"""))
+        assertEquals(Signaling.Event.HangupAck("x"), Signaling.decodeEvent("""{"type":"hangup.ack","commandId":"x"}"""))
         assertNull(Signaling.decodeEvent("""{"type":"status"}"""))
         assertNull(Signaling.decodeEvent("""{"type":"unknown","status":"x"}"""))
         assertNull(Signaling.decodeEvent("not json"))

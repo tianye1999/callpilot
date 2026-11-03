@@ -49,6 +49,7 @@ class SignalingTest {
     @Test
     fun `hangup 命令`() {
         assertEquals("hangup", fields(Signaling.encodeHangup())["type"])
+        assertEquals("command-A", fields(Signaling.encodeHangup("command-A"))["commandId"])
     }
 
     @Test

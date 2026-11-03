@@ -38,7 +38,11 @@ object Signaling {
         }.toString()
     }
 
-    fun encodeHangup(): String = buildJsonObject { put("type", "hangup") }.toString()
+    /** commandId 让 Edge 回带同一编号的 `hangup.ack`，挂断方据此确认送达后再断开（同 iOS）。 */
+    fun encodeHangup(commandId: String = java.util.UUID.randomUUID().toString()): String = buildJsonObject {
+        put("type", "hangup")
+        put("commandId", commandId)
+    }.toString()
 
     fun encodeDtmf(digits: String): String {
         require(Validation.isValidDtmf(digits)) { "DTMF 只允许 0-9*#，1-16 位" }
@@ -62,8 +66,8 @@ object Signaling {
         /** `{"type":"media_failed","reason":"no_phone_audio"}`：直连已通但 Edge 收不到手机音频，应回落 LiveKit。 */
         data class MediaFailed(val reason: String) : Event
 
-        /** `{"type":"hangup.ack"}`：Edge 已收到挂断命令。 */
-        data object HangupAck : Event
+        /** `{"type":"hangup.ack","commandId":...}`：Edge 已收到该编号的挂断命令。 */
+        data class HangupAck(val commandId: String?) : Event
     }
 
     fun decodeEvent(raw: String): Event? {
@@ -81,7 +85,7 @@ object Signaling {
             "remote_call" -> status?.let { Event.RemoteCall(it) }
             "ended" -> Event.Ended(reason ?: "ended")
             "media_failed" -> Event.MediaFailed(reason ?: "media_failed")
-            "hangup.ack" -> Event.HangupAck
+            "hangup.ack" -> Event.HangupAck((obj["commandId"] as? JsonPrimitive)?.takeIf { it.isString }?.content)
             else -> null
         }
     }

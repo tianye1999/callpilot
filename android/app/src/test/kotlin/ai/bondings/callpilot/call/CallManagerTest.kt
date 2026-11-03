@@ -17,6 +17,8 @@ import java.util.Base64
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -61,7 +63,16 @@ class CallManagerTest {
                 dialRelease?.await()
             }
             commands += json
+            if (autoAckHangup && json.contains("\"hangup\"")) {
+                // 与真实 Edge 一致：收到带编号的挂断就回同一编号的确认。
+                val id = (kotlinx.serialization.json.Json.parseToJsonElement(json) as kotlinx.serialization.json.JsonObject)["commandId"]
+                    .toString().trim('"')
+                _events.tryEmit(SessionEvent.Edge(Signaling.Event.HangupAck(id)))
+            }
         }
+
+        /** 真实 Edge 会回 hangup.ack；个别测试关掉它来验证超时重发。 */
+        var autoAckHangup = true
 
         override fun setSpeakerphone(enabled: Boolean) = Unit
 
@@ -108,6 +119,7 @@ class CallManagerTest {
         val calls = mutableListOf<String>()
         var claimGate: CompletableDeferred<Unit>? = null
         var fallbackGate: CompletableDeferred<Unit>? = null
+        var fallbackError: Exception? = null
         var claimedWithSdp: String? = null
         override suspend fun claim(offerId: String, direct: Boolean, sdpOffer: String?): HostedCallSession {
             calls += if (sdpOffer != null) "claim:$direct+sdp" else "claim:$direct"
@@ -132,7 +144,10 @@ class CallManagerTest {
         override suspend fun fallbackLiveKit(offerId: String, claimId: String, clientTiming: List<String>): HostedCallSession {
             fallbackTiming = clientTiming
             calls += "fallback"
-            fallbackGate?.await()
+            withContext(NonCancellable) {
+                fallbackGate?.await()
+                fallbackError?.let { throw it }
+            }
             return claimResult.copy(token = "fallback-token", directAttempted = true, sdpPending = false)
         }
 
@@ -149,6 +164,8 @@ class CallManagerTest {
         var iceError: Exception? = null
         var createError: Exception? = null
         var createGate: CompletableDeferred<Unit>? = null
+        var fallbackGate: CompletableDeferred<Unit>? = null
+        var fallbackError: Exception? = null
         var offer: String? = null
 
         override suspend fun iceServers(edgeId: String): List<IceServer> {
@@ -172,6 +189,10 @@ class CallManagerTest {
 
         override suspend fun fallbackLiveKit(callId: String): HostedCallSession {
             calls += "fallback:$callId"
+            withContext(NonCancellable) {
+                fallbackGate?.await()
+                fallbackError?.let { throw it }
+            }
             return HostedCallSession(callId, "wss://lk.example.com", "fallback-token", 9_999_999L)
         }
     }
@@ -201,7 +222,7 @@ class CallManagerTest {
     }
 
     /** 用测试调度器驱动 manager 的 scope 与 IO，保证 advanceUntilIdle 完全确定。 */
-    private class Harness(testScope: TestScope) {
+    private class Harness(private val testScope: TestScope) {
         val dispatcher = StandardTestDispatcher(testScope.testScheduler)
         val scope = CoroutineScope(SupervisorJob() + dispatcher)
         val foreground = mutableListOf<Boolean>()
@@ -223,6 +244,7 @@ class CallManagerTest {
             gatewayFactory: (StoredPairing) -> InboundMediaGateway = { gateway ?: error("gateway should not be used") },
             outboundGateway: OutboundMediaGateway? = null,
             clockMs: () -> Long = { 1_000L },
+            timingClockMs: () -> Double = { testScope.testScheduler.currentTime.toDouble() },
             inviteProvider: suspend (StoredPairing) -> Invite,
         ): CallManager = CallManager(
             sessionFactory = { session },
@@ -239,6 +261,7 @@ class CallManagerTest {
             mediaGatewayFactory = gatewayFactory,
             outboundGatewayFactory = { outboundGateway ?: error("outbound gateway should not be used") },
             clockMs = clockMs,
+            timingClockMs = timingClockMs,
         )
 
         fun close() = scope.cancel()
@@ -1565,6 +1588,183 @@ class CallManagerTest {
         runCurrent()
         assertTrue(gateway.calls.contains("end"))
         assertTrue(gateway.endTiming.isNotEmpty())
+        h.close()
+    }
+
+    private fun hangupIds(session: FakeSession): List<String> = session.commands.filter { it.contains("\"hangup\"") }.map {
+        (kotlinx.serialization.json.Json.parseToJsonElement(it) as kotlinx.serialization.json.JsonObject)["commandId"]
+            .toString().trim('"')
+    }
+
+    @Test
+    fun `遥测与确认共用点击起算的1500毫秒预算`() = runTest {
+        val h = Harness(this)
+        val direct = GatedTimingSession().also { it.autoAckHangup = false }
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = FakeOutboundGateway()) { error("no tunnel") }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+        manager.hangup()
+        advanceTimeBy(1_499)
+        runCurrent()
+        assertFalse(direct.disconnected)
+        assertEquals(2, hangupIds(direct).size)
+        advanceTimeBy(1)
+        runCurrent()
+        assertTrue(direct.disconnected)
+        assertEquals(CallState.Ended("10086", "local_hangup"), manager.state.value)
+        h.close()
+    }
+
+    @Test
+    fun `挂断协程延迟调度也不重置点击预算`() = runTest {
+        val h = Harness(this)
+        var monotonicMs = 0.0
+        val session = FakeSession().also { it.autoAckHangup = false }
+        val manager = h.manager(session, timingClockMs = { monotonicMs }) { invite() }
+        manager.startCall(pairing, "10000")
+        runCurrent()
+        // 挂断登记同步完成，但挂断协程排队期间也必须消耗总预算。
+        manager.hangup()
+        monotonicMs = 1_500.0
+        runCurrent()
+        assertTrue(session.disconnected)
+        h.close()
+    }
+
+    @Test
+    fun `来电与外呼回落挂起后挂断 迟到失败不得结束本通或伤及下一通`() = runTest {
+        for ((inbound, failAfterNextCall) in listOf(false to false, true to false, false to true, true to true)) {
+            val h = Harness(this)
+            val legacy = FakeSession()
+            val direct = FakeDirectSession().also { it.autoAckHangup = false }
+            val gate = CompletableDeferred<Unit>()
+            val incoming = FakeGateway(v2Claim(sdpAnswer = "v=0\r\nanswer")).also {
+                it.fallbackGate = gate
+                it.fallbackError = IllegalStateException("late fallback failure")
+            }
+            val outgoing = FakeOutboundGateway().also {
+                it.fallbackGate = gate
+                it.fallbackError = IllegalStateException("late fallback failure")
+            }
+            val manager = h.manager(legacy, directSession = direct, gateway = incoming, outboundGateway = outgoing) { invite() }
+            if (inbound) manager.answerTakeover(hosted, "offer-A", direct = true)
+            else manager.startCall(hosted, "10086", direct = true)
+            runCurrent()
+            direct.emit(SessionEvent.Edge(Signaling.Event.MediaFailed("no_phone_audio")))
+            runCurrent()
+            assertTrue(if (inbound) "fallback" in incoming.calls else outgoing.calls.any { it.startsWith("fallback:") })
+            manager.hangup()
+            runCurrent()
+            if (!failAfterNextCall) gate.complete(Unit)
+            runCurrent()
+            assertTrue("inbound=$inbound ${manager.state.value}", manager.isActive)
+            assertFalse(direct.disconnected)
+            // 旧回落失败不能发布 Failed 给用户开启 B 的机会。
+            manager.startCall(pairing, "20000")
+            runCurrent()
+            assertFalse(legacy.connected)
+            advanceTimeBy(1_500)
+            runCurrent()
+            manager.startCall(pairing, "20000")
+            runCurrent()
+            assertEquals(CallState.WaitingMedia("20000"), manager.state.value)
+            if (failAfterNextCall) {
+                gate.complete(Unit)
+                runCurrent()
+            }
+            advanceTimeBy(2_000)
+            runCurrent()
+            assertEquals(CallState.WaitingMedia("20000"), manager.state.value)
+            assertFalse(legacy.disconnected)
+            h.close()
+        }
+    }
+
+    @Test
+    fun `旧挂断释放资源期间开启新通不得被旧Ended覆写`() = runTest {
+        val h = Harness(this)
+        lateinit var manager: CallManager
+        val old = object : FakeDirectSession() {
+            override fun disconnect() {
+                super.disconnect()
+                manager.startCall(pairing, "20000")
+            }
+        }.also { it.autoAckHangup = false }
+        val next = FakeSession()
+        manager = h.manager(next, directSession = old, outboundGateway = FakeOutboundGateway()) { invite() }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+        manager.hangup()
+        advanceTimeBy(1_500)
+        runCurrent()
+        assertEquals(CallState.WaitingMedia("20000"), manager.state.value)
+        assertFalse(next.disconnected)
+        h.close()
+    }
+
+    @Test
+    fun `挂断带编号 收到 Edge 确认才断开 不重发`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession().also { it.autoAckHangup = false }
+        val manager = h.manager(session) { invite() }
+        manager.startCall(pairing, "10000")
+        advanceUntilIdle()
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("connected")))
+        runCurrent()
+
+        manager.hangup()
+        runCurrent()
+        val ids = hangupIds(session)
+        assertTrue(manager.hangingUp.value)
+        assertEquals(1, ids.size)
+        assertFalse(session.disconnected)
+
+        session.emit(SessionEvent.Edge(Signaling.Event.HangupAck("someone-else")))
+        runCurrent()
+        assertFalse(session.disconnected)
+        for (raw in listOf(
+            """{"type":"hangup.ack"}""",
+            """{"type":"hangup.ack","commandId":null}""",
+            """{"type":"hangup.ack","commandId":123}""",
+            """{"type":"hangup.ack","commandId":true}""",
+            """{"type":"hangup.ack","commandId":[]}""",
+            """{"type":"hangup.ack","commandId":{}}""",
+        )) {
+            Signaling.decodeEvent(raw)?.let { session.emit(SessionEvent.Edge(it)) }
+            runCurrent()
+            assertFalse(raw, session.disconnected)
+        }
+        session.emit(SessionEvent.Edge(Signaling.Event.HangupAck(ids.single())))
+        runCurrent()
+        assertTrue(session.disconnected)
+        assertFalse(manager.hangingUp.value)
+        assertEquals(CallState.Ended("10000", "local_hangup"), manager.state.value)
+        assertEquals(1, hangupIds(session).size)
+        h.close()
+    }
+
+    @Test
+    fun `挂断没收到确认时重发一次 上限内本地收尾`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession().also { it.autoAckHangup = false }
+        val manager = h.manager(session) { invite() }
+        manager.startCall(pairing, "10000")
+        advanceUntilIdle()
+
+        manager.hangup()
+        runCurrent()
+        assertEquals(1, hangupIds(session).size)
+        advanceTimeBy(401)
+        runCurrent()
+        val ids = hangupIds(session)
+        assertEquals(2, ids.size)
+        assertEquals(ids[0], ids[1])
+        assertFalse(session.disconnected)
+
+        advanceTimeBy(1_200)
+        runCurrent()
+        assertTrue(session.disconnected)
+        assertEquals(CallState.Ended("10000", "local_hangup"), manager.state.value)
         h.close()
     }
 }
