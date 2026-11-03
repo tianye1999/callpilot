@@ -25,6 +25,8 @@ interface SocketAttachment {
   connectedAt: number;
   socketId?: string;
   replaced?: boolean;
+  /** Last D1 last_seen write attempt for this connection; survives hibernation wakes. */
+  lastSeenAttemptAt?: number;
 }
 
 interface LastSeenTiming {
@@ -173,7 +175,9 @@ export class EdgeRoom extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server, ["edge"]);
     this.logSocket("edge.connect", server, null, null);
     await this.ctx.storage.put<EdgePresence>("presence", { connected: true, lastSeenAt: now });
-    await this.updateLastSeen(edgeId, now);
+    // Record the connect-time write in the attachment too, so a wake right after
+    // connecting does not repeat the D1 request on its first heartbeat.
+    await this.updateLastSeen(edgeId, now, false, server);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -434,7 +438,7 @@ export class EdgeRoom extends DurableObject<Env> {
       try {
         await Promise.all([
           this.ctx.storage.put("presence", presence).finally(() => { storageMs = Date.now() - startedAt; }),
-          this.updateLastSeen(attachment.edgeId, now, true).then(timing => { lastSeen = timing; })
+          this.updateLastSeen(attachment.edgeId, now, true, ws).then(timing => { lastSeen = timing; })
         ]);
       } finally {
         console.log(JSON.stringify({ event: "edge.heartbeat", sid: attachment.socketId ?? null,
@@ -627,12 +631,24 @@ export class EdgeRoom extends DurableObject<Env> {
     else await this.ctx.storage.setAlarm(Date.now() + (interval ?? PRECONNECT_CLEANUP_INTERVAL_MS));
   }
 
-  private async updateLastSeen(edgeId: string, now: number, heartbeat = false): Promise<LastSeenTiming> {
+  private async updateLastSeen(edgeId: string, now: number, heartbeat = false, ws?: WebSocket): Promise<LastSeenTiming> {
     const cutoff = now - 5 * 60_000;
-    if (heartbeat && this.lastSeenAttemptAt !== undefined && this.lastSeenAttemptAt > cutoff) return { d1: false, d1_ms: null };
     const newWake = this.lastSeenAttemptAt === undefined;
+    // Hibernation re-instantiates this object on every wake, so an in-memory throttle
+    // alone wrote D1 on every 15 s heartbeat. The socket attachment survives wakes:
+    // read the last attempt from it (synchronous, no storage round-trip) and record
+    // each attempt back into it. A reconnect gets a fresh attachment and writes once.
+    const attachment = ws ? (ws.deserializeAttachment() as SocketAttachment | null) : null;
+    const lastAttempt = this.lastSeenAttemptAt ?? attachment?.lastSeenAttemptAt;
+    if (heartbeat && lastAttempt !== undefined && lastAttempt > cutoff) {
+      // Adopt the attachment's time so later heartbeats on this instance log new_wake:false:
+      // "fresh instance" and "D1 throttled" are different facts in the diagnostics.
+      this.lastSeenAttemptAt = lastAttempt;
+      return { d1: false, d1_ms: null };
+    }
     // Reserve before awaiting D1, including failures, to avoid overlapping retries.
     this.lastSeenAttemptAt = now;
+    if (ws && attachment) ws.serializeAttachment({ ...attachment, lastSeenAttemptAt: now } satisfies SocketAttachment);
     const startedAt = Date.now();
     let ok = false;
     let durationMs: number;

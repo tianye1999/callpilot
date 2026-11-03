@@ -24,18 +24,20 @@ describe("VoIP push security boundary", () => {
     const env = pushEnv({ key, privateKeyPEM: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
       alert: true, deleted: [], rows: [{ device_id: "device_abcdefghijkl",
         token_ciphertext: encrypted.ciphertext, token_nonce: encrypted.nonce, environment }] });
-    let count = 0;
+    // Assert outside the fetch stub: dispatch wraps sends in Promise.allSettled, so an
+    // expectation thrown inside the stub would be swallowed and the test would pass anyway.
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
     await dispatchAlertPushes(env, "edge_abcdefghijkl", "sms", async (url, init) => {
-      count++;
-      expect(String(url)).toBe(`https://${environment === "sandbox" ? "api.sandbox" : "api"}.push.apple.com/3/device/${token}`);
-      const headers = new Headers(init?.headers);
-      expect(headers.get("apns-push-type")).toBe("alert");
-      expect(headers.get("apns-topic")).toBe("ai.bondings.callpilot");
-      expect(headers.get("apns-priority")).toBe("10");
-      expect(JSON.parse(String(init?.body))).toEqual(buildAlertPayload("sms"));
+      requests.push({ url: String(url), init });
       return new Response(null, { status: 200 });
     });
-    expect(count).toBe(1);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe(`https://${environment === "sandbox" ? "api.sandbox" : "api"}.push.apple.com/3/device/${token}`);
+    const headers = new Headers(requests[0]?.init?.headers);
+    expect(headers.get("apns-push-type")).toBe("alert");
+    expect(headers.get("apns-topic")).toBe("ai.bondings.callpilot");
+    expect(headers.get("apns-priority")).toBe("10");
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual(buildAlertPayload("sms"));
   });
 
   it.each([[410, "Unregistered", true], [400, "BadDeviceToken", true],
@@ -45,12 +47,24 @@ describe("VoIP push security boundary", () => {
       const encrypted = await encryptPushToken("ef".repeat(32), key);
       const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
       const deleted: string[] = [];
+      const statements: Statement[] = [];
       const env = pushEnv({ key, privateKeyPEM: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
-        alert: true, deleted, rows: [{ device_id: "device_abcdefghijkl",
+        alert: true, deleted, statements, rows: [{ device_id: "device_abcdefghijkl",
           token_ciphertext: encrypted.ciphertext, token_nonce: encrypted.nonce, environment: "production" }] });
       await dispatchAlertPushes(env, "edge_abcdefghijkl", "missed_call",
         async () => Response.json({ reason }, { status }));
       expect(deleted).toEqual(removed ? ["device_abcdefghijkl"] : []);
+      expect(statements[0]?.sql).toContain("FROM device_alert_push_tokens");
+      expect(statements[0]?.sql).toContain("devices.edge_id = ?1 AND devices.revoked_at IS NULL");
+      expect(statements[0]?.values).toEqual(["edge_abcdefghijkl"]);
+      const deletes = statements.filter(statement => statement.sql.includes("DELETE FROM"));
+      // A negative case must show no DELETE was attempted at all, not merely none recorded.
+      expect(deletes).toHaveLength(removed ? 1 : 0);
+      if (removed) {
+        expect(deletes[0]?.sql).toContain("DELETE FROM device_alert_push_tokens");
+        expect(deletes[0]?.sql).toContain("AND token_ciphertext = ?2");
+        expect(deletes[0]?.values).toEqual(["device_abcdefghijkl", encrypted.ciphertext]);
+      }
     }
   );
 
@@ -125,6 +139,7 @@ describe("VoIP push security boundary", () => {
     const privateKeyPEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
     const requests: Array<{ url: string; init?: RequestInit }> = [];
     const deleted: string[] = [];
+    const statements: Statement[] = [];
     const env = pushEnv({
       key,
       privateKeyPEM,
@@ -134,7 +149,8 @@ describe("VoIP push security boundary", () => {
         token_nonce: encrypted.nonce,
         environment: "sandbox"
       }],
-      deleted
+      deleted,
+      statements
     });
 
     await dispatchInboundOfferPushes(env, {
@@ -160,6 +176,8 @@ describe("VoIP push security boundary", () => {
       expiresAtUnixMs: 1_800_000_000_000
     })));
     expect(deleted).toEqual([]);
+    expect(statements.map(statement => statement.sql).filter(sql => sql.includes("DELETE FROM"))).toEqual([]);
+    expect(statements[0]?.sql).toContain("FROM device_push_tokens");
   });
 
   it("forgets a token rejected by APNs without exposing it", async () => {
@@ -167,6 +185,7 @@ describe("VoIP push security boundary", () => {
     const encrypted = await encryptPushToken("ef".repeat(32), key);
     const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
     const deleted: string[] = [];
+    const statements: Statement[] = [];
     const env = pushEnv({
       key,
       privateKeyPEM: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
@@ -176,7 +195,8 @@ describe("VoIP push security boundary", () => {
         token_nonce: encrypted.nonce,
         environment: "production"
       }],
-      deleted
+      deleted,
+      statements
     });
 
     await dispatchInboundOfferPushes(env, {
@@ -187,6 +207,9 @@ describe("VoIP push security boundary", () => {
     }, async () => Response.json({ reason: "BadDeviceToken" }, { status: 400 }));
 
     expect(deleted).toEqual(["device_abcdefghijkl"]);
+    const deletes = statements.filter(statement => statement.sql.includes("DELETE FROM device_push_tokens"));
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]?.values[0]).toBe("device_abcdefghijkl");
   });
 
   it.each(["accepted", "rejected", "invalid", "thrown"] as const)(
@@ -317,11 +340,17 @@ function decodeBase64URL(value: string | undefined): string {
   return Buffer.from(value, "base64url").toString("utf8");
 }
 
+type Statement = { sql: string; values: unknown[] };
+
+// The DB stub only records what was asked of it. Assertions live in the tests, after
+// dispatch returns: production wraps sends in Promise.allSettled, so an expectation
+// thrown inside the stub would be swallowed and a negative case would pass for free.
 function pushEnv(input: {
   key: Uint8Array;
   privateKeyPEM: string;
   rows: Array<Record<string, string>>;
   deleted: string[];
+  statements?: Statement[];
   alert?: boolean;
 }): Env {
   const db = {
@@ -330,17 +359,11 @@ function pushEnv(input: {
         bind(...values: unknown[]) {
           return {
             async all() {
-              expect(sql).toContain(`FROM ${input.alert ? "device_alert_push_tokens" : "device_push_tokens"}`);
-              expect(sql).toContain("devices.edge_id = ?1 AND devices.revoked_at IS NULL");
-              expect(values).toEqual(["edge_abcdefghijkl"]);
+              input.statements?.push({ sql, values });
               return { results: input.rows };
             },
             async run() {
-              expect(sql).toContain(`DELETE FROM ${input.alert ? "device_alert_push_tokens" : "device_push_tokens"}`);
-              if (input.alert) {
-                expect(sql).toContain("AND token_ciphertext = ?2");
-                expect(values[1]).toBe(input.rows[0]?.token_ciphertext);
-              }
+              input.statements?.push({ sql, values });
               input.deleted.push(String(values[0]));
               return { meta: { changes: 1 } };
             }

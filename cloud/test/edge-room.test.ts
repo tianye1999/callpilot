@@ -24,6 +24,22 @@ function edgeSocket(connectedAt?: number, replaced?: boolean) {
   };
 }
 
+/** Open an Edge connection the way the Worker does (101 upgrade) and return the server-side socket. */
+async function acceptEdge(room: EdgeRoom, now: number) {
+  const client = edgeSocket(now);
+  const server = edgeSocket(now);
+  vi.stubGlobal("WebSocketPair", class {
+    0 = client;
+    1 = server;
+  });
+  const NativeResponse = Response;
+  vi.spyOn(globalThis, "Response").mockImplementationOnce(function () { return new NativeResponse(); });
+  await room.fetch(new Request("https://edge-room/connect", {
+    headers: { Upgrade: "websocket", "X-CallPilot-Edge-Id": edgeId }
+  }));
+  return server;
+}
+
 function edgeRoom(sockets: ReturnType<typeof edgeSocket>[], vars: Partial<Env> = {}) {
   vi.stubGlobal("WebSocketRequestResponsePair", class {});
   const run = vi.fn().mockResolvedValue({});
@@ -88,7 +104,8 @@ describe("EdgeRoom current connection", () => {
     expect(legacy.deserializeAttachment()).toMatchObject({ edgeId, replaced: true });
     expect(old.close).toHaveBeenCalledWith(4001, "Replaced by a newer connection");
     expect(legacy.close).toHaveBeenCalledWith(4001, "Replaced by a newer connection");
-    expect(latest.deserializeAttachment()).toEqual({ edgeId, connectedAt: now, socketId: expect.stringMatching(/^[0-9a-f]{8}$/) });
+    expect(latest.deserializeAttachment()).toEqual({ edgeId, connectedAt: now, socketId: expect.stringMatching(/^[0-9a-f]{8}$/),
+      lastSeenAttemptAt: now });
     expect(state.acceptWebSocket).toHaveBeenCalledWith(latest, ["edge"]);
     const records = log.mock.calls.map(([line]) => JSON.parse(line));
     expect(records).toContainEqual(expect.objectContaining({
@@ -291,12 +308,42 @@ describe("EdgeRoom connection diagnostics", () => {
     await room.webSocketMessage(socket as unknown as WebSocket, heartbeat);
     expect(records().at(-1)).toMatchObject({ event: "edge.heartbeat", d1: false, d1_ms: null, new_wake: false });
     expect(run).toHaveBeenCalledOnce();
+    // A hibernation wake builds a fresh instance on the same socket: the attachment
+    // remembers the attempt 15 s ago, so the wake must not write D1 again, and only
+    // the instance's first heartbeat counts as a new wake.
+    const woken = edgeRoom([socket]);
+    await woken.room.webSocketMessage(socket as unknown as WebSocket, heartbeat);
+    expect(records().at(-1)).toMatchObject({ event: "edge.heartbeat", d1: false, d1_ms: null, new_wake: true });
+    now += 15_000;
+    await woken.room.webSocketMessage(socket as unknown as WebSocket, heartbeat);
+    expect(records().at(-1)).toMatchObject({ event: "edge.heartbeat", d1: false, d1_ms: null, new_wake: false });
+    expect(woken.run).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledOnce();
+    // Past the 5 min window the next wake writes again.
+    now += 300_000;
     await edgeRoom([socket]).room.webSocketMessage(socket as unknown as WebSocket, heartbeat);
     expect(records().at(-1)).toMatchObject({ event: "edge.heartbeat", d1: true, new_wake: true });
   });
 });
 
 describe("EdgeRoom last-seen bookkeeping", () => {
+  it("connect-time write is remembered by the attachment so the first heartbeat after a wake is throttled", async () => {
+    let now = 2_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const sockets: ReturnType<typeof edgeSocket>[] = [];
+    const { room, run } = edgeRoom(sockets);
+    const accepted = (await acceptEdge(room, now)) as ReturnType<typeof edgeSocket>;
+    expect(run).toHaveBeenCalledOnce();
+    expect(accepted.deserializeAttachment()).toMatchObject({ lastSeenAttemptAt: now });
+    now += 15_000;
+    // Each edgeRoom() builds its own DB mock: assert on the resumed instance's mock.
+    const resumed = edgeRoom(sockets);
+    await resumed.room.webSocketMessage(accepted as unknown as WebSocket, heartbeat);
+    expect(resumed.run).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledOnce();
+  });
+
   it("still returns a 101 upgrade when D1 rejects the update", async () => {
     const { room, run } = edgeRoom([]);
     run.mockRejectedValue(new Error("D1 write limit"));

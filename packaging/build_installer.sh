@@ -186,11 +186,80 @@ info "building PyInstaller app"
 chmod +x "$APP_PATH/Contents/Resources/bin/$(basename "$FFMPEG_BIN")" 2>/dev/null || true
 "$PYTHON" "$ROOT/packaging/verify_bundle.py" "$APP_PATH"
 
+# Sign inside-out, one Mach-O at a time with retries: a single failed timestamp
+# request (flaky route to Apple's TSA, e.g. over VPN) aborts `codesign --deep`
+# for the whole bundle, and a crashed codesign leaves `.cstemp` files behind.
+sign_one() {
+    local target="$1" attempt
+    for attempt in 1 2 3 4 5; do
+        if codesign --force --options runtime --timestamp \
+             --entitlements "$ROOT/packaging/entitlements.plist" \
+             --sign "$CODESIGN_IDENTITY" "$target" 2>"$DMG_STAGE/sign.err"; then
+            return 0
+        fi
+        printf '[sign] retry %s/5 %s: %s\n' "$attempt" "${target#$APP_PATH/}" "$(tail -1 "$DMG_STAGE/sign.err")" >&2
+        sleep $((attempt * 2))
+    done
+    cat "$DMG_STAGE/sign.err" >&2
+    die "codesign failed 5 times: $target"
+}
+
+sign_inside_out() {
+    local macho_list="$DMG_STAGE/macho.txt" total
+    mkdir -p "$DMG_STAGE"
+    find "$APP_PATH" -name "*.cstemp" -delete
+    "$PYTHON" - "$APP_PATH" > "$macho_list" <<'MACHO'
+import os, sys
+magics = {b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xce'}
+app = sys.argv[1]
+main = os.path.join(app, "Contents", "MacOS")
+found = []
+for root, _dirs, files in os.walk(app):
+    for name in files:
+        path = os.path.join(root, name)
+        if os.path.islink(path) or os.path.dirname(path) == main:
+            continue
+        try:
+            with open(path, "rb") as handle:
+                if handle.read(4) in magics:
+                    found.append(path)
+        except OSError:
+            pass
+for path in sorted(found, key=lambda p: (-p.count(os.sep), p)):
+    print(path)
+MACHO
+    total=$(wc -l < "$macho_list" | tr -d ' ')
+    info "signing $total nested Mach-O files inside-out"
+    while IFS= read -r item; do sign_one "$item"; done < "$macho_list"
+    while IFS= read -r bundle; do sign_one "$bundle"; done < <(find "$APP_PATH/Contents" -type d \( -name "*.framework" -o -name "*.bundle" -o -name "*.app" -o -name "*.xpc" \) | awk '{print gsub("/","/")" "$0}' | sort -rn | cut -d" " -f2-)
+    local exe
+    for exe in "$APP_PATH/Contents/MacOS/"*; do [[ -L "$exe" ]] || sign_one "$exe"; done
+    sign_one "$APP_PATH"
+    codesign --verify --deep --strict --verbose=2 "$APP_PATH" || die "deep verify failed after inside-out signing"
+    info "inside-out signing complete"
+}
+
+# Apple's notary service intermittently drops the S3-accelerated upload and
+# occasionally times out while the request is actually Accepted: retry, and
+# judge by the recorded status rather than the exit code.
+notarize_with_retry() {
+    local target="$1" attempt
+    mkdir -p "$DMG_STAGE"
+    for attempt in 1 2 3; do
+        xcrun notarytool submit --no-s3-acceleration "$target" --keychain-profile "$NOTARY_PROFILE" --wait >"$DMG_STAGE/notary.out" 2>&1 || true
+        if grep -q "status: Accepted" "$DMG_STAGE/notary.out"; then
+            return 0
+        fi
+        printf '[notary] retry %s/3 for %s: %s\n' "$attempt" "$(basename "$target")" "$(grep -E 'Error|status:' "$DMG_STAGE/notary.out" | tail -1)" >&2
+        sleep $((attempt * 15))
+    done
+    cat "$DMG_STAGE/notary.out" >&2
+    die "notarization failed 3 times: $target"
+}
+
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
     info "codesigning with identity: $CODESIGN_IDENTITY"
-    codesign --force --deep --options runtime --timestamp \
-      --entitlements "$ROOT/packaging/entitlements.plist" \
-      --sign "$CODESIGN_IDENTITY" "$APP_PATH"
+    sign_inside_out
 else
     info "CODESIGN_IDENTITY not set; leaving app unsigned"
 fi
@@ -204,7 +273,7 @@ if [[ -n "${NOTARY_PROFILE:-}" ]]; then
     xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null || \
       die "keychain profile unavailable; configure with notarytool store-credentials locally"
     ditto -c -k --keepParent "$APP_PATH" "$DMG_STAGE/CallPilot-notary.zip"
-    xcrun notarytool submit "$DMG_STAGE/CallPilot-notary.zip" --keychain-profile "$NOTARY_PROFILE" --wait
+    notarize_with_retry "$DMG_STAGE/CallPilot-notary.zip"
     xcrun stapler staple "$APP_PATH"
     xcrun stapler validate "$APP_PATH"
 fi
@@ -222,7 +291,7 @@ fi
 
 if [[ -n "${NOTARY_PROFILE:-}" ]]; then
     info "submitting DMG for notarization with keychain profile: $NOTARY_PROFILE"
-    xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
+    notarize_with_retry "$DMG_PATH"
     xcrun stapler staple "$DMG_PATH"
 else
     info "NOTARY_PROFILE not set; skipping notarization"
