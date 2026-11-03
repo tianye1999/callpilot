@@ -67,7 +67,7 @@ VALID_SERVICE_NUMBERS: frozenset[str] = frozenset(_SERVICE_NUMBERS.values()) | {
 }
 
 _IMSI_RE = re.compile(r"\b(\d{14,15})\b")
-_CREG_RE = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?(\d+)(?:\s|$)")
+_CREG_RE = re.compile(r"\+CREG:[ \t]*(?:\d+[ \t]*,[ \t]*)?(\d+)(?=[ \t]*(?:,|\r?$))", re.MULTILINE)
 _EPS_RE = re.compile(r"\+C[EG]REG:\s*(?:\d+\s*,\s*)?(\d+)(?=\s*(?:,|$))", re.MULTILINE)
 
 # CREG <stat> 语义(3GPP TS 27.007):1=已注册(本地),5=已注册(漫游)。

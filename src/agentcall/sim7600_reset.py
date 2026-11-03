@@ -1,4 +1,10 @@
-"""Opt-in SIM7600 post-call reset; all waits and serial work stay off callers."""
+"""Opt-in SIM7600 recovery; all waits and serial work stay off callers.
+
+SIMCom SIM7500_SIM7600 AT Command Manual V3.00: CFUN section 3.2.1,
+CEER section 5.2.8, CEREG section 4.2.16. CIREG is not documented there;
+LTE registration is NOT proof of IMS registration or voice availability.
+https://www.waveshare.net/w/upload/a/af/SIM7500_SIM7600_Series_AT_Command_Manual_V3.00.pdf
+"""
 
 from __future__ import annotations
 
@@ -9,7 +15,9 @@ import threading
 import time
 from collections.abc import Callable
 
-from .modem import Sim7600Modem
+from . import config
+from .modem import Sim7600Modem, parse_clcc_lines, parse_csq
+from .sim_identity import parse_eps_registration
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +26,8 @@ class Sim7600CallReset:
     _TIMEOUT_SECONDS = 90.0
     _CONNECT_TIMEOUT_SECONDS = 30.0
     _POLL_SECONDS = 0.25
+    _NETWORK_WAIT_SECONDS = 30.0
+    _NETWORK_COOLDOWN_SECONDS = 600.0
 
     def __init__(
         self, modem: Sim7600Modem, audio_mode: str, pcm_port: str | None,
@@ -36,14 +46,67 @@ class Sim7600CallReset:
         self._finished = False
         self._started = 0.0
         self._deadline = 0.0
+        self._network_mode = False
+        self._last_network_reset = float("-inf")
+        self._pending_network: threading.Thread | None = None
         modem.on_post_call_reset(self.request)
+        modem._on_network_failure = self.request_network_recovery
 
-    def request(self) -> None:
+    def request_network_recovery(self) -> None:
+        if not config.get_bool("MODEM_NETWORK_RECOVERY"):
+            return
+        with self._lock:
+            if self._pending_network is not None and self._pending_network.is_alive():
+                return
+            if time.monotonic() - self._last_network_reset < self._NETWORK_COOLDOWN_SECONDS:
+                self._log_phase("network_cooldown")
+                return
+            self._pending_network = threading.Thread(
+                target=self._wait_network_idle, name="sim7600-network-idle", daemon=True,
+            )
+            self._pending_network.start()
+
+    def _wait_network_idle(self) -> None:
+        deadline = time.monotonic() + self._NETWORK_WAIT_SECONDS
+        self._log_phase("network_pending reason=no_service_available")
+        while not self._stop.is_set() and not self.modem._closed and time.monotonic() < deadline:
+            # A post-call reset already owns recovery; never stack two resets.
+            if self.modem.recovery_in_progress:
+                self._log_phase("network_skipped_existing_recovery")
+                return
+            runner = self.modem.run_idle_hardware
+            try:
+                if runner is not None and runner(self._claim_network_reset):
+                    return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SIM7600 network recovery claim failed: %s", type(exc).__name__)
+                return
+            self._stop.wait(self._POLL_SECONDS)
+        self._log_phase("network_idle_timeout")
+
+    def _claim_network_reset(self) -> None:
+        with self.modem._serial_lock:
+            if self._stop.is_set() or self.modem._closed or not self.modem.is_connected():
+                return
+            calls = self.modem._write_command("AT+CLCC")
+            if "OK" not in calls or parse_clcc_lines(calls) or self.modem.is_call_connected():
+                self._log_phase("network_skipped_line_busy")
+                return
+            self.modem._reset_in_progress = True
+            self.modem._maintenance_generation += 1
+            with self.modem._sim_refresh_lock:
+                self.modem._sim_refresh_generation += 1
+                self.modem._sim_refresh_requested_generation = None
+            self._last_network_reset = time.monotonic()
+        self.request(network=True)
+
+    def request(self, *, network: bool = False) -> None:
         # The modem has already claimed reset ownership atomically with hangup.
         with self._lock:
             if self._thread is not None and self._thread.is_alive() and not self._finished:
                 return
             self._started = time.monotonic()
+            self._network_mode = network
             self._deadline = self._started + self._TIMEOUT_SECONDS
             self._connector = None
             self._connect_result = None
@@ -62,8 +125,9 @@ class Sim7600CallReset:
 
     def _log_phase(self, phase: str) -> None:
         logger.info(
-            "SIM7600 #121 post-call reset phase=%s elapsed_seconds=%.3f",
-            phase, time.monotonic() - self._started,
+            "SIM7600 recovery mode=%s phase=%s elapsed_seconds=%.3f",
+            "network" if self._network_mode else "post_call", phase,
+            time.monotonic() - self._started if self._started else 0,
         )
 
     def _ports_ready(self) -> bool:
@@ -92,14 +156,20 @@ class Sim7600CallReset:
             if not self.modem._reconnect_complete.wait(timeout=self._remaining()):
                 raise TimeoutError("已有串口重连尚未退出")
             with self.modem.reset_transport_access():
+                if self._network_mode and self._soft_network_reset():
+                    success = True
+                    return
+                if self._stop.is_set() or self.modem._closed:
+                    raise RuntimeError("service stopping")
                 self._log_phase("reset_sent")
                 # Never use _send: its automatic retry could reboot the new device twice.
                 try:
-                    response = self.modem._write_command("AT+CRESET")
+                    command = "AT+CFUN=1,1" if self._network_mode else "AT+CRESET"
+                    response = self.modem._write_command(command)
                     if "OK" not in response:
-                        logger.warning("AT+CRESET 未返回 OK，仍等待重枚举确认，不重发")
+                        logger.warning("%s 未返回 OK，仍等待重枚举确认，不重发", command)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("AT+CRESET 响应不确定 (%s)，仍等待重枚举，不重发", type(exc).__name__)
+                    logger.warning("模组重启响应不确定 (%s)，仍等待重枚举，不重发", type(exc).__name__)
                 finally:
                     self._close_transport()
             self._wait_for_ports(False)
@@ -125,6 +195,30 @@ class Sim7600CallReset:
                 logger.error("SIM7600 重连 worker 仍未退出，保留串口占用；看门狗不得重复重连")
             else:
                 self._finish(success)
+
+    def _soft_network_reset(self) -> bool:
+        self._log_phase("network_cfun_off_on")
+        try:
+            for command in ("AT+CFUN=0", "AT+CFUN=1"):
+                if self._stop.is_set():
+                    raise RuntimeError("service stopping")
+                if "OK" not in self.modem._write_command(command):
+                    raise RuntimeError("CFUN rejected")
+            deadline = min(self._deadline, time.monotonic() + self._NETWORK_WAIT_SECONDS)
+            while not self._stop.is_set() and time.monotonic() < deadline:
+                if self._network_ready():
+                    self.modem._write_command("AT+CREG=1")
+                    self.modem._write_command("AT+CEREG=1")
+                    self.modem.refresh_sim_identity()
+                    self._log_phase("network_soft_ready")
+                    return True
+                self._stop.wait(min(self._POLL_SECONDS, max(0, deadline - time.monotonic())))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SIM7600 network soft recovery failed: %s", type(exc).__name__)
+        if self._stop.is_set():
+            raise RuntimeError("service stopping")
+        self._log_phase("network_escalate_cfun_reboot")
+        return False
 
     def _connect_bounded(self) -> bool:
         with self._lock:
@@ -177,6 +271,9 @@ class Sim7600CallReset:
         if "+CPIN: READY" not in self.modem._write_command("AT+CPIN?"):
             return False
         eps = self.modem._write_command("AT+CEREG?")
+        if self._network_mode:
+            csq, _level = parse_csq(self.modem._write_command("AT+CSQ"))
+            return parse_eps_registration(eps)[0] and csq is not None and csq != 99
         if self._registered(eps, "+CEREG:"):
             return True
         cs = self.modem._write_command("AT+CREG?")
@@ -200,6 +297,7 @@ class Sim7600CallReset:
             self._finished = True
         success = success and not self._stop.is_set() and not self.modem._closed
         if not success:
+            self._log_phase("failed")
             self._close_transport()
         self.modem._reset_in_progress = False
         if success:

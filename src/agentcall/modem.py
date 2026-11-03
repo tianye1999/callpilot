@@ -82,7 +82,7 @@ CLCC_PATTERN = re.compile(
 )
 QPCMV_PATTERN = re.compile(r"\+QPCMV:\s*(\d+),(\d+)")
 CMTI_PATTERN = re.compile(r'\+CMTI:\s*"([^"]*)",\s*(\d+)')
-CREG_PATTERN = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?\d+(?=\s|$)")
+CREG_PATTERN = re.compile(r"\+CREG:[ \t]*\d+(?:[ \t]*,[^\r\n]*)?[ \t]*(?=\r?\n)")
 # 等完整行到达再消费,避免分片中的状态或位置字段被提前截断。
 CEREG_PATTERN = re.compile(r"\+CEREG:[ \t]*\d+(?:[ \t]*,[^\r\n]*)?[ \t]*(?=\r?\n)")
 QSIMSTAT_PATTERN = re.compile(r"\+QSIMSTAT:\s*(\d+)\s*,\s*(\d+)")
@@ -326,6 +326,55 @@ class SerialModem:
         网络、``AT+CPIN?`` 查 SIM）。与拨号/短信等共用串口锁，可与监听并发安全调用。
         """
         return self._send(command)
+
+    def refresh_registration(self, timeout: float = 1.0) -> None:
+        """Bounded preflight, no retry/reconnect/SIM read; healthy calls skip this."""
+        deadline = time.monotonic() + timeout
+        if not self._serial_lock.acquire(timeout=max(0, deadline - time.monotonic())):
+            return
+        try:
+            if not self.is_connected() or self.recovery_in_progress:
+                return
+            for command in ("AT+CREG?", "AT+CEREG?"):
+                self._bounded_command(command, deadline)
+        except (serial.SerialException, OSError, RuntimeError):
+            logger.warning("拨号前注册刷新失败，保留原拨号保护")
+        finally:
+            self._serial_lock.release()
+
+    def _bounded_command(self, command: str, deadline: float) -> str:
+        """Caller owns serial lock; preserve IO limits and never retry mutations."""
+        ser = self._ser
+        remaining = deadline - time.monotonic()
+        if ser is None or not ser.is_open or remaining <= 0:
+            return ""
+        old_timeout, old_write_timeout = ser.timeout, ser.write_timeout
+        chunks: list[str] = []
+        try:
+            ser.write_timeout = remaining
+            ser.write((command + "\r").encode("ascii"))
+            while (remaining := deadline - time.monotonic()) > 0:
+                ser.timeout = min(0.05, remaining)
+                raw = ser.read(ser.in_waiting or 1)
+                if not raw:
+                    continue
+                chunks.append(raw.decode("ascii", errors="replace"))
+                if re.search(r"(?:^|\r?\n)(?:OK|ERROR|\+CME ERROR:[^\r\n]*)(?:\r?\n)", "".join(chunks)):
+                    break
+        finally:
+            ser.timeout, ser.write_timeout = old_timeout, old_write_timeout
+        response = "".join(chunks)
+        self._process_response_urcs(response)
+        return response
+
+    def _update_registration(self, response: str) -> None:
+        for line in response.splitlines(keepends=True):
+            if not line.endswith("\n"):
+                continue  # A timed-out query may end at <n>, before <stat> arrives.
+            if line.strip().startswith("+CREG:"):
+                self._set_sim_identity(with_registration(self._sim_identity, line))
+            elif line.strip().startswith("+CEREG:"):
+                self._set_sim_identity(with_eps_registration(self._sim_identity, line))
 
     # 非 owner 等待他方重连的上限。必须有界：调用方可能持有 _serial_lock，
     # 而重连方需要该锁，无限等待会死锁（WIL-111 真机实证）。
@@ -1155,6 +1204,7 @@ class SerialModem:
             finally:
                 ser.timeout, ser.write_timeout = old_timeout, old_write_timeout
             if response:
+                self._update_registration(response)
                 self._capture_cend(response, report)
                 self._scan_pcm_flow(response)
                 with report.lock:
@@ -1177,6 +1227,13 @@ class SerialModem:
                 logger.warning("处理释放报告中的短信通知失败: %s", exc)
             finally:
                 self._run_release_callback(report)
+                if (report is self._release_report and report.started
+                        and re.search(
+                            r'\+CEER:[ \t]*"?No service available"?[ \t]*(?:\r?\n|$)', response, re.IGNORECASE,
+                        )):
+                    callback = getattr(self, "_on_network_failure", None)
+                    if callback is not None:
+                        callback()
 
     @staticmethod
     def _run_release_callback(report: _ReleaseReport) -> None:
@@ -1543,6 +1600,7 @@ class SerialModem:
         ``_pcm_ready_event`` 保持初始置位，``pcm_ready`` 恒为 True）。"""
 
     def _process_response_urcs(self, text: str, report: _ReleaseReport | None = None) -> None:
+        self._update_registration(text)
         self._capture_cend(text, report)
         if "NO CARRIER" in text or CEND_PATTERN.search(text):
             self._invalidate_reserved_incoming()
@@ -1994,6 +2052,7 @@ class Sim7600Modem(SerialModem):
         self._reset_in_progress = False
         self._reset_access = threading.local()
         self._on_post_call_reset: Callable[[], None] | None = None
+        self._on_network_failure: Callable[[], None] | None = None
         self._answer_greeting_route_ready = False
 
     @property

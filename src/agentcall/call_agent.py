@@ -5823,7 +5823,9 @@ class CallAgentService:
         self._setup_callbacks()
         if isinstance(self.modem, SerialModem):
             self.modem.run_idle_hardware = self.run_idle_hardware
-        if isinstance(self.modem, Sim7600Modem) and config.get_bool("MODEM_RESET_AFTER_CALL"):
+        if isinstance(self.modem, Sim7600Modem) and (
+            config.get_bool("MODEM_RESET_AFTER_CALL") or config.get_bool("MODEM_NETWORK_RECOVERY")
+        ):
             self._sim7600_reset = Sim7600CallReset(
                 self.modem, audio_mode, pcm_port, self._set_modem_connected,
             )
@@ -6622,6 +6624,11 @@ class CallAgentService:
             return DialGuardFailure("MODEM_OFFLINE", "模组维护中，请稍后再拨")
         if isinstance(self.modem, BluetoothModem) and not self.modem.is_connected():
             return DialGuardFailure("MODEM_OFFLINE", "手机未连接，请检查手机蓝牙与 HFP 连接")
+        sim = getattr(self.modem, "sim_identity", None)
+        if (self.modem_connected and isinstance(self.modem, SerialModem)
+                and not isinstance(self.modem, BluetoothModem)
+                and sim is not None and sim.present and not sim.network_attached):
+            self.modem.refresh_registration()
         return check_dial_guard(
             modem_online=self.modem_connected and not self.modem.recovery_in_progress
             if self._sim7600_reset is not None else self.modem_connected,
