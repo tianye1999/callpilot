@@ -181,6 +181,8 @@ def test_direct_claim_starts_pcm_without_waiting_for_sdp_and_rejects_postcommit_
 
 
 @pytest.mark.parametrize("slow_connect", [False, True])
+@pytest.mark.parametrize("preparation_yields", [0, 20, 700])
+@pytest.mark.parametrize("preparation_stage", ["connect", "pcm", "both"])
 def test_direct_preview_forwards_caller_before_phone_audio_and_commit(rig, monkeypatch, slow_connect):
     from agentcall.inbound_direct import SwitchableInboundEndpoint
 
@@ -274,8 +276,9 @@ def test_direct_media_uses_claim_lease_after_ringing_window(rig, monkeypatch, op
 
 
 @pytest.mark.parametrize("accepted", [False, True])
-@pytest.mark.parametrize("setup_yields", [0, 20, 700])
-def test_cloud_claim_then_immediate_sdp_uses_same_fenced_request(rig, monkeypatch, accepted, setup_yields):
+@pytest.mark.parametrize("preparation_yields", [0, 20, 700])
+@pytest.mark.parametrize("preparation_stage", ["connect", "pcm", "both"])
+def test_cloud_claim_then_immediate_sdp_uses_same_fenced_request(rig, monkeypatch, accepted):
     monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
     session = rig.session
     rig.ring()
@@ -283,40 +286,6 @@ def test_cloud_claim_then_immediate_sdp_uses_same_fenced_request(rig, monkeypatc
     client = CloudEdgeClient("https://relay.example.test", rig.service, SimpleNamespace())
     replies = []
     requests = []
-    connected = asyncio.Event()
-    pcm_prepared = asyncio.Event()
-    threaded_call = session._threaded_modem_call
-
-    async def delayed_modem_call(operation, *args):
-        preparing = operation == rig.modem.prepare_reserved_voice
-        if preparing:
-            # 700 polls exhaust the old fake 30 s lease without 30 s of work.
-            for _ in range(setup_yields):
-                await asyncio.sleep(0)
-        result = await threaded_call(operation, *args)
-        if preparing:
-            pcm_prepared.set()
-        return result
-
-    monkeypatch.setattr(session, "_threaded_modem_call", delayed_modem_call)
-
-    async def connect():
-        for _ in range(setup_yields):
-            await asyncio.sleep(0)
-        connected.set()
-
-    rig.endpoint.connect = connect
-
-    async def sleep_after_setup(seconds):
-        # This tests immediate SDP fencing, not setup timeouts. Real executor
-        # work must finish before polling advances the synthetic media lease.
-        # The zero-second post-ATA settle must not wait for its own PCM stage.
-        if requests and seconds > 0:
-            await asyncio.wait_for(asyncio.gather(connected.wait(), pcm_prepared.wait()), 5)
-        await rig.clock.sleep(seconds)
-
-    session._phone_first_sleep = sleep_after_setup
-
     def tick():
         rig.clock.tick = lambda: None
         offer = session._takeover_request
@@ -396,16 +365,89 @@ class Clock:
     def __call__(self):
         return self.now
 
-    async def sleep(self, seconds):
-        self.sleep_sync(seconds)
-        await asyncio.sleep(0)
-
     def sleep_sync(self, seconds):
         self.now += seconds
         self.tick()
 
     def tick(self):
         pass
+
+
+class PhoneFirstClock:
+    """Keep executor/endpoint scheduling out of the synthetic media budget."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.pending = {"connect": 0, "modem": 0}
+        self.allow_pending_connect = False
+        self.advance_when = lambda: True
+        self.frozen_at = None
+
+    async def prepare(self, kind, operation, *args, yields=0):
+        self.pending[kind] += 1
+        try:
+            for _ in range(yields):
+                await asyncio.sleep(0)
+            return await operation(*args)
+        finally:
+            self.pending[kind] -= 1
+
+    async def sleep(self, seconds):
+        # Let newly created connect/answer tasks register before deciding to tick.
+        # Return to the polling loop even while frozen: preview and cancellation
+        # may themselves be prerequisites for preparation to finish.
+        await asyncio.sleep(0)
+        blocked = (self.pending["modem"]
+                   or (self.pending["connect"] and not self.allow_pending_connect)
+                   or not self.advance_when())
+        if seconds > 0 and blocked:
+            now = asyncio.get_running_loop().time()
+            if self.frozen_at is None:
+                self.frozen_at = now
+            if now - self.frozen_at >= 5:
+                pytest.fail("phone-first async preparation stalled for 5 real seconds")
+            self.clock.sleep_sync(0)
+        else:
+            # The zero-second post-ATA settle cannot wait for its own PCM stage.
+            if seconds > 0:
+                self.frozen_at = None
+            self.clock.sleep_sync(seconds)
+
+
+def test_polling_clock_freezes_preparation_but_keeps_zero_settle_and_ticks_live():
+    async def scenario():
+        clock = Clock()
+        polling = PhoneFirstClock(clock)
+        released = asyncio.Event()
+        ticks = []
+        clock.tick = lambda: ticks.append(clock.now)
+        worker = asyncio.create_task(polling.prepare("modem", released.wait))
+        try:
+            await polling.sleep(0.05)
+            await polling.sleep(0)  # The answer task must be able to reach PCM.
+            assert clock.now == 100 and ticks == [100, 100]
+            released.set()
+            await worker
+            await polling.sleep(0.05)
+            assert clock.now == 100.05 and not any(polling.pending.values())
+        finally:
+            released.set()
+            await worker
+
+    asyncio.run(scenario())
+
+
+def test_polling_clock_preparation_watchdog_uses_real_not_fake_time():
+    async def scenario():
+        clock = Clock()
+        polling = PhoneFirstClock(clock)
+        polling.advance_when = lambda: False
+        polling.frozen_at = asyncio.get_running_loop().time() - 5
+        with pytest.raises(pytest.fail.Exception, match="5 real seconds"):
+            await polling.sleep(0.05)
+        assert clock.now == 100
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("outcome", [
@@ -483,7 +525,17 @@ def test_reserved_ata_confirmation_is_bounded_and_urc_friendly(monkeypatch, outc
 
 
 @pytest.fixture
-def rig(monkeypatch):
+def preparation_yields():
+    return 0
+
+
+@pytest.fixture
+def preparation_stage():
+    return "both"
+
+
+@pytest.fixture
+def rig(monkeypatch, preparation_yields, preparation_stage):
     monkeypatch.delenv("INBOUND_PHONE_FIRST_MEDIA_SECONDS", raising=False)
     monkeypatch.setenv("INBOUND_PHONE_FIRST_ENABLED", "true")
     monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
@@ -513,9 +565,58 @@ def rig(monkeypatch):
     ))
     service = CallAgentService("unused", "unused", provider="openai", modem=modem)
     session = service.session
+    polling_clock = PhoneFirstClock(clock)
+    threaded_call = session._threaded_modem_call
+
+    async def delayed_modem_call(operation, *args):
+        return await polling_clock.prepare(
+            "modem", threaded_call, operation, *args,
+            yields=(preparation_yields if operation == modem.prepare_reserved_voice
+                    and preparation_stage in {"pcm", "both"} else 0),
+        )
+
+    monkeypatch.setattr(session, "_threaded_modem_call", delayed_modem_call)
+    handle_phone_first = session._handle_phone_first
+
+    async def handle_with_delayed_connect(*args):
+        factory = session._takeover_endpoint_factory
+        polling_clock.frozen_at = None
+
+        def track_endpoint(endpoint):
+            def track(operation):
+                async def tracked(*operation_args):
+                    return await polling_clock.prepare(
+                        "connect", operation, *operation_args,
+                        yields=preparation_yields if preparation_stage in {"connect", "both"} else 0,
+                    )
+                return tracked
+
+            for name in ("connect", "preconnect", "bind_winner"):
+                if hasattr(endpoint, name):
+                    patch.setattr(endpoint, name, track(getattr(endpoint, name)))
+            fallback_factory = getattr(endpoint, "_livekit_factory", None)
+            if fallback_factory is not None:
+                # Switchable.connect can finish before its background repair.
+                patch.setattr(endpoint, "_livekit_factory", lambda issued: track_endpoint(fallback_factory(issued)))
+            return endpoint
+
+        def tracked_factory(issued):
+            return track_endpoint(factory(issued))
+
+        # Tests may replace the factory after fixture setup. Track the actual
+        # endpoint, and restore its methods between calls on a reused rig.
+        with monkeypatch.context() as patch:
+            if factory is not None:
+                patch.setattr(session, "_takeover_endpoint_factory", tracked_factory)
+            try:
+                return await handle_phone_first(*args)
+            finally:
+                polling_clock.frozen_at = None
+
+    monkeypatch.setattr(session, "_handle_phone_first", handle_with_delayed_connect)
     session._phone_first_cloud_ready = lambda: True
     session._phone_first_clock = clock
-    session._phone_first_sleep = clock.sleep
+    session._phone_first_sleep = polling_clock.sleep
     monkeypatch.setattr(service, "_reject_if_credentials_missing", lambda: (False, None))
     notifications = []
     monkeypatch.setattr("agentcall.notification_events.publish_notification", lambda *args: notifications.append(args))
@@ -584,6 +685,7 @@ def rig(monkeypatch):
     monkeypatch.setattr(session, "_pump_mobile_media", pump)
     return SimpleNamespace(
         service=service, session=session, modem=modem, commands=commands, clock=clock,
+        polling_clock=polling_clock,
         ring=ring, claim=claim, issued=issued, endpoint=endpoint, bridge=bridge, notifications=notifications,
     )
 
@@ -734,6 +836,8 @@ def test_silent_prepare_is_fenced_and_never_touches_modem_before_claim(rig, monk
 
 
 @pytest.mark.parametrize("delay", [8, 12, 19])
+@pytest.mark.parametrize("preparation_yields", [0, 20, 700])
+@pytest.mark.parametrize("preparation_stage", ["connect", "pcm"])
 def test_delayed_media_ready_records_both_latencies(rig, monkeypatch, delay):
     def forbidden(*args, **kwargs):
         pytest.fail("ready mobile must not start AI")
@@ -810,6 +914,8 @@ def test_full_offer_queue_falls_back_to_ai(rig, monkeypatch, caplog):
 
 
 @pytest.mark.parametrize("provider,parallel", [("openai", False), ("openai", True), ("moss", True)])
+@pytest.mark.parametrize("preparation_yields", [0, 20, 700])
+@pytest.mark.parametrize("preparation_stage", ["connect", "pcm"])
 def test_mobile_answer_never_starts_ai_or_greeting(rig, monkeypatch, provider, parallel):
     monkeypatch.setenv("PARALLEL_AGENT_CONNECT", str(parallel))
     rig.session.provider = provider
@@ -1129,6 +1235,7 @@ def test_media_timeout_uses_live_config_and_warns_on_invalid_value(
             cancelled.append(True)
 
     if pending_connect:
+        rig.polling_clock.allow_pending_connect = True  # Deliberately stalled until lease expiry.
         rig.endpoint.connect = connect
     rig.endpoint.media_ready = False
     agent = FakeAgent()
@@ -1495,13 +1602,7 @@ def enable_early_answer(rig, monkeypatch):
 
     monkeypatch.setattr(rig.bridge, "start", start)
 
-    async def sleep(seconds):
-        # Only timeout tests advance time, after their prerequisites are ready.
-        # Worker scheduling must not consume a call's fake media budget.
-        rig.clock.sleep_sync(seconds if rig.advance_early_clock else 0)
-        await asyncio.sleep(0)
-
-    rig.session._phone_first_sleep = sleep
+    rig.polling_clock.advance_when = lambda: rig.advance_early_clock
     rig.ring()
 
     def claim_once():
@@ -2135,6 +2236,7 @@ def test_http_client_timing_is_same_winner_fenced_and_received_before_end(rig, m
 
 
 @pytest.mark.parametrize("outcome", ["lease", "repair", "repair_failed", "hangup"])
+@pytest.mark.parametrize("preparation_yields", [0, 20, 700])
 def test_no_phone_audio_starts_ai_at_eight_seconds_and_preserves_same_claim_pcm(rig, monkeypatch, outcome):
     from agentcall.inbound_direct import SwitchableInboundEndpoint
 
@@ -2219,11 +2321,7 @@ def test_no_phone_audio_starts_ai_at_eight_seconds_and_preserves_same_claim_pcm(
 
     monkeypatch.setattr(session, "_pump_mobile_media", pump)
 
-    async def sleep(seconds):
-        rig.clock.sleep_sync(seconds if rig.bridge.started else 0)
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr(session, "_phone_first_sleep", sleep)
+    rig.polling_clock.advance_when = lambda: rig.bridge.started
     rig.ring()
 
     def claim():
@@ -2292,16 +2390,15 @@ def test_v2_connected_silence_is_state_bounded_and_ai_reuses_pcm(rig, monkeypatc
 
     rig.session._takeover_endpoint_factory = factory
 
-    async def sleep(seconds):
-        rig.clock.sleep_sync(seconds if rig.bridge.started else 0)
-        await asyncio.sleep(0)
+    rig.polling_clock.advance_when = lambda: rig.bridge.started
+    # This test exercises stalled SDP/ICE/LiveKit, not connection preparation.
+    rig.polling_clock.allow_pending_connect = True
 
     async def loop(*_args):
         assert rig.session.takeover_state is TakeoverState.AI_ACTIVE
         assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
         return rig.bridge
 
-    monkeypatch.setattr(rig.session, "_phone_first_sleep", sleep)
     monkeypatch.setattr(rig.session, "_run_agent_loop", loop)
     rig.ring()
 
@@ -2348,9 +2445,7 @@ def test_deferred_control_hangup_is_fenced_idempotent_and_never_starts_ai(rig, m
     rig.session._takeover_endpoint_factory = lambda issued: SwitchableInboundEndpoint(
         issued.direct, direct_factory=lambda *_args, **_kwargs: pytest.fail("Unexpected peer without SDP"))
 
-    async def sleep(seconds):
-        rig.clock.sleep_sync(0)
-        await asyncio.sleep(0)
+    rig.polling_clock.advance_when = lambda: False
 
     def end():
         if after_pcm and not rig.bridge.started:
@@ -2377,7 +2472,6 @@ def test_deferred_control_hangup_is_fenced_idempotent_and_never_starts_ai(rig, m
         if not after_pcm:
             end()
 
-    monkeypatch.setattr(rig.session, "_phone_first_sleep", sleep)
     rig.ring()
     rig.clock.tick = claim
     asyncio.run(rig.session._handle_call())
