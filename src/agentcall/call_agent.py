@@ -178,17 +178,18 @@ DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS = 3.0
 DTMF_RECENT_SEND_WINDOW_SECONDS = 5.0
 _EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
 _PARALLEL_PLAYOUT_STALL_SECONDS = 1.0
-_INBOUND_TAKEOVER_HOLD_INSTRUCTIONS = {
-    "zh": "正在尝试联系机主接听，但尚未接通。结合上下文简短、自然地告知来电者正在等待机主，"
-          "不要承诺一定能够转接，也不要展开新的话题。",
-    "en": "The owner has been invited to take this call but has not answered yet. Briefly and naturally "
-          "let the caller know they are waiting for the owner, without promising a connection or starting a new topic.",
+# 转接等待语是固定话术：直接送 TTS（不经 LLM），一字不差、比模型生成快一次往返。
+# 措辞只说「正在联系」，不承诺一定能接通。
+_INBOUND_TAKEOVER_HOLD_TEXT = {
+    "zh": "好的，您稍等一下，我这边正在联系机主。",
+    "en": "Okay, please hold on a moment — I'm reaching them now.",
 }
 _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
+_REASON_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _PHONE_FIRST_MEDIA_TIMEOUT_SECONDS = 20.0
 _EARLY_ANSWER_CONNECTED_WAIT_SECONDS = 8.0
 _INBOUND_TRIAGE_CLARIFY_TEXT = {
-    "zh": "请简单确认一下，您是有具体事情找本人，还是一般业务介绍？",
+    "zh": "请简单确认一下，您是有具体事情找机主，还是一般业务介绍？",
     "en": "Just to confirm — do you have a specific matter for them personally, or is this a general offer?",
 }
 _INBOUND_TRIAGE_REJECT_TEXT = {
@@ -434,6 +435,11 @@ class CallSession:
         self._takeover_hold_generation: int | None = None
         self._takeover_hold_done = False
         self._takeover_hold_audio_at: float | None = None
+        # Hold-line playout accounting: bytes queued for the hold vs bytes the bridge
+        # confirmed written. Generation time is not playout: a cached sentence arrives
+        # whole and the bridge plays it out over seconds.
+        self._takeover_hold_queued = 0
+        self._takeover_hold_played = 0
         self._takeover_attempted = False
         self._takeover_ai_fallback = False
         self._takeover_resume_pending = False
@@ -947,6 +953,11 @@ class CallSession:
             instructions if instructions is not None else self._build_agent_instructions(direction)
         )
         agent.set_session_instructions(session_instructions)
+        preload = getattr(agent, "preload_phrases", None)
+        if callable(preload) and direction == "inbound":
+            lang = agent_language()
+            preload([_INBOUND_TAKEOVER_HOLD_TEXT[lang], _INBOUND_TRIAGE_CLARIFY_TEXT[lang],
+                     _INBOUND_TRIAGE_REJECT_TEXT[lang]])
         if direction == "outbound":
             configure_turn = getattr(agent, "configure_turn", None)
             if callable(configure_turn):
@@ -1493,7 +1504,9 @@ class CallSession:
                 self._agent_output_rate = agent.output_rate
                 if self.hub is not None:
                     self.hub.set_audio_rate(self._agent_output_rate)
-            if pcm_agent and self._takeover_hold_generation == generation and not self._takeover_hold_done:
+            hold_chunk = (bool(pcm_agent) and self._takeover_hold_generation == generation
+                          and not self._takeover_hold_done)
+            if hold_chunk:
                 self._takeover_hold_audio_at = time.monotonic()
             # 单轮长度闸门必须在护窗**之前**结算（2026-08-05 Codex 评审 P1）。
             # 闸门量的是「模型生成了多久」，护窗丢的是「要不要送出去」——两件事。
@@ -1601,6 +1614,9 @@ class CallSession:
                             )
                 on_written = getattr(pcm_agent, "on_written", None)
                 on_played = getattr(pcm_agent, "on_played", None)
+                if hold_chunk:
+                    on_played = self._hold_playout_observer(on_played)
+                    self._takeover_hold_queued += len(pcm_8k)
                 if first_for_turn and self._last_voiced_at > 0 and record is not None:
                     on_written = self._response_playout_observer(record, self._last_voiced_at, on_written)
                 if record_at_playout or on_written is not None or on_played is not None:
@@ -1613,6 +1629,15 @@ class CallSession:
                         self._outgoing_audio.put(pcm_8k)
 
         return on_agent_audio
+
+    def _hold_playout_observer(
+        self, previous: Callable[[int], None] | None,
+    ) -> Callable[[int], None]:
+        def played(count: int) -> None:
+            self._takeover_hold_played += count
+            if previous is not None:
+                previous(count)
+        return played
 
     @staticmethod
     def _response_playout_observer(
@@ -1693,12 +1718,18 @@ class CallSession:
             return
         try:
             remaining = max(0.0, (self._takeover_deadline or time.monotonic()) - time.monotonic())
-            await asyncio.wait_for(agent.say(_INBOUND_TAKEOVER_HOLD_INSTRUCTIONS[agent_language()]), timeout=remaining)
-            speech_deadline = min(self._takeover_deadline or time.monotonic(), time.monotonic() + 4.0)
+            await asyncio.wait_for(agent.say_verbatim(_INBOUND_TAKEOVER_HOLD_TEXT[agent_language()]), timeout=remaining)
+            speech_deadline = min(self._takeover_deadline or time.monotonic(), time.monotonic() + 6.0)
+            # Bridges with an output observer confirm written bytes: wait until the hold line
+            # has actually been played, not merely generated. Others keep the quiet-gap rule.
+            confirms_playout = getattr(bridge, "_output_observer", None) is not None
             while self._agent_generation_current(generation) and time.monotonic() < speech_deadline:
                 self._drain_agent_audio(bridge)
                 last_audio = self._takeover_hold_audio_at
-                if last_audio is not None and time.monotonic() - last_audio >= 0.35:
+                quiet = last_audio is not None and time.monotonic() - last_audio >= 0.35
+                played_out = (not confirms_playout
+                              or self._takeover_hold_played >= self._takeover_hold_queued > 0)
+                if quiet and played_out:
                     break
                 await asyncio.sleep(0.01)
         except Exception as exc:  # noqa: BLE001
@@ -2570,7 +2601,10 @@ class CallSession:
             await self._pump_mobile_media(endpoint, bridge, record, claimed)
             return "completed"
         except Exception as exc:
-            logger.warning("Phone-first media failed: %s", type(exc).__name__)
+            # Our own RuntimeErrors carry fixed snake_case reason codes (no call content):
+            # log them so an intermittent CI failure says which branch it took.
+            reason = str(exc) if isinstance(exc, RuntimeError) and _REASON_CODE.fullmatch(str(exc)) else ""
+            logger.warning("Phone-first media failed: %s%s", type(exc).__name__, f" ({reason})" if reason else "")
             abandoned = True
             if fastpath_v2 and str(exc) == "owner_cancelled":
                 coordinator.end_call("owner_hangup")
@@ -3454,7 +3488,7 @@ class CallSession:
                     continue
                 self._triage_clarification_spoken = True
                 try:
-                    await agent.say(_INBOUND_TRIAGE_CLARIFY_TEXT[agent_language()])
+                    await agent.say_verbatim(_INBOUND_TRIAGE_CLARIFY_TEXT[agent_language()])
                     self._drain_agent_audio(bridge)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -3501,7 +3535,7 @@ class CallSession:
                 # free-form policy. Fence immediately after its audio is flushed.
                 self._clear_outgoing_audio()
                 try:
-                    await agent.say(_INBOUND_TRIAGE_REJECT_TEXT[agent_language()])
+                    await agent.say_verbatim(_INBOUND_TRIAGE_REJECT_TEXT[agent_language()])
                     self._drain_agent_audio(bridge)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -4923,6 +4957,7 @@ class CallSession:
             self._takeover_hold_generation = None
             self._takeover_hold_done = False
             self._takeover_hold_audio_at = None
+            self._takeover_hold_queued = self._takeover_hold_played = 0
             self._takeover_attempted = False
             self._takeover_ai_fallback = False
             self._takeover_resume_pending = False
@@ -5222,6 +5257,7 @@ class CallSession:
                 self._takeover_hold_generation = generation
                 self._takeover_hold_done = False
                 self._takeover_hold_audio_at = None
+                self._takeover_hold_queued = self._takeover_hold_played = 0
                 try:
                     self._takeover_offer_queue.put_nowait(request)
                 except Full:

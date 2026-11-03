@@ -181,6 +181,13 @@ class VoiceAgent(ABC):
     async def say(self, instructions: str) -> None:
         """让 Agent 主动说一段话；不支持的实现可以忽略。"""
 
+    async def say_verbatim(self, text: str) -> None:
+        """一字不差地说一句固定话术（稍候、拒绝、确认等）。
+
+        能直接合成的实现（三段式）不经 LLM；实时语音模型只能退回「照念」指令。
+        """
+        await self.say(f"请一字不差地只说下面这句话，不要增减任何字（say exactly this and nothing else）：{text}")
+
     async def external_tool_result(
         self,
         name: str,

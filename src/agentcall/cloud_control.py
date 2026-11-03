@@ -185,6 +185,9 @@ class CloudControlApi:
         return value
 
 
+_HEALTHY_CONNECTION_SECONDS = 60.0
+_MAX_RECONNECT_DELAY_SECONDS = 10.0
+
 class CloudEdgeClient:
     """Maintain one outbound WSS and dispatch bounded session commands."""
 
@@ -562,8 +565,15 @@ class CloudEdgeClient:
                     self._last_disconnect_at = now
                 if self._reconnect_started_at is None:
                     self._reconnect_started_at = now
+                # A connection that stayed up for a while was healthy: the drop is a fresh
+                # incident, so retry fast instead of inheriting the backoff from earlier
+                # failures (11-03: 37 drops in a day kept the delay pinned near its cap).
+                if (self._connection_started_at is not None
+                        and now - self._connection_started_at >= _HEALTHY_CONNECTION_SECONDS):
+                    delay = 1.0
                 self._stop_event.wait(delay + random.random() * 0.25 * delay)
-                delay = min(delay * 2.0, 30.0)
+                # Inbound offers cannot reach the phone while disconnected: keep the cap short.
+                delay = min(delay * 2.0, _MAX_RECONNECT_DELAY_SECONDS)
 
     def _run_connection(self, credential: EdgeCredential) -> None:
         connect = self._connect

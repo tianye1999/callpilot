@@ -1086,3 +1086,46 @@ def test_invalid_http_rtp_rejected_and_not_allowed_on_claim():
         _parse_cloud_command(json.dumps(_takeover_claim(type="inbound.media.end", clientRtpStats={})))
     with pytest.raises(ValueError):
         _parse_cloud_command(json.dumps(_takeover_claim(clientRtpStats={})))
+
+
+def test_cloud_reconnect_resets_backoff_after_a_healthy_connection_and_caps_it(monkeypatch):
+    credential = EdgeCredential("edge_abcdefghijkl", "edge_abcdefghijkl." + "s" * 40)
+    clock = [100.0]
+    attempts = [0]
+    waits = []
+    monkeypatch.setattr("agentcall.cloud_control.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("agentcall.cloud_control.random.random", lambda: 0.0)
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def send(self, _message):
+            pass
+
+        def recv(self, *, timeout):
+            # The 6th attempt connects and stays up for 2 minutes before dropping.
+            clock[0] += 120.0
+            raise ConnectionClosedError(None, None)
+
+    def connect(*_args, **_kwargs):
+        attempts[0] += 1
+        if attempts[0] == 7:
+            client._stop_event.set()
+        if attempts[0] < 6:
+            raise OSError("network down")
+        return Socket()
+
+    def wait(delay):
+        waits.append(delay)
+        clock[0] += delay
+
+    client = CloudEdgeClient("https://relay.example.test", _Service(), _Store(credential), connect=connect)
+    monkeypatch.setattr(client._stop_event, "wait", wait)
+    client._run()
+    # Failures double up to the 10 s cap; a drop after a healthy connection retries after 1 s.
+    assert waits[:5] == [1.0, 2.0, 4.0, 8.0, 10.0]
+    assert waits[5] == 1.0

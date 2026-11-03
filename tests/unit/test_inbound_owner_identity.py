@@ -24,7 +24,7 @@ def test_inbound_owner_name_never_enters_spoken_prompts(monkeypatch, lang, pendi
     spoken = [instructions, opening, module_opening,
               call_agent._INBOUND_TRIAGE_CLARIFY_TEXT[lang],
               call_agent._INBOUND_TRIAGE_REJECT_TEXT[lang],
-              call_agent._INBOUND_TAKEOVER_HOLD_INSTRUCTIONS[lang],
+              call_agent._INBOUND_TAKEOVER_HOLD_TEXT[lang],
               config.get_spec("LOCAL_INBOUND_GREETING").default,
               config.get_spec("MODEM_ANSWER_GREETING").default]
     assert all("李明" not in text for text in spoken)

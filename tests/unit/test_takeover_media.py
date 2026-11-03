@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from fakes import FakeAgent, FakeAudioBridge, FakeModem
 
+from agentcall import call_agent
 from agentcall.call_agent import CallAgentService
 from agentcall.remote_dialer import IssuedLiveKitSession, RemoteDialerInvite
 from agentcall.takeover_coordinator import (
@@ -205,7 +206,8 @@ def test_takeover_hold_is_one_scenario_instruction_before_agent_gate(monkeypatch
     asyncio.run(session._speak_takeover_hold_if_needed(agent, bridge, 7))
 
     assert len(agent.said) == 1
-    assert "尚未接通" in agent.said[0]
+    # Fixed phrase, spoken verbatim (no LLM rewrite): the realtime fallback carries the exact text.
+    assert call_agent._INBOUND_TAKEOVER_HOLD_TEXT["zh"] in agent.said[0]
     assert bridge.downlink
     assert session._agent_effect_allowed(7) is False
 

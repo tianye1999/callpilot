@@ -92,6 +92,10 @@ class SpeechPipeline(Protocol):
 @dataclass
 class _SayRequest:
     instructions: str
+    # True：instructions 就是要说的原话，直接送 TTS，不经 LLM。
+    verbatim: bool = False
+    # 固定句在入队时就绑定的轮次：之后的取消（新话、更新的固定句）能让它失效。
+    turn: "_Turn | None" = None
 
 
 @dataclass(eq=False)
@@ -415,6 +419,7 @@ class LocalPipelineAgent(VoiceAgent):
         # 外呼 IVR 循环播报没有句末：N 秒后把已识别的文本交给模型（0 = 关）。
         self._max_turn_samples = 0
         self._turn_speech_samples = 0
+        self._fixed_phrases: list[str] = []
         # 强制切轮后欠一个轮末：VAD 线程独占。对方停下且没有新内容时投递一个空的轮末标记，
         # 走 ASR 队列（FIFO），不可能抢在更新的识别结果前面。
         self._followup_owed = False
@@ -694,7 +699,7 @@ class LocalPipelineAgent(VoiceAgent):
                 pipeline = self._pipeline_factory()
             if self._segmented_asr and not callable(getattr(pipeline, "is_speech_detected", None)):
                 raise ValueError("分段识别管线需要 is_speech_detected()")
-            for phrase in _cache_phrases().split("|"):
+            for phrase in [*_cache_phrases().split("|"), *self._fixed_phrases]:
                 if phrase.strip() and phrase not in self._tts_cache:
                     self._tts_cache[phrase] = normalize_peak(pipeline.synthesize(phrase), self._peak)
             return pipeline
@@ -777,6 +782,22 @@ class LocalPipelineAgent(VoiceAgent):
                     self._emit_output_complete()
                     return
             self._brain_queue.put(_SayRequest(instructions))
+
+    async def say_verbatim(self, text: str) -> None:
+        if self._running:
+            # 固定话术由编排层下达，替代正在生成或排队合成的回复：先取消（流式 LLM 随之中止、
+            # 待合成分句清空、已合成的旧音频在输出前被拦下），再由 brain 按序说原话，
+            # 保证不会出现「固定句插在上一句中间」或「先说固定句再说旧回复」。
+            self._cancel_speculation()
+            with self._turn_lock:
+                # 取消旧轮与登记新固定句在同一把锁里：中间插不进别的轮次。
+                self._cancel_turn()
+                turn = self._new_turn(None)
+            self._brain_queue.put(_SayRequest(text, verbatim=True, turn=turn))
+
+    def preload_phrases(self, phrases: list[str]) -> None:
+        """会话开始前登记固定话术：模型加载时一并预合成，说的时候零合成延迟。"""
+        self._fixed_phrases = [p for p in (speech_text(x) for x in phrases) if p]
 
     async def external_tool_result(
         self,
@@ -959,7 +980,10 @@ class LocalPipelineAgent(VoiceAgent):
                 continue
             try:
                 if isinstance(item, _SayRequest):
-                    self._handle_say(item.instructions)
+                    if item.verbatim:
+                        self._handle_say_verbatim(item.instructions, item.turn)
+                    else:
+                        self._handle_say(item.instructions)
                     continue
                 # utterance 合并：LLM 忙期间堆积的语音段拼成同一轮。
                 utterances = [item]
@@ -1015,6 +1039,27 @@ class LocalPipelineAgent(VoiceAgent):
         with self._messages_lock:
             self._messages.append({"role": "user", "content": text})
         self._respond(turn)
+
+    def _handle_say_verbatim(self, text: str, turn: _Turn | None = None) -> None:
+        """固定话术：原话进历史、直接合成（命中缓存则零合成），不调用 LLM。"""
+        spoken = text.strip()
+        if not spoken or not self._running:
+            return
+        if turn is None:
+            turn = self._new_turn(None)
+        if turn.cancelled.is_set():
+            # 排队期间被新话或更新的固定句取代：不说、不进历史，也不改任何回复状态。
+            return
+        # 这是一次真正生效的回复决定：此前强制轮压下的那句不再补答。
+        self._withheld_reply = False
+        batch = _SpeechBatch(turn)
+        with self._messages_lock:
+            self._messages.append({"role": "assistant", "content": spoken})
+        self._emit_transcript("agent", spoken)
+        logger.info("[下行·Agent·固定] %s", spoken)
+        self._speak(spoken, batch)
+        if self._on_output_complete is not None:
+            self._emit_output_complete()
 
     def _handle_say(self, instructions: str) -> None:
         # say 语义（开场白/收尾道别/复读提示）：临时把指令并进本轮请求，
@@ -1155,8 +1200,17 @@ class LocalPipelineAgent(VoiceAgent):
     def _run_tool_calls(self, tool_calls: list[dict], turn: _Turn) -> bool:
         """执行工具并回填结果；返回本轮是否应停止生成后续回复。"""
         wait_for_remote = False
-        for call in tool_calls:
+        for index, call in enumerate(tool_calls):
             if turn.cancelled.is_set() or not self._running:
+                # 历史里已经写了整批 tool_calls：没执行的也要有结果，否则后续请求会被供应方拒绝。
+                with self._messages_lock:
+                    for skipped in tool_calls[index:]:
+                        self._messages.append({
+                            "role": "tool",
+                            "tool_call_id": str(skipped.get("id") or ""),
+                            "content": json.dumps({"success": False, "code": "CANCELLED",
+                                                   "message": "本轮已被取消，未执行"}, ensure_ascii=False),
+                        })
                 return True
             function = call.get("function") or {}
             name = str(function.get("name") or "")

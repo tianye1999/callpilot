@@ -68,7 +68,7 @@ def test_reject_needs_two_turns_then_uses_fixed_line_and_bounded_timer() -> None
         )
     )
     assert asyncio.run(session._consume_triage_results(agent, bridge, 4)) is None
-    assert "具体事情找本人" in agent.said[-1]
+    assert "具体事情找机主" in agent.said[-1]
     assert session._triage_terminal is False
 
     session._triage_results.put_nowait(
