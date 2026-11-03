@@ -1,12 +1,28 @@
 type ClaimStage = "auth" | "offer_read" | "cas" | "edge_token" | "edge_send" | "phone_token" | "audit"
   | "permission" | "prepare_read" | "claim_finalize" | "cleanup_queue" | "claim_check" | "candidates"
-  | "presence" | "prepare_batch" | "turn" | "sdp_relay" | "edge_reserve";
+  | "presence" | "prepare_batch" | "turn" | "sdp_relay" | "edge_reserve"
+  | "idempotency" | "rate_read" | "call_insert" | "call_read" | "call_finalize" | "edge_wait" | "do_total"
+  | "request_parse" | "answer_parse" | "call_checks" | "call_finalize_read";
 
 export class ClaimTiming {
   private readonly started = performance.now();
   private readonly stages: Partial<Record<ClaimStage | "total", number>> = {};
   private readonly starts: Partial<Record<`${"edge_reserve" | "turn" | "sdp_relay"}_start_ms`, number>> = {};
   private claimId?: string;
+  private callId?: string;
+
+  constructor(private readonly event?: string, private readonly requestId?: string) {}
+
+  tagCall(callId: string): void {
+    if (/^call_[A-Za-z0-9_-]{12,80}$/.test(callId)) this.callId = callId;
+  }
+
+  absorbRelay(response: Response): void {
+    for (const stage of ["edge_wait", "do_total"] as const) {
+      const value = Number(response.headers.get(`X-CallPilot-${stage}`));
+      if (response.headers.has(`X-CallPilot-${stage}`) && Number.isFinite(value) && value >= 0) this.stages[stage] = value;
+    }
+  }
 
   tagClaim(claimId: string): void {
     if (/^claim_[A-Za-z0-9_-]{12,80}$/.test(claimId)) this.claimId = claimId;
@@ -28,7 +44,9 @@ export class ClaimTiming {
     this.stages.total = this.elapsed(this.started);
     response.headers.set("Server-Timing", Object.entries(this.stages)
       .map(([stage, duration]) => `${stage};dur=${duration.toFixed(1)}`).join(", "));
-    console.log(JSON.stringify({ ...this.stages, ...this.starts, ...(this.claimId ? { claimId: this.claimId } : {}) }));
+    console.log(JSON.stringify({ ...(this.event ? { event: this.event, requestId: this.requestId, status: response.status } : {}),
+      ...this.stages, ...this.starts, ...(this.claimId ? { claimId: this.claimId } : {}),
+      ...(this.callId ? { callId: this.callId } : {}) }));
     return response;
   }
 

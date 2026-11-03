@@ -347,15 +347,24 @@ class WebRtcRemoteMediaEndpoint:
             self._track_task = asyncio.create_task(self._pump_phone_audio(track))
 
         try:
+            stage_started = time.monotonic()
             await pc.setRemoteDescription(stack.rtc.RTCSessionDescription(**self._offer))
+            logger.info("Direct answer peer=%s stage=remote_description duration_ms=%.1f",
+                        id(pc), (time.monotonic() - stage_started) * 1000)
             await self._check_current(pc)
             self._local_track = _modem_track(self._modem_audio, self._downlink_gain)
             pc.addTrack(self._local_track)
             stack.ice.configure_peer(pc)
+            stage_started = time.monotonic()
             answer = await pc.createAnswer()
+            logger.info("Direct answer peer=%s stage=create_answer duration_ms=%.1f",
+                        id(pc), (time.monotonic() - stage_started) * 1000)
             await self._check_current(pc)
             # aiortc gathers local candidates here, but does not wait for peer ICE.
+            stage_started = time.monotonic()
             await pc.setLocalDescription(answer)
+            logger.info("Direct answer peer=%s stage=local_description_gather duration_ms=%.1f",
+                        id(pc), (time.monotonic() - stage_started) * 1000)
             await self._check_current(pc)
             self._answer = {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp}
             if callable(getattr(pc, "getTransceivers", None)):

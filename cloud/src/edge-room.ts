@@ -724,6 +724,7 @@ export class EdgeRoom extends DurableObject<Env> {
 
   /** A8: send one outbound direct command and wait for its correlated call.answer. */
   private async relayCallMedia(request: Request): Promise<Response> {
+    const started = performance.now();
     const text = await request.text();
     if (serializedByteLength(text) > CONTENT_WIRE_LIMIT_BYTES) return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
     let parsed: unknown;
@@ -737,7 +738,17 @@ export class EdgeRoom extends DurableObject<Env> {
     if (!socket) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
     const { commandId, callId, type } = command.data;
     const maxMs = type === "session.start" ? OUTBOUND_DIRECT_START_MAX_MS : OUTBOUND_FALLBACK_MAX_MS;
-    return new Promise<Response>(resolve => {
+    const sentAt = performance.now();
+    return new Promise<Response>(finish => {
+      const resolve = (response: Response) => {
+        const total = Math.max(0, performance.now() - started);
+        const wait = Math.max(0, performance.now() - sentAt);
+        response.headers.set("X-CallPilot-edge_wait", wait.toFixed(1));
+        response.headers.set("X-CallPilot-do_total", total.toFixed(1));
+        console.log(JSON.stringify({ event: "outbound_edge_relay", callId, commandId,
+          status: response.status, edge_wait: wait, do_total: total }));
+        finish(response);
+      };
       const timeout = setTimeout(() => {
         this.pendingCallRelays.delete(commandId);
         resolve(Response.json({ error: "TIMEOUT" }, { status: 504 }));

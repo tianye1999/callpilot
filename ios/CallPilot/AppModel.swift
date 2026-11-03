@@ -106,6 +106,7 @@ final class AppModel: ObservableObject {
     }
 
     private func rebuildClient() {
+        client?.clearOutboundIce()
         for task in ownerWatches.values { task.cancel() }
         ownerWatches.removeAll()
         for task in ownerDeclines.values { task.cancel() }
@@ -162,6 +163,7 @@ final class AppModel: ObservableObject {
     }
 
     func unpair() {
+        client?.clearOutboundIce()
         closeSilentIncoming()
         let pairedClient = client
         Task {
@@ -261,6 +263,7 @@ final class AppModel: ObservableObject {
             guard currentClient === client,
                   deviceStatusMachine.succeed(status, for: refresh) else { return }
             claimPrewarmer.setEnabled(status.claimPrewarm)
+            if status.outboundDirect { prefetchOutboundIce() }
             claimPrewarmer.setPreconnectEnabled(status.preconnect)
             if !claimPrewarmer.canPreconnect && !status.inboundFastpathV2 { closeSilentIncoming() }
         } catch {
@@ -277,6 +280,14 @@ final class AppModel: ObservableObject {
             }
         }
         publishDeviceStatus()
+    }
+
+    func prefetchOutboundIce() {
+        guard let client, let pairing else { return }
+        Task { [weak self] in
+            guard self?.client === client else { return }
+            _ = try? await client.outboundIceServers(edgeId: pairing.edgeId)
+        }
     }
 
     func dismissOffer(_ offer: InboundOffer) {

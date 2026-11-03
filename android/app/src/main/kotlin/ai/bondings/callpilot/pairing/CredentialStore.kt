@@ -2,6 +2,7 @@ package ai.bondings.callpilot.pairing
 
 import ai.bondings.callpilot.call.CallDigestStore
 import ai.bondings.callpilot.call.DirectCallCapabilities
+import ai.bondings.callpilot.call.OutboundIcePrefetch
 import ai.bondings.callpilot.call.SmsAlertStore
 import ai.bondings.callpilot.protocol.DeviceCredential
 import ai.bondings.callpilot.protocol.PairingProtocol
@@ -31,6 +32,7 @@ class CredentialStore(private val context: Context) {
     )
 
     fun save(pairing: StoredPairing) {
+        OutboundIcePrefetch.cache.activate(pairing)
         prefs.edit()
             .putString(KEY_GATEWAY, pairing.gatewayUrl)
             .putString(KEY_NAME, pairing.displayName)
@@ -56,6 +58,7 @@ class CredentialStore(private val context: Context) {
 
     /** 解除配对：清凭证但保留最近网关，下次配对免重新粘贴链接。 */
     fun clear() {
+        OutboundIcePrefetch.cache.activate(null)
         DirectCallCapabilities.cache.activate(null)
         val lastGateway = prefs.getString(KEY_GATEWAY, null)
         prefs.edit().clear().apply()

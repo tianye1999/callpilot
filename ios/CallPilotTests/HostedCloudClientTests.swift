@@ -4,6 +4,76 @@ import XCTest
 
 @MainActor
 final class HostedCloudClientTests: XCTestCase {
+    func testOutboundIceCacheExpiresAndClearsWithPairing() async throws {
+        var now: Int64 = 1_000
+        var requests = 0
+        let client = try makeClient(clockMilliseconds: { now }) { request in
+            requests += 1
+            return Self.response(for: request, status: 200, json: """
+            {"iceServers":[{"urls":["turn:turn.example:3478"],"username":"u","credential":"synthetic"}],"expiresAt":121000}
+            """)
+        }
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        XCTAssertEqual(requests, 1)
+        now = 61_000 // Exactly 60 seconds left must miss.
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        XCTAssertEqual(requests, 2)
+        now = 1_000
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        client.clearOutboundIce()
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        XCTAssertEqual(requests, 4)
+        client.credential = nil
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        XCTAssertEqual(requests, 5)
+    }
+
+    func testOutboundIceConcurrentPrefetchAndDialShareRequest() async throws {
+        var requests = 0
+        let client = try makeClient { request in
+            requests += 1
+            return Self.response(for: request, status: 200, json: """
+            {"iceServers":[{"urls":["turn:turn.example:3478"],"username":"u","credential":"synthetic"}],"expiresAt":121000}
+            """)
+        }
+        let prefetch = Task { try await client.outboundIceServers(edgeId: "edge_abcdefghijkl") }
+        let dial = Task { try await client.outboundIceServers(edgeId: "edge_abcdefghijkl") }
+        let foreground = Task { try await client.outboundIceServers(edgeId: "edge_abcdefghijkl") }
+        prefetch.cancel() // A disappearing view must not cancel shared ICE acquisition.
+        _ = try await prefetch.value
+        _ = try await dial.value
+        _ = try await foreground.value
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        XCTAssertEqual(requests, 1)
+    }
+
+    func testOutboundIceLongTTLStillRefreshesAfterOneMinuteAndFailureIsNotCached() async throws {
+        var now: Int64 = 1_000
+        var requests = 0
+        let client = try makeClient(clockMilliseconds: { now }) { request in
+            requests += 1
+            if requests == 1 {
+                return Self.response(for: request, status: 503, json: """
+                {"error":{"code":"TURN_UNAVAILABLE","message":"Unavailable"}}
+                """)
+            }
+            return Self.response(for: request, status: 200, json: """
+            {"iceServers":[{"urls":["turn:turn.example:3478"],"username":"u","credential":"synthetic"}],"expiresAt":86521000}
+            """)
+        }
+        do {
+            _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+            XCTFail("Expected transient prefetch failure")
+        } catch { }
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        XCTAssertEqual(requests, 2)
+        now = 61_000
+        _ = try await client.outboundIceServers(edgeId: "edge_abcdefghijkl")
+        XCTAssertEqual(requests, 3)
+    }
+
     override func tearDown() {
         MockURLProtocol.requestHandler = nil
         super.tearDown()

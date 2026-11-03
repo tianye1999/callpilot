@@ -10,7 +10,17 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     private let urlSession: URLSession
     private let clockMilliseconds: () -> Int64
     private let sleepMilliseconds: (UInt64) async throws -> Void
-    var credential: DeviceCredential?
+    var credential: DeviceCredential? { didSet { clearOutboundIce() } }
+    private var outboundIceCache: (edgeId: String, servers: [CallIceServer], expiresAt: Int64)?
+    private var outboundIcePending: (edgeId: String, task: Task<([CallIceServer], Int64), Error>)?
+    private var outboundIceGeneration = UUID()
+
+    func clearOutboundIce() {
+        outboundIceGeneration = UUID()
+        outboundIcePending?.task.cancel()
+        outboundIcePending = nil
+        outboundIceCache = nil
+    }
 
     private static let deviceCookieName = "__Host-callpilot-device"
     private static var deviceIdRE: Regex<Substring> { /^device_[A-Za-z0-9_-]{12,80}$/ }
@@ -206,9 +216,29 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         guard edgeId.wholeMatch(of: Self.edgeIdRE) != nil else {
             throw HostedCloudError(statusCode: 0, code: "BAD_EDGE_ID", message: "云配对缺少有效的 Edge ID")
         }
-        let body = try JSONSerialization.data(withJSONObject: ["edgeId": edgeId])
-        let (payload, response) = try await request("POST", "v1/calls/ice", body: body)
-        return try Self.iceServers(payload, response: response)
+        if let cached = outboundIceCache, cached.edgeId == edgeId,
+           cached.expiresAt - clockMilliseconds() > 60_000 { return cached.servers }
+        if outboundIcePending?.edgeId != edgeId {
+            clearOutboundIce()
+            outboundIcePending = (edgeId, Task {
+                let body = try JSONSerialization.data(withJSONObject: ["edgeId": edgeId])
+                let (payload, response) = try await self.request("POST", "v1/calls/ice", body: body)
+                let servers = try Self.iceServers(payload, response: response)
+                // Missing/invalid expiry is usable for this request only, never cached.
+                let expires = (payload["expiresAt"] as? NSNumber)?.int64Value ?? 0
+                return (servers, expires)
+            })
+        }
+        let generation = outboundIceGeneration
+        guard let pending = outboundIcePending else { throw CancellationError() }
+        defer { if generation == outboundIceGeneration { outboundIcePending = nil } }
+        let (servers, expiresAt) = try await pending.task.value
+        guard generation == outboundIceGeneration else { throw CancellationError() }
+        if expiresAt - clockMilliseconds() > 60_000 {
+            // TTL is 24h + 120s: retain at most 60s to preserve the maximum call plus setup margin.
+            outboundIceCache = (edgeId, servers, min(expiresAt, clockMilliseconds() + 120_000))
+        }
+        return servers
     }
 
     /// Create the call with the phone's offer; the Edge answer returns in the same response.

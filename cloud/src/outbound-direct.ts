@@ -1,6 +1,7 @@
 // A8: app-dialed calls over direct WebRTC, with the existing LiveKit room kept as
 // the one same-call fallback. The relay never stores SDP or ICE credentials.
 import { authenticateDevice } from "./auth";
+import { ClaimTiming } from "./claim-timing";
 import { HttpError, json, readJson, requireSameOrigin } from "./http";
 import { issueParticipantToken, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS } from "./livekit";
 import { callAnswerSchema, outboundIceSchema } from "./schemas";
@@ -25,17 +26,18 @@ export function outboundDirectAvailable(env: Env, presence: Pick<EdgePresence, "
 }
 
 /** Phone ICE credentials for building a complete offer before creating the call. */
-export async function outboundIce(request: Request, env: Env): Promise<Response> {
+export async function outboundIce(request: Request, env: Env, timing = new ClaimTiming()): Promise<Response> {
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
-  const device = await authenticateDevice(request, env);
-  const input = outboundIceSchema.parse(await readJson(request, 4096));
+  const device = await timing.measure("auth", () => authenticateDevice(request, env));
+  const input = await timing.measure("request_parse", async () => outboundIceSchema.parse(await readJson(request, 4096)));
   if (device.edge_id !== input.edgeId) throw new HttpError("FORBIDDEN", "Device is not paired to this Edge", 403);
   if (!outboundDirectEnabled(env)) throw new HttpError("DIRECT_UNAVAILABLE", "Direct media is not available", 503);
-  const presence = await (await edgeRoom(env, input.edgeId).fetch("https://edge-room/presence")).json() as EdgePresence;
+  const presence = await timing.measure("presence", async () =>
+    (await edgeRoom(env, input.edgeId).fetch("https://edge-room/presence")).json() as Promise<EdgePresence>);
   if (!presence.connected || !outboundDirectAvailable(env, presence)) {
     throw new HttpError("DIRECT_UNAVAILABLE", "Direct media is not available", 503);
   }
-  return json(await issueIceServers(env));
+  return json(await timing.measure("turn", () => issueIceServers(env)));
 }
 
 /** Payload shared by create, idempotent replay and GET. */
@@ -49,43 +51,44 @@ export function outboundPayload(call: CallRecord, base: Record<string, unknown>)
  * can start the same call as a plain LiveKit session instead.
  */
 export async function startOutboundDirect(env: Env, command: StartCommand, sdpOffer: string,
-  edgeId: string, payload: () => Promise<Record<string, unknown>>): Promise<Response | null> {
+  edgeId: string, payload: (update: D1PreparedStatement) => Promise<Record<string, unknown>>, timing = new ClaimTiming()): Promise<Response | null> {
   let iceServers;
   try {
-    iceServers = (await issueIceServers(env)).iceServers;
+    iceServers = (await timing.measure("turn", () => issueIceServers(env))).iceServers;
   } catch {
-    await env.DB.prepare("UPDATE calls SET media_transport = NULL, updated_at = ?1 WHERE call_id = ?2 AND status = 'pending'")
-      .bind(Date.now(), command.callId).run();
+    await timing.measure("call_finalize", () => env.DB.prepare("UPDATE calls SET media_transport = NULL, updated_at = ?1 WHERE call_id = ?2 AND status = 'pending'")
+      .bind(Date.now(), command.callId).run());
     return null;
   }
-  const response = await edgeRoom(env, edgeId).fetch("https://edge-room/call-media-relay", {
+  const response = await timing.measure("sdp_relay", () => edgeRoom(env, edgeId).fetch("https://edge-room/call-media-relay", {
     method: "POST", body: JSON.stringify({ ...command, direct: { sdpOffer, iceServers } })
-  }).catch(() => null);
-  const answer = response && (response.ok || response.status === 409)
-    ? callAnswerSchema.safeParse(await response.json().catch(() => null)) : null;
+  }).catch(() => null));
+  if (response) timing.absorbRelay(response);
+  const answer = await timing.measure("answer_parse", async () => response && (response.ok || response.status === 409)
+    ? callAnswerSchema.safeParse(await response.json().catch(() => null)) : null);
   const now = Date.now();
   if (!answer?.success || answer.data.commandId !== command.commandId || answer.data.callId !== command.callId) {
     const timeout = response?.status === 504;
-    await env.DB.prepare("UPDATE calls SET status = 'failed', error_code = ?1, updated_at = ?2 WHERE call_id = ?3 AND status = 'pending'")
-      .bind(timeout ? "EDGE_TIMEOUT" : "EDGE_OFFLINE", now, command.callId).run();
+    await timing.measure("call_finalize", () => env.DB.prepare("UPDATE calls SET status = 'failed', error_code = ?1, updated_at = ?2 WHERE call_id = ?3 AND status = 'pending'")
+      .bind(timeout ? "EDGE_TIMEOUT" : "EDGE_OFFLINE", now, command.callId).run());
     throw timeout ? new HttpError("EDGE_TIMEOUT", "Edge did not answer in time", 504)
       : new HttpError("EDGE_OFFLINE", "Edge disconnected before the call could start", 409);
   }
   if (answer.data.status === "accepted" && answer.data.sdpAnswer) {
-    await env.DB.prepare(`UPDATE calls SET status = 'ready', media_transport = 'direct', updated_at = ?1
-      WHERE call_id = ?2 AND status = 'pending'`).bind(now, command.callId).run();
-    return json({ ...await payload(), directAttempted: true,
+    const base = await payload(env.DB.prepare(`UPDATE calls SET status = 'ready', media_transport = 'direct', updated_at = ?1
+      WHERE call_id = ?2 AND status = 'pending'`).bind(now, command.callId));
+    return json({ ...base, directAttempted: true,
       transports: [{ kind: "webrtc", sdpAnswer: answer.data.sdpAnswer }] }, 202);
   }
   if (answer.data.errorCode === "DIRECT_SETUP_FAILED") {
     // The Edge session is live and waits for the same-call LiveKit fallback.
-    await env.DB.prepare("UPDATE calls SET status = 'ready', updated_at = ?1 WHERE call_id = ?2 AND status = 'pending'")
-      .bind(now, command.callId).run();
-    return json({ ...await payload(), directAttempted: true, transports: [] }, 202);
+    const base = await payload(env.DB.prepare("UPDATE calls SET status = 'ready', updated_at = ?1 WHERE call_id = ?2 AND status = 'pending'")
+      .bind(now, command.callId));
+    return json({ ...base, directAttempted: true, transports: [] }, 202);
   }
-  await env.DB.prepare("UPDATE calls SET status = 'failed', error_code = ?1, updated_at = ?2 WHERE call_id = ?3 AND status = 'pending'")
-    .bind(answer.data.errorCode ?? "EDGE_REJECTED", now, command.callId).run();
-  return json(await payload(), 202);
+  const base = await payload(env.DB.prepare("UPDATE calls SET status = 'failed', error_code = ?1, updated_at = ?2 WHERE call_id = ?3 AND status = 'pending'")
+    .bind(answer.data.errorCode ?? "EDGE_REJECTED", now, command.callId));
+  return json(base, 202);
 }
 
 /** Switch a direct call to its LiveKit room once; repeats are idempotent at the Edge. */

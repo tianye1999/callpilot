@@ -55,12 +55,15 @@ const COOKIE_MAX_AGE = 180 * 24 * 60 * 60;
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
-    const timing = request.method === "POST" && ["/v1/inbound-offers/claim", "/v1/inbound-offers/prepare"].includes(path.replace(/\/$/, ""))
-      ? new ClaimTiming() : undefined;
     const requestId = randomId(
       path.startsWith("/v1/messages") || path.startsWith("/v1/call-records") ? "request" : "req",
       12
     );
+    const normalized = path.replace(/\/$/, "");
+    const timing = request.method === "POST" && ["/v1/calls", "/v1/calls/ice"].includes(normalized)
+      ? new ClaimTiming(normalized.endsWith("/ice") ? "outbound_ice" : "outbound_create", requestId)
+      : request.method === "POST" && ["/v1/inbound-offers/claim", "/v1/inbound-offers/prepare"].includes(normalized)
+        ? new ClaimTiming() : undefined;
     let response: Response;
     try {
       response = await route(request, env, requestId, timing, ctx);
@@ -109,7 +112,7 @@ async function route(request: Request, env: Env, requestId: string, timing?: Cla
   if (path === "/v1/device/push-token" && request.method === "DELETE") {
     return unregisterVoipToken(request, env);
   }
-  if (path === "/v1/calls" && request.method === "POST") return createCall(request, env);
+  if (path === "/v1/calls" && request.method === "POST") return createCall(request, env, timing!, ctx);
   if (path === "/v1/inbound-offers" && request.method === "GET") {
     return listInboundOffers(request, env);
   }
@@ -171,7 +174,7 @@ async function route(request: Request, env: Env, requestId: string, timing?: Cla
   if (device && request.method === "DELETE") return revokeDevice(request, env, device[1] ?? "");
   const call = path.match(/^\/v1\/calls\/(call_[A-Za-z0-9_-]+)$/);
   if (call && request.method === "GET") return getCall(request, env, call[1] ?? "");
-  if (path === "/v1/calls/ice" && request.method === "POST") return outboundIce(request, env);
+  if (path === "/v1/calls/ice" && request.method === "POST") return outboundIce(request, env, timing);
   const callMedia = path.match(/^\/v1\/calls\/(call_[A-Za-z0-9_-]+)\/media\/livekit$/);
   if (callMedia && request.method === "POST") return fallbackOutboundLivekit(request, env, callMedia[1] ?? "");
 
@@ -418,52 +421,59 @@ async function unregisterVoipToken(request: Request, env: Env, kind: "voip" | "a
   return json({ registered: false });
 }
 
-async function createCall(request: Request, env: Env): Promise<Response> {
+async function createCall(request: Request, env: Env, timing: ClaimTiming, ctx?: ExecutionContext): Promise<Response> {
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
-  const device = await authenticateDevice(request, env);
-  const input = createCallSchema.parse(await readJson(request, 32 * 1024));
+  const device = await timing.measure("auth", () => authenticateDevice(request, env));
+  const input = await timing.measure("request_parse", async () => createCallSchema.parse(await readJson(request, 32 * 1024)));
   if (device.edge_id !== input.edgeId) throw new HttpError("FORBIDDEN", "Device is not paired to this Edge", 403);
 
-  const duplicate = await env.DB.prepare(
-    "SELECT * FROM calls WHERE device_id = ?1 AND idempotency_key = ?2"
-  ).bind(device.device_id, input.idempotencyKey).first<CallRecord>();
-  // A replayed direct create never gets a second answer; the phone uses the LiveKit fallback.
+  const checks = timing.measure("call_checks", () => env.DB.batch([
+      env.DB.prepare("SELECT * FROM calls WHERE device_id = ?1 AND idempotency_key = ?2")
+        .bind(device.device_id, input.idempotencyKey),
+      env.DB.prepare("SELECT COUNT(*) AS count FROM calls WHERE device_id = ?1 AND created_at > ?2")
+        .bind(device.device_id, Date.now() - 60 * 60 * 1000)
+    ]));
+  const presenceTask = timing.measure("presence", async () => {
+      const response = await edgeRoom(env, input.edgeId).fetch("https://edge-room/presence");
+      return response.json<{ connected?: boolean; modemOnline?: boolean; lineBusy?: boolean; outboundDirectV1?: boolean }>();
+    }).then(value => ({ value }), failure => ({ failure }));
+  const reads = await checks;
+  const duplicate = reads[0]!.results[0] as CallRecord | undefined;
+  // Speculative presence errors must not affect an idempotent replay or rate-limit precedence.
   if (duplicate) return json(outboundPayload(duplicate, callPayload(duplicate)), 200);
-
-  const recent = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM calls WHERE device_id = ?1 AND created_at > ?2"
-  ).bind(device.device_id, Date.now() - 60 * 60 * 1000).first<{ count: number }>();
+  const recent = reads[1]!.results[0] as { count: number } | undefined;
   if ((recent?.count ?? 0) >= 10) throw new HttpError("RATE_LIMITED", "Remote call limit reached", 429);
+  const presence = await presenceTask;
+  if ("failure" in presence) throw presence.failure;
+  const state = presence.value;
 
-  const presenceResponse = await edgeRoom(env, input.edgeId).fetch("https://edge-room/presence");
-  const presence = await presenceResponse.json<{ connected?: boolean; modemOnline?: boolean; lineBusy?: boolean;
-    outboundDirectV1?: boolean }>();
-  if (!presence.connected) throw new HttpError("EDGE_OFFLINE", "Edge is offline", 409);
-  if (presence.modemOnline === false) throw new HttpError("MODEM_OFFLINE", "Modem is offline", 409);
-  if (presence.lineBusy) throw new HttpError("LINE_BUSY", "Line is busy", 409);
+  if (!state.connected) throw new HttpError("EDGE_OFFLINE", "Edge is offline", 409);
+  if (state.modemOnline === false) throw new HttpError("MODEM_OFFLINE", "Modem is offline", 409);
+  if (state.lineBusy) throw new HttpError("LINE_BUSY", "Line is busy", 409);
 
   const now = Date.now();
   const callId = randomId("call");
+  timing.tagCall(callId);
   const commandId = randomId("command");
   const sessionId = randomId("session");
   const roomName = randomId("callpilot");
   const phoneIdentity = randomId("web", 12);
   const edgeIdentity = randomId("edgepart", 12);
   const expiresAt = now + 5 * 60 * 1000;
-  const direct = input.sdpOffer !== undefined && outboundDirectAvailable(env, presence);
-  const inserted = await env.DB.prepare(
+  const direct = input.sdpOffer !== undefined && outboundDirectAvailable(env, state);
+  const inserted = await timing.measure("call_insert", () => env.DB.prepare(
     "INSERT OR IGNORE INTO calls(call_id, edge_id, device_id, idempotency_key, room_name, phone_identity, edge_identity, status, created_at, expires_at, updated_at, media_transport) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?8, ?10)"
   ).bind(callId, input.edgeId, device.device_id, input.idempotencyKey, roomName, phoneIdentity, edgeIdentity, now, expiresAt,
-    direct ? "direct_pending" : null).run();
+    direct ? "direct_pending" : null).run());
   if (!inserted.meta.changes) {
-    const raced = await env.DB.prepare(
+    const raced = await timing.measure("call_read", () => env.DB.prepare(
       "SELECT * FROM calls WHERE device_id = ?1 AND idempotency_key = ?2"
-    ).bind(device.device_id, input.idempotencyKey).first<CallRecord>();
+    ).bind(device.device_id, input.idempotencyKey).first<CallRecord>());
     if (raced) return json(outboundPayload(raced, callPayload(raced)), 200);
     throw new HttpError("CONFLICT", "Call could not be created", 409);
   }
 
-  const edgeToken = await issueParticipantToken(env, roomName, edgeIdentity);
+  const edgeToken = await timing.measure("edge_token", () => issueParticipantToken(env, roomName, edgeIdentity));
   const command = {
     v: 1,
     type: "session.start",
@@ -479,28 +489,36 @@ async function createCall(request: Request, env: Env): Promise<Response> {
       token: edgeToken
     }
   };
+  const recordAudit = async () => {
+    const operation = audit(env, "phone", device.device_id, "call.created", callId, "allowed")
+      .catch(() => console.warn(JSON.stringify({ event: "outbound_audit_failed", callId })));
+    if (ctx) ctx.waitUntil(operation);
+    else await operation;
+  };
   if (direct) {
     const started = await startOutboundDirect(env, command as Parameters<typeof startOutboundDirect>[1], input.sdpOffer!,
-      input.edgeId, async () => {
-        const row = await env.DB.prepare("SELECT * FROM calls WHERE call_id = ?1").bind(callId).first<CallRecord>();
-        return callPayload(row as CallRecord);
-      });
+      input.edgeId, async update => {
+        const rows = await timing.measure("call_finalize_read", () => env.DB.batch([
+          update, env.DB.prepare("SELECT * FROM calls WHERE call_id = ?1").bind(callId)
+        ]));
+        return callPayload(rows[1]!.results[0] as CallRecord);
+      }, timing);
     if (started) {
-      await audit(env, "phone", device.device_id, "call.created", callId, "allowed");
+      await recordAudit();
       return started;
     }
   }
-  const delivered = await edgeRoom(env, input.edgeId).fetch("https://edge-room/command", {
+  const delivered = await timing.measure("edge_send", () => edgeRoom(env, input.edgeId).fetch("https://edge-room/command", {
     method: "POST",
     body: JSON.stringify(command)
-  });
+  }));
   if (!delivered.ok) {
-    await env.DB.prepare("UPDATE calls SET status = 'failed', updated_at = ?1 WHERE call_id = ?2")
-      .bind(Date.now(), callId).run();
+    await timing.measure("call_finalize", () => env.DB.prepare("UPDATE calls SET status = 'failed', updated_at = ?1 WHERE call_id = ?2")
+      .bind(Date.now(), callId).run());
     throw new HttpError("EDGE_OFFLINE", "Edge disconnected before the call could start", 409);
   }
-  await audit(env, "phone", device.device_id, "call.created", callId, "allowed");
-  const call = await env.DB.prepare("SELECT * FROM calls WHERE call_id = ?1").bind(callId).first<CallRecord>();
+  await recordAudit();
+  const call = await timing.measure("call_read", () => env.DB.prepare("SELECT * FROM calls WHERE call_id = ?1").bind(callId).first<CallRecord>());
   return json(callPayload(call as CallRecord), 202);
 }
 

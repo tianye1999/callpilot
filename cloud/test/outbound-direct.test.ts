@@ -21,7 +21,8 @@ const iceServers = [{ urls: ["turn:turn.example:3478?transport=udp"], username: 
 type Command = { type: string; commandId: string; callId: string; direct?: { sdpOffer: string; iceServers: unknown[] };
   session: { token: string; roomName: string; browserIdentity: string; edgeIdentity: string } };
 
-async function fixture(options: { edgeDirect?: boolean; enabled?: boolean } = {}) {
+async function fixture(options: { edgeDirect?: boolean; enabled?: boolean; rateGate?: Promise<void>;
+  auditGate?: Promise<void>; failAudit?: boolean } = {}) {
   const db = new DatabaseSync(":memory:");
   databases.push(db);
   for (const name of readdirSync(new URL("../migrations/", import.meta.url)).filter(n => n.endsWith(".sql")).sort()) {
@@ -32,14 +33,26 @@ async function fixture(options: { edgeDirect?: boolean; enabled?: boolean } = {}
   const env = {
     DB: {
       batch: vi.fn(async (statements: D1PreparedStatement[]) =>
-        statements.map(statement => (statement as unknown as { execute(): unknown }).execute())),
+        Promise.all(statements.map(statement => (statement as unknown as { execute(): unknown }).execute()))),
       prepare: (sql: string) => ({ bind: (...values: SQLInputValue[]) => {
         const params = Object.fromEntries(values.map((value, index) => [String(index + 1), value]));
         return {
-          execute: () => ({ results: db.prepare(sql).all(params) }),
-          first: async () => db.prepare(sql).get(params) ?? null,
+          execute: async () => {
+            if (sql.includes("SELECT COUNT(*) AS count FROM calls")) await options.rateGate;
+            return { results: db.prepare(sql).all(params) };
+          },
+          first: async () => {
+            if (sql.includes("SELECT COUNT(*) AS count FROM calls")) await options.rateGate;
+            return db.prepare(sql).get(params) ?? null;
+          },
           all: async () => ({ results: db.prepare(sql).all(params) }),
-          run: async () => ({ meta: { changes: Number(db.prepare(sql).run(params).changes) } })
+          run: async () => {
+            if (sql.startsWith("INSERT INTO audit_events")) {
+              await options.auditGate;
+              if (options.failAudit) throw new Error("synthetic private audit failure");
+            }
+            return { meta: { changes: Number(db.prepare(sql).run(params).changes) } };
+          }
         };
       } })
     },
@@ -63,14 +76,15 @@ async function fixture(options: { edgeDirect?: boolean; enabled?: boolean } = {}
     return Response.json({ accepted: true }, { status: 202 });
   });
   env.EDGE_ROOMS = { idFromName: (id: string) => id, get: vi.fn(() => ({ fetch: relay })) } as unknown as DurableObjectNamespace;
+  const background: Promise<unknown>[] = [];
   const request = (path: string, body?: object) => worker.fetch(new Request(`https://relay${path}`, {
     method: body === undefined ? "GET" : "POST",
     headers: { Origin: "https://relay", "Content-Type": "application/json", Cookie: `__Host-callpilot-device=${device}.secret` },
     ...(body === undefined ? {} : { body: JSON.stringify(body) })
-  }), env, { waitUntil: () => undefined } as unknown as ExecutionContext);
+  }), env, { waitUntil: (operation: Promise<unknown>) => { background.push(operation); } } as unknown as ExecutionContext);
   const turn = vi.fn(async () => Response.json({ iceServers }));
   vi.stubGlobal("fetch", turn);
-  return { db, env, request, relay, commands, turn, setEdgeReply: (reply: typeof edgeReply) => { edgeReply = reply; } };
+  return { db, env, request, relay, commands, turn, background, setEdgeReply: (reply: typeof edgeReply) => { edgeReply = reply; } };
 }
 
 const create = (key = "idempotency-key-0001", extra: object = { mediaTransport: "webrtc", sdpOffer: sdp }) =>
@@ -109,10 +123,97 @@ describe("outbound direct device feature", () => {
 });
 
 describe("outbound direct create", () => {
+  it("returns an idempotent replay without waiting for stalled speculative presence", async () => {
+    const f = await fixture();
+    await f.request("/v1/calls", create());
+    f.relay.mockImplementationOnce(() => new Promise<Response>(() => {}));
+    expect((await f.request("/v1/calls", create())).status).toBe(200);
+    expect(f.commands).toHaveLength(1);
+    await Promise.all(f.background);
+  });
+  it("uses two D1 batches and preserves a concurrent terminal status during answer finalization", async () => {
+    const f = await fixture();
+    f.setEdgeReply(command => {
+      f.db.prepare("UPDATE calls SET status = 'ended' WHERE call_id = ?").run(command.callId);
+      return Response.json({ v: 1, type: "call.answer", commandId: command.commandId,
+        callId: command.callId, status: "accepted", sdpAnswer: answerSdp });
+    });
+    const response = await f.request("/v1/calls", create());
+    expect(await response.json()).toMatchObject({ status: "ended" });
+    expect(f.env.DB.batch).toHaveBeenCalledTimes(2);
+    expect(row(f).status).toBe("ended");
+    await Promise.all(f.background);
+  });
+
+  it("keeps INSERT OR IGNORE races idempotent with only one Edge command", async () => {
+    const f = await fixture();
+    const responses = await Promise.all([f.request("/v1/calls", create()), f.request("/v1/calls", create())]);
+    expect(responses.map(response => response.status).sort()).toEqual([200, 202]);
+    const bodies = await Promise.all(responses.map(response => response.json() as Promise<{ callId: string }>));
+    expect(bodies[0]!.callId).toBe(bodies[1]!.callId);
+    expect(f.commands).toHaveLength(1);
+    await Promise.all(f.background);
+  });
+
+  it("returns before a blocked audit and only logs a sanitized background failure", async () => {
+    let release!: () => void;
+    const auditGate = new Promise<void>(resolve => { release = resolve; });
+    const f = await fixture({ auditGate, failAudit: true });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const response = await f.request("/v1/calls", create());
+    expect(response.status).toBe(202);
+    expect(f.background).toHaveLength(1);
+    expect(warning).not.toHaveBeenCalled();
+    release();
+    await Promise.all(f.background);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('"event":"outbound_audit_failed"'));
+    expect(JSON.stringify(warning.mock.calls)).not.toContain("private audit failure");
+  });
+
+  it("fetches presence while the independent rate read is still pending", async () => {
+    let release!: () => void;
+    const rateGate = new Promise<void>(resolve => { release = resolve; });
+    const f = await fixture({ rateGate });
+    const pending = f.request("/v1/calls", create());
+    try {
+      await vi.waitFor(() => expect(f.relay.mock.calls.some(([url]) => url.endsWith("/presence"))).toBe(true));
+      expect(f.commands).toHaveLength(0);
+    } finally { release(); }
+    expect((await pending).status).toBe(202);
+  });
+
+  it("preserves rate-limit precedence even when parallel presence fails, and bypasses both for replay", async () => {
+    const f = await fixture();
+    for (let i = 0; i < 10; i++) await f.request("/v1/calls", create(`idempotency-key-${i.toString().padStart(4, "0")}`));
+    f.relay.mockRejectedValue(new Error("synthetic presence failure"));
+    const blocked = await f.request("/v1/calls", create("idempotency-key-next"));
+    expect(blocked.status).toBe(429);
+    expect(await blocked.json()).toMatchObject({ error: { code: "RATE_LIMITED" } });
+    const replay = await f.request("/v1/calls", create("idempotency-key-0000"));
+    expect(replay.status).toBe(200);
+    expect(f.commands).toHaveLength(10);
+  });
+
+  it("emits only stage timings and opaque correlation IDs, including failed requests", async () => {
+    const f = await fixture();
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    f.setEdgeReply(() => Response.json({ error: "timeout" }, { status: 504 }));
+    const response = await f.request("/v1/calls", create());
+    expect(response.headers.get("Server-Timing")).toMatch(/sdp_relay;dur=/);
+    const summary = log.mock.calls.map(args => JSON.parse(args[0] as string) as Record<string, unknown>)
+      .find(entry => entry.event === "outbound_create");
+    expect(summary).toMatchObject({ status: 504 });
+    expect(summary!.callId).toMatch(/^call_/);
+    expect(JSON.stringify(summary)).not.toContain("temporary-password");
+    expect(JSON.stringify(summary)).not.toContain("v=0");
+  });
+
   it("relays the offer inside session.start and returns the Edge answer in one request", async () => {
     const f = await fixture();
     const response = await f.request("/v1/calls", create());
     expect(response.status).toBe(202);
+    expect(response.headers.get("Server-Timing")).toMatch(/turn;dur=/);
+    expect(response.headers.get("Server-Timing")).toMatch(/call_finalize_read;dur=/);
     const body = await response.json() as Record<string, unknown>;
     expect(body).toMatchObject({ status: "ready", directAttempted: true, transports: [{ kind: "webrtc", sdpAnswer: answerSdp }] });
     expect(f.relay.mock.calls.some(([url]) => url.endsWith("/command"))).toBe(false);
@@ -276,6 +377,8 @@ describe("outbound direct DO relay", () => {
     const response = await pending;
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ sdpAnswer: answerSdp });
+    expect(Number(response.headers.get("X-CallPilot-edge_wait"))).toBeGreaterThanOrEqual(0);
+    expect(response.headers.has("X-CallPilot-do_total")).toBe(true);
   });
 
   it("times out a silent Edge and rejects a start without direct media", async () => {

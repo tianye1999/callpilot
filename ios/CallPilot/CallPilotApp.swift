@@ -46,6 +46,7 @@ struct RootView: View {
         .task { await model.startOfferPolling() }
         .task(id: model.pairing?.credential.deviceId) {
             guard model.pairing != nil else { return }
+            model.prefetchOutboundIce()
             await refreshAlertRegistration()
             await openPendingAlert()
         }
@@ -58,6 +59,7 @@ struct RootView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
+                model.prefetchOutboundIce()
                 Task { await refreshAlertRegistration() }
             }
         }

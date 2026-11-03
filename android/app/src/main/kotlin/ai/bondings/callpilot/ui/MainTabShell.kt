@@ -2,6 +2,13 @@ package ai.bondings.callpilot.ui
 
 import ai.bondings.callpilot.R
 import ai.bondings.callpilot.call.CallManager
+import ai.bondings.callpilot.call.HostedOutboundMediaGateway
+import ai.bondings.callpilot.call.OutboundIcePrefetch
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.CancellationException
 import ai.bondings.callpilot.content.CallHistoryCacheStore
 import ai.bondings.callpilot.content.CallHistoryModel
 import ai.bondings.callpilot.content.CallHistoryState
@@ -82,6 +89,22 @@ fun MainTabShell(
     var smsDetailVersion by remember { mutableIntStateOf(0) }
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route ?: MainTab.Dial.route
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(pairing, currentRoute, lifecycle) {
+        OutboundIcePrefetch.cache.activate(pairing)
+        if (pairing.protocol == PairingProtocol.HOSTED && pairing.edgeId != null) {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                try {
+                    HostedOutboundMediaGateway(pairing).iceServers(pairing.edgeId)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // Speculative only: dialing retains its normal fetch/fallback path.
+                }
+                awaitCancellation()
+            }
+        }
+    }
     val tunnelClient = remember(pairing) {
         if (pairing.protocol == PairingProtocol.TUNNEL) GatewayClient(pairing.gatewayUrl).also {
             it.credential = pairing.credential

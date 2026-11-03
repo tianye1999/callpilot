@@ -240,22 +240,35 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
     connection._agentcall_gathers.add(current)
     started = time.monotonic()
 
-    async def collect(awaitable: Any) -> None:
+    def milestone(kind: str, outcome: str, launched: float) -> None:
+        now = time.monotonic()
+        logger.info("Direct ICE candidate connection=%s component=%s type=%s outcome=%s "
+                    "ready_ms=%.1f operation_ms=%.1f", id(connection), component, kind, outcome,
+                    (now - started) * 1000, (now - launched) * 1000)
+
+    async def collect(awaitable: Any, kind: str) -> None:
+        launched = time.monotonic()
         try:
             candidate, protocol = await awaitable
             if protocol is not None:
                 configure_turn_transport(protocol.transport)
                 connection._protocols.append(protocol)
             candidates.append(candidate)
+            milestone(kind, "ready", launched)
+        except asyncio.CancelledError:
+            milestone(kind, "cancelled", launched)
+            raise
         except (OSError, stun.TransactionError) as error:
+            milestone(kind, "unavailable", launched)
             logger.debug("Direct ICE candidate unavailable: %s", type(error).__name__)
 
-    def launch(awaitable: Any) -> None:
-        jobs.add(asyncio.create_task(collect(awaitable)))
+    def launch(awaitable: Any, kind: str) -> None:
+        jobs.add(asyncio.create_task(collect(awaitable, kind)))
 
     protocols: dict[str, Any] = {}
 
     async def bind_host(host: str, advertise: bool) -> None:
+        launched = time.monotonic()
         if ((ipaddress.ip_address(host).version == 4 and not connection._use_ipv4)
                 or (ipaddress.ip_address(host).version == 6 and not connection._use_ipv6)):
             return
@@ -278,6 +291,7 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
         protocols[host] = protocol
         if advertise and connection._transport_policy == ice.TransportPolicy.ALL:
             candidates.append(protocol.local_candidate)
+            milestone("host", "ready", launched)
 
     try:
         async with asyncio.timeout(GATHER_MAX_SECONDS):
@@ -289,19 +303,21 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
                     turn_server=connection.turn_server, turn_username=connection.turn_username,
                     turn_password=connection.turn_password, turn_ssl=connection.turn_ssl,
                     turn_transport=connection.turn_transport,
-                ))
+                ), "relay")
             hosts = physical_host_addresses()
             for host in hosts:
                 await bind_host(host, advertise=True)
             # Host sockets already exist if DNS stalls until the gathering ceiling.
+            dns_started = time.monotonic()
             sources = (await asyncio.to_thread(default_stun_sources, connection.stun_server)
                        if connection.stun_server else {})
+            milestone("stun_route", "ready", dns_started)
             for source, target in sources.items():
                 # A private VPN default source must remain usable on VPN-only hosts.
                 if source not in protocols:
                     await bind_host(source, advertise=ipaddress.ip_address(source).is_private)
                 if source in protocols:
-                    launch(_server_reflexive(protocols[source], target))
+                    launch(_server_reflexive(protocols[source], target), "srflx")
             if jobs:
                 await asyncio.gather(*jobs)
     except TimeoutError:
@@ -314,6 +330,10 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
             await asyncio.gather(*jobs, return_exceptions=True)
         connection._agentcall_gathers.discard(current)
         connection._agentcall_gather_ms = (time.monotonic() - started) * 1000
+        logger.info("Direct ICE gather connection=%s component=%s total_ms=%.1f host=%s srflx=%s relay=%s",
+                    id(connection), component, connection._agentcall_gather_ms,
+                    sum(c.type == "host" for c in candidates), sum(c.type == "srflx" for c in candidates),
+                    sum(c.type == "relay" for c in candidates))
     return candidates
 
 
@@ -332,6 +352,7 @@ def peer_connections(pc: Any) -> list[Any]:
 
 def configure_peer(pc: Any) -> None:
     for connection in peer_connections(pc):
+        logger.info("Direct ICE peer=%s connection=%s", id(pc), id(connection))
         configure_connection(connection)
 
 

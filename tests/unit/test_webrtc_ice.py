@@ -8,6 +8,41 @@ from types import SimpleNamespace
 from agentcall import webrtc_ice
 
 
+def test_candidate_timings_distinguish_ready_relay_from_stalled_stun(monkeypatch, caplog):
+    from aioice import Candidate, Connection
+
+    async def scenario():
+        async def relay(**_):
+            await asyncio.sleep(0.005)
+            return Candidate(foundation="relay", component=1, transport="udp", priority=1,
+                             host="127.0.0.1", port=12345, type="relay"), None
+
+        async def stalled(*_):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(webrtc_ice, "GATHER_MAX_SECONDS", 0.05)
+        monkeypatch.setattr(webrtc_ice, "physical_host_addresses", lambda: ["127.0.0.1"])
+        monkeypatch.setattr(webrtc_ice, "default_stun_sources", lambda _: {"127.0.0.1": ("127.0.0.1", 9)})
+        monkeypatch.setattr(webrtc_ice.ice, "relayed_candidate", relay)
+        monkeypatch.setattr(webrtc_ice, "_server_reflexive", stalled)
+        connection = Connection(ice_controlling=False, stun_server=("unused", 9), turn_server=("unused", 9),
+                                turn_username="private-user", turn_password="private-secret")
+        webrtc_ice.configure_connection(connection)
+        try:
+            await connection.gather_candidates()
+            assert {c.type for c in connection.local_candidates} == {"host", "relay"}
+        finally:
+            await connection.close()
+
+    with caplog.at_level("INFO", logger="agentcall.webrtc_ice"):
+        asyncio.run(scenario())
+    assert "type=host outcome=ready" in caplog.text
+    assert "type=relay outcome=ready" in caplog.text
+    assert "type=srflx outcome=cancelled" in caplog.text
+    assert "total_ms=" in caplog.text and "ready_ms=" in caplog.text
+    assert "private-user" not in caplog.text and "private-secret" not in caplog.text
+
+
 def adapter(name, *addresses):
     return SimpleNamespace(name=name, nice_name=name, ips=[SimpleNamespace(ip=ip) for ip in addresses])
 

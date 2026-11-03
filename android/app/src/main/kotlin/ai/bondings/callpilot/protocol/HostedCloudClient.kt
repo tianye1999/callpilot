@@ -158,9 +158,16 @@ class HostedCloudClient(
 
     /** A8：外呼直连用的 TURN/STUN 凭证；中转或 Edge 没开直连时中转回 503，调用方改走 LiveKit。 */
     fun outboundIceServers(edgeId: String): List<IceServer> {
+        return outboundIceCredentials(edgeId).first
+    }
+
+    fun outboundIceCredentials(edgeId: String): Pair<List<IceServer>, Long> {
         require(EDGE_ID.matches(edgeId)) { "云配对缺少有效的 Edge ID" }
         val body = buildJsonObject { put("edgeId", edgeId) }.toString()
-        return request("POST", "v1/calls/ice", body).use { response -> parseIceServers(parseOrThrow(response), response.code) }
+        return request("POST", "v1/calls/ice", body).use { response ->
+            val payload = parseOrThrow(response)
+            parseIceServers(payload, response.code) to (payload["expiresAt"]?.jsonPrimitive?.longOrNull ?: 0L)
+        }
     }
 
     /**
