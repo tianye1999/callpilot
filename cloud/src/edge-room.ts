@@ -195,7 +195,7 @@ export class EdgeRoom extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  private currentConnection(): WebSocket | undefined {
+  private currentConnection(fenceReplaced = true): WebSocket | undefined {
     const sockets = this.ctx.getWebSockets("edge")
       .filter((socket) => socket.readyState === WebSocket.OPEN)
       .map((socket) => ({ socket, attachment: socket.deserializeAttachment() as SocketAttachment }));
@@ -209,6 +209,7 @@ export class EdgeRoom extends DurableObject<Env> {
         connectedAt = timestamp;
       }
     }
+    if (!fenceReplaced) return current;
     for (const { socket, attachment } of sockets) {
       if (socket === current) continue;
       // Persist the fence even if closing leaves the socket reporting OPEN.
@@ -222,7 +223,8 @@ export class EdgeRoom extends DurableObject<Env> {
 
   private async presence(): Promise<Response> {
     const stored = await this.ctx.storage.get<EdgePresence>("presence");
-    const connected = this.currentConnection() !== undefined;
+    // Speculative, unauthenticated presence must not fence/close stale sockets.
+    const connected = this.currentConnection(false) !== undefined;
     return Response.json({ ...(stored ?? {}), connected });
   }
 

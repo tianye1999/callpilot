@@ -4,7 +4,139 @@ Round 1 scope: source changes and offline verification only. Claude owns indepen
 review, relay deployment and physical-device acceptance. No Worker configuration,
 schema, Edge Python implementation or media state-machine change is required.
 
-## Round 2 (current implementation)
+## Round 3 / Task O (current cloud implementation)
+
+Supplied baseline: after ecfe4b3 / sim-relay a73dd401, Android outbound create
+claim_start -> claim_response is about 2.0s; each D1 round trip is about 180ms.
+These are supplied measurements, not another Codex deployment or dial.
+Claude's review correction supplies a 2026-11-04 05:37 trace: auth 166ms,
+presence 168ms, call_checks 180ms. Serializing presence after the combined batch
+would erase almost all the expected gain; that initial round-3 design is replaced
+below with speculative parallel presence.
+
+### Auth and checks: one fresh transaction, no credential cache
+
+- Valid create bodies use `authenticateDeviceWithReads`: active-device lookup,
+  idempotency lookup and hourly count share one read-only D1 batch. Secret SHA-256
+  validation and paired-Edge validation still precede consumption of call reads.
+  Invalid/missing/revoked credentials cannot return replay payloads, rate results,
+  create rows or update last-used bookkeeping. They may trigger one speculative
+  read-only EdgeRoom presence request after a valid body has been parsed.
+- Body parsing is performed first to construct the queries, but its error is held
+  until normal authentication succeeds. Thus invalid credentials plus an invalid
+  body still return 401; a valid device plus an invalid body returns the original
+  validation error. The 32 KiB bound and same-origin check remain unchanged.
+- `authenticateDevice` retains its single-query path for all other callers.
+  Last-used writes retain their existing conditional/await/background behavior.
+- Presence starts concurrently with auth_checks, with immediate rejection capture.
+  Its state/error is discarded on 401/403, replay or rate failure; it cannot change
+  their response status, error text or precedence. A stalled presence cannot block
+  these responses. No presence state or exception content is exposed to an
+  unauthenticated caller; existing stage-duration telemetry remains. The accepted
+  extra cost is one DO presence read for an unauthenticated valid-body request.
+- To make that read genuinely non-mutating, presence selects the current socket
+  without fencing older sockets. Previously currentConnection also serialized
+  replacement attachments, failed pending relays and closed stale sockets.
+  Command/media paths retain normal fencing; presence does not write storage or
+  attachments, close sockets or send commands. This is the only EdgeRoom change.
+- There is no Worker/DO credential cache, TTL, invalidation RPC or cached version.
+  Every create reads D1, including replays. Existing revokeDevice/unpair writes
+  remain authoritative across isolates. A revocation committed before the auth
+  read is observed immediately; no additional 60s (or other) grace period exists.
+  An already-authenticated in-flight request can still complete if revocation
+  commits after its read, as before. This does not cancel in-flight calls.
+- Both paths use the direct `env.DB` binding, not unconstrained replica sessions.
+  Cloudflare documents that without the Sessions API queries use the primary:
+  [D1 read replication](https://developers.cloudflare.com/d1/best-practices/read-replication/).
+  Batch statements execute in order in a transaction:
+  [D1 batch](https://developers.cloudflare.com/d1/worker-api/d1-database/#batch).
+
+### Insert: deliberately not combined
+
+Call insertion still follows authenticated replay -> rate -> presence admission.
+Presence supplies connected/modem/line-busy state AND the direct-media capability
+used for the inserted media_transport. Inserting speculatively in the checks batch
+would leave rows on offline/busy failures, consuming quota and idempotency keys.
+Waiting for presence before that batch would make replay/rate/auth results wait
+for a failed or stalled DO. A D1 transaction cannot branch on a future DO response;
+compensating deletes introduce observable pending rows and new race/failure cases.
+Within this round's preserved semantics, do not merge call_insert. No insertion
+round trip is saved. INSERT OR IGNORE, UNIQUE(device_id, idempotency_key), winner
+re-read and single-winner Edge command delivery remain intact. This does not add
+strict serialization of hourly quota admission for different concurrent keys.
+
+### Timing and expected savings
+
+- Valid POST /v1/calls replaces separate `auth` + `call_checks` with `auth_checks`.
+  It includes the fresh three-read batch, hash validation and any due last-used
+  write. Invalid-body requests retain `request_parse` + `auth` timing.
+- Presence and auth_checks start together after valid-body parsing. Auth failure,
+  wrong pairing, replay and rate results return without awaiting presence.
+  Remaining call_insert, edge_token, turn, sdp_relay, answer_parse,
+  call_finalize_read, edge_wait/do_total, fallback/error stages and outbound_create
+  logging remain. Do not add old auth/call_checks to new auth_checks comparisons.
+- Approximate old path: A + max(C, P); corrected new path: max(B, P), where A
+  is auth, C is checks, P is presence and B is the combined auth/checks batch.
+  With supplied A=166ms, C=180ms, P=168ms and estimated B=180ms, that is
+  346ms -> 180ms, saving about 166ms (2.0s -> about 1.83s if other costs hold).
+  Against the rejected serial B+P implementation, overlap saves about 168ms.
+  These are estimates, not post-correction measurements. SQL execution, cold
+  last-used writes and network variance can change the result.
+- Claude must compare new max(auth_checks, presence) against old auth +
+  max(call_checks, presence) on sim-relay and perform independent real-device
+  acceptance. No configuration, schema, migration, deployment or dial was done.
+
+Offline regression coverage uses an ordered BEGIN/COMMIT/ROLLBACK SQLite batch
+fixture, not Promise.all statements. It checks eight concurrent same-key requests
+yield one row, one Edge command, one 202 and seven 200 responses with one callId;
+revocation and actual unpair reject replays/new calls; invalid credentials cannot
+expose replay/rate/validation results; replay does not wait for stalled presence;
+rate/pairing/validation priority, offline/modem/busy no-insert and timing/privacy
+assertions remain covered. These are local tests, not workerd/production evidence.
+The correction additionally holds both batch and presence behind controllable
+promises and proves both are started before either is released. It verifies exact
+401/403 error bodies when presence rejects before authorization completes, replay
+while presence is held pending, replay despite presence failure, and read-only
+presence with stale OPEN sockets while a later command still performs fencing.
+
+Parallel-presence correction verification (all three commands exited 0):
+
+```text
+$ cd cloud && npx vitest run
+ Test Files  16 passed (16)
+      Tests  349 passed (349)
+   Start at  05:54:32
+   Duration  6.36s (transform 5.79s, setup 0ms, import 13.55s, tests 11.14s, environment 8ms)
+
+$ npm run typecheck
+> callpilot-cloud@0.1.0 typecheck
+> tsc --noEmit
+
+$ npm run lint
+> callpilot-cloud@0.1.0 lint
+> eslint .
+```
+
+Initial round-3 verification before the parallel-presence correction (historical;
+all three commands exited 0):
+
+```text
+$ cd cloud && npx vitest run
+ Test Files  16 passed (16)
+      Tests  346 passed (346)
+   Start at  05:37:48
+   Duration  7.14s (transform 8.83s, setup 0ms, import 16.38s, tests 12.20s, environment 4ms)
+
+$ npm run typecheck
+> callpilot-cloud@0.1.0 typecheck
+> tsc --noEmit
+
+$ npm run lint
+> callpilot-cloud@0.1.0 lint
+> eslint .
+```
+
+## Round 2 (historical implementation)
 
 Input evidence supplied by Claude: sim-relay ad0dbbc9, Android 0.7.7, 2026-11-04
 01:06. D1 stages take roughly 180ms each, outbound_create total 3095ms, Edge

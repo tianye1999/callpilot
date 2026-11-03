@@ -1,4 +1,4 @@
-import { authenticateDevice, authenticateEdge } from "./auth";
+import { authenticateDevice, authenticateDeviceWithReads, authenticateEdge } from "./auth";
 import { inboundOwnerAction, notifyOwnerDecision, rejectOwnerDecision } from "./inbound-owner";
 import { ClaimTiming } from "./claim-timing";
 import { claimInboundFastpathV2, fallbackInboundLivekit, inboundIce, completeInboundSdp, endInboundMedia } from "./inbound-fastpath-v2";
@@ -423,23 +423,31 @@ async function unregisterVoipToken(request: Request, env: Env, kind: "voip" | "a
 
 async function createCall(request: Request, env: Env, timing: ClaimTiming, ctx?: ExecutionContext): Promise<Response> {
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
-  const device = await timing.measure("auth", () => authenticateDevice(request, env));
-  const input = await timing.measure("request_parse", async () => createCallSchema.parse(await readJson(request, 32 * 1024)));
+  // Parse to construct the batch, but preserve auth-before-validation error precedence.
+  const parsed = await timing.measure("request_parse", async () => createCallSchema.parse(await readJson(request, 32 * 1024)))
+    .then(input => ({ input }), (error: unknown) => ({ error }));
+  if ("error" in parsed) {
+    await timing.measure("auth", () => authenticateDevice(request, env));
+    throw parsed.error;
+  }
+  const input = parsed.input;
+  // Speculation exposes no presence state/error before auth, pairing, replay and
+  // rate decisions. Its cost is one extra read-only DO presence read (no writes)
+  // for an unauthenticated request; capture rejection now so discarded results
+  // cannot change 401/403 content or become unhandled rejections.
+  const presenceTask = timing.measure("presence", async () => {
+    const response = await edgeRoom(env, input.edgeId).fetch("https://edge-room/presence");
+    return response.json<{ connected?: boolean; modemOnline?: boolean; lineBusy?: boolean; outboundDirectV1?: boolean }>();
+  }).then(value => ({ value }), (failure: unknown) => ({ failure }));
+  const { device, reads } = await timing.measure("auth_checks", () => authenticateDeviceWithReads(request, env, deviceId => [
+      env.DB.prepare("SELECT * FROM calls WHERE device_id = ?1 AND idempotency_key = ?2")
+        .bind(deviceId, input.idempotencyKey),
+      env.DB.prepare("SELECT COUNT(*) AS count FROM calls WHERE device_id = ?1 AND created_at > ?2")
+        .bind(deviceId, Date.now() - 60 * 60 * 1000)
+    ]));
   if (device.edge_id !== input.edgeId) throw new HttpError("FORBIDDEN", "Device is not paired to this Edge", 403);
 
-  const checks = timing.measure("call_checks", () => env.DB.batch([
-      env.DB.prepare("SELECT * FROM calls WHERE device_id = ?1 AND idempotency_key = ?2")
-        .bind(device.device_id, input.idempotencyKey),
-      env.DB.prepare("SELECT COUNT(*) AS count FROM calls WHERE device_id = ?1 AND created_at > ?2")
-        .bind(device.device_id, Date.now() - 60 * 60 * 1000)
-    ]));
-  const presenceTask = timing.measure("presence", async () => {
-      const response = await edgeRoom(env, input.edgeId).fetch("https://edge-room/presence");
-      return response.json<{ connected?: boolean; modemOnline?: boolean; lineBusy?: boolean; outboundDirectV1?: boolean }>();
-    }).then(value => ({ value }), failure => ({ failure }));
-  const reads = await checks;
   const duplicate = reads[0]!.results[0] as CallRecord | undefined;
-  // Speculative presence errors must not affect an idempotent replay or rate-limit precedence.
   if (duplicate) return json(outboundPayload(duplicate, callPayload(duplicate)), 200);
   const recent = reads[1]!.results[0] as { count: number } | undefined;
   if ((recent?.count ?? 0) >= 10) throw new HttpError("RATE_LIMITED", "Remote call limit reached", 429);

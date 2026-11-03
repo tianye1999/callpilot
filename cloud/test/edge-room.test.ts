@@ -154,13 +154,19 @@ describe("EdgeRoom current connection", () => {
     expect(await (await room.fetch(new Request("https://edge-room/presence"))).json()).toMatchObject({ connected: true });
   });
 
-  it("presence alone fences an old OPEN socket before a command", async () => {
+  it("presence is read-only even with stale OPEN sockets; commands still fence them", async () => {
     const old = edgeSocket(100);
     const latest = edgeSocket(200);
-    const { room } = edgeRoom([old, latest]);
+    const { room, state, prepare } = edgeRoom([old, latest]);
     expect(await (await room.fetch(new Request("https://edge-room/presence"))).json()).toMatchObject({ connected: true });
-    expect(old.close).toHaveBeenCalledWith(4001, "Replaced by a newer connection");
+    expect(old.serializeAttachment).not.toHaveBeenCalled();
+    expect(old.close).not.toHaveBeenCalled();
+    expect(latest.serializeAttachment).not.toHaveBeenCalled();
+    expect(latest.close).not.toHaveBeenCalled();
+    expect(state.storage.put).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
     expect((await room.fetch(command())).status).toBe(202);
+    expect(old.close).toHaveBeenCalledWith(4001, "Replaced by a newer connection");
     expect(latest.send).toHaveBeenCalledOnce();
     expect(old.send).not.toHaveBeenCalled();
   });

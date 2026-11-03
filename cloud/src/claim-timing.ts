@@ -2,7 +2,7 @@ type ClaimStage = "auth" | "offer_read" | "cas" | "edge_token" | "edge_send" | "
   | "permission" | "prepare_read" | "claim_finalize" | "cleanup_queue" | "claim_check" | "candidates"
   | "presence" | "prepare_batch" | "turn" | "sdp_relay" | "edge_reserve"
   | "idempotency" | "rate_read" | "call_insert" | "call_read" | "call_finalize" | "edge_wait" | "do_total"
-  | "request_parse" | "answer_parse" | "call_checks" | "call_finalize_read";
+  | "request_parse" | "answer_parse" | "call_checks" | "auth_checks" | "call_finalize_read";
 
 export class ClaimTiming {
   private readonly started = performance.now();

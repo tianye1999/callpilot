@@ -32,13 +32,22 @@ async function fixture(options: { edgeDirect?: boolean; enabled?: boolean; rateG
   db.prepare("INSERT INTO devices VALUES (?, ?, 'Test', ?, 0, ?, NULL)").run(device, edge, await sha256("secret"), Date.now());
   const env = {
     DB: {
-      batch: vi.fn(async (statements: D1PreparedStatement[]) =>
-        Promise.all(statements.map(statement => (statement as unknown as { execute(): unknown }).execute()))),
+      batch: vi.fn(async (statements: D1PreparedStatement[]) => {
+        await options.rateGate;
+        db.exec("BEGIN");
+        try {
+          const results = statements.map(statement => (statement as unknown as { execute(): unknown }).execute());
+          db.exec("COMMIT");
+          return results;
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
+        }
+      }),
       prepare: (sql: string) => ({ bind: (...values: SQLInputValue[]) => {
         const params = Object.fromEntries(values.map((value, index) => [String(index + 1), value]));
         return {
-          execute: async () => {
-            if (sql.includes("SELECT COUNT(*) AS count FROM calls")) await options.rateGate;
+          execute: () => {
             return { results: db.prepare(sql).all(params) };
           },
           first: async () => {
@@ -77,9 +86,9 @@ async function fixture(options: { edgeDirect?: boolean; enabled?: boolean; rateG
   });
   env.EDGE_ROOMS = { idFromName: (id: string) => id, get: vi.fn(() => ({ fetch: relay })) } as unknown as DurableObjectNamespace;
   const background: Promise<unknown>[] = [];
-  const request = (path: string, body?: object) => worker.fetch(new Request(`https://relay${path}`, {
+  const request = (path: string, body?: object, cookie = `${device}.secret`) => worker.fetch(new Request(`https://relay${path}`, {
     method: body === undefined ? "GET" : "POST",
-    headers: { Origin: "https://relay", "Content-Type": "application/json", Cookie: `__Host-callpilot-device=${device}.secret` },
+    headers: { Origin: "https://relay", "Content-Type": "application/json", Cookie: `__Host-callpilot-device=${cookie}` },
     ...(body === undefined ? {} : { body: JSON.stringify(body) })
   }), env, { waitUntil: (operation: Promise<unknown>) => { background.push(operation); } } as unknown as ExecutionContext);
   const turn = vi.fn(async () => Response.json({ iceServers }));
@@ -123,11 +132,78 @@ describe("outbound direct device feature", () => {
 });
 
 describe("outbound direct create", () => {
+  it("batches fresh auth with checks and rejects revoked credentials even on replay", async () => {
+    const f = await fixture();
+    const response = await f.request("/v1/calls", create());
+    expect(response.status).toBe(202);
+    expect(response.headers.get("Server-Timing")).toMatch(/auth_checks;dur=/);
+    expect(f.env.DB.batch).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(f.env.DB.batch).mock.calls[0]![0]).toHaveLength(3);
+    f.db.prepare("UPDATE devices SET revoked_at = ? WHERE device_id = ?").run(Date.now(), device);
+    expect((await f.request("/v1/calls", create())).status).toBe(401);
+    expect(f.commands).toHaveLength(1);
+  });
+
+  it("does not expose replay, rate or validation results to invalid credentials", async () => {
+    const f = await fixture();
+    for (let i = 0; i < 10; i++) await f.request("/v1/calls", create(`idempotency-key-${i.toString().padStart(4, "0")}`));
+    f.relay.mockClear();
+    f.db.prepare("UPDATE devices SET last_used_at = 0").run();
+    for (const body of [create(), {}, create("new-idempotency-key", {})]) {
+      expect((await f.request("/v1/calls", body, `${device}.wrong`)).status).toBe(401);
+    }
+    expect((await f.request("/v1/calls", create(), "device_missingabc.secret")).status).toBe(401);
+    expect((await f.request("/v1/calls", create(), "")).status).toBe(401);
+    expect(f.db.prepare("SELECT last_used_at FROM devices").get()).toMatchObject({ last_used_at: 0 });
+    expect(f.relay.mock.calls.every(([url]) => url.endsWith("/presence"))).toBe(true);
+    expect(f.commands).toHaveLength(10);
+  });
+
+  it("rejects replay and new calls immediately after the device unpairs", async () => {
+    const f = await fixture();
+    await f.request("/v1/calls", create());
+    const unpaired = await worker.fetch(new Request("https://relay/v1/device", {
+      method: "DELETE", headers: { Origin: "https://relay", Cookie: `__Host-callpilot-device=${device}.secret` }
+    }), f.env);
+    expect(unpaired.status).toBe(200);
+    f.relay.mockClear();
+    expect((await f.request("/v1/calls", create())).status).toBe(401);
+    expect((await f.request("/v1/calls", create("another-idempotency-key"))).status).toBe(401);
+    expect(f.relay.mock.calls.every(([url]) => url.endsWith("/presence"))).toBe(true);
+    expect(f.commands).toHaveLength(1);
+  });
+
+  it("keeps pairing and validation errors ahead of replay and presence", async () => {
+    const f = await fixture();
+    await f.request("/v1/calls", create());
+    f.relay.mockClear();
+    expect((await f.request("/v1/calls", { ...create(), edgeId: "edge_otherabcdefg" })).status).toBe(403);
+    expect((await f.request("/v1/calls", {})).status).toBe(400);
+    expect(f.relay.mock.calls.every(([url]) => url.endsWith("/presence"))).toBe(true);
+  });
+
+  it.each([
+    { connected: false },
+    { connected: true, modemOnline: false },
+    { connected: true, lineBusy: true }
+  ])("does not insert a call when presence rejects admission: %j", async state => {
+    const f = await fixture();
+    f.relay.mockResolvedValue(Response.json(state));
+    expect((await f.request("/v1/calls", create())).status).toBe(409);
+    expect(f.db.prepare("SELECT COUNT(*) AS count FROM calls").get()).toMatchObject({ count: 0 });
+    expect(f.commands).toHaveLength(0);
+  });
   it("returns an idempotent replay without waiting for stalled speculative presence", async () => {
     const f = await fixture();
     await f.request("/v1/calls", create());
-    f.relay.mockImplementationOnce(() => new Promise<Response>(() => {}));
-    expect((await f.request("/v1/calls", create())).status).toBe(200);
+    f.relay.mockClear();
+    let release!: (response: Response) => void;
+    const presence = new Promise<Response>(resolve => { release = resolve; });
+    f.relay.mockImplementationOnce(() => presence);
+    try {
+      expect((await f.request("/v1/calls", create())).status).toBe(200);
+      expect(f.relay).toHaveBeenCalledExactlyOnceWith("https://edge-room/presence");
+    } finally { release(Response.json({ connected: false })); }
     expect(f.commands).toHaveLength(1);
     await Promise.all(f.background);
   });
@@ -147,10 +223,11 @@ describe("outbound direct create", () => {
 
   it("keeps INSERT OR IGNORE races idempotent with only one Edge command", async () => {
     const f = await fixture();
-    const responses = await Promise.all([f.request("/v1/calls", create()), f.request("/v1/calls", create())]);
-    expect(responses.map(response => response.status).sort()).toEqual([200, 202]);
+    const responses = await Promise.all(Array.from({ length: 8 }, () => f.request("/v1/calls", create())));
+    expect(responses.map(response => response.status).sort()).toEqual([200, 200, 200, 200, 200, 200, 200, 202]);
     const bodies = await Promise.all(responses.map(response => response.json() as Promise<{ callId: string }>));
-    expect(bodies[0]!.callId).toBe(bodies[1]!.callId);
+    expect(new Set(bodies.map(body => body.callId)).size).toBe(1);
+    expect(f.db.prepare("SELECT COUNT(*) AS count FROM calls").get()).toMatchObject({ count: 1 });
     expect(f.commands).toHaveLength(1);
     await Promise.all(f.background);
   });
@@ -170,19 +247,56 @@ describe("outbound direct create", () => {
     expect(JSON.stringify(warning.mock.calls)).not.toContain("private audit failure");
   });
 
-  it("fetches presence while the independent rate read is still pending", async () => {
-    let release!: () => void;
-    const rateGate = new Promise<void>(resolve => { release = resolve; });
+  it("starts presence and auth/checks concurrently while both results are blocked", async () => {
+    let releaseAuth!: () => void;
+    let releasePresence!: (response: Response) => void;
+    const rateGate = new Promise<void>(resolve => { releaseAuth = resolve; });
+    const presenceGate = new Promise<Response>(resolve => { releasePresence = resolve; });
     const f = await fixture({ rateGate });
+    f.relay.mockImplementationOnce(() => presenceGate);
     const pending = f.request("/v1/calls", create());
     try {
-      await vi.waitFor(() => expect(f.relay.mock.calls.some(([url]) => url.endsWith("/presence"))).toBe(true));
+      await vi.waitFor(() => {
+        expect(f.env.DB.batch).toHaveBeenCalledOnce();
+        expect(f.relay).toHaveBeenCalledExactlyOnceWith("https://edge-room/presence");
+      });
       expect(f.commands).toHaveLength(0);
-    } finally { release(); }
+    } finally {
+      releaseAuth();
+      releasePresence(Response.json({ connected: true, modemOnline: true, outboundDirectV1: true }));
+      await pending;
+    }
     expect((await pending).status).toBe(202);
   });
 
-  it("preserves rate-limit precedence even when parallel presence fails, and bypasses both for replay", async () => {
+  it.each(["invalid", "revoked", "wrong-edge"])("discards rejected speculative presence for %s authorization", async kind => {
+    let release!: () => void;
+    const rateGate = new Promise<void>(resolve => { release = resolve; });
+    const f = await fixture({ rateGate });
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    if (kind === "revoked") f.db.prepare("UPDATE devices SET revoked_at = 1").run();
+    f.relay.mockRejectedValue(new Error("private speculative presence failure"));
+    const body = kind === "wrong-edge" ? { ...create(), edgeId: "edge_otherabcdefg" } : create();
+    const pending = f.request("/v1/calls", body, `${device}.${kind === "invalid" ? "wrong" : "secret"}`);
+    try {
+      await vi.waitFor(() => {
+        expect(f.env.DB.batch).toHaveBeenCalledOnce();
+        expect(f.relay).toHaveBeenCalledOnce();
+      });
+    } finally { release(); await pending; }
+    const response = await pending;
+    expect(response.status).toBe(kind === "wrong-edge" ? 403 : 401);
+    expect(await response.json()).toEqual({ error: {
+      code: kind === "wrong-edge" ? "FORBIDDEN" : "UNAUTHORIZED",
+      message: kind === "wrong-edge" ? "Device is not paired to this Edge" : "Credential is missing, invalid, or revoked",
+      requestId: expect.stringMatching(/^req_/)
+    } });
+    expect(f.commands).toHaveLength(0);
+    expect(f.db.prepare("SELECT COUNT(*) AS count FROM calls").get()).toMatchObject({ count: 0 });
+    expect(errorLog).not.toHaveBeenCalled();
+  });
+
+  it("preserves rate-limit precedence with failed presence and returns replay despite that failure", async () => {
     const f = await fixture();
     for (let i = 0; i < 10; i++) await f.request("/v1/calls", create(`idempotency-key-${i.toString().padStart(4, "0")}`));
     f.relay.mockRejectedValue(new Error("synthetic presence failure"));
@@ -200,9 +314,11 @@ describe("outbound direct create", () => {
     f.setEdgeReply(() => Response.json({ error: "timeout" }, { status: 504 }));
     const response = await f.request("/v1/calls", create());
     expect(response.headers.get("Server-Timing")).toMatch(/sdp_relay;dur=/);
+    expect(response.headers.get("Server-Timing")).toMatch(/auth_checks;dur=/);
     const summary = log.mock.calls.map(args => JSON.parse(args[0] as string) as Record<string, unknown>)
       .find(entry => entry.event === "outbound_create");
     expect(summary).toMatchObject({ status: 504 });
+    expect(summary!.auth_checks).toBeTypeOf("number");
     expect(summary!.callId).toMatch(/^call_/);
     expect(JSON.stringify(summary)).not.toContain("temporary-password");
     expect(JSON.stringify(summary)).not.toContain("v=0");
