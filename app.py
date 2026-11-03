@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import webbrowser
+from collections.abc import Callable
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -46,6 +47,9 @@ def _restart_after_cleanup() -> None:
     the tray to reconcile instead: exec of an overwritten bundle could otherwise
     put new service code beside an old bridge.
     """
+    if sys.platform == "win32" and config._is_frozen():
+        # Windows tray owns the restart budget and the next process instance.
+        return
     if sys.platform == "darwin":
         from agentcall.macos_launchd import APP_LABEL
 
@@ -129,7 +133,12 @@ def _enable_thread_dump() -> None:
         pass
 
 
-def main() -> None:
+def main(*, stop_requested: Callable[[], bool] | None = None, hardware_selftest: bool = False) -> None:
+    if hardware_selftest:
+        from agentcall.windows_smoke import run
+
+        run(stop_requested)
+        return
     load_dotenv(config.env_file_path())
     _force_utf8()
 
@@ -328,6 +337,15 @@ def main() -> None:
     url = f"http://{host}:{port}"
     logger.info("网页仪表盘已启动: %s", url)
     _open_browser_later(url)
+
+    def check_stop() -> None:
+        if stop_requested is not None and stop_requested():
+            loop.stop()
+        else:
+            loop.call_later(0.25, check_stop)
+
+    if stop_requested is not None:
+        loop.call_later(0.25, check_stop)
 
     try:
         loop.run_forever()

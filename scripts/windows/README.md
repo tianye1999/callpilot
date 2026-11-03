@@ -1,8 +1,24 @@
-# CallPilot Windows 第一阶段
+# CallPilot Windows
 
 状态：SIM7600G 驱动、真实 COM 口与双向音频均**待硬件验证**。打包与无界面自检由 CI 验证。
-当前 zip 是桌面薄前端，不是独立后端安装器；后端仍需要源码目录、Python venv 和计划任务。
-本阶段不提供 MSI、签名或自动安装驱动，不携带 API 密钥与模型资产。
+第二阶段代码已加入随包后端、托盘与 Inno Setup 安装器，Windows CI 首次验收待完成。
+不提供 MSI、签名或自动安装驱动，不携带 API 密钥与模型资产。
+
+## 成品安装与升级
+
+CI artifact 同时包含 `CallPilot-<version>-setup.exe`、便携 ZIP 和安装后自检 JSON。
+setup 按当前用户安装到 `%LOCALAPPDATA%\Programs\CallPilot`，无需管理员。
+可选登录自启写入 HKCU Run；默认启动托盘，托盘管理 `--service` 后端并按需启动
+`--window` 面板，关闭面板不会停止服务。自动重启最多五次，退避 1/2/4/8/16 秒。
+
+配置在 `%LOCALAPPDATA%\CallPilot\.env`，数据与日志分别在该目录的 `data` 与 `logs`。
+首次配置来自包内 `.env.example`，移除三个 Mac 端口/音频覆盖项，让 Windows 默认值生效；
+已有用户配置不覆盖。SIM7600 用户仍须按下文选择厂商并填写 AI 凭证。
+升级/卸载先通过旧 EXE 的 `--shutdown` 优雅停止；超时中止，不强杀。
+卸载保留用户数据，并提示可手动删除。旧源码计划任务不自动迁移，须先手动注销，
+第一阶段薄前端也须先关闭，避免与成品后端争用端口。
+
+完整协议与 CI 验收范围见 [任务 P](../../docs/task-p-windows-installer.md)。
 
 ## SIM7600G 驱动与端口
 
@@ -60,14 +76,15 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1 status
 
 `restart` 重启，`uninstall` 停止并移除任务；它不是 exe 安装器。
 任务登录自启、失败重启；源码日志在 `data\app_console.log`，面板为 http://127.0.0.1:47100。
-冻结前端可写数据默认在 `%LOCALAPPDATA%\CallPilot`；源码后端 `.env` 仍在项目根目录。
+冻结版可写数据默认在 `%LOCALAPPDATA%\CallPilot`；源码后端 `.env` 仍在项目根目录。
 
 ## CI 与本地打包
 
 `windows-package` 仅在 main push 和 PR 自动运行，无手动触发入口。
 GitHub Actions → CI → 对应成功 run → Artifacts → `CallPilot-windows-x64`，
 下载解压 artifact，再解压其中的 `CallPilot-windows-x64.zip`，保留整个 CallPilot 目录，不能只拷 exe。
-包内 `selftest.json` 是该次自检报告，不证明 GUI、常驻或真实通话已验收。
+包内 `selftest.json` 是重定位自检报告，artifact 的 `installer-selftest.json` 是安装后报告；
+安装验收还检查安全后端版本、覆盖升级及卸载保留数据，不证明 GUI、常驻或真实通话已验收。
 目标机仍需 Microsoft Edge WebView2 Runtime 与 .NET Framework（pywebview WinForms 要求）。
 
 本地复现（只在 Windows 构建 Windows 产物）：

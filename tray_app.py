@@ -512,6 +512,11 @@ def _handoff_previous_tray():
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        from agentcall.windows_runtime import main as windows_main
+
+        windows_main()
+        return
     _prepend_runtime_paths()
     if "--selftest" in sys.argv[1:]:
         # 打包后 import 自检（不起服务/不装 launchd）：验证关键模块真进了 bundle。

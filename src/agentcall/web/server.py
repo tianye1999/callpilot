@@ -631,7 +631,8 @@ async def _meta(request: web.Request) -> web.Response:
     meta["credentials"] = config.credential_status(meta.get("provider"))
     meta["setup_required"] = config.setup_required()
     tray = request.query.get("tray") == "1"
-    usb_online = _tray_usb_online(request.app, "tray" if tray else "meta")
+    usb_online = (False if request.app.get("hardware_selftest")
+                  else _tray_usb_online(request.app, "tray" if tray else "meta"))
     task = request.app["tray_usb"]["task"]
     if not tray and not _line_busy(request.app) and task is not None:
         await asyncio.shield(task)

@@ -18,7 +18,7 @@ jobs:
   windows-package:
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: windows-latest
-    timeout-minutes: 19
+    timeout-minutes: 15
     env:
       PYTHONUTF8: "1"
     steps:
@@ -60,12 +60,29 @@ jobs:
             throw 'Invalid frozen selftest report'
           }
           Copy-Item $env:CALLPILOT_SELFTEST_REPORT dist/CallPilot/selftest.json
-      - name: Zip portable frontend
+      - name: Build Inno Setup installer
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          }
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read version' }
+          & $iscc "/DAppVersion=$version" packaging/windows/CallPilot.iss
+          if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
+      - name: Installed backend and uninstall smoke test (no hardware)
+        timeout-minutes: 4
+        run: scripts/windows/test_installer.ps1
+      - name: Zip portable app
         run: Compress-Archive -Path dist/CallPilot -DestinationPath dist/CallPilot-windows-x64.zip
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: CallPilot-windows-x64
-          path: dist/CallPilot-windows-x64.zip
+          path: |
+            dist/CallPilot-windows-x64.zip
+            dist/CallPilot-*-setup.exe
+            dist/installer-selftest.json
           if-no-files-found: error
           retention-days: 14
 

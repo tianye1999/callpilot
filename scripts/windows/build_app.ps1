@@ -1,4 +1,4 @@
-﻿# 打包 CallPilot.exe（薄前端窗口，对应 macOS 的 scripts/build_app.sh）
+﻿# 打包 CallPilot.exe（托盘 + 后端 + 按需面板，共用 EXE 分角色运行）
 #
 # 用法：powershell -ExecutionPolicy Bypass -File scripts\windows\build_app.ps1
 # 产物：dist\CallPilot\CallPilot.exe

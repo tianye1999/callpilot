@@ -30,7 +30,8 @@ def run() -> int:
                 importlib.import_module(name)
             if platforms.IS_WINDOWS:
                 # Load the native/pythonnet assemblies but never construct a Form.
-                for name in ("clr", "webview.platforms.winforms", "webview.platforms.edgechromium"):
+                for name in ("clr", "webview.platforms.winforms", "webview.platforms.edgechromium",
+                             "pystray._win32", "PIL.Image", "agentcall.windows_runtime"):
                     importlib.import_module(name)
         result["defaults"] = {
             "modem_port": platforms.default_modem_port(),

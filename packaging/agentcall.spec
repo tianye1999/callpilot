@@ -31,6 +31,8 @@ from agentcall.platforms import IS_MACOS, IS_WINDOWS
 
 datas = []
 datas.append((str(project_root / "pyproject.toml"), "."))
+if IS_WINDOWS:
+    datas.append((str(project_root / ".env.example"), "."))
 binaries = []
 hiddenimports = [
     "webview",
@@ -114,7 +116,8 @@ elif IS_WINDOWS:
     # Windows 后端 = WinForms + EdgeChromium(WebView2)，经 pythonnet 的 clr 加载；
     # pythonnet/clr 的打包细节由 pyinstaller-hooks-contrib 兜底。【待硬件验证】
     hiddenimports += ["webview.platforms.winforms", "webview.platforms.edgechromium", "clr"]
-    gui_packages = ("webview",)
+    hiddenimports += ["pystray._win32"]
+    gui_packages = ("webview", "pystray", "PIL")
 else:
     gui_packages = ("webview",)
 
@@ -127,8 +130,8 @@ for package_name in gui_packages:
 
 a = Analysis(
     # macOS 入口 = 菜单栏托盘 App（tray_app 惰性拉起 desktop_app 的面板窗口）；
-    # 其余平台仍以窗口 desktop_app 为入口（无菜单栏概念）。
-    [str(project_root / ("tray_app.py" if IS_MACOS else "desktop_app.py"))],
+    # Windows 复用托盘入口，惰性分发到 Windows roles；Linux 保留窗口入口。
+    [str(project_root / ("tray_app.py" if IS_MACOS or IS_WINDOWS else "desktop_app.py"))],
     pathex=[str(project_root), str(project_root / "src")],
     binaries=binaries,
     datas=datas,
