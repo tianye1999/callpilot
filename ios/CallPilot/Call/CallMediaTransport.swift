@@ -7,6 +7,7 @@ enum CallMediaTransportEvent: Equatable, Sendable {
     case permissionsReady(Bool)
     case tracksChanged
     case audioEngine(CallAudioEngineSnapshot, failed: Bool)
+    case audioDiagnostic(CallAudioEngineSnapshot, stage: CallTimingMark, at: TimeInterval)
     case rtpStats(Data)
     case participantLeft(String)
 }
@@ -62,6 +63,12 @@ struct CallAudioEngineSnapshot: Codable, Equatable, Sendable {
     // platformDefault uses a VoIP AudioUnit, not AVAudioEngine. Its valid
     // readiness evidence is recording/playing; engineState is diagnostic only.
     var platformAudioReady: Bool { recording && playing }
+    var standaloneAudioReady: Bool {
+        platformAudioReady && audioSession?.category == "AVAudioSessionCategoryPlayAndRecord" &&
+            audioSession?.mode == "AVAudioSessionModeVoiceChat" &&
+            audioSession?.inputAvailable == true && (audioSession?.inputNumberOfChannels ?? 0) > 0 &&
+            audioSession?.inputs.isEmpty == false
+    }
 }
 
 struct CallAudioSessionSnapshot: Codable, Equatable, Sendable {
@@ -86,10 +93,14 @@ enum CallDirectAudioStartup {
 
     static func verify(snapshot: () -> CallAudioEngineSnapshot,
                        repair: () -> Bool,
+                       requiresStandaloneSession: Bool = false,
                        wait: (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) async throws -> CallAudioEngineSnapshot {
-        if snapshot().platformAudioReady { return snapshot() }
+        func ready(_ state: CallAudioEngineSnapshot) -> Bool {
+            requiresStandaloneSession ? state.standaloneAudioReady : state.platformAudioReady
+        }
+        if ready(snapshot()) { return snapshot() }
         guard repair() else { throw CallAudioError.answerExpired }
-        if !snapshot().platformAudioReady { try await wait(maximum) }
+        if !ready(snapshot()) { try await wait(maximum) }
         try Task.checkCancellation()
         return snapshot()
     }
@@ -119,6 +130,7 @@ protocol CallDirectMediaTransport: CallMediaTransport {
     func activateDirectAudio() throws
     // A protocol requirement so the concrete transport's override is dispatched.
     func activateStandaloneAudio() throws
+    func captureAudioDiagnostic(stage: CallTimingMark)
     // Synchronous revocation fences audio before an uncooperative SDK teardown.
     func stopDirectAudio()
     var latestRtpStats: Data? { get }
@@ -126,6 +138,7 @@ protocol CallDirectMediaTransport: CallMediaTransport {
 }
 
 extension CallDirectMediaTransport {
+    func captureAudioDiagnostic(stage: CallTimingMark) {}
     var latestRtpStats: Data? { nil }
     func finishRtpSampling() {}
     /// A8: app-dialed calls have no CallKit activation to wait for.

@@ -421,14 +421,15 @@ final class CallMediaSession {
     private func startOutboundDirect(client: HostedCloudClient, edgeId: String, packet: Data,
                                      attempt: UInt64) async throws -> Bool {
         guard let directTransportFactory else { return false }
-        let servers: [CallIceServer]
-        do { servers = try await client.outboundIceServers(edgeId: edgeId) }
-        catch is CancellationError { throw CancellationError() }
-        catch { return false }
-        try checkCurrent(attempt)
         let connection = directTransportFactory()
         transport = connection
         installEvents(connection, attempt: attempt)
+        connection.captureAudioDiagnostic(stage: .audioLeaseEnd)
+        let servers: [CallIceServer]
+        do { servers = try await client.outboundIceServers(edgeId: edgeId) }
+        catch is CancellationError { throw CancellationError() }
+        catch { detachDirect(connection); return false }
+        try checkCurrent(attempt)
         timing.mark(.preconnectStart)
         let offer: String
         do { offer = try await connection.prepareDirect(servers: servers) }
@@ -439,6 +440,7 @@ final class CallMediaSession {
         }
         try checkCurrent(attempt)
         timing.mark(.preconnectReady)
+        connection.captureAudioDiagnostic(stage: .preconnectReady)
         timing.mark(.claimStart)
         let call = try await client.createDirectCall(edgeId: edgeId, sdpOffer: offer)
         timing.mark(.claimResponse)
@@ -911,6 +913,12 @@ final class CallMediaSession {
                 if let packet = lastDirectRtpStats { try? await connection.publishControl(packet) }
             }
             scheduleTiming()
+        case let .audioDiagnostic(snapshot, stage, instant):
+            timing.recordAudioDiagnostic(snapshot, stage: stage, at: instant)
+            scheduleTiming()
+            // Preserve the evidence before a following startup failure detaches
+            // this transport. Pre-channel observations stay in the bounded queue.
+            if directControlOpen { await timingTask?.value }
         case let .audioEngine(snapshot, failed):
             timing.recordAudioEngine(snapshot)
             timing.mark(failed ? .audioEngineFailed : .audioEngineRunning)

@@ -56,6 +56,13 @@ final class CallTiming {
     private var sentCloudDurations = Set<String>()
     private(set) var sequence = 0
     private var audioEngine: CallAudioEngineSnapshot?
+    private var audioDiagnostics: [(CallAudioEngineSnapshot, CallTimingMark, TimeInterval)] = []
+
+    func recordAudioDiagnostic(_ snapshot: CallAudioEngineSnapshot, stage: CallTimingMark, at: TimeInterval) {
+        // Bound pre-channel storage. Each observation gets its own immutable batch.
+        guard audioDiagnostics.count < 16 else { return }
+        audioDiagnostics.append((snapshot, stage, at))
+    }
     private let logger = Logger(subsystem: "ai.bondings.callpilot.sim", category: "CallTiming")
 
     init(now: @escaping () -> TimeInterval = CallMonotonic.now) {
@@ -108,6 +115,19 @@ final class CallTiming {
         // milestone-per-packet channel must not exhaust the shared seq limit.
         let reserved = !isHTTPReplay && marks[.directControlReady] != nil ? 8 : 0
         guard sequence < Self.maxBatches - reserved else { return nil }
+        if let (snapshot, stage, instant) = audioDiagnostics.first {
+            let ms = min(86_400_000, max(-60_000, ((instant - origin) * 1_000_000).rounded() / 1000))
+            guard let engine = try? JSONEncoder().encode(snapshot),
+                  let object = try? JSONSerialization.jsonObject(with: engine),
+                  let data = try? JSONSerialization.data(withJSONObject: [
+                    "type": "client_timing", "v": 1, "attempt": attempt, "seq": sequence + 1,
+                    "marks": [stage.rawValue: ms], "audioEngine": object,
+                  ], options: [.sortedKeys]), data.count <= Self.maxBatchBytes else { return nil }
+            audioDiagnostics.removeFirst()
+            sequence += 1
+            logger.info("attempt=\(self.attempt, privacy: .public) audio_diagnostic_seq=\(self.sequence) stage=\(stage.rawValue, privacy: .public) ms=\(ms)")
+            return data
+        }
         let keys = CallTimingMark.allCases.filter { marks[$0] != nil && !sent.contains($0) }
             .prefix(Self.maxBatchMarks)
         let cloudKeys = cloudDurations.keys.sorted().filter { !sentCloudDurations.contains($0) }

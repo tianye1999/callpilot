@@ -58,6 +58,26 @@ final class CallKitConfigurationTests: XCTestCase {
         XCTAssertTrue(activation.contains("verifyActivatedAudioIfReady()"))
     }
 
+    func testDirectActivationRefreshesCachedRTCConfigurationBeforeOpeningGate() throws {
+        let source = try String(contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/WebRtcDirectTransport.swift"), encoding: .utf8)
+        let activation = try section(source, from: "static func activate(_ id", to: "static func release(_ id")
+        try assertBefore("try gate.activate(id)", "synchronizeRTCConfiguration(session)", in: activation)
+        try assertBefore("synchronizeRTCConfiguration(session)", "session.audioSessionDidActivate", in: activation)
+        try assertBefore("synchronizeRTCConfiguration(session)", "session.isAudioEnabled = true", in: activation)
+        let sync = try section(source, from: "private static func synchronizeRTCConfiguration", to: "static func release(_ id")
+        try assertBefore("session.lockForConfiguration()", "LKRTCAudioSessionConfiguration.webRTC()", in: sync)
+        XCTAssertTrue(sync.contains("defer { session.unlockForConfiguration() }"))
+        for field in ["category", "categoryOptions", "mode"] {
+            XCTAssertTrue(sync.contains("config.\(field) = current.\(field)"))
+        }
+        for field in ["sampleRate", "ioBufferDuration", "inputNumberOfChannels", "outputNumberOfChannels"] {
+            XCTAssertTrue(sync.contains("config.\(field) = previous.\(field)"))
+        }
+        XCTAssertTrue(sync.contains("LKRTCAudioSessionConfiguration.setWebRTC(config)"))
+        XCTAssertFalse(sync.contains("setCategory("))
+        XCTAssertFalse(sync.contains("setActive("))
+    }
+
     func testEndedResultTimerUsesFiveSecondsAndFencesDismissal() throws {
         let source = try String(
             contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8

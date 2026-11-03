@@ -20,6 +20,9 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
     private var standaloneAudio = false
     private var transportConnected = false
     private var audioVerificationTask: Task<Void, Never>?
+    private var audioObservationTask: Task<Void, Never>?
+    private var audioNotifications: [NSObjectProtocol] = []
+    private let audioLog = Logger(subsystem: "ai.bondings.callpilot.sim", category: "DirectAudio")
     private(set) var latestRtpStats: Data?
     private var latestRtpSequence = 0
     private lazy var rtpSampler = CallRtpSampler { [weak self] sequence, elapsed in
@@ -127,13 +130,53 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
 
     /// A8: an app-dialed call owns the audio session itself instead of CallKit.
     func activateStandaloneAudio() throws {
-        let session = AVAudioSession.sharedInstance()
-        // .voiceChat implies Bluetooth HFP routing.
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [])
-        try session.setActive(true)
+        try ensureOpen()
+        guard !audioRevoked else { throw DirectMediaError.audioInactive }
         standaloneAudio = true
+        try configureStandaloneSession()
         try activateDirectAudio()
+        captureAudioDiagnostic(stage: .activateReturn)
         applyStandaloneRoute()
+        let activatedAt = ContinuousClock.now
+        audioObservationTask = Task { [weak self] in
+            for delay: Duration in [.milliseconds(300), .seconds(1), .seconds(3)] {
+                do { try await Task.sleep(until: activatedAt.advanced(by: delay), clock: .continuous) }
+                catch { return }
+                guard let self, !closed, !audioRevoked else { return }
+                captureAudioDiagnostic(stage: .audioEngineRunning)
+            }
+        }
+    }
+
+    private func configureStandaloneSession() throws {
+        let rtc = LKRTCAudioSession.sharedInstance()
+        let session = AVAudioSession.sharedInstance()
+        do {
+            rtc.lockForConfiguration()
+            defer { rtc.unlockForConfiguration() }
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [])
+        } catch {
+            audioLog.error("setCategory failed: \(String(describing: error), privacy: .public)")
+            logAudio("setCategory failure")
+            captureAudioDiagnostic(stage: .configureStart)
+            throw error
+        }
+        // ADM getters can synchronously enter the worker thread. Never read
+        // them while holding the session lock that worker may need itself.
+        logAudio("setCategory success")
+        captureAudioDiagnostic(stage: .configureStart)
+        do {
+            rtc.lockForConfiguration()
+            defer { rtc.unlockForConfiguration() }
+            try session.setActive(true)
+        } catch {
+            audioLog.error("setActive failed: \(String(describing: error), privacy: .public)")
+            logAudio("setActive failure")
+            captureAudioDiagnostic(stage: .configureEnd)
+            throw error
+        }
+        logAudio("setActive success")
+        captureAudioDiagnostic(stage: .configureEnd)
     }
 
     private func applyStandaloneRoute() {
@@ -144,6 +187,9 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
     func stopDirectAudio() {
         finishRtpSampling()
         audioVerificationTask?.cancel()
+        audioObservationTask?.cancel()
+        audioNotifications.forEach { NotificationCenter.default.removeObserver($0) }
+        audioNotifications.removeAll()
         audioRevoked = true
         microphone?.isEnabled = false
         delegate.revokeAudio()
@@ -180,18 +226,31 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
         // repair a failed readback; do not replace that working primary path.
         let result: CallAudioEngineSnapshot
         do {
-            result = try await CallDirectAudioStartup.verify(snapshot: { self.audioSnapshot(module) }, repair: {
+            result = try await CallDirectAudioStartup.verify(snapshot: { self.sessionSnapshot() }, repair: {
+                if self.standaloneAudio {
+                    guard !Task.isCancelled, !self.audioRevoked, !self.closed else { return false }
+                    // A recording flag alone does not prove an input-capable session.
+                    // Stop both sides so a stale AudioUnit cannot survive reconfiguration.
+                    let stopRecord = module.stopRecording()
+                    let stopPlay = module.stopPlayout()
+                    self.audioLog.info("standalone repair stopRecording=\(stopRecord) stopPlayout=\(stopPlay)")
+                    do { try self.configureStandaloneSession() }
+                    catch { return false }
+                    guard stopRecord == 0, stopPlay == 0 else { return false }
+                }
                 let recording = module.initAndStartRecording()
                 let playoutInit = module.initPlayout()
                 let playout = module.startPlayout()
+                if self.standaloneAudio { self.applyStandaloneRoute() }
+                self.audioLog.info("ADM repair recording=\(recording) initPlayout=\(playoutInit) playout=\(playout)")
                 return recording == 0 && playoutInit == 0 && playout == 0
-            })
+            }, requiresStandaloneSession: standaloneAudio)
         } catch {
             if !Task.isCancelled, !audioRevoked { await reportAudio(module, failed: true) }
             return
         }
         guard !Task.isCancelled, !audioRevoked, !closed else { return }
-        let failed = !result.platformAudioReady
+        let failed = !(standaloneAudio ? result.standaloneAudioReady : result.platformAudioReady)
         await reportAudio(module, failed: failed)
         if failed { microphone?.isEnabled = false }
     }
@@ -225,15 +284,55 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
             inputMuted: state.inputMuted.boolValue, muteMode: state.muteMode.rawValue)
     }
 
-    private func reportAudio(_ module: LKRTCAudioDeviceModule, failed: Bool) async {
-        var snapshot = audioSnapshot(module)
+    private func sessionSnapshot() -> CallAudioEngineSnapshot {
+        var snapshot = factory.map { audioSnapshot($0.audioDeviceModule) } ?? CallAudioEngineSnapshot(
+            running: false, recording: false, playing: false, inputEnabled: false, inputRunning: false,
+            outputEnabled: false, outputRunning: false, inputMuted: false, muteMode: -1)
         let session = AVAudioSession.sharedInstance()
         snapshot.audioSession = CallAudioSessionSnapshot(
             category: session.category.rawValue, mode: session.mode.rawValue,
             inputAvailable: session.isInputAvailable, inputNumberOfChannels: session.inputNumberOfChannels,
             inputs: session.currentRoute.inputs.prefix(8).map { $0.portType.rawValue },
             outputs: session.currentRoute.outputs.prefix(8).map { $0.portType.rawValue })
-        await eventHandler?(.audioEngine(snapshot, failed: failed))
+        return snapshot
+    }
+
+    func captureAudioDiagnostic(stage: CallTimingMark) {
+        guard !closed, !audioRevoked else { return }
+        if audioNotifications.isEmpty {
+            for name in [AVAudioSession.routeChangeNotification, AVAudioSession.interruptionNotification,
+                         AVAudioSession.mediaServicesWereResetNotification] {
+                let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] note in
+                    let detail = "\(note.name.rawValue) monotonic=\(CallMonotonic.now()) reason=\(note.userInfo?[AVAudioSessionRouteChangeReasonKey] ?? "-") type=\(note.userInfo?[AVAudioSessionInterruptionTypeKey] ?? "-") options=\(note.userInfo?[AVAudioSessionInterruptionOptionKey] ?? "-")"
+                    Task { @MainActor [weak self] in
+                        guard let self, !closed, !audioRevoked else { return }
+                        logAudio(detail)
+                    }
+                }
+                audioNotifications.append(token)
+            }
+        }
+        let instant = CallMonotonic.now()
+        logAudio("snapshot stage=\(stage.rawValue) monotonic=\(instant)")
+        delegate.relay?.yield(.audioDiagnostic(sessionSnapshot(), stage: stage, at: instant))
+    }
+
+    private func logAudio(_ stage: String) {
+        let session = AVAudioSession.sharedInstance()
+        let rtc = LKRTCAudioSession.sharedInstance()
+        // Only port types, never device names, UIDs, audio data or SDP.
+        audioLog.info("owner=\(self.owner.uuidString, privacy: .public) \(stage, privacy: .public) category=\(session.category.rawValue, privacy: .public) mode=\(session.mode.rawValue, privacy: .public) inputs=\(session.currentRoute.inputs.map { $0.portType.rawValue }.description, privacy: .public) channels=\(session.inputNumberOfChannels) useManualAudio=\(rtc.useManualAudio) isAudioEnabled=\(rtc.isAudioEnabled) isActive=\(rtc.isActive)")
+    }
+
+    private func reportAudio(_ module: LKRTCAudioDeviceModule, failed: Bool) async {
+        logAudio("verify failed=\(failed)")
+        let event = CallMediaTransportEvent.audioEngine(sessionSnapshot(), failed: failed)
+        if standaloneAudio {
+            // Keep failure behind the captured activation/repair diagnostics.
+            delegate.relay?.yield(event)
+        } else {
+            await eventHandler?(event)
+        }
     }
 
     func publishControl(_ data: Data) async throws {
@@ -293,8 +392,28 @@ enum WebRtcAudioBridge {
     static func activate(_ id: UUID) throws {
         try gate.activate(id)
         let session = LKRTCAudioSession.sharedInstance()
+        synchronizeRTCConfiguration(session)
         session.audioSessionDidActivate(AVAudioSession.sharedInstance())
         session.isAudioEnabled = true
+    }
+    private static func synchronizeRTCConfiguration(_ session: LKRTCAudioSession) {
+        session.lockForConfiguration()
+        defer { session.unlockForConfiguration() }
+        let current = AVAudioSession.sharedInstance()
+        let previous = LKRTCAudioSessionConfiguration.webRTC()
+        // The platformDefault ADM reapplies this cached configuration when its
+        // manual gate opens. AVAudioSession.setCategory alone does not update it.
+        // Publish a fresh object, never mutate one a native reader may retain.
+        let config = LKRTCAudioSessionConfiguration()
+        config.category = current.category.rawValue
+        config.categoryOptions = current.categoryOptions
+        config.mode = current.mode.rawValue
+        config.sampleRate = previous.sampleRate
+        config.ioBufferDuration = previous.ioBufferDuration
+        config.inputNumberOfChannels = previous.inputNumberOfChannels
+        config.outputNumberOfChannels = previous.outputNumberOfChannels
+        log.info("RTC configuration sync: cached=\(previous.category, privacy: .public)/\(previous.mode, privacy: .public) target=\(config.category, privacy: .public)/\(config.mode, privacy: .public)")
+        LKRTCAudioSessionConfiguration.setWebRTC(config)
     }
     static func release(_ id: UUID) {
         guard gate.release(id) else {

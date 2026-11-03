@@ -17,6 +17,17 @@ private final class FakeDirectTransport: CallDirectMediaTransport {
     var prepareGate: ManualGate?
     var connectGate: ManualGate?
     var disconnectGate: ManualGate?
+    var diagnosticStages: [CallTimingMark] = []
+    var diagnosticsEnabled = false
+    private lazy var diagnosticRelay = CallMediaEventRelay { [weak self] event in
+        await self?.eventHandler?(event)
+    }
+    func captureAudioDiagnostic(stage: CallTimingMark) {
+        diagnosticStages.append(stage)
+        if diagnosticsEnabled {
+            diagnosticRelay.yield(.audioDiagnostic(Self.snapshot(ready: false), stage: stage, at: CallMonotonic.now()))
+        }
+    }
     func prepareDirect(servers: [CallIceServer]) async throws -> String {
         prepares += 1
         await prepareGate?.wait()
@@ -27,6 +38,14 @@ private final class FakeDirectTransport: CallDirectMediaTransport {
         if failure { throw URLError(.cannotConnectToHost) }
     }
     func activateDirectAudio() throws { activations += 1 }
+    func activateStandaloneAudio() throws {
+        try activateDirectAudio()
+        if diagnosticsEnabled {
+            for stage: CallTimingMark in [.configureStart, .configureEnd, .activateReturn] {
+                captureAudioDiagnostic(stage: stage)
+            }
+        }
+    }
     func stopDirectAudio() { audioStopped = true }
     func finishRtpSampling() { statsFinished += 1 }
     func connect(url: String, token: String, enableMicrophone: Bool) async throws { XCTFail("not LiveKit") }
@@ -229,6 +248,28 @@ final class CallMediaSessionTests: XCTestCase {
     func testAudioUnitReadinessDoesNotRequireAVAudioEngine() {
         XCTAssertTrue(FakeDirectTransport.snapshot(ready: true).platformAudioReady)
         XCTAssertFalse(FakeDirectTransport.snapshot(ready: false).platformAudioReady)
+    }
+
+    func testStandaloneRejectsSoloAmbientEvenWhenADMClaimsRecording() async throws {
+        var state = FakeDirectTransport.snapshot(ready: true)
+        state.audioSession = CallAudioSessionSnapshot(category: "AVAudioSessionCategorySoloAmbient",
+            mode: "AVAudioSessionModeDefault", inputAvailable: true, inputNumberOfChannels: 0,
+            inputs: [], outputs: ["Speaker"])
+        var repairs = 0
+        let result = try await CallDirectAudioStartup.verify(snapshot: { state }, repair: {
+            repairs += 1
+            state.audioSession = CallAudioSessionSnapshot(category: "AVAudioSessionCategoryPlayAndRecord",
+                mode: "AVAudioSessionModeVoiceChat", inputAvailable: true, inputNumberOfChannels: 1,
+                inputs: ["MicrophoneBuiltIn"], outputs: ["Receiver"])
+            return true
+        }, requiresStandaloneSession: true, wait: { _ in })
+        XCTAssertEqual(repairs, 1)
+        XCTAssertTrue(result.standaloneAudioReady)
+        state.audioSession = nil
+        XCTAssertFalse(state.standaloneAudioReady)
+        _ = try await CallDirectAudioStartup.verify(snapshot: { state }, repair: {
+            XCTFail("CallKit readiness must remain unchanged"); return false
+        }, wait: { _ in XCTFail("CallKit must not wait") })
     }
 
     func testAudioStartupBoundUsesReadbackAndDoesNotWaitWhenRepairFails() async throws {
@@ -665,6 +706,35 @@ final class CallMediaSessionTests: XCTestCase {
     }
 
     // MARK: - A8 outbound direct
+
+    func testOutboundDiagnosticBatchesSurvivePreChannelAndFallbackKeepsStandaloneOwnership() async throws {
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        let device = TestCallAudioDevice()
+        direct.diagnosticsEnabled = true
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { livekit },
+            audio: CallAudioOwner(device: device, onCleanupError: { _ in }), directTransportFactory: { direct })
+        await media.startOutbound(client: try makeOutboundClient(answer: true), edgeId: "edge_abcdefghijkl", number: "10086", direct: true)
+        XCTAssertEqual(device.modes, [.standalone])
+        XCTAssertEqual(device.activateCount, 0, "direct must not start LiveKit's separate engine")
+        await direct.eventHandler?(.timing(.directControlReady, at: CallMonotonic.now()))
+        await waitUntil {
+            direct.packets.contains { packet in
+                guard let batch = (try? JSONSerialization.jsonObject(with: packet)) as? [String: Any],
+                      let marks = batch["marks"] as? [String: Double] else { return false }
+                return marks["activate_return"] != nil
+            }
+        }
+        let batches = try direct.packets.compactMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let diagnostic = batches.filter { ($0["marks"] as? [String: Double])?.count == 1 && $0["audioEngine"] != nil }
+        XCTAssertEqual(diagnostic.prefix(5).compactMap { ($0["marks"] as? [String: Double])?.keys.first },
+                       ["audio_lease_end", "preconnect_ready", "configure_start", "configure_end", "activate_return"])
+        XCTAssertEqual(direct.diagnosticStages, [.audioLeaseEnd, .preconnectReady, .configureStart, .configureEnd, .activateReturn])
+        await direct.eventHandler?(.data(Data(#"{"type":"media_failed","reason":"no_phone_audio"}"#.utf8), topic: CallPilotTopic.status))
+        await waitUntil { !livekit.connectedTokens.isEmpty }
+        XCTAssertEqual(device.modes, [.standalone], "fallback retains LiveKit standalone automatic management")
+        XCTAssertTrue(direct.audioStopped)
+        await media.stop()
+    }
 
     private func makeOutboundClient(answer: Bool = true, directAttempted: Bool = true, iceUnavailable: Bool = false,
                                     onCreate: ((([String: Any]) -> Void))? = nil,

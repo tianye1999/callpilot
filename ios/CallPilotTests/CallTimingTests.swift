@@ -4,6 +4,28 @@ import XCTest
 
 @MainActor
 final class CallTimingTests: XCTestCase {
+    func testDiagnosticSnapshotsAreSeparateBatchesEvenWithoutNewMilestones() throws {
+        var instant: TimeInterval = 1
+        let timing = CallTiming(now: { instant })
+        var snapshot = CallAudioEngineSnapshot(running: false, recording: false, playing: false,
+            inputEnabled: false, inputRunning: false, outputEnabled: false, outputRunning: false,
+            inputMuted: false, muteMode: -1)
+        timing.recordAudioDiagnostic(snapshot, stage: .audioLeaseEnd, at: instant)
+        instant = 2
+        snapshot.audioSession = CallAudioSessionSnapshot(category: "AVAudioSessionCategoryPlayAndRecord",
+            mode: "AVAudioSessionModeVoiceChat", inputAvailable: true, inputNumberOfChannels: 1,
+            inputs: ["MicrophoneBuiltIn"], outputs: ["Receiver"])
+        timing.recordAudioDiagnostic(snapshot, stage: .configureEnd, at: instant)
+        let first = try decode(XCTUnwrap(timing.nextBatch()))
+        let second = try decode(XCTUnwrap(timing.nextBatch()))
+        XCTAssertEqual((first["marks"] as? [String: Double])?["audio_lease_end"], 0)
+        XCTAssertEqual((second["marks"] as? [String: Double])?["configure_end"], 1000)
+        XCTAssertNotNil(first["audioEngine"])
+        XCTAssertNotNil(second["audioEngine"])
+        XCTAssertNil((first["audioEngine"] as? [String: Any])?["audioSession"])
+        XCTAssertNotNil((second["audioEngine"] as? [String: Any])?["audioSession"])
+        XCTAssertNil(timing.nextBatch())
+    }
     func testCaptureAndDecodeStatsAreBoundedValidatedAndContentFree() throws {
         let packet = try XCTUnwrap(CallRtpStats.packet(reports: [
             CallRtpReport(id: "source", type: "media-source", values: ["kind": "audio", "audioLevel": 0.25, "totalAudioEnergy": 2.5, "totalSamplesDuration": 10.0, "deviceName": "private"]),
