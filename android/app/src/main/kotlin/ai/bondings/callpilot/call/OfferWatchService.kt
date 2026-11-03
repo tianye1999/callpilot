@@ -315,6 +315,11 @@ class OfferWatchService : Service() {
             entry.value.job.cancel()
             iterator.remove()
         }
+        if (DirectCallSettings.enabled(this)) {
+            // 后台响铃也提前准备直连：用户解锁、点接听的几秒里连接已经备好。只备一通，
+            // 与前台默认显示的同一通（列表最新在前）；列表不变时 prepareTakeover 原样保留。
+            wanted.values.firstOrNull()?.let { CallGraph.manager(this).prepareTakeover(current, it) }
+        }
         if (SystemClock.elapsedRealtime() < ownerWatchPausedUntil) return
         for ((offerId, offer) in wanted) {
             if (offerId in ownerWatches) continue
@@ -385,6 +390,7 @@ class OfferWatchService : Service() {
             }
             if (state == InboundOfferState.OFFERED) continue
             if (store.load() == current) alerts.resolve(offer.offerId, state)
+            if (state != InboundOfferState.CLAIMED) CallGraph.manager(this).discardPrepared(offer.offerId)
             return
         }
     }

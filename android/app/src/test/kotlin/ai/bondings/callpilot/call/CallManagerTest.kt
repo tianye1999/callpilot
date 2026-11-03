@@ -8,6 +8,7 @@ import ai.bondings.callpilot.protocol.DeviceCredential
 import ai.bondings.callpilot.protocol.HostedCallSession
 import ai.bondings.callpilot.protocol.HostedCloudException
 import ai.bondings.callpilot.protocol.IceServer
+import ai.bondings.callpilot.protocol.InboundOffer
 import ai.bondings.callpilot.protocol.Invite
 import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.protocol.Signaling
@@ -96,8 +97,10 @@ class CallManagerTest {
         val calls = mutableListOf<String>()
         var claimGate: CompletableDeferred<Unit>? = null
         var fallbackGate: CompletableDeferred<Unit>? = null
-        override suspend fun claim(offerId: String, direct: Boolean): HostedCallSession {
-            calls += "claim:$direct"
+        var claimedWithSdp: String? = null
+        override suspend fun claim(offerId: String, direct: Boolean, sdpOffer: String?): HostedCallSession {
+            calls += if (sdpOffer != null) "claim:$direct+sdp" else "claim:$direct"
+            claimedWithSdp = sdpOffer
             claimGate?.await()
             return claimResult
         }
@@ -168,6 +171,7 @@ class CallManagerTest {
             gateway: InboundMediaGateway? = null,
             directSessionFactory: (() -> DirectCapableSession)? = directSession?.let { { it } },
             gatewayFactory: (StoredPairing) -> InboundMediaGateway = { gateway ?: error("gateway should not be used") },
+            clockMs: () -> Long = { 1_000L },
             inviteProvider: suspend (StoredPairing) -> Invite,
         ): CallManager = CallManager(
             sessionFactory = { session },
@@ -182,6 +186,7 @@ class CallManagerTest {
             takeoverFailureVisibleMs = takeoverFailureVisibleMs,
             directSessionFactory = directSessionFactory,
             mediaGatewayFactory = gatewayFactory,
+            clockMs = clockMs,
         )
 
         fun close() = scope.cancel()
@@ -816,6 +821,204 @@ class CallManagerTest {
         runCurrent()
         assertEquals("fallback", secondGateway.calls.last())
         watcher.cancel()
+        h.close()
+    }
+
+    private val ringing = InboundOffer("offer_abcdefghijkl", 16_000L)
+
+    @Test
+    fun `响铃期预备好的 SDP 随 claim 发出 answer 直接连通 不再补交`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+
+        manager.prepareTakeover(hosted, ringing)
+        runCurrent()
+        assertEquals(listOf("ice"), gateway.calls)
+        assertEquals(1, direct.prepared.size)
+
+        manager.answerTakeover(hosted, ringing.offerId, direct = true)
+        runCurrent()
+
+        assertEquals(listOf("ice", "claim:true+sdp"), gateway.calls)
+        assertEquals("v=0\r\nfake-offer typ relay", gateway.claimedWithSdp)
+        assertEquals("v=0\r\nanswer", direct.answer)
+        assertEquals(1, direct.prepared.size) // the peer prepared while ringing is the one used
+        h.close()
+    }
+
+    @Test
+    fun `预备还没收集完就接听 claim 先定归属 再用同一份预备补交`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession().apply { prepareGate = CompletableDeferred() }
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.prepareTakeover(hosted, ringing)
+        runCurrent()
+
+        manager.answerTakeover(hosted, ringing.offerId, direct = true)
+        runCurrent()
+        assertEquals(listOf("ice", "claim:true"), gateway.calls)
+        direct.prepareGate!!.complete(Unit)
+        runCurrent()
+
+        assertEquals(listOf("ice", "claim:true", "sdp"), gateway.calls)
+        assertEquals(1, direct.prepared.size)
+        assertEquals("v=0\r\nanswer", direct.answer)
+        h.close()
+    }
+
+    @Test
+    fun `没在本机接听或过期就放掉预备的连接`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim())
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.prepareTakeover(hosted, ringing)
+        runCurrent()
+        manager.discardPrepared("offer_zzzzzzzzzzzz") // other offers are not touched
+        assertFalse(direct.disconnected)
+        manager.discardPrepared(ringing.offerId)
+        assertTrue(direct.disconnected)
+
+        val second = FakeDirectSession()
+        val manager2 = h.manager(FakeSession(), directSession = second, gateway = gateway,
+            clockMs = { 15_000L }) { error("invite path should not run") }
+        manager2.prepareTakeover(hosted, ringing)
+        runCurrent()
+        advanceTimeBy(3_100) // offer expires at 16 s + 2 s grace, clock says 15 s
+        runCurrent()
+        assertTrue(second.disconnected)
+        h.close()
+    }
+
+    @Test
+    fun `中转没走直连时放掉预备 改用 LiveKit 会话`() = runTest {
+        val h = Harness(this)
+        val legacy = FakeSession()
+        val direct = FakeDirectSession()
+        val gateway = FakeGateway(v2Claim().copy(directAttempted = false, sdpPending = false))
+        val manager = h.manager(legacy, directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.prepareTakeover(hosted, ringing)
+        runCurrent()
+
+        manager.answerTakeover(hosted, ringing.offerId, direct = true)
+        runCurrent()
+
+        assertTrue(direct.disconnected)
+        assertTrue(legacy.connected)
+        h.close()
+    }
+
+    @Test
+    fun `预备被接听取走后 claim 失败或 claim 途中挂断都会放掉它`() = runTest {
+        for (mode in listOf("claim-fails", "hangup-during-claim")) {
+            val h = Harness(this)
+            val direct = FakeDirectSession()
+            val gateway = object : InboundMediaGateway by FakeGateway(v2Claim()) {
+                val gate = CompletableDeferred<Unit>()
+                override suspend fun claim(offerId: String, direct: Boolean, sdpOffer: String?): HostedCallSession {
+                    if (mode == "claim-fails") throw HostedCloudException(409, "OFFER_UNAVAILABLE", "gone")
+                    gate.await()
+                    return v2Claim()
+                }
+            }
+            val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+            manager.prepareTakeover(hosted, ringing)
+            runCurrent()
+            manager.answerTakeover(hosted, ringing.offerId, direct = true)
+            runCurrent()
+            if (mode == "hangup-during-claim") {
+                manager.hangup()
+                runCurrent()
+            }
+            assertTrue(mode, direct.disconnected)
+            h.close()
+        }
+    }
+
+    @Test
+    fun `预备失败时接听照常走补交流程的回落`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession().apply { failPrepare = true }
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.prepareTakeover(hosted, ringing)
+        runCurrent()
+        manager.answerTakeover(hosted, ringing.offerId, direct = true)
+        runCurrent()
+        assertEquals(listOf("ice", "claim:true", "fallback"), gateway.calls)
+        assertTrue(direct.connected)
+        h.close()
+    }
+
+    @Test
+    fun `预备在接听前或接听后超时 都只回落一次且不重复预备`() = runTest {
+        for (answerAfterTimeout in listOf(false, true)) {
+            val h = Harness(this)
+            val direct = FakeDirectSession().apply { prepareGate = CompletableDeferred() } // gathering never finishes
+            val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+            val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+            val later = InboundOffer("offer_abcdefghijkl", 120_000L)
+            manager.prepareTakeover(hosted, later)
+            runCurrent()
+            if (answerAfterTimeout) {
+                advanceTimeBy(20_001)
+                runCurrent()
+            }
+            manager.answerTakeover(hosted, later.offerId, direct = true)
+            runCurrent()
+            advanceTimeBy(20_001)
+            runCurrent()
+            assertEquals("timeout after=$answerAfterTimeout ${gateway.calls}", 1, gateway.calls.count { it == "fallback" })
+            assertEquals(1, direct.prepared.size)
+            assertFalse(gateway.calls.contains("sdp"))
+            h.close()
+        }
+    }
+
+    @Test
+    fun `上一通清理阻塞期间为下一通预备并接听 新预备不被旧清理碰到`() = runTest {
+        val h = Harness(this)
+        lateinit var manager: CallManager
+        val second = FakeDirectSession()
+        val secondGateway = FakeGateway(v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val next = InboundOffer("offer_abcdefghijkm", 120_000L)
+        var started = false
+        val first = object : FakeDirectSession() {
+            override fun disconnect() {
+                super.disconnect()
+                if (!started) {
+                    started = true
+                    manager.reset()
+                    manager.prepareTakeover(hosted, next)
+                    manager.answerTakeover(hosted, next.offerId, direct = true)
+                }
+            }
+        }
+        val firstGateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val sessions = listOf<DirectCapableSession>(first, second)
+        var created = 0
+        var gateways = 0
+        manager = h.manager(
+            FakeSession(),
+            directSessionFactory = { sessions[created++] },
+            gatewayFactory = { listOf<InboundMediaGateway>(firstGateway, secondGateway)[gateways++] },
+        ) { error("invite path should not run") }
+
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+        advanceTimeBy(60_001) // first call's media timeout → cleanup → disconnect starts the next call
+        runCurrent()
+
+        assertTrue(first.disconnected)
+        assertFalse(second.disconnected)
+        assertEquals("v=0\r\nanswer", second.answer)
+        assertEquals(listOf("ice", "claim:true+sdp"), secondGateway.calls)
+        manager.hangup()
+        runCurrent()
+        assertTrue(second.disconnected)
         h.close()
     }
 

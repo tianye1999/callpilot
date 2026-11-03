@@ -43,6 +43,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -248,6 +249,15 @@ class MainActivity : ComponentActivity() {
                     }
 
                     val activeOffer = incomingOffer
+                    // 直连开着时，来电一显示就开始准备连接；界面收起而没接听就放掉（接听时 CallManager 会接手）。
+                    DisposableEffect(activeOffer?.offerId) {
+                        val shown = activeOffer
+                        val paired = current
+                        if (shown != null && paired != null && DirectCallSettings.enabled(this@MainActivity)) {
+                            manager.prepareTakeover(paired, shown)
+                        }
+                        onDispose { shown?.let { manager.discardPrepared(it.offerId) } }
+                    }
                     LaunchedEffect(activeOffer) {
                         if (activeOffer != null) {
                             delay((activeOffer.expiresAt - System.currentTimeMillis()).coerceAtLeast(0))

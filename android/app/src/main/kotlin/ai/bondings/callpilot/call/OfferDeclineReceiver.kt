@@ -17,6 +17,8 @@ class OfferDeclineReceiver : BroadcastReceiver() {
         val pairing = runCatching { CredentialStore(context.applicationContext).load() }.getOrNull()
         val alerts = OfferAlerts.get(context)
         alerts.dismiss(offer)
+        // 后台没有界面替它收尾：拒绝了就立刻放掉响铃期预备的连接。
+        CallGraph.manager(context).discardPrepared(offer.offerId)
         if (pairing?.protocol != PairingProtocol.HOSTED) return
         // 进程可能在 onReceive 返回后被回收：goAsync 让拒绝请求有机会发完（系统上限约 10 s）。
         val pending = goAsync()

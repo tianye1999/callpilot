@@ -11,7 +11,7 @@ import kotlinx.coroutines.withContext
 
 /** 来电接管的中转媒体接口（claim / TURN / 补 SDP / 回落 / 结束），抽成接口便于状态机单测。 */
 interface InboundMediaGateway {
-    suspend fun claim(offerId: String, direct: Boolean): HostedCallSession
+    suspend fun claim(offerId: String, direct: Boolean, sdpOffer: String? = null): HostedCallSession
     suspend fun iceServers(offerId: String): List<IceServer>
     suspend fun completeSdp(offerId: String, claimId: String, sdpOffer: String): HostedCallSession
     suspend fun fallbackLiveKit(offerId: String, claimId: String): HostedCallSession
@@ -25,8 +25,8 @@ class HostedInboundMediaGateway(
     private fun client(): HostedCloudClient =
         HostedCloudClient(pairing.gatewayUrl).also { it.credential = pairing.credential }
 
-    override suspend fun claim(offerId: String, direct: Boolean): HostedCallSession =
-        withContext(io) { client().claimInboundOffer(offerId, direct = direct) }
+    override suspend fun claim(offerId: String, direct: Boolean, sdpOffer: String?): HostedCallSession =
+        withContext(io) { client().claimInboundOffer(offerId, sdpOffer = sdpOffer, direct = direct) }
 
     override suspend fun iceServers(offerId: String): List<IceServer> =
         withContext(io) { client().inboundIceServers(offerId) }

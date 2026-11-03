@@ -529,6 +529,25 @@ class HostedCloudClientTest {
     }
 
     @Test
+    fun `claim 带上响铃期预备的 SDP 时接受随 claim 返回的 answer`() {
+        val answer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\na=candidate:1 1 udp 1 1.2.3.4 1 typ relay"
+        server.enqueue(
+            MockResponse().setResponseCode(202)
+                .setBody(v2Claim.replace("\"sdpPending\":true", "\"sdpPending\":false")
+                    .replace("\"transports\":[", "\"transports\":[{\"kind\":\"webrtc\",\"sdpAnswer\":\"$answer\"},")),
+        )
+
+        val session = client.claimInboundOffer("offer_abcdefghijkl", sdpOffer = "v=0\r\nprepared", direct = true)
+
+        val body = server.takeRequest().body.readUtf8()
+        assertTrue(body.contains("\"mediaTransport\":\"webrtc\""))
+        assertTrue(body.contains("\"sdpOffer\":\"v=0\\r\\nprepared\""))
+        assertTrue(session.directAttempted)
+        assertFalse(session.sdpPending)
+        assertTrue(session.sdpAnswer!!.contains("typ relay"))
+    }
+
+    @Test
     fun `没发 offer 却收到 answer 视为协议破坏`() {
         server.enqueue(
             MockResponse().setResponseCode(202)
