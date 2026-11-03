@@ -187,8 +187,19 @@ def test_network_recovery_defaults_off(recovery, monkeypatch):
     assert controller._pending_network is None
 
 
-@pytest.mark.parametrize("uncertain", [False, True])
-def test_escalation_uses_existing_reconnect_and_never_retries_reboot(recovery, monkeypatch, uncertain):
+@pytest.mark.parametrize("network,budget", [(False, 90), (True, 120)])
+def test_reset_budget_reserves_post_call_window_after_soft_recovery(recovery, monkeypatch, network, budget):
+    _modem, controller, clock = recovery
+    monkeypatch.setattr("agentcall.sim7600_reset.threading.Thread.start", lambda self: None)
+    controller.request(network=network)
+    assert controller._deadline == clock.now + budget
+    if network:
+        clock.wait(controller._NETWORK_WAIT_SECONDS)
+        assert controller._remaining() == controller._TIMEOUT_SECONDS == 90
+
+
+@pytest.mark.parametrize("reply", ["OK", "", OSError("USB disappeared before OK")])
+def test_escalation_uses_existing_reconnect_and_never_retries_reboot(recovery, monkeypatch, reply):
     modem, controller, _clock = recovery
     modem._reset_in_progress = True
     controller._started = 1000
@@ -201,13 +212,13 @@ def test_escalation_uses_existing_reconnect_and_never_retries_reboot(recovery, m
 
     def write(command):
         commands.append(command)
-        if uncertain:
-            raise OSError("USB disappeared before OK")
-        return "OK"
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
     monkeypatch.setattr(modem, "_write_command", write)
     controller._run()
-    assert commands == ["AT+CFUN=1,1"]
+    assert commands == ["AT+CRESET"]
     assert ports == [False, True]
     assert states == [True]
     assert not modem.recovery_in_progress

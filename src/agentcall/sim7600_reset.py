@@ -107,7 +107,10 @@ class Sim7600CallReset:
                 return
             self._started = time.monotonic()
             self._network_mode = network
-            self._deadline = self._started + self._TIMEOUT_SECONDS
+            # Reserve the full post-call CRESET window after network soft recovery.
+            self._deadline = self._started + self._TIMEOUT_SECONDS + (
+                self._NETWORK_WAIT_SECONDS if network else 0.0
+            )
             self._connector = None
             self._connect_result = None
             self._coordinator_done = False
@@ -164,7 +167,10 @@ class Sim7600CallReset:
                 self._log_phase("reset_sent")
                 # Never use _send: its automatic retry could reboot the new device twice.
                 try:
-                    command = "AT+CFUN=1,1" if self._network_mode else "AT+CRESET"
+                    # Colleagues verified SIM7600G (2026-08-26): CFUN=1,1 could not
+                    # clear CSQ=99/CEREG 0,4; CRESET did (~45s reboot + ~15s search).
+                    # Reuse our post-call reset and its 90s re-enumeration/reconnect window.
+                    command = "AT+CRESET"
                     response = self.modem._write_command(command)
                     if "OK" not in response:
                         logger.warning("%s 未返回 OK，仍等待重枚举确认，不重发", command)
@@ -217,7 +223,7 @@ class Sim7600CallReset:
             logger.warning("SIM7600 network soft recovery failed: %s", type(exc).__name__)
         if self._stop.is_set():
             raise RuntimeError("service stopping")
-        self._log_phase("network_escalate_cfun_reboot")
+        self._log_phase("network_escalate_creset")
         return False
 
     def _connect_bounded(self) -> bool:
