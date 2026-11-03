@@ -33,6 +33,16 @@ struct HostedCallSession: Equatable, CustomStringConvertible, CustomDebugStringC
     var debugDescription: String { description }
 }
 
+/// A8: one app-dialed call created with a direct offer. Without an answer,
+/// `directAttempted` selects the same-call LiveKit fallback over polling.
+struct HostedOutboundCall: Equatable, CustomStringConvertible {
+    let callId: String
+    let expiresAt: Int64
+    let directAttempted: Bool
+    let sdpAnswer: String?
+    var description: String { "HostedOutboundCall(callId: \(callId), direct: \(directAttempted), answer: \(sdpAnswer != nil))" }
+}
+
 struct InboundPreparation {
     let prepareId: String
     let roomName: String
@@ -76,6 +86,8 @@ struct HostedDeviceStatus: Equatable {
     let inboundFastpathV2: Bool
     var multiDeviceStop = false
     var ownerDecline = false
+    /// A8: relay and Edge both allow app-dialed calls over direct WebRTC.
+    var outboundDirect = false
 
     init(connected: Bool, modemOnline: Bool, claimPrewarm: Bool = false, preconnect: Bool = false,
          inboundFastpathV2: Bool = false) {

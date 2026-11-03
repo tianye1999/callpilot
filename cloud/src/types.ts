@@ -20,6 +20,7 @@ export interface Env {
   INBOUND_PRECONNECT_ENABLED?: string;
   INBOUND_CLAIM_FAST_PATH_ENABLED?: string;
   INBOUND_FASTPATH_V2_ENABLED?: string;
+  OUTBOUND_DIRECT_ENABLED?: string;
   TURN_KEY_ID?: string;
   TURN_API_TOKEN?: string;
   APNS_TEAM_ID?: string;
@@ -62,6 +63,7 @@ export interface CallRecord {
   created_at: number;
   expires_at: number;
   updated_at: number;
+  media_transport?: string | null;
 }
 
 export interface InboundOfferRecord {
@@ -96,4 +98,5 @@ export interface EdgePresence {
   version?: string;
   inboundPreconnectV1?: boolean;
   inboundFastpathV2?: boolean;
+  outboundDirectV1?: boolean;
 }

@@ -107,6 +107,8 @@ from .triage_judge import (
 
 logger = logging.getLogger(__name__)
 _MOSS_PREBRIEF_TIMEOUT = 30.0
+# A8: direct setup (phone ~20 s) plus one LiveKit fallback must finish within this.
+_OUTBOUND_DIRECT_PHONE_CONNECT_SECONDS = 60.0
 
 # 上行「有声」判定峰值（int16）。真机实测（2026-08-12）上行静音是纯数字零
 # （峰值中位 2、p90 13）——modem 不给底噪，所以阈值可以放得很低；而对端小声
@@ -5770,6 +5772,8 @@ class CallAgentService:
         self._remote_worker: RemoteDialerWorker | None = None
         self._remote_invite: RemoteDialerInvite | None = None
         self._remote_session_device_id: str | None = None
+        # A8: the direct request of the current app-dialed session, for its one LiveKit fallback.
+        self._outbound_direct: tuple[str, InboundDirectRequest] | None = None
         self._remote_call_owner: RemoteWebDialerCoordinator | None = None
         # 模组连接状态与后台 supervisor：首启时模组不在也不阻塞 Web，
         # supervisor 反复重连直到成功（首次连上后由 modem 读循环自愈接管）。
@@ -6325,10 +6329,13 @@ class CallAgentService:
             return self._invite_payload(invite), None
 
     def start_cloud_remote_session(
-        self, command: dict
+        self, command: dict, reply: Reply | None = None
     ) -> tuple[bool, str | None]:
-        """Start one server-issued LiveKit session without local signing secrets."""
+        """Start one server-issued session; a direct offer answers through ``reply`` (A8)."""
 
+        direct = command.get("direct")
+        if direct is not None and (reply is None or not config.get_bool("OUTBOUND_DIRECT_ENABLED")):
+            return False, "DIRECT_DISABLED"
         if not config.get_bool("REMOTE_WEB_DIALER_ENABLED"):
             return False, "REMOTE_DISABLED"
         if not config.get_bool("REMOTE_CLOUD_ENABLED"):
@@ -6355,21 +6362,45 @@ class CallAgentService:
             worker = self._remote_worker
             if worker is not None and worker.is_running:
                 return False, "LINE_BUSY"
+            request: InboundDirectRequest | None = None
             try:
-                worker = self._build_remote_worker_for_issued(issued)
+                if direct is not None:
+                    assert reply is not None
+                    request = InboundDirectRequest(command["callId"], command["callId"], direct["sdpOffer"],
+                                                   direct["iceServers"], reply)
+                    worker = self._build_remote_worker_for_issued(
+                        issued, endpoint=SwitchableInboundEndpoint(request),
+                        phone_connect_timeout=_OUTBOUND_DIRECT_PHONE_CONNECT_SECONDS,
+                        phone_audio_timeout=_EARLY_ANSWER_CONNECTED_WAIT_SECONDS)
+                else:
+                    worker = self._build_remote_worker_for_issued(issued)
                 self._remote_worker = worker
                 self._remote_invite = issued.invite
                 self._remote_session_device_id = f"cloud:{command['callId']}"
+                self._outbound_direct = (command["callId"], request) if request is not None else None
                 worker.start(timeout=10.0)
             except (ImportError, RuntimeError, ValueError) as exc:
                 self._remote_worker = None
                 self._remote_invite = None
                 self._remote_session_device_id = None
+                self._outbound_direct = None
+                if request is not None:
+                    request.close()
                 logger.warning(
                     "启动云端远程拨号会话失败: error_type=%s", type(exc).__name__
                 )
                 return False, "MEDIA_FAILED"
         return True, None
+
+    def fallback_outbound_direct(self, call_id: str, issued: IssuedLiveKitSession, reply: Reply) -> bool:
+        """Switch the current direct app-dialed session to its LiveKit room (idempotent)."""
+
+        with self._remote_setup_lock:
+            current = self._outbound_direct
+            worker = self._remote_worker
+        if current is None or current[0] != call_id or worker is None or not worker.is_running:
+            return False
+        return current[1].fallback(issued, reply)
 
     def remote_dialer_status(self) -> dict:
         """Return non-secret readiness/session state for the local dashboard."""
@@ -6508,11 +6539,13 @@ class CallAgentService:
         return issued.invite, self._build_remote_worker_for_issued(issued)
 
     def _build_remote_worker_for_issued(
-        self, issued: IssuedLiveKitSession
+        self, issued: IssuedLiveKitSession, *, endpoint: RemoteMediaEndpoint | None = None,
+        phone_connect_timeout: float = 0.0, phone_audio_timeout: float = 0.0,
     ) -> RemoteDialerWorker:
         from .livekit_media import LiveKitRemoteMediaEndpoint
 
-        endpoint = LiveKitRemoteMediaEndpoint(issued)
+        if endpoint is None:
+            endpoint = LiveKitRemoteMediaEndpoint(issued)
         runtime = RemoteDialerRuntimeConfig(
             audio_mode=self.audio_mode,
             audio_keyword=self.audio_keyword,
@@ -6532,6 +6565,8 @@ class CallAgentService:
             dtmf_tone_ms=config.get_int("DTMF_TONE_MS"),
             dtmf_tone_amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
             recording_enabled=config.get_bool("REMOTE_HUMAN_RECORDING_ENABLED"),
+            phone_connect_timeout_seconds=phone_connect_timeout,
+            phone_audio_timeout_seconds=phone_audio_timeout,
         )
         coordinator = RemoteWebDialerCoordinator(
             session_id=issued.invite.session_id,

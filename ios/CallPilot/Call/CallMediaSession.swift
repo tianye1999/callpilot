@@ -32,6 +32,8 @@ final class CallMediaSession {
     private var directControlOpen = false
     private var lastDirectRtpStats: Data?
     private var directFallbackHandler: (() -> Void)?
+    /// A8: the app-dialed call created with a direct offer (its same-call fallback key).
+    private var outboundCallId: String?
     // A resource lease, not a network-speed threshold or a warm/cold heuristic.
     static let directSetupMax: Duration = .seconds(20)
     private let ownerID = UUID()
@@ -390,13 +392,18 @@ final class CallMediaSession {
         try outcome.result?.get()
     }
 
-    func startOutbound(client: HostedCloudClient, edgeId: String, number: String) async {
+    func startOutbound(client: HostedCloudClient, edgeId: String, number: String, direct: Bool = false) async {
         guard let attempt = beginAttempt(label: number, mode: .standalone) else { return }
         timing.mark(.dialStart)
         let task = Task {
             try await audio.acquire(ownerID, mode: .standalone)
             try checkCurrent(attempt)
             let packet = try CallSignaling.encodeDial(number: number, idempotencyKey: UUID().uuidString)
+            if direct, directTransportFactory != nil {
+                if try await startOutboundDirect(client: client, edgeId: edgeId, packet: packet, attempt: attempt) {
+                    return
+                }
+            }
             timing.mark(.claimStart)
             let session = try await client.createSession(edgeId: edgeId)
             timing.mark(.claimResponse)
@@ -407,6 +414,88 @@ final class CallMediaSession {
         }
         setupTask = task
         await finishSetup(task, attempt: attempt)
+    }
+
+    /// A8: app-dialed call over direct WebRTC with one same-call LiveKit fallback before dialing.
+    /// Returns false while no call exists yet (direct unavailable), so the caller keeps LiveKit.
+    private func startOutboundDirect(client: HostedCloudClient, edgeId: String, packet: Data,
+                                     attempt: UInt64) async throws -> Bool {
+        guard let directTransportFactory else { return false }
+        let servers: [CallIceServer]
+        do { servers = try await client.outboundIceServers(edgeId: edgeId) }
+        catch is CancellationError { throw CancellationError() }
+        catch { return false }
+        try checkCurrent(attempt)
+        let connection = directTransportFactory()
+        transport = connection
+        installEvents(connection, attempt: attempt)
+        timing.mark(.preconnectStart)
+        let offer: String
+        do { offer = try await connection.prepareDirect(servers: servers) }
+        catch {
+            try checkCurrent(attempt)
+            detachDirect(connection)
+            return false
+        }
+        try checkCurrent(attempt)
+        timing.mark(.preconnectReady)
+        timing.mark(.claimStart)
+        let call = try await client.createDirectCall(edgeId: edgeId, sdpOffer: offer)
+        timing.mark(.claimResponse)
+        try checkCurrent(attempt)
+        outboundCallId = call.callId
+        pendingDialPacket = packet
+        onState(.waitingMedia(label: activeLabel ?? ""))
+        directFallbackHandler = { [weak self] in
+            guard let self, isCurrent(attempt), pendingDialPacket != nil, !directFallbackStarted else { return }
+            directFallbackHandler = nil
+            let fallback = Task { try await self.connectOutboundFallback(client: client, attempt: attempt) }
+            setupTask = fallback
+            Task { await self.finishSetup(fallback, attempt: attempt) }
+        }
+        if let answer = call.sdpAnswer {
+            do {
+                timing.mark(.connectStart)
+                try await connectDirect(connection, answer: answer, attempt: attempt)
+                timing.mark(.connectReturn)
+                try checkCurrent(attempt)
+                // No CallKit activation exists for app-dialed calls.
+                try connection.activateStandaloneAudio()
+                audioActivated = true
+                roomConnected = true
+                timing.mark(.roomConnected)
+                scheduleTiming()
+                return true
+            } catch {
+                try checkCurrent(attempt)
+                timing.mark(.coldFallback)
+            }
+        } else if !call.directAttempted {
+            // The relay started a plain LiveKit session (older Edge): poll it as before.
+            directFallbackHandler = nil
+            detachDirect(connection)
+            let session = try await client.awaitCallSession(edgeId: edgeId, call: call)
+            try checkCurrent(attempt)
+            preparedSession = session
+            try await connect(session, for: attempt)
+            return true
+        }
+        try await connectOutboundFallback(client: client, attempt: attempt)
+        return true
+    }
+
+    private func connectOutboundFallback(client: HostedCloudClient, attempt: UInt64) async throws {
+        try checkCurrent(attempt)
+        guard !directFallbackStarted, pendingDialPacket != nil, let callId = outboundCallId else { return }
+        directFallbackStarted = true
+        directFallbackHandler = nil
+        if let direct = transport as? any CallDirectMediaTransport { detachDirect(direct) }
+        roomConnected = false
+        audioActivated = false
+        let session = try await client.fallbackCallLiveKit(callId: callId)
+        try checkCurrent(attempt)
+        preparedSession = session
+        try await connect(session, for: attempt)
     }
 
     /// Edge waits for our microphone subscription before committing phone-first takeover.
@@ -796,7 +885,9 @@ final class CallMediaSession {
                 }
             }
         case let .disconnected(reason):
-            if connection is any CallDirectMediaTransport, !edgeCommitted {
+            // After an outbound dial the call cannot switch transports; a lost peer ends it.
+            if connection is any CallDirectMediaTransport, !edgeCommitted,
+               outboundCallId == nil || pendingDialPacket != nil {
                 directSetupFailure = CallAudioError.answerExpired
                 if roomConnected { directFallbackHandler?() }
                 return

@@ -125,6 +125,12 @@ class RemoteDialerRuntimeConfig:
     dtmf_tone_ms: int = 200
     dtmf_tone_amplitude: float = 0.50
     recording_enabled: bool = True
+    # A8: a direct session ends when the phone never reaches media_ready, across
+    # the direct attempt and its one fallback (one total budget, not per attempt).
+    phone_connect_timeout_seconds: float = 0.0
+    # A8: direct connected but no phone audio within this window → tell the phone
+    # to fall back before dialing (same rule as the inbound direct path).
+    phone_audio_timeout_seconds: float = 0.0
 
 
 def _validate_url(value: str, *, schemes: set[str], label: str) -> str:
@@ -329,6 +335,8 @@ class RemoteWebDialerCoordinator:
             self._timing.mark("endpoint_connect_return")
             self.edge_ready.set()
             await self._send_status("waiting_for_phone")
+            phone_timeout = self.runtime.phone_connect_timeout_seconds
+            phone_deadline = time.monotonic() + phone_timeout if phone_timeout > 0 else None
             while not self._stop_requested.is_set():
                 now = time.time()
                 if not self._dial_attempted and now >= self.expires_at:
@@ -336,6 +344,20 @@ class RemoteWebDialerCoordinator:
                         "failed", code="invite_expired", reason="invite_expired"
                     )
                     break
+                expired = getattr(self.endpoint, "no_phone_audio_expired", None)
+                if (not self._dial_attempted and self.runtime.phone_audio_timeout_seconds > 0
+                        and callable(expired)
+                        and expired(time.monotonic(), self.runtime.phone_audio_timeout_seconds)):
+                    await self.endpoint.fail_no_phone_audio()  # type: ignore[attr-defined]
+                if phone_deadline is not None:
+                    if self.endpoint.media_ready or self._dial_attempted:
+                        phone_deadline = None
+                    elif time.monotonic() >= phone_deadline:
+                        # Nobody to talk to: release the line instead of holding it to invite expiry.
+                        await self._send_status(
+                            "failed", code="phone_not_connected", reason="phone_not_connected"
+                        )
+                        break
 
                 if self.endpoint.media_ready and not media_was_ready:
                     self._timing.mark("media_ready")
@@ -469,6 +491,14 @@ class RemoteWebDialerCoordinator:
             )
             return
         if not self.endpoint.media_ready:
+            await self._send_status(
+                "failed", code="media_not_ready", reason="media_not_ready"
+            )
+            return
+        seal = getattr(self.endpoint, "seal", None)
+        if callable(seal) and not seal():
+            # A8: dialing and a transport fallback compete for one commit; a switch
+            # that already won means this dial would ride a transport being removed.
             await self._send_status(
                 "failed", code="media_not_ready", reason="media_not_ready"
             )

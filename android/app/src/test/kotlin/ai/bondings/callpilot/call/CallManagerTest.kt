@@ -9,6 +9,7 @@ import ai.bondings.callpilot.protocol.HostedCallSession
 import ai.bondings.callpilot.protocol.HostedCloudException
 import ai.bondings.callpilot.protocol.IceServer
 import ai.bondings.callpilot.protocol.InboundOffer
+import ai.bondings.callpilot.protocol.OutboundCall
 import ai.bondings.callpilot.protocol.Invite
 import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.protocol.Signaling
@@ -40,8 +41,11 @@ class CallManagerTest {
         private val _events = MutableSharedFlow<SessionEvent>(extraBufferCapacity = 16)
         override val events: SharedFlow<SessionEvent> = _events
 
+        var connectedToken: String? = null
+
         override suspend fun connect(livekitUrl: String, token: String) {
             connected = true
+            connectedToken = token
         }
 
         override suspend fun sendCommand(json: String) {
@@ -126,6 +130,40 @@ class CallManagerTest {
         }
     }
 
+    private class FakeOutboundGateway(
+        var created: OutboundCall = OutboundCall("call_abcdefghijkl", 9_999_999L, true, "v=0\r\nedge-answer"),
+    ) : OutboundMediaGateway {
+        val calls = mutableListOf<String>()
+        var iceError: Exception? = null
+        var createError: Exception? = null
+        var createGate: CompletableDeferred<Unit>? = null
+        var offer: String? = null
+
+        override suspend fun iceServers(edgeId: String): List<IceServer> {
+            calls += "ice"
+            iceError?.let { throw it }
+            return listOf(IceServer(listOf("turn:turn.example:3478"), "u", "c"))
+        }
+
+        override suspend fun create(edgeId: String, idempotencyKey: String, sdpOffer: String): OutboundCall {
+            calls += "create"
+            offer = sdpOffer
+            createGate?.await()
+            createError?.let { throw it }
+            return created
+        }
+
+        override suspend fun awaitSession(edgeId: String, call: OutboundCall): HostedCallSession {
+            calls += "poll"
+            return HostedCallSession(call.callId, "wss://lk.example.com", "polled-token", 9_999_999L)
+        }
+
+        override suspend fun fallbackLiveKit(callId: String): HostedCallSession {
+            calls += "fallback:$callId"
+            return HostedCallSession(callId, "wss://lk.example.com", "fallback-token", 9_999_999L)
+        }
+    }
+
     private val pairing = StoredPairing(
         gatewayUrl = "https://gw.example.com",
         displayName = "Test",
@@ -171,6 +209,7 @@ class CallManagerTest {
             gateway: InboundMediaGateway? = null,
             directSessionFactory: (() -> DirectCapableSession)? = directSession?.let { { it } },
             gatewayFactory: (StoredPairing) -> InboundMediaGateway = { gateway ?: error("gateway should not be used") },
+            outboundGateway: OutboundMediaGateway? = null,
             clockMs: () -> Long = { 1_000L },
             inviteProvider: suspend (StoredPairing) -> Invite,
         ): CallManager = CallManager(
@@ -186,6 +225,7 @@ class CallManagerTest {
             takeoverFailureVisibleMs = takeoverFailureVisibleMs,
             directSessionFactory = directSessionFactory,
             mediaGatewayFactory = gatewayFactory,
+            outboundGatewayFactory = { outboundGateway ?: error("outbound gateway should not be used") },
             clockMs = clockMs,
         )
 
@@ -1158,6 +1198,205 @@ class CallManagerTest {
         assertTrue(state is CallState.Failed)
         assertEquals("OFFER_UNAVAILABLE", (state as CallState.Failed).code)
         assertFalse(session.connected)
+        h.close()
+    }
+
+
+    @Test
+    fun `外呼直连 带 offer 建呼叫后用 answer 连通 media_ready 后经直连发 dial`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeOutboundGateway()
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
+
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+
+        assertEquals(listOf("ice", "create"), gateway.calls)
+        assertEquals("v=0\r\nfake-offer typ relay", gateway.offer)
+        assertEquals("v=0\r\nedge-answer", direct.answer)
+        assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
+        runCurrent()
+        assertTrue(direct.commands.single().contains("10086"))
+        assertFalse(direct.connected)
+        h.close()
+    }
+
+    @Test
+    fun `外呼直连 不可用时照旧走 LiveKit 不建直连`() = runTest {
+        val h = Harness(this)
+        val legacy = FakeSession()
+        val direct = FakeDirectSession()
+        val gateway = FakeOutboundGateway().also { it.iceError = HostedCloudException(503, "DIRECT_UNAVAILABLE", "off") }
+        val manager = h.manager(
+            legacy, directSession = direct, outboundGateway = gateway,
+            hostedSessionProvider = { _, _ -> HostedCallSession("call_abcdefghijkl", "wss://lk.example.com", "legacy-token", 9_999_999L) },
+        ) { error("no tunnel") }
+
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+
+        assertEquals(listOf("ice"), gateway.calls)
+        assertTrue(direct.prepared.isEmpty())
+        assertEquals("legacy-token", legacy.connectedToken)
+        assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
+        h.close()
+    }
+
+    @Test
+    fun `外呼直连 收集 offer 失败时放掉对等连接改走 LiveKit`() = runTest {
+        val h = Harness(this)
+        val legacy = FakeSession()
+        val direct = FakeDirectSession().also { it.failPrepare = true }
+        val gateway = FakeOutboundGateway()
+        val manager = h.manager(
+            legacy, directSession = direct, outboundGateway = gateway,
+            hostedSessionProvider = { _, _ -> HostedCallSession("call_abcdefghijkl", "wss://lk.example.com", "legacy-token", 9_999_999L) },
+        ) { error("no tunnel") }
+
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+
+        assertEquals(listOf("ice"), gateway.calls)
+        assertTrue(direct.disconnected)
+        assertEquals("legacy-token", legacy.connectedToken)
+        h.close()
+    }
+
+    @Test
+    fun `外呼直连 连不上时同一通回落 LiveKit 只回落一次`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession().also { it.failConnect = true }
+        val gateway = FakeOutboundGateway()
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
+
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+        direct.emit(SessionEvent.Disconnected("direct_failed"))
+        runCurrent()
+
+        assertEquals(listOf("ice", "create", "fallback:call_abcdefghijkl"), gateway.calls)
+        assertEquals(1, direct.closedDirect)
+        assertEquals("fallback-token", direct.connectedToken)
+        assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
+        h.close()
+    }
+
+    @Test
+    fun `外呼直连 Edge 没建成直连时直接回落 中转没走直连时照旧轮询`() = runTest {
+        for ((created, expected, token) in listOf(
+            Triple(OutboundCall("call_abcdefghijkl", 9_999_999L, true, null), "fallback:call_abcdefghijkl", "fallback-token"),
+            Triple(OutboundCall("call_abcdefghijkl", 9_999_999L, false, null), "poll", "polled-token"),
+        )) {
+            val h = Harness(this)
+            val direct = FakeDirectSession()
+            val gateway = FakeOutboundGateway(created)
+            val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
+            manager.startCall(hosted, "10086", direct = true)
+            runCurrent()
+            assertEquals(listOf("ice", "create", expected), gateway.calls)
+            assertEquals(null, direct.answer)
+            assertEquals(1, direct.closedDirect)
+            assertEquals(token, direct.connectedToken)
+            h.close()
+        }
+    }
+
+    @Test
+    fun `外呼直连 拨号后直连断开按结束处理不回落`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeOutboundGateway()
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("dialing")))
+        runCurrent()
+
+        direct.emit(SessionEvent.Disconnected("direct_failed"))
+        runCurrent()
+
+        assertEquals(listOf("ice", "create"), gateway.calls)
+        assertEquals(CallState.Ended("10086", "direct_failed"), manager.state.value)
+        assertTrue(direct.disconnected)
+        h.close()
+    }
+
+    @Test
+    fun `外呼直连 建呼叫被拒绝时显示失败码并释放连接`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeOutboundGateway().also { it.createError = HostedCloudException(200, "LINE_BUSY", "云端呼叫创建失败") }
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
+
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+
+        val state = manager.state.value as CallState.Failed
+        assertEquals("LINE_BUSY", state.code)
+        assertTrue(direct.disconnected)
+        assertEquals(listOf(true, false), h.foreground)
+        h.close()
+    }
+
+    @Test
+    fun `外呼直连 建呼叫期间挂断不连通也不回落`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeOutboundGateway().also { it.createGate = CompletableDeferred() }
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+        assertEquals(listOf("ice", "create"), gateway.calls)
+
+        manager.hangup()
+        gateway.createGate!!.complete(Unit)
+        runCurrent()
+
+        assertEquals(CallState.Ended("10086", "local_hangup"), manager.state.value)
+        assertEquals(null, direct.answer)
+        assertEquals(listOf("ice", "create"), gateway.calls)
+        assertTrue(direct.disconnected)
+        h.close()
+    }
+
+    @Test
+    fun `外呼直连 dial 已交出但 Edge 确认未到时断开按结束处理不回落`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeOutboundGateway()
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+        direct.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
+        runCurrent()
+        assertTrue(direct.commands.single().contains("10086"))
+        assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
+
+        direct.emit(SessionEvent.Disconnected("direct_failed"))
+        runCurrent()
+
+        assertEquals(listOf("ice", "create"), gateway.calls)
+        assertEquals(CallState.Ended("10086", "direct_failed"), manager.state.value)
+        h.close()
+    }
+
+    @Test
+    fun `外呼直连 Edge 收不到手机音频时拨号前同一通回落`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession()
+        val gateway = FakeOutboundGateway()
+        val manager = h.manager(FakeSession(), directSession = direct, outboundGateway = gateway) { error("no tunnel") }
+        manager.startCall(hosted, "10086", direct = true)
+        runCurrent()
+
+        direct.emit(SessionEvent.Edge(Signaling.Event.MediaFailed("no_phone_audio")))
+        runCurrent()
+
+        assertEquals(listOf("ice", "create", "fallback:call_abcdefghijkl"), gateway.calls)
+        assertEquals("fallback-token", direct.connectedToken)
+        assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
         h.close()
     }
 }

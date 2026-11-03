@@ -3,6 +3,7 @@ import { inboundOwnerAction, notifyOwnerDecision, rejectOwnerDecision } from "./
 import { ClaimTiming } from "./claim-timing";
 import { claimInboundFastpathV2, fallbackInboundLivekit, inboundIce, completeInboundSdp, endInboundMedia } from "./inbound-fastpath-v2";
 import { turnConfigured } from "./turn";
+import { fallbackOutboundLivekit, outboundDirectAvailable, outboundIce, outboundPayload, startOutboundDirect } from "./outbound-direct";
 import {
   contentReadEnabled,
   contentRelayTimeoutMs
@@ -170,6 +171,9 @@ async function route(request: Request, env: Env, requestId: string, timing?: Cla
   if (device && request.method === "DELETE") return revokeDevice(request, env, device[1] ?? "");
   const call = path.match(/^\/v1\/calls\/(call_[A-Za-z0-9_-]+)$/);
   if (call && request.method === "GET") return getCall(request, env, call[1] ?? "");
+  if (path === "/v1/calls/ice" && request.method === "POST") return outboundIce(request, env);
+  const callMedia = path.match(/^\/v1\/calls\/(call_[A-Za-z0-9_-]+)\/media\/livekit$/);
+  if (callMedia && request.method === "POST") return fallbackOutboundLivekit(request, env, callMedia[1] ?? "");
 
   if (path.startsWith("/v1/") || path.startsWith("/api/")) {
     return error("NOT_FOUND", "Resource not found", 404, requestId);
@@ -304,7 +308,8 @@ async function getDevice(request: Request, env: Env): Promise<Response> {
   const features = { claimPrewarm: env.CLAIM_PREWARM_ENABLED === "true", preconnect: !v2 && env.INBOUND_PRECONNECT_ENABLED === "true",
     ...(env.INBOUND_MULTI_DEVICE_STOP_ENABLED === "true" ? { multiDeviceStop: false } : {}),
     ...(env.INBOUND_OWNER_DECLINE_ENABLED === "true" ? { ownerDecline: false } : {}),
-    ...(v2 ? { inboundFastpathV2: false } : {}) };
+    ...(v2 ? { inboundFastpathV2: false } : {}),
+    ...(env.OUTBOUND_DIRECT_ENABLED === "true" ? { outboundDirectV1: false } : {}) };
   try {
     const device = await authenticateDevice(request, env);
     const response = await edgeRoom(env, device.edge_id).fetch("https://edge-room/presence");
@@ -312,6 +317,7 @@ async function getDevice(request: Request, env: Env): Promise<Response> {
     if (env.INBOUND_OWNER_DECLINE_ENABLED === "true") features.ownerDecline = presence.ownerDecline === true;
     if (env.INBOUND_MULTI_DEVICE_STOP_ENABLED === "true") features.multiDeviceStop = presence.multiDeviceStop === true;
     if (v2) features.inboundFastpathV2 = turnConfigured(env) && presence.connected && presence.inboundFastpathV2 === true;
+    if (env.OUTBOUND_DIRECT_ENABLED === "true") features.outboundDirectV1 = presence.connected && outboundDirectAvailable(env, presence);
     return json({
       ok: true,
       paired: true,
@@ -415,13 +421,14 @@ async function unregisterVoipToken(request: Request, env: Env, kind: "voip" | "a
 async function createCall(request: Request, env: Env): Promise<Response> {
   requireSameOrigin(request, env.PUBLIC_ORIGIN);
   const device = await authenticateDevice(request, env);
-  const input = createCallSchema.parse(await readJson(request));
+  const input = createCallSchema.parse(await readJson(request, 32 * 1024));
   if (device.edge_id !== input.edgeId) throw new HttpError("FORBIDDEN", "Device is not paired to this Edge", 403);
 
   const duplicate = await env.DB.prepare(
     "SELECT * FROM calls WHERE device_id = ?1 AND idempotency_key = ?2"
   ).bind(device.device_id, input.idempotencyKey).first<CallRecord>();
-  if (duplicate) return json(callPayload(duplicate), 200);
+  // A replayed direct create never gets a second answer; the phone uses the LiveKit fallback.
+  if (duplicate) return json(outboundPayload(duplicate, callPayload(duplicate)), 200);
 
   const recent = await env.DB.prepare(
     "SELECT COUNT(*) AS count FROM calls WHERE device_id = ?1 AND created_at > ?2"
@@ -429,7 +436,8 @@ async function createCall(request: Request, env: Env): Promise<Response> {
   if ((recent?.count ?? 0) >= 10) throw new HttpError("RATE_LIMITED", "Remote call limit reached", 429);
 
   const presenceResponse = await edgeRoom(env, input.edgeId).fetch("https://edge-room/presence");
-  const presence = await presenceResponse.json<{ connected?: boolean; modemOnline?: boolean; lineBusy?: boolean }>();
+  const presence = await presenceResponse.json<{ connected?: boolean; modemOnline?: boolean; lineBusy?: boolean;
+    outboundDirectV1?: boolean }>();
   if (!presence.connected) throw new HttpError("EDGE_OFFLINE", "Edge is offline", 409);
   if (presence.modemOnline === false) throw new HttpError("MODEM_OFFLINE", "Modem is offline", 409);
   if (presence.lineBusy) throw new HttpError("LINE_BUSY", "Line is busy", 409);
@@ -442,14 +450,16 @@ async function createCall(request: Request, env: Env): Promise<Response> {
   const phoneIdentity = randomId("web", 12);
   const edgeIdentity = randomId("edgepart", 12);
   const expiresAt = now + 5 * 60 * 1000;
+  const direct = input.sdpOffer !== undefined && outboundDirectAvailable(env, presence);
   const inserted = await env.DB.prepare(
-    "INSERT OR IGNORE INTO calls(call_id, edge_id, device_id, idempotency_key, room_name, phone_identity, edge_identity, status, created_at, expires_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?8)"
-  ).bind(callId, input.edgeId, device.device_id, input.idempotencyKey, roomName, phoneIdentity, edgeIdentity, now, expiresAt).run();
+    "INSERT OR IGNORE INTO calls(call_id, edge_id, device_id, idempotency_key, room_name, phone_identity, edge_identity, status, created_at, expires_at, updated_at, media_transport) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?8, ?10)"
+  ).bind(callId, input.edgeId, device.device_id, input.idempotencyKey, roomName, phoneIdentity, edgeIdentity, now, expiresAt,
+    direct ? "direct_pending" : null).run();
   if (!inserted.meta.changes) {
     const raced = await env.DB.prepare(
       "SELECT * FROM calls WHERE device_id = ?1 AND idempotency_key = ?2"
     ).bind(device.device_id, input.idempotencyKey).first<CallRecord>();
-    if (raced) return json(callPayload(raced), 200);
+    if (raced) return json(outboundPayload(raced, callPayload(raced)), 200);
     throw new HttpError("CONFLICT", "Call could not be created", 409);
   }
 
@@ -469,6 +479,17 @@ async function createCall(request: Request, env: Env): Promise<Response> {
       token: edgeToken
     }
   };
+  if (direct) {
+    const started = await startOutboundDirect(env, command as Parameters<typeof startOutboundDirect>[1], input.sdpOffer!,
+      input.edgeId, async () => {
+        const row = await env.DB.prepare("SELECT * FROM calls WHERE call_id = ?1").bind(callId).first<CallRecord>();
+        return callPayload(row as CallRecord);
+      });
+    if (started) {
+      await audit(env, "phone", device.device_id, "call.created", callId, "allowed");
+      return started;
+    }
+  }
   const delivered = await edgeRoom(env, input.edgeId).fetch("https://edge-room/command", {
     method: "POST",
     body: JSON.stringify(command)
@@ -693,8 +714,9 @@ async function getCall(request: Request, env: Env, callId: string): Promise<Resp
     "SELECT * FROM calls WHERE call_id = ?1 AND device_id = ?2"
   ).bind(callId, device.device_id).first<CallRecord>();
   if (!call) throw new HttpError("NOT_FOUND", "Call not found", 404);
-  const payload: Record<string, unknown> = callPayload(call);
-  if (call.status === "ready" && call.expires_at > Date.now()) {
+  const payload: Record<string, unknown> = outboundPayload(call, callPayload(call));
+  // Direct calls hand out the LiveKit credential only through the explicit fallback.
+  if (call.status === "ready" && call.expires_at > Date.now() && (!call.media_transport || call.media_transport === "livekit")) {
     payload.session = {
       livekitUrl: env.LIVEKIT_URL,
       token: await issueParticipantToken(env, call.room_name, call.phone_identity),

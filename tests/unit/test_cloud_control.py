@@ -1129,3 +1129,106 @@ def test_cloud_reconnect_resets_backoff_after_a_healthy_connection_and_caps_it(m
     # Failures double up to the 10 s cap; a drop after a healthy connection retries after 1 s.
     assert waits[:5] == [1.0, 2.0, 4.0, 8.0, 10.0]
     assert waits[5] == 1.0
+
+
+_DIRECT_OFFER = {"sdpOffer": "v=0\r\ns=phone\r\n", "iceServers": [
+    {"urls": ["turn:turn.example.test:3478"], "username": "test", "credential": "test"}]}
+
+
+class _OutboundService(_Service):
+    def __init__(self, *, answer: tuple[str | None, str | None] | None = ("v=0\r\nanswer", None),
+                 result: tuple[bool, str | None] = (True, None)) -> None:
+        super().__init__()
+        self.answer, self.result = answer, result
+        self.fallbacks: list[tuple[str, object]] = []
+
+    def start_cloud_remote_session(self, command, reply=None):
+        self.commands.append(command)
+        if self.answer is not None and reply is not None:
+            reply(*self.answer)
+        return self.result
+
+    def fallback_outbound_direct(self, call_id, issued, reply):
+        self.fallbacks.append((call_id, issued))
+        reply(None, None)
+        return True
+
+
+def _fallback_command(**overrides) -> dict:
+    value = {key: _command()[key] for key in ("v", "commandId", "callId", "session")}
+    value.update(type="call.media.livekit", commandId="command_fallbackabcdef", **overrides)
+    return value
+
+
+def test_outbound_direct_start_answers_once_with_sdp_and_no_ack(monkeypatch) -> None:
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "true")
+    service = _OutboundService()
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    sent: list[dict] = []
+    client.handle_message(json.dumps(_command(direct=_DIRECT_OFFER)), lambda v: sent.append(json.loads(v)))
+    assert service.commands[0]["direct"] == _DIRECT_OFFER
+    assert sent == [{"v": 1, "type": "call.answer", "commandId": "command_abcdefghijkl",
+                     "callId": "call_abcdefghijkl", "status": "accepted", "sdpAnswer": "v=0\r\nanswer"}]
+
+
+def test_outbound_direct_rejection_is_a_single_correlated_answer(monkeypatch) -> None:
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "true")
+    service = _OutboundService(answer=(None, "MEDIA_ENDED"), result=(False, "MEDIA_FAILED"))
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    sent: list[dict] = []
+    client.handle_message(json.dumps(_command(direct=_DIRECT_OFFER)), lambda v: sent.append(json.loads(v)))
+    assert [(m["type"], m["status"], m["errorCode"]) for m in sent] == [("call.answer", "rejected", "MEDIA_ENDED")]
+
+    service = _OutboundService(answer=None, result=(False, "LINE_BUSY"))
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    sent.clear()
+    client.handle_message(json.dumps(_command(direct=_DIRECT_OFFER)), lambda v: sent.append(json.loads(v)))
+    assert [(m["type"], m["errorCode"]) for m in sent] == [("call.answer", "LINE_BUSY")]
+
+
+def test_outbound_direct_disabled_never_starts_a_session(monkeypatch) -> None:
+    monkeypatch.delenv("OUTBOUND_DIRECT_ENABLED", raising=False)
+    service = _OutboundService()
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    sent: list[dict] = []
+    for message in (_command(direct=_DIRECT_OFFER), _fallback_command()):
+        client.handle_message(json.dumps(message), lambda v: sent.append(json.loads(v)))
+    assert service.commands == [] and service.fallbacks == []
+    assert [(m["type"], m["errorCode"]) for m in sent] == [("call.answer", "DIRECT_DISABLED")] * 2
+
+
+def test_outbound_fallback_passes_the_server_room_to_the_service(monkeypatch) -> None:
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "true")
+    service = _OutboundService()
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    sent: list[dict] = []
+    client.handle_message(json.dumps(_fallback_command()), lambda v: sent.append(json.loads(v)))
+    call_id, issued = service.fallbacks[0]
+    assert call_id == "call_abcdefghijkl"
+    assert issued.room_name == "callpilot_abcdefghijkl" and issued.edge_token == "x" * 80
+    assert sent == [{"v": 1, "type": "call.answer", "commandId": "command_fallbackabcdef",
+                     "callId": "call_abcdefghijkl", "status": "accepted"}]
+
+
+@pytest.mark.parametrize("message", [
+    _command(direct={"sdpOffer": "not-sdp", "iceServers": []}),
+    _command(direct={"sdpOffer": "v=0\r\n"}),
+    _command(direct={**_DIRECT_OFFER, "extra": True}),
+    {**_fallback_command(), "direct": _DIRECT_OFFER},
+    {**_fallback_command(), "callId": "nope"},
+])
+def test_outbound_direct_parser_rejects_malformed_commands(monkeypatch, message) -> None:
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "true")
+    service = _OutboundService()
+    client = CloudEdgeClient("https://relay.example.test", service, _Store())
+    sent: list[str] = []
+    client.handle_message(json.dumps(message), sent.append)
+    assert sent == [] and service.commands == [] and service.fallbacks == []
+
+
+def test_heartbeat_advertises_outbound_direct_only_when_enabled(monkeypatch) -> None:
+    client = CloudEdgeClient("https://relay.example.test", _Service(), _Store())
+    monkeypatch.delenv("OUTBOUND_DIRECT_ENABLED", raising=False)
+    assert "outboundDirectV1" not in json.loads(client._heartbeat())["status"]
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "true")
+    assert json.loads(client._heartbeat())["status"]["outboundDirectV1"] is True

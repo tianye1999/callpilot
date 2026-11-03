@@ -26,5 +26,5 @@
     <string name="offer_answered_elsewhere">已在其他设备接听</string>
     <string name="offer_declined_elsewhere">已在其他设备拒绝，由助理接听</string>
     <string name="offer_direct_toggle">直连通话（实验）</string>
-    <string name="offer_direct_hint">接听后手机与电脑经中转 TURN 直接建立音频，接通更快；真机验证前默认关闭。</string>
+    <string name="offer_direct_hint">接听来电或拨出电话时，手机与电脑经中转 TURN 直接建立音频，接通更快；连不上会自动改走原通道。真机验证前默认关闭。</string>
 </resources>

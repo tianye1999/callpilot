@@ -86,6 +86,8 @@ class CallManager(
     /** 直连（Fastpath V2）会话工厂；为 null 表示本机不支持直连，一律走 LiveKit。 */
     private val directSessionFactory: (() -> DirectCapableSession)? = null,
     private val mediaGatewayFactory: (StoredPairing) -> InboundMediaGateway = { HostedInboundMediaGateway(it) },
+    /** A8：外呼直连的中转接口。 */
+    private val outboundGatewayFactory: (StoredPairing) -> OutboundMediaGateway = { HostedOutboundMediaGateway(it) },
     /** 直连整体上限（含 TURN 收集、补 SDP、ICE、回落），与 iOS 的 60 s 一致。 */
     private val directMediaTimeoutMs: Long = 60_000L,
     private val directSetupMs: Long = 20_000L,
@@ -136,12 +138,22 @@ class CallManager(
         @Volatile var ended = false
     }
 
+    /** A8：一通直连外呼；建呼叫后才有 callId，回落 LiveKit 恰好一次。 */
+    private class OutboundContext(val gateway: OutboundMediaGateway, val session: DirectCapableSession) {
+        @Volatile var callId: String? = null
+        @Volatile var fallbackStarted = false
+        @Volatile var fallbackJob: Job? = null
+    }
+
+    /** 当前直连外呼（commandLock 保护）；非直连外呼与来电接管时为 null。 */
+    private var outbound: OutboundContext? = null
+
     val isActive: Boolean
         get() = _state.value.let {
             it !is CallState.Idle && it !is CallState.Ended && it !is CallState.Failed
         }
 
-    fun startCall(pairing: StoredPairing, number: String) {
+    fun startCall(pairing: StoredPairing, number: String, direct: Boolean = false) {
         if (isActive) return
         synchronized(commandLock) {
             takeoverMediaTimeoutJob?.cancel()
@@ -152,6 +164,12 @@ class CallManager(
         val idempotencyKey = idempotencyKeyProvider()
         setupJob = scope.launch {
             try {
+                if (direct && pairing.protocol == PairingProtocol.HOSTED &&
+                    startOutboundDirect(pairing, number, idempotencyKey)
+                ) {
+                    setupJob = null
+                    return@launch
+                }
                 val (livekitUrl, token) = withContext(ioDispatcher) {
                     when (pairing.protocol) {
                         PairingProtocol.TUNNEL -> connectionFromInvite(inviteProvider(pairing))
@@ -185,6 +203,115 @@ class CallManager(
                 setupJob = null
                 cleanup()
                 _state.value = CallState.Failed(number, e.message ?: "拨号失败")
+            }
+        }
+    }
+
+    /**
+     * A8：外呼直连。取 TURN → 建对等连接收集完整 offer → 建呼叫时把 offer 交给 Edge，answer 随响应返回 → 连通。
+     * 建呼叫之前任何一步不可用都返回 false，由调用方照旧走 LiveKit；建呼叫之后的失败都在同一通里回落 LiveKit。
+     */
+    private suspend fun startOutboundDirect(pairing: StoredPairing, number: String, idempotencyKey: String): Boolean {
+        val edgeId = pairing.edgeId ?: return false
+        val factory = directSessionFactory ?: return false
+        val gateway = outboundGatewayFactory(pairing)
+        val servers = try {
+            gateway.iceServers(edgeId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return false
+        }
+        val s = factory()
+        val offer = try {
+            withTimeout(directSetupMs) { s.prepareDirect(servers) }
+        } catch (e: TimeoutCancellationException) {
+            s.disconnect()
+            return false
+        } catch (e: CancellationException) {
+            s.disconnect()
+            throw e
+        } catch (_: Exception) {
+            s.disconnect()
+            return false
+        }
+        val context = OutboundContext(gateway, s)
+        synchronized(commandLock) {
+            if (hangupRequested || _state.value !is CallState.Preparing) {
+                s.disconnect()
+                throw CancellationException("call ended before direct setup")
+            }
+            session = s
+            outbound = context
+            pendingDial = number
+        }
+        eventJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { s.events.collect { handleEvent(number, it) } }
+        onForeground(true)
+        val created = gateway.create(edgeId, idempotencyKey, offer)
+        context.callId = created.callId
+        currentCoroutineContext().ensureActive()
+        _state.value = CallState.WaitingMedia(number)
+        armTakeoverMediaTimeout(s, number, directMediaTimeoutMs, "通话媒体建立超时", "CALL_MEDIA_TIMEOUT")
+        val answer = created.sdpAnswer
+        when {
+            answer != null -> try {
+                withTimeout(directSetupMs) { s.connectDirect(answer) }
+            } catch (e: TimeoutCancellationException) {
+                // 阶段超时是直连失败，不是整通被取消：同一通回落。
+                outboundFallback(context)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                outboundFallback(context)
+            }
+            created.directAttempted -> outboundFallback(context)
+            else -> {
+                // 中转没走直连（未开启或旧 Edge）：这条对等连接用不上，照旧轮询拿 LiveKit 凭证。
+                s.closeDirect()
+                val legacy = gateway.awaitSession(edgeId, created)
+                currentCoroutineContext().ensureActive()
+                s.connect(legacy.livekitUrl, legacy.token)
+            }
+        }
+        return true
+    }
+
+    /** A8：同一通切到 LiveKit，恰好一次；每个异步返回点都核对这通仍是当前外呼且没被挂断。 */
+    private suspend fun outboundFallback(context: OutboundContext) {
+        val callId = context.callId ?: return
+        synchronized(commandLock) {
+            // 回落资格只看 dial 是否已交出（pendingDial 在交出时清空），不看远端确认后才变的界面状态。
+            if (context.fallbackStarted || hangupRequested || outbound !== context || pendingDial == null ||
+                _state.value !is CallState.WaitingMedia
+            ) {
+                return
+            }
+            context.fallbackStarted = true
+        }
+        context.session.closeDirect()
+        val fallback = context.gateway.fallbackLiveKit(callId)
+        currentCoroutineContext().ensureActive()
+        val stillCurrent = synchronized(commandLock) {
+            outbound === context && session === context.session && !hangupRequested && _state.value is CallState.WaitingMedia
+        }
+        if (!stillCurrent) return
+        context.session.connect(fallback.livekitUrl, fallback.token)
+    }
+
+    private fun outboundFallbackIfPossible(context: OutboundContext, number: String, reason: String) {
+        val eligible = synchronized(commandLock) { pendingDial != null }
+        if (!eligible || context.fallbackStarted || _state.value !is CallState.WaitingMedia) return
+        context.fallbackJob = scope.launch {
+            try {
+                outboundFallback(context)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val mine = synchronized(commandLock) { outbound === context && isActive }
+                if (mine) {
+                    cleanup()
+                    _state.value = CallState.Failed(number, e.message ?: reason, (e as? HostedCloudException)?.errorCode)
+                }
             }
         }
     }
@@ -507,7 +634,8 @@ class CallManager(
                     }
                     is Signaling.Event.MediaFailed -> {
                         // 直连通了但 Edge 收不到手机音频：提交前回落 LiveKit，提交后由 Edge 处置。
-                        fallbackIfPossible(e.reason)
+                        val out = outbound
+                        if (out != null) outboundFallbackIfPossible(out, number, e.reason) else fallbackIfPossible(e.reason)
                         return
                     }
                     Signaling.Event.HangupAck -> return
@@ -529,6 +657,16 @@ class CallManager(
                 }
             }
             is SessionEvent.Disconnected -> {
+                val out = outbound
+                if (out != null && (event.reason.startsWith("direct_") || event.reason == "channel_closed")) {
+                    // 回落进行中的旧对等连接尾随事件与本通无关；dial 交出前直连断开则同一通回落，交出后按结束处理。
+                    if (out.fallbackStarted) return
+                    val dialPending = synchronized(commandLock) { pendingDial != null }
+                    if (dialPending && _state.value is CallState.WaitingMedia) {
+                        outboundFallbackIfPossible(out, number, event.reason)
+                        return
+                    }
+                }
                 val context = takeover
                 val direct = context?.direct
                 val fromDirect = event.reason.startsWith("direct_") || event.reason == "channel_closed"
@@ -582,16 +720,18 @@ class CallManager(
             dialJob?.isActive == true
     }
 
-    private fun armTakeoverMediaTimeout(expectedSession: RemoteSession, label: String, timeoutMs: Long = takeoverMediaTimeoutMs) {
+    private fun armTakeoverMediaTimeout(
+        expectedSession: RemoteSession,
+        label: String,
+        timeoutMs: Long = takeoverMediaTimeoutMs,
+        message: String = "接管媒体建立超时",
+        code: String = "TAKEOVER_MEDIA_TIMEOUT",
+    ) {
         val job = synchronized(commandLock) {
             takeoverMediaTimeoutJob?.cancel()
             scope.launch(start = CoroutineStart.LAZY) {
                 delay(timeoutMs)
-                val failed = CallState.Failed(
-                    label,
-                    "接管媒体建立超时",
-                    code = "TAKEOVER_MEDIA_TIMEOUT",
-                )
+                val failed = CallState.Failed(label, message, code = code)
                 // 校验所属会话、发布 Failed、摘取这通的资源是同一次锁内转换：
                 // 看到 Failed 后立刻开始的下一通，不可能被这里的清理碰到。
                 val captured = synchronized(commandLock) {
@@ -651,7 +791,12 @@ class CallManager(
         release(synchronized(commandLock) { captureForCleanupLocked() })
     }
 
-    private class CapturedCall(val session: RemoteSession?, val takeover: TakeoverContext?, val eventJob: Job?)
+    private class CapturedCall(
+        val session: RemoteSession?,
+        val takeover: TakeoverContext?,
+        val eventJob: Job?,
+        val outbound: OutboundContext? = null,
+    )
 
     /** 必须持有 commandLock：摘下当前通话的全部引用并置空，之后的新通话从空状态开始。 */
     private fun captureForCleanupLocked(): CapturedCall {
@@ -662,9 +807,10 @@ class CallManager(
         takeoverMediaTimeoutJob?.cancel()
         takeoverMediaTimeoutJob = null
         pendingDial = null
-        val captured = CapturedCall(session, takeover, eventJob)
+        val captured = CapturedCall(session, takeover, eventJob, outbound)
         session = null
         takeover = null
+        outbound = null
         eventJob = null
         return captured
     }
@@ -674,6 +820,7 @@ class CallManager(
         onForeground(false)
         captured.eventJob?.cancel()
         captured.takeover?.fallbackJob?.cancel()
+        captured.outbound?.fallbackJob?.cancel()
         // claim 失败或 claim 期间挂断：预备还没交给会话，这里放掉。
         captured.takeover?.prepared?.let {
             captured.takeover.prepared = null

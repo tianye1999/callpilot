@@ -117,6 +117,8 @@ protocol CallDirectMediaTransport: CallMediaTransport {
     func prepareDirect(servers: [CallIceServer]) async throws -> String
     func connectDirect(answer: String) async throws
     func activateDirectAudio() throws
+    // A protocol requirement so the concrete transport's override is dispatched.
+    func activateStandaloneAudio() throws
     // Synchronous revocation fences audio before an uncooperative SDK teardown.
     func stopDirectAudio()
     var latestRtpStats: Data? { get }
@@ -126,6 +128,8 @@ protocol CallDirectMediaTransport: CallMediaTransport {
 extension CallDirectMediaTransport {
     var latestRtpStats: Data? { nil }
     func finishRtpSampling() {}
+    /// A8: app-dialed calls have no CallKit activation to wait for.
+    func activateStandaloneAudio() throws { try activateDirectAudio() }
 }
 
 final class CallFirstFrameRendererRemoval: @unchecked Sendable {

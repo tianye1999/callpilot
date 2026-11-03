@@ -41,7 +41,9 @@ class CloudSessionService(Protocol):
 
     def line_busy(self) -> bool: ...
 
-    def start_cloud_remote_session(self, command: dict[str, Any]) -> tuple[bool, str | None]: ...
+    def start_cloud_remote_session(
+        self, command: dict[str, Any], reply: Callable[[str | None, str | None], None] | None = None
+    ) -> tuple[bool, str | None]: ...
 
     def next_inbound_takeover_offer(
         self, timeout: float = 0.0
@@ -295,6 +297,11 @@ class CloudEdgeClient:
             # Prepare is not a claim ACK and cannot transition D1 to edge_ready.
             return
 
+        if command["type"] == "call.media.livekit" or (
+                command["type"] == "session.start" and "direct" in command):
+            self._handle_outbound_direct(command, send)
+            return
+
         command_id = command["commandId"]
         call_id = command["callId"]
         offer_id: str | None = None
@@ -393,6 +400,53 @@ class CloudEdgeClient:
         if error:
             response["errorCode"] = error
         send(json.dumps(response, separators=(",", ":")))
+
+    def _handle_outbound_direct(self, command: dict[str, Any], send: Callable[[str], None]) -> None:
+        """A8: answer a direct outbound start or its same-call LiveKit fallback exactly once."""
+        lock = threading.Lock()
+        answered = False
+
+        def reply(sdp: str | None, error_code: str | None) -> None:
+            nonlocal answered
+            with lock:
+                if answered:
+                    return
+                answered = True
+            answer: dict[str, Any] = {"v": 1, "type": "call.answer", "commandId": command["commandId"],
+                                      "callId": command["callId"],
+                                      "status": "rejected" if error_code else "accepted"}
+            if sdp is not None:
+                answer["sdpAnswer"] = sdp
+            if error_code:
+                answer["errorCode"] = error_code
+            try:
+                send(json.dumps(answer, separators=(",", ":")))
+            except Exception:
+                # SDP must never reach logs on failure.
+                logger.warning("Outbound media answer delivery failed")
+
+        if not config.get_bool("OUTBOUND_DIRECT_ENABLED"):
+            reply(None, "DIRECT_DISABLED")
+            return
+        if command["type"] == "call.media.livekit":
+            session = command["session"]
+            issued = IssuedLiveKitSession(
+                invite=RemoteDialerInvite(session_id=session["sessionId"], url="",
+                                          expires_at=time.time() + 600.0),
+                room_name=session["roomName"],
+                browser_identity=session["browserIdentity"],
+                edge_identity=session["edgeIdentity"],
+                browser_token="",
+                edge_token=session["token"],
+                livekit_url=session["livekitUrl"],
+            )
+            fallback = getattr(self.service, "fallback_outbound_direct", None)
+            if not callable(fallback) or not fallback(command["callId"], issued, reply):
+                reply(None, "MEDIA_FALLBACK_REJECTED")
+            return
+        accepted, error = self.service.start_cloud_remote_session(command, reply=reply)
+        if not accepted:
+            reply(None, error or "SESSION_REJECTED")
 
     def _handle_data_request(
         self, command: dict[str, Any], send: Callable[[str], None]
@@ -645,6 +699,7 @@ class CloudEdgeClient:
                 **({"inboundFastpathV2": True} if config.get_bool("INBOUND_FASTPATH_V2_ENABLED") else {}),
                 **({"ownerDecline": True} if config.get_bool("INBOUND_OWNER_DECLINE_ENABLED") else {}),
                 **({"multiDeviceStop": True} if config.get_bool("INBOUND_MULTI_DEVICE_STOP_ENABLED") else {}),
+                **({"outboundDirectV1": True} if config.get_bool("OUTBOUND_DIRECT_ENABLED") else {}),
             },
         }
         return json.dumps(payload, separators=(",", ":"))
@@ -681,6 +736,13 @@ def _parse_cloud_command(raw: str) -> dict[str, Any]:
         return value
     if command_type == "session.start":
         return _validate_session_command(value)
+    if command_type == "call.media.livekit":
+        if (set(value) != {"v", "type", "commandId", "callId", "session"} or value.get("v") != 1
+                or not _valid_id(value.get("commandId"), "command")
+                or not _valid_id(value.get("callId"), "call")):
+            raise ValueError("invalid outbound fallback")
+        _validate_issued_session(value.get("session"))
+        return value
     if command_type == "inbound.owner_declined":
         if (set(value) != {"v", "type", "offerId", "callId", "generation", "nonce"}
                 or value.get("v") != 1 or type(value.get("generation")) is not int
@@ -745,10 +807,12 @@ def _parse_session_command(raw: str) -> dict[str, Any]:
 
 
 def _validate_session_command(value: dict[str, Any]) -> dict[str, Any]:
-    if set(value) != {
+    if set(value) - {"direct"} != {
         "v", "type", "commandId", "callId", "expiresAt", "session"
     }:
         raise ValueError("invalid command")
+    if "direct" in value:
+        _validate_direct_offer(value["direct"])
     if value.get("v") != 1 or value.get("type") != "session.start":
         raise ValueError("invalid command")
     if not _valid_id(value.get("commandId"), "command") or not _valid_id(
@@ -797,13 +861,17 @@ def _validate_inbound_claim(value: dict[str, Any]) -> dict[str, Any]:
         direct = value["direct"]
         if isinstance(direct, dict) and set(direct) == {"deferred"} and direct["deferred"] is True:
             return value
-        if not isinstance(direct, dict) or set(direct) != {"sdpOffer", "iceServers"}:
-            raise ValueError("invalid direct media")
-        sdp = direct["sdpOffer"]
-        if not isinstance(sdp, str) or not sdp.startswith("v=0") or len(sdp.encode("utf-8")) > 16 * 1024:
-            raise ValueError("invalid SDP")
-        _validate_ice_servers(direct["iceServers"])
+        _validate_direct_offer(direct)
     return value
+
+
+def _validate_direct_offer(direct: Any) -> None:
+    if not isinstance(direct, dict) or set(direct) != {"sdpOffer", "iceServers"}:
+        raise ValueError("invalid direct media")
+    sdp = direct["sdpOffer"]
+    if not isinstance(sdp, str) or not sdp.startswith("v=0") or len(sdp.encode("utf-8")) > 16 * 1024:
+        raise ValueError("invalid SDP")
+    _validate_ice_servers(direct["iceServers"])
 
 
 def _validate_ice_servers(servers: Any) -> None:

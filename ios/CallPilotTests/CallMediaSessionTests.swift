@@ -664,6 +664,136 @@ final class CallMediaSessionTests: XCTestCase {
         await media.stop()
     }
 
+    // MARK: - A8 outbound direct
+
+    private func makeOutboundClient(answer: Bool = true, directAttempted: Bool = true, iceUnavailable: Bool = false,
+                                    onCreate: ((([String: Any]) -> Void))? = nil,
+                                    onFallback: (() -> Void)? = nil) throws -> HostedCloudClient {
+        MediaMockURLProtocol.requestHandler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/v1/calls/ice" {
+                if iceUnavailable {
+                    return Self.httpResponse(for: request, statusCode: 503,
+                        json: #"{"error":{"code":"DIRECT_UNAVAILABLE","message":"Unavailable"}}"#)
+                }
+                return Self.httpResponse(for: request, statusCode: 200,
+                    json: #"{"iceServers":[{"urls":["turn:relay.example:3478"],"username":"test","credential":"test"}],"expiresAt":9999}"#)
+            }
+            if path == "/v1/calls/call_abcdefghijkl/media/livekit" {
+                onFallback?()
+                return Self.httpResponse(for: request, statusCode: 202,
+                    json: #"{"callId":"call_abcdefghijkl","session":{"livekitUrl":"wss://lk.example.com","token":"fallback-token","expiresAt":9999}}"#)
+            }
+            if path == "/v1/calls/call_abcdefghijkl" {
+                return Self.httpResponse(for: request, statusCode: 200,
+                    json: #"{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"ready","createdAt":1,"expiresAt":9999,"session":{"livekitUrl":"wss://lk.example.com","token":"legacy-token","expiresAt":9999}}"#)
+            }
+            XCTAssertEqual(path, "/v1/calls")
+            let body = try Self.directRequestFields(request)
+            onCreate?(body)
+            let direct = body["sdpOffer"] != nil && directAttempted
+            let transports = answer && direct ? #","transports":[{"kind":"webrtc","sdpAnswer":"v=0\r\nanswer"}]"# : ""
+            return Self.httpResponse(for: request, statusCode: 202,
+                json: #"{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"#
+                    + (direct ? #""ready","directAttempted":true"# : #""pending""#)
+                    + #","createdAt":1,"expiresAt":9999"# + transports + "}")
+        }
+        return try makeClient()
+    }
+
+    private func outboundMedia(_ direct: FakeDirectTransport, _ livekit: FakeCallMediaTransport,
+                               states: @escaping CallMediaSession.StateHandler = { _ in }) -> CallMediaSession {
+        CallMediaSession(onState: states, transportFactory: { livekit },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct })
+    }
+
+    func testOutboundDirectAnswersInCreateAndDialsOverDirectAfterMediaReady() async throws {
+        var created: [String: Any] = [:]
+        let client = try makeOutboundClient(onCreate: { created = $0 }, onFallback: { XCTFail("no fallback") })
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        let media = outboundMedia(direct, livekit)
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086", direct: true)
+        XCTAssertEqual(created["mediaTransport"] as? String, "webrtc")
+        XCTAssertEqual(created["sdpOffer"] as? String, "v=0\r\noffer")
+        XCTAssertEqual(direct.activations, 1, "app-dialed direct audio activates without CallKit")
+        XCTAssertTrue(livekit.connectedTokens.isEmpty)
+        await direct.eventHandler?(.data(Data(#"{"type":"status","status":"media_ready"}"#.utf8), topic: CallPilotTopic.status))
+        await waitUntil { direct.packets.contains { String(decoding: $0, as: UTF8.self).contains("10086") } }
+        XCTAssertTrue(direct.packets.contains { String(decoding: $0, as: UTF8.self).contains("10086") })
+        await media.stop()
+    }
+
+    func testOutboundDirectFailureFallsBackOnceToTheSameCallsRoom() async throws {
+        var fallbacks = 0
+        let client = try makeOutboundClient(onFallback: { fallbacks += 1 })
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        direct.failure = true
+        var states: [CallState] = []
+        let media = outboundMedia(direct, livekit) { states.append($0) }
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086", direct: true)
+        await waitUntil { livekit.connectedTokens == ["fallback-token"] }
+        XCTAssertEqual(livekit.connectedTokens, ["fallback-token"])
+        XCTAssertEqual(fallbacks, 1)
+        XCTAssertTrue(direct.audioStopped)
+        XCTAssertFalse(states.contains { $0.isTerminal })
+        await media.stop()
+    }
+
+    func testOutboundWithoutAnEdgeAnswerFallsBackAndAnOldEdgeIsPolled() async throws {
+        for (directAttempted, token) in [(true, "fallback-token"), (false, "legacy-token")] {
+            let client = try makeOutboundClient(answer: false, directAttempted: directAttempted)
+            let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+            let media = outboundMedia(direct, livekit)
+            await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086", direct: true)
+            await waitUntil { livekit.connectedTokens == [token] }
+            XCTAssertEqual(livekit.connectedTokens, [token])
+            XCTAssertEqual(direct.activations, 0)
+            await media.stop()
+        }
+    }
+
+    func testOutboundDirectUnavailableKeepsThePlainLiveKitPath() async throws {
+        var created: [String: Any] = [:]
+        let client = try makeOutboundClient(iceUnavailable: true, onCreate: { created = $0 })
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        let media = outboundMedia(direct, livekit)
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086", direct: true)
+        await waitUntil { livekit.connectedTokens == ["legacy-token"] }
+        XCTAssertEqual(direct.prepares, 0)
+        XCTAssertNil(created["sdpOffer"])
+        XCTAssertEqual(livekit.connectedTokens, ["legacy-token"])
+        await media.stop()
+    }
+
+    func testOutboundEdgeWithoutPhoneAudioAsksForTheFallbackBeforeDialing() async throws {
+        var fallbacks = 0
+        let client = try makeOutboundClient(onFallback: { fallbacks += 1 })
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        let media = outboundMedia(direct, livekit)
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086", direct: true)
+        await direct.eventHandler?(.data(Data(#"{"type":"media_failed","reason":"no_phone_audio"}"#.utf8),
+                                           topic: CallPilotTopic.status))
+        await waitUntil { livekit.connectedTokens == ["fallback-token"] }
+        XCTAssertEqual(livekit.connectedTokens, ["fallback-token"])
+        XCTAssertEqual(fallbacks, 1)
+        await media.stop()
+    }
+
+    func testOutboundDirectLossAfterDialEndsTheCallInsteadOfSwitching() async throws {
+        let client = try makeOutboundClient(onFallback: { XCTFail("a dialed call cannot switch transports") })
+        let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
+        var states: [CallState] = []
+        let media = outboundMedia(direct, livekit) { states.append($0) }
+        await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086", direct: true)
+        await direct.eventHandler?(.data(Data(#"{"type":"status","status":"media_ready"}"#.utf8), topic: CallPilotTopic.status))
+        await waitUntil { !direct.packets.isEmpty }
+        await direct.eventHandler?(.disconnected(reason: "ICE failed while ringing"))
+        XCTAssertTrue(states.last?.isTerminal == true)
+        XCTAssertTrue(livekit.connectedTokens.isEmpty)
+        await media.stop()
+    }
+
     private func makeDirectClient(includeAnswer: Bool = true, iceUnavailable: Bool = false, rejectClaim: Bool = false,
                                   onFallback: (() -> Void)? = nil, onClaim: ((Bool) -> Void)? = nil,
                                   onSupplement: (() -> Void)? = nil, onEnd: (() -> Void)? = nil,

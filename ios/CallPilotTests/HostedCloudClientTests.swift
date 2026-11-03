@@ -367,6 +367,98 @@ final class HostedCloudClientTests: XCTestCase {
         XCTAssertEqual(session.token, "jwt-token")
     }
 
+    func testCreateDirectCallParsesTheEdgeAnswerAndRejectsContradictions() async throws {
+        var bodies: [[String: Any]] = []
+        var responses = [
+            #"{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"ready","createdAt":1,"expiresAt":9999,"directAttempted":true,"transports":[{"kind":"webrtc","sdpAnswer":"v=0\r\nanswer"}]}"#,
+            #"{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"ready","createdAt":1,"expiresAt":9999,"transports":[{"kind":"webrtc","sdpAnswer":"v=0\r\nanswer"}]}"#,
+        ]
+        let client = try makeClient { request in
+            XCTAssertEqual(request.url?.path, "/v1/calls")
+            bodies.append(try XCTUnwrap(JSONSerialization.jsonObject(with: try Self.requestBody(request)) as? [String: Any]))
+            return Self.response(for: request, status: 202, json: responses.removeFirst())
+        }
+        let call = try await client.createDirectCall(edgeId: "edge_abcdefghijkl", sdpOffer: "v=0\r\noffer",
+                                                     idempotencyKey: "ios-test-key-1234")
+        XCTAssertEqual(call.sdpAnswer, "v=0\r\nanswer")
+        XCTAssertTrue(call.directAttempted)
+        XCTAssertEqual(bodies[0]["mediaTransport"] as? String, "webrtc")
+        do {
+            _ = try await client.createDirectCall(edgeId: "edge_abcdefghijkl", sdpOffer: "v=0\r\noffer",
+                                                  idempotencyKey: "ios-test-key-5678")
+            XCTFail("an answer without directAttempted is contradictory")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "INVALID_RESPONSE")
+        }
+    }
+
+    func testCreateDirectCallReplayWaitsForThePendingCreateToSettle() async throws {
+        var paths: [String] = []
+        let client = try makeClient { request in
+            paths.append(request.url?.path ?? "")
+            let status = paths.count < 3 ? "pending" : "ready"
+            return Self.response(for: request, status: paths.count == 1 ? 200 : 200,
+                json: #"{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":""# + status
+                    + #"","createdAt":1,"expiresAt":9999,"directAttempted":true}"#)
+        }
+        let call = try await client.createDirectCall(edgeId: "edge_abcdefghijkl", sdpOffer: "v=0\r\noffer",
+                                                     idempotencyKey: "ios-test-key-1234")
+        XCTAssertTrue(call.directAttempted)
+        XCTAssertNil(call.sdpAnswer)
+        XCTAssertEqual(paths, ["/v1/calls", "/v1/calls/call_abcdefghijkl", "/v1/calls/call_abcdefghijkl"])
+    }
+
+    func testCreateDirectCallReplayFollowsADowngradeToPlainLiveKit() async throws {
+        var count = 0
+        let client = try makeClient { request in
+            count += 1
+            if count == 1 {
+                return Self.response(for: request, status: 200,
+                    json: #"{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"pending","createdAt":1,"expiresAt":9999,"directAttempted":true}"#)
+            }
+            return Self.response(for: request, json: Self.callJSON(status: "ready",
+                session: #"{"livekitUrl":"wss://lk.example.com","token":"jwt-token","expiresAt":9999}"#))
+        }
+        let call = try await client.createDirectCall(edgeId: "edge_abcdefghijkl", sdpOffer: "v=0\r\noffer",
+                                                     idempotencyKey: "ios-test-key-1234")
+        XCTAssertFalse(call.directAttempted, "a settled plain LiveKit call is polled, never switched")
+    }
+
+    func testCreateDirectCallReplayKeepsTheSettledFailureCode() async throws {
+        var count = 0
+        let client = try makeClient { request in
+            count += 1
+            return Self.response(for: request, status: 200,
+                json: #"{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":""#
+                    + (count == 1 ? "pending" : "failed")
+                    + #"","errorCode":"EDGE_TIMEOUT","createdAt":1,"expiresAt":9999,"directAttempted":true}"#)
+        }
+        do {
+            _ = try await client.createDirectCall(edgeId: "edge_abcdefghijkl", sdpOffer: "v=0\r\noffer",
+                                                  idempotencyKey: "ios-test-key-1234")
+            XCTFail("a failed create must surface")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "EDGE_TIMEOUT")
+        }
+    }
+
+    func testOutboundFallbackRetriesAMediaRelayTimeoutOnce() async throws {
+        var calls = 0
+        let client = try makeClient { request in
+            calls += 1
+            XCTAssertEqual(request.url?.path, "/v1/calls/call_abcdefghijkl/media/livekit")
+            if calls == 1 {
+                return Self.response(for: request, status: 504,
+                    json: #"{"error":{"code":"MEDIA_RELAY_TIMEOUT","message":"timeout"}}"#)
+            }
+            return Self.response(for: request, status: 202,
+                json: #"{"callId":"call_abcdefghijkl","session":{"livekitUrl":"wss://lk.example.com","token":"fallback-token","expiresAt":9999}}"#)
+        }
+        let session = try await client.fallbackCallLiveKit(callId: "call_abcdefghijkl")
+        XCTAssertEqual(session.token, "fallback-token")
+        XCTAssertEqual(calls, 2)
+    }
+
     func testCreateSessionPreservesStablePreflightError() async throws {
         // Android parity: HostedCloudClientTest.`结构化 API 错误按 code 暴露`.
         let client = try makeClient { request in

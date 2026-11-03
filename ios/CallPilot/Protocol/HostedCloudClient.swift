@@ -85,6 +85,8 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
                                   preconnect: silent, inboundFastpathV2: v2)
         status.multiDeviceStop = features?["multiDeviceStop"] as? Bool == true
         status.ownerDecline = features?["ownerDecline"] as? Bool == true
+        let outbound = features?["outboundDirectV1"] as? NSNumber
+        status.outboundDirect = outbound.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
         return status
     }
 
@@ -161,16 +163,19 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
             "edgeId": edgeId,
             "idempotencyKey": idempotencyKey,
         ])
-        let created = try await createCallWithRetry(body: body, expectedEdgeId: edgeId)
+        let created = try await createCallWithRetry(body: body, expectedEdgeId: edgeId).call
         try throwIfTerminal(created)
+        return try await pollCallSession(edgeId: edgeId, callId: created.callId, expiresAt: created.expiresAt)
+    }
 
+    private func pollCallSession(edgeId: String, callId: String, expiresAt: Int64) async throws -> HostedCallSession {
         let pollingStartedAt = clockMilliseconds()
-        while clockMilliseconds() < created.expiresAt {
-            let (payload, response) = try await request("GET", "v1/calls/\(created.callId)")
+        while clockMilliseconds() < expiresAt {
+            let (payload, response) = try await request("GET", "v1/calls/\(callId)")
             let call = try decodeCall(payload, statusCode: response.statusCode)
             try validateCall(
                 call,
-                expectedCallId: created.callId,
+                expectedCallId: callId,
                 expectedEdgeId: edgeId,
                 statusCode: response.statusCode
             )
@@ -186,12 +191,109 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
             }
 
             let now = clockMilliseconds()
-            let remaining = created.expiresAt - now
+            let remaining = expiresAt - now
             if remaining <= 0 { break }
             let interval: Int64 = now - pollingStartedAt < 3_000 ? 250 : 1_000
             try await sleepMilliseconds(UInt64(min(interval, remaining)))
         }
         throw HostedCloudError(statusCode: 408, code: "SESSION_TIMEOUT", message: "等待云端通话会话超时")
+    }
+
+    // MARK: - 外呼直连(A8)
+
+    /// Phone ICE for a complete outbound offer. 503 means direct is off for this Edge.
+    func outboundIceServers(edgeId: String) async throws -> [CallIceServer] {
+        guard edgeId.wholeMatch(of: Self.edgeIdRE) != nil else {
+            throw HostedCloudError(statusCode: 0, code: "BAD_EDGE_ID", message: "云配对缺少有效的 Edge ID")
+        }
+        let body = try JSONSerialization.data(withJSONObject: ["edgeId": edgeId])
+        let (payload, response) = try await request("POST", "v1/calls/ice", body: body)
+        return try Self.iceServers(payload, response: response)
+    }
+
+    /// Create the call with the phone's offer; the Edge answer returns in the same response.
+    func createDirectCall(edgeId: String, sdpOffer: String,
+                          idempotencyKey: String = "ios-\(UUID().uuidString)") async throws -> HostedOutboundCall {
+        guard edgeId.wholeMatch(of: Self.edgeIdRE) != nil,
+              idempotencyKey.wholeMatch(of: Self.idempotencyKeyRE) != nil,
+              sdpOffer.hasPrefix("v=0"), sdpOffer.utf8.count <= 16 * 1024 else {
+            throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "外呼直连参数不合法")
+        }
+        let body = try JSONSerialization.data(withJSONObject: [
+            "edgeId": edgeId, "idempotencyKey": idempotencyKey, "mediaTransport": "webrtc", "sdpOffer": sdpOffer,
+        ])
+        let (call, payload, statusCode) = try await createCallWithRetry(body: body, expectedEdgeId: edgeId)
+        try throwIfTerminal(call)
+        let flag = payload["directAttempted"] as? NSNumber
+        let directAttempted = flag.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
+        let transports = payload["transports"] as? [[String: Any]] ?? []
+        let webrtc = transports.first { $0["kind"] as? String == "webrtc" }
+        let answer = webrtc?["sdpAnswer"] as? String
+        if (webrtc != nil && (!directAttempted || answer == nil)) || (directAttempted && call.session != nil) {
+            throw HostedCloudError(statusCode: statusCode, code: "INVALID_RESPONSE", message: "直连外呼响应不一致")
+        }
+        if let answer, !answer.hasPrefix("v=0") || answer.utf8.count > 16 * 1024 {
+            throw HostedCloudError(statusCode: statusCode, code: "INVALID_RESPONSE", message: "Invalid SDP answer")
+        }
+        if directAttempted, answer == nil, call.status == "pending" {
+            // A same-key replay can arrive while the first create still waits for the Edge.
+            // Wait for it to settle and use the settled transport: without Edge TURN the relay
+            // starts a plain LiveKit session, which is polled rather than switched.
+            let settled = try await awaitCallSettled(edgeId: edgeId, callId: call.callId, expiresAt: call.expiresAt)
+            return HostedOutboundCall(callId: call.callId, expiresAt: call.expiresAt,
+                                      directAttempted: settled, sdpAnswer: nil)
+        }
+        return HostedOutboundCall(callId: call.callId, expiresAt: call.expiresAt,
+                                  directAttempted: directAttempted, sdpAnswer: answer)
+    }
+
+    /// Poll until the call leaves pending; returns whether it is still a direct call.
+    private func awaitCallSettled(edgeId: String, callId: String, expiresAt: Int64) async throws -> Bool {
+        let startedAt = clockMilliseconds()
+        while clockMilliseconds() < expiresAt {
+            let (payload, response) = try await request("GET", "v1/calls/\(callId)")
+            let call = try decodeCall(payload, statusCode: response.statusCode)
+            try validateCall(call, expectedCallId: callId, expectedEdgeId: edgeId, statusCode: response.statusCode)
+            try throwIfTerminal(call)
+            if call.status != "pending" {
+                let flag = payload["directAttempted"] as? NSNumber
+                return flag.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
+            }
+            let now = clockMilliseconds()
+            let interval: Int64 = now - startedAt < 3_000 ? 250 : 1_000
+            try await sleepMilliseconds(UInt64(max(0, min(interval, expiresAt - now))))
+        }
+        throw HostedCloudError(statusCode: 408, code: "SESSION_TIMEOUT", message: "等待云端通话会话超时")
+    }
+
+    /// The relay started a plain LiveKit session (older Edge): poll as before.
+    func awaitCallSession(edgeId: String, call: HostedOutboundCall) async throws -> HostedCallSession {
+        try await pollCallSession(edgeId: edgeId, callId: call.callId, expiresAt: call.expiresAt)
+    }
+
+    /// Switch this same call to its LiveKit room; the Edge treats repeats as idempotent.
+    func fallbackCallLiveKit(callId: String) async throws -> HostedCallSession {
+        guard callId.wholeMatch(of: Self.callIdRE) != nil else {
+            throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "Invalid call")
+        }
+        let path = "v1/calls/\(callId)/media/livekit"
+        let body = Data("{}".utf8)
+        let result: ([String: Any], HTTPURLResponse)
+        do { result = try await request("POST", path, body: body) }
+        catch let error as HostedCloudError where
+            (error.statusCode == 503 && error.code == "MEDIA_RELAY_UNAVAILABLE") ||
+            (error.statusCode == 504 && error.code == "MEDIA_RELAY_TIMEOUT") {
+            try Task.checkCancellation()
+            result = try await request("POST", path, body: body)
+        }
+        let (payload, response) = result
+        guard payload["callId"] as? String == callId, let session = payload["session"] as? [String: Any],
+              let url = session["livekitUrl"] as? String, let token = session["token"] as? String,
+              let expiresAt = Self.jsonInt64(session["expiresAt"]) else {
+            throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid fallback session")
+        }
+        try validateSession(HostedSessionPayload(livekitURL: url, token: token, expiresAt: expiresAt), statusCode: response.statusCode)
+        return HostedCallSession(sessionId: callId, livekitURL: url, token: token, expiresAt: expiresAt)
     }
 
     // MARK: - 来电接管(#95)
@@ -318,6 +420,10 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
             throw HostedCloudError(statusCode: 0, code: "BAD_OFFER_ID", message: "Invalid offer")
         }
         let (payload, response) = try await request("POST", "v1/inbound-offers/\(offerId)/ice")
+        return try Self.iceServers(payload, response: response)
+    }
+
+    private static func iceServers(_ payload: [String: Any], response: HTTPURLResponse) throws -> [CallIceServer] {
         guard let rows = payload["iceServers"] as? [[String: Any]], !rows.isEmpty, rows.count <= 16 else {
             throw HostedCloudError(statusCode: response.statusCode, code: "INVALID_RESPONSE", message: "Invalid ICE servers")
         }
@@ -607,7 +713,7 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     private func createCallWithRetry(
         body: Data,
         expectedEdgeId: String
-    ) async throws -> HostedCallPayload {
+    ) async throws -> (call: HostedCallPayload, payload: [String: Any], statusCode: Int) {
         for attempt in 0..<2 {
             do {
                 let (payload, response) = try await request("POST", "v1/calls", body: body)
@@ -618,7 +724,7 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
                     expectedEdgeId: expectedEdgeId,
                     statusCode: response.statusCode
                 )
-                return call
+                return (call, payload, response.statusCode)
             } catch is URLError where attempt == 0 {
                 continue
             }

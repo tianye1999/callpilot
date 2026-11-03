@@ -703,4 +703,103 @@ class HostedCloudClientTest {
         }
         assertEquals("PAYLOAD_TOO_LARGE", error.errorCode)
     }
+
+    private val directCreated = """{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"ready","createdAt":1,"expiresAt":9999999999999,"directAttempted":true,"transports":[{"kind":"webrtc","sdpAnswer":"v=0\r\nanswer"}]}"""
+
+    @Test
+    fun `createDirectCall 带 offer 建呼叫并解析 Edge answer`() {
+        server.enqueue(MockResponse().setResponseCode(202).setBody(directCreated))
+
+        val call = client.createDirectCall("edge_abcdefghijkl", "v=0\r\noffer", "android-idempotency-0001")
+
+        assertEquals("call_abcdefghijkl", call.callId)
+        assertTrue(call.directAttempted)
+        assertEquals("v=0\r\nanswer", call.sdpAnswer)
+        val request = server.takeRequest()
+        assertEquals("/v1/calls", request.path)
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("\"mediaTransport\":\"webrtc\""))
+        assertTrue(body.contains("\"sdpOffer\""))
+    }
+
+    @Test
+    fun `createDirectCall 旧中转不走直连 Edge 拒绝带失败码 自相矛盾的响应不信`() {
+        server.enqueue(MockResponse().setResponseCode(202)
+            .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"pending","createdAt":1,"expiresAt":9999999999999}"""))
+        val legacy = client.createDirectCall("edge_abcdefghijkl", "v=0\r\noffer", "android-idempotency-0002")
+        assertFalse(legacy.directAttempted)
+        assertEquals(null, legacy.sdpAnswer)
+
+        server.enqueue(MockResponse().setResponseCode(202)
+            .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"failed","errorCode":"LINE_BUSY","createdAt":1,"expiresAt":9999999999999}"""))
+        val busy = runCatching { client.createDirectCall("edge_abcdefghijkl", "v=0\r\noffer", "android-idempotency-0003") }
+        assertEquals("LINE_BUSY", (busy.exceptionOrNull() as HostedCloudException).errorCode)
+
+        server.enqueue(MockResponse().setResponseCode(202).setBody(directCreated.replace("\"directAttempted\":true", "\"directAttempted\":false")))
+        val contradictory = runCatching { client.createDirectCall("edge_abcdefghijkl", "v=0\r\noffer", "android-idempotency-0004") }
+        assertEquals("INVALID_RESPONSE", (contradictory.exceptionOrNull() as HostedCloudException).errorCode)
+    }
+
+    @Test
+    fun `outboundIceServers 与 fallbackCallLiveKit 走外呼路由`() {
+        server.enqueue(MockResponse().setResponseCode(200)
+            .setBody("""{"iceServers":[{"urls":["turn:turn.example:3478"],"username":"u","credential":"c"}],"expiresAt":9999999999999}"""))
+        server.enqueue(MockResponse().setResponseCode(202)
+            .setBody("""{"callId":"call_abcdefghijkl","session":{"livekitUrl":"wss://cloud.livekit.example","token":"a.b.c","expiresAt":9999999999999}}"""))
+        server.enqueue(MockResponse().setResponseCode(202)
+            .setBody("""{"callId":"call_otherabcdefg","session":{"livekitUrl":"wss://cloud.livekit.example","token":"a.b.c","expiresAt":9999999999999}}"""))
+
+        assertEquals("u", client.outboundIceServers("edge_abcdefghijkl").single().username)
+        assertEquals("a.b.c", client.fallbackCallLiveKit("call_abcdefghijkl").token)
+        val mismatch = runCatching { client.fallbackCallLiveKit("call_abcdefghijkl") }
+        assertEquals("INVALID_RESPONSE", (mismatch.exceptionOrNull() as HostedCloudException).errorCode)
+        assertEquals("/v1/calls/ice", server.takeRequest().path)
+        assertEquals("/v1/calls/call_abcdefghijkl/media/livekit", server.takeRequest().path)
+    }
+
+    @Test
+    fun `createDirectCall 重放时首次建呼叫仍在进行 等它 ready 再交回落`() {
+        server.enqueue(MockResponse().setResponseCode(200)
+            .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"pending","createdAt":1,"expiresAt":9999999999999,"directAttempted":true}"""))
+        server.enqueue(MockResponse().setResponseCode(200)
+            .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"pending","createdAt":1,"expiresAt":9999999999999,"directAttempted":true}"""))
+        server.enqueue(MockResponse().setResponseCode(200)
+            .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"ready","createdAt":1,"expiresAt":9999999999999,"directAttempted":true}"""))
+
+        val call = client.createDirectCall("edge_abcdefghijkl", "v=0\r\noffer", "android-idempotency-0005")
+
+        assertTrue(call.directAttempted)
+        assertEquals(null, call.sdpAnswer)
+        assertEquals("/v1/calls", server.takeRequest().path)
+        assertEquals("/v1/calls/call_abcdefghijkl", server.takeRequest().path)
+        assertEquals("/v1/calls/call_abcdefghijkl", server.takeRequest().path)
+        assertEquals(listOf(250L), sleeps)
+    }
+
+    @Test
+    fun `createDirectCall 重放等待后中转已降级为普通 LiveKit 时不再标记直连`() {
+        server.enqueue(MockResponse().setResponseCode(200)
+            .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"pending","createdAt":1,"expiresAt":9999999999999,"directAttempted":true}"""))
+        server.enqueue(MockResponse().setResponseCode(200)
+            .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"ready","createdAt":1,"expiresAt":9999999999999,"session":{"livekitUrl":"wss://cloud.livekit.example","token":"a.b.c","expiresAt":9999999999999}}"""))
+
+        val call = client.createDirectCall("edge_abcdefghijkl", "v=0\r\noffer", "android-idempotency-0006")
+
+        assertFalse(call.directAttempted)
+        assertEquals(null, call.sdpAnswer)
+    }
+
+    @Test
+    fun `createDirectCall 重放等待到 failed 时保留服务端错误码`() {
+        server.enqueue(MockResponse().setResponseCode(200)
+            .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"pending","createdAt":1,"expiresAt":9999999999999,"directAttempted":true}"""))
+        server.enqueue(MockResponse().setResponseCode(200)
+            .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"failed","errorCode":"EDGE_TIMEOUT","createdAt":1,"expiresAt":9999999999999,"directAttempted":true}"""))
+
+        val error = assertThrows(HostedCloudException::class.java) {
+            client.createDirectCall("edge_abcdefghijkl", "v=0\r\noffer", "android-idempotency-0007")
+        }
+
+        assertEquals("EDGE_TIMEOUT", error.errorCode)
+    }
 }

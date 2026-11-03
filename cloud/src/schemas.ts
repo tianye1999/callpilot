@@ -116,7 +116,26 @@ export const claimPairingSchema = z.object({
 
 export const createCallSchema = z.object({
   edgeId: opaqueId,
-  idempotencyKey: z.string().min(16).max(128).regex(/^[A-Za-z0-9._:-]+$/)
+  idempotencyKey: z.string().min(16).max(128).regex(/^[A-Za-z0-9._:-]+$/),
+  // A8: a phone offering direct media sends its complete (non-trickle) offer.
+  mediaTransport: z.literal("webrtc").optional(),
+  sdpOffer: sdp.optional()
+}).strict().refine(value => value.sdpOffer === undefined || value.mediaTransport === "webrtc");
+export const outboundIceSchema = z.object({ edgeId: opaqueId }).strict();
+const outboundStartSchema = z.object({
+  v: z.literal(1), type: z.literal("session.start"), commandId: opaqueId, callId: opaqueId,
+  expiresAt: z.string().datetime(), session: inboundSessionSchema,
+  direct: z.object({ sdpOffer: sdp, iceServers: z.array(iceServerSchema).max(16) }).strict()
+}).strict();
+const outboundFallbackSchema = z.object({
+  v: z.literal(1), type: z.literal("call.media.livekit"), commandId: opaqueId, callId: opaqueId,
+  session: inboundSessionSchema
+}).strict();
+export const callMediaCommandSchema = z.discriminatedUnion("type", [outboundStartSchema, outboundFallbackSchema]);
+export const callAnswerSchema = z.object({
+  v: z.literal(1), type: z.literal("call.answer"), commandId: opaqueId, callId: opaqueId,
+  status: z.enum(["accepted", "rejected"]), sdpAnswer: sdp.optional(),
+  errorCode: z.string().regex(/^[A-Z][A-Z0-9_]{2,63}$/).optional()
 }).strict();
 
 export const edgeMessageSchema = z.union([
@@ -137,6 +156,7 @@ export const edgeMessageSchema = z.union([
       inboundFastpathV2: z.boolean().optional(),
       ownerDecline: z.boolean().optional(),
       multiDeviceStop: z.boolean().optional(),
+      outboundDirectV1: z.boolean().optional(),
       version: z.string().max(64).optional()
     }).strict()
   }).strict(),
@@ -178,7 +198,8 @@ export const edgeMessageSchema = z.union([
     reason: z.string().regex(/^[A-Z][A-Z0-9_]{2,63}$/)
   }).strict(),
   dataResponseSchema,
-  inboundAnswerSchema
+  inboundAnswerSchema,
+  callAnswerSchema
 ]);
 
 export const claimInboundOfferSchema = z.object({

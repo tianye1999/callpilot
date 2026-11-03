@@ -16,6 +16,8 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
     private var audioRevoked = false
     private var audioActive = false
     private var speakerPreferred = false
+    /// A8: an app-dialed call owns its route; CallKit owns it for answered calls.
+    private var standaloneAudio = false
     private var transportConnected = false
     private var audioVerificationTask: Task<Void, Never>?
     private(set) var latestRtpStats: Data?
@@ -123,6 +125,22 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
         verifyActivatedAudioIfReady()
     }
 
+    /// A8: an app-dialed call owns the audio session itself instead of CallKit.
+    func activateStandaloneAudio() throws {
+        let session = AVAudioSession.sharedInstance()
+        // .voiceChat implies Bluetooth HFP routing.
+        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [])
+        try session.setActive(true)
+        standaloneAudio = true
+        try activateDirectAudio()
+        applyStandaloneRoute()
+    }
+
+    private func applyStandaloneRoute() {
+        guard standaloneAudio, !closed, !audioRevoked else { return }
+        try? AVAudioSession.sharedInstance().overrideOutputAudioPort(speakerPreferred ? .speaker : .none)
+    }
+
     func stopDirectAudio() {
         finishRtpSampling()
         audioVerificationTask?.cancel()
@@ -226,7 +244,8 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
 
     func setSpeakerphone(_ enabled: Bool) {
         speakerPreferred = enabled
-        // CallKit owns routing, including Bluetooth. Do not override its port.
+        // CallKit owns routing, including Bluetooth; only an app-dialed call routes itself.
+        applyStandaloneRoute()
     }
 
     func disconnect() async {

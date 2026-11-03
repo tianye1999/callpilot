@@ -10,7 +10,7 @@ import {
   type ContentResource,
   type DataResponse
 } from "./content-sync";
-import { edgeMessageSchema, inboundAnswerSchema, inboundIceRequestSchema, inboundMediaCommandSchema } from "./schemas";
+import { callAnswerSchema, callMediaCommandSchema, edgeMessageSchema, inboundAnswerSchema, inboundIceRequestSchema, inboundMediaCommandSchema } from "./schemas";
 import type { z } from "zod";
 import { HttpError } from "./http";
 import type { EdgePresence, Env } from "./types";
@@ -45,10 +45,22 @@ interface PendingRelay {
 export const INBOUND_MEDIA_RELAY_MAX_MS = 15_000;
 // Reservation is a synchronous control acknowledgement, not media setup.
 export const INBOUND_CLAIM_RESERVE_MAX_MS = 5_000;
+// A8: a direct session.start includes a cold WebRTC stack and TURN gathering at the
+// Edge; LiveKit fallback includes joining the room. Both are bounded per command.
+export const OUTBOUND_DIRECT_START_MAX_MS = 12_000;
+export const OUTBOUND_FALLBACK_MAX_MS = 15_000;
 interface PendingMediaRelay {
   offerId: string;
   callId: string;
   claimId: string;
+  expectsSdp: boolean;
+  socket: WebSocket;
+  deadline: number;
+  timeout: ReturnType<typeof setTimeout>;
+  resolve: (response: Response) => void;
+}
+interface PendingCallRelay {
+  callId: string;
   expectsSdp: boolean;
   socket: WebSocket;
   deadline: number;
@@ -122,6 +134,7 @@ export class EdgeRoom extends DurableObject<Env> {
   }
   private readonly pendingRelays = new Map<string, PendingRelay>();
   private readonly pendingMediaRelays = new Map<string, PendingMediaRelay>();
+  private readonly pendingCallRelays = new Map<string, PendingCallRelay>();
   private mediaDispatchTail: Promise<void> = Promise.resolve();
   private readonly warmInboundIce = new Map<string, WarmInboundIce>();
   private readonly contentRateLimiter = new ContentReadRateLimiter();
@@ -145,6 +158,7 @@ export class EdgeRoom extends DurableObject<Env> {
     if (url.pathname === "/command" && request.method === "POST") return this.sendCommand(request);
     if (url.pathname === "/inbound-media-relay" && request.method === "POST") return this.relayInboundMedia(request);
     if (url.pathname === "/inbound-ice" && request.method === "POST") return this.inboundIce(request);
+    if (url.pathname === "/call-media-relay" && request.method === "POST") return this.relayCallMedia(request);
     if (url.pathname === "/preconnect-cleanup" && request.method === "POST") {
       await this.alarm();
       return Response.json({ ok: true });
@@ -395,6 +409,10 @@ export class EdgeRoom extends DurableObject<Env> {
       this.acceptMediaAnswer(ws, result.data);
       return;
     }
+    if (result.data.type === "call.answer") {
+      this.acceptCallAnswer(ws, result.data);
+      return;
+    }
     const now = Date.now();
     if (result.data.type === "device.notify") {
       // Identity comes only from the authenticated connection, never the payload.
@@ -433,7 +451,8 @@ export class EdgeRoom extends DurableObject<Env> {
         inboundPreconnectV1: result.data.status.inboundPreconnectV1 === true,
         inboundFastpathV2: result.data.status.inboundFastpathV2 === true,
         ...(result.data.status.ownerDecline ? { ownerDecline: true } : {}),
-        ...(result.data.status.multiDeviceStop ? { multiDeviceStop: true } : {})
+        ...(result.data.status.multiDeviceStop ? { multiDeviceStop: true } : {}),
+        ...(result.data.status.outboundDirectV1 ? { outboundDirectV1: true } : {})
       };
       try {
         await Promise.all([
@@ -689,12 +708,58 @@ export class EdgeRoom extends DurableObject<Env> {
       this.pendingMediaRelays.delete(commandId);
       pending.resolve(Response.json({ error: code }, { status }));
     }
+    for (const [commandId, pending] of this.pendingCallRelays) {
+      if (pending.socket !== ws) continue;
+      clearTimeout(pending.timeout);
+      this.pendingCallRelays.delete(commandId);
+      pending.resolve(Response.json({ error: code }, { status }));
+    }
     for (const [requestId, pending] of this.pendingRelays) {
       if (pending.socket !== ws) continue;
       clearTimeout(pending.timeout);
       this.pendingRelays.delete(requestId);
       pending.resolve(Response.json({ error: code }, { status }));
     }
+  }
+
+  /** A8: send one outbound direct command and wait for its correlated call.answer. */
+  private async relayCallMedia(request: Request): Promise<Response> {
+    const text = await request.text();
+    if (serializedByteLength(text) > CONTENT_WIRE_LIMIT_BYTES) return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
+    let parsed: unknown;
+    try { parsed = JSON.parse(text); } catch { return Response.json({ error: "INVALID_REQUEST" }, { status: 400 }); }
+    const command = callMediaCommandSchema.safeParse(parsed);
+    if (!command.success || this.pendingCallRelays.has(command.data.commandId)) {
+      return Response.json({ error: "INVALID_REQUEST" }, { status: 400 });
+    }
+    if (this.pendingCallRelays.size >= 4) return Response.json({ error: "BUSY" }, { status: 429 });
+    const socket = this.currentConnection();
+    if (!socket) return Response.json({ error: "EDGE_OFFLINE" }, { status: 503 });
+    const { commandId, callId, type } = command.data;
+    const maxMs = type === "session.start" ? OUTBOUND_DIRECT_START_MAX_MS : OUTBOUND_FALLBACK_MAX_MS;
+    return new Promise<Response>(resolve => {
+      const timeout = setTimeout(() => {
+        this.pendingCallRelays.delete(commandId);
+        resolve(Response.json({ error: "TIMEOUT" }, { status: 504 }));
+      }, maxMs);
+      this.pendingCallRelays.set(commandId, { callId, expectsSdp: type === "session.start", socket,
+        deadline: Date.now() + maxMs, timeout, resolve });
+      try { socket.send(text); }
+      catch {
+        clearTimeout(timeout);
+        this.pendingCallRelays.delete(commandId);
+        resolve(Response.json({ error: "EDGE_OFFLINE" }, { status: 503 }));
+      }
+    });
+  }
+
+  private acceptCallAnswer(ws: WebSocket, answer: z.infer<typeof callAnswerSchema>): void {
+    const pending = this.pendingCallRelays.get(answer.commandId);
+    if (!pending || pending.socket !== ws || pending.deadline <= Date.now() || pending.callId !== answer.callId
+        || (answer.status === "accepted" && pending.expectsSdp && !answer.sdpAnswer)) return;
+    clearTimeout(pending.timeout);
+    this.pendingCallRelays.delete(answer.commandId);
+    pending.resolve(Response.json(answer, { status: answer.status === "accepted" ? 200 : 409 }));
   }
 
   private acceptMediaAnswer(ws: WebSocket, answer: z.infer<typeof inboundAnswerSchema>): void {

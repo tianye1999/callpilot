@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import dataclasses
 import inspect
 import json
 import struct
@@ -1322,3 +1323,163 @@ def test_all_real_audio_bridges_satisfy_remote_full_duplex_contract() -> None:
     assert {"mode", "device_keyword", "pcm_port", "pcm_baudrate", "tx_gain"} <= set(
         factory_params
     )
+
+
+def test_direct_session_releases_the_line_when_the_phone_never_connects() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=False)
+        modem = FakeModem()
+        coordinator = _coordinator(endpoint, modem, FakeBridge())
+        coordinator.runtime = dataclasses.replace(coordinator.runtime, phone_connect_timeout_seconds=0.1)
+        await asyncio.wait_for(coordinator.run(), 2.0)
+        failed = [e for e in endpoint.events if e.get("status") == "failed"]
+        assert failed and failed[-1].get("code") == "phone_not_connected"
+        assert modem.calls == []
+
+    asyncio.run(run())
+
+
+def test_phone_connect_deadline_stops_counting_once_media_is_ready() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=True)
+        coordinator = _coordinator(endpoint, FakeModem(), FakeBridge())
+        coordinator.runtime = dataclasses.replace(coordinator.runtime, phone_connect_timeout_seconds=0.05)
+        task = asyncio.create_task(coordinator.run())
+        await asyncio.sleep(0.2)
+        endpoint._media_ready = False
+        await asyncio.sleep(0.2)
+        assert not any(e.get("code") == "phone_not_connected" for e in endpoint.events)
+        coordinator.request_stop("test_done")
+        await task
+
+    asyncio.run(run())
+
+
+def _direct_coordinator(*, fail_direct: bool = False, audio_timeout: float = 0.0):
+    from agentcall.inbound_direct import InboundDirectRequest, SwitchableInboundEndpoint
+
+    answers: list[tuple] = []
+    made: dict[str, FakeRemoteEndpoint] = {}
+
+    def direct_factory(offer, servers, *, call_id):
+        assert offer == {"type": "offer", "sdp": "v=0\r\nphone"} and call_id == "call_abcdefghijkl"
+        inner = FakeRemoteEndpoint(media_ready=False)
+        inner.answer = {"type": "answer", "sdp": "v=0\r\nedge"}  # type: ignore[attr-defined]
+        if fail_direct:
+            async def broken() -> None:
+                raise ConnectionError("no relay candidate")
+            inner.connect = broken  # type: ignore[method-assign]
+        made["direct"] = inner
+        return inner
+
+    def livekit_factory(_issued):
+        made["livekit"] = FakeRemoteEndpoint(media_ready=False)
+        return made["livekit"]
+
+    request = InboundDirectRequest("call_abcdefghijkl", "call_abcdefghijkl", "v=0\r\nphone", [],
+                                   lambda *answer: answers.append(answer))
+    endpoint = SwitchableInboundEndpoint(request, direct_factory=direct_factory, livekit_factory=livekit_factory)
+    modem = FakeModem()
+    coordinator = _coordinator(endpoint, modem, FakeBridge())  # type: ignore[arg-type]
+    coordinator.runtime = dataclasses.replace(coordinator.runtime, phone_audio_timeout_seconds=audio_timeout)
+    return coordinator, request, answers, made, modem
+
+
+def test_outbound_direct_answers_then_dials_over_the_direct_channel() -> None:
+    async def run() -> None:
+        coordinator, _request, answers, made, modem = _direct_coordinator()
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: coordinator.edge_ready.is_set())
+        assert answers == [("v=0\r\nedge", None)]
+        made["direct"].set_media_ready(True)
+        await _wait_for(lambda: any(e.get("status") == "media_ready" for e in made["direct"].events))
+        await made["direct"].commands.put({"type": "dial", "number": "10086", "idempotency_key": "direct-1"})
+        await _wait_for(lambda: any(name == "dial" for name, _ in modem.calls))
+        coordinator.request_stop("test_done")
+        await task
+        assert made["direct"].closed and "livekit" not in made
+
+    asyncio.run(run())
+
+
+def test_outbound_direct_setup_failure_waits_for_one_livekit_fallback_then_dials() -> None:
+    async def run() -> None:
+        coordinator, request, answers, made, modem = _direct_coordinator(fail_direct=True)
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: coordinator.edge_ready.is_set())
+        assert answers == [(None, "DIRECT_SETUP_FAILED")]
+        issued = SimpleNamespace(room_name="callpilot_abcdefghijkl", browser_identity="web_abcdefghijkl",
+                                 edge_identity="edgepart_abcdefghijkl", livekit_url="wss://media.test")
+        switched: list[tuple] = []
+        assert request.fallback(issued, lambda *reply: switched.append(reply))  # type: ignore[arg-type]
+        await _wait_for(lambda: switched == [(None, None)])
+        # A repeated relay command for the same room is answered without a second switch.
+        assert request.fallback(issued, lambda *reply: switched.append(reply))  # type: ignore[arg-type]
+        assert switched == [(None, None), (None, None)]
+        made["livekit"].set_media_ready(True)
+        await _wait_for(lambda: any(e.get("status") == "media_ready" for e in made["livekit"].events))
+        await made["livekit"].commands.put({"type": "dial", "number": "10086", "idempotency_key": "direct-2"})
+        await _wait_for(lambda: any(name == "dial" for name, _ in modem.calls))
+        coordinator.request_stop("test_done")
+        await task
+
+    asyncio.run(run())
+
+
+def test_outbound_dial_seals_the_transport_so_a_late_fallback_is_refused() -> None:
+    async def run() -> None:
+        coordinator, request, _answers, made, modem = _direct_coordinator()
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: coordinator.edge_ready.is_set())
+        made["direct"].set_media_ready(True)
+        await made["direct"].commands.put({"type": "dial", "number": "10086", "idempotency_key": "direct-3"})
+        await _wait_for(lambda: any(name == "dial" for name, _ in modem.calls))
+        issued = SimpleNamespace(room_name="callpilot_abcdefghijkl", browser_identity="web_abcdefghijkl",
+                                 edge_identity="edgepart_abcdefghijkl", livekit_url="wss://media.test")
+        assert request.fallback(issued, lambda *_: None) is False  # type: ignore[arg-type]
+        coordinator.request_stop("test_done")
+        await task
+        assert "livekit" not in made
+
+    asyncio.run(run())
+
+
+def test_outbound_dial_is_refused_while_a_fallback_switch_is_in_flight() -> None:
+    async def run() -> None:
+        coordinator, request, _answers, made, modem = _direct_coordinator()
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: coordinator.edge_ready.is_set())
+        made["direct"].set_media_ready(True)
+        issued = SimpleNamespace(room_name="callpilot_abcdefghijkl", browser_identity="web_abcdefghijkl",
+                                 edge_identity="edgepart_abcdefghijkl", livekit_url="wss://media.test")
+        assert request.fallback(issued, lambda *_: None)  # type: ignore[arg-type]
+        await made["direct"].commands.put({"type": "dial", "number": "10086", "idempotency_key": "direct-4"})
+        await asyncio.sleep(0.2)
+        assert not any(name == "dial" for name, _ in modem.calls)
+        coordinator.request_stop("test_done")
+        await task
+
+    asyncio.run(run())
+
+
+def test_outbound_direct_without_phone_audio_asks_the_phone_to_fall_back_before_dialing() -> None:
+    async def run() -> None:
+        coordinator, request, _answers, made, _modem = _direct_coordinator(audio_timeout=0.05)
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: coordinator.edge_ready.is_set())
+        inner = made["direct"]
+        inner._browser_connected = True
+        inner.direct_connected_at = time.monotonic()  # type: ignore[attr-defined]
+        inner.phone_audio_received = False  # type: ignore[attr-defined]
+        await _wait_for(lambda: {"type": "media_failed", "reason": "no_phone_audio"} in inner.events)
+        assert [e for e in inner.events if e.get("type") == "media_failed"] == [
+            {"type": "media_failed", "reason": "no_phone_audio"}]
+        issued = SimpleNamespace(room_name="callpilot_abcdefghijkl", browser_identity="web_abcdefghijkl",
+                                 edge_identity="edgepart_abcdefghijkl", livekit_url="wss://media.test")
+        switched: list[tuple] = []
+        assert request.fallback(issued, lambda *r: switched.append(r))  # type: ignore[arg-type]
+        await _wait_for(lambda: switched == [(None, None)])
+        coordinator.request_stop("test_done")
+        await task
+
+    asyncio.run(run())

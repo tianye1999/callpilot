@@ -300,12 +300,18 @@ final class AppModel: ObservableObject {
         // createSession → LiveKit 媒体 → 号码经 Dongle SIM ATD(dial 在 media_ready 后发)。
         // 具体媒体建立与 data-topic 控制由 CallMediaSession 承担。
         _ = apply(.waitingMedia(label: number), for: attempt)
+        // A8: direct only when the relay reports that both it and the Edge enable it.
+        let direct = deviceStatus?.outboundDirect == true
+        var directFactory: CallMediaSession.DirectTransportFactory?
+        if direct { directFactory = { WebRtcDirectTransport() } }
         let session = CallMediaSession(onState: { [weak self] st in
             _ = self?.apply(st, for: attempt)
-        }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner, timing: timing)
+        }, transportFactory: { LiveKitRoomTransport() }, audio: LiveKitAudioDevice.owner, timing: timing,
+           directTransportFactory: directFactory)
         media = session
-        scheduleMediaTimeout(for: attempt, session: session, duration: .seconds(30))
-        await session.startOutbound(client: c, edgeId: p.edgeId, number: number)
+        // Direct gathering plus one LiveKit fallback share a single setup lease.
+        scheduleMediaTimeout(for: attempt, session: session, duration: .seconds(direct ? 60 : 30))
+        await session.startOutbound(client: c, edgeId: p.edgeId, number: number, direct: direct)
     }
 
     // MARK: - 来电接管(US-1 App 侧,前台版)

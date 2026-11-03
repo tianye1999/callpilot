@@ -1095,3 +1095,90 @@ def test_opening_mode_reset_across_calls_no_leak(monkeypatch, tmp_path):
     assert "greeting_sent" in [e[0] for e in record2.events], (
         "第二通默认 say 应记录 greeting_sent: " + ", ".join(e[0] for e in record2.events)
     )
+
+
+def _outbound_direct_command() -> dict:
+    return {
+        "callId": "call_abcdefghijkl",
+        "expiresAtUnix": time.time() + 300,
+        "direct": {"sdpOffer": "v=0\r\ns=phone\r\n", "iceServers": []},
+        "session": {
+            "sessionId": "session_abcdefghijkl",
+            "roomName": "callpilot_abcdefghijkl",
+            "browserIdentity": "web_abcdefghijkl",
+            "edgeIdentity": "edgepart_abcdefghijkl",
+            "livekitUrl": "wss://project.livekit.cloud",
+            "token": "server-issued-edge-token",
+        },
+    }
+
+
+def test_outbound_direct_session_uses_switchable_endpoint_and_one_fallback(monkeypatch):
+    from agentcall.inbound_direct import SwitchableInboundEndpoint
+
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_CLOUD_ENABLED", "true")
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "true")
+    service = make_service(FakeModem())
+    worker = FakeRemoteWorker(FakeRemoteCoordinator())
+    built: list[dict] = []
+
+    def build(issued, **kwargs):
+        built.append({"issued": issued, **kwargs})
+        return worker
+
+    monkeypatch.setattr(service, "_build_remote_worker_for_issued", build)
+    answers: list[tuple] = []
+    ok, error = service.start_cloud_remote_session(
+        _outbound_direct_command(), reply=lambda *answer: answers.append(answer))
+
+    assert ok is True and error is None
+    endpoint = built[0]["endpoint"]
+    assert isinstance(endpoint, SwitchableInboundEndpoint)
+    assert endpoint.request.media_offer() == ("v=0\r\ns=phone\r\n", [])
+    assert built[0]["phone_connect_timeout"] > 0
+    endpoint.request.reply("v=0\r\nanswer", None)
+    assert answers == [("v=0\r\nanswer", None)]
+
+    issued = built[0]["issued"]
+    fallback_replies: list[tuple] = []
+    assert service.fallback_outbound_direct("call_otherabcdefg", issued, fallback_replies.append) is False
+    assert service.fallback_outbound_direct("call_abcdefghijkl", issued,
+                                            lambda *r: fallback_replies.append(r)) is True
+    assert endpoint.request.take_fallback() is not None
+    worker.is_running = False
+    assert service.fallback_outbound_direct("call_abcdefghijkl", issued, fallback_replies.append) is False
+
+
+def test_outbound_direct_requires_its_flag(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_CLOUD_ENABLED", "true")
+    monkeypatch.delenv("OUTBOUND_DIRECT_ENABLED", raising=False)
+    service = make_service(FakeModem())
+    built: list[bool] = []
+    monkeypatch.setattr(service, "_build_remote_worker_for_issued", lambda *_a, **_k: built.append(True))
+
+    ok, error = service.start_cloud_remote_session(_outbound_direct_command(), reply=lambda *_: None)
+
+    assert (ok, error) == (False, "DIRECT_DISABLED") and built == []
+
+
+def test_outbound_direct_start_failure_ends_the_request(monkeypatch):
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_CLOUD_ENABLED", "true")
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "true")
+    service = make_service(FakeModem())
+
+    class FailingWorker(FakeRemoteWorker):
+        def start(self, timeout: float = 10.0) -> None:
+            raise RuntimeError("timeout")
+
+    monkeypatch.setattr(service, "_build_remote_worker_for_issued",
+                        lambda *_a, **_k: FailingWorker(FakeRemoteCoordinator()))
+    answers: list[tuple] = []
+    ok, error = service.start_cloud_remote_session(
+        _outbound_direct_command(), reply=lambda *answer: answers.append(answer))
+
+    assert (ok, error) == (False, "MEDIA_FAILED")
+    assert answers == [(None, "MEDIA_ENDED")]
+    assert service._outbound_direct is None

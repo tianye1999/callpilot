@@ -117,15 +117,20 @@ class HostedCloudClient(
             put("edgeId", edgeId)
             put("idempotencyKey", idempotencyKey)
         }.toString()
-        val created = createCallWithRetry(body, edgeId)
+        val created = createCallWithRetry(body, edgeId).call
         throwIfTerminal(created)
+        return pollCallSession(edgeId, created.callId, created.expiresAt)
+    }
+
+    /** 轮询到 Edge 签发 LiveKit 凭证（Edge 在 call 变 ready 后才可用）。 */
+    private fun pollCallSession(edgeId: String, callId: String, expiresAt: Long): HostedCallSession {
         val pollingStartedAt = clockMs()
-        while (clockMs() < created.expiresAt) {
-            val call = request("GET", "v1/calls/${created.callId}", null).use { response ->
+        while (clockMs() < expiresAt) {
+            val call = request("GET", "v1/calls/$callId", null).use { response ->
                 decodeCall(parseOrThrow(response), response.code).also {
                     validateCall(
                         it,
-                        expectedCallId = created.callId,
+                        expectedCallId = callId,
                         expectedEdgeId = edgeId,
                         statusCode = response.code,
                     )
@@ -142,12 +147,104 @@ class HostedCloudClient(
                 )
             }
             val now = clockMs()
-            val remaining = created.expiresAt - now
+            val remaining = expiresAt - now
             if (remaining <= 0) break
             val interval = if (now - pollingStartedAt < 3_000) 250L else 1_000L
             sleepMs(minOf(interval, remaining))
         }
         throw HostedCloudException(408, "SESSION_TIMEOUT", "等待云端通话会话超时")
+    }
+
+    /** A8：外呼直连用的 TURN/STUN 凭证；中转或 Edge 没开直连时中转回 503，调用方改走 LiveKit。 */
+    fun outboundIceServers(edgeId: String): List<IceServer> {
+        require(EDGE_ID.matches(edgeId)) { "云配对缺少有效的 Edge ID" }
+        val body = buildJsonObject { put("edgeId", edgeId) }.toString()
+        return request("POST", "v1/calls/ice", body).use { response -> parseIceServers(parseOrThrow(response), response.code) }
+    }
+
+    /**
+     * A8：带完整 offer 建外呼，Edge 的 answer 随响应返回。没有 answer 时看 directAttempted：
+     * true 表示 Edge 已为这通开了会话、只能走同一通的 LiveKit 回落；false 表示中转没走直连（旧 Edge），照旧轮询。
+     */
+    fun createDirectCall(
+        edgeId: String,
+        sdpOffer: String,
+        idempotencyKey: String = "android-${UUID.randomUUID()}",
+    ): OutboundCall {
+        require(EDGE_ID.matches(edgeId)) { "云配对缺少有效的 Edge ID" }
+        require(IDEMPOTENCY_KEY.matches(idempotencyKey)) { "idempotency key 格式不合法" }
+        require(sdpOffer.startsWith("v=0") && sdpOffer.toByteArray().size <= MAX_SDP_BYTES) { "sdp offer 不合法" }
+        val body = buildJsonObject {
+            put("edgeId", edgeId)
+            put("idempotencyKey", idempotencyKey)
+            put("mediaTransport", "webrtc")
+            put("sdpOffer", sdpOffer)
+        }.toString()
+        val created = createCallWithRetry(body, edgeId)
+        val call = created.call
+        val payload = created.payload
+        val code = created.statusCode
+        if (call.status == "failed" || call.status == "ended") {
+            val errorCode = payload["errorCode"]?.jsonPrimitive?.contentOrNull ?: "CALL_FAILED"
+            throw HostedCloudException(code, errorCode, "云端呼叫创建失败")
+        }
+        val directAttempted = payload.strictBoolean("directAttempted", code) ?: false
+        val webrtc = payload["transports"]?.jsonArray?.map { it.jsonObject }
+            ?.firstOrNull { it["kind"]?.jsonPrimitive?.contentOrNull == "webrtc" }
+        val sdpAnswer = (webrtc?.get("sdpAnswer") as? JsonPrimitive)?.takeIf { it.isString }?.content
+        val contradictory = (!directAttempted && webrtc != null) || (webrtc != null && sdpAnswer == null) ||
+            (sdpAnswer != null && (!sdpAnswer.startsWith("v=0") || sdpAnswer.toByteArray().size > MAX_SDP_BYTES)) ||
+            (directAttempted && call.session != null)
+        if (contradictory) throw HostedCloudException(code, "INVALID_RESPONSE", "直连外呼响应不一致")
+        if (directAttempted && sdpAnswer == null && call.status == "pending") {
+            // 同 key 重放时首次建呼叫可能还在等 Edge：等它定下来（failed 直接报错）。定下来后以最终状态为准——
+            // Edge 取不到 TURN 时中转会改成普通 LiveKit 会话，那时 directAttempted 为 false，走轮询而不是回落。
+            val settled = awaitCallSettled(edgeId, call.callId, call.expiresAt)
+            return OutboundCall(call.callId, call.expiresAt, settled, null)
+        }
+        return OutboundCall(call.callId, call.expiresAt, directAttempted, sdpAnswer)
+    }
+
+    /** 轮询到离开 pending，返回最终是否仍是直连通话。 */
+    private fun awaitCallSettled(edgeId: String, callId: String, expiresAt: Long): Boolean {
+        val startedAt = clockMs()
+        while (clockMs() < expiresAt) {
+            val (call, direct) = request("GET", "v1/calls/$callId", null).use { response ->
+                val payload = parseOrThrow(response)
+                val decoded = decodeCall(payload, response.code).also {
+                    validateCall(it, expectedCallId = callId, expectedEdgeId = edgeId, statusCode = response.code)
+                }
+                decoded to (payload.strictBoolean("directAttempted", response.code) ?: false)
+            }
+            throwIfTerminal(call)
+            if (call.status != "pending") return direct
+            val now = clockMs()
+            sleepMs(minOf(if (now - startedAt < 3_000) 250L else 1_000L, maxOf(0L, expiresAt - now)))
+        }
+        throw HostedCloudException(408, "SESSION_TIMEOUT", "等待云端通话会话超时")
+    }
+
+    /** A8：中转没走直连（未开启或旧 Edge）时沿用轮询拿 LiveKit 凭证。 */
+    fun awaitCallSession(edgeId: String, call: OutboundCall): HostedCallSession {
+        require(EDGE_ID.matches(edgeId) && CALL_ID.matches(call.callId)) { "标识格式不合法" }
+        return pollCallSession(edgeId, call.callId, call.expiresAt)
+    }
+
+    /** A8：直连没连上，同一通切到 LiveKit 房间（Edge 端幂等，绝不重新建呼叫）。 */
+    fun fallbackCallLiveKit(callId: String): HostedCallSession {
+        require(CALL_ID.matches(callId)) { "call id 格式不合法" }
+        return request("POST", "v1/calls/$callId/media/livekit", "{}").use { response ->
+            val payload = parseOrThrow(response)
+            val session = payload["session"] as? JsonObject
+            val url = (session?.get("livekitUrl") as? JsonPrimitive)?.takeIf { it.isString }?.content
+            val token = (session?.get("token") as? JsonPrimitive)?.takeIf { it.isString }?.content
+            val expiresAt = (session?.get("expiresAt") as? JsonPrimitive)?.longOrNull
+            if (payload["callId"]?.jsonPrimitive?.contentOrNull != callId || url == null || token == null || expiresAt == null) {
+                throw HostedCloudException(response.code, "INVALID_RESPONSE", "外呼回落响应不匹配")
+            }
+            validateSession(HostedSessionPayload(url, token, expiresAt))
+            HostedCallSession(sessionId = callId, livekitUrl = url, token = token, expiresAt = expiresAt)
+        }
     }
 
     /** #95 inbound takeover：轮询本 Edge 当前可接管的来电 offer（仅 opaque id）。 */
@@ -186,16 +283,19 @@ class HostedCloudClient(
     fun inboundIceServers(offerId: String): List<IceServer> {
         require(OFFER_ID.matches(offerId)) { "offer id 格式不合法" }
         return request("POST", "v1/inbound-offers/$offerId/ice", "{}").use { response ->
-            val payload = parseOrThrow(response)
-            val servers = payload["iceServers"]?.jsonArray?.mapNotNull { element ->
-                val obj = element.jsonObject
-                val urls = obj["urls"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
-                if (urls.isEmpty()) return@mapNotNull null
-                IceServer(urls, obj["username"]?.jsonPrimitive?.contentOrNull, obj["credential"]?.jsonPrimitive?.contentOrNull)
-            } ?: emptyList()
-            if (servers.isEmpty()) throw HostedCloudException(response.code, "INVALID_RESPONSE", "ICE 服务器列表为空")
-            servers
+            parseIceServers(parseOrThrow(response), response.code)
         }
+    }
+
+    private fun parseIceServers(payload: JsonObject, statusCode: Int): List<IceServer> {
+        val servers = payload["iceServers"]?.jsonArray?.mapNotNull { element ->
+            val obj = element.jsonObject
+            val urls = obj["urls"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+            if (urls.isEmpty()) return@mapNotNull null
+            IceServer(urls, obj["username"]?.jsonPrimitive?.contentOrNull, obj["credential"]?.jsonPrimitive?.contentOrNull)
+        } ?: emptyList()
+        if (servers.isEmpty()) throw HostedCloudException(statusCode, "INVALID_RESPONSE", "ICE 服务器列表为空")
+        return servers
     }
 
     /** claim 时 SDP 还没准备好（sdpPending）：事后补交，拿 Edge 的 answer。 */
@@ -506,13 +606,17 @@ class HostedCloudClient(
         throw HostedCloudException(statusCode, "INVALID_RESPONSE", "云端呼叫响应字段不完整")
     }
 
-    private fun createCallWithRetry(body: String, edgeId: String): HostedCallResponse {
+    private class CreatedCall(val call: HostedCallResponse, val payload: JsonObject, val statusCode: Int)
+
+    private fun createCallWithRetry(body: String, edgeId: String): CreatedCall {
         repeat(2) { attempt ->
             try {
                 return request("POST", "v1/calls", body).use { response ->
-                    decodeCall(parseOrThrow(response), response.code).also {
+                    val payload = parseOrThrow(response)
+                    val call = decodeCall(payload, response.code).also {
                         validateCall(it, expectedEdgeId = edgeId, statusCode = response.code)
                     }
+                    CreatedCall(call, payload, response.code)
                 }
             } catch (e: IOException) {
                 if (attempt == 1) throw e
@@ -553,7 +657,8 @@ class HostedCloudClient(
 
     private fun throwIfTerminal(call: HostedCallResponse) {
         if (call.status == "failed" || call.status == "ended") {
-            throw HostedCloudException(200, "CALL_FAILED", "云端呼叫创建失败")
+            val code = call.errorCode?.takeIf { Regex("^[A-Z][A-Z0-9_]{2,63}$").matches(it) } ?: "CALL_FAILED"
+            throw HostedCloudException(200, code, "云端呼叫创建失败")
         }
     }
 
@@ -650,6 +755,16 @@ data class HostedCallSession(
         "HostedCallSession(sessionId=$sessionId, livekitUrl=$livekitUrl, token=***, expiresAt=$expiresAt, direct=$directAttempted, sdpPending=$sdpPending)"
 }
 
+/** A8：一通外呼的直连建立结果；sdpAnswer 为空时按 directAttempted 决定回落还是轮询。 */
+data class OutboundCall(
+    val callId: String,
+    val expiresAt: Long,
+    val directAttempted: Boolean,
+    val sdpAnswer: String?,
+) {
+    override fun toString(): String = "OutboundCall(callId=$callId, direct=$directAttempted, answer=${sdpAnswer != null})"
+}
+
 /** TURN/STUN 服务器（凭证不入日志）。 */
 data class IceServer(val urls: List<String>, val username: String? = null, val credential: String? = null) {
     override fun toString(): String = "IceServer(urls=$urls, credential=${if (credential != null) "***" else "none"})"
@@ -669,6 +784,7 @@ private data class HostedCallResponse(
     val createdAt: Long,
     val expiresAt: Long,
     val session: HostedSessionPayload? = null,
+    val errorCode: String? = null,
 )
 
 @Serializable
