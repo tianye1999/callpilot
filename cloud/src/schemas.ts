@@ -34,7 +34,13 @@ const clientTimingMarks = new Set([
 const audioEngineSchema = z.object({
   running: z.boolean(), recording: z.boolean(), playing: z.boolean(),
   inputEnabled: z.boolean(), inputRunning: z.boolean(), outputEnabled: z.boolean(), outputRunning: z.boolean(),
-  inputMuted: z.boolean(), muteMode: z.number().int().min(-1).max(2)
+  inputMuted: z.boolean(), muteMode: z.number().int().min(-1).max(2),
+  audioSession: z.object({
+    category: z.string().regex(/^[A-Za-z0-9]{1,64}$/), mode: z.string().regex(/^[A-Za-z0-9]{1,64}$/),
+    inputAvailable: z.boolean(), inputNumberOfChannels: z.number().int().min(0).max(64),
+    inputs: z.array(z.string().regex(/^[A-Za-z0-9]{1,64}$/)).max(8),
+    outputs: z.array(z.string().regex(/^[A-Za-z0-9]{1,64}$/)).max(8)
+  }).strict().optional()
 }).strict();
 export const clientTimingSchema = z.object({
   type: z.literal("client_timing"), v: z.literal(1),
@@ -56,8 +62,15 @@ export const clientRtpStatsSchema = z.object({
   inPackets: rtpCounter, inBytes: rtpCounter,
   lost: z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER).nullable(),
   rttMs: z.number().nonnegative().nullable(), localCandidate: candidateType, remoteCandidate: candidateType,
-  pairState: z.enum(["frozen", "waiting", "in-progress", "failed", "succeeded"]).nullable()
-}).strict().refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 512);
+  pairState: z.enum(["frozen", "waiting", "in-progress", "failed", "succeeded"]).nullable(),
+  source: z.object({ audioLevel: z.number().min(0).max(1).nullable(),
+    totalAudioEnergy: z.number().nonnegative().nullable(), totalSamplesDuration: z.number().nonnegative().nullable()
+  }).strict().optional(),
+  sender: z.object({ headerBytesSent: rtpCounter, retransmittedPacketsSent: rtpCounter,
+    active: z.boolean().nullable() }).strict().optional(),
+  receiver: z.object({ audioLevel: z.number().min(0).max(1).nullable(), concealedSamples: rtpCounter,
+    totalSamplesReceived: rtpCounter, jitterBufferEmittedCount: rtpCounter }).strict().optional()
+}).strict().refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 1024);
 
 export const inboundMediaCommandSchema = z.object({
   v: z.literal(1), type: z.enum(["inbound.claim", "inbound.media.sdp", "inbound.media.livekit", "inbound.media.end"]),

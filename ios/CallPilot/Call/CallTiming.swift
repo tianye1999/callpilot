@@ -114,9 +114,9 @@ final class CallTiming {
             .prefix(Self.maxBatchMarks - keys.count)
         guard !keys.isEmpty || !cloudKeys.isEmpty else { return nil }
         var values = Dictionary(uniqueKeysWithValues: keys.map {
-            ($0.rawValue, min(86_400_000, max(-60_000, (marks[$0]! - origin) * 1000)))
+            ($0.rawValue, min(86_400_000, max(-60_000, ((marks[$0]! - origin) * 1_000_000).rounded() / 1000)))
         })
-        for key in cloudKeys { values[key] = cloudDurations[key] }
+        for key in cloudKeys { values[key] = cloudDurations[key].map { ($0 * 1000).rounded() / 1000 } }
         var envelope: [String: Any] = [
             "type": "client_timing", "v": 1, "attempt": attempt,
             "seq": sequence + 1, "marks": values,
@@ -158,7 +158,7 @@ struct CallRtpReport {
 }
 
 enum CallRtpStats {
-    static let maxBytes = 512
+    static let maxBytes = 1024
     private static let maxInteger = 9_007_199_254_740_991.0
 
     static func packet(reports: [CallRtpReport], sequence: Int, elapsedMs: Int) -> Data? {
@@ -177,7 +177,7 @@ enum CallRtpStats {
         let candidates = Set(["host", "srflx", "prflx", "relay"])
         let states = Set(["frozen", "waiting", "in-progress", "failed", "succeeded"])
         let rtt = remote.compactMap { finiteNumber($0.values["roundTripTime"], minimum: 0) }.first
-        let fields: [String: Any] = [
+        var fields: [String: Any] = [
             "type": "client_rtp_stats", "v": 1, "seq": sequence, "elapsedMs": elapsedMs,
             "outPackets": sum(outbound, "packetsSent") ?? NSNull(),
             "outBytes": sum(outbound, "bytesSent") ?? NSNull(),
@@ -189,6 +189,23 @@ enum CallRtpStats {
             "remoteCandidate": allowed(reports.first(where: { $0.id == remoteID })?.values["candidateType"], in: candidates) ?? NSNull(),
             "pairState": allowed(pair?.values["state"], in: states) ?? NSNull(),
         ]
+        let source = audio.filter { $0.type == "media-source" }
+        fields["source"] = [
+            "audioLevel": source.compactMap { finiteNumber($0.values["audioLevel"], minimum: 0) }.first.flatMap { $0 <= 1 ? $0 : nil } as Any? ?? NSNull(),
+            "totalAudioEnergy": source.compactMap { finiteNumber($0.values["totalAudioEnergy"], minimum: 0) }.first as Any? ?? NSNull(),
+            "totalSamplesDuration": source.compactMap { finiteNumber($0.values["totalSamplesDuration"], minimum: 0) }.first as Any? ?? NSNull(),
+        ]
+        fields["sender"] = [
+            "headerBytesSent": sum(outbound, "headerBytesSent") ?? NSNull(),
+            "retransmittedPacketsSent": sum(outbound, "retransmittedPacketsSent") ?? NSNull(),
+            "active": outbound.isEmpty || outbound.contains(where: { !($0.values["active"] is Bool) }) ? NSNull() : outbound.contains(where: { $0.values["active"] as? Bool == true }) as Any,
+        ]
+        fields["receiver"] = [
+            "audioLevel": inbound.compactMap { finiteNumber($0.values["audioLevel"], minimum: 0) }.first.flatMap { $0 <= 1 ? $0 : nil } as Any? ?? NSNull(),
+            "concealedSamples": sum(inbound, "concealedSamples") ?? NSNull(),
+            "totalSamplesReceived": sum(inbound, "totalSamplesReceived") ?? NSNull(),
+            "jitterBufferEmittedCount": sum(inbound, "jitterBufferEmittedCount") ?? NSNull(),
+        ]
         guard let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
               data.count <= maxBytes else { return nil }
         return data
@@ -197,7 +214,7 @@ enum CallRtpStats {
     static func validatedObject(_ data: Data?) -> [String: Any]? {
         guard let data, data.count <= maxBytes,
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              Set(object.keys) == ["type", "v", "seq", "elapsedMs", "outPackets", "outBytes", "inPackets", "inBytes", "lost", "rttMs", "localCandidate", "remoteCandidate", "pairState"],
+              Set(object.keys).subtracting(["source", "sender", "receiver"]) == ["type", "v", "seq", "elapsedMs", "outPackets", "outBytes", "inPackets", "inBytes", "lost", "rttMs", "localCandidate", "remoteCandidate", "pairState"],
               object["type"] as? String == "client_rtp_stats",
               finiteNumber(object["v"], minimum: 1) == 1,
               let sequence = finiteNumber(object["seq"], minimum: 1), sequence <= 10, sequence.rounded(.towardZero) == sequence,
@@ -212,6 +229,22 @@ enum CallRtpStats {
             if !(object[name] is NSNull), allowed(object[name], in: ["host", "srflx", "prflx", "relay"]) == nil { return nil }
         }
         if !(object["pairState"] is NSNull), allowed(object["pairState"], in: ["frozen", "waiting", "in-progress", "failed", "succeeded"]) == nil { return nil }
+        let groups = ["source": ["audioLevel", "totalAudioEnergy", "totalSamplesDuration"],
+                      "sender": ["headerBytesSent", "retransmittedPacketsSent", "active"],
+                      "receiver": ["audioLevel", "concealedSamples", "totalSamplesReceived", "jitterBufferEmittedCount"]]
+        for (group, keys) in groups where object[group] != nil {
+            guard let values = object[group] as? [String: Any], Set(values.keys) == Set(keys) else { return nil }
+            for (key, value) in values {
+                if value is NSNull { continue }
+                if key == "active" {
+                    guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+                } else {
+                    guard let number = finiteNumber(value, minimum: 0) else { return nil }
+                    if key == "audioLevel" { guard number <= 1 else { return nil } }
+                    else if group != "source" { guard number <= maxInteger, number.rounded(.towardZero) == number else { return nil } }
+                }
+            }
+        }
         return object
     }
 

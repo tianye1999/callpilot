@@ -36,7 +36,7 @@ MAX_HTTP_TIMING_BATCHES = 8
 MAX_HTTP_TIMING_BYTES = 4096
 _ENGINE_FLAGS = frozenset({"running", "recording", "playing", "inputEnabled", "inputRunning",
                            "outputEnabled", "outputRunning", "inputMuted"})
-MAX_RTP_STATS_BYTES = 512
+MAX_RTP_STATS_BYTES = 1024
 MAX_RTP_STATS_SAMPLES = 10
 _SAFE_INTEGER = 2**53 - 1
 _RTP_COUNTERS = frozenset({"outPackets", "outBytes", "inPackets", "inBytes", "lost"})
@@ -75,9 +75,11 @@ def valid_client_timing(command: Any) -> bool:
             return False
     if "audioEngine" in command:
         engine = command["audioEngine"]
-        if (not isinstance(engine, dict) or set(engine) != _ENGINE_FLAGS | {"muteMode"}
+        if (not isinstance(engine, dict) or set(engine) - {"audioSession"} != _ENGINE_FLAGS | {"muteMode"}
                 or any(type(engine[key]) is not bool for key in _ENGINE_FLAGS)
                 or type(engine["muteMode"]) is not int or not -1 <= engine["muteMode"] <= 2):
+            return False
+        if "audioSession" in engine and not _valid_audio_session(engine["audioSession"]):
             return False
     try:
         return len(json.dumps(command, separators=(",", ":")).encode()) <= MAX_TIMING_BYTES
@@ -91,10 +93,23 @@ def valid_http_client_timing(batches: Any) -> bool:
             and len(json.dumps(batches, separators=(",", ":")).encode()) <= MAX_HTTP_TIMING_BYTES)
 
 
+def _valid_audio_session(value: Any) -> bool:
+    if (not isinstance(value, dict) or set(value) != {
+            "category", "mode", "inputAvailable", "inputNumberOfChannels", "inputs", "outputs"}
+            or type(value["inputAvailable"]) is not bool
+            or type(value["inputNumberOfChannels"]) is not int or not 0 <= value["inputNumberOfChannels"] <= 64):
+        return False
+    for key in ("inputs", "outputs"):
+        if not isinstance(value[key], list) or len(value[key]) > 8:
+            return False
+    return all(isinstance(item, str) and 1 <= len(item) <= 64 and item.isascii() and item.isalnum()
+               for item in [value["category"], value["mode"], *value["inputs"], *value["outputs"]])
+
+
 def valid_client_rtp_stats(packet: Any) -> bool:
     """Only bounded counters and enums cross the client diagnostics boundary."""
     fields = {"type", "v", "seq", "elapsedMs", "rttMs", "localCandidate", "remoteCandidate", "pairState"}
-    if not isinstance(packet, dict) or set(packet) != fields | _RTP_COUNTERS:
+    if not isinstance(packet, dict) or set(packet) - {"source", "sender", "receiver"} != fields | _RTP_COUNTERS:
         return False
     if (packet["type"] != "client_rtp_stats" or type(packet["v"]) is not int or packet["v"] != 1
             or type(packet["seq"]) is not int or not 1 <= packet["seq"] <= MAX_RTP_STATS_SAMPLES
@@ -113,6 +128,26 @@ def valid_client_rtp_stats(packet: Any) -> bool:
         allowed = _PAIR_STATES if name == "pairState" else _CANDIDATE_TYPES
         if value is not None and (not isinstance(value, str) or value not in allowed):
             return False
+    groups = {"source": {"audioLevel", "totalAudioEnergy", "totalSamplesDuration"},
+              "sender": {"headerBytesSent", "retransmittedPacketsSent", "active"},
+              "receiver": {"audioLevel", "concealedSamples", "totalSamplesReceived", "jitterBufferEmittedCount"}}
+    for group, keys in groups.items():
+        if group not in packet:
+            continue
+        values = packet[group]
+        if not isinstance(values, dict) or set(values) != keys:
+            return False
+        for key, value in values.items():
+            if value is None:
+                continue
+            if key == "active":
+                if type(value) is not bool:
+                    return False
+            elif (type(value) not in (int, float) or not 0 <= value <= 1.7976931348623157e308
+                  or (key == "audioLevel" and value > 1)
+                  or (group != "source" and key != "audioLevel"
+                      and (type(value) is not int or value > _SAFE_INTEGER))):
+                return False
     return len(json.dumps(packet, separators=(",", ":")).encode()) <= MAX_RTP_STATS_BYTES
 
 

@@ -56,10 +56,27 @@ struct CallAudioEngineSnapshot: Codable, Equatable, Sendable {
     let outputRunning: Bool
     let inputMuted: Bool
     let muteMode: Int
+    var audioSession: CallAudioSessionSnapshot? = nil
 
     // platformDefault uses a VoIP AudioUnit, not AVAudioEngine. Its valid
     // readiness evidence is recording/playing; engineState is diagnostic only.
     var platformAudioReady: Bool { recording && playing }
+}
+
+struct CallAudioSessionSnapshot: Codable, Equatable, Sendable {
+    let category: String
+    let mode: String
+    let inputAvailable: Bool
+    let inputNumberOfChannels: Int
+    let inputs: [String]
+    let outputs: [String]
+
+    var isValid: Bool {
+        (0...64).contains(inputNumberOfChannels) && inputs.count <= 8 && outputs.count <= 8 &&
+            ([category, mode] + inputs + outputs).allSatisfy {
+                $0.wholeMatch(of: /[A-Za-z0-9]{1,64}/) != nil
+            }
+    }
 }
 
 @MainActor

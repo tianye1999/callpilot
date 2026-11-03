@@ -208,7 +208,14 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
     }
 
     private func reportAudio(_ module: LKRTCAudioDeviceModule, failed: Bool) async {
-        await eventHandler?(.audioEngine(audioSnapshot(module), failed: failed))
+        var snapshot = audioSnapshot(module)
+        let session = AVAudioSession.sharedInstance()
+        snapshot.audioSession = CallAudioSessionSnapshot(
+            category: session.category.rawValue, mode: session.mode.rawValue,
+            inputAvailable: session.isInputAvailable, inputNumberOfChannels: session.inputNumberOfChannels,
+            inputs: session.currentRoute.inputs.prefix(8).map { $0.portType.rawValue },
+            outputs: session.currentRoute.outputs.prefix(8).map { $0.portType.rawValue })
+        await eventHandler?(.audioEngine(snapshot, failed: failed))
     }
 
     func publishControl(_ data: Data) async throws {

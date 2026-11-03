@@ -358,10 +358,11 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         }
         if let engine = batch["audioEngine"] {
             guard let fields = engine as? [String: Any],
-                  Set(fields.keys) == ["running", "recording", "playing", "inputEnabled", "inputRunning", "outputEnabled", "outputRunning", "inputMuted", "muteMode"],
+                  Set(fields.keys).subtracting(["audioSession"]) == ["running", "recording", "playing", "inputEnabled", "inputRunning", "outputEnabled", "outputRunning", "inputMuted", "muteMode"],
                   let bytes = try? JSONSerialization.data(withJSONObject: engine),
                   let snapshot = try? JSONDecoder().decode(CallAudioEngineSnapshot.self, from: bytes),
-                  (-1...2).contains(snapshot.muteMode) else { return nil }
+                  (-1...2).contains(snapshot.muteMode),
+                  snapshot.audioSession?.isValid != false else { return nil }
         }
         return batch
     }

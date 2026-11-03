@@ -11,7 +11,23 @@ import worker from "../src/index";
 import { EdgeRoom, INBOUND_MEDIA_RELAY_MAX_MS } from "../src/edge-room";
 import { issueIceServers, TURN_REQUEST_MAX_MS } from "../src/turn";
 import { sha256 } from "../src/security";
-import { inboundMediaCommandSchema } from "../src/schemas";
+import { inboundMediaCommandSchema, clientRtpStatsSchema, clientTimingSchema } from "../src/schemas";
+
+it("accepts bounded capture/decode evidence and port types without device identifiers", () => {
+  const extended = { ...clientRtpStats,
+    source: { audioLevel: 0.2, totalAudioEnergy: 1, totalSamplesDuration: 2 },
+    sender: { headerBytesSent: 12, retransmittedPacketsSent: 0, active: true },
+    receiver: { audioLevel: null, concealedSamples: 0, totalSamplesReceived: 48000, jitterBufferEmittedCount: 100 }
+  };
+  expect(clientRtpStatsSchema.safeParse(extended).success).toBe(true);
+  expect(clientRtpStatsSchema.safeParse({ ...extended, source: { ...extended.source, audioLevel: 2 } }).success).toBe(false);
+  expect(clientRtpStatsSchema.safeParse({ ...extended, sender: { ...extended.sender, active: 1 } }).success).toBe(false);
+  const audioSession = { category: "AVAudioSessionCategoryPlayAndRecord", mode: "AVAudioSessionModeVoiceChat",
+    inputAvailable: true, inputNumberOfChannels: 1, inputs: ["MicrophoneBuiltIn"], outputs: ["Receiver"] };
+  expect(clientTimingSchema.safeParse({ ...clientTiming[0], audioEngine: { ...clientTiming[0]!.audioEngine, audioSession } }).success).toBe(true);
+  expect(clientTimingSchema.safeParse({ ...clientTiming[0], audioEngine: { ...clientTiming[0]!.audioEngine,
+    audioSession: { ...audioSession, deviceName: "private" } } }).success).toBe(false);
+});
 
 const databases: DatabaseSync[] = [];
 const edge = "edge_abcdefghijkl";

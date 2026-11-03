@@ -32,6 +32,28 @@ def rtp_packet(**changes):
             "pairState": "succeeded", **changes}
 
 
+def test_capture_decode_stats_and_session_route_types_survive_validation():
+    from agentcall.call_timing import valid_client_rtp_stats, valid_client_timing
+
+    extended = rtp_packet(source={"audioLevel": 0.2, "totalAudioEnergy": 1.5, "totalSamplesDuration": 2},
+                          sender={"headerBytesSent": 12, "retransmittedPacketsSent": 0, "active": True},
+                          receiver={"audioLevel": None, "concealedSamples": 0, "totalSamplesReceived": 48000,
+                                    "jitterBufferEmittedCount": 100})
+    assert valid_client_rtp_stats(extended)
+    record = Record()
+    CallTiming(record).receive_rtp(extended)
+    assert record.events == [extended]
+    assert not valid_client_rtp_stats({**extended, "source": {**extended["source"], "audioLevel": 2}})
+    assert not valid_client_rtp_stats({**extended, "source": {**extended["source"], "totalAudioEnergy": 10**400}})
+    assert not valid_client_rtp_stats({**extended, "sender": {**extended["sender"], "active": 1}})
+    session = {"category": "AVAudioSessionCategoryPlayAndRecord", "mode": "AVAudioSessionModeVoiceChat",
+               "inputAvailable": True, "inputNumberOfChannels": 1,
+               "inputs": ["MicrophoneBuiltIn"], "outputs": ["Receiver"]}
+    assert valid_client_timing(packet(audioEngine=engine_snapshot(audioSession=session)))
+    private_session = {**session, "deviceName": "private"}
+    assert not valid_client_timing(packet(audioEngine=engine_snapshot(audioSession=private_session)))
+
+
 def test_rtp_observations_buffer_deduplicate_and_keep_unknown_distinct_from_zero():
     timing = CallTiming()
     timing.receive_rtp(rtp_packet())

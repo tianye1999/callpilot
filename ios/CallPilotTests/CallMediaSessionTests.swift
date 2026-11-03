@@ -515,7 +515,7 @@ final class CallMediaSessionTests: XCTestCase {
             await waitUntil { direct.microphones == 1 }
             XCTAssertEqual(direct.activations, 1)
             XCTAssertEqual(direct.prepares, 1)
-            XCTAssertEqual(device.activateCount, 0, "Direct must not start LiveKit's ADM")
+            XCTAssertEqual(device.activateCount, 1, "CallKit reasserts category and SDK availability after the direct gate")
             XCTAssertFalse(livekit.operations.contains(.connect))
             await media.stop()
         }

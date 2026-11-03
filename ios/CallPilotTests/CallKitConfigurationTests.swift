@@ -2,6 +2,24 @@ import Foundation
 import XCTest
 
 final class CallKitConfigurationTests: XCTestCase {
+    func testIncomingPushPreparesAudioBeforeReportingWithoutActorHop() throws {
+        let source = try String(contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/CallKitCoordinator.swift"), encoding: .utf8)
+        let report = try section(source, from: "private func report(", to: "private func scheduleExpiration")
+        try assertBefore("calls.register(payload", "LiveKitAudioDevice.prepareForIncoming()", in: report)
+        try assertBefore("LiveKitAudioDevice.prepareForIncoming()", "provider.reportNewIncomingCall", in: report)
+        XCTAssertTrue(report.contains("delegate?.callKitCanAcceptIncomingCall == true"))
+        let device = try String(contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/LiveKitAudioDevice.swift"), encoding: .utf8)
+        let prepare = try section(device, from: "static func prepareForIncoming", to: "static let owner")
+        try assertBefore("configureCallKitSession()", "isAutomaticConfigurationEnabled = false", in: prepare)
+        XCTAssertTrue(prepare.contains("setEngineAvailability(.none)"))
+        XCTAssertFalse(prepare.contains("setActive"))
+        let activate = try section(device, from: "func activate()", to: "func stop()")
+        try assertBefore("configureCallKitSession()", "setEngineAvailability(.default)", in: activate)
+        let session = try String(contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/CallMediaSession.swift"), encoding: .utf8)
+        let direct = try section(session, from: "if let direct = transport as? any CallDirectMediaTransport {\n            do", to: "timing.mark(.activateReturn)")
+        try assertBefore("direct.activateDirectAudio()", "audio.activate(ownerID)", in: direct)
+    }
+
     func testDirectPreparedSenderIsEnabledBehindManualPrivacyGate() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/WebRtcDirectTransport.swift"), encoding: .utf8)
         let preparing = try section(source, from: "func prepareDirect", to: "func connectDirect")
@@ -142,7 +160,7 @@ final class CallKitConfigurationTests: XCTestCase {
             contentsOf: repositoryRoot.appendingPathComponent("ios/project.yml"), encoding: .utf8
         )
         XCTAssertTrue(project.contains("MARKETING_VERSION: \"0.7.5\""))
-        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"17\""))
+        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"18\""))
         XCTAssertTrue(project.contains("PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot.sim\n"))
         XCTAssertTrue(project.contains("name: CallPilot\n"))
         XCTAssertTrue(project.contains("DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}"))

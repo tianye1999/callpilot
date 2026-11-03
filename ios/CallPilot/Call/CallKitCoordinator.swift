@@ -165,6 +165,11 @@ final class CallKitCoordinator: NSObject {
             completion.call()
             return
         }
+        // This must run synchronously inside the PushKit callback, before report.
+        // Do not reconfigure audio belonging to an already active call.
+        if delegate?.callKitCanAcceptIncomingCall == true {
+            LiveKitAudioDevice.prepareForIncoming()
+        }
         let update = CXCallUpdate()
         update.localizedCallerName = L10n.text("callkit.incoming.name")
         update.remoteHandle = CXHandle(type: .generic, value: "KinyAI SIM")

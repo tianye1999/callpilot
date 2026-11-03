@@ -362,7 +362,7 @@ final class CallMediaSession {
         // A successful CAS is never repeated. The fallback route keeps its fence.
         let fallback = session.directAttempted
             ? try await client.fallbackInboundLiveKit(offerId: offerId, claimId: session.sessionId,
-                                                     clientTiming: timing.httpBatches(reservingBytes: 512),
+                                                     clientTiming: timing.httpBatches(reservingBytes: CallRtpStats.maxBytes),
                                                      clientRtpStats: lastDirectRtpStats)
             : session
         try checkCurrent(attempt)
@@ -514,7 +514,10 @@ final class CallMediaSession {
         guard !audioActivated else { return }
         if directTransportFactory != nil && !directFallbackStarted && transport == nil { return }
         if let direct = transport as? any CallDirectMediaTransport {
-            do { try direct.activateDirectAudio() }
+            do {
+                try direct.activateDirectAudio()
+                try audio.activate(ownerID)
+            }
             catch {
                 timing.mark(.audioEngineFailed)
                 scheduleTiming()
@@ -687,7 +690,7 @@ final class CallMediaSession {
         // the device/claim fence even when RTP and the data channel never opened.
         controlEndTask = Task {
             _ = try? await client.endInboundClaim(offerId: offerId, claimId: claimId,
-                                                clientTiming: timing.httpBatches(reservingBytes: 512),
+                                                clientTiming: timing.httpBatches(reservingBytes: CallRtpStats.maxBytes),
                                                 clientRtpStats: lastDirectRtpStats)
         }
     }

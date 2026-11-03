@@ -4,6 +4,25 @@ import XCTest
 
 @MainActor
 final class CallTimingTests: XCTestCase {
+    func testCaptureAndDecodeStatsAreBoundedValidatedAndContentFree() throws {
+        let packet = try XCTUnwrap(CallRtpStats.packet(reports: [
+            CallRtpReport(id: "source", type: "media-source", values: ["kind": "audio", "audioLevel": 0.25, "totalAudioEnergy": 2.5, "totalSamplesDuration": 10.0, "deviceName": "private"]),
+            CallRtpReport(id: "out", type: "outbound-rtp", values: ["kind": "audio", "headerBytesSent": 120, "retransmittedPacketsSent": 0, "active": true]),
+            CallRtpReport(id: "in", type: "inbound-rtp", values: ["kind": "audio", "audioLevel": 0.5, "concealedSamples": 12, "totalSamplesReceived": 48000, "jitterBufferEmittedCount": 100]),
+        ], sequence: 10, elapsedMs: 60000))
+        let object = try XCTUnwrap(CallRtpStats.validatedObject(packet))
+        XCTAssertEqual((object["source"] as? [String: Any])?["totalAudioEnergy"] as? Double, 2.5)
+        XCTAssertEqual((object["sender"] as? [String: Any])?["active"] as? Bool, true)
+        XCTAssertEqual((object["receiver"] as? [String: Any])?["totalSamplesReceived"] as? Int, 48000)
+        XCTAssertLessThanOrEqual(packet.count, 1024)
+        XCTAssertFalse(String(decoding: packet, as: UTF8.self).contains("private"))
+        var bad = object
+        bad["source"] = ["audioLevel": 2, "totalAudioEnergy": 0, "totalSamplesDuration": 0]
+        XCTAssertNil(CallRtpStats.validatedObject(try JSONSerialization.data(withJSONObject: bad)))
+        let snapshot = CallAudioSessionSnapshot(category: "AVAudioSessionCategoryPlayAndRecord", mode: "AVAudioSessionModeVoiceChat", inputAvailable: true, inputNumberOfChannels: 1, inputs: ["MicrophoneBuiltIn"], outputs: ["Receiver"])
+        XCTAssertTrue(snapshot.isValid)
+    }
+
     func testRtpSamplerUsesEventsStopsAtTenAndTakesFastTerminalSample() async {
         var instant: TimeInterval = 0
         var requests: [(Int, Int)] = []
@@ -59,7 +78,7 @@ final class CallTimingTests: XCTestCase {
             CallRtpReport(id: "local-private", type: "local-candidate", values: ["candidateType": "relay", "address": "198.51.100.7", "port": 9999]),
             CallRtpReport(id: "remote-private", type: "remote-candidate", values: ["candidateType": "host"]),
         ], sequence: 1, elapsedMs: 2000))
-        XCTAssertLessThanOrEqual(packet.count, 512)
+        XCTAssertLessThanOrEqual(packet.count, CallRtpStats.maxBytes)
         let object = try decode(packet)
         XCTAssertEqual(object["outPackets"] as? Int, 8)
         XCTAssertEqual(object["inPackets"] as? Int, 7)
@@ -108,7 +127,7 @@ final class CallTimingTests: XCTestCase {
             inputMuted: false, muteMode: -1))
         while timing.nextBatch() != nil {}
         let lastSequence = timing.sequence
-        let batches = try timing.httpBatches(reservingBytes: 512).map(decode)
+        let batches = try timing.httpBatches(reservingBytes: CallRtpStats.maxBytes).map(decode)
         XCTAssertLessThanOrEqual(batches.count, 8)
         let rtp = try decode(XCTUnwrap(CallRtpStats.packet(reports: [
             CallRtpReport(id: "out", type: "outbound-rtp", values: ["kind": "audio", "packetsSent": 9_007_199_254_740_991, "bytesSent": 9_007_199_254_740_991]),
