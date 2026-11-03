@@ -18,6 +18,11 @@ ROLES = ('tray', 'service', 'window')
 logger = logging.getLogger(__name__)
 
 
+def _require_frozen() -> None:
+    if not config._is_frozen():
+        raise RuntimeError('Windows tray runtime requires a frozen executable; use app.py for source development')
+
+
 def seed_env(support: Path, template: Path) -> None:
     from dotenv import unset_key
 
@@ -127,6 +132,7 @@ def run_window(support: Path) -> None:
 
 
 def run_tray(support: Path) -> None:
+    _require_frozen()
     import pystray
     from PIL import Image
 
@@ -203,6 +209,7 @@ def run_tray(support: Path) -> None:
 
 
 def main() -> None:
+    _require_frozen()
     if '--selftest' in sys.argv:
         from .windows_selftest import run
 

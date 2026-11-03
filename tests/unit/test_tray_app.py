@@ -19,6 +19,9 @@ def _forbid_unmocked_dashboard_spawn(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("托盘单测必须显式注入窗口启动桩，不允许派生真实桌面或服务进程")
     monkeypatch.setitem(tray_app.open_or_focus_dashboard.__kwdefaults__, "popen", forbidden)
+    from agentcall import windows_runtime
+
+    monkeypatch.setattr(windows_runtime, 'main', forbidden)
 
 
 def test_early_window_spawn_failure_does_not_prevent_tray_startup(monkeypatch, caplog):

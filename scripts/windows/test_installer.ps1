@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 function Run-Checked($Exe, $Arguments, $Timeout = 90000) {
-    $p = Start-Process -FilePath $Exe -ArgumentList $Arguments -PassThru
+    $p = Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $root -PassThru
     if (-not $p.WaitForExit($Timeout)) { throw "Timed out: $Exe $Arguments" }
     if ($p.ExitCode -ne 0) { throw "Exit $($p.ExitCode): $Exe $Arguments" }
 }
@@ -42,8 +42,10 @@ try {
         if ($meta) { break }
         Start-Sleep -Milliseconds 500
     }
-    if (-not $meta -or $meta.version -ne $version) { throw "Bad backend version: $($meta | ConvertTo-Json -Compress)" }
-    $meta | ConvertTo-Json -Depth 10
+    # Never log the meta response, including on failure: it contains setup tokens.
+    $versionMatches = $null -ne $meta -and $meta.version -eq $version
+    Write-Output "Backend responded=$($null -ne $meta) versionMatches=$versionMatches"
+    if (-not $versionMatches) { throw 'Backend version did not match the package' }
     Run-Checked $exe '--shutdown'
     if (-not $service.WaitForExit(10000) -or $service.ExitCode -ne 0) { throw 'Service did not exit cleanly' }
     $userEnv = Join-Path $env:AGENTCALL_APP_SUPPORT_DIR '.env'
@@ -56,12 +58,27 @@ try {
     if (-not $service.WaitForExit(10000)) { throw 'Upgrade left old service running' }
     if (Get-ItemProperty $runKey -Name CallPilot -ErrorAction SilentlyContinue) { throw 'Autostart not disabled' }
     if ((Get-FileHash $userEnv).Hash -ne $envHash) { throw 'Upgrade changed user .env' }
-    Run-Checked (Join-Path $install 'unins000.exe') '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
-    if (Test-Path $install) { throw 'Program directory survived uninstall' }
+    $uninstallLog = Join-Path $root 'uninstall.log'
+    Run-Checked (Join-Path $install 'unins000.exe') "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=`"$uninstallLog`""
+    # Inno's temporary clone can still be deleting the original uninstaller
+    # after its process handle signals exit. Do not race that final cleanup.
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ((Test-Path $install) -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+    }
+    if (Test-Path $install) {
+        throw "Program directory survived uninstall; diagnostic log: $uninstallLog"
+    }
     if (-not (Test-Path (Join-Path $env:AGENTCALL_APP_SUPPORT_DIR '.env'))) { throw 'User data was deleted' }
     if ((Get-FileHash $userEnv).Hash -ne $envHash) { throw 'Uninstall changed user .env' }
     Get-Content $env:CALLPILOT_SELFTEST_REPORT
     Copy-Item $env:CALLPILOT_SELFTEST_REPORT dist/installer-selftest.json
+} catch {
+    if (Test-Path $install) {
+        Write-Output 'Installed files remaining at failure (paths only; no file contents):'
+        Get-ChildItem $install -Recurse -Force | Select-Object FullName, Length, Attributes | Format-Table -AutoSize
+    }
+    throw
 } finally {
     if (Test-Path $exe) { Run-Checked $exe '--shutdown' }
 }

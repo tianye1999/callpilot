@@ -74,6 +74,14 @@ jobs:
       - name: Installed backend and uninstall smoke test (no hardware)
         timeout-minutes: 4
         run: scripts/windows/test_installer.ps1
+      - name: Preserve installer cleanup diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: CallPilot-installer-diagnostics
+          path: ${{ runner.temp }}/CallPilot installed test/uninstall.log
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Zip portable app
         run: Compress-Archive -Path dist/CallPilot -DestinationPath dist/CallPilot-windows-x64.zip
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

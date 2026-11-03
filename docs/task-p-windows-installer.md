@@ -1,7 +1,8 @@
 # Task P: Windows 第二阶段
 
 本地任务记录，关联用户任务 P；未创建远端 issue 或评论。
-状态：实现与本地回归完成，Windows CI / Claude 审查待完成；未提交、推送或安装。
+状态：308331a 已由机主推送；本轮 CI 修正与本地回归完成，Windows 再验 / Claude 审查待完成。
+本轮修正未提交、推送或安装。
 
 ## 运行约定
 
@@ -47,6 +48,50 @@
   15 分钟，实际耗时必须由首次 CI 证明。
 
 ## 审查与剩余门槛
+
+### 308331a 的 CI 修正
+
+已只读核对 CI run 41732750940，未触发 workflow 或修改远端。
+Windows 3.12/3.13 超时栈均指向
+`test_early_window_spawn_failure_does_not_prevent_tray_startup`。
+原 Windows 分发只判断 win32，绕过测试的 Mac 胶水桩而进入真实 pystray。
+现在仅 win32 + frozen 分发；windows_runtime 明确不支持源码入口，副作用前报错，
+源码后端继续使用 app.py。新增非冻结不分发、冻结分发和 runtime 拒绝源码回归；
+原托盘测试加禁止未打桩 Windows runtime 的护栏。
+
+卸载检查原来把进程退出码等同于全部删除完成，但 Inno 官方说明临时 clone
+可能仍在清理原始 uninstaller。检查改为最多等 30 秒，所有检查进程显式使用安装目录
+之外的 cwd；失败打印残留路径/大小/属性，并上传单独的 uninstall.log。
+旧 CI 没有残留清单，无法追溯具体残留文件，所以这里不声称已证明它只有 unins000.exe，
+也不添加无证据的递归 UninstallDelete。实际清理结果仍待下一次 Windows CI。
+Windows frozen selftest 的默认报告移到用户目录，导入前 cwd 也切到用户目录，
+防止无报告覆盖参数或依赖的相对路径写入污染安装目录。
+
+meta 成功与失败路径均取消完整 JSON 输出，只打印 responded/versionMatches 布尔值。
+selftest 报告改为结构化默认值、导入模块名列表与异常类型，不保存原始 stdout/stderr
+或 traceback/异常消息；用含令牌哨兵的成功和失败路径回归证明不进入报告。
+该失败 CI run 的 artifacts 列表为空（原上传步骤未执行），没有可下载的旧 Windows
+artifact 可扫描；新的 ZIP/setup 内 selftest JSON 与 installer-selftest.json 均来自同一
+受限报告生成器。未删除或更改已公开的旧 CI 日志。
+
+依据：[Inno Uninstaller Exit Codes](https://jrsoftware.org/ishelp/topic_uninstexitcodes.htm)。
+
+本轮修正最终验证（下方旧结果为第一轮历史记录）：
+
+```text
+.venv/bin/pytest -q --timeout 600
+4182 passed, 3 skipped, 1816 warnings in 314.60s (0:05:14)
+build/venv312/bin/python -m pytest -q
+4182 passed, 3 skipped, 1816 warnings in 218.95s (0:03:38)
+.venv/bin/ruff check .
+All checks passed!
+.venv/bin/mypy
+Success: no issues found in 87 source files
+.venv/bin/mypy --platform win32
+Success: no issues found in 87 source files
+actionlint
+exit 0, no output
+```
 
 2026-11-04 本地最终验证末尾原文：
 

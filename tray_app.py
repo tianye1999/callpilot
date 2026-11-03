@@ -512,7 +512,7 @@ def _handoff_previous_tray():
 
 
 def main() -> None:
-    if sys.platform == "win32":
+    if sys.platform == "win32" and _is_frozen():
         from agentcall.windows_runtime import main as windows_main
 
         windows_main()

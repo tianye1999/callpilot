@@ -102,6 +102,7 @@ def test_windows_dispatch_and_mac_selftest_unchanged(monkeypatch):
     monkeypatch.setattr(tray_app, '_prepend_runtime_paths', lambda: None)
     monkeypatch.setattr('sys.argv', ['CallPilot', '--selftest'])
     monkeypatch.setattr('sys.platform', 'win32')
+    monkeypatch.setattr(tray_app, '_is_frozen', lambda: True)
     windows = Mock(return_value=0)
     monkeypatch.setattr(runtime, 'main', windows)
     tray_app.main()
@@ -113,6 +114,34 @@ def test_windows_dispatch_and_mac_selftest_unchanged(monkeypatch):
         tray_app.main()
     assert exc.value.code == 0
     mac.assert_called_once()
+
+
+def test_win32_source_keeps_original_entry_without_windows_dispatch(monkeypatch):
+    import app
+    import tray_app
+
+    monkeypatch.setattr('sys.platform', 'win32')
+    monkeypatch.setattr(tray_app, '_is_frozen', lambda: False)
+    monkeypatch.setattr(tray_app, '_prepend_runtime_paths', lambda: None)
+    monkeypatch.setattr('sys.argv', ['tray_app.py', '--selftest'])
+    windows = Mock(side_effect=AssertionError('Source must not enter Windows runtime'))
+    monkeypatch.setattr(runtime, 'main', windows)
+    original = Mock(return_value=0)
+    monkeypatch.setattr(app, '_selftest', original)
+    with pytest.raises(SystemExit) as exc:
+        tray_app.main()
+    assert exc.value.code == 0
+    original.assert_called_once()
+    windows.assert_not_called()
+
+
+@pytest.mark.parametrize('entry', ['main', 'run_tray'])
+def test_windows_runtime_rejects_source_before_side_effects(monkeypatch, tmp_path, entry):
+    monkeypatch.setattr(runtime.config, '_is_frozen', lambda: False)
+    monkeypatch.setattr(runtime.config, 'app_support_dir', Mock(side_effect=AssertionError('No data writes')))
+    monkeypatch.setattr(runtime.subprocess, 'Popen', Mock(side_effect=AssertionError('No real child')))
+    with pytest.raises(RuntimeError, match='frozen'):
+        getattr(runtime, entry)(*([tmp_path] if entry == 'run_tray' else []))
 
 
 def test_packaging_contract():
