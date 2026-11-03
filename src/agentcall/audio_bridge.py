@@ -410,7 +410,7 @@ class SerialPcmAudioBridge(_OutputObserver):
                 port=self.port, baudrate=self.baudrate, timeout=0.02, write_timeout=0.2,
             )
         except OSError as exc:
-            if exc.errno != errno.ENOTTY:
+            if platforms.IS_WINDOWS or exc.errno != errno.ENOTTY:
                 raise
             logger.info(
                 "PCM 口 %s 为 PTY，自定义波特率 %d 不适用(ENOTTY)，回退 115200 打开",

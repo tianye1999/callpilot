@@ -41,13 +41,15 @@ def default_modem_port() -> str:
     return "/dev/ttyUSB2"
 
 
-def default_audio_mode() -> str:
+def default_audio_mode(vendor: str = "quectel") -> str:
     """按平台给 MODEM_AUDIO_MODE 默认值。
 
     macOS 上 PortAudio 打不开 EC20 的 UAC 声卡（AUHAL -66740），须走
     ffmpeg(avfoundation/audiotoolbox)；其他平台 PortAudio 本身可用，
     uac 即标准路径（Windows 经 WASAPI，Linux 经 ALSA）。
     """
+    if IS_WINDOWS and vendor.strip().lower() == "simcom":
+        return "nmea"
     return "uac_ffmpeg" if IS_MACOS else "uac"
 
 

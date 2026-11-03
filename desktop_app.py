@@ -781,6 +781,10 @@ def _bundled_main(webview, web_url: str, exit_process: Callable[[int], None] | N
 
 
 def main() -> None:
+    if "--selftest" in sys.argv[1:]:
+        from agentcall.windows_selftest import run
+
+        raise SystemExit(run())
     if sys.platform == "darwin" and getattr(sys, "frozen", False):
         from agentcall.macos_shell import configure_shell_logging
 

@@ -55,6 +55,8 @@ def app_support_dir() -> Path:
     if override:
         return Path(override).expanduser()
     if _is_frozen():
+        if platforms.IS_WINDOWS:
+            return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / APP_NAME
         return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path.cwd()
 

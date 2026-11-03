@@ -43,6 +43,8 @@ class ModemPreset:
     reset_on_start: bool = False  # 仅控制首次启动；快速失败恢复由桥入口单独决定
     recover_alt_pid: int | None = None
     recovery_request_path: str | None = None
+    serial_at_pattern: str = r"\bAT\b"
+    serial_pcm_pattern: str | None = None
 
     def state(self) -> dict:
         return {
@@ -60,7 +62,8 @@ PRESETS = (
     ModemPreset("simcom", "SIM7600", SIM7600_VID, SIM7600_PID, tuple(SIM7600_MAPS),
                 SIM7600_MAPS[0].split(":", 1)[1], SIM7600_MAPS[1].split(":", 1)[1],
                 # 启动复位会导致首通 PCM 数据面起不来，默认仅快速失败后复位。
-                "nmea", False, SIM7600_ALT_PID, RECOVERY_REQUEST_PATH),
+                "nmea", False, SIM7600_ALT_PID, RECOVERY_REQUEST_PATH,
+                serial_pcm_pattern=r"\b(?:Audio|PCM)\b"),
 )
 
 
@@ -187,6 +190,21 @@ def detect_modem() -> dict:
 def resolve_settings(
     vendor: str, port: str, audio_mode: str, pcm_port: str | None,
 ) -> tuple[str, str, str, str | None]:
+    if platforms.IS_WINDOWS and vendor.strip().lower() in {"auto", "simcom"}:
+        from .port_detect import detect_serial_ports
+
+        selected = detect_modem()["vendor"] if vendor.strip().lower() == "auto" else "simcom"
+        if selected == "simcom":
+            if not config.is_explicit("MODEM_AUDIO_MODE"):
+                audio_mode = platforms.default_audio_mode("simcom")
+            # Only resolve a pair for auto AT; fixed installations retain explicit COM values.
+            if port == platforms.AUTO_PORT:
+                at, pcm = detect_serial_ports("simcom")
+                if at:
+                    port = at
+                if pcm_port == platforms.AUTO_PORT or (not pcm_port and not config.is_explicit("MODEM_PCM_PORT")):
+                    pcm_port = pcm
+            return selected, port, audio_mode, pcm_port
     if vendor.strip().lower() != "auto":
         return vendor, port, audio_mode, pcm_port
     state = detect_modem()

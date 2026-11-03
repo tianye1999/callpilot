@@ -476,6 +476,7 @@ def test_serial_pcm_open_falls_back_to_115200_on_enotty(monkeypatch):
 
     from agentcall.audio_bridge import SerialPcmAudioBridge
 
+    monkeypatch.setattr(audio_bridge.platforms, "IS_WINDOWS", False)
     tried = []
 
     class FakeSerial:

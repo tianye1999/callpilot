@@ -71,6 +71,7 @@ def test_auto_resolution_state_scan_fallback(tmp_path, monkeypatch):
 
 
 def test_auto_settings_preserve_explicit_values(monkeypatch):
+    monkeypatch.setattr(platforms, "IS_WINDOWS", False)
     monkeypatch.setattr(platforms, "IS_MACOS", True)
     monkeypatch.setattr(hardware, "detect_modem", lambda: hardware.PRESETS[1].state())
     for key in ("MODEM_PORT", "MODEM_AUDIO_MODE", "MODEM_PCM_PORT"):

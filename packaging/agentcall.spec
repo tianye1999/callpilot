@@ -138,8 +138,9 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-# Windows 图标需 .ico 格式（现仅有 mac 的 .icns），暂用 PyInstaller 默认图标
-icon_path = str(project_root / "packaging" / "CallPilot.icns") if IS_MACOS else None
+icon_path = str(project_root / "packaging" / "CallPilot.icns") if IS_MACOS else (
+    str(project_root / "packaging" / "CallPilot.ico") if IS_WINDOWS else None
+)
 
 exe = EXE(
     pyz,

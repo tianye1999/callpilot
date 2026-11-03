@@ -485,7 +485,7 @@ class SerialModem:
         detected = (port_detect.detect_at_port(vid=modem_hardware.SIM7600_VID)
                     if self.vendor == "simcom" else port_detect.detect_at_port())
         if detected is None:
-            raise serial.SerialException("MODEM_PORT=auto 未探测到 Quectel AT 串口")
+            raise serial.SerialException(f"MODEM_PORT=auto 未探测到 {self.vendor} AT 串口")
         return detected
 
     def _open_serial(self) -> None:
