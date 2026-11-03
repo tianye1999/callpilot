@@ -259,6 +259,16 @@ class MainActivity : ComponentActivity() {
                         if (callState !is CallState.Idle) incomingOffer = null
                         else if (incomingOffer == null && !offerLookupPending) setOfferLockscreen(false)
                     }
+                    // 本机拒绝（含通知上的「拒绝」按钮）：立刻收起同一来电的接听界面。
+                    LaunchedEffect(current) {
+                        alerts.dismissals.collect { dismissed ->
+                            val offer = incomingOffer ?: return@collect
+                            if (offer.offerId in dismissed) {
+                                incomingOffer = null
+                                if (manager.state.value is CallState.Idle) setOfferLockscreen(false)
+                            }
+                        }
+                    }
                     // 中转长轮询得知他机接听 / 机主拒绝 / 已结束：立刻收起响铃界面，不等 3 s 轮询。
                     LaunchedEffect(current) {
                         alerts.resolutions.collect { resolved ->

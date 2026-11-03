@@ -14,6 +14,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.graphics.drawable.Icon
 import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.net.Uri
@@ -22,6 +23,7 @@ import androidx.annotation.MainThread
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -44,6 +46,10 @@ class OfferAlerts private constructor(private val context: Context) {
     private var foreground = false
     private var busy = false
     private val mutableResolutions = MutableStateFlow<Map<String, InboundOfferState>>(emptyMap())
+    private val mutableDismissals = MutableStateFlow<Set<String>>(emptySet())
+
+    /** 本机拒绝（含通知上的按钮）：前台接听界面立即收起，不等下一次列表轮询。 */
+    val dismissals: StateFlow<Set<String>> = mutableDismissals.asStateFlow()
     // 拒绝上报不随 Activity 销毁而取消（锁屏上拒绝后界面立刻收起）。
     private val relayScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -98,6 +104,7 @@ class OfferAlerts private constructor(private val context: Context) {
 
     fun dismiss(offer: InboundOffer) {
         policy.dismiss(offer)
+        mutableDismissals.value = (mutableDismissals.value + offer.offerId).toList().takeLast(RESOLUTIONS_KEPT).toSet()
         reconcile(allowNew = false)
     }
 
@@ -105,6 +112,7 @@ class OfferAlerts private constructor(private val context: Context) {
         clearNotifications()
         policy = OfferAlertPolicy()
         mutableResolutions.value = emptyMap()
+        mutableDismissals.value = emptySet()
         persist()
     }
 
@@ -129,7 +137,7 @@ class OfferAlerts private constructor(private val context: Context) {
      * 拒绝即告诉中转：Edge 立刻让 AI 接起，本通不再转回手机。最多重试 3 次；
      * 409（已被接听 / 已结束）与 404（能力未开）是终态，不再重试。
      */
-    fun declineOnRelay(pairing: StoredPairing, offerId: String) {
+    fun declineOnRelay(pairing: StoredPairing, offerId: String): Job =
         relayScope.launch {
             val client = HostedCloudClient(pairing.gatewayUrl).also { it.credential = pairing.credential }
             repeat(DECLINE_ATTEMPTS) { attempt ->
@@ -146,7 +154,6 @@ class OfferAlerts private constructor(private val context: Context) {
                 if (attempt < DECLINE_ATTEMPTS - 1) delay(500L * (attempt + 1))
             }
         }
-    }
 
     fun clearNotifications() {
         offers = emptyList()
@@ -175,6 +182,23 @@ class OfferAlerts private constructor(private val context: Context) {
                 context, 1, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
+            // 通知上直接「拒绝」：不用打开 App，锁屏、没有全屏通知权限时也能把来电交给助理。
+            // 完整 offerId 进 data URI：PendingIntent 按 Intent 身份区分，extras 不参与，
+            // 只靠 requestCode（hashCode 会碰撞）会让旧通知的按钮拒绝到新来电。
+            val declineIntent = Intent(context, OfferDeclineReceiver::class.java)
+                .setAction(OfferDeclineReceiver.ACTION_DECLINE_OFFER)
+                .setData(Uri.parse("callpilot://decline/${offer.offerId}"))
+                .putExtra(EXTRA_OFFER_ID, offer.offerId)
+                .putExtra(EXTRA_EXPIRES_AT, offer.expiresAt)
+            val decline = PendingIntent.getBroadcast(
+                context, 2, declineIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            val declineAction = Notification.Action.Builder(
+                Icon.createWithResource(context, R.drawable.ic_callpilot_notification),
+                context.getString(R.string.offer_decline),
+                decline,
+            ).build()
             fun notification(fullScreen: Boolean): Notification = Notification.Builder(context, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_callpilot_notification)
                 .setContentTitle(context.getString(R.string.offer_notification_title))
@@ -185,6 +209,7 @@ class OfferAlerts private constructor(private val context: Context) {
                 .setAutoCancel(true)
                 .setOnlyAlertOnce(true)
                 .setTimeoutAfter((offer.expiresAt - now).coerceAtLeast(1))
+                .addAction(declineAction)
                 .apply { if (fullScreen) setFullScreenIntent(pending, true) }
                 .build()
             try {

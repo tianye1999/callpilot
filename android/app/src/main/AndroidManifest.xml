@@ -59,6 +59,11 @@
             </intent-filter>
         </receiver>
 
+        <!-- 来电通知上的「拒绝」按钮：只接收本 App 的 PendingIntent，不对外暴露 -->
+        <receiver
+            android:name=".call.OfferDeclineReceiver"
+            android:exported="false" />
+
         <!-- 通话前台服务：只是保活壳，业务在 CallManager -->
         <service
             android:name=".call.CallService"
