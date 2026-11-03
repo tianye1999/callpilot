@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import AudioStreamTrack
+from fakes.webrtc_loopback import loopback_phase
 
 from agentcall.call_timing import CallTiming
 from agentcall.remote_dialer import REMOTE_CONTROL_TOPIC
@@ -555,16 +556,92 @@ def test_failed_stats_reads_are_bounded_and_never_block_close():
     reason="Windows + Python 3.12 CI: in-process aiortc<->aiortc loopback parks the Proactor loop with no timer armed "
            "(pytest-timeout dump: idle select, no aiortc frames); Windows 3.13 and all other legs run it. BACKLOG C11.",
 )
-def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch):
-    monkeypatch.setenv("REMOTE_DOWNLINK_GAIN", "1")
+@pytest.mark.parametrize("slow_start", [False, True], ids=["normal", "delayed-gather-dtls-consumer"])
+def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch, slow_start):
+    from aioice import ice
+    from aiortc import RTCDtlsTransport
 
-    async def scenario(final_attempt: bool) -> bool:
+    from agentcall import webrtc_ice
+
+    monkeypatch.setenv("REMOTE_DOWNLINK_GAIN", "1")
+    # Upstream excludes loopback, while the product adapter enumerates separately.
+    # Restrict both sources, not SDP after gathering: no real NIC/VPN/IPv6/mDNS I/O.
+    monkeypatch.setattr(ice, "get_host_addresses", lambda **_: ["127.0.0.1"])
+    monkeypatch.setattr(webrtc_ice, "physical_host_addresses", lambda: ["127.0.0.1"])
+    if slow_start:
+        def unexpected_interfaces():
+            raise AssertionError("loopback must not enumerate host interfaces")
+
+        monkeypatch.setattr(ice.ifaddr, "get_adapters", unexpected_interfaces)
+        gather, start_dtls = ice.Connection.gather_candidates, RTCDtlsTransport.start
+
+        async def delayed_gather(self):
+            await asyncio.sleep(0.25)
+            return await gather(self)
+
+        async def delayed_dtls(self, parameters):
+            await asyncio.sleep(0.25)
+            return await start_dtls(self, parameters)
+
+        monkeypatch.setattr(ice.Connection, "gather_candidates", delayed_gather)
+        monkeypatch.setattr(RTCDtlsTransport, "start", delayed_dtls)
+
+    async def scenario():
+        phone_ice_started = asyncio.Event()
+
+        class AnswerPeer(RTCPeerConnection):
+            async def setLocalDescription(self, description):
+                # aiortc schedules answerer ICE before the offerer applies the
+                # answer. Incoming checks can then start a candidate-pair task
+                # with remote_password=None. Sequence signaling before checks,
+                # without replacing the real ICE/DTLS implementation.
+                transports = {t.receiver.transport.transport for t in self.getTransceivers()}
+                if self.sctp is not None:
+                    transports.add(self.sctp.transport.transport)
+                for transport in transports:
+                    original_start = transport.start
+
+                    async def start(parameters, original_start=original_start):
+                        await phone_ice_started.wait()
+                        return await original_start(parameters)
+
+                    monkeypatch.setattr(transport, "start", start)
+                await super().setLocalDescription(description)
+
         phone = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        peers = [phone]
         phone.addTrack(ToneTrack())
         channel = phone.createDataChannel(REMOTE_CONTROL_TOPIC)
+        phone_ice = phone.getTransceivers()[0].receiver.transport.transport
+
+        @phone_ice.on("statechange")
+        def on_phone_ice_state():
+            if phone_ice.state == "checking":
+                phone_ice_started.set()
+
+        if slow_start:
+            original_phone_start = phone_ice.start
+
+            async def delayed_phone_start(parameters):
+                await asyncio.sleep(0.25)
+                return await original_phone_start(parameters)
+
+            monkeypatch.setattr(phone_ice, "start", delayed_phone_start)
         remote_track = asyncio.Future()
         events = asyncio.Queue()
         media = None
+        producer = None
+        ready, channel_open = asyncio.Event(), asyncio.Event()
+        observations = []
+
+        @channel.on("open")
+        def on_open():
+            channel_open.set()
+
+        def observe(kind, **fields):
+            observations.append((kind, fields))
+            if kind == "latency" and fields.get("stage") == "edge_media_ready":
+                ready.set()
 
         @phone.on("track")
         def on_track(track):
@@ -575,54 +652,67 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch)
         def on_message(payload):
             events.put_nowait(json.loads(payload))
 
-        async def wait_ready():
-            while not media.media_ready or channel.readyState != "open":
-                await asyncio.sleep(0.01)
-
         try:
-            await phone.setLocalDescription(await phone.createOffer())
+            async with loopback_phase("offer gathering", peers):
+                await phone.setLocalDescription(await phone.createOffer())
             media = WebRtcRemoteMediaEndpoint(
                 {"type": "offer", "sdp": phone.localDescription.sdp}, [], call_id="loopback",
+                peer_factory=lambda _: AnswerPeer(RTCConfiguration(iceServers=[])),
             )
-            observations = []
-            media.set_timing(CallTiming(SimpleNamespace(
-                log_event=lambda kind, **fields: observations.append((kind, fields)),
-            )))
-            await asyncio.wait_for(media.connect(), 30)
+            media.set_timing(CallTiming(SimpleNamespace(log_event=observe)))
+            async with loopback_phase("answer gathering", peers):
+                try:
+                    await media.connect()
+                finally:
+                    if media._pc is not None:
+                        peers.append(media._pc)
             assert media.answer is not None and not media.media_ready
-            await phone.setRemoteDescription(RTCSessionDescription(**media.answer))
-            try:
-                await asyncio.wait_for(wait_ready(), 60 if final_attempt else 20)
-            except TimeoutError:
-                # Two aiortc peers in one process occasionally lose the answerer's ICE transport mid-check on
-                # Python 3.12 (also reproduced with our ICE adapter disabled). Retry a fresh pair; the
-                # final attempt keeps the full cold-start watchdog and fails loudly.
-                if final_attempt:
-                    raise
-                return False
-            uplink = media.take_browser_audio()
-            assert uplink and all(len(chunk) == 320 for chunk in uplink)
-            assert max(abs(value) for chunk in uplink for value in struct.unpack("<160h", chunk)) > 500
+            for peer in peers:
+                candidates = [line.split() for line in peer.localDescription.sdp.splitlines()
+                              if line.startswith("a=candidate:")]
+                assert candidates and all(c[4] == "127.0.0.1" and c[7] == "host" for c in candidates)
+            async with loopback_phase("ICE/DTLS/SCTP and first PCM", peers, timeout=60):
+                await phone.setRemoteDescription(RTCSessionDescription(**media.answer))
+                await ready.wait()
+                await channel_open.wait()
+                assert media.media_ready and channel.readyState == "open"
+
+            async with loopback_phase("non-silent uplink PCM", peers):
+                while True:
+                    uplink = media.take_browser_audio()
+                    assert all(len(chunk) == 320 for chunk in uplink)
+                    if any(abs(value) > 500 for chunk in uplink for value in struct.unpack("<160h", chunk)):
+                        break
+                    await asyncio.sleep(0.01)
             stages = {fields["stage"] for kind, fields in observations if kind == "latency"}
             assert {"edge_direct_remote_track", "edge_direct_audio_ready", "edge_phone_first_frame"} <= stages
             assert "edge_phone_track_subscribed" not in stages
 
             channel.send('{"type":"dtmf","digits":"12#"}')
-            assert await media.next_command(10) == {"type": "dtmf", "digits": "12#"}
+            async with loopback_phase("DTMF", peers):
+                assert await media.next_command(30) == {"type": "dtmf", "digits": "12#"}
 
-            track = await asyncio.wait_for(remote_track, 30)
-            for _ in range(10):
-                media.push_modem_audio(struct.pack("<160h", *([3000, -3000] * 80)))
+            async with loopback_phase("remote track", peers):
+                track = await remote_track
+            if slow_start:
+                # Accumulate >100 decoded silence frames before producing tone.
+                async with loopback_phase("delayed consumer backlog", peers):
+                    while track._queue.qsize() < 120:
+                        await asyncio.sleep(0.01)
 
-            async def hear_non_silent():
-                for _ in range(100):
+            async def feed_modem():
+                while True:
+                    media.push_modem_audio(struct.pack("<160h", *([3000, -3000] * 80)))
+                    await asyncio.sleep(0.02)
+
+            producer = asyncio.create_task(feed_modem())
+            async with loopback_phase("non-silent downlink PCM", peers):
+                while True:
                     frame = await track.recv()
                     if abs(frame.to_ndarray()).max() > 500:
-                        return True
-                return False
-
-            assert await asyncio.wait_for(hear_non_silent(), 30)
-            await media.finish_rtp_stats("commit")
+                        break
+            async with loopback_phase("terminal RTP stats", peers):
+                await media.finish_rtp_stats("commit")
             rtp = [fields for kind, fields in observations if kind == "edge_rtp_stats"]
             assert rtp[-1]["terminal"] and rtp[-1]["outPackets"] > 0 and rtp[-1]["inPackets"] > 0
             assert rtp[-1]["senderFrames"] > 0 and rtp[-1]["dtlsState"] == "connected"
@@ -635,24 +725,50 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch)
                        and codec["channels"] == 2 for codec in audio["codecs"])
             command_id = str(uuid4())
             channel.send(json.dumps({"type": "hangup", "commandId": command_id}))
-            command = await media.next_command(10)
-            assert command is not None and command["type"] == "hangup"
-            assert await media._timing.acknowledge_hangup(command, media.send_event)
-            assert await asyncio.wait_for(events.get(), 10) == {"type": "hangup.ack", "commandId": command_id}
+            async with loopback_phase("hangup.ack", peers):
+                command = await media.next_command(30)
+                assert command is not None and command["type"] == "hangup"
+                assert await media._timing.acknowledge_hangup(command, media.send_event)
+                assert await events.get() == {"type": "hangup.ack", "commandId": command_id}
         finally:
+            if producer is not None:
+                producer.cancel()
+                await asyncio.gather(producer, return_exceptions=True)
             try:
                 if media is not None:
-                    await asyncio.wait_for(media.close(), 30)
-                await asyncio.wait_for(phone.close(), 30)
-            except TimeoutError:
-                pending = [t.get_coro().__qualname__ for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-                raise AssertionError(f"loopback teardown hung; pending tasks: {pending}")
+                    async with loopback_phase("endpoint close", peers):
+                        await media.close()
+            finally:
+                async with loopback_phase("phone close", peers):
+                    await phone.close()
         assert not media.media_ready and not media.browser_connected
-        return True
 
-    async def run_with_retry():
-        for attempt in range(3):
-            if await scenario(final_attempt=attempt == 2):
-                return
+    asyncio.run(scenario())
 
-    asyncio.run(run_with_retry())
+
+def test_loopback_timeout_reports_transport_state_and_drains_waiter():
+    async def scenario():
+        peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        peer.addTransceiver("audio")
+        drained = asyncio.Event()
+
+        async def stalled():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                drained.set()
+
+        try:
+            with pytest.raises(AssertionError) as caught:
+                async with loopback_phase("injected stalled transport", [peer], timeout=0.01):
+                    await stalled()
+            message = str(caught.value)
+            assert drained.is_set()
+            assert "phase='injected stalled transport'" in message
+            assert "'ice': 'new'" in message and "'dtls': 'new'" in message
+            assert "localCandidates" in message and "'stats':" in message and "pending=" in message
+            assert not any(secret in message for secret in ("ice-pwd", "ice-ufrag", "fingerprint"))
+        finally:
+            await peer.close()
+
+    asyncio.run(scenario())
