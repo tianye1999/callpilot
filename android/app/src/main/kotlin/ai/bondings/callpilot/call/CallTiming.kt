@@ -54,10 +54,12 @@ class CallTiming(private val nowMs: () -> Double = { System.nanoTime() / 1_000_0
         marks[mark] = origin
     }
 
-    /** 下一批未发出的里程碑；没有新内容或已到 seq 上限时返回 null。 */
+    /** 控制通道的下一批未发里程碑；没有新内容或已到控制通道的 seq 上限（为 HTTP 补交留出额度）时返回 null。 */
     @Synchronized
-    fun nextBatch(): Batch? {
-        if (sequence >= MAX_BATCHES) return null
+    fun nextBatch(): Batch? = next(MAX_BATCHES - MAX_HTTP_BATCHES)
+
+    private fun next(limit: Int): Batch? {
+        if (sequence >= limit) return null
         val pending = Mark.entries.filter { it in marks && it !in sent }.take(MAX_BATCH_MARKS)
         if (pending.isEmpty()) return null
         val text = buildJsonObject {
@@ -78,6 +80,34 @@ class CallTiming(private val nowMs: () -> Double = { System.nanoTime() / 1_000_0
         return Batch(text, pending)
     }
 
+    /**
+     * 随 HTTP 回落 / 结束请求补交的完整里程碑（同 iOS httpBatches）：控制通道发送成功不代表 Edge 收到，
+     * 直连失败时通道可能从未打开。全部里程碑用新的 seq 重新打包，最多 8 批、合计 ≤4 KiB。
+     */
+    @Synchronized
+    fun httpBatches(): List<String> {
+        // 快照不改动控制通道的发送状态：HTTP 可能失败或晚到被 Edge 按 seq 丢弃，控制通道没送达的里程碑
+        // （如 hangup_intent）仍要经控制通道按序补发，两条路互为兜底。已知限制（与 iOS 相同）：控制通道
+        // 「发送成功却没送达」的批次，若 HTTP 快照又被更大 seq 的控制批次越过，其中的点会缺失——只影响诊断。
+        val controlSent = HashSet(sent)
+        sent.clear()
+        val result = mutableListOf<String>()
+        try {
+            var bytes = 2 // JSON array brackets
+            while (result.size < MAX_HTTP_BATCHES) {
+                val batch = next(MAX_BATCHES) ?: break
+                val size = batch.text.toByteArray().size + 1
+                if (bytes + size > MAX_HTTP_BYTES) break
+                result += batch.text
+                bytes += size
+            }
+        } finally {
+            sent.clear()
+            sent.addAll(controlSent)
+        }
+        return result
+    }
+
     /** 控制通道发送失败：这些里程碑下次重发（seq 仍递增，Edge 只收更大的 seq）。 */
     @Synchronized
     fun unsend(batch: Batch) {
@@ -88,5 +118,7 @@ class CallTiming(private val nowMs: () -> Double = { System.nanoTime() / 1_000_0
         const val MAX_BATCH_MARKS = 16
         const val MAX_BATCH_BYTES = 2048
         const val MAX_BATCHES = 64
+        const val MAX_HTTP_BATCHES = 8
+        const val MAX_HTTP_BYTES = 4096
     }
 }

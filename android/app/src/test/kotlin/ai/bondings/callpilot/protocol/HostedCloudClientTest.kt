@@ -582,13 +582,16 @@ class HostedCloudClientTest {
         server.enqueue(MockResponse().setResponseCode(202).setBody(v2Claim.replace("\"sdpPending\":true", "\"sdpPending\":false")))
         server.enqueue(MockResponse().setResponseCode(202).setBody("""{"accepted":true,"offerId":"offer_abcdefghijkl","claimId":"claim_abcdefghijkl"}"""))
 
-        val fallback = client.fallbackInboundLiveKit("offer_abcdefghijkl", "claim_abcdefghijkl")
+        val timing = """{"type":"client_timing","v":1,"attempt":"497f6eca-6276-4993-bfeb-53cbbbba6f08","seq":1,"marks":{"claim_start":0.0}}"""
+        val fallback = client.fallbackInboundLiveKit("offer_abcdefghijkl", "claim_abcdefghijkl", listOf(timing))
         client.endInboundClaim("offer_abcdefghijkl", "claim_abcdefghijkl")
 
         assertEquals("a.b.c", fallback.token)
         val first = server.takeRequest()
         assertEquals("/v1/inbound-offers/offer_abcdefghijkl/media/livekit", first.path)
-        assertTrue(first.body.readUtf8().contains("\"claimId\":\"claim_abcdefghijkl\""))
+        val firstBody = first.body.readUtf8()
+        assertTrue(firstBody.contains("\"claimId\":\"claim_abcdefghijkl\""))
+        assertTrue(firstBody.contains("\"clientTiming\":[{\"type\":\"client_timing\""))
         assertEquals("/v1/inbound-offers/offer_abcdefghijkl/media/end", server.takeRequest().path)
     }
 

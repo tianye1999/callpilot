@@ -10,6 +10,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
@@ -316,9 +317,9 @@ class HostedCloudClient(
     }
 
     /** 直连失败：同一 claim 下切到 LiveKit 房间，绝不重新 claim。 */
-    fun fallbackInboundLiveKit(offerId: String, claimId: String): HostedCallSession {
+    fun fallbackInboundLiveKit(offerId: String, claimId: String, clientTiming: List<String> = emptyList()): HostedCallSession {
         require(OFFER_ID.matches(offerId) && CLAIM_ID.matches(claimId)) { "标识格式不合法" }
-        val body = buildJsonObject { put("claimId", claimId) }.toString()
+        val body = mediaBody(claimId, clientTiming)
         return request("POST", "v1/inbound-offers/$offerId/media/livekit", body).use { response ->
             val session = decodeInboundSession(parseOrThrow(response), offerId, response.code, directRequested = true, sdpSent = false)
             if (session.sessionId != claimId) throw HostedCloudException(response.code, "INVALID_RESPONSE", "回落响应不匹配")
@@ -327,11 +328,17 @@ class HostedCloudClient(
     }
 
     /** 机主挂断：告知中转该 claim 已结束（幂等）。 */
-    fun endInboundClaim(offerId: String, claimId: String) {
+    fun endInboundClaim(offerId: String, claimId: String, clientTiming: List<String> = emptyList()) {
         require(OFFER_ID.matches(offerId) && CLAIM_ID.matches(claimId)) { "标识格式不合法" }
-        val body = buildJsonObject { put("claimId", claimId) }.toString()
+        val body = mediaBody(claimId, clientTiming)
         request("POST", "v1/inbound-offers/$offerId/media/end", body).use { response -> parseOrThrow(response) }
     }
+
+    /** claim 围栏 + 可选的客户端里程碑（CallTiming.httpBatches 产出，只含固定名与毫秒）。 */
+    private fun mediaBody(claimId: String, clientTiming: List<String>): String = buildJsonObject {
+        put("claimId", claimId)
+        if (clientTiming.isNotEmpty()) put("clientTiming", JsonArray(clientTiming.map { json.parseToJsonElement(it) }))
+    }.toString()
 
     private fun JsonObject.strictBoolean(key: String, statusCode: Int): Boolean? {
         val value = this[key] ?: return null

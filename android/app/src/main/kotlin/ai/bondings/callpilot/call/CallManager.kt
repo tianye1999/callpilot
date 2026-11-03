@@ -557,7 +557,7 @@ class CallManager(
         }
         timing.mark(CallTiming.Mark.COLD_FALLBACK)
         s.closeDirect()
-        val fallback = gateway.fallbackLiveKit(context.offerId, claimId)
+        val fallback = gateway.fallbackLiveKit(context.offerId, claimId, timing.httpBatches())
         currentCoroutineContext().ensureActive()
         val stillCurrent = synchronized(commandLock) {
             takeover === context && session === s && !hangupRequested && _state.value is CallState.WaitingMedia
@@ -594,6 +594,7 @@ class CallManager(
     /** claim 可能在挂断后才返回：赢了就通知中转结束，不留下无人收尾的接管。 */
     private fun endClaimAfterHangup(context: TakeoverContext) {
         val gateway = context.gateway ?: return
+        val callTiming = timing
         val claimJob = synchronized(commandLock) {
             // 还没发出 claim（LAZY 任务未创建）就不会再发：answerTakeover 在同一把锁下看到 hangupRequested 会放弃。
             if (context.ended) return
@@ -611,7 +612,7 @@ class CallManager(
                 null
             } ?: return@launch
             try {
-                gateway.end(context.offerId, claimId)
+                gateway.end(context.offerId, claimId, callTiming.httpBatches())
             } catch (_: Exception) {
                 // 中转结束通知是尽力而为；数据通道的 hangup 与 Edge 的收尾不依赖它。
             }

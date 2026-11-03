@@ -14,8 +14,9 @@ interface InboundMediaGateway {
     suspend fun claim(offerId: String, direct: Boolean, sdpOffer: String? = null): HostedCallSession
     suspend fun iceServers(offerId: String): List<IceServer>
     suspend fun completeSdp(offerId: String, claimId: String, sdpOffer: String): HostedCallSession
-    suspend fun fallbackLiveKit(offerId: String, claimId: String): HostedCallSession
-    suspend fun end(offerId: String, claimId: String)
+    /** clientTiming：随请求补交的里程碑批次（直连失败时控制通道可能从未打开）。 */
+    suspend fun fallbackLiveKit(offerId: String, claimId: String, clientTiming: List<String> = emptyList()): HostedCallSession
+    suspend fun end(offerId: String, claimId: String, clientTiming: List<String> = emptyList())
 }
 
 class HostedInboundMediaGateway(
@@ -35,19 +36,24 @@ class HostedInboundMediaGateway(
         withContext(io) { client().completeInboundSdp(offerId, claimId, sdpOffer) }
 
     /** 中转媒体通道暂不可用（503 / 504）时同请求重试一次，绝不重新 claim。 */
-    override suspend fun fallbackLiveKit(offerId: String, claimId: String): HostedCallSession = withContext(io) {
-        try {
-            client().fallbackInboundLiveKit(offerId, claimId)
-        } catch (error: HostedCloudException) {
-            if (error.statusCode == 503 || error.statusCode == 504) client().fallbackInboundLiveKit(offerId, claimId) else throw error
+    override suspend fun fallbackLiveKit(offerId: String, claimId: String, clientTiming: List<String>): HostedCallSession =
+        withContext(io) {
+            try {
+                client().fallbackInboundLiveKit(offerId, claimId, clientTiming)
+            } catch (error: HostedCloudException) {
+                if (error.statusCode == 503 || error.statusCode == 504) {
+                    client().fallbackInboundLiveKit(offerId, claimId, clientTiming)
+                } else {
+                    throw error
+                }
+            }
         }
-    }
 
-    override suspend fun end(offerId: String, claimId: String) = withContext(io) {
+    override suspend fun end(offerId: String, claimId: String, clientTiming: List<String>) = withContext(io) {
         try {
-            client().endInboundClaim(offerId, claimId)
+            client().endInboundClaim(offerId, claimId, clientTiming)
         } catch (error: HostedCloudException) {
-            if (error.statusCode == 503) client().endInboundClaim(offerId, claimId) else throw error
+            if (error.statusCode == 503) client().endInboundClaim(offerId, claimId, clientTiming) else throw error
         }
     }
 }

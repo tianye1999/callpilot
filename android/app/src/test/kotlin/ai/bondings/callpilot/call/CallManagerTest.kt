@@ -126,13 +126,18 @@ class CallManagerTest {
             return sdpResult ?: error("no sdp result")
         }
 
-        override suspend fun fallbackLiveKit(offerId: String, claimId: String): HostedCallSession {
+        var fallbackTiming: List<String> = emptyList()
+        var endTiming: List<String> = emptyList()
+
+        override suspend fun fallbackLiveKit(offerId: String, claimId: String, clientTiming: List<String>): HostedCallSession {
+            fallbackTiming = clientTiming
             calls += "fallback"
             fallbackGate?.await()
             return claimResult.copy(token = "fallback-token", directAttempted = true, sdpPending = false)
         }
 
-        override suspend fun end(offerId: String, claimId: String) {
+        override suspend fun end(offerId: String, claimId: String, clientTiming: List<String>) {
+            endTiming = clientTiming
             calls += "end"
         }
     }
@@ -1537,6 +1542,29 @@ class CallManagerTest {
         runCurrent()
         assertEquals("fallback-token", direct.connectedToken)
         assertTrue(sentMarks(direct).containsAll(listOf("connect_start", "connect_return", "cold_fallback", "room_connected")))
+        h.close()
+    }
+
+    @Test
+    fun `来电直连回落与结束接管时把里程碑随请求补交给中转`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession().also { it.failConnect = true }
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer typ relay"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+
+        manager.answerTakeover(hosted, "offer_abcdefghijkl", direct = true)
+        runCurrent()
+        assertTrue(gateway.calls.contains("fallback"))
+        val fallbackMarks = gateway.fallbackTiming.flatMap {
+            (kotlinx.serialization.json.Json.parseToJsonElement(it) as kotlinx.serialization.json.JsonObject)["marks"]
+                .let { marks -> (marks as kotlinx.serialization.json.JsonObject).keys }
+        }
+        assertTrue(fallbackMarks.containsAll(listOf("answer_action", "claim_start", "claim_response", "cold_fallback")))
+
+        manager.hangup()
+        runCurrent()
+        assertTrue(gateway.calls.contains("end"))
+        assertTrue(gateway.endTiming.isNotEmpty())
         h.close()
     }
 }
