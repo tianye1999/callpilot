@@ -214,6 +214,45 @@ class _CallSessionMediaRouter:
             self._owner = owner
 
 
+# 先响手机阶段的结果 → 告诉 AI 的背景（只是陈述发生了什么；能不能转接由能力分支决定）。
+_PHONE_FIRST_OUTCOMES = {
+    "OWNER_TIMEOUT": "missed",
+    "OWNER_DECLINED": "declined",
+    "NO_PHONE_AUDIO": "media_failed",
+    "MEDIA_PREPARE_FAILED": "media_failed",
+}
+_PHONE_FIRST_CONTEXT_NOTES = {
+    "zh": {
+        "missed": (
+            "本通先响了机主的手机约 {seconds} 秒没人接，才转到你这里。对方已经等了一会儿："
+            "问候后直接进入正题，别再让对方久等。"
+        ),
+        "declined": (
+            "机主看到了这通来电，选择由你全权处理。不要再提转接、联系或让机主接听，"
+            "直接把事情办好并记下要点。"
+        ),
+        "media_failed": (
+            "机主刚才试着接这通电话，但手机线路没接上，改由你处理。对方已经等了一会儿："
+            "问候后直接进入正题。"
+        ),
+    },
+    "en": {
+        "missed": (
+            "This call rang the owner's phone for about {seconds} seconds with no answer before "
+            "reaching you. The caller has already waited: after the greeting, get straight to the point."
+        ),
+        "declined": (
+            "The owner saw this call and chose to leave it entirely to you. Do not mention "
+            "transferring, contacting or putting the owner on; just handle it and note the key points."
+        ),
+        "media_failed": (
+            "The owner tried to pick up this call but the phone line did not connect, so it is yours "
+            "now. The caller has already waited: after the greeting, get straight to the point."
+        ),
+    },
+}
+
+
 class CallSession:
     def __init__(
         self,
@@ -383,6 +422,9 @@ class CallSession:
         # sent (bound to that offer id); a second call never does.
         self._takeover_tool_acknowledged: str | None = None
         self._takeover_request_trigger: str | None = None
+        # What happened on the owner's phone before the AI answered ("missed",
+        # "declined", "media_failed"); told to the AI as background, not as a rule.
+        self._phone_first_outcome: str | None = None
         self._takeover_offer_queue: Queue[InboundTakeoverOfferRequest] = Queue(
             maxsize=1
         )
@@ -2086,6 +2128,7 @@ class CallSession:
             if self.takeover_state in {TakeoverState.MOBILE_ACTIVE, TakeoverState.MOBILE_RECONNECTING}:
                 return False
             self._owner_declined = True
+            self._phone_first_outcome = "declined"
             self._triage_mode = "off"
             self._triage_pending = self._triage_terminal = False
             if self._record is not None:
@@ -2143,6 +2186,20 @@ class CallSession:
             # No AI has spoken; fallback starts its normal opening, not a resume scene.
             self._takeover_resume_pending = False
             self._takeover_ai_fallback_notified = True
+            self._phone_first_outcome = _PHONE_FIRST_OUTCOMES.get(reason)
+
+    def _phone_first_context_note(self, lang: str) -> str | None:
+        """Background for the AI about the owner's phone before it answered (F2)."""
+        outcome = self._phone_first_outcome
+        if outcome is None:
+            return None
+        try:
+            seconds = int(config.get_str("INBOUND_PHONE_FIRST_RING_SECONDS"))
+        except ValueError:
+            seconds = 15
+        notes = _PHONE_FIRST_CONTEXT_NOTES.get("en" if lang == "en" else "zh", {})
+        template = notes.get(outcome)
+        return template.format(seconds=seconds) if template else None
 
     async def _handle_phone_first(self, record: CallRecord | None,
                                  transcripts: list[tuple[str, str]] | None = None) -> str:
@@ -2249,6 +2306,9 @@ class CallSession:
         provisional_transcripts = transcripts if transcripts is not None else []
 
         async def run_provisional_ai(agent: VoiceAgent, active_bridge: AudioBridge) -> AudioBridge:
+            # The same agent stays if the repair fails; its first prompt must already
+            # carry the fact that the owner's phone did not get audio.
+            self._phone_first_outcome = _PHONE_FIRST_OUTCOMES["NO_PHONE_AUDIO"]
             self._configure_call_agent(agent, lambda: active_bridge, record, provisional_transcripts,
                                        "inbound", self.current_caller, time.monotonic())
             await agent.start(self._make_agent_audio_handler(agent, active_bridge, record))
@@ -3640,6 +3700,7 @@ class CallSession:
             lang,
             scenario=scenario,
             takeover_preference=takeover_preference,
+            inbound_context=self._phone_first_context_note(lang) if direction == "inbound" else None,
             # 读标志而不是 mode：裁决 continue_ai 后要能真的解除限制话术。
             # 曾写成 triage_mode == "enforce"，于是 _triage_pending 成了只写
             # 标志（4 处写、0 处读），放行裁决完全落空（#76）。
@@ -4847,6 +4908,7 @@ class CallSession:
         self._owner_declined = False
         self._takeover_tool_acknowledged = None
         self._takeover_request_trigger = None
+        self._phone_first_outcome = None
         self._owner_offer_fences = {}
         self._mobile_timing = None
         with self._takeover_lock:

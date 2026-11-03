@@ -205,8 +205,13 @@ def build_instructions(
     takeover_preference: str | None = None,
     triage_pending: bool = False,
     task_package: dict | None = None,
+    inbound_context: str | None = None,
 ) -> str:
-    """构造会话系统提示词；``task``/``task_package`` 仅在外呼时使用。"""
+    """构造会话系统提示词；``task``/``task_package`` 仅在外呼时使用。
+
+    ``inbound_context``：来电接起前已经发生的事（先响了机主手机没人接、机主
+    选择交给 AI……），只在来电提示词里作为背景陈述，不改变规则。
+    """
     lang = normalize_lang(lang)
     if lang == "en":
         return _build_en(
@@ -218,6 +223,7 @@ def build_instructions(
             takeover_preference,
             triage_pending,
             task_package,
+            inbound_context,
         )
     return _build_zh(
         direction,
@@ -228,6 +234,7 @@ def build_instructions(
         takeover_preference,
         triage_pending,
         task_package,
+        inbound_context,
     )
 
 
@@ -275,6 +282,7 @@ def _build_zh(
     takeover_preference: str | None = None,
     triage_pending: bool = False,
     task_package: dict | None = None,
+    inbound_context: str | None = None,
 ) -> str:
     style = config.get_str("VOICE_STYLE").strip()
     style_line = f"机主希望的说话风格：{style}。\n" if style else ""
@@ -407,9 +415,12 @@ def _build_zh(
             "**不是一份要背诵的清单**——一次只问其中一件，等对方答完再问下一件。\n"
         )
         relay_rule = f"3. 不承诺回拨时间、不替{owner}做决定；只说会转告{owner}。\n"
+    context_value = (inbound_context or "").strip()
+    context_text = f"本通背景：{context_value}\n" if context_value else ""
     return (
         f"你是{owner}的{persona}，正在替{owner}接听打进来的电话，"
         f"{owner}现在不方便接。\n"
+        + context_text
         + task_line
         + "来电规则：\n"
         # 开场白只说「喂?」之后，主动表明身份就成了必需（WIL-91）：靠「被问才说」
@@ -499,6 +510,7 @@ def _build_en(
     takeover_preference: str | None = None,
     triage_pending: bool = False,
     task_package: dict | None = None,
+    inbound_context: str | None = None,
 ) -> str:
     style = config.get_str("VOICE_STYLE").strip()
     style_line = f"Preferred speaking style: {style}.\n" if style else ""
@@ -688,9 +700,12 @@ def _build_en(
             f"3. Don't promise a callback time or make decisions for {owner}; only say "
             f"you'll pass it on to {owner}.\n"
         )
+    context_value = (inbound_context or "").strip()
+    context_text = f"Context for this call: {context_value}\n" if context_value else ""
     return (
         f"You are {owner}'s {persona}, answering an incoming call for {owner}, "
         f"who can't take it right now.\n"
+        + context_text
         + task_line
         + "Incoming-call rules:\n"
         # 与中文侧同步（WIL-91 / WIL-99）：身份主动说；且不要引用开场白原文，
