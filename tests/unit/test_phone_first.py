@@ -180,7 +180,8 @@ def test_direct_claim_starts_pcm_without_waiting_for_sdp_and_rejects_postcommit_
     assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
 
 
-def test_direct_preview_forwards_caller_before_phone_audio_and_commit(rig, monkeypatch):
+@pytest.mark.parametrize("slow_connect", [False, True])
+def test_direct_preview_forwards_caller_before_phone_audio_and_commit(rig, monkeypatch, slow_connect):
     from agentcall.inbound_direct import SwitchableInboundEndpoint
 
     monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
@@ -198,8 +199,26 @@ def test_direct_preview_forwards_caller_before_phone_audio_and_commit(rig, monke
         direct.media_ready = True  # Phone starts its microphone only after hearing the caller.
 
     direct.push_modem_audio = push
-    rig.bridge.feed_uplink(b"caller-before-microphone")
-    rig.session._takeover_endpoint_factory = lambda issued: SwitchableInboundEndpoint(
+    connect_direct = direct.connect
+
+    async def connect_then_caller_speaks():
+        # The caller keeps talking in a real call; feeding one chunk before the
+        # endpoint exists let a slow runner drain and drop it (CI ubuntu 3.12).
+        await connect_direct()
+        rig.bridge.feed_uplink(b"caller-before-microphone")
+
+    direct.connect = connect_then_caller_speaks
+
+    class SlowSwitchable(SwitchableInboundEndpoint):
+        async def connect(self):
+            if slow_connect:
+                # The connect task needs extra loop turns, so the preview loop's
+                # threaded bridge read runs first (well inside the 8 s silence cap).
+                for _ in range(20):
+                    await asyncio.sleep(0)
+            await super().connect()
+
+    rig.session._takeover_endpoint_factory = lambda issued: SlowSwitchable(
         issued.direct, direct_factory=lambda *_args, **_kwargs: direct)
 
     def claim():
