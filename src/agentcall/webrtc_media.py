@@ -28,6 +28,10 @@ _FRAME_BYTES = _FRAME_SAMPLES * 2
 _FRAME_SECONDS = _FRAME_SAMPLES / REMOTE_AUDIO_RATE
 # Catch up at most this far behind real time; beyond it the backlog is stale.
 _MAX_CATCH_UP_SECONDS = 0.1
+# On re-anchor, retain three 20 ms frames (60 ms including the next send):
+# enough cushion for producer jitter without preserving a call-long stale backlog.
+_REANCHOR_KEEP_FRAMES = 3
+_BACKLOG_TRIM_LOG_INTERVAL_SECONDS = 5.0
 _MAX_CONTROL_BYTES = 4096
 _MAX_CONTROL_BUFFER = 64 * 1024
 _RTP_STATS_INTERVAL_SECONDS = 2.0
@@ -110,6 +114,7 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
             super().__init__()
             self._next_at: float | None = None
             self._pts = 0
+            self._last_trim_log_at: float | None = None
             self.stats = PcmFlowStats("downlink1_direct_publish")
             self.frames = 0
             self.silence_frames = 0
@@ -129,6 +134,15 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
                 self._next_at += _FRAME_SECONDS
                 if self._next_at < now - _MAX_CATCH_UP_SECONDS:
                     self._next_at = now
+                    dropped = 0
+                    while source.qsize() > _REANCHOR_KEEP_FRAMES:
+                        source.get_nowait()
+                        dropped += 1
+                    if dropped and (self._last_trim_log_at is None
+                                    or now - self._last_trim_log_at >= _BACKLOG_TRIM_LOG_INTERVAL_SECONDS):
+                        logger.info("Direct downlink backlog trimmed: dropped_frames=%d dropped_ms=%.0f kept_frames=%d",
+                                    dropped, dropped * _FRAME_SECONDS * 1000, source.qsize())
+                        self._last_trim_log_at = now
                 elif self._next_at > now:
                     await asyncio.sleep(self._next_at - now)
             if self.readyState != "live":

@@ -385,6 +385,93 @@ def test_modem_sender_keeps_real_time_cadence_despite_sleep_overshoot_and_encode
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("capacity", [10, 50])
+def test_modem_sender_reanchor_trims_oldest_backlog_and_resumes_cadence(monkeypatch, caplog, capacity):
+    from agentcall import webrtc_media
+
+    clock = [100.0]
+
+    async def scenario():
+        await asyncio.wrap_future(webrtc_media.warm_webrtc_stack())
+
+        async def sleep(delay):
+            clock[0] += delay
+
+        monkeypatch.setattr(webrtc_media, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(webrtc_media.asyncio, "sleep", sleep)
+        caplog.set_level("INFO", logger="agentcall.webrtc_media")
+        media = endpoint(FakePeer(), queue_max_chunks=capacity)
+        track = webrtc_media._modem_track(media._modem_audio, 1)
+        await track.recv()
+        clock[0] += 0.5
+        # Exercise the real chunking/overflow producer before the sender resumes.
+        for value in range(1, capacity + 6):
+            media.push_modem_audio(struct.pack("<160h", *([value] * 160)))
+        assert media._modem_audio.qsize() == capacity
+        resumed_at = clock[0]
+        for index, expected in enumerate(range(capacity + 3, capacity + 6)):
+            frame = await track.recv()
+            assert frame.to_ndarray().flatten().tolist() == [expected] * 160
+            assert frame.pts == (index + 1) * 160
+            assert clock[0] == pytest.approx(resumed_at + index * 0.02)
+            assert media._modem_audio.qsize() == 2 - index
+        logs = [r.message for r in caplog.records if "backlog trimmed" in r.message]
+        assert len(logs) == 1
+        assert f"dropped_frames={capacity - 3}" in logs[0]
+        assert f"dropped_ms={(capacity - 3) * 20}" in logs[0]
+        # A second stall still trims, but does not flood the log.
+        clock[0] += 0.5
+        for _ in range(capacity):
+            media.push_modem_audio(bytes(320))
+        await track.recv()
+        assert media._modem_audio.qsize() == 2
+        assert len([r for r in caplog.records if "backlog trimmed" in r.message]) == 1
+        clock[0] += 5.0
+        for _ in range(capacity):
+            media.push_modem_audio(bytes(320))
+        await track.recv()
+        assert media._modem_audio.qsize() == 2
+        assert len([r for r in caplog.records if "backlog trimmed" in r.message]) == 2
+        track.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stall", [0.0, 0.08])
+def test_modem_sender_normal_and_short_catchup_preserve_all_frames(monkeypatch, caplog, stall):
+    from agentcall import webrtc_media
+
+    clock = [100.0]
+
+    async def scenario():
+        await asyncio.wrap_future(webrtc_media.warm_webrtc_stack())
+
+        async def sleep(delay):
+            clock[0] += delay
+
+        monkeypatch.setattr(webrtc_media, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(webrtc_media.asyncio, "sleep", sleep)
+        caplog.set_level("INFO", logger="agentcall.webrtc_media")
+        source = asyncio.Queue()
+        track = webrtc_media._modem_track(source, 1)
+        for value in range(10):
+            source.put_nowait(struct.pack("<160h", *([value] * 160)))
+        for value in range(10):
+            if value == 1:
+                clock[0] += stall
+            frame = await track.recv()
+            assert frame.to_ndarray().flatten().tolist() == [value] * 160
+            assert frame.pts == value * 160
+            assert source.qsize() == 9 - value
+            expected_elapsed = max(stall, value * 0.02) if value else 0.0
+            assert clock[0] == pytest.approx(100.0 + expected_elapsed)
+        assert track.silence_frames == 0
+        assert not [r for r in caplog.records if "backlog trimmed" in r.message]
+        track.stop()
+
+    asyncio.run(scenario())
+
+
 def test_periodic_rtp_stats_stop_at_reserved_terminal_slot(monkeypatch):
     from agentcall import webrtc_media
 
