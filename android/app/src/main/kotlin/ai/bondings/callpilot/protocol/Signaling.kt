@@ -55,7 +55,7 @@ object Signaling {
     /** Edge → 客户端状态事件。未知类型返回 null（协议演进容错）。 */
     sealed interface Event {
         /** `{"type":"status","status":"...","reason":?,"code":?}` */
-        data class Status(val status: String, val reason: String? = null) : Event
+        data class Status(val status: String, val reason: String? = null, val code: String? = null) : Event
 
         /** `{"type":"remote_call","status":"dialing"|"connected"|...}` */
         data class RemoteCall(val status: String) : Event
@@ -80,8 +80,9 @@ object Signaling {
         val type = (obj["type"] as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return null
         val status = (obj["status"] as? JsonPrimitive)?.takeIf { it.isString }?.content
         val reason = ((obj["reason"] ?: obj["code"]) as? JsonPrimitive)?.takeIf { it.isString }?.content
+        val code = (obj["code"] as? JsonPrimitive)?.takeIf { it.isString }?.content
         return when (type) {
-            "status" -> status?.let { Event.Status(it, reason = reason) }
+            "status" -> status?.let { Event.Status(it, reason = reason, code = code) }
             "remote_call" -> status?.let { Event.RemoteCall(it) }
             "ended" -> Event.Ended(reason ?: "ended")
             "media_failed" -> Event.MediaFailed(reason ?: "media_failed")

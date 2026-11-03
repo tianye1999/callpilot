@@ -410,10 +410,12 @@ class CallManagerTest {
         advanceUntilIdle()
 
         session.emit(
-            SessionEvent.Edge(Signaling.Event.Status("failed", reason = "line_unavailable"))
+            SessionEvent.Edge(Signaling.decodeEvent(
+                """{"type":"status","status":"failed","reason":"line_unavailable","code":"SIM_NOT_REGISTERED"}"""
+            )!!)
         )
         advanceUntilIdle()
-        assertEquals(CallState.Failed("10000", "line_unavailable"), manager.state.value)
+        assertEquals(CallState.Failed("10000", "line_unavailable", "SIM_NOT_REGISTERED"), manager.state.value)
         assertTrue(session.disconnected)
         h.close()
     }

@@ -760,7 +760,9 @@ class CallManager(
                     }
                     "failed" -> {
                         cleanup()
-                        _state.value = CallState.Failed(number, reason ?: status)
+                        _state.value = CallState.Failed(
+                            number, reason ?: status, (event.event as? Signaling.Event.Status)?.code,
+                        )
                     }
                     // waiting_for_phone 等生命周期提示不改变状态
                     else -> Unit

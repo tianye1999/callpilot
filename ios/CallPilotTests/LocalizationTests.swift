@@ -211,7 +211,7 @@ final class LocalizationTests: XCTestCase {
                 code: "SIM_NOT_REGISTERED",
                 locale: Locale(identifier: "en")
             ),
-            "The SIM is not registered on the mobile network."
+            "The phone line is not connected to the carrier network. Try again later."
         )
         XCTAssertEqual(
             CallFailureCopy.message(
@@ -224,6 +224,33 @@ final class LocalizationTests: XCTestCase {
             CallFailureCopy.message(code: nil, locale: Locale(identifier: "en")),
             "The call could not be completed."
         )
+    }
+
+    func testAllKnownCallFailureCodesAndUnknownFallbackInBothLanguages() {
+        let codes = [
+            "EDGE_OFFLINE": "edge_offline", "MODEM_OFFLINE": "modem_offline",
+            "SIM_NOT_READY": "sim_not_ready", "SIM_NOT_REGISTERED": "sim_not_registered",
+            "SERVICE_NUMBER_MISMATCH": "service_number_mismatch",
+            "SERVICE_NUMBER_UNKNOWN": "service_number_unknown", "LINE_BUSY": "line_busy",
+            "RATE_LIMITED": "rate_limited", "TAKEOVER_MEDIA_TIMEOUT": "timeout",
+            "SESSION_TIMEOUT": "timeout", "EDGE_TIMEOUT": "timeout", "TIMEOUT": "timeout",
+            "OFFER_UNAVAILABLE": "offer_unavailable",
+        ]
+        for language in ["en", "zh-Hans"] {
+            let locale = Locale(identifier: language)
+            let generic = L10n.text("call.error.generic", locale: locale)
+            for (code, suffix) in codes {
+                let message = CallFailureCopy.message(code: code, locale: locale)
+                XCTAssertEqual(message, L10n.text("call.error." + suffix, locale: locale))
+                XCTAssertFalse(message.isEmpty)
+                XCTAssertFalse(message.hasPrefix("call.error."))
+                XCTAssertNotEqual(message, generic)
+                XCTAssertFalse(message.contains(code))
+            }
+            XCTAssertEqual(CallFailureCopy.message(code: "FUTURE_ERROR", locale: locale), generic + " (FUTURE_ERROR)")
+            XCTAssertEqual(CallFailureCopy.message(code: nil, locale: locale), generic)
+            XCTAssertEqual(CallFailureCopy.message(code: "", locale: locale), generic)
+        }
     }
 
     private var repositoryRoot: URL {

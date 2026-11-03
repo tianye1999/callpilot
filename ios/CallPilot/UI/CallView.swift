@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// 通话页(对齐 Android CallScreen)。状态标签 + DTMF + 挂断;
 /// 明确显示"正在通过远端 SIM 通话"(#30 体验设计:避免误以为是手机蜂窝线路)。
@@ -28,7 +29,11 @@ struct CallView: View {
                 if showKeypad {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 14) {
                         ForEach(keys, id: \.self) { k in
-                            Button(k) { model.sendDTMF(k) }
+                            Button(k) {
+                                model.sendDTMF(k)
+                                // Do not play system sounds or reconfigure the active call audio session.
+                                UISelectionFeedbackGenerator().selectionChanged()
+                            }
                                 .font(.title).frame(width: 66, height: 66)
                                 .background(Color.gray.opacity(0.12), in: Circle())
                         }

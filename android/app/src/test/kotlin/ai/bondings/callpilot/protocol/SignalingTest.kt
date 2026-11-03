@@ -71,7 +71,7 @@ class SignalingTest {
             Signaling.decodeEvent("""{"type":"status","status":"ended","reason":"user_hangup"}"""),
         )
         assertEquals(
-            Signaling.Event.Status("failed", reason = "media_not_ready"),
+            Signaling.Event.Status("failed", reason = "media_not_ready", code = "media_not_ready"),
             Signaling.decodeEvent("""{"type":"status","status":"failed","code":"media_not_ready"}"""),
         )
     }

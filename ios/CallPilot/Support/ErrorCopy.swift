@@ -21,12 +21,17 @@ enum CallFailureCopy {
         case "SIM_NOT_READY": "call.error.sim_not_ready"
         case "SIM_NOT_REGISTERED": "call.error.sim_not_registered"
         case "SERVICE_NUMBER_MISMATCH": "call.error.service_number_mismatch"
+        case "SERVICE_NUMBER_UNKNOWN": "call.error.service_number_unknown"
         case "LINE_BUSY": "call.error.line_busy"
         case "RATE_LIMITED": "call.error.rate_limited"
-        case "TAKEOVER_MEDIA_TIMEOUT", "SESSION_TIMEOUT": "call.error.timeout"
+        case "TAKEOVER_MEDIA_TIMEOUT", "SESSION_TIMEOUT", "EDGE_TIMEOUT", "TIMEOUT": "call.error.timeout"
         case "OFFER_UNAVAILABLE": "call.error.offer_unavailable"
         default: "call.error.generic"
         }
-        return L10n.text(key, locale: locale)
+        let message = L10n.text(key, locale: locale)
+        if key == "call.error.generic", let code, !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "\(message) (\(code))"
+        }
+        return message
     }
 }

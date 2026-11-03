@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="call_error_edge_offline">电脑端不在线。</string>
+    <string name="call_error_modem_offline">电话线路暂不可用，请检查电脑端连接或稍后再试。</string>
+    <string name="call_error_sim_not_ready">SIM 卡未插入或尚未就绪，请检查后重试。</string>
+    <string name="call_error_sim_not_registered">电话线路未连上运营商网络，请稍后再试。</string>
+    <string name="call_error_service_number_mismatch">当前 SIM 与该运营商客服号码不匹配。</string>
+    <string name="call_error_service_number_unknown">未能识别 SIM 卡运营商，请在电脑端设置中确认免费客服号码。</string>
+    <string name="call_error_line_busy">另一通电话正在进行。</string>
+    <string name="call_error_rate_limited">已达到拨号限额，请稍后再试。</string>
+    <string name="call_error_timeout">连接超时。</string>
+    <string name="call_error_offer_unavailable">这次来电转接已失效。</string>
+    <string name="call_error_generic">未能完成这通电话。</string>
     <string name="app_name">KinyAI-SIM助手</string>
     <string name="common_back">返回</string>
     <string name="common_cancel">取消</string>

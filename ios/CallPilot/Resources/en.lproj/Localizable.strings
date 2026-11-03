@@ -61,11 +61,12 @@
 "call.state.failed" = "%@ · %@";
 "call.state.idle" = "Idle";
 "call.error.edge_offline" = "The computer is offline.";
-"call.error.modem_offline" = "The modem is offline. Check its USB connection.";
-"call.error.sim_not_ready" = "The SIM is not ready.";
-"call.error.sim_not_registered" = "The SIM is not registered on the mobile network.";
+"call.error.modem_offline" = "The phone line is unavailable. Check the computer connection or try again later.";
+"call.error.sim_not_ready" = "The SIM is missing or not ready. Check the SIM and try again.";
+"call.error.sim_not_registered" = "The phone line is not connected to the carrier network. Try again later.";
 "call.error.service_number_mismatch" = "That carrier service number does not match the current SIM.";
-"call.error.line_busy" = "The remote line is already in use.";
+"call.error.service_number_unknown" = "The SIM carrier could not be identified. Confirm the free service number in computer settings.";
+"call.error.line_busy" = "Another call is in progress.";
 "call.error.rate_limited" = "The calling limit has been reached. Try again later.";
 "call.error.timeout" = "The connection timed out.";
 "call.error.offer_unavailable" = "This call handoff is no longer available.";

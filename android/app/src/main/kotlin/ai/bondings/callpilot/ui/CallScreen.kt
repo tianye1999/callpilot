@@ -62,7 +62,9 @@ fun CallScreen(state: CallState, manager: CallManager) {
         is CallState.Dialing -> state.number to "拨号中…"
         is CallState.InCall -> state.number to "%02d:%02d".format(seconds / 60, seconds % 60)
         is CallState.Ended -> state.number to "通话结束（${endReasonText(state.reason)}）"
-        is CallState.Failed -> state.number to "失败：${state.reason}"
+        is CallState.Failed -> state.number to CallFailureCopy.format(
+            state.code, stringResource(CallFailureCopy.resource(state.code)),
+        )
         CallState.Idle -> "" to ""
     }
     // 通话活跃全程都给键盘：客服 IVR 从会话建立到接通任一阶段都可能要按键，

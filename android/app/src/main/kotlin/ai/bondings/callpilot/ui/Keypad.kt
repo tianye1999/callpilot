@@ -12,6 +12,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -39,6 +45,19 @@ fun Keypad(
     showLetters: Boolean = true,
     zeroLongPressPlus: Boolean = false,
 ) {
+    val context = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val tone = remember(context) { KeypadTone(context.applicationContext) }
+    DisposableEffect(tone, lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) tone.release()
+        }
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+            tone.release()
+        }
+    }
     Column(
         modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -53,9 +72,9 @@ fun Keypad(
                             .clip(CircleShape)
                             .background(MaterialTheme.colorScheme.surfaceVariant)
                             .combinedClickable(
-                                onClick = { onKey(digit) },
+                                onClick = { onKey(digit); tone.play(digit) },
                                 onLongClick = if (zeroLongPressPlus && digit == "0") {
-                                    { onKey("+") }
+                                    { onKey("+"); tone.play("0") }
                                 } else {
                                     null
                                 },

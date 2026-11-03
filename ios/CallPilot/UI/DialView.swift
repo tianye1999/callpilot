@@ -1,4 +1,5 @@
 import SwiftUI
+import AudioToolbox
 
 /// 拨号页(对齐 Android DialScreen)。12 键盘 + 拨号键。
 struct DialView: View {
@@ -15,7 +16,10 @@ struct DialView: View {
 
             LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 18) {
                 ForEach(keys, id: \.self) { k in
-                    Button(k) { if number.count < 32 { number += k } }
+                    Button(k) {
+                        if number.count < 32 { number += k }
+                        if let sound = Self.keySound(k) { AudioServicesPlaySystemSound(sound) }
+                    }
                         .font(.system(size: 30))
                         .frame(width: 74, height: 74)
                         .background(Color.gray.opacity(0.12), in: Circle())
@@ -50,5 +54,14 @@ struct DialView: View {
             Spacer()
         }
         .padding(24)
+    }
+
+    private static func keySound(_ key: String) -> SystemSoundID? {
+        switch key {
+        case "0"..."9": return key.count == 1 ? UInt32(key).map { 1200 + $0 } : nil
+        case "*": return 1210
+        case "#": return 1211
+        default: return nil
+        }
     }
 }
