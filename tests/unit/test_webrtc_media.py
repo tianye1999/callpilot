@@ -342,6 +342,49 @@ def test_modem_sender_logs_pcm_windows_even_when_queue_is_empty(caplog):
     asyncio.run(scenario())
 
 
+def test_modem_sender_keeps_real_time_cadence_despite_sleep_overshoot_and_encode_time(monkeypatch):
+    """11-03 device call: re-anchoring on each wake-up sent ~33 frames/s and dropped caller audio."""
+    from agentcall import webrtc_media
+
+    clock = [100.0]
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return clock[0]
+
+    async def scenario():
+        await asyncio.wrap_future(webrtc_media.warm_webrtc_stack())
+        real_sleep = asyncio.sleep
+
+        async def overshooting_sleep(delay):
+            clock[0] += delay + 0.008  # a busy event loop wakes late
+            await real_sleep(0)
+
+        monkeypatch.setattr(webrtc_media, "time", FakeTime)
+        monkeypatch.setattr(webrtc_media.asyncio, "sleep", overshooting_sleep)
+        source = asyncio.Queue()
+        track = webrtc_media._modem_track(source, 1)
+        start = clock[0]
+        for _ in range(250):
+            source.put_nowait(bytes(320))
+            await track.recv()
+            clock[0] += 0.006  # encoder and RTP send time between pulls
+        elapsed = clock[0] - start
+        assert track.frames == 250
+        assert elapsed < 5.0 + 0.05, f"250 frames took {elapsed:.2f}s instead of 5 s"
+        assert track.silence_frames == 0
+
+        clock[0] += 2.0  # a long stall re-anchors instead of bursting 100 stale frames
+        before = clock[0]
+        await track.recv()
+        await track.recv()
+        assert clock[0] - before >= 0.02
+        track.stop()
+
+    asyncio.run(scenario())
+
+
 def test_periodic_rtp_stats_stop_at_reserved_terminal_slot(monkeypatch):
     from agentcall import webrtc_media
 

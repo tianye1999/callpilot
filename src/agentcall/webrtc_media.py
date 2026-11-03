@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 _FRAME_SAMPLES = REMOTE_AUDIO_RATE // 50
 _FRAME_BYTES = _FRAME_SAMPLES * 2
+_FRAME_SECONDS = _FRAME_SAMPLES / REMOTE_AUDIO_RATE
+# Catch up at most this far behind real time; beyond it the backlog is stale.
+_MAX_CATCH_UP_SECONDS = 0.1
 _MAX_CONTROL_BYTES = 4096
 _MAX_CONTROL_BUFFER = 64 * 1024
 _RTP_STATS_INTERVAL_SECONDS = 2.0
@@ -115,12 +118,21 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
             if self.readyState != "live":
                 raise _stack.streams.MediaStreamError
             now = time.monotonic()
-            if self._next_at is not None:
-                await asyncio.sleep(max(0, self._next_at - now))
+            if self._next_at is None:
+                self._next_at = now
+            else:
+                # Fixed 20 ms cadence from the previous slot, not from the wake-up time:
+                # re-anchoring on every wake lost each frame's sleep overshoot and
+                # encode time, so a busy loop sent ~33 frames/s and the modem queue
+                # overflowed (11-03 device call: choppy caller audio). Short stalls
+                # are caught up; a long stall re-anchors instead of bursting stale audio.
+                self._next_at += _FRAME_SECONDS
+                if self._next_at < now - _MAX_CATCH_UP_SECONDS:
+                    self._next_at = now
+                elif self._next_at > now:
+                    await asyncio.sleep(self._next_at - now)
             if self.readyState != "live":
                 raise _stack.streams.MediaStreamError
-            # Do not burst stale frames after an event-loop stall.
-            self._next_at = time.monotonic() + 0.02
             try:
                 pcm = apply_pcm_gain(source.get_nowait(), gain)
                 self.stats.add(pcm)
