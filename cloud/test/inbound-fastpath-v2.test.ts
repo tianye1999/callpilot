@@ -123,6 +123,28 @@ const clientRtpStats = { type: "client_rtp_stats", v: 1, seq: 1, elapsedMs: 0,
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); databases.splice(0).forEach(db => db.close()); });
 
 describe("direct inbound fastpath V2", () => {
+  it("reports answered elsewhere for late ICE and claim instead of generic failure", async () => {
+    const f = await fixture();
+    f.env.INBOUND_MULTI_DEVICE_STOP_ENABLED = "true";
+    f.db.prepare("UPDATE inbound_offers SET status='claimed', claimed_device_id=? WHERE offer_id=?").run(other, offer);
+    for (const [path, body] of [[icePath, {}], [claimPath, { offerId: offer, sdpOffer: sdp }],
+      [claimPath, { offerId: offer, sdpOffer: sdp, mediaTransport: "webrtc" }]] as const) {
+      const response = await f.request(path, body);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: { code: "OFFER_ANSWERED_ELSEWHERE" } });
+    }
+  });
+  it("reports owner decline for racing ICE and direct or legacy claim", async () => {
+    const f = await fixture();
+    f.env.INBOUND_OWNER_DECLINE_ENABLED = "true";
+    f.db.prepare("UPDATE inbound_offers SET status='revoked', error_code='OWNER_DECLINED' WHERE offer_id=?").run(offer);
+    for (const [path, body] of [[icePath, {}], [claimPath, { offerId: offer, sdpOffer: sdp, mediaTransport: "webrtc" }],
+      [claimPath, { offerId: offer }]] as const) {
+      const response = await f.request(path, body);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: { code: "OFFER_OWNER_DECLINED" } });
+    }
+  });
   it.each(["claim", "sdp", "fallback"])("uses the minted token expiry after ringing expires: %s", async phase => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const origin = 1_800_000_000_123;

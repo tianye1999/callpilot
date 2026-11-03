@@ -262,6 +262,13 @@ class CloudEdgeClient:
         if command["type"] == "data.request":
             self._handle_data_request(command, send)
             return
+        if command["type"] == "inbound.owner_declined":
+            session = getattr(self.service, "session", None)
+            if session is not None and (session.owner_declined(command)
+                                        or command["generation"] < session._session_generation
+                                        or not session.is_active):
+                send(json.dumps({**command, "type": "inbound.owner_declined.ack"}))
+            return
 
         if command["type"] == "inbound.offer.pushed":
             pushed = getattr(self.service, "inbound_offer_pushed", None)
@@ -626,6 +633,8 @@ class CloudEdgeClient:
                 **({"inboundPreconnectV1": True} if config.get_bool("INBOUND_PRECONNECT_ENABLED")
                    and not config.get_bool("INBOUND_FASTPATH_V2_ENABLED") else {}),
                 **({"inboundFastpathV2": True} if config.get_bool("INBOUND_FASTPATH_V2_ENABLED") else {}),
+                **({"ownerDecline": True} if config.get_bool("INBOUND_OWNER_DECLINE_ENABLED") else {}),
+                **({"multiDeviceStop": True} if config.get_bool("INBOUND_MULTI_DEVICE_STOP_ENABLED") else {}),
             },
         }
         return json.dumps(payload, separators=(",", ":"))
@@ -662,6 +671,14 @@ def _parse_cloud_command(raw: str) -> dict[str, Any]:
         return value
     if command_type == "session.start":
         return _validate_session_command(value)
+    if command_type == "inbound.owner_declined":
+        if (set(value) != {"v", "type", "offerId", "callId", "generation", "nonce"}
+                or value.get("v") != 1 or type(value.get("generation")) is not int
+                or value["generation"] < 0 or not isinstance(value.get("nonce"), str)
+                or not 16 <= len(value["nonce"]) <= 128
+                or not _valid_id(value.get("offerId"), "offer") or not _valid_id(value.get("callId"), "call")):
+            raise ValueError("invalid owner decline")
+        return value
     if command_type == "inbound.claim":
         return _validate_inbound_claim(value)
     if command_type == "inbound.media.sdp":

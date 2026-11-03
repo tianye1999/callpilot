@@ -4511,7 +4511,7 @@ async function loadConfig() {
     for (const c of cfgSpecs) {
       const g = cfgGroup(c.key);
       const row = el("div", "cfg-row");
-      const label = el("label", "", cfgLabel(c));
+      const label = el("label", "", c.key === "INBOUND_PHONE_FIRST_ENABLED" ? "来电模式" : cfgLabel(c));
       if (c.requires_restart) label.appendChild(el("span", "tag-restart", t("tag_restart")));
       label.appendChild(el("span", "key", c.key));
       if (c.key === "SMS_EMAIL_FORWARD_ENABLED") {
@@ -4542,6 +4542,20 @@ async function loadConfig() {
           ctrl = el("span", "tag-secret" + (c.value === "已设置" ? " set" : ""), c.value === "已设置" ? t("secret_set") : t("secret_unset"));
         }
         row.appendChild(ctrl);
+      } else if (c.key === "INBOUND_PHONE_FIRST_ENABLED") {
+        const choices = el("div", "");
+        choices.style.cssText = "display:flex;flex-direction:column;gap:8px;max-width:100%";
+        ctrl = document.createElement("input");
+        ctrl.type = "hidden"; ctrl.value = boolChecked(c.value) ? "true" : "false"; ctrl.dataset.key = c.key;
+        choices.appendChild(ctrl);
+        for (const [value, text] of [["true", "先响我，没接再给 AI"], ["false", "AI 先筛，重要的转给我"]]) {
+          const option = document.createElement("label");
+          const radio = document.createElement("input"); radio.type = "radio"; radio.name = "inboundMode";
+          radio.value = value; radio.checked = ctrl.value === value; radio.disabled = !c.editable;
+          radio.addEventListener("change", () => { ctrl.value = value; });
+          option.append(radio, document.createTextNode(text)); choices.appendChild(option);
+        }
+        row.appendChild(choices);
       } else if (c.kind === "bool") {
         const sw = el("label", "switch");
         ctrl = document.createElement("input");
@@ -4652,7 +4666,7 @@ $("configSave").addEventListener("click", async () => {
       if (val) updates[c.key] = val;
       continue;
     }
-    const val = c.kind === "bool" ? (ctrl.checked ? "true" : "false") : ctrl.value;
+    const val = c.kind === "bool" && c.key !== "INBOUND_PHONE_FIRST_ENABLED" ? (ctrl.checked ? "true" : "false") : ctrl.value;
     const orig = c.kind === "bool" ? (boolChecked(c.value) ? "true" : "false") : String(c.value);
     if (val !== orig) updates[c.key] = val;
   }
@@ -4668,7 +4682,7 @@ $("configSave").addEventListener("click", async () => {
       cfgDirty = false;
       // 含「需重启」项且当前无通话：自动重启服务应用（通话中则留待用户手动，不打断）。
       if (res.requires_restart.length && !callActive) restartService();
-      else loadConfig();
+      else await loadConfig();
       loadRemoteDialerStatus();
     } else setToast("configToast", "err", t("cfg_savefail") + (res.error || ""));
   } catch (err) { setToast("configToast", "err", t("req_error")); }

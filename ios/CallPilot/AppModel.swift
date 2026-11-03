@@ -1,11 +1,52 @@
 import Foundation
 import Combine
+import UIKit
 
 /// App 状态中枢:配对、线路状态轮询、来电 offer 轮询、通话状态机。
 /// 对齐 Android CallManager + MainActivity 的组合职责。
 /// 媒体会话(LiveKit)由 CallMediaSession 承担;本类只驱动状态与协议。
 @MainActor
 final class AppModel: ObservableObject {
+    private var ownerWatches: [String: Task<Void, Never>] = [:]
+    private var ownerDeclines: [String: Task<Void, Never>] = [:]
+
+    private func watchOwnerDecision(_ offer: InboundOffer) {
+        guard ownerWatches[offer.offerId] == nil, let client else { return }
+        ownerWatches[offer.offerId] = Task { [weak self] in
+            let background = UIApplication.shared.beginBackgroundTask(withName: "incoming-owner-state") { [weak self] in
+                Task { @MainActor in self?.ownerWatches[offer.offerId]?.cancel() }
+            }
+            defer {
+                if background != .invalid { UIApplication.shared.endBackgroundTask(background) }
+                if self?.client === client { self?.ownerWatches.removeValue(forKey: offer.offerId) }
+            }
+            var rulesReady = false
+            while !Task.isCancelled && Int64(Date().timeIntervalSince1970 * 1000) < offer.expiresAt {
+                do {
+                    if !rulesReady {
+                        let status = try await client.deviceStatus()
+                        guard status.multiDeviceStop || status.ownerDecline else { return }
+                        rulesReady = true
+                    }
+                    let state = try await client.inboundOwnerAction(offerId: offer.offerId, action: "watch")
+                    guard !Task.isCancelled, self?.client === client else { return }
+                    if state == "claimed" { return }
+                    if state != "offered" {
+                        guard let self else { return }
+                        callKit.finishOwnerDecision(offerId: offer.offerId, state: state)
+                        dismissedOffers.insert(offer.offerId)
+                        if incomingOffer?.offerId == offer.offerId { incomingOffer = nil }
+                        if silentIncoming?.offer.offerId == offer.offerId { closeSilentIncoming() }
+                        if callKitOfferId == offer.offerId { media?.finishOwnerDecision(state) }
+                        return
+                    }
+                } catch {
+                    if Task.isCancelled { return }
+                    try? await Task.sleep(for: .seconds(1)) // Reconnect pacing only.
+                }
+            }
+        }
+    }
     @Published var pairing: StoredPairing?
     @Published var selectedTab: MainTab = .dial
     @Published private(set) var alertRouteID: UUID?
@@ -65,6 +106,10 @@ final class AppModel: ObservableObject {
     }
 
     private func rebuildClient() {
+        for task in ownerWatches.values { task.cancel() }
+        ownerWatches.removeAll()
+        for task in ownerDeclines.values { task.cancel() }
+        ownerDeclines.removeAll()
         resetDeviceStatus()
         guard let p = pairing else {
             claimPrewarmer.clear()
@@ -179,13 +224,15 @@ final class AppModel: ObservableObject {
                     }
                     callKit.reconcile(
                         openOffers: offers,
-                        nowUnixMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                        nowUnixMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                        watchedOfferIds: Set(ownerWatches.keys)
                     )
                     if callState == .idle, let offer = offers.first(where: {
                         !dismissedOffers.contains($0.offerId)
                             && $0.expiresAt > Int64(Date().timeIntervalSince1970 * 1000)
                     }) {
                         incomingOffer = offer
+                        watchOwnerDecision(offer)
                     } else if callState == .idle {
                         incomingOffer = nil
                     }
@@ -236,7 +283,9 @@ final class AppModel: ObservableObject {
         if silentIncoming?.offer.offerId == offer.offerId { closeSilentIncoming() }
         dismissedOffers.insert(offer.offerId)
         incomingOffer = nil
-        Task { _ = await callKit.requestEndIfManaged(offer) }
+        Task {
+            if !((await callKit.requestEndIfManaged(offer))) { callKitDidRequestDecline(offer) }
+        }
     }
 
     // MARK: - 外呼(US-2)
@@ -468,7 +517,10 @@ final class AppModel: ObservableObject {
         case .failed:
             callKit.finishActiveCall(reason: .failed)
         case let .ended(_, reason):
-            if reason != "local_hangup" { callKit.finishActiveCall(reason: .remoteEnded) }
+            if reason != "local_hangup" {
+                callKit.finishActiveCall(reason: reason == L10n.text("call.answered_elsewhere")
+                    ? .answeredElsewhere : reason == L10n.text("call.owner_declined") ? .declinedElsewhere : .remoteEnded)
+            }
         case .idle, .preparing, .waitingMedia, .dialing, .inCall:
             break
         }
@@ -502,6 +554,7 @@ extension AppModel: CallKitCoordinatorDelegate {
     }
 
     func callKitDidReceiveOffer(_ offer: InboundOffer) {
+        watchOwnerDecision(offer)
         // A background CallKit hangup leaves the result unacknowledged.
         dismissCallResult()
         guard callKitCanAcceptIncomingCall,
@@ -551,6 +604,30 @@ extension AppModel: CallKitCoordinatorDelegate {
     }
 
     func callKitDidRequestDecline(_ offer: InboundOffer) {
+        if let client, ownerDeclines[offer.offerId] == nil {
+            ownerDeclines[offer.offerId] = Task { [weak self] in
+                let background = UIApplication.shared.beginBackgroundTask(withName: "owner-decline") { [weak self] in
+                    Task { @MainActor in self?.ownerDeclines[offer.offerId]?.cancel() }
+                }
+                defer {
+                    if background != .invalid { UIApplication.shared.endBackgroundTask(background) }
+                    if self?.client === client { self?.ownerDeclines.removeValue(forKey: offer.offerId) }
+                }
+                // The server owns the feature gate; a cached false must not discard an explicit decline.
+                for _ in 0..<3 {
+                    guard !Task.isCancelled else { return }
+                    do { _ = try await client.inboundOwnerAction(offerId: offer.offerId, action: "decline"); break }
+                    catch let error as HostedCloudError where error.statusCode == 409 || error.statusCode == 404 { break }
+                    catch { continue }
+                }
+            }
+        }
+        if silentIncoming?.offer.offerId == offer.offerId { closeSilentIncoming() }
+        dismissedOffers.insert(offer.offerId)
+        if incomingOffer?.offerId == offer.offerId { incomingOffer = nil }
+    }
+
+    func callKitDidDismissOffer(_ offer: InboundOffer) {
         if silentIncoming?.offer.offerId == offer.offerId { closeSilentIncoming() }
         dismissedOffers.insert(offer.offerId)
         if incomingOffer?.offerId == offer.offerId { incomingOffer = nil }

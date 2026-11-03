@@ -100,6 +100,57 @@ async function roomFixture() {
   return { ...f, room, socket, state, message };
 }
 
+describe("owner product decisions", () => {
+  it("declines atomically, wakes every watch, replays idempotently and clears delivery on fenced ack", async () => {
+    const f = await roomFixture();
+    f.env.INBOUND_OWNER_DECLINE_ENABLED = "true";
+    f.env.INBOUND_MULTI_DEVICE_STOP_ENABLED = "true";
+    await f.state.storage.put("presence", { connected: true, ownerDecline: true });
+    const action = (kind: string, id = device) => f.room.fetch(new Request("https://edge-room/owner-action", {
+      method: "POST", body: JSON.stringify({ action: kind, offerId: offer, edgeId: edge, deviceId: id })
+    }));
+    const watch = action("watch", "device_otherabcdefg");
+    expect((await action("decline")).status).toBe(200);
+    expect(await (await watch).json()).toEqual({ state: "owner_declined" });
+    expect((await action("decline")).status).toBe(200);
+    expect(f.db.prepare("SELECT status,error_code FROM inbound_offers").get())
+      .toMatchObject({ status: "revoked", error_code: "OWNER_DECLINED" });
+    const command = JSON.parse(f.socket.send.mock.calls.find(([raw]) => JSON.parse(raw).type === "inbound.owner_declined")![0]);
+    await f.message({ ...command, type: "inbound.owner_declined.ack" });
+    expect(await f.state.storage.get("ownerDeclineAcks")).toContain(offer);
+  });
+
+  it("late subscriber sees the winner and decline cannot revoke a claimed call", async () => {
+    const f = await roomFixture();
+    f.env.INBOUND_MULTI_DEVICE_STOP_ENABLED = f.env.INBOUND_OWNER_DECLINE_ENABLED = "true";
+    await f.state.storage.put("presence", { connected: true, ownerDecline: true });
+    f.db.prepare("UPDATE inbound_offers SET status='claimed',claimed_device_id=? WHERE offer_id=?").run(device, offer);
+    const action = (kind: string) => f.room.fetch(new Request("https://edge-room/owner-action", {
+      method: "POST", body: JSON.stringify({ action: kind, offerId: offer, edgeId: edge, deviceId: "device_otherabcdefg" }) }));
+    expect(await (await action("watch")).json()).toEqual({ state: "answered_elsewhere" });
+    expect((await action("decline")).status).toBe(409);
+    expect(f.db.prepare("SELECT status FROM inbound_offers").get()?.status).toBe("claimed");
+  });
+
+  it("recovers a committed decline after send failure and DO recreation without an outbox", async () => {
+    const f = await roomFixture();
+    f.env.INBOUND_OWNER_DECLINE_ENABLED = "true";
+    await f.state.storage.put("presence", { connected: true, ownerDecline: true });
+    const request = () => new Request("https://edge-room/owner-action", { method: "POST",
+      body: JSON.stringify({ action: "decline", offerId: offer, edgeId: edge, deviceId: device }) });
+    f.socket.send.mockImplementationOnce(() => { throw new Error("socket closed"); });
+    const watch = f.room.fetch(new Request("https://edge-room/owner-action", { method: "POST",
+      body: JSON.stringify({ action: "watch", offerId: offer, edgeId: edge, deviceId: "device_otherabcdefg" }) }));
+    expect((await f.room.fetch(request())).status).toBe(200);
+    expect(await (await watch).json()).toEqual({ state: "owner_declined" });
+    expect(f.db.prepare("SELECT error_code FROM inbound_offers").get()?.error_code).toBe("OWNER_DECLINED");
+    const replacement = new EdgeRoom(f.state as unknown as DurableObjectState, f.env);
+    expect((await replacement.fetch(request())).status).toBe(200);
+    expect(f.socket.send.mock.calls.map(([raw]) => JSON.parse(raw))).toContainEqual(
+      expect.objectContaining({ type: "inbound.owner_declined", offerId: offer }));
+  });
+});
+
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); databases.splice(0).forEach(db => db.close()); });
 
 describe("inbound preconnect", () => {

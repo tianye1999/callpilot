@@ -81,8 +81,11 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         let silent = preconnect.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
         let direct = features?["inboundFastpathV2"] as? NSNumber
         let v2 = direct.map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
-        return HostedDeviceStatus(connected: connected, modemOnline: modemOnline, claimPrewarm: enabled,
+        var status = HostedDeviceStatus(connected: connected, modemOnline: modemOnline, claimPrewarm: enabled,
                                   preconnect: silent, inboundFastpathV2: v2)
+        status.multiDeviceStop = features?["multiDeviceStop"] as? Bool == true
+        status.ownerDecline = features?["ownerDecline"] as? Bool == true
+        return status
     }
 
     func prewarmClaimConnection() async {
@@ -130,6 +133,12 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     }
 
     // MARK: - 外呼会话
+    func inboundOwnerAction(offerId: String, action: String) async throws -> String {
+        guard offerId.wholeMatch(of: Self.offerIdRE) != nil, ["watch", "decline"].contains(action) else { throw CancellationError() }
+        let (payload, _) = try await request("POST", "v1/inbound-offers/\(offerId)/\(action)",
+                                             body: Data("{}".utf8), timeout: action == "decline" ? 4 : 25)
+        return payload["state"] as? String ?? "ended"
+    }
 
     /// 创建云端会话并轮询到 Edge 签发 LiveKit 凭证。号码不进入云 API，
     /// 必须等房间的 media_ready 事件后再经 data topic 发给 Edge。
@@ -493,10 +502,12 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     // MARK: - 内部
 
     private func request(
-        _ method: String, _ path: String, body: Data? = nil, metrics: ClaimNetworkMetrics? = nil
+        _ method: String, _ path: String, body: Data? = nil, metrics: ClaimNetworkMetrics? = nil,
+        timeout: TimeInterval = 60
     ) async throws -> ([String: Any], HTTPURLResponse) {
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = method
+        req.timeoutInterval = timeout
         req.setValue(origin, forHTTPHeaderField: "Origin")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("no-store", forHTTPHeaderField: "Cache-Control")

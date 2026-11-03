@@ -51,6 +51,17 @@ private final class FakeDirectTransport: CallDirectMediaTransport {
 
 @MainActor
 final class CallMediaSessionTests: XCTestCase {
+    func testOwnerDecisionIsEndedRatherThanFailureAndIdempotent() async {
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }))
+        media.finishOwnerDecision("answered_elsewhere")
+        media.finishOwnerDecision("answered_elsewhere")
+        XCTAssertEqual(states.count, 1)
+        guard case let .ended(_, reason) = states[0] else { return XCTFail("must not be a failed call") }
+        XCTAssertEqual(reason, L10n.text("call.answered_elsewhere"))
+        await media.stop()
+    }
     func testEndedNoticeAndMatchingEdgeDepartureTerminateOnlyOnce() async throws {
         for noticeFirst in [false, true] {
             let transport = FakeCallMediaTransport()

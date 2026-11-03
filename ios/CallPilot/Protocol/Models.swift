@@ -74,6 +74,8 @@ struct HostedDeviceStatus: Equatable {
     let claimPrewarm: Bool
     let preconnect: Bool
     let inboundFastpathV2: Bool
+    var multiDeviceStop = false
+    var ownerDecline = false
 
     init(connected: Bool, modemOnline: Bool, claimPrewarm: Bool = false, preconnect: Bool = false,
          inboundFastpathV2: Bool = false) {

@@ -199,3 +199,5 @@
 "push.sms" = "You received a new text message";
 "push.call_digest" = "AI answered a call for you";
 "push.missed_call" = "You have a missed call";
+"call.answered_elsewhere" = "Answered on another device";
+"call.owner_declined" = "AI is handling this call";

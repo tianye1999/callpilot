@@ -25,6 +25,8 @@ def test_phone_first_configuration_defaults_and_example(monkeypatch):
     example = dotenv_values(Path(__file__).parents[2] / ".env.example", encoding="utf-8")
     for key, default in (
         ("INBOUND_PHONE_FIRST_ENABLED", "false"),
+        ("INBOUND_MULTI_DEVICE_STOP_ENABLED", "false"),
+        ("INBOUND_OWNER_DECLINE_ENABLED", "false"),
         ("INBOUND_PRECONNECT_ENABLED", "false"),
         ("INBOUND_EARLY_ANSWER_ENABLED", "false"),
         ("INBOUND_PCM_PRE_ATA_PROBE_ENABLED", "false"),
@@ -55,6 +57,78 @@ def test_unanswered_coordinator_has_no_ai_owner():
     assert router.owner is MediaOwner.NONE
     assert coordinator.rollback_precommit("timeout").accepted
     assert coordinator.state is TakeoverState.AI_ACTIVE
+
+
+def test_phone_first_unanswered_preserves_ai_transfer_but_ai_timeout_consumes_it(rig, monkeypatch):
+    monkeypatch.setenv("INBOUND_TAKEOVER_PREFERENCE", "按来意判断是否需要本人接听")
+    rig.ring()
+    rig.session._initialize_takeover_context("inbound")
+    monkeypatch.setattr(rig.session, "_takeover_endpoint_rejection", lambda: None)
+    assert asyncio.run(rig.session._handle_phone_first(None)) == "ai"
+    assert not rig.session._takeover_attempted
+    assert not rig.session._takeover_ai_fallback
+    assert "owner_takeover_preference" in rig.session._build_agent_instructions("inbound")
+    assert rig.session.begin_owner_takeover()["success"]
+    request = rig.session._takeover_request
+    assert request is not None and not request.phone_first
+    rig.session._expire_takeover(generation=request.generation, now=request.expires_at)
+    assert rig.session.begin_owner_takeover()["code"] == "TAKEOVER_ATTEMPT_EXHAUSTED"
+    assert "owner_takeover_preference" not in rig.session._build_agent_instructions("inbound")
+
+
+@pytest.mark.parametrize("early_answer", [False, True])
+def test_owner_decline_immediately_answers_ai_and_fences_future_takeover(rig, monkeypatch, early_answer):
+    monkeypatch.setenv("INBOUND_OWNER_DECLINE_ENABLED", "true")
+    monkeypatch.setenv("INBOUND_EARLY_ANSWER_ENABLED", str(early_answer).lower())
+    monkeypatch.setenv("INBOUND_TAKEOVER_PREFERENCE", "需要本人接听时转接")
+    agent = FakeAgent()
+    monkeypatch.setattr("agentcall.call_agent.create_agent", lambda provider: agent)
+
+    async def loop(*args):
+        return rig.bridge
+
+    monkeypatch.setattr(rig.session, "_run_agent_loop", loop)
+    rig.ring()
+
+    def decline():
+        request = rig.session._takeover_request
+        assert request is not None
+        command = {"offerId": request.offer_id, "callId": request.call_id,
+                   "generation": request.generation, "nonce": request.nonce}
+        assert not rig.session.owner_declined({**command, "nonce": "wrong-fence"})
+        assert rig.session.owner_declined(command)
+        assert rig.session.owner_declined(command)
+        rig.clock.tick = lambda: None
+
+    rig.clock.tick = decline
+    asyncio.run(rig.session._handle_call())
+    assert rig.commands.count("ATA") == 1
+    assert agent.started and agent.said
+    assert rig.clock.now < 103
+    assert rig.session._request_owner_takeover(rig.session._session_generation)["code"] == "OWNER_DECLINED"
+    assert "request_owner_takeover" not in str(rig.session._build_tools("inbound").specs())
+    assert "owner_takeover_preference" not in rig.session._build_agent_instructions("inbound")
+    assert "不要承诺" in rig.session._build_agent_instructions("inbound")
+
+
+def test_delayed_decline_after_ring_timeout_refreshes_running_ai_policy(rig, monkeypatch):
+    monkeypatch.setenv("INBOUND_OWNER_DECLINE_ENABLED", "true")
+    monkeypatch.setenv("INBOUND_TAKEOVER_PREFERENCE", "需要本人接听时转接")
+    rig.ring()
+    rig.session._initialize_takeover_context("inbound")
+    assert asyncio.run(rig.session._handle_phone_first(None)) == "ai"
+    offer_id, (call_id, generation, nonce) = next(iter(rig.session._owner_offer_fences.items()))
+    def decline_during_preflight():
+        assert rig.session.owner_declined({"offerId": offer_id, "callId": call_id,
+                                           "generation": generation, "nonce": nonce})
+        return None
+
+    result = rig.session._request_owner_takeover(generation, endpoint_check=decline_during_preflight)
+    assert result["code"] == "OWNER_DECLINED"
+    assert rig.session._takeover_resume_pending
+    assert rig.session._takeover_ai_fallback
+    assert "owner_takeover_preference" not in rig.session._build_agent_instructions("inbound")
+    assert rig.session.begin_owner_takeover()["code"] == "OWNER_DECLINED"
 
 
 def test_direct_claim_starts_pcm_without_waiting_for_sdp_and_rejects_postcommit_fallback(rig, monkeypatch):

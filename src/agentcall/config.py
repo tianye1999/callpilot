@@ -247,6 +247,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ),
     ConfigSpec("INBOUND_TAKEOVER_TIMEOUT_SECONDS", "来电真人接管等待时限（秒）", "float", "20"),
     ConfigSpec("INBOUND_PHONE_FIRST_ENABLED", "串口模组来电先响手机（依赖真人接管）", "bool", "false"),
+    ConfigSpec("INBOUND_MULTI_DEVICE_STOP_ENABLED", "多设备认领后同步收铃（实验）", "bool", "false"),
+    ConfigSpec("INBOUND_OWNER_DECLINE_ENABLED", "拒绝后立即由 AI 全权处理（实验）", "bool", "false"),
     ConfigSpec("INBOUND_PRECONNECT_ENABLED", "来电响铃时静默预连媒体房间", "bool", "false"),
     ConfigSpec("INBOUND_FASTPATH_V2_ENABLED", "来电接管 V2 实验路径", "bool", "false"),
     ConfigSpec("INBOUND_PCM_PRE_ATA_PROBE_ENABLED", "响铃期 PCM 诊断探针", "bool", "false"),

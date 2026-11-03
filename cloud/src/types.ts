@@ -1,4 +1,6 @@
 export interface Env {
+  INBOUND_MULTI_DEVICE_STOP_ENABLED?: string;
+  INBOUND_OWNER_DECLINE_ENABLED?: string;
   DB: D1Database;
   EDGE_ROOMS: DurableObjectNamespace;
   ASSETS: Fetcher;
@@ -85,6 +87,8 @@ export interface InboundOfferRecord {
 }
 
 export interface EdgePresence {
+  ownerDecline?: boolean;
+  multiDeviceStop?: boolean;
   connected: boolean;
   lastSeenAt?: number;
   modemOnline?: boolean;

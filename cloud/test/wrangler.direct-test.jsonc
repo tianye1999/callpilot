@@ -18,6 +18,8 @@
     "LIVEKIT_API_KEY": "synthetic-key",
     "LIVEKIT_API_SECRET": "synthetic-local-livekit-signing-key-not-a-secret",
     "INBOUND_FASTPATH_V2_ENABLED": "true",
+    "INBOUND_MULTI_DEVICE_STOP_ENABLED": "true",
+    "INBOUND_OWNER_DECLINE_ENABLED": "true",
     "TURN_KEY_ID": "synthetic-direct-key",
     "TURN_API_TOKEN": "synthetic-local-turn-token-not-a-secret"
   }

@@ -1,4 +1,5 @@
 import { authenticateDevice, authenticateEdge } from "./auth";
+import { inboundOwnerAction, notifyOwnerDecision, rejectOwnerDecision } from "./inbound-owner";
 import { ClaimTiming } from "./claim-timing";
 import { claimInboundFastpathV2, fallbackInboundLivekit, inboundIce, completeInboundSdp, endInboundMedia } from "./inbound-fastpath-v2";
 import { turnConfigured } from "./turn";
@@ -130,6 +131,8 @@ async function route(request: Request, env: Env, requestId: string, timing?: Cla
       : inboundMedia[2] === "media/end" ? endInboundMedia(request, env, inboundMedia[1]!)
       : fallbackInboundLivekit(request, env, inboundMedia[1]!);
   }
+  const ownerAction = path.match(/^\/v1\/inbound-offers\/(offer_[A-Za-z0-9_-]{12,80})\/(watch|decline)$/);
+  if (ownerAction && request.method === "POST") return inboundOwnerAction(request, env, ownerAction[1]!, ownerAction[2]!);
   if (path === "/v1/inbound-offers/prepare" && request.method === "POST") {
     requireSameOrigin(request, env.PUBLIC_ORIGIN);
     const device = await timing!.measure("auth", () => authenticateDevice(request, env, ctx));
@@ -299,11 +302,15 @@ async function claimPairing(request: Request, env: Env): Promise<Response> {
 async function getDevice(request: Request, env: Env): Promise<Response> {
   const v2 = env.INBOUND_FASTPATH_V2_ENABLED === "true";
   const features = { claimPrewarm: env.CLAIM_PREWARM_ENABLED === "true", preconnect: !v2 && env.INBOUND_PRECONNECT_ENABLED === "true",
+    ...(env.INBOUND_MULTI_DEVICE_STOP_ENABLED === "true" ? { multiDeviceStop: false } : {}),
+    ...(env.INBOUND_OWNER_DECLINE_ENABLED === "true" ? { ownerDecline: false } : {}),
     ...(v2 ? { inboundFastpathV2: false } : {}) };
   try {
     const device = await authenticateDevice(request, env);
     const response = await edgeRoom(env, device.edge_id).fetch("https://edge-room/presence");
     const presence = await response.json() as EdgePresence;
+    if (env.INBOUND_OWNER_DECLINE_ENABLED === "true") features.ownerDecline = presence.ownerDecline === true;
+    if (env.INBOUND_MULTI_DEVICE_STOP_ENABLED === "true") features.multiDeviceStop = presence.multiDeviceStop === true;
     if (v2) features.inboundFastpathV2 = turnConfigured(env) && presence.connected && presence.inboundFastpathV2 === true;
     return json({
       ok: true,
@@ -554,6 +561,7 @@ async function claimInboundOffer(request: Request, env: Env, timing: ClaimTiming
     } else await operation;
   };
   if (!offer) {
+    await rejectOwnerDecision(env, device.edge_id, input.offerId, device.device_id);
     const existing = !fast || await timing.measure("offer_read", () => env.DB.prepare(
       "SELECT offer_id FROM inbound_offers WHERE offer_id = ?1 AND edge_id = ?2"
     ).bind(input.offerId, device.edge_id).first());
@@ -562,6 +570,10 @@ async function claimInboundOffer(request: Request, env: Env, timing: ClaimTiming
     throw new HttpError("OFFER_UNAVAILABLE", "Offer already claimed, expired or revoked", 409);
   }
 
+  if (env.INBOUND_MULTI_DEVICE_STOP_ENABLED === "true" || env.INBOUND_OWNER_DECLINE_ENABLED === "true") {
+    const decision = notifyOwnerDecision(env, device.edge_id, input.offerId);
+    if (ctx) ctx.waitUntil(decision); else await decision;
+  }
   // Past the atomic UPDATE the row is 'claimed'; any failure below must mark it
   // failed instead of stranding an unclaimable row.
   try {

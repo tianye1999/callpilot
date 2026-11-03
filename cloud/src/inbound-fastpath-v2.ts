@@ -2,6 +2,7 @@ import { authenticateDevice } from "./auth";
 import { ClaimTiming } from "./claim-timing";
 import { HttpError, json, readJson, requireSameOrigin } from "./http";
 import { invalidateCandidatesStatement } from "./inbound-preconnect";
+import { notifyOwnerDecision, rejectOwnerDecision } from "./inbound-owner";
 import { issueParticipantToken, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS } from "./livekit";
 import { claimInboundOfferSchema, inboundAnswerSchema, inboundFallbackSchema, inboundSdpSchema } from "./schemas";
 import { cookieCredential, randomId, sha256 } from "./security";
@@ -22,7 +23,10 @@ export async function inboundIce(request: Request, env: Env, offerId: string, ct
     AND ((status = 'offered' AND expires_at > ?3) OR (status IN ('claimed', 'edge_ready')
       AND claimed_device_id = ?4 AND media_transport IN ('direct_pending', 'direct')))`)
     .bind(offerId, device.edge_id, Date.now(), device.device_id).first<InboundOfferRecord>();
-  if (!offer) throw unavailable();
+  if (!offer) {
+    await rejectOwnerDecision(env, device.edge_id, offerId, device.device_id);
+    throw unavailable();
+  }
   if (!["direct_eligible", "direct_pending", "direct"].includes(offer.media_transport ?? "")) {
     throw new HttpError("DIRECT_UNAVAILABLE", "Direct media is not available", 503);
   }
@@ -56,9 +60,10 @@ export async function claimInboundFastpathV2(request: Request, env: Env, timing:
       AND edge_id = (SELECT edge_id FROM devices WHERE device_id = ?2 AND secret_hash = ?8 AND revoked_at IS NULL)
     RETURNING *`).bind(claimId, deviceId, now, room, phone, edgeIdentity, input.offerId, hash).first<InboundOfferRecord>());
   if (!offer) {
-    const valid = await env.DB.prepare(`SELECT device_id FROM devices WHERE device_id = ?1 AND secret_hash = ?2 AND revoked_at IS NULL`)
-      .bind(deviceId, hash).first();
+    const valid = await env.DB.prepare(`SELECT edge_id FROM devices WHERE device_id = ?1 AND secret_hash = ?2 AND revoked_at IS NULL`)
+      .bind(deviceId, hash).first<{edge_id: string}>();
     if (!valid) throw unauthorized();
+    await rejectOwnerDecision(env, valid.edge_id, input.offerId, deviceId);
     const ineligible = await env.DB.prepare(`SELECT offer_id FROM inbound_offers WHERE offer_id = ?1
       AND status = 'offered' AND expires_at > ?2 AND media_transport IS NULL
       AND edge_id = (SELECT edge_id FROM devices WHERE device_id = ?3 AND secret_hash = ?4 AND revoked_at IS NULL)`)
@@ -67,6 +72,10 @@ export async function claimInboundFastpathV2(request: Request, env: Env, timing:
     throw unavailable();
   }
   timing.tagClaim(claimId);
+  if (env.INBOUND_MULTI_DEVICE_STOP_ENABLED === "true" || env.INBOUND_OWNER_DECLINE_ENABLED === "true") {
+    const decision = notifyOwnerDecision(env, offer.edge_id, offer.offer_id);
+    if (ctx) ctx.waitUntil(decision); else await decision;
+  }
   try {
     const expiresAt = tokenExpiryBeforeMint();
     const [edgeToken, phoneToken] = await Promise.all([

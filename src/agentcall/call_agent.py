@@ -393,6 +393,8 @@ class CallSession:
         self._takeover_ai_fallback_notified = False
         self._takeover_resuming = False
         self._takeover_direct_precommit = False
+        self._owner_declined = False
+        self._owner_offer_fences: dict[str, tuple[str, int, str]] = {}
         self._takeover_started_at: float | None = None
         self._takeover_deadline: float | None = None
         self._triage_judge: InboundTriageJudge | None = None
@@ -2053,6 +2055,30 @@ class CallSession:
         threading.Thread(target=self._probe_pcm_pre_ata, args=(request.generation, lease, record),
                          name="pcm-pre-ata-probe", daemon=True).start()
 
+    def owner_declined(self, command: dict[str, Any]) -> bool:
+        with self._takeover_lock:
+            fence = (command["callId"], command["generation"], command["nonce"])
+            if (not config.get_bool("INBOUND_OWNER_DECLINE_ENABLED") or not self.is_active
+                    or command["generation"] != self._session_generation
+                    or self._owner_offer_fences.get(command["offerId"]) != fence):
+                return False
+            if self._owner_declined:
+                return True
+            if self.takeover_state in {TakeoverState.MOBILE_ACTIVE, TakeoverState.MOBILE_RECONNECTING}:
+                return False
+            self._owner_declined = True
+            self._triage_mode = "off"
+            self._triage_pending = self._triage_terminal = False
+            if self._record is not None:
+                self._record.log_event("owner_declined")
+            if self._takeover_request is None:
+                # A persisted decline may arrive after the ring timeout and AI startup.
+                self._takeover_ai_fallback = True
+                self._takeover_resume_pending = True
+            elif not self._takeover_request.phone_first:
+                self._finish_takeover_precommit("OWNER_DECLINED", generation=self._session_generation)
+            return True
+
     def _probe_pcm_pre_ata(self, generation: int, lease: IncomingReservation, record: CallRecord | None) -> None:
         if not config.get_bool("INBOUND_PCM_PRE_ATA_PROBE_ENABLED") or not isinstance(self.modem, Sim7600Modem):
             return
@@ -2144,6 +2170,7 @@ class CallSession:
         )
         with self._takeover_lock:
             self._takeover_request = request
+            self._owner_offer_fences[request.offer_id] = (request.call_id, request.generation, request.nonce)
             self._phone_first_offer_id = request.offer_id
             self._takeover_started_at = self._phone_first_clock()
             self._takeover_attempted = True
@@ -2157,6 +2184,9 @@ class CallSession:
             record.log_event("phone_first_ringing", generation=generation)
         claimed: InboundTakeoverSession | None = None
         while current():
+            if self._owner_declined:
+                self._phone_first_fallback("OWNER_DECLINED", generation)
+                return "ai"
             if preconnect.task is not None and (fastpath_v2 or not config.get_bool("INBOUND_PRECONNECT_ENABLED")):
                 await preconnect.close()
             # A claim and the timeout compete under the same lock. Once claimed,
@@ -3114,6 +3144,7 @@ class CallSession:
             and not isinstance(self.modem, BluetoothModem)
             and config.get_bool("INBOUND_TAKEOVER_ENABLED")
             and self._triage_mode == "off"
+            and not self._owner_declined
         ):
             registry.register(
                 REQUEST_OWNER_TAKEOVER_SPEC,
@@ -3192,7 +3223,7 @@ class CallSession:
         self, direction: str, record: CallRecord | None
     ) -> None:
         self._stop_triage_judge(join_timeout=0.0)
-        mode = config.get_str("INBOUND_TRIAGE_MODE").strip().lower()
+        mode = "off" if self._owner_declined else config.get_str("INBOUND_TRIAGE_MODE").strip().lower()
         if isinstance(self.modem, BluetoothModem):
             if mode != "off":
                 logger.info("Bluetooth inbound policy overrides INBOUND_TRIAGE_MODE; triage disabled")
@@ -3431,7 +3462,7 @@ class CallSession:
                     "call_id": self._record.id if self._record is not None else None,
                     **fields,
                 })
-        triage_mode = self._triage_mode if direction == "inbound" else "off"
+        triage_mode = self._triage_mode if direction == "inbound" and not self._owner_declined else "off"
         if not getattr(self.modem, "supports_sms", True):
             note = (
                 "This Bluetooth HFP line cannot send or receive SMS or read verification codes. "
@@ -3445,6 +3476,7 @@ class CallSession:
             and config.get_bool("INBOUND_TAKEOVER_ENABLED")
             and triage_mode == "off"
             and not self._takeover_ai_fallback
+            and not self._owner_declined
             else None
         )
         return build_instructions(
@@ -4659,6 +4691,8 @@ class CallSession:
             return coordinator.active_fence if coordinator is not None else None
 
     def _initialize_takeover_context(self, direction: str) -> None:
+        self._owner_declined = False
+        self._owner_offer_fences = {}
         self._mobile_timing = None
         with self._takeover_lock:
             self._takeover_offer_queue = Queue(maxsize=1)
@@ -4789,6 +4823,10 @@ class CallSession:
             self._takeover_hold_done = True
             self._takeover_ai_fallback = True
             self._takeover_resume_pending = True
+            # Unanswered initial ringing is not the AI's one transfer attempt (#131).
+            if request.phone_first and reason == "OWNER_TIMEOUT" and not self._owner_declined:
+                self._takeover_attempted = False
+                self._takeover_ai_fallback = False
             self._triage_terminal = False
             self._triage_pending = False
             self._clear_outgoing_audio()
@@ -4855,6 +4893,8 @@ class CallSession:
         bypass_enabled: bool = False,
         endpoint_check: Callable[[], str | None] | None = None,
     ) -> dict:
+        if self._owner_declined:
+            return {"success": False, "code": "OWNER_DECLINED", "message": "机主已将本通交由 AI 处理"}
         if isinstance(self.modem, BluetoothModem):
             return {"success": False, "code": "TAKEOVER_UNSUPPORTED",
                     "message": "蓝牙线路不支持 App 接管，请在手机上切回听筒"}
@@ -4880,6 +4920,8 @@ class CallSession:
         # Keychain/Credential Manager can block; never hold the media fence lock during I/O.
         endpoint_reason = (endpoint_check or self._takeover_endpoint_rejection)()
         with self._takeover_lock:
+            if self._owner_declined:
+                return {"success": False, "code": "OWNER_DECLINED", "message": "机主已将本通交由 AI 处理"}
             if not self._agent_generation_current(generation):
                 return {
                     "success": False, "code": "STALE_AGENT_GENERATION",
@@ -4923,6 +4965,7 @@ class CallSession:
                 expires_at=created_at + timeout,
             )
             self._takeover_request = request
+            self._owner_offer_fences[request.offer_id] = (request.call_id, request.generation, request.nonce)
             self._takeover_hold_generation = generation
             self._takeover_hold_done = False
             self._takeover_hold_audio_at = None

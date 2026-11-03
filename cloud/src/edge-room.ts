@@ -62,6 +62,62 @@ interface WarmInboundIce {
 }
 
 export class EdgeRoom extends DurableObject<Env> {
+  private ownerWatches = new Map<string, { offerId: string; wake: () => void }>();
+
+  private async ownerState(offerId: string, edgeId: string, deviceId: string): Promise<string> {
+    const row = await this.env.DB.prepare("SELECT status, claimed_device_id, error_code, expires_at FROM inbound_offers WHERE offer_id = ?1 AND edge_id = ?2")
+      .bind(offerId, edgeId).first<{ status: string; claimed_device_id: string | null; error_code: string | null; expires_at: number }>();
+    if (!row) return "ended";
+    if (row.error_code === "OWNER_DECLINED") return "owner_declined";
+    if (["claimed", "edge_ready"].includes(row.status)) return row.claimed_device_id === deviceId
+      || this.env.INBOUND_MULTI_DEVICE_STOP_ENABLED !== "true" ? "claimed" : "answered_elsewhere";
+    return row.status === "offered" && row.expires_at > Date.now() ? "offered" : "ended";
+  }
+
+  private wakeOwners(offerId: string): void {
+    for (const watch of this.ownerWatches.values()) if (watch.offerId === offerId) watch.wake();
+  }
+
+  private async ownerAction(request: Request): Promise<Response> {
+    const { offerId, action, edgeId, deviceId } = await request.json() as { offerId: string; action: string; edgeId: string; deviceId: string };
+    if (action === "decline") {
+      const presence = await this.ctx.storage.get<EdgePresence>("presence");
+      if (this.env.INBOUND_OWNER_DECLINE_ENABLED !== "true" || !presence?.ownerDecline)
+        return Response.json({ error: "FEATURE_DISABLED" }, { status: 409 });
+      const row = await this.env.DB.prepare(`UPDATE inbound_offers SET status='revoked', error_code='OWNER_DECLINED', updated_at=?1
+        WHERE offer_id=?2 AND edge_id=?3 AND status='offered' AND expires_at>?1 RETURNING *`)
+        .bind(Date.now(), offerId, edgeId).first<{ call_id: string; generation: number; nonce: string }>();
+      const state = await this.ownerState(offerId, edgeId, deviceId);
+      if (state === "owner_declined") {
+        const decision = row ?? await this.env.DB.prepare(`SELECT call_id,generation,nonce FROM inbound_offers
+          WHERE offer_id=?1 AND edge_id=?2 AND error_code='OWNER_DECLINED'`)
+          .bind(offerId, edgeId).first<{call_id: string; generation: number; nonce: string}>();
+        this.wakeOwners(offerId);
+        try {
+          if (decision) this.currentConnection()?.send(JSON.stringify({ v: 1, type: "inbound.owner_declined", offerId,
+            callId: decision.call_id, generation: decision.generation, nonce: decision.nonce }));
+        } catch { /* Persisted decision is retried on heartbeat, independent of phone notification. */ }
+      }
+      return Response.json({ state }, { status: state === "owner_declined" ? 200 : 409 });
+    }
+    const key = `${offerId}/${deviceId}`;
+    this.ownerWatches.get(key)?.wake();
+    let wake!: () => void;
+    const changed = new Promise<void>(resolve => { wake = resolve; });
+    const watch = { offerId, wake };
+    this.ownerWatches.set(key, watch);
+    // Register before reading D1 so a CAS notification cannot fall in a gap.
+    const timer = setTimeout(wake, 20_000); // HTTP lifecycle ceiling, not routing policy.
+    try {
+      const state = await this.ownerState(offerId, edgeId, deviceId);
+      if (state !== "offered") return Response.json({ state });
+      await changed;
+      return Response.json({ state: await this.ownerState(offerId, edgeId, deviceId) });
+    } finally {
+      clearTimeout(timer);
+      if (this.ownerWatches.get(key) === watch) this.ownerWatches.delete(key);
+    }
+  }
   private readonly pendingRelays = new Map<string, PendingRelay>();
   private readonly pendingMediaRelays = new Map<string, PendingMediaRelay>();
   private mediaDispatchTail: Promise<void> = Promise.resolve();
@@ -76,6 +132,12 @@ export class EdgeRoom extends DurableObject<Env> {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/owner-action" && request.method === "POST") return this.ownerAction(request);
+    if (url.pathname === "/owner-decision" && request.method === "POST") {
+      const { offerId } = await request.json() as { offerId: string };
+      this.wakeOwners(offerId);
+      return Response.json({ ok: true });
+    }
     if (url.pathname === "/connect") return this.acceptConnection(request);
     if (url.pathname === "/presence" && request.method === "GET") return this.presence();
     if (url.pathname === "/command" && request.method === "POST") return this.sendCommand(request);
@@ -301,6 +363,19 @@ export class EdgeRoom extends DurableObject<Env> {
       ws.close(1007, "Invalid JSON");
       return;
     }
+    const ownerAck = parsed as Record<string, unknown> | null;
+    if (ownerAck?.type === "inbound.owner_declined.ack" && typeof ownerAck.offerId === "string") {
+      if (this.currentConnection() !== ws) return;
+      const saved = await this.env.DB.prepare(`SELECT call_id,generation,nonce FROM inbound_offers
+        WHERE offer_id=?1 AND edge_id=?2 AND error_code='OWNER_DECLINED'`)
+        .bind(ownerAck.offerId, (ws.deserializeAttachment() as SocketAttachment).edgeId)
+        .first<{call_id: string; generation: number; nonce: string}>();
+      if (saved && saved.call_id === ownerAck.callId && saved.generation === ownerAck.generation && saved.nonce === ownerAck.nonce) {
+        const acked = await this.ctx.storage.get<string[]>("ownerDeclineAcks") ?? [];
+        await this.ctx.storage.put("ownerDeclineAcks", [...acked.filter(id => id !== ownerAck.offerId), ownerAck.offerId].slice(-16));
+      }
+      return;
+    }
     const result = edgeMessageSchema.safeParse(parsed);
     if (!result.success) {
       ws.send(JSON.stringify({ v: 1, type: "error", code: "INVALID_MESSAGE" }));
@@ -332,6 +407,15 @@ export class EdgeRoom extends DurableObject<Env> {
       return;
     }
     if (result.data.type === "heartbeat") {
+      if (this.env.INBOUND_OWNER_DECLINE_ENABLED === "true") {
+        const pending = await this.env.DB.prepare(`SELECT offer_id,call_id,generation,nonce FROM inbound_offers
+          WHERE edge_id=?1 AND error_code='OWNER_DECLINED' ORDER BY updated_at DESC LIMIT 16`)
+          .bind(attachment.edgeId).all<{offer_id: string; call_id: string; generation: number; nonce: string}>();
+        const acked = await this.ctx.storage.get<string[]>("ownerDeclineAcks") ?? [];
+        for (const row of pending.results) if (!acked.includes(row.offer_id))
+          ws.send(JSON.stringify({ v: 1, type: "inbound.owner_declined", offerId: row.offer_id,
+            callId: row.call_id, generation: row.generation, nonce: row.nonce }));
+      }
       const startedAt = Date.now();
       const newWake = this.lastSeenAttemptAt === undefined;
       let storageMs: number | null = null;
@@ -343,7 +427,9 @@ export class EdgeRoom extends DurableObject<Env> {
         lineBusy: result.data.status.lineBusy,
         version: result.data.status.version,
         inboundPreconnectV1: result.data.status.inboundPreconnectV1 === true,
-        inboundFastpathV2: result.data.status.inboundFastpathV2 === true
+        inboundFastpathV2: result.data.status.inboundFastpathV2 === true,
+        ...(result.data.status.ownerDecline ? { ownerDecline: true } : {}),
+        ...(result.data.status.multiDeviceStop ? { multiDeviceStop: true } : {})
       };
       try {
         await Promise.all([
@@ -377,6 +463,14 @@ export class EdgeRoom extends DurableObject<Env> {
       return;
     }
     if (result.data.type === "inbound.offer") {
+      if (this.env.INBOUND_OWNER_DECLINE_ENABLED === "true") {
+        const declined = await this.env.DB.prepare(`SELECT offer_id FROM inbound_offers WHERE edge_id=?1
+          AND call_id=?2 AND generation=?3 AND error_code='OWNER_DECLINED' LIMIT 1`)
+          .bind(attachment.edgeId, result.data.callId, result.data.generation).first();
+        if (declined) {
+          return;
+        }
+      }
       // Offers are insert-once; a duplicate offerId from a reconnect replay is
       // ignored rather than resurrecting a consumed offer.
       const callUUID = crypto.randomUUID();

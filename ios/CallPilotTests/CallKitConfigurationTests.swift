@@ -2,6 +2,26 @@ import Foundation
 import XCTest
 
 final class CallKitConfigurationTests: XCTestCase {
+    func testRemoteAndExpiredCallCleanupCannotSendOwnerDecline() throws {
+        let source = try String(contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/CallKitCoordinator.swift"), encoding: .utf8)
+        let cleanup = try section(source, from: "private func finish(callUUID", to: "private func pendingOrActiveCallUUID")
+        XCTAssertFalse(cleanup.contains("callKitDidRequestDecline"))
+        let explicit = try section(source, from: "perform action: CXEndCallAction", to: "didActivate audioSession")
+        XCTAssertTrue(explicit.contains("callKitDidRequestDecline"))
+        XCTAssertTrue(source.contains(".answeredElsewhere"))
+        XCTAssertTrue(source.contains(".declinedElsewhere"))
+        XCTAssertTrue(source.contains(".union(watchedOfferIds)"))
+        let model = try String(contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8)
+        let watch = try section(model, from: "private func watchOwnerDecision", to: "@Published var pairing")
+        try assertBefore("while !Task.isCancelled", "try await client.deviceStatus()", in: watch)
+        let card = try section(model, from: "func dismissOffer", to: "// MARK: - 外呼")
+        XCTAssertTrue(card.contains("callKitDidRequestDecline(offer)"))
+        let decline = try section(model, from: "func callKitDidRequestDecline", to: "func callKitDidDismissOffer")
+        XCTAssertFalse(decline.contains("status?.ownerDecline"))
+        XCTAssertTrue(decline.contains("beginBackgroundTask"))
+        XCTAssertTrue(decline.contains("ownerDeclines[offer.offerId]?.cancel()"))
+        XCTAssertTrue(decline.contains("guard !Task.isCancelled"))
+    }
     func testIncomingPushPreparesAudioBeforeReportingWithoutActorHop() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/Call/CallKitCoordinator.swift"), encoding: .utf8)
         let report = try section(source, from: "private func report(", to: "private func scheduleExpiration")
@@ -160,7 +180,7 @@ final class CallKitConfigurationTests: XCTestCase {
             contentsOf: repositoryRoot.appendingPathComponent("ios/project.yml"), encoding: .utf8
         )
         XCTAssertTrue(project.contains("MARKETING_VERSION: \"0.7.5\""))
-        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"19\""))
+        XCTAssertTrue(project.contains("CURRENT_PROJECT_VERSION: \"20\""))
         XCTAssertTrue(project.contains("PRODUCT_BUNDLE_IDENTIFIER: ai.bondings.callpilot.sim\n"))
         XCTAssertTrue(project.contains("name: CallPilot\n"))
         XCTAssertTrue(project.contains("DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}"))

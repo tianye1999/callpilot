@@ -269,7 +269,8 @@ async def eventually(predicate, *, timeout: float = 15) -> None:
 
 
 async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel_before_sdp: bool = False,
-              cancel_during_ice: bool = False, no_audio: str | None = None, transfer: bool = False) -> dict:
+              cancel_during_ice: bool = False, no_audio: str | None = None, transfer: bool = False,
+              owner_decline: bool = False, multi_device: bool = False) -> dict:
     timeline = Timeline()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as http:
         async def request(method: str, path: str, body=None, headers=None, expected=200):
@@ -299,6 +300,12 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
             "code": pairing["code"], "displayName": "Synthetic Phone",
         }, {"Origin": ORIGIN}, 201)
         phone_headers = {"Cookie": headers["Set-Cookie"].split(";", 1)[0], "Origin": ORIGIN}
+        other_headers = None
+        if multi_device:
+            second, _ = await request("POST", path, {"ttlSeconds": 300}, credentials.headers("POST", path), 201)
+            _, second_response = await request("POST", "/v1/pairing-sessions/claim", {
+                "code": second["code"], "displayName": "Synthetic Other Phone"}, {"Origin": ORIGIN}, 201)
+            other_headers = {"Cookie": second_response["Set-Cookie"].split(";", 1)[0], "Origin": ORIGIN}
         timeline.mark("enrolled_and_paired")
 
         modem = SyntheticSim7600(timeline)
@@ -375,7 +382,7 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
         def no_ai(*_args, **_kwargs):
             nonlocal ai_attempts
             ai_attempts += 1
-            if no_audio is not None or transfer:
+            if no_audio is not None or transfer or owner_decline:
                 return ai
             raise AssertionError("AI_MUST_NOT_START_FOR_OWNER_CLAIM")
 
@@ -415,6 +422,31 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
                         await asyncio.sleep(0.02)
                 offer_id = offers["offers"][0]["offerId"]
                 timeline.mark("phone_offer_received")
+                other_watch = (asyncio.create_task(request(
+                    "POST", f"/v1/inbound-offers/{offer_id}/watch", {}, other_headers))
+                               if multi_device else None)
+                if owner_decline:
+                    record_path = session._record.path
+                    timeline.mark("phone_decline")
+                    answer, _ = await request("POST", f"/v1/inbound-offers/{offer_id}/decline", {}, phone_headers)
+                    assert answer["state"] == "owner_declined"
+                    if other_watch is not None:
+                        decision, _ = await asyncio.wait_for(other_watch, 5)
+                        assert decision["state"] == "owner_declined"
+                        timeline.mark("other_phone_stopped_ringing")
+                    await asyncio.wait_for(ai_spoke.wait(), 5)
+                    elapsed = timeline.marks["ai_spoke"] - timeline.marks["phone_decline"]
+                    assert elapsed < 5000, "DECLINE_MUST_NOT_WAIT_FOR_RING_EXPIRY"
+                    assert session._request_owner_takeover(session._session_generation)["code"] == "OWNER_DECLINED"
+                    assert session._owner_declined and ai.started
+                    session.stop()
+                    await asyncio.wait_for(call_task, 10)
+                    recorded = [json.loads(line) for line in (record_path / "events.jsonl").read_text().splitlines()]
+                    assert sum(event["type"] == "owner_declined" for event in recorded) == 1
+                    return {"type": "inbound_direct_e2e", "status": "passed", "signaling": "owner_declined",
+                            "milestones_ms": timeline.marks,
+                            "edge_summary": {"owner_decline_to_ai_ms": round(elapsed, 3)},
+                            "ata_count": modem.commands.count("ATA"), "pcm_prepare_count": modem.commands.count("PCM")}
                 ice, _ = await request("POST", f"/v1/inbound-offers/{offer_id}/ice", {}, phone_headers)
                 timeline.mark("phone_ice_received")
                 phone = RTCPeerConnection(ice_servers_config(ice["iceServers"]))
@@ -469,6 +501,10 @@ async def run(base: str, *, record_dir: Path, deferred_sdp: bool = False, cancel
                 claim, response_headers = await request("POST", "/v1/inbound-offers/claim",
                                                         claim_body, phone_headers, 202)
                 timeline.mark("phone_claim_response")
+                if other_watch is not None:
+                    decision, _ = await asyncio.wait_for(other_watch, 5)
+                    assert decision["state"] == "answered_elsewhere"
+                    timeline.mark("other_phone_stopped_ringing")
                 record_path = session._record.path
                 for item in response_headers.get("Server-Timing", "").split(","):
                     name, _, value = item.strip().partition(";dur=")
@@ -724,6 +760,8 @@ def main() -> None:
     parser.add_argument("--no-audio", choices=("fallback", "ai"),
                         help="Connect without audio capture, then follow or ignore media_failed")
     parser.add_argument("--transfer", action="store_true", help="Start AI first, then request owner takeover")
+    parser.add_argument("--owner-decline", action="store_true")
+    parser.add_argument("--multi-device", action="store_true")
     args = parser.parse_args()
     if args.cancel_during_ice and (args.deferred_sdp or args.cancel_before_sdp):
         parser.error("--cancel-during-ice is an independent inline SDP mode")
@@ -748,7 +786,8 @@ def main() -> None:
         asyncio.get_running_loop().set_exception_handler(lambda _loop, _context: failures.append("asyncio"))
         result = await run(base, record_dir=Path(records), deferred_sdp=args.deferred_sdp or args.cancel_before_sdp,
                            cancel_before_sdp=args.cancel_before_sdp, cancel_during_ice=args.cancel_during_ice,
-                           no_audio=args.no_audio, transfer=args.transfer)
+                           no_audio=args.no_audio, transfer=args.transfer,
+                           owner_decline=args.owner_decline, multi_device=args.multi_device)
         # Assert before asyncio.run cancels remaining tasks: teardown itself must retire retries.
         for transaction in transactions:
             assert getattr(transaction, "_Transaction__future").done(), "ICE_TRANSACTION_LEFT_PENDING"
@@ -758,6 +797,7 @@ def main() -> None:
         result["ai_transfer"] = args.transfer
         return result
     environment = {"INBOUND_FASTPATH_V2_ENABLED": "true", "INBOUND_PRECONNECT_ENABLED": "false",
+                   "INBOUND_OWNER_DECLINE_ENABLED": "true", "INBOUND_MULTI_DEVICE_STOP_ENABLED": "true",
                    "INBOUND_PHONE_FIRST_ENABLED": "true", "INBOUND_TAKEOVER_ENABLED": "true",
                    "REMOTE_WEB_DIALER_ENABLED": "true", "REMOTE_CLOUD_ENABLED": "true",
                    "RECORDING_ENABLED": "false",

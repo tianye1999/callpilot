@@ -199,3 +199,5 @@
 "push.sms" = "收到一条新短信";
 "push.call_digest" = "AI 帮你接了一通电话";
 "push.missed_call" = "有一通未接来电";
+"call.answered_elsewhere" = "已在其他设备接听";
+"call.owner_declined" = "已交给 AI 处理";

@@ -11,11 +11,16 @@ protocol CallKitCoordinatorDelegate: AnyObject {
     func callKitDidReceiveOffer(_ offer: InboundOffer)
     func callKitDidRequestAnswer(_ offer: InboundOffer)
     func callKitDidRequestDecline(_ offer: InboundOffer)
+    func callKitDidDismissOffer(_ offer: InboundOffer)
     func callKitDidRequestHangup(offerId: String)
     func callKitPrepareToAnswer(offerId: String) throws
     func callKitDidActivateAudio(offerId: String) throws
     func callKitDidFail(offerId: String, code: String)
     func callKitAudioStopper(offerId: String) -> () -> Void
+}
+
+extension CallKitCoordinatorDelegate {
+    func callKitDidDismissOffer(_ offer: InboundOffer) {}
 }
 
 @MainActor
@@ -147,9 +152,15 @@ final class CallKitCoordinator: NSObject {
         finish(callUUID: id, reason: .remoteEnded)
     }
 
-    func reconcile(openOffers: [InboundOffer], nowUnixMs: Int64) {
+    func finishOwnerDecision(offerId: String, state: String) {
+        guard let id = calls.callUUID(offerId: offerId), calls.phase(callUUID: id) != .active else { return }
+        finish(callUUID: id, reason: state == "answered_elsewhere" ? .answeredElsewhere :
+            state == "owner_declined" ? .declinedElsewhere : .remoteEnded)
+    }
+
+    func reconcile(openOffers: [InboundOffer], nowUnixMs: Int64, watchedOfferIds: Set<String> = []) {
         let stale = calls.reconcile(
-            openOfferIds: Set(openOffers.map(\.offerId)),
+            openOfferIds: Set(openOffers.map(\.offerId)).union(watchedOfferIds),
             nowUnixMs: nowUnixMs
         )
         for callUUID in stale {
@@ -227,11 +238,8 @@ final class CallKitCoordinator: NSObject {
             provider.reportCall(with: callUUID, endedAt: Date(), reason: reason)
         }
         if phase == .ringing {
-            delegate?.callKitDidRequestDecline(InboundOffer(
-                offerId: payload.offerId,
-                callUUID: payload.callUUID,
-                expiresAt: payload.expiresAtUnixMs
-            ))
+            delegate?.callKitDidDismissOffer(InboundOffer(offerId: payload.offerId,
+                callUUID: payload.callUUID, expiresAt: payload.expiresAtUnixMs))
         }
     }
 

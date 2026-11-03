@@ -373,7 +373,8 @@ def _build_zh(
         "垫话、等待和转接由系统处理。请求未成功时继续帮助来电者，了解并记录来意和口信。"
         "不要在工具参数或话语中复述偏好、分类或推理。\n"
         if preference
-        else ""
+        else "本通当前没有可用的真人转接能力。由你继续处理并记录来意；"
+        "不要承诺联系、通知或接通机主等当前工具无法完成的行动。\n"
     )
     triage_rules = (
         "分诊等待态（最高优先级）：系统正在独立判断如何处理本通来电。"
@@ -620,7 +621,9 @@ def _build_en(
         "If it does not succeed, continue helping the caller and record their purpose and message. Never repeat the "
         "preference, categories, or reasoning in tool arguments or speech.\n"
         if preference
-        else ""
+        else "No live owner transfer capability is available for this call. Continue handling it and record "
+        "the caller's purpose; do not promise actions such as contacting or connecting the owner "
+        "that the available tools cannot perform.\n"
     )
     triage_rules = (
         "TRIAGE_PENDING (highest priority): the system independently decides how "

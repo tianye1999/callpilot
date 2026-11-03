@@ -135,6 +135,8 @@ export const edgeMessageSchema = z.union([
       lineBusy: z.boolean(),
       inboundPreconnectV1: z.boolean().optional(),
       inboundFastpathV2: z.boolean().optional(),
+      ownerDecline: z.boolean().optional(),
+      multiDeviceStop: z.boolean().optional(),
       version: z.string().max(64).optional()
     }).strict()
   }).strict(),

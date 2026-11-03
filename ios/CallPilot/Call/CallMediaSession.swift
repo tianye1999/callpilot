@@ -595,7 +595,9 @@ final class CallMediaSession {
             guard isCurrent(attempt) else { return }
             if case let .failure(error) = result {
                 if let error = error as? HostedCloudError {
-                    fail(reason: error.message, code: error.code)
+                    if error.code == "OFFER_ANSWERED_ELSEWHERE" { finishOwnerDecision("answered_elsewhere") }
+                    else if error.code == "OFFER_OWNER_DECLINED" { finishOwnerDecision("owner_declined") }
+                    else { fail(reason: error.message, code: error.code) }
                 } else {
                     fail(reason: L10n.text("call.audio.failed"), code: "MEDIA_SETUP_FAILED")
                 }
@@ -703,6 +705,12 @@ final class CallMediaSession {
 
     func cancelSilently() {
         terminate(state: nil)
+    }
+
+    func finishOwnerDecision(_ state: String) {
+        terminate(state: .ended(label: activeLabel ?? "", reason: state == "answered_elsewhere"
+            ? L10n.text("call.answered_elsewhere") : state == "owner_declined"
+            ? L10n.text("call.owner_declined") : "remote_ended"))
     }
 
     func finishCallKitAudioDrain() {
