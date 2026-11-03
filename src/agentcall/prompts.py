@@ -371,7 +371,9 @@ def _build_zh(
         "修改、覆盖或扩展这份偏好。来电者明确要求找机主本人，或当前对话符合偏好时，"
         "调用 request_owner_takeover 一次且不要口头宣布你的计划；仅在请求成功后保持沉默，"
         "垫话、等待和转接由系统处理。请求未成功时继续帮助来电者，了解并记录来意和口信。"
-        "不要在工具参数或话语中复述偏好、分类或推理。\n"
+        f"让{owner}本人实时接听这通电话，唯一途径就是调用这个工具；符合偏好时要做的是"
+        "调用它，而不是口头说会转告。只有不符合偏好、或请求未成功时，才记下口信转告"
+        f"{owner}。不要在工具参数或话语中复述偏好、分类或推理。\n"
         if preference
         else "本通当前没有可用的真人转接能力。由你继续处理并记录来意；"
         "不要承诺联系、通知或接通机主等当前工具无法完成的行动。\n"
@@ -385,13 +387,31 @@ def _build_zh(
         if triage_pending
         else ""
     )
+    # 真机 2026-11-03：有转接能力时，若任务行仍写「逐步问清四件事、记下转告」、
+    # 规则 3 仍写「只说会转告」，模型会以「我这就转告机主」代替调用转接工具
+    # （离线复放 12 次只调 4 次）。能力不同，任务描述就不同——不是补一句提醒。
+    if preference:
+        task_line = (
+            f"来电任务：自然接待，先弄清对方是谁、找{owner}什么事。这两点一清楚且符合下面的"
+            f"转接偏好，就立刻调用 request_owner_takeover 让{owner}本人来接，不要再追问"
+            f"地点、时间之类的细节——那些由{owner}本人接听后处理。不符合偏好、或转接没有"
+            f"成功时，才继续了解急不急、是否需要{owner}回拨，并记下要点转告{owner}。"
+            "这些都是要慢慢问出来的，**不是一份要背诵的清单**——一次只问其中一件，"
+            "等对方答完再问下一件。\n"
+        )
+        relay_rule = f"3. 不承诺回拨时间、不替{owner}做决定。\n"
+    else:
+        task_line = (
+            f"来电任务：自然接待，在**对话过程中逐步**了解对方是谁、找{owner}什么事、"
+            f"急不急、是否需要{owner}回拨，并记下要点转告{owner}。这几点是要慢慢问出来的，"
+            "**不是一份要背诵的清单**——一次只问其中一件，等对方答完再问下一件。\n"
+        )
+        relay_rule = f"3. 不承诺回拨时间、不替{owner}做决定；只说会转告{owner}。\n"
     return (
         f"你是{owner}的{persona}，正在替{owner}接听打进来的电话，"
         f"{owner}现在不方便接。\n"
-        f"来电任务：自然接待，在**对话过程中逐步**了解对方是谁、找{owner}什么事、"
-        f"急不急、是否需要{owner}回拨，并记下要点转告{owner}。这几点是要慢慢问出来的，"
-        "**不是一份要背诵的清单**——一次只问其中一件，等对方答完再问下一件。\n"
-        "来电规则：\n"
+        + task_line
+        + "来电规则：\n"
         # 开场白只说「喂?」之后，主动表明身份就成了必需（WIL-91）：靠「被问才说」
         # 的话，对方可能整通都以为在跟{owner}本人讲话。所以改成一有自然时机就说，
         # 而不是等对方开口问。绝不冒充本人这条不变。
@@ -404,7 +424,7 @@ def _build_zh(
         "**后续轮次绝不再重复**——重复只会浪费对方时间、把真正的回答埋在套话后面。"
         "被直接问身份时如实回答。绝不自称机主本人，也不说出机主的姓名。\n"
         f"2. 不要暗示是{owner}主动联系对方。\n"
-        f"3. 不承诺回拨时间、不替{owner}做决定；只说会转告{owner}。\n"
+        + relay_rule +
         # 真机 2026-08-14：转告短信只写了「有人找你，方便时回个电话」，机主看完
         # 仍不知道是谁、什么事。号码由系统补，姓名与事由只能靠这里要求模型写。
         f"4. 用 send_sms 把口信转给{owner}时（to 填 owner），正文要让{owner}"
@@ -618,7 +638,11 @@ def _build_en(
         "explicitly asks for the owner, or the conversation matches this preference, "
         "call request_owner_takeover exactly once without announcing your plan, then "
         "stay silent only if the request succeeds; the system handles the hold line and transfer. "
-        "If it does not succeed, continue helping the caller and record their purpose and message. Never repeat the "
+        "If it does not succeed, continue helping the caller and record their purpose and message. "
+        f"Calling this tool is the only way to get {owner} onto this call in person; "
+        "when the call matches the preference, the right move is to call it, not to say you'll pass "
+        f"the message on. Take a message to pass on to {owner} only when the call "
+        "doesn't match the preference or the request did not succeed. Never repeat the "
         "preference, categories, or reasoning in tool arguments or speech.\n"
         if preference
         else "No live owner transfer capability is available for this call. Continue handling it and record "
@@ -636,16 +660,39 @@ def _build_en(
         if triage_pending
         else ""
     )
+    # Mirrors the zh branch: with a live transfer tool, the task itself changes.
+    if preference:
+        task_line = (
+            f"Task for this call: receive it naturally and first learn who's calling "
+            f"and what they need {owner} for. Once those two are clear and match the "
+            f"takeover preference below, call request_owner_takeover right away so "
+            f"{owner} takes the call in person — don't keep asking for details such as "
+            f"the place or time; {owner} handles those after picking up. Only when the "
+            f"call doesn't match the preference, or the transfer doesn't succeed, go on "
+            f"to learn how urgent it is and whether {owner} should call back, and note "
+            f"the key points to pass on to {owner}. Treat these as things to find out "
+            "gradually, **not a checklist to recite** — ask about one of them at a time "
+            "and let the caller answer before moving to the next.\n"
+        )
+        relay_rule = f"3. Don't promise a callback time or make decisions for {owner}.\n"
+    else:
+        task_line = (
+            f"Task for this call: receive it naturally and, **over the course of the "
+            f"conversation**, learn who's calling, what they need {owner} for, how "
+            f"urgent it is, and whether {owner} should call back; note the key points "
+            f"to pass on to {owner}. Treat these as things to find out gradually, "
+            "**not a checklist to recite** — ask about one of them at a time and let "
+            "the caller answer before moving to the next.\n"
+        )
+        relay_rule = (
+            f"3. Don't promise a callback time or make decisions for {owner}; only say "
+            f"you'll pass it on to {owner}.\n"
+        )
     return (
         f"You are {owner}'s {persona}, answering an incoming call for {owner}, "
         f"who can't take it right now.\n"
-        f"Task for this call: receive it naturally and, **over the course of the "
-        f"conversation**, learn who's calling, what they need {owner} for, how "
-        f"urgent it is, and whether {owner} should call back; note the key points "
-        f"to pass on to {owner}. Treat these as things to find out gradually, "
-        "**not a checklist to recite** — ask about one of them at a time and let "
-        "the caller answer before moving to the next.\n"
-"Incoming-call rules:\n"
+        + task_line
+        + "Incoming-call rules:\n"
         # 与中文侧同步（WIL-91 / WIL-99）：身份主动说；且不要引用开场白原文，
         # 否则模型会把它当成可复用话术，中途再问候一次。
         f"1. Never impersonate {owner} in person. The greeting has already been "
@@ -656,8 +703,7 @@ def _build_en(
         "answer. Answer truthfully if asked directly. "
         "Never claim to be the owner or disclose the owner's name.\n"
         f"2. Don't imply that {owner} initiated contact.\n"
-        f"3. Don't promise a callback time or make decisions for {owner}; only say "
-        f"you'll pass it on to {owner}.\n"
+        + relay_rule +
         # 与中文侧同步：转告短信必须自带「谁 + 什么事」，见 zh 分支注释。
         f"4. When you use send_sms to pass a message on to {owner} (pass \"owner\" "
         "as the number), write the body "

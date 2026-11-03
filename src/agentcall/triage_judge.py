@@ -7,8 +7,9 @@ import math
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, Iterator, Literal, cast
 
 from .prompt_gen import call_text_model, select_text_model, text_backend_for_agent
 
@@ -136,6 +137,41 @@ class TriageVerdictConsumer:
     def rollback_terminal(self) -> None:
         """Re-open policy after a pre-commit orchestration failure."""
         self._terminal = False
+
+
+class TakeoverBackstopPolicy(TriageVerdictConsumer):
+    """Transfer-only policy for the judge that runs beside a free-speaking AI.
+
+    Triage is off: the conversational model keeps its own transfer tool and
+    speaks freely. Verdicts still flow through the control loop's single commit
+    point, but only a fenced transfer at or above the threshold becomes an
+    action; reject/clarify/continue verdicts are observations and never
+    restrict the AI.
+    """
+
+    def __init__(self, *, transfer_threshold: float = 0.7) -> None:
+        super().__init__(transfer_threshold=transfer_threshold)
+        self._fired = False
+
+    def consume(
+        self, verdict: TriageVerdict, *, current_generation: int
+    ) -> TriageConsumption:
+        if self._fired:
+            return TriageConsumption("ignored", verdict, "backstop_fired")
+        if verdict.call_generation != current_generation:
+            return TriageConsumption("ignored", verdict, "stale_generation")
+        if verdict.turn_id <= self._last_turn_id:
+            return TriageConsumption("ignored", verdict, "stale_turn")
+        self._last_turn_id = verdict.turn_id
+        if verdict.action == "transfer" and verdict.confidence >= self._transfer_threshold:
+            self._fired = True
+            return TriageConsumption("transfer", verdict, "threshold_met")
+        return TriageConsumption("observe", verdict, "backstop_observe")
+
+    def rollback_terminal(self) -> None:
+        """Re-open after the orchestrator refused or skipped the request (never after success)."""
+        self._fired = False
+
 
 
 def parse_triage_verdict(text: str) -> TriageVerdict:
@@ -300,6 +336,18 @@ class InboundTriageJudge:
             self._deadline = time.monotonic() + self._debounce_seconds
             self._condition.notify_all()
             return self._caller_turn_id
+
+    def is_current(self, turn_id: int) -> bool:
+        """True while this judge runs and no newer caller turn has been finalized."""
+        with self._condition:
+            return self._running and turn_id == self._caller_turn_id
+
+    @contextmanager
+    def hold_if_current(self, turn_id: int) -> Iterator[bool]:
+        """Hold the judge lock around a commit so stop()/submit_turn() cannot slip in between
+        the currency check and the action; yields False once stopped or superseded."""
+        with self._condition:
+            yield self._running and turn_id == self._caller_turn_id
 
     def stop(self, *, join_timeout: float = 0.2) -> None:
         with self._condition:

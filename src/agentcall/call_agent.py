@@ -99,6 +99,7 @@ from .takeover_coordinator import (
 )
 from .triage_judge import (
     InboundTriageJudge,
+    TakeoverBackstopPolicy,
     TriageConsumption,
     TriageVerdict,
     TriageVerdictConsumer,
@@ -378,6 +379,10 @@ class CallSession:
         self._takeover_lock = threading.RLock()
         self._takeover_coordinator: InboundTakeoverCoordinator | None = None
         self._takeover_request: InboundTakeoverOfferRequest | None = None
+        # A late first tool call may acknowledge the one request the backstop judge
+        # sent (bound to that offer id); a second call never does.
+        self._takeover_tool_acknowledged: str | None = None
+        self._takeover_request_trigger: str | None = None
         self._takeover_offer_queue: Queue[InboundTakeoverOfferRequest] = Queue(
             maxsize=1
         )
@@ -398,6 +403,8 @@ class CallSession:
         self._takeover_started_at: float | None = None
         self._takeover_deadline: float | None = None
         self._triage_judge: InboundTriageJudge | None = None
+        # Backstop transfer in flight: verdict, endpoint probe task, started-at.
+        self._backstop_pending: tuple[TriageVerdict, asyncio.Task[str | None], float] | None = None
         self._triage_mode = "off"
         self._triage_results: Queue[TriageVerdict] = Queue(maxsize=4)
         self._triage_consumer = TriageVerdictConsumer()
@@ -868,6 +875,7 @@ class CallSession:
             # 先作废判官世代再 finish record，避免迟到结果在 meta 落盘后追加事件。
             self._stop_dtmf_judge()
             self._stop_triage_judge()
+            await self._drain_backstop_pending()
             self._end_takeover_context("CALL_ENDED")
             mark("ended", status=status)
             if release_report is not None:
@@ -893,9 +901,10 @@ class CallSession:
         *, instructions: str | None = None,
     ) -> None:
         self._start_dtmf_judge(record, session_t0=session_t0)
-        agent.set_session_instructions(
+        session_instructions = (
             instructions if instructions is not None else self._build_agent_instructions(direction)
         )
+        agent.set_session_instructions(session_instructions)
         if isinstance(agent, MossVoiceAgent) and direction == "outbound":
             agent.set_briefing_context(number or "对方", self._outbound_task(agent_language()))
         agent.set_transcript_handler(self._make_transcript_handler(record, transcripts, agent))
@@ -905,6 +914,16 @@ class CallSession:
         with self._dtmf_lock:
             self._active_tools = tools
         agent.set_tools(tools)
+        if record is not None:
+            record.log_event(
+                "agent_session_tools",
+                tools=[str(spec.get("function", {}).get("name", "")) for spec in tools.specs()],
+                takeover_preference="owner_takeover_preference" in session_instructions,
+                takeover_backstop=(
+                    isinstance(self._triage_consumer, TakeoverBackstopPolicy)
+                    and self._triage_judge is not None
+                ),
+            )
         bridge = get_bridge()
         # 非并行路径原先只在 local 指标开启时计写出字节；挂断排空也需要
         # 这个计数，不能把「新音频不断入桥」误当成播放进度。
@@ -3223,6 +3242,7 @@ class CallSession:
         self, direction: str, record: CallRecord | None
     ) -> None:
         self._stop_triage_judge(join_timeout=0.0)
+        self._discard_backstop_pending()
         mode = "off" if self._owner_declined else config.get_str("INBOUND_TRIAGE_MODE").strip().lower()
         if isinstance(self.modem, BluetoothModem):
             if mode != "off":
@@ -3238,14 +3258,22 @@ class CallSession:
         self._triage_terminal = False
         self._triage_reject_deadline = None
         self._triage_clarification_spoken = False
-        if direction != "inbound" or self._triage_mode == "off":
+        if direction != "inbound":
             return
+        backstop = self._triage_mode == "off"
+        if backstop:
+            if not self._takeover_backstop_allowed():
+                return
+            # Same judge, same preference, same control-loop commit point as
+            # enforce mode; only the policy differs (transfer-only, AI speaks freely).
+            self._triage_consumer = TakeoverBackstopPolicy()
+        judge_mode = "backstop" if backstop else self._triage_mode
 
         def on_verdict(verdict: TriageVerdict, latency_ms: float) -> None:
             if record is not None:
                 record.log_event(
                     "inbound_triage_judge",
-                    mode=self._triage_mode,
+                    mode=judge_mode,
                     latency_ms=latency_ms,
                     **verdict.public_fields(),
                 )
@@ -3253,11 +3281,14 @@ class CallSession:
                 {
                     "type": "inbound_triage",
                     "status": "judged",
-                    "mode": self._triage_mode,
+                    "mode": judge_mode,
                     **verdict.public_fields(),
                 }
             )
-            if self._triage_mode != "enforce":
+            if backstop:
+                if self._owner_declined:
+                    return
+            elif self._triage_mode != "enforce":
                 return
             try:
                 self._triage_results.put_nowait(verdict)
@@ -3295,6 +3326,23 @@ class CallSession:
         self._triage_judge = judge
         judge.start()
 
+    def _takeover_backstop_allowed(self) -> bool:
+        """Triage off: an independent judge backs up the model's own transfer tool.
+
+        真机 2026-11-03：先响手机未接后 AI 接起，来电者说「送外卖的到小区门口了
+        需要他下来拿」，对话模型两轮都只口头说「转告机主」而不调用
+        request_owner_takeover（离线复放 12 次只调 4 次）。转接不能只押在
+        对话模型的一次选择上：同一份偏好交给只做判断的判官，判定转接就由控制
+        循环补发请求；判官的其他裁决只记录，不限制 AI 说话。
+        """
+        return (
+            config.get_bool("INBOUND_TAKEOVER_BACKSTOP_ENABLED")
+            and config.get_bool("INBOUND_TAKEOVER_ENABLED")
+            and bool(config.get_str("INBOUND_TAKEOVER_PREFERENCE").strip())
+            and not isinstance(self.modem, BluetoothModem)
+            and not self._owner_declined
+        )
+
     def _stop_triage_judge(self, *, join_timeout: float = 0.2) -> None:
         judge = self._triage_judge
         self._triage_judge = None
@@ -3312,6 +3360,13 @@ class CallSession:
         if self._takeover_ai_fallback:
             return None
         terminal_action: str | None = None
+        if self._backstop_pending is not None:
+            if self._finish_backstop_transfer(generation):
+                terminal_action = "transfer"
+            elif self._backstop_pending is not None:
+                # Probe still running: newer verdicts stay queued and are judged
+                # once it settles, so a superseded attempt never loses them.
+                return terminal_action
         while True:
             try:
                 verdict = self._triage_results.get_nowait()
@@ -3343,6 +3398,14 @@ class CallSession:
                     )
                 continue
             if result.outcome == "transfer":
+                if isinstance(self._triage_consumer, TakeoverBackstopPolicy):
+                    # Two-phase: probe the endpoint off-loop, commit on a later tick.
+                    self._begin_backstop_transfer(result.verdict)
+                    if self._backstop_pending is not None:
+                        # Stop draining now: a verdict for a newer caller turn that lands
+                        # during the probe must wait for it, not be consumed as "fired".
+                        return terminal_action
+                    continue
                 try:
                     endpoint_reason = await asyncio.wait_for(
                         asyncio.to_thread(self._takeover_endpoint_rejection), timeout=1.0
@@ -3409,6 +3472,96 @@ class CallSession:
             logger.warning(
                 "分诊放行: provider 不支持中途更新提示词，AI 仍受限于分诊话术"
             )
+
+    def _backstop_applicable(self, verdict: TriageVerdict) -> InboundTriageJudge | None:
+        """The judge whose live verdict this is, or None when the backstop must stand down."""
+        judge = self._triage_judge
+        if (
+            judge is None
+            or not judge.is_current(verdict.turn_id)
+            or self._takeover_attempted
+            or self._owner_declined
+            or self.takeover_state is not TakeoverState.AI_ACTIVE
+        ):
+            return None
+        return judge
+
+    def _begin_backstop_transfer(self, verdict: TriageVerdict) -> None:
+        """Start the endpoint probe without suspending the audio loop; commit on a later tick."""
+        if self._backstop_pending is not None or self._backstop_applicable(verdict) is None:
+            self._triage_consumer.rollback_terminal()
+            self._log_triage_consumption(
+                TriageConsumption("ignored", verdict, "backstop_not_applicable")
+            )
+            return
+        task = asyncio.create_task(asyncio.to_thread(self._takeover_endpoint_rejection))
+        self._backstop_pending = (verdict, task, time.monotonic())
+
+    def _finish_backstop_transfer(self, generation: int) -> bool:
+        pending = self._backstop_pending
+        if pending is None:
+            return False
+        verdict, task, started = pending
+        if not task.done() and time.monotonic() - started < 1.0:
+            return False
+        self._backstop_pending = None
+        endpoint_reason: str | None = "local_registration_timeout"
+        if task.done():
+            try:
+                endpoint_reason = task.result()
+            except Exception:  # noqa: BLE001 - a failed probe reads as endpoint unavailable
+                endpoint_reason = "local_registration_error"
+        else:
+            task.cancel()
+        if not self._agent_generation_current(generation):
+            return False
+        judge = self._backstop_applicable(verdict)
+        if judge is None:
+            self._triage_consumer.rollback_terminal()
+            self._log_triage_consumption(
+                TriageConsumption("ignored", verdict, "backstop_superseded")
+            )
+            return False
+        # Fence normal output before orchestration; the commit re-validates the verdict
+        # under the judge lock so a stop or newer caller turn cannot slip in.
+        self._triage_terminal = True
+        request = self._request_owner_takeover(
+            generation,
+            trigger="takeover_backstop",
+            endpoint_check=lambda: endpoint_reason,
+            commit_guard=lambda: judge.hold_if_current(verdict.turn_id),
+        )
+        if request.get("success") is True:
+            return True
+        self._triage_terminal = False
+        self._triage_consumer.rollback_terminal()
+        code = str(request.get("code") or "failed").lower()
+        self._log_triage_consumption(TriageConsumption("ignored", verdict, f"backstop_{code}"))
+        return False
+
+    def _discard_backstop_pending(self) -> None:
+        """Drop a probe left by an earlier call without touching its (possibly closed) loop."""
+        pending = self._backstop_pending
+        self._backstop_pending = None
+        if pending is None or pending[1].done():
+            return
+        try:
+            if not pending[1].get_loop().is_closed():
+                pending[1].cancel()
+        except RuntimeError:
+            pass
+
+    async def _drain_backstop_pending(self) -> None:
+        """Cancel and settle the probe inside the call's own loop before that loop closes."""
+        pending = self._backstop_pending
+        self._backstop_pending = None
+        if pending is None:
+            return
+        task = pending[1]
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
     def _log_triage_consumption(self, result: TriageConsumption) -> None:
         record = self._record
@@ -4692,6 +4845,8 @@ class CallSession:
 
     def _initialize_takeover_context(self, direction: str) -> None:
         self._owner_declined = False
+        self._takeover_tool_acknowledged = None
+        self._takeover_request_trigger = None
         self._owner_offer_fences = {}
         self._mobile_timing = None
         with self._takeover_lock:
@@ -4892,6 +5047,7 @@ class CallSession:
         allow_outbound: bool = False,
         bypass_enabled: bool = False,
         endpoint_check: Callable[[], str | None] | None = None,
+        commit_guard: Callable[[], contextlib.AbstractContextManager[bool]] | None = None,
     ) -> dict:
         if self._owner_declined:
             return {"success": False, "code": "OWNER_DECLINED", "message": "机主已将本通交由 AI 处理"}
@@ -4928,6 +5084,28 @@ class CallSession:
                     "message": "当前 Agent 会话已失效",
                 }
             coordinator = self._takeover_coordinator
+            pending = self._takeover_request
+            if (
+                trigger == "agent_tool"
+                and coordinator is not None
+                and pending is not None
+                and pending.generation == coordinator.generation
+                and coordinator.state in (
+                    TakeoverState.TAKEOVER_PREPARING,
+                    TakeoverState.WAITING_OWNER,
+                    TakeoverState.MOBILE_MEDIA_READY,
+                )
+                and self._takeover_request_trigger == "takeover_backstop"
+                and self._takeover_tool_acknowledged != pending.offer_id
+            ):
+                # The backstop judge already sent this exact request and the model
+                # has not been told yet: it asked for what is happening, keep it silent.
+                self._takeover_tool_acknowledged = pending.offer_id
+                return {
+                    "success": True,
+                    "code": "TAKEOVER_REQUESTED",
+                    "message": "真人接管请求已发出",
+                }
             if coordinator is None or coordinator.state is not TakeoverState.AI_ACTIVE or self._takeover_resuming:
                 return {
                     "success": False,
@@ -4945,46 +5123,58 @@ class CallSession:
                     "success": False, "code": code,
                     "message": "机主当前无法接听。继续帮助来电者，了解并记录来意及需转告的信息，不再承诺转接。",
                 }
-            result = coordinator.begin_takeover()
-            if not result.accepted:
-                return {
-                    "success": False,
-                    "code": str(result.code or TakeoverRejection.INVALID_STATE),
-                    "message": "当前通话状态不允许真人接管",
-                }
-            created_at = time.time()
-            timeout = config.get_float("INBOUND_TAKEOVER_TIMEOUT_SECONDS")
-            if not math.isfinite(timeout) or timeout <= 0:
-                timeout = 20.0
-            request = InboundTakeoverOfferRequest(
-                offer_id=f"offer_{secrets.token_urlsafe(18)}",
-                nonce=secrets.token_urlsafe(24),
-                call_id=coordinator.call_id,
-                generation=coordinator.generation,
-                created_at=created_at,
-                expires_at=created_at + timeout,
-            )
-            self._takeover_request = request
-            self._owner_offer_fences[request.offer_id] = (request.call_id, request.generation, request.nonce)
-            self._takeover_hold_generation = generation
-            self._takeover_hold_done = False
-            self._takeover_hold_audio_at = None
-            try:
-                self._takeover_offer_queue.put_nowait(request)
-            except Full:
-                coordinator.rollback_precommit("offer_queue_full")
-                self._takeover_request = None
-                return {
-                    "success": False,
-                    "code": "TAKEOVER_QUEUE_FULL",
-                    "message": "真人接管请求队列繁忙",
-                }
-            self._takeover_attempted = True
-            self._takeover_ai_fallback = False
-            self._takeover_resume_pending = False
-            self._takeover_ai_fallback_notified = False
-            self._takeover_started_at = time.monotonic()
-            self._takeover_deadline = self._takeover_started_at + timeout
+            # The guard (backstop: the judge lock) stays held through the commit, so a
+            # stop or a newer caller turn cannot land between validation and action.
+            with (commit_guard() if commit_guard is not None else contextlib.nullcontext(True)) as live:
+                if not live:
+                    return {
+                        "success": False,
+                        "code": "TAKEOVER_SUPERSEDED",
+                        "message": "裁决已过期，未发起真人接管",
+                    }
+                result = coordinator.begin_takeover()
+                if not result.accepted:
+                    return {
+                        "success": False,
+                        "code": str(result.code or TakeoverRejection.INVALID_STATE),
+                        "message": "当前通话状态不允许真人接管",
+                    }
+                created_at = time.time()
+                timeout = config.get_float("INBOUND_TAKEOVER_TIMEOUT_SECONDS")
+                if not math.isfinite(timeout) or timeout <= 0:
+                    timeout = 20.0
+                request = InboundTakeoverOfferRequest(
+                    offer_id=f"offer_{secrets.token_urlsafe(18)}",
+                    nonce=secrets.token_urlsafe(24),
+                    call_id=coordinator.call_id,
+                    generation=coordinator.generation,
+                    created_at=created_at,
+                    expires_at=created_at + timeout,
+                )
+                self._takeover_request = request
+                self._owner_offer_fences[request.offer_id] = (request.call_id, request.generation, request.nonce)
+                self._takeover_hold_generation = generation
+                self._takeover_hold_done = False
+                self._takeover_hold_audio_at = None
+                try:
+                    self._takeover_offer_queue.put_nowait(request)
+                except Full:
+                    coordinator.rollback_precommit("offer_queue_full")
+                    self._takeover_request = None
+                    return {
+                        "success": False,
+                        "code": "TAKEOVER_QUEUE_FULL",
+                        "message": "真人接管请求队列繁忙",
+                    }
+                self._takeover_attempted = True
+                self._takeover_ai_fallback = False
+                self._takeover_resume_pending = False
+                self._takeover_ai_fallback_notified = False
+                self._takeover_request_trigger = trigger
+                if trigger == "agent_tool":
+                    self._takeover_tool_acknowledged = request.offer_id
+                self._takeover_started_at = time.monotonic()
+                self._takeover_deadline = self._takeover_started_at + timeout
 
         self._clear_outgoing_audio()
         record = self._record
