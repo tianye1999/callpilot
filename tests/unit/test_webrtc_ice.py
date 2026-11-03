@@ -175,9 +175,11 @@ def test_unsupported_aioice_falls_back_without_patching(monkeypatch, caplog):
     async def scenario():
         connection = Connection(ice_controlling=False)
         original = connection.get_component_candidates
+        original_consent = connection.query_consent
         monkeypatch.setattr(webrtc_ice.aioice, "__version__", "99.0.0")
         assert not webrtc_ice.configure_connection(connection)
         assert connection.get_component_candidates == original
+        assert connection.query_consent == original_consent
         assert "unsupported" in caplog.text
         await connection.close()
 

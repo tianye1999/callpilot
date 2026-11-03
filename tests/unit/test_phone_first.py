@@ -274,7 +274,8 @@ def test_direct_media_uses_claim_lease_after_ringing_window(rig, monkeypatch, op
 
 
 @pytest.mark.parametrize("accepted", [False, True])
-def test_cloud_claim_then_immediate_sdp_uses_same_fenced_request(rig, monkeypatch, accepted):
+@pytest.mark.parametrize("setup_yields", [0, 20, 700])
+def test_cloud_claim_then_immediate_sdp_uses_same_fenced_request(rig, monkeypatch, accepted, setup_yields):
     monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
     session = rig.session
     rig.ring()
@@ -282,6 +283,39 @@ def test_cloud_claim_then_immediate_sdp_uses_same_fenced_request(rig, monkeypatc
     client = CloudEdgeClient("https://relay.example.test", rig.service, SimpleNamespace())
     replies = []
     requests = []
+    connected = asyncio.Event()
+    pcm_prepared = asyncio.Event()
+    threaded_call = session._threaded_modem_call
+
+    async def delayed_modem_call(operation, *args):
+        preparing = operation == rig.modem.prepare_reserved_voice
+        if preparing:
+            # 700 polls exhaust the old fake 30 s lease without 30 s of work.
+            for _ in range(setup_yields):
+                await asyncio.sleep(0)
+        result = await threaded_call(operation, *args)
+        if preparing:
+            pcm_prepared.set()
+        return result
+
+    monkeypatch.setattr(session, "_threaded_modem_call", delayed_modem_call)
+
+    async def connect():
+        for _ in range(setup_yields):
+            await asyncio.sleep(0)
+        connected.set()
+
+    rig.endpoint.connect = connect
+
+    async def sleep_after_setup(seconds):
+        # This tests immediate SDP fencing, not setup timeouts. Real executor
+        # work must finish before polling advances the synthetic media lease.
+        # The zero-second post-ATA settle must not wait for its own PCM stage.
+        if requests and seconds > 0:
+            await asyncio.wait_for(asyncio.gather(connected.wait(), pcm_prepared.wait()), 5)
+        await rig.clock.sleep(seconds)
+
+    session._phone_first_sleep = sleep_after_setup
 
     def tick():
         rig.clock.tick = lambda: None
