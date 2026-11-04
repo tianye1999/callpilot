@@ -86,7 +86,10 @@ class CallManager(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val takeoverMediaTimeoutMs: Long = 20_000L,
     private val incomingCallLabel: () -> String = { "Incoming call" },
-    private val takeoverFailureVisibleMs: Long = 2_000L,
+    /** J1：正常结束后自动回拨号页的可见时长。 */
+    private val endedVisibleMs: Long = 3_000L,
+    /** J1：失败结果自动回拨号页的可见时长（比正常结束长，保证原因看得清）。 */
+    private val failedVisibleMs: Long = 6_000L,
     /** 直连（Fastpath V2）会话工厂；为 null 表示本机不支持直连，一律走 LiveKit。 */
     private val directSessionFactory: (() -> DirectCapableSession)? = null,
     private val mediaGatewayFactory: (StoredPairing) -> InboundMediaGateway = { HostedInboundMediaGateway(it) },
@@ -107,6 +110,24 @@ class CallManager(
 
     private val _state = MutableStateFlow<CallState>(CallState.Idle)
     val state: StateFlow<CallState> = _state
+
+    /** J1：结束页倒计时剩余秒数；null 表示无倒计时（空闲/通话中/已取消/立即返回）。 */
+    private val _returnCountdown = MutableStateFlow<Int?>(null)
+    val returnCountdown: StateFlow<Int?> = _returnCountdown
+    private var returnJob: Job? = null
+
+    init {
+        // 终止态由这里统一调度自动返回；非终止态立即取消，避免旧结束页把新通话清掉。
+        this.scope.launch {
+            _state.collect { next ->
+                when (next) {
+                    is CallState.Ended -> scheduleAutoReturn(next, endedVisibleMs)
+                    is CallState.Failed -> scheduleAutoReturn(next, failedVisibleMs)
+                    else -> cancelAutoReturn()
+                }
+            }
+        }
+    }
 
     private var session: RemoteSession? = null
     private var eventJob: Job? = null
@@ -750,7 +771,37 @@ class CallManager(
 
     /** UI 从 Ended/Failed 回到拨号页。 */
     fun reset() {
-        if (!isActive) _state.value = CallState.Idle
+        if (!isActive) {
+            cancelAutoReturn()
+            _state.value = CallState.Idle
+        }
+    }
+
+    /** J1：用户点按/滚动结束页时取消自动返回，把返回时机交还用户。 */
+    fun cancelAutoReturn() {
+        returnJob?.cancel()
+        returnJob = null
+        _returnCountdown.value = null
+    }
+
+    /** J1：终止结果倒计时；仅当仍是同一通结果时才回到 Idle。 */
+    private fun scheduleAutoReturn(terminal: CallState, visibleMs: Long) {
+        returnJob?.cancel()
+        var remaining = ((visibleMs + 999) / 1_000).toInt().coerceAtLeast(1)
+        _returnCountdown.value = remaining
+        returnJob = scope.launch {
+            while (remaining > 0) {
+                delay(1_000)
+                if (_state.value !== terminal) return@launch
+                remaining -= 1
+                if (remaining == 0) {
+                    _returnCountdown.value = null
+                    _state.value = CallState.Idle
+                } else {
+                    _returnCountdown.value = remaining
+                }
+            }
+        }
     }
 
     private fun handleEvent(number: String, event: SessionEvent) {
@@ -894,8 +945,7 @@ class CallManager(
                 } ?: return@launch
 
                 release(captured)
-                delay(takeoverFailureVisibleMs)
-                if (_state.value == failed) _state.value = CallState.Idle
+                // Failed 的自动回 Idle 由 state 收集器按 failedVisibleMs 统一调度。
             }.also { takeoverMediaTimeoutJob = it }
         }
         job.start()

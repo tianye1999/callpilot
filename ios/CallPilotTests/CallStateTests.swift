@@ -220,4 +220,45 @@ final class CallStateTests: XCTestCase {
         XCTAssertFalse(machine.transition(to: .dialing(number: "10086"), for: attempt))
         XCTAssertEqual(machine.state, .ended(label: "10086", reason: "local_hangup"))
     }
+
+    func testCallResultCountdownTicksDownAndCompletes() {
+        var countdown = CallResultCountdown(seconds: 3)
+        XCTAssertEqual(countdown.remaining, 3)
+
+        XCTAssertFalse(countdown.tick())
+        XCTAssertEqual(countdown.remaining, 2)
+        XCTAssertFalse(countdown.tick())
+        XCTAssertEqual(countdown.remaining, 1)
+        XCTAssertTrue(countdown.tick())
+        XCTAssertEqual(countdown.remaining, 0)
+    }
+
+    func testCallResultCountdownCancelStopsTicks() {
+        var countdown = CallResultCountdown(seconds: 6)
+        countdown.cancel()
+        XCTAssertTrue(countdown.cancelled)
+        XCTAssertFalse(countdown.tick())
+        XCTAssertEqual(countdown.remaining, 0)
+    }
+
+    func testIsCurrentTerminalResultFencesOldAttemptAndManualReset() {
+        var machine = CallAttemptStateMachine()
+        let ended = CallState.ended(label: "10086", reason: "remote_hangup")
+        let old = machine.begin(with: ended)
+        XCTAssertTrue(machine.isCurrentTerminalResult(ended, for: old))
+
+        let failed = CallState.failed(label: "10086", reason: "busy", code: "LINE_BUSY")
+        XCTAssertTrue(machine.transition(to: failed, for: old))
+        XCTAssertTrue(machine.isCurrentTerminalResult(failed, for: old))
+        XCTAssertFalse(machine.isCurrentTerminalResult(ended, for: old))
+
+        let next = machine.begin(with: .preparing(label: "10010"))
+        XCTAssertFalse(machine.isCurrentTerminalResult(failed, for: old))
+        XCTAssertFalse(machine.isCurrentTerminalResult(ended, for: old))
+        XCTAssertTrue(machine.isCurrent(next))
+
+        _ = machine.transition(to: .failed(label: "10010", reason: "network", code: nil), for: next)
+        XCTAssertTrue(machine.resetTerminal())
+        XCTAssertFalse(machine.isCurrentTerminalResult(failed, for: old))
+    }
 }

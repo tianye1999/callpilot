@@ -44,6 +44,8 @@
 
 "call.remote_sim_notice" = "Calling through your remote SIM";
 "call.return_to_dialer" = "Return to Keypad";
+"call.returning_in" = "Returning in %d s";
+"call.return_now" = "Return now";
 "call.keypad.show" = "Show keypad";
 "call.keypad.hide" = "Hide keypad";
 "call.speaker.enable" = "Turn on speaker";

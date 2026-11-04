@@ -154,4 +154,6 @@
     <string name="settings_unpair_confirm_title">Unpair from the computer?</string>
     <string name="settings_unpair_confirm_message">This clears local content. You’ll need a new pairing code to use the remote line again.</string>
     <string name="call_hanging_up">Ending call...</string>
+    <string name="call_returning_in">Returning in %1$d s</string>
+    <string name="call_return_now">Return now</string>
 </resources>

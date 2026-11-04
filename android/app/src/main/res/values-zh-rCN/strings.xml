@@ -154,4 +154,6 @@
     <string name="settings_unpair_confirm_title">解除与电脑端的配对？</string>
     <string name="settings_unpair_confirm_message">解除后将清除本机内容，需要重新输入配对码才能使用远程线路。</string>
     <string name="call_hanging_up">正在挂断...</string>
+    <string name="call_returning_in">%1$d 秒后返回</string>
+    <string name="call_return_now">立即返回</string>
 </resources>

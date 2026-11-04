@@ -21,7 +21,12 @@ struct CallView: View {
             Spacer()
 
             if model.callState.isTerminal {
-                Button(L10n.text("call.return_to_dialer")) {
+                if let countdown = model.callResultCountdown {
+                    Text(L10n.format("call.returning_in", countdown))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Button(L10n.text("call.return_now")) {
                     model.dismissCallResult()
                 }
                 .buttonStyle(.borderedProminent)
@@ -76,6 +81,14 @@ struct CallView: View {
             Spacer()
         }
         .padding(24)
+        .simultaneousGesture(
+            TapGesture()
+                .onEnded { if model.callState.isTerminal { model.cancelCallResultAutoReturn() } }
+        )
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 8)
+                .onChanged { _ in if model.callState.isTerminal { model.cancelCallResultAutoReturn() } }
+        )
     }
 
     private var statusText: String {

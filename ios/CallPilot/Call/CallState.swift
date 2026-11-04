@@ -65,6 +65,12 @@ struct CallAttemptStateMachine {
         return state == expectedState
     }
 
+    /// J1：结束/失败结果都可用同一代令牌围栏，倒计时不会清掉后来开始的新通话。
+    func isCurrentTerminalResult(_ expectedState: CallState, for attempt: CallAttempt) -> Bool {
+        guard isCurrent(attempt), state.isTerminal else { return false }
+        return state == expectedState
+    }
+
     @discardableResult
     mutating func transition(
         from expectedState: CallState? = nil,
@@ -87,5 +93,32 @@ struct CallAttemptStateMachine {
         guard state.isTerminal else { return false }
         invalidate()
         return true
+    }
+}
+
+/// J1:结束页自动返回拨号页的纯倒计时。tick 每秒推进一次,到零返回 true;
+/// cancel 后不再推进(用户点按/滚动结束页即取消)。纯函数便于无时钟单测。
+struct CallResultCountdown: Equatable {
+    private(set) var remaining: Int
+    private(set) var cancelled = false
+
+    init(seconds: Int) {
+        remaining = max(1, seconds)
+    }
+
+    @discardableResult
+    mutating func tick() -> Bool {
+        guard !cancelled else { return false }
+        if remaining <= 1 {
+            remaining = 0
+            return true
+        }
+        remaining -= 1
+        return false
+    }
+
+    mutating func cancel() {
+        cancelled = true
+        remaining = 0
     }
 }

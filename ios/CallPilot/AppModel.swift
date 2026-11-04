@@ -51,6 +51,7 @@ final class AppModel: ObservableObject {
     @Published var selectedTab: MainTab = .dial
     @Published private(set) var alertRouteID: UUID?
     @Published var callState: CallState = .idle
+    @Published private(set) var callResultCountdown: Int? = nil
     @Published var incomingOffer: InboundOffer?
     @Published var lineStatusLabel = L10n.text("line.status.checking")
     @Published var pairingError: String?
@@ -68,7 +69,8 @@ final class AppModel: ObservableObject {
     private var media: CallMediaSession?
     private var mediaTimeoutTask: Task<Void, Never>?
     private var callResultTask: Task<Void, Never>?
-    private let endedResultDisplayDuration: Duration = .seconds(5)
+    private let endedResultDisplaySeconds = 3
+    private let failedResultDisplaySeconds = 6
     private var callKitOfferId: String?
     private var pendingAudioAttempt: (attempt: CallAttempt, label: String)?
     private var callAttempts = CallAttemptStateMachine()
@@ -413,24 +415,43 @@ final class AppModel: ObservableObject {
     private func scheduleCallResultDismissal(for attempt: CallAttempt, state: CallState) {
         callResultTask?.cancel()
         callResultTask = nil
-        guard case .ended = state else { return }
-        let duration = endedResultDisplayDuration
+        guard state.isTerminal else {
+            callResultCountdown = nil
+            return
+        }
+        let seconds: Int
+        switch state {
+        case .failed: seconds = failedResultDisplaySeconds
+        default: seconds = endedResultDisplaySeconds
+        }
+        callResultCountdown = seconds
         callResultTask = Task { [weak self] in
-            do { try await Task.sleep(for: duration) }
-            catch { return }
-            guard let self, callAttempts.isCurrentEndedResult(state, for: attempt) else { return }
-            dismissCallResult()
+            for step in 0..<seconds {
+                do { try await Task.sleep(for: .seconds(1)) }
+                catch { return }
+                guard let self, self.callAttempts.isCurrentTerminalResult(state, for: attempt) else { return }
+                let remaining = seconds - step - 1
+                self.callResultCountdown = remaining > 0 ? remaining : nil
+            }
+            guard let self, self.callAttempts.isCurrentTerminalResult(state, for: attempt) else { return }
+            self.dismissCallResult()
         }
     }
 
     func dismissCallResult() {
         guard callAttempts.resetTerminal() else { return }
-        callResultTask?.cancel()
-        callResultTask = nil
+        cancelCallResultAutoReturn()
         callState = .idle
         media = nil
         callKitOfferId = nil
         speakerphoneEnabled = false
+    }
+
+    /// J1：用户点按/滚动结束页时取消自动返回，把返回时机交还用户。
+    func cancelCallResultAutoReturn() {
+        callResultTask?.cancel()
+        callResultTask = nil
+        callResultCountdown = nil
     }
 
     func hangup() {
@@ -454,8 +475,7 @@ final class AppModel: ObservableObject {
 
     private func beginCallAttempt(with initialState: CallState) -> CallAttempt {
         mediaTimeoutTask?.cancel()
-        callResultTask?.cancel()
-        callResultTask = nil
+        cancelCallResultAutoReturn()
         callKitOfferId = nil
         let attempt = callAttempts.begin(with: initialState)
         speakerphoneEnabled = false

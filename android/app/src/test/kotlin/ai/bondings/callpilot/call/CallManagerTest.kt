@@ -31,6 +31,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -237,7 +238,8 @@ class CallManagerTest {
                 error("takeover provider should not be called")
             },
             takeoverMediaTimeoutMs: Long = 20_000L,
-            takeoverFailureVisibleMs: Long = 2_000L,
+            endedVisibleMs: Long = 3_000L,
+            failedVisibleMs: Long = 6_000L,
             directSession: DirectCapableSession? = null,
             gateway: InboundMediaGateway? = null,
             directSessionFactory: (() -> DirectCapableSession)? = directSession?.let { { it } },
@@ -257,7 +259,8 @@ class CallManagerTest {
             scope = scope,
             ioDispatcher = dispatcher,
             takeoverMediaTimeoutMs = takeoverMediaTimeoutMs,
-            takeoverFailureVisibleMs = takeoverFailureVisibleMs,
+            endedVisibleMs = endedVisibleMs,
+            failedVisibleMs = failedVisibleMs,
             directSessionFactory = directSessionFactory,
             mediaGatewayFactory = gatewayFactory,
             outboundGatewayFactory = { outboundGateway ?: error("outbound gateway should not be used") },
@@ -375,7 +378,7 @@ class CallManagerTest {
         assertEquals(CallState.InCall("10000"), manager.state.value)
 
         manager.hangup()
-        advanceUntilIdle()
+        runCurrent()
         assertTrue(session.commands.last().contains("\"hangup\""))
         assertEquals(CallState.Ended("10000", "local_hangup"), manager.state.value)
         assertTrue(session.disconnected)
@@ -395,7 +398,7 @@ class CallManagerTest {
         advanceUntilIdle()
 
         session.emit(SessionEvent.Edge(Signaling.Event.Status("ended")))
-        advanceUntilIdle()
+        runCurrent()
         assertEquals(CallState.Ended("10000", "ended"), manager.state.value)
         assertTrue(session.disconnected)
         h.close()
@@ -414,7 +417,7 @@ class CallManagerTest {
                 """{"type":"status","status":"failed","reason":"line_unavailable","code":"SIM_NOT_REGISTERED"}"""
             )!!)
         )
-        advanceUntilIdle()
+        runCurrent()
         assertEquals(CallState.Failed("10000", "line_unavailable", "SIM_NOT_REGISTERED"), manager.state.value)
         assertTrue(session.disconnected)
         h.close()
@@ -443,7 +446,7 @@ class CallManagerTest {
         advanceUntilIdle()
 
         session.emit(SessionEvent.Disconnected("network_lost"))
-        advanceUntilIdle()
+        runCurrent()
         assertEquals(CallState.Ended("10000", "network_lost"), manager.state.value)
         assertTrue(session.disconnected)
         h.close()
@@ -454,7 +457,7 @@ class CallManagerTest {
         val h = Harness(this)
         val manager = h.manager(FakeSession()) { throw IllegalStateException("线路正在使用") }
         manager.startCall(pairing, "10000")
-        advanceUntilIdle()
+        runCurrent()
         val state = manager.state.value
         assertTrue(state is CallState.Failed && state.reason.contains("线路"))
         h.close()
@@ -467,7 +470,7 @@ class CallManagerTest {
             Invite(sessionId = "s", url = "https://d/p.html#not-base64!!!")
         }
         manager.startCall(pairing, "10000")
-        advanceUntilIdle()
+        runCurrent()
         assertTrue(manager.state.value is CallState.Failed)
         h.close()
     }
@@ -582,7 +585,7 @@ class CallManagerTest {
         assertEquals(CallState.Preparing("10000"), manager.state.value)
 
         manager.hangup()
-        advanceUntilIdle()
+        runCurrent()
         sessionResult.complete(
             HostedCallSession(
                 sessionId = "call_abcdefghijkl",
@@ -591,7 +594,7 @@ class CallManagerTest {
                 expiresAt = 9999,
             )
         )
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(CallState.Ended("10000", "local_hangup"), manager.state.value)
         assertFalse(session.connected)
@@ -614,7 +617,7 @@ class CallManagerTest {
 
         manager.hangup()
         session.dialRelease?.complete(Unit)
-        advanceUntilIdle()
+        runCurrent()
 
         assertFalse(session.commands.any { it.contains("\"dial\"") })
         assertEquals(CallState.Ended("10000", "local_hangup"), manager.state.value)
@@ -637,7 +640,7 @@ class CallManagerTest {
         )
 
         manager.startCall(hostedPairing, "10000")
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(
             CallState.Failed("10000", "Line is busy", code = "LINE_BUSY"),
@@ -1316,7 +1319,7 @@ class CallManagerTest {
             session,
             takeoverClaimProvider = { _, _ -> takeoverSession() },
             takeoverMediaTimeoutMs = 1_000L,
-            takeoverFailureVisibleMs = 500L,
+            failedVisibleMs = 1_000L,
         ) { error("invite path should not run") }
         val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
 
@@ -1337,7 +1340,7 @@ class CallManagerTest {
         assertTrue(session.disconnected)
         assertEquals(listOf(true, false), h.foreground)
 
-        advanceTimeBy(500L)
+        advanceTimeBy(1_000L)
         runCurrent()
         assertEquals(CallState.Idle, manager.state.value)
         h.close()
@@ -1356,7 +1359,7 @@ class CallManagerTest {
         val hostedPairing = pairing.copy(protocol = PairingProtocol.HOSTED, edgeId = "edge_abcdefghijkl")
 
         manager.answerTakeover(hostedPairing, "offer_abcdefghijkl")
-        advanceUntilIdle()
+        runCurrent()
 
         val state = manager.state.value
         assertTrue(state is CallState.Failed)
@@ -1894,6 +1897,73 @@ class CallManagerTest {
         runCurrent()
         assertTrue(session.disconnected)
         assertEquals(CallState.Ended("10000", "local_hangup"), manager.state.value)
+        h.close()
+    }
+
+    @Test
+    fun `通话结束倒计时到点自动回 Idle`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(session) { invite() }
+        manager.startCall(pairing, "10000")
+        advanceUntilIdle()
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("connected")))
+        runCurrent()
+        manager.hangup()
+        runCurrent()
+        assertEquals(CallState.Ended("10000", "local_hangup"), manager.state.value)
+        assertEquals(3, manager.returnCountdown.value)
+
+        advanceTimeBy(3_000L)
+        runCurrent()
+        assertEquals(CallState.Idle, manager.state.value)
+        assertNull(manager.returnCountdown.value)
+        h.close()
+    }
+
+    @Test
+    fun `立即返回立即回到 Idle 并取消倒计时`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(session) { invite() }
+        manager.startCall(pairing, "10000")
+        advanceUntilIdle()
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("connected")))
+        runCurrent()
+        manager.hangup()
+        runCurrent()
+        assertEquals(CallState.Ended("10000", "local_hangup"), manager.state.value)
+
+        manager.reset()
+        assertEquals(CallState.Idle, manager.state.value)
+        assertNull(manager.returnCountdown.value)
+
+        advanceTimeBy(4_000L)
+        runCurrent()
+        assertEquals(CallState.Idle, manager.state.value)
+        h.close()
+    }
+
+    @Test
+    fun `倒计时中开始新通话不会被旧结果清除`() = runTest {
+        val h = Harness(this)
+        val session = FakeSession()
+        val manager = h.manager(session) { invite() }
+        manager.startCall(pairing, "10000")
+        advanceUntilIdle()
+        session.emit(SessionEvent.Edge(Signaling.Event.Status("connected")))
+        runCurrent()
+        manager.hangup()
+        runCurrent()
+        assertEquals(CallState.Ended("10000", "local_hangup"), manager.state.value)
+
+        manager.startCall(pairing, "10086")
+        runCurrent()
+        assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
+
+        advanceTimeBy(4_000L)
+        runCurrent()
+        assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
         h.close()
     }
 }

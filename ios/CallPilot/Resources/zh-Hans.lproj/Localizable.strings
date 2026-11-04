@@ -44,6 +44,8 @@
 
 "call.remote_sim_notice" = "正在通过远端 SIM 通话";
 "call.return_to_dialer" = "返回拨号";
+"call.returning_in" = "%d 秒后返回";
+"call.return_now" = "立即返回";
 "call.keypad.show" = "显示键盘";
 "call.keypad.hide" = "隐藏键盘";
 "call.speaker.enable" = "打开扬声器";

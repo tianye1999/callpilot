@@ -78,23 +78,24 @@ final class CallKitConfigurationTests: XCTestCase {
         XCTAssertFalse(sync.contains("setActive("))
     }
 
-    func testEndedResultTimerUsesFiveSecondsAndFencesDismissal() throws {
+    func testEndedResultTimerUsesThreeSecondCountdownAndFencesDismissal() throws {
         let source = try String(
             contentsOf: repositoryRoot.appendingPathComponent("ios/CallPilot/AppModel.swift"), encoding: .utf8
         )
-        XCTAssertTrue(source.contains("let endedResultDisplayDuration: Duration = .seconds(5)"))
+        XCTAssertTrue(source.contains("private let endedResultDisplaySeconds = 3"))
+        XCTAssertTrue(source.contains("private let failedResultDisplaySeconds = 6"))
         let timer = try section(source, from: "private func scheduleCallResultDismissal", to: "func dismissCallResult()")
-        try assertBefore("callResultTask?.cancel()", "guard case .ended = state else { return }", in: timer)
-        XCTAssertTrue(timer.contains("Task { [weak self]"))
-        XCTAssertTrue(timer.contains("let duration = endedResultDisplayDuration"))
-        try assertBefore("try await Task.sleep(for: duration)", "callAttempts.isCurrentEndedResult(state, for: attempt)", in: timer)
-        try assertBefore("callAttempts.isCurrentEndedResult(state, for: attempt)", "dismissCallResult()", in: timer)
+        try assertBefore("callResultTask?.cancel()", "guard state.isTerminal", in: timer)
+        XCTAssertTrue(timer.contains("for step in 0..<seconds"))
+        XCTAssertTrue(timer.contains("try await Task.sleep(for: .seconds(1))"))
+        XCTAssertTrue(timer.contains("callAttempts.isCurrentTerminalResult(state, for: attempt)"))
+        XCTAssertTrue(timer.contains("dismissCallResult()"))
         let apply = try section(source, from: "private func apply(", to: "private func registerCurrentVoipToken")
         try assertBefore("callState = nextState", "scheduleCallResultDismissal(for: attempt, state: nextState)", in: apply)
         let reset = try section(source, from: "func dismissCallResult()", to: "func hangup()")
-        XCTAssertTrue(reset.contains("callResultTask?.cancel()"))
+        XCTAssertTrue(reset.contains("cancelCallResultAutoReturn()"))
         let begin = try section(source, from: "private func beginCallAttempt", to: "private func canBeginAudio")
-        XCTAssertTrue(begin.contains("callResultTask?.cancel()"))
+        XCTAssertTrue(begin.contains("cancelCallResultAutoReturn()"))
     }
 
     func testIncomingOfferResetsTerminalResultBeforeAdmissionAndPreconnectDecision() throws {
