@@ -690,14 +690,22 @@ def rig(monkeypatch, preparation_yields, preparation_stage):
     )
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_service_webrtc_warmup_is_v2_only_and_nonblocking(rig, monkeypatch, enabled):
-    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", str(enabled).lower())
+@pytest.mark.parametrize(("fastpath_v2", "outbound_direct"), [
+    (False, False),
+    (False, True),
+    (True, False),
+    (True, True),
+])
+def test_service_webrtc_warmup_gates_on_v2_or_outbound_direct(
+    rig, monkeypatch, fastpath_v2, outbound_direct,
+):
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", str(fastpath_v2).lower())
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", str(outbound_direct).lower())
     warmed = []
     monkeypatch.setattr("agentcall.webrtc_media.warm_webrtc_stack", lambda: warmed.append(True), raising=False)
     monkeypatch.setattr("agentcall.call_agent.threading.Thread", lambda **_: SimpleNamespace(start=lambda: None))
     rig.service.start()
-    assert warmed == ([True] if enabled else [])
+    assert warmed == ([True] if (fastpath_v2 or outbound_direct) else [])
 
 
 @pytest.mark.parametrize("response", ["OK", "ERROR", RuntimeError("serial unavailable")])

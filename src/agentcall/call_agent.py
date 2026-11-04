@@ -6693,7 +6693,9 @@ class CallAgentService:
         supervisor 连上后自动开始接听。首次连上后，后续掉线由 modem 读循环
         的自愈重连（P0-1）接管。
         """
-        if config.get_bool("INBOUND_FASTPATH_V2_ENABLED"):
+        # 外呼直连默认开启，启动即后台预热 WebRTC 栈（后台单例、不阻塞），
+        # 避免 Windows 重启后第一通在通话现场初始化约 2 s。
+        if config.get_bool("INBOUND_FASTPATH_V2_ENABLED") or config.get_bool("OUTBOUND_DIRECT_ENABLED"):
             from .webrtc_media import warm_webrtc_stack
 
             warm_webrtc_stack()
