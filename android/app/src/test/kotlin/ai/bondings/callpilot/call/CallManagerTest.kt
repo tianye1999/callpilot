@@ -1008,6 +1008,11 @@ class CallManagerTest {
 
         manager.answerTakeover(hosted, ringing.offerId, direct = true)
         runCurrent()
+        assertEquals(listOf("ice"), gateway.calls)
+
+        // 有界等待到上限仍未就绪：超时后照旧先 claim（不带 SDP），之后同一份预备补交。
+        advanceTimeBy(1_200)
+        runCurrent()
         assertEquals(listOf("ice", "claim:true"), gateway.calls)
         direct.prepareGate!!.complete(Unit)
         runCurrent()
@@ -1015,6 +1020,56 @@ class CallManagerTest {
         assertEquals(listOf("ice", "claim:true", "sdp"), gateway.calls)
         assertEquals(1, direct.prepared.size)
         assertEquals("v=0\r\nanswer", direct.answer)
+        h.close()
+    }
+
+    @Test
+    fun `预备在上限内就绪 一次 claim 带 SDP 不再补交`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession().apply { prepareGate = CompletableDeferred() }
+        val gateway = FakeGateway(v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.prepareTakeover(hosted, ringing)
+        runCurrent()
+
+        manager.answerTakeover(hosted, ringing.offerId, direct = true)
+        runCurrent()
+        assertEquals(listOf("ice"), gateway.calls)
+
+        // 在等待上限内收集完成：SDP 随 claim 一次发出。
+        advanceTimeBy(300)
+        direct.prepareGate!!.complete(Unit)
+        runCurrent()
+
+        assertEquals(listOf("ice", "claim:true+sdp"), gateway.calls)
+        assertEquals("v=0\r\nfake-offer typ relay", gateway.claimedWithSdp)
+        assertEquals("v=0\r\nanswer", direct.answer)
+        assertFalse(gateway.calls.contains("sdp"))
+        assertEquals(1, direct.prepared.size)
+        h.close()
+    }
+
+    @Test
+    fun `接听时等待预备期间挂断 不发 claim 且放掉预备`() = runTest {
+        val h = Harness(this)
+        val direct = FakeDirectSession().apply { prepareGate = CompletableDeferred() }
+        val gateway = FakeGateway(v2Claim(), sdpResult = v2Claim(sdpAnswer = "v=0\r\nanswer"))
+        val manager = h.manager(FakeSession(), directSession = direct, gateway = gateway) { error("invite path should not run") }
+        manager.prepareTakeover(hosted, ringing)
+        runCurrent()
+
+        manager.answerTakeover(hosted, ringing.offerId, direct = true)
+        runCurrent()
+        assertEquals(listOf("ice"), gateway.calls)
+
+        manager.hangup()
+        runCurrent()
+
+        assertFalse(gateway.calls.contains("claim:true"))
+        assertFalse(gateway.calls.contains("claim:true+sdp"))
+        assertTrue(direct.disconnected)
+        val state = manager.state.value
+        assertTrue("$state", state is CallState.Ended && state.reason == "local_hangup")
         h.close()
     }
 

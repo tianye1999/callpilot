@@ -20,6 +20,7 @@ final class CallMediaSession {
     private var directOfferId: String?
     private var directPreparationTask: Task<String?, Error>?
     private var directPreparedOffer: String?
+    private var directPreparationFinished = false
     private var directPreparationRejection: HostedCloudError?
     private var directClaimTask: Task<HostedCallSession, Error>?
     private var directClaimClient: HostedCloudClient?
@@ -63,7 +64,10 @@ final class CallMediaSession {
     private var cleanupTask: Task<Void, Never>?
     static let hangupBudget: Duration = .milliseconds(2500)
     static let preconnectWaitTimeout: Duration = .seconds(8)
+    /// 接听时有界等待直连预备 SDP 就绪的上限（≤1.2 s，见任务说明）。
+    static let preconnectClaimWaitMax: Duration = .milliseconds(1200)
     private let hangupBudget: Duration
+    private let preconnectClaimWaitBudget: Duration
     let timing: CallTiming
     private var timingTask: Task<Void, Never>?
     private var supportsClientTiming = false
@@ -182,11 +186,13 @@ final class CallMediaSession {
          hangupBudget: Duration = CallMediaSession.hangupBudget,
          timing: CallTiming = CallTiming(),
          directTransportFactory: DirectTransportFactory? = nil,
-         directSetupMax: Duration = CallMediaSession.directSetupMax) {
+         directSetupMax: Duration = CallMediaSession.directSetupMax,
+         preconnectClaimWaitBudget: Duration = CallMediaSession.preconnectClaimWaitMax) {
         self.onState = onState
         self.transportFactory = transportFactory
         self.audio = audio
         self.hangupBudget = hangupBudget
+        self.preconnectClaimWaitBudget = preconnectClaimWaitBudget
         self.timing = timing
         self.directTransportFactory = directTransportFactory
         self.directSetupMax = directSetupMax
@@ -202,9 +208,11 @@ final class CallMediaSession {
         guard directTransportFactory != nil, directPreparationTask == nil,
               let attempt = beginAttempt(label: L10n.text("call.takeover.label"), mode: .callKit) else { return }
         directOfferId = offer.offerId
+        directPreparationFinished = false
         let acquiring = Task { try await acquireSilentAudioLease(for: attempt) }
         silentAudioLeaseTask = acquiring
         let task = Task<String?, Error> {
+            defer { directPreparationFinished = true }
             timing.mark(.prepareStart)
             let servers: [CallIceServer]
             do { servers = try await client.inboundIceServers(offerId: offer.offerId) }
@@ -236,6 +244,19 @@ final class CallMediaSession {
         directPreparationTask = task
     }
 
+    /// 有界等待响铃期直连预备产出 SDP；未开始/已结束/超时都立即返回，不阻塞 claim 的冷路径。
+    private func awaitDirectPreparation(upTo budget: Duration, attempt: UInt64) async throws {
+        guard directPreparationTask != nil, !directPreparationFinished else { return }
+        if directPreparedOffer != nil { return }
+        let deadline = ContinuousClock.now.advanced(by: budget)
+        while !directPreparationFinished && directPreparedOffer == nil {
+            try checkCurrent(attempt)
+            let remaining = ContinuousClock.now.duration(to: deadline)
+            guard remaining > .zero else { return }
+            try await Task.sleep(for: min(.milliseconds(20), remaining))
+        }
+    }
+
     private func installEvents(_ connection: any CallMediaTransport, attempt: UInt64) {
         connection.eventHandler = { [weak self, weak connection] event in
             guard let connection else { return }
@@ -259,6 +280,8 @@ final class CallMediaSession {
                                      prepareReservedAudio: (() async throws -> Void)?,
                                      onClaimed: @escaping () throws -> Void,
                                      onConnected: @escaping () -> Void) async -> Bool {
+        // 只有响铃期已经在收集的直连预备才值得等；前台接听现起预备仍走「先 claim、后补交」。
+        let hadInFlightPreparation = directPreparationTask != nil
         if directPreparationTask == nil {
             // No push prewarm (for example, a foreground offer); begin immediately.
             beginDirectPreparation(client: client, offer: InboundOffer(offerId: offerId, expiresAt: 0))
@@ -270,6 +293,11 @@ final class CallMediaSession {
         let task = Task {
             try checkCurrent(attempt)
             if let directPreparationRejection { throw directPreparationRejection }
+            // 预备仍在收集中：有界等它产出 SDP，随 claim 一次提交；超时/失败/未开始都不等。
+            if hadInFlightPreparation, directPreparedOffer == nil, !directPreparationFinished {
+                try await awaitDirectPreparation(upTo: preconnectClaimWaitBudget, attempt: attempt)
+                try checkCurrent(attempt)
+            }
             timing.startClaim()
             directClaimClient = client
             let claim = Task {

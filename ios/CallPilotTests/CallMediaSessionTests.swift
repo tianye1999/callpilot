@@ -321,7 +321,8 @@ final class CallMediaSessionTests: XCTestCase {
         direct.prepareGate = gate
         let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
             audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
-            hangupBudget: .milliseconds(20), directTransportFactory: { direct })
+            hangupBudget: .milliseconds(20), directTransportFactory: { direct },
+            preconnectClaimWaitBudget: .milliseconds(20))
         let preparing = Task { await media.startDirectPreparation(client: client,
             offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
         await waitUntil { gate.didStart }
@@ -419,7 +420,8 @@ final class CallMediaSessionTests: XCTestCase {
         var states: [CallState] = []
         let owner = CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in })
         let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { FakeCallMediaTransport() },
-                                     audio: owner, directTransportFactory: { direct })
+                                     audio: owner, directTransportFactory: { direct },
+                                     preconnectClaimWaitBudget: .milliseconds(20))
         let preparing = Task { await media.startDirectPreparation(client: client,
             offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
         await waitUntil { gate.didStart }
@@ -527,10 +529,12 @@ final class CallMediaSessionTests: XCTestCase {
         XCTAssertEqual(servers.first?.urls, ["stuns:relay.example:5349"])
     }
 
-    func testV2AnswerReusesInFlightGatherWithoutAnotherPeer() async throws {
-        let claimed = expectation(description: "claim arrives while gather is held")
-        let fulfilled = expectation(description: "CallKit claim completion does not wait for gather")
-        let client = try makeDirectClient(onClaim: { hasSDP in XCTAssertFalse(hasSDP); claimed.fulfill() })
+    func testV2AnswerWaitsForInFlightGatherAndSubmitsSDPInOneClaim() async throws {
+        let claimed = expectation(description: "claim carries the ringing-phase SDP")
+        let client = try makeDirectClient(onClaim: { hasSDP in
+            XCTAssertTrue(hasSDP, "an in-flight gather that finishes within budget must ride the single claim")
+            claimed.fulfill()
+        }, onSupplement: { XCTFail("ready SDP belongs in the only claim HTTP") })
         let direct = FakeDirectTransport(), gate = ManualGate()
         direct.prepareGate = gate
         var peers = 0
@@ -541,15 +545,114 @@ final class CallMediaSessionTests: XCTestCase {
             offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
         await waitUntil { gate.didStart }
         let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
-            usesCallKit: true, onClaimed: { try media.prepareCallKitAnswer(); fulfilled.fulfill() }, onConnected: {}) }
-        await fulfillment(of: [claimed, fulfilled], timeout: 1)
+            usesCallKit: true, onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {}) }
         gate.open()
+        await fulfillment(of: [claimed], timeout: 1)
         await preparing.value
         let accepted = await answering.value
         XCTAssertTrue(accepted)
         XCTAssertEqual(peers, 1)
         XCTAssertEqual(direct.prepares, 1)
         await media.stop()
+    }
+
+    func testV2BoundedWaitTimeoutFallsBackToClaimThenSupplement() async throws {
+        let claimed = expectation(description: "claim goes out without SDP after the bounded wait")
+        let supplemented = expectation(description: "late SDP is submitted once via completeSDP")
+        let client = try makeDirectClient(onClaim: { hasSDP in
+            XCTAssertFalse(hasSDP, "a held gather must not be waited past the budget")
+            claimed.fulfill()
+        }, onSupplement: { supplemented.fulfill() })
+        let direct = FakeDirectTransport(), gate = ManualGate()
+        direct.prepareGate = gate
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct }, preconnectClaimWaitBudget: .milliseconds(20))
+        let preparing = Task { await media.startDirectPreparation(client: client,
+            offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
+        await waitUntil { gate.didStart }
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {}) }
+        await fulfillment(of: [claimed], timeout: 1)
+        gate.open()
+        await fulfillment(of: [supplemented], timeout: 1)
+        await preparing.value
+        let accepted = await answering.value
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(direct.prepares, 1)
+        await media.stop()
+    }
+
+    func testV2ForegroundAnswerWithoutPrewarmDoesNotWaitForFreshGather() async throws {
+        let claimed = expectation(description: "cold claim fires without waiting for a fresh gather")
+        let supplemented = expectation(description: "fresh gather is submitted after the claim")
+        let client = try makeDirectClient(onClaim: { hasSDP in
+            XCTAssertFalse(hasSDP, "a preconnect started only at answer time must not delay the claim")
+            claimed.fulfill()
+        }, onSupplement: { supplemented.fulfill() })
+        let direct = FakeDirectTransport(), gate = ManualGate()
+        direct.prepareGate = gate
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct }, preconnectClaimWaitBudget: .milliseconds(20))
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {}) }
+        await fulfillment(of: [claimed], timeout: 1)
+        gate.open()
+        await fulfillment(of: [supplemented], timeout: 1)
+        let accepted = await answering.value
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(direct.prepares, 1)
+        await media.stop()
+    }
+
+    func testV2FailedPrewarmDoesNotDelayTheColdClaim() async throws {
+        let claimed = expectation(description: "claim fires immediately after the prewarm failed")
+        let fallback = expectation(description: "failed prewarm falls back within the same claim")
+        let client = try makeDirectClient(iceUnavailable: true, onFallback: { fallback.fulfill() }, onClaim: { hasSDP in
+            XCTAssertFalse(hasSDP)
+            claimed.fulfill()
+        })
+        let direct = FakeDirectTransport()
+        let media = CallMediaSession(onState: { _ in }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct }, preconnectClaimWaitBudget: .milliseconds(20))
+        let preparing = Task { await media.startDirectPreparation(client: client,
+            offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
+        await preparing.value
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onClaimed: { try media.prepareCallKitAnswer() }, onConnected: {}) }
+        await fulfillment(of: [claimed], timeout: 1)
+        await fulfillment(of: [fallback], timeout: 1)
+        let accepted = await answering.value
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(direct.prepares, 0)
+        await media.stop()
+    }
+
+    func testV2HangupDuringBoundedWaitIssuesNoClaimAndReleasesGather() async throws {
+        let client = try makeDirectClient(onClaim: { _ in XCTFail("hangup during the wait must not claim") },
+                                          onSupplement: { XCTFail("hangup during the wait must not supplement") })
+        let direct = FakeDirectTransport(), gate = ManualGate()
+        direct.prepareGate = gate
+        var states: [CallState] = []
+        let media = CallMediaSession(onState: { states.append($0) }, transportFactory: { FakeCallMediaTransport() },
+            audio: CallAudioOwner(device: TestCallAudioDevice(), onCleanupError: { _ in }),
+            directTransportFactory: { direct }, preconnectClaimWaitBudget: .milliseconds(20))
+        let preparing = Task { await media.startDirectPreparation(client: client,
+            offer: InboundOffer(offerId: "offer_abcdefghijkl", expiresAt: 9999)) }
+        await waitUntil { gate.didStart }
+        let answering = Task { await media.startTakeover(client: client, offerId: "offer_abcdefghijkl",
+            usesCallKit: true, onClaimed: { XCTFail("no claim after hangup") }, onConnected: {}) }
+        await Task.yield()
+        await media.stop()
+        let before = states
+        gate.open()
+        await preparing.value
+        let accepted = await answering.value
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(states, before)
+        XCTAssertTrue(direct.audioStopped)
     }
 
     func testV2AcceptedClaimWithoutAnswerCallsFallbackInsteadOfReclaiming() async throws {

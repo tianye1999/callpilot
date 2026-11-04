@@ -14,6 +14,7 @@ import ai.bondings.callpilot.protocol.InviteParser
 import ai.bondings.callpilot.protocol.PairingProtocol
 import ai.bondings.callpilot.protocol.Signaling
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -138,6 +139,10 @@ class CallManager(
         val gateway: InboundMediaGateway,
         val offer: Deferred<String?>,
         val expiryJob: Job,
+        /** 响铃期预备开始收集的时刻（timingClockMs 单调时钟）。 */
+        val preconnectStartAtMs: Double,
+        /** 预备 SDP 就绪时刻；收集完成前为 null。 */
+        val readyAt: AtomicReference<Double?>,
     )
 
     /** 当前唯一的预备（只为最新响铃的那通准备）；commandLock 保护。 */
@@ -383,10 +388,14 @@ class CallManager(
             if (current?.offerId == offer.offerId) return
             val session = factory()
             val gateway = mediaGatewayFactory(pairing)
+            val preconnectStartAt = timingClockMs()
+            val readyAt = AtomicReference<Double?>()
             val sdp = scope.async {
                 try {
                     val servers = gateway.iceServers(offer.offerId)
-                    withTimeout(directSetupMs) { session.prepareDirect(servers) }
+                    val sdpOffer = withTimeout(directSetupMs) { session.prepareDirect(servers) }
+                    readyAt.set(timingClockMs())
+                    sdpOffer
                 } catch (_: TimeoutCancellationException) {
                     null // 收集超时等同预备失败：接听时回落，不另起一份
                 } catch (e: CancellationException) {
@@ -399,7 +408,7 @@ class CallManager(
                 delay((offer.expiresAt - clockMs() + PREPARED_GRACE_MS).coerceAtLeast(0))
                 discardPrepared(offer.offerId)
             }
-            prepared = PreparedDirect(offer.offerId, session, gateway, sdp, expiry)
+            prepared = PreparedDirect(offer.offerId, session, gateway, sdp, expiry, preconnectStartAt, readyAt)
             current
         }
         stale?.let { release(it) }
@@ -430,6 +439,31 @@ class CallManager(
         return match
     }
 
+    /**
+     * 接听时有界等待响铃期直连预备的 SDP 就绪，便于随 claim 一次提交。
+     * 未开始 / 已失败 / 已取消 / 超时都返回 null，照旧「先 claim、后补交」；等待中的挂断会取消本协程。
+     */
+    private suspend fun awaitPreparedSdp(ready: PreparedDirect?): String? {
+        if (ready == null) return null
+        val offer = ready.offer
+        if (offer.isCancelled) return null
+        val sdp = if (offer.isCompleted) {
+            offer.getCompleted()
+        } else {
+            try {
+                withTimeoutOrNull(PRECONNECT_CLAIM_WAIT_MS) { offer.await() }
+            } catch (e: CancellationException) {
+                // 接听被取消（挂断）要继续抛出；预备本身被取消则当作未就绪。
+                currentCoroutineContext().ensureActive()
+                if (offer.isCancelled) null else throw e
+            }
+        }
+        if (sdp != null) {
+            timing.mark(CallTiming.Mark.PRECONNECT_READY, atMs = ready.readyAt.get() ?: timingClockMs())
+        }
+        return sdp
+    }
+
     fun answerTakeover(pairing: StoredPairing, offerId: String, direct: Boolean = false) {
         if (isActive) return
         if (pairing.protocol != PairingProtocol.HOSTED) return
@@ -446,21 +480,22 @@ class CallManager(
         val prep = takePrepared(offerId)
         if (!wantDirect && prep != null) release(prep)
         val ready = if (wantDirect) prep else null
+        // 响铃期预备已开始就记下开始时刻（相对 claim 起点为负，与 iOS 对齐）。
+        ready?.let { timing.mark(CallTiming.Mark.PRECONNECT_START, atMs = it.preconnectStartAtMs) }
         val context = TakeoverContext(offerId, if (wantDirect) ready?.gateway ?: mediaGatewayFactory(pairing) else null)
         context.prepared = ready
         synchronized(commandLock) { takeover = context }
         setupJob = scope.launch {
             try {
-                // 先 claim（CAS 定归属），直连准备在 claim 之后与 Edge 并行进行。
                 val gateway = context.gateway
+                // 响铃期预备仍在收集中：有界等它拿到 SDP，随 claim 一次提交；超时/失败/未开始都不等。
+                val sdpNow = if (wantDirect && gateway != null) awaitPreparedSdp(ready) else null
                 timing.restartAt(CallTiming.Mark.CLAIM_START)
                 val claimed = if (wantDirect && gateway != null) {
                     // claim 作为 scope 的独立子任务：挂断取消 setup 时它照常跑完，结果交给 hangup 收尾。
                     // 在锁内创建并发布（LAZY），挂断要么看见它、要么阻止它启动，不存在没人收尾的 claim。
                     val claimJob = synchronized(commandLock) {
                         if (hangupRequested) throw CancellationException("hangup before claim")
-                        // 预备的 SDP 已就绪就随 claim 一起发；没就绪也不等，claim 先定归属，之后补交。
-                        val sdpNow = ready?.offer?.takeIf { it.isCompleted && !it.isCancelled }?.getCompleted()
                         scope.async(start = CoroutineStart.LAZY) { gateway.claim(offerId, direct = true, sdpOffer = sdpNow) }
                             .also { context.claimJob = it }
                     }
@@ -978,3 +1013,6 @@ private const val HANGUP_TIMING_BUDGET_MS = 300L
 
 /** 预备在来电过期后再保留一小会儿：服务端时钟与本机略有偏差。 */
 private const val PREPARED_GRACE_MS = 2_000L
+
+/** 接听时有界等待响铃期直连 SDP 就绪的上限。取值见任务说明：≤1.2 s。 */
+private const val PRECONNECT_CLAIM_WAIT_MS = 1_200L
