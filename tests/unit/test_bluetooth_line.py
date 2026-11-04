@@ -318,7 +318,7 @@ def test_factories_defaults_and_optional_imports(monkeypatch):
     from agentcall.modem import Eg25Modem, Sim7600Modem, create_modem
 
     monkeypatch.delenv("MODEM_VENDOR", raising=False)
-    assert config.get_str("MODEM_VENDOR") == "quectel"
+    assert config.get_str("MODEM_VENDOR") == "auto"
     assert isinstance(create_modem("unused"), Eg25Modem)
     assert isinstance(create_modem("unused", vendor="simcom"), Sim7600Modem)
     monkeypatch.setattr(sys, "platform", "linux")

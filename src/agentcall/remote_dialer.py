@@ -21,7 +21,7 @@ from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Protocol
 from urllib.parse import urlparse
 
-from . import config
+from . import config, platforms
 from .audio_bridge import MODEM_RATE, create_audio_bridge
 from .bluetooth_modem import BluetoothModem
 from .call_log import CallLogger, CallRecord
@@ -76,6 +76,13 @@ class AudioBridgeLike(Protocol):
     def read_modem_chunk(self) -> bytes: ...
 
     def write_modem_chunks(self, chunks: Iterable[bytes]) -> None: ...
+
+
+async def _read_remote_pcm(bridge: AudioBridgeLike) -> bytes:
+    # A serial condition wait must not block the Windows RTP sender's loop.
+    if platforms.IS_WINDOWS:
+        return await asyncio.to_thread(bridge.read_modem_chunk)
+    return bridge.read_modem_chunk()
 
 
 class RemoteModem(Protocol):
@@ -723,7 +730,7 @@ class RemoteWebDialerCoordinator:
                         ),
                     )
 
-                modem_pcm = bridge.read_modem_chunk()
+                modem_pcm = await _read_remote_pcm(bridge)
                 if modem_pcm:
                     if record is not None:
                         record.write_uplink(modem_pcm)
@@ -894,8 +901,11 @@ class RemoteDialerWorker:
             thread.join(timeout=join_timeout)
 
     def _run(self) -> None:
+        from .windows_audio_timing import audio_timer_resolution
+
         try:
-            asyncio.run(self.coordinator.run())
+            with audio_timer_resolution():
+                asyncio.run(self.coordinator.run())
         except Exception as exc:  # noqa: BLE001
             self.coordinator.last_error = str(exc)
             logger.warning("远程拨号 worker 异常退出: error_type=%s", type(exc).__name__)

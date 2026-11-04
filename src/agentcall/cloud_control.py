@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
 from . import config
@@ -599,7 +600,10 @@ class CloudEdgeClient:
                 code = (rcvd.code if rcvd else sent.code if sent else 1006
                         ) if isinstance(exc, ConnectionClosed) else None
                 self._set_connected(False)
-                self._set_error(f"{type(exc).__name__}:{code}" if code is not None else type(exc).__name__)
+                detail = f"{type(exc).__name__}:{code}" if code is not None else _handshake_error(exc)
+                self._set_error(detail)
+                if detail.startswith("clock_skew:"):
+                    logger.warning("%s", detail)
                 logger.warning(
                     "CallPilot 云控制面连接中断: %s",
                     _compact_json({
@@ -1060,6 +1064,24 @@ def _utc_now() -> str:
     from datetime import UTC, datetime
 
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _handshake_error(error: Exception) -> str:
+    from websockets.exceptions import InvalidStatus
+
+    if isinstance(error, InvalidStatus) and error.response.status_code in (401, 403):
+        try:
+            date = error.response.headers.get("Date")
+            server_time = parsedate_to_datetime(date).timestamp() if date else None
+            skew = time.time() - server_time if server_time is not None else 0.0
+            if abs(skew) > 60:
+                direction = "快" if skew > 0 else "慢"
+                return (f"clock_skew: 电脑时间比服务器{direction}约 {abs(skew):.0f} 秒，"
+                        "可能导致设备签名被拒绝；请在 Windows「设置→时间和语言」开启自动设置时间；"
+                        "macOS/Linux 请开启系统自动时间同步")
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return type(error).__name__
 
 
 def _add_device_proof(

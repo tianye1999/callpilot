@@ -126,8 +126,8 @@ def test_vendor_scan_uses_platform_transport(monkeypatch, mac):
 
 
 @pytest.mark.parametrize("mac,frozen,vendor,interval", [
-    (True, True, "auto", 60), (True, False, "quectel", 0),
-    (False, True, "quectel", 0), (False, False, "quectel", 0),
+    (True, True, "auto", 60), (True, False, "auto", 0),
+    (False, True, "auto", 0), (False, False, "auto", 0),
 ])
 def test_packaged_macos_defaults(monkeypatch, mac, frozen, vendor, interval):
     monkeypatch.setattr(platforms, "IS_MACOS", mac)

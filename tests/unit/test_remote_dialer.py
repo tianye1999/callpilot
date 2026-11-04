@@ -1125,7 +1125,7 @@ def test_livekit_modem_audio_queue_is_bounded_to_latest_frames() -> None:
     assert endpoint._modem_audio.get_nowait() == b"\x03\x00" * 160
 
 
-def test_livekit_downlink_gain_applies_before_capture_and_clamps_without_wrap(
+def test_livekit_downlink_gain_applies_before_capture_and_soft_limits_without_rails(
     monkeypatch,
 ) -> None:
     async def run() -> None:
@@ -1148,7 +1148,12 @@ def test_livekit_downlink_gain_applies_before_capture_and_clamps_without_wrap(
             await _wait_for(lambda: len(source.frames) == 1)
 
             captured = struct.unpack("<160h", source.frames[0].kwargs["data"])
-            assert captured[:4] == (8000, -8000, 32767, -32768)
+            # Gain is applied before the limiter: quiet samples are identity-scaled,
+            # loud samples leave both s16 rails instead of hard-clipping.
+            assert captured[:2] == (8000, -8000)
+            assert 30000 < captured[2] < 32767
+            assert -32767 < captured[3] < -30000
+            assert captured[2] == -captured[3]
         finally:
             await endpoint.close()
 

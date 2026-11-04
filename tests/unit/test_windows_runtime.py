@@ -24,7 +24,7 @@ def test_windows_seed_removes_mac_hardware_overrides(tmp_path):
     runtime.seed_env(tmp_path, root / '.env.example')
     values = dotenv_values(tmp_path / '.env')
     assert not {'MODEM_PORT', 'MODEM_AUDIO_MODE', 'MODEM_PCM_PORT'} & values.keys()
-    assert values['MODEM_VENDOR'] == 'quectel'
+    assert values['MODEM_VENDOR'] == 'auto'
     assert values['AGENT_PROVIDER'] == 'local'
 
 

@@ -416,7 +416,7 @@ class LiveKitRemoteMediaEndpoint:
         try:
             while True:
                 pcm = await self._modem_audio.get()
-                amplified = apply_pcm_gain(pcm, self._downlink_gain)
+                amplified = apply_pcm_gain(pcm, self._downlink_gain, self._modem_publish_stats)
                 frame = rtc.AudioFrame(
                     data=amplified,
                     sample_rate=REMOTE_AUDIO_RATE,

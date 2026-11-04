@@ -87,11 +87,19 @@ def resample_pcm(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     return resampled.astype(np.int16).tobytes()
 
 
-def apply_pcm_gain(pcm: bytes, gain: float) -> bytes:
+def apply_pcm_gain(pcm: bytes, gain: float, stats: PcmFlowStats | None = None) -> bytes:
+    # Unity gain cannot leave the s16 range; keep the exact pass-through (no limiter).
     if gain == 1.0 or not pcm:
         return pcm
     samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-    amplified = np.clip(samples * gain, -32768, 32767)
+    amplified = samples * gain
+    magnitude = np.abs(amplified)
+    limited = magnitude > 24000
+    if stats is not None:
+        stats.note_limiter(int(np.count_nonzero(limited)), len(samples))
+    # Unity slope at the knee, identity below it; asymptote stays off both s16 rails.
+    excess = magnitude[limited] - 24000
+    amplified[limited] = np.sign(amplified[limited]) * (24000 + 8766 * excess / (8766 + excess))
     return amplified.astype(np.int16).tobytes()
 
 
@@ -329,6 +337,7 @@ class SerialPcmAudioBridge(_OutputObserver):
         self._opening_pending = True
         self._rx_dropped = 0
         self._rx_drop_logged_at = float("-inf")
+        self._read_stats = PcmFlowStats("modem_serial_read")
         # 消费/对齐、故障回退读与启停互斥；读线程只拿 condition，join 不会死锁。
         self._rx_lock = threading.Lock()
 
@@ -559,6 +568,8 @@ class SerialPcmAudioBridge(_OutputObserver):
         if not self._reader_alive:
             self._log_uplink_backlog()
         data = self._ser.read(NMEA_READ_SIZE)
+        self._read_stats.add(data)
+        self._read_stats.maybe_log()
         if data:
             # 在原始读取处计时：奇数字节、数字静音、回退直读都算通路有数据。
             self._last_uplink_at = time.monotonic()

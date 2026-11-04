@@ -118,6 +118,7 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
             self.stats = PcmFlowStats("downlink1_direct_publish")
             self.frames = 0
             self.silence_frames = 0
+            self._late_ms: list[float] = []
 
         async def recv(self) -> Any:
             if self.readyState != "live":
@@ -147,8 +148,9 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
                     await asyncio.sleep(self._next_at - now)
             if self.readyState != "live":
                 raise _stack.streams.MediaStreamError
+            self._late_ms.append(max(0.0, (time.monotonic() - self._next_at) * 1000))
             try:
-                pcm = apply_pcm_gain(source.get_nowait(), gain)
+                pcm = apply_pcm_gain(source.get_nowait(), gain, self.stats)
                 self.stats.add(pcm)
             except asyncio.QueueEmpty:
                 pcm = bytes(_FRAME_BYTES)
@@ -160,8 +162,12 @@ def _modem_track(source: asyncio.Queue[bytes], gain: float) -> Any:
             frame.time_base = Fraction(1, REMOTE_AUDIO_RATE)
             self._pts += _FRAME_SAMPLES
             self.frames += 1
-            self.stats.maybe_log(senderFrames=self.frames, senderSilenceFrames=self.silence_frames,
-                                 queued=source.qsize())
+            if self.stats.due():
+                late = sorted(self._late_ms)
+                self.stats.maybe_log(senderFrames=self.frames, senderSilenceFrames=self.silence_frames,
+                                     queued=source.qsize(), late_p50_ms=round(late[len(late) // 2], 3),
+                                     late_p95_ms=round(late[min(len(late) - 1, int(len(late) * .95))], 3))
+                self._late_ms.clear()
             return frame
 
     return ModemTrack()

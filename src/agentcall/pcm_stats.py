@@ -40,6 +40,12 @@ class PcmFlowStats:
         self._frames = 0
         self._bytes = 0
         self._peak = 0
+        self._limited = 0
+        self._samples = 0
+
+    def note_limiter(self, limited: int, samples: int) -> None:
+        self._limited += limited
+        self._samples += samples
 
     def add(self, pcm: bytes) -> None:
         self._frames += 1
@@ -66,6 +72,8 @@ class PcmFlowStats:
         if elapsed < self.interval_seconds:
             return False
         detail = "".join(f" {key}={value}" for key, value in extra.items())
+        if self._samples:
+            detail += f" limited_samples={self._limited} limited_ratio={self._limited / self._samples:.6f}"
         logger.info(
             "[audio-stats] %s %.1fs: frames=%d bytes=%d peak=%d%s",
             self.label,
@@ -79,6 +87,7 @@ class PcmFlowStats:
         self._frames = 0
         self._bytes = 0
         self._peak = 0
+        self._limited = self._samples = 0
         return True
 
 
