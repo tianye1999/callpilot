@@ -117,7 +117,76 @@ def configure_connection(connection: Any) -> bool:
         connection._agentcall_stopping = False
         connection.get_component_candidates = MethodType(_gather_component, connection)
         connection.query_consent = MethodType(_query_consent, connection)
+    _install_early_complete(connection)
     return True
+
+
+_EARLY_COMPLETE_LOG = "Direct ICE early complete first-pair-success -> DTLS"
+
+
+def _early_complete_enabled() -> bool:
+    try:
+        from . import config
+        return config.get_bool("DIRECT_ICE_EARLY_COMPLETE_ENABLED")
+    except Exception:
+        return False
+
+
+def _early_complete_hook(connection: Any, pair: Any) -> None:
+    # Only the controlled agent waits for the peer's regular nomination; upstream
+    # already uses aggressive nomination when controlling, so it needs no shortcut.
+    if pair.state != ice.CandidatePair.State.SUCCEEDED or connection.ice_controlling or pair.nominated:
+        return
+    if connection._agentcall_first_pair_success_at is None:
+        connection._agentcall_first_pair_success_at = time.monotonic()
+    if pair.component in connection._agentcall_early_nominated_components:
+        return
+    connection._agentcall_early_nominated_components.add(pair.component)
+    # Promote the first usable pair to nominated; upstream check_complete then drops
+    # the component's unchecked pairs and finishes the checklist. A later peer
+    # USE-CANDIDATE still replaces _nominated through check_incoming.
+    pair.nominated = True
+    if not connection._agentcall_early_complete_logged:
+        connection._agentcall_early_complete_logged = True
+        started = connection._agentcall_connect_started_at
+        if started is None:
+            started = time.monotonic()
+        logger.info("%s connection=%s component=%s local=%s remote=%s elapsed_ms=%.0f",
+                    _EARLY_COMPLETE_LOG, id(connection), pair.component, pair.local_addr, pair.remote_addr,
+                    (time.monotonic() - started) * 1000)
+
+
+def _install_early_complete(connection: Any) -> None:
+    if getattr(connection, "_agentcall_early_complete_installed", False):
+        return
+    if not _early_complete_enabled():
+        return
+    if (list(inspect.signature(ice.Connection.check_complete).parameters) != ["self", "pair"]
+            or list(inspect.signature(ice.Connection.connect).parameters) != ["self"]
+            or not hasattr(connection, "ice_controlling")):
+        logger.warning("Direct ICE early-complete adapter unsupported aioice layout; using upstream behavior")
+        return
+    connection._agentcall_early_complete_installed = True
+    connection._agentcall_connect_started_at = None
+    connection._agentcall_first_pair_success_at = None
+    connection._agentcall_early_nominated_components = set()
+    connection._agentcall_early_complete_logged = False
+
+    original_connect = connection.connect
+
+    async def connect() -> None:
+        connection._agentcall_connect_started_at = time.monotonic()
+        await original_connect()
+
+    connection.connect = connect
+
+    original_check_complete = connection.check_complete
+
+    def check_complete(pair: Any) -> None:
+        _early_complete_hook(connection, pair)
+        original_check_complete(pair)
+
+    connection.check_complete = check_complete
 
 
 class _ConsentTransaction(stun.Transaction):

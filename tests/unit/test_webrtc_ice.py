@@ -447,3 +447,166 @@ def test_orphaned_upstream_srflx_transaction_is_drained_before_socket_close(monk
             server.close()
 
     asyncio.run(scenario())
+
+
+NOMINATION_DELAY = 0.8
+
+
+def test_early_complete_hook_nominates_first_succeeded_pair_only_for_controlled(caplog):
+    from aioice import ice
+
+    pair = SimpleNamespace(state=ice.CandidatePair.State.SUCCEEDED, component=1, nominated=False,
+                           local_addr=("192.168.1.12", 5000), remote_addr=("192.168.1.10", 5001))
+    controlled = SimpleNamespace(ice_controlling=False, _agentcall_first_pair_success_at=None,
+                                 _agentcall_early_nominated_components=set(), _agentcall_early_complete_logged=False,
+                                 _agentcall_connect_started_at=1000.0)
+    with caplog.at_level("INFO", logger="agentcall.webrtc_ice"):
+        webrtc_ice._early_complete_hook(controlled, pair)
+        assert pair.nominated and controlled._agentcall_early_nominated_components == {1}
+        assert "first-pair-success -> DTLS" in caplog.text
+        webrtc_ice._early_complete_hook(controlled, pair)
+        assert controlled._agentcall_early_nominated_components == {1}
+
+    controlling = SimpleNamespace(ice_controlling=True, _agentcall_first_pair_success_at=None,
+                                  _agentcall_early_nominated_components=set(), _agentcall_early_complete_logged=False,
+                                  _agentcall_connect_started_at=1000.0)
+    other = SimpleNamespace(state=ice.CandidatePair.State.SUCCEEDED, component=1, nominated=False,
+                            local_addr=("a", 1), remote_addr=("b", 2))
+    webrtc_ice._early_complete_hook(controlling, other)
+    assert not other.nominated and not controlling._agentcall_early_nominated_components
+
+
+async def _run_controlled_pair(enabled: bool) -> float:
+    import os
+
+    from aioice import Candidate, Connection, ice
+
+    os.environ["DIRECT_ICE_EARLY_COMPLETE_ENABLED"] = "true" if enabled else "false"
+    webrtc_ice.physical_host_addresses = lambda: ["127.0.0.1"]
+    ice.get_host_addresses = lambda **_: ["127.0.0.1"]
+
+    class Blackhole(asyncio.DatagramProtocol):
+        def datagram_received(self, _data, _addr):
+            pass
+
+    loop = asyncio.get_running_loop()
+    blackhole, _ = await loop.create_datagram_endpoint(Blackhole, local_addr=("127.0.0.1", 0))
+    blackhole_addr = blackhole.get_extra_info("sockname")
+    controlled = Connection(ice_controlling=False)
+    peer = Connection(ice_controlling=True)
+    try:
+        webrtc_ice.configure_connection(controlled)
+        await controlled.gather_candidates()
+        await peer.gather_candidates()
+        controlled.remote_username = peer.local_username
+        controlled.remote_password = peer.local_password
+        peer.remote_username = controlled.local_username
+        peer.remote_password = controlled.local_password
+        await controlled.add_remote_candidate(peer.local_candidates[0])
+        await peer.add_remote_candidate(controlled.local_candidates[0])
+        for i in range(4):
+            await controlled.add_remote_candidate(Candidate(
+                foundation=f"blackhole-{i}", component=1, transport="udp", priority=1,
+                host=blackhole_addr[0], port=blackhole_addr[1], type="host"))
+        await controlled.add_remote_candidate(None)
+        await peer.add_remote_candidate(None)
+
+        original_check_start = peer.check_start
+
+        async def delayed_check_start(pair):
+            await asyncio.sleep(NOMINATION_DELAY)
+            await original_check_start(pair)
+
+        peer.check_start = delayed_check_start
+
+        started = time.monotonic()
+        await asyncio.wait_for(controlled.connect(), timeout=6)
+        return time.monotonic() - started
+    finally:
+        for connection in (controlled, peer):
+            try:
+                await webrtc_ice.stop_connection_checks(connection)
+            finally:
+                await connection.close()
+        blackhole.close()
+
+
+def test_early_complete_flag_cuts_controlled_connect_wait(monkeypatch):
+    off_elapsed = asyncio.run(_run_controlled_pair(enabled=False))
+    on_elapsed = asyncio.run(_run_controlled_pair(enabled=True))
+    assert on_elapsed < 0.4
+    assert off_elapsed > 0.5
+    assert on_elapsed < off_elapsed
+
+
+def test_early_complete_real_aiortc_loopback_media_and_data_channel(monkeypatch):
+    import math
+    import os
+    import struct
+
+    from aioice import ice
+    from aiortc import RTCConfiguration, RTCPeerConnection
+    from aiortc.mediastreams import AudioStreamTrack
+
+    os.environ["DIRECT_ICE_EARLY_COMPLETE_ENABLED"] = "true"
+    monkeypatch.setattr(ice, "get_host_addresses", lambda **_: ["127.0.0.1"])
+    monkeypatch.setattr(webrtc_ice, "physical_host_addresses", lambda: ["127.0.0.1"])
+
+    class ToneTrack(AudioStreamTrack):
+        async def recv(self):
+            frame = await super().recv()
+            pcm = struct.pack("<160h", *(int(6000 * math.sin(2 * math.pi * 440 * n / 8000)) for n in range(160)))
+            frame.planes[0].update(pcm)
+            return frame
+
+    async def scenario():
+        phone = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        answer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        channel = phone.createDataChannel("control")
+        phone.addTrack(ToneTrack())
+        channel_open, frame_received = asyncio.Event(), asyncio.Event()
+        frame_peak = []
+
+        @channel.on("open")
+        def on_open():
+            channel_open.set()
+
+        @answer.on("track")
+        def on_track(track):
+            async def pump():
+                try:
+                    frame = await asyncio.wait_for(track.recv(), 8)
+                    frame_peak.append(abs(frame.to_ndarray()).max())
+                    frame_received.set()
+                except Exception as error:
+                    raise AssertionError(f"remote audio frame timed out: {type(error).__name__}") from error
+
+            asyncio.create_task(pump())
+
+        try:
+            await phone.setLocalDescription(await phone.createOffer())
+            await answer.setRemoteDescription(phone.localDescription)
+            webrtc_ice.configure_peer(answer)
+            # Delay the controlling peer's USE-CANDIDATE so the controlled answerer
+            # self-nominates on its first successful check, exercising the flag path.
+            phone_connection = phone.getTransceivers()[0].receiver.transport.transport._connection
+            original_check_start = phone_connection.check_start
+
+            async def delayed_check_start(pair):
+                await asyncio.sleep(0.3)
+                await original_check_start(pair)
+
+            phone_connection.check_start = delayed_check_start
+            await answer.setLocalDescription(await answer.createAnswer())
+            await phone.setRemoteDescription(answer.localDescription)
+            answer_connection = answer.getTransceivers()[0].receiver.transport.transport._connection
+            assert getattr(answer_connection, "_agentcall_early_complete_logged", False)
+            await asyncio.wait_for(channel_open.wait(), 10)
+            await asyncio.wait_for(frame_received.wait(), 10)
+            assert frame_peak and frame_peak[0] > 500
+            assert channel.readyState == "open"
+        finally:
+            await phone.close()
+            await answer.close()
+
+    asyncio.run(scenario())
