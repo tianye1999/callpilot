@@ -100,6 +100,8 @@ def test_slow_filler_is_precached_once_across_calls(sherpa, monkeypatch):
 def test_default_aishell3_downloads_missing_assets_and_uses_owner_speaker(
     sherpa, monkeypatch, product_latency_defaults,
 ):
+    # 产品默认 TTS 已改千问云；本测试验证「选本地 TTS 时」默认模型仍是 aishell3 + 机主音色 25。
+    monkeypatch.setenv("LOCAL_TTS_PROVIDER", "local")
     selected = local_models.selected_assets()
     assert "vits-icefall-zh-aishell3" in selected[-1].url
     assert "chaowen" not in selected[-1].url

@@ -13,6 +13,12 @@ from agentcall import config, local_models
 from agentcall.local_models import MODEL_ASSETS, ModelAsset
 
 
+@pytest.fixture(autouse=True)
+def _local_tts_provider(monkeypatch):
+    """本文件测试本地 TTS 模型清单与加载；产品默认已改为千问云 TTS，这里显式选本地。"""
+    monkeypatch.setenv("LOCAL_TTS_PROVIDER", "local")
+
+
 def test_manifest_shape_and_ids():
     ids = [asset.id for asset in MODEL_ASSETS]
     assert ids == ["vad", "stt", "tts"]

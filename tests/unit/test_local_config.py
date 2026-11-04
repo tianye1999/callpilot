@@ -26,7 +26,7 @@ from agentcall import config
     ("LOCAL_TTS_PEAK", ""),
     ("LOCAL_ASR_PROVIDER", "local"),
     ("LOCAL_ASR_DASHSCOPE_MODEL", "qwen3-asr-flash-realtime"),
-    ("LOCAL_TTS_PROVIDER", "local"),
+    ("LOCAL_TTS_PROVIDER", "dashscope"),
     ("LOCAL_TTS_DASHSCOPE_MODEL", "qwen3-tts-flash-realtime"),
     ("LOCAL_TTS_DASHSCOPE_VOICE", "Kai"),
     ("LOCAL_FAST_OPENING", "true"),
@@ -60,6 +60,8 @@ def test_speed_switches_allow_explicit_false(monkeypatch, key):
 
 def test_deepseek_credentials_do_not_require_dashscope(monkeypatch):
     monkeypatch.setenv("LOCAL_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("LOCAL_ASR_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_TTS_PROVIDER", "local")
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     assert "DEEPSEEK_API_KEY" in config.validate_provider_credentials("local")[0]

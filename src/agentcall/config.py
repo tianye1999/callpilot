@@ -424,7 +424,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                choices=("local", "dashscope"), requires_restart=True),
     ConfigSpec("LOCAL_ASR_DASHSCOPE_MODEL", "三段式 DashScope ASR 模型", "str",
                "qwen3-asr-flash-realtime", requires_restart=True),
-    ConfigSpec("LOCAL_TTS_PROVIDER", "三段式 TTS 提供方", "select", "local",
+    # owner 11-04：本地 TTS 待全面调研，先用千问云 TTS（音色 Kai）。
+    ConfigSpec("LOCAL_TTS_PROVIDER", "三段式 TTS 提供方", "select", "dashscope",
                choices=("local", "dashscope"), requires_restart=True),
     ConfigSpec("LOCAL_TTS_DASHSCOPE_MODEL", "三段式 DashScope TTS 模型", "str",
                "qwen3-tts-flash-realtime", requires_restart=True),
@@ -472,7 +473,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("MODEM_NETWORK_RECOVERY", "SIM7600 无服务自动恢复（实验）", "bool", "false",
                editable=False, hidden=True, requires_restart=True),
     # Windows/无桥平台：PCM 劣化后由服务在线路空闲时执行 CFUN 软复位（真机验收前关闭）。
-    ConfigSpec("MODEM_SELF_HEAL_ENABLED", "SIM7600 服务内自愈（实验）", "bool", "false",
+    # Windows 无 USB 桥，默认服务内自愈；macOS 由桥负责恢复，默认不在服务内做 CFUN。
+    ConfigSpec("MODEM_SELF_HEAL_ENABLED", "SIM7600 服务内自愈", "bool",
+               "true" if platforms.IS_WINDOWS else "false",
                editable=False, hidden=True, requires_restart=True),
     ConfigSpec("MODEM_PCM_UPLINK_HOLD_MS", "SIM7600 先读后写实验等待毫秒", "int", "0"),
     ConfigSpec("MODEM_PCM_PIN_8K", "SIM7600 PCM 固定 8kHz", "bool",
