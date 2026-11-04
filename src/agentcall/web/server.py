@@ -286,9 +286,10 @@ def build_app(
     app["service"] = service
     app["meta"] = meta or {}
     from ..app_updates import UpdateChecker, watch_updates
-    from ..app_version import RELEASE_NOTES, VERSION
+    from ..app_version import BUILD, RELEASE_NOTES, VERSION
 
     app["version"] = VERSION
+    app["build"] = BUILD
     app["release_notes"] = RELEASE_NOTES
     app["updates"] = UpdateChecker(config.data_dir() / "updates.json")
     app.cleanup_ctx.append(watch_updates)
@@ -600,6 +601,7 @@ def _tray_usb_online(app: web.Application, source: str = "tray") -> bool | None:
 async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
     meta["version"] = request.app["version"]
+    meta["build"] = request.app["build"]
     meta["release_notes"] = request.app["release_notes"]
     meta["update"] = request.app["updates"].snapshot() if _updates_enabled() else None
     meta["executable"] = sys.executable

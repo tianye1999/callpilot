@@ -879,11 +879,16 @@
   .version-footer { flex: none; text-align: center; font-size: 11px; color: var(--muted);
     height: 24px; background: var(--bg); z-index: 31; }
   .dock { bottom: 30px; }
+  #appVersion { overflow-wrap: anywhere; }
+  @media (max-width: 520px) {
+    .version-footer { height: 40px; }
+    .dock { bottom: 46px; }
+  }
   #releaseDialog { width: min(600px, calc(100vw - 32px)); max-height: calc(100vh - 48px);
     padding: 24px; border: 1px solid var(--border); border-radius: 8px;
     color: var(--text); background: var(--bg); }
   #releaseDialog::backdrop { background: rgba(0,0,0,.6); }
-  #releaseDialog h2 { font-size: 20px; }
+  #releaseDialog h2 { font-size: 20px; overflow-wrap: anywhere; }
   #releaseDialog p { white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>
 </head>
@@ -2671,7 +2676,7 @@ async function loadMeta() {
 
 function renderRelease() {
   const meta = lastMeta || {};
-  $("appVersion").textContent = meta.version || "";
+  $("appVersion").textContent = meta.build || meta.version || "";
   const update = meta.update;
   let url;
   try { url = new URL(update?.downloadUrl); } catch (_) { /* absent release */ }
@@ -2686,7 +2691,7 @@ function renderRelease() {
 }
 function showRelease(about) {
   if (callActive || lastMeta?.call_active) return;
-  const release = about ? {version: lastMeta?.version, notes: lastMeta?.release_notes} : lastMeta?.update;
+  const release = about ? {version: lastMeta?.build || lastMeta?.version, notes: lastMeta?.release_notes} : lastMeta?.update;
   if (!release) return;
   $("releaseTitle").textContent = `${about ? t("app_name") : t("update_available")} ${release.version || ""}`;
   $("releaseNotes").textContent = release.notes?.[LANG === "zh" ? "zh" : "en"] || "";

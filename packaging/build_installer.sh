@@ -178,6 +178,7 @@ export AGENTCALL_FFMPEG_PATH="$FFMPEG_BIN"
 export AGENTCALL_LIBUSB_PATH="$LIBUSB_DYLIB"
 
 info "building PyInstaller app"
+"$PYTHON" "$ROOT/packaging/write_build_info.py"
 "$PYTHON" -m PyInstaller --noconfirm --clean \
   --distpath "$DIST_DIR" --workpath "$BUILD_DIR" \
   "$ROOT/packaging/agentcall.spec"

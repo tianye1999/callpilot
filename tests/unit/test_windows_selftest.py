@@ -40,6 +40,11 @@ def test_headless_report_without_hardware(monkeypatch, tmp_path, fail):
         desktop_app.main()
     assert exc.value.code == int(fail)
     assert json.loads(report.read_text(encoding="utf-8"))["ok"] is not fail
+    from agentcall.app_version import BUILD, VERSION
+
+    result = json.loads(report.read_text(encoding="utf-8"))
+    assert result["build"] == BUILD
+    assert result["version"] == VERSION
     assert 'SECRET_SENTINEL' not in report.read_text(encoding='utf-8')
     if not fail:
         assert "webview.platforms.edgechromium" in imports

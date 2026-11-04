@@ -348,6 +348,9 @@ def test_packaging_contract():
     assert 'ISCC' not in workflow
     assert 'setup.exe' not in workflow
     assert 'test_portable.ps1' in workflow
+    assert '$report.build -ne $expectedBuild' in workflow
+    assert '.r$env:GITHUB_RUN_ID' in workflow
+    assert 'build/app/build-info.json' in workflow
 
 
 def test_portable_readonly_runtime_exits_without_fallback(monkeypatch, tmp_path):

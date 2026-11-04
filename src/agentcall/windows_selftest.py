@@ -13,6 +13,7 @@ from pathlib import Path
 
 def run() -> int:
     from . import config, platforms
+    from .app_version import BUILD, VERSION
 
     support = config.app_support_dir()
     report_path = Path(os.environ.get("CALLPILOT_SELFTEST_REPORT", str(support / "selftest.json"))).resolve()
@@ -20,6 +21,7 @@ def run() -> int:
         support.mkdir(parents=True, exist_ok=True)
         os.chdir(support)
     result: dict = {"ok": False, "frozen": bool(getattr(sys, "frozen", False)), "platform": sys.platform}
+    result.update(version=VERSION, build=BUILD)
     transcript = io.StringIO()
     checked = []
     try:

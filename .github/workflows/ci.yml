@@ -60,6 +60,10 @@ jobs:
           if (-not $report.ok -or -not $report.frozen -or $report.platform -ne 'win32') {
             throw 'Invalid frozen selftest report'
           }
+          $expectedBuild = (Get-Content build/app/build-info.json -Raw | ConvertFrom-Json).build
+          if ($report.build -ne $expectedBuild -or -not $report.build.EndsWith(".r$env:GITHUB_RUN_ID")) {
+            throw 'Frozen build identity mismatch'
+          }
           Copy-Item $env:CALLPILOT_SELFTEST_REPORT dist/CallPilot/selftest.json
       - name: Zip portable app
         run: Compress-Archive -Path dist/CallPilot -DestinationPath dist/CallPilot-windows-x64.zip

@@ -38,6 +38,11 @@ New-Item -ItemType Directory -Force -Path $RootFileDir | Out-Null
 $env:AGENTCALL_BUILD_ROOT = $ProjectRoot
 $env:AGENTCALL_BUILD_ROOT_FILE = $RootFile
 
+& $Python (Join-Path $ProjectRoot "packaging\write_build_info.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "Build identity generation failed (exit=$LASTEXITCODE)"
+}
+
 & $Python -m PyInstaller --noconfirm --clean `
     --distpath $DistDir --workpath $BuildDir `
     (Join-Path $ProjectRoot "packaging\agentcall.spec")

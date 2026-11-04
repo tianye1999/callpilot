@@ -162,6 +162,9 @@ def main(*, stop_requested: Callable[[], bool] | None = None, hardware_selftest:
         force=config._is_frozen(),
     )
     logger.info("日志文件: %s", log_file)
+    from agentcall.app_version import BUILD
+
+    logger.info("CallPilot build=%s", BUILD)
 
     provider = config.get_str("AGENT_PROVIDER")
     credential_errors = config.validate_provider_credentials(provider)

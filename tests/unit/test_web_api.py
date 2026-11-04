@@ -1655,6 +1655,30 @@ def test_endpoints_without_service_return_500():
 # ---- /api/meta ----
 
 
+@pytest.mark.parametrize("with_info", [False, True])
+@pytest.mark.parametrize("tray", [False, True])
+def test_meta_build_preserves_release_version(monkeypatch, tmp_path, with_info, tray):
+    import json
+
+    from agentcall import app_version
+
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setattr("sys._MEIPASS", str(tmp_path), raising=False)
+    expected = app_version.VERSION
+    if with_info:
+        expected += "+g96e1622.r41839780534"
+        (tmp_path / "build-info.json").write_text(json.dumps({"build": expected}), encoding="utf-8")
+    monkeypatch.setattr(app_version, "BUILD", app_version._build())
+    app = make_app(FakeService())
+
+    async def check(client):
+        return await (await client.get("/api/meta?tray=1" if tray else "/api/meta")).json()
+
+    meta = api(app, check)
+    assert meta["version"] == app_version.VERSION
+    assert meta["build"] == expected
+
+
 def test_meta_returns_injected_metadata(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("SETUP_DONE", raising=False)

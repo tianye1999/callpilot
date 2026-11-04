@@ -13,6 +13,14 @@ SPEC_FILE = PROJECT_ROOT / "packaging" / "agentcall.spec"
 ENTITLEMENTS_FILE = PROJECT_ROOT / "packaging" / "entitlements.plist"
 
 
+def test_build_identity_is_generated_before_pyinstaller_and_bundled():
+    mac = BUILD_SCRIPT.read_text(encoding="utf-8")
+    windows = (PROJECT_ROOT / "scripts/windows/build_app.ps1").read_text(encoding="utf-8")
+    assert mac.index('"$PYTHON" "$ROOT/packaging/write_build_info.py"') < mac.index('"$PYTHON" -m PyInstaller')
+    assert windows.index('packaging\\write_build_info.py') < windows.index('& $Python -m PyInstaller')
+    assert '"build" / "app" / "build-info.json"' in SPEC_FILE.read_text(encoding="utf-8")
+
+
 def test_build_installer_script_exists_and_builds_app_and_dmg():
     text = BUILD_SCRIPT.read_text(encoding="utf-8")
 

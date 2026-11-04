@@ -31,6 +31,7 @@ from agentcall.platforms import IS_MACOS, IS_WINDOWS
 
 datas = []
 datas.append((str(project_root / "pyproject.toml"), "."))
+datas.append((str(project_root / "build" / "app" / "build-info.json"), "."))
 if IS_WINDOWS:
     datas.append((str(project_root / ".env.example"), "."))
 binaries = []
