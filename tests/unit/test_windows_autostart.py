@@ -63,8 +63,9 @@ def fake_winreg(monkeypatch):
 
 
 def test_run_command_quotes_exe_and_keeps_login_arg():
+    # Path renders with the host separator (backslashes on Windows); assert on that rendering.
     exe = Path("C:/Program Files/CallPilot/CallPilot.exe")
-    assert autostart.run_command(exe) == '"C:/Program Files/CallPilot/CallPilot.exe" --login'
+    assert autostart.run_command(exe) == f'"{exe}" --login'
 
 
 def test_read_run_value_missing_returns_none(fake_winreg):
