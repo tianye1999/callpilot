@@ -1,12 +1,16 @@
 """外壳纯逻辑：不启动 Cocoa、launchd 或真实服务。"""
 
 import json
+import os
 import subprocess
 import sys
 
 import pytest
 
 from agentcall import macos_launchd, macos_shell
+
+_CALLPILOT_GUI_TESTS = os.environ.get("CALLPILOT_GUI_TESTS", "") == "1"
+_GUI_REASON = "需要真实 macOS AppKit；设置 CALLPILOT_GUI_TESTS=1 才会运行"
 
 
 @pytest.mark.parametrize("languages,expected", [
@@ -18,7 +22,7 @@ def test_ui_language_uses_preferred_languages_not_agent_language(monkeypatch, la
     assert macos_shell.ui_language(languages) == expected
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="需要 macOS 原生 run loop，不创建托盘或窗口")
+@pytest.mark.skipif(sys.platform != "darwin" or not _CALLPILOT_GUI_TESTS, reason=_GUI_REASON)
 def test_common_mode_timer_fires_during_menu_tracking():
     result = subprocess.run([sys.executable, "-c", '''
 import time

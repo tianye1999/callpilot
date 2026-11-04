@@ -14,6 +14,41 @@ _SPEED_SWITCHES = (
     "LOCAL_SPECULATIVE_LLM", "LOCAL_LATENCY_METRICS", "PARALLEL_AGENT_CONNECT",
 )
 
+_GUARDED_CALLPILOT_FILES = (
+    "focus-window",
+    "tray-version.json",
+    "listen-window",
+    "shell-requests",
+    "startup-failure.json",
+    "uninstall-ready",
+    "legacy-cleanup.json",
+)
+
+
+def _snapshot_paths(root: Path, names) -> dict[str, int | None]:
+    snapshot: dict[str, int | None] = {}
+    for name in names:
+        path = root / name
+        try:
+            snapshot[name] = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            snapshot[name] = None
+    return snapshot
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_real_callpilot_data_dir():
+    """会话结束校验真实 CallPilot 数据目录未被测试改写；目录不存在则跳过。"""
+    root = Path.home() / "Library" / "Application Support" / "CallPilot"
+    if not root.is_dir():
+        yield
+        return
+    before = _snapshot_paths(root, _GUARDED_CALLPILOT_FILES)
+    yield
+    after = _snapshot_paths(root, _GUARDED_CALLPILOT_FILES)
+    changed = [name for name in _GUARDED_CALLPILOT_FILES if before[name] != after[name]]
+    assert not changed, "测试会话改写了真实 CallPilot 数据目录: " + ", ".join(changed)
+
 
 @pytest.fixture(autouse=True)
 def _explicit_legacy_latency_mode(monkeypatch):
@@ -70,6 +105,31 @@ def _isolate_side_effects(tmp_path, monkeypatch):
     yield
     reset_sms_rate_limit_state()
     reset_shared_speech_models()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_macos_runtime_dirs(tmp_path, monkeypatch):
+    """把 bundled macOS 用户目录入口重定向到本次测试的临时目录。
+
+    打包版分支经 ``macos_launchd.app_support_dir()`` / ``launch_agents_dir()`` 解析
+    ``~/Library/...``；不重定向会在本机真实 CallPilot 目录写 focus-window 等文件。
+    ``app_support_dir`` 走项目已有 ``AGENTCALL_APP_SUPPORT_DIR`` 覆写，显式清空该变量
+    的测试（如 display_branding）恢复原始默认解析；``launch_agents_dir`` 无覆写变量，
+    直接打桩到 tmp，并保留显式 ``home`` 参数的语义。
+    """
+    from agentcall import macos_launchd
+
+    support = tmp_path / "app-support"
+    monkeypatch.setenv("AGENTCALL_APP_SUPPORT_DIR", str(support))
+
+    original_launch_agents = macos_launchd.launch_agents_dir
+
+    def scoped_launch_agents(home=None):
+        if home is not None:
+            return original_launch_agents(home)
+        return tmp_path / "LaunchAgents"
+
+    monkeypatch.setattr(macos_launchd, "launch_agents_dir", scoped_launch_agents)
 
 
 @pytest.fixture

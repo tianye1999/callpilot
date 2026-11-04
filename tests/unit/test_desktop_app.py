@@ -16,6 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import desktop_app
 
+_CALLPILOT_GUI_TESTS = os.environ.get("CALLPILOT_GUI_TESTS", "") == "1"
+_COCOA_GUI_REASON = "需要真实 macOS Cocoa 窗口；设置 CALLPILOT_GUI_TESTS=1 才会运行"
+
 
 def _cocoa_test_env(home):
     # pywebview 私密模式也使用默认 WebKit datastore；业务 support_dir 隔离还不够。
@@ -72,7 +75,7 @@ def test_native_startup_precedes_webview_import(monkeypatch, tmp_path):
     assert calls == ["native-visible", "webview-import", "webview-create", "hooks", "runloop", "splash-close"]
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="需要真实 macOS Cocoa 窗口")
+@pytest.mark.skipif(sys.platform != "darwin" or not _CALLPILOT_GUI_TESTS, reason=_COCOA_GUI_REASON)
 def test_native_startup_handoff_has_one_visible_window_and_preserves_geometry(tmp_path):
     result = subprocess.run([sys.executable, "-c", '''
 import json, sys
@@ -119,7 +122,7 @@ assert json.loads((support / 'window.json').read_text(encoding='utf-8')) == expe
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="需要真实 macOS Cocoa 窗口")
+@pytest.mark.skipif(sys.platform != "darwin" or not _CALLPILOT_GUI_TESTS, reason=_COCOA_GUI_REASON)
 def test_native_startup_close_and_quit_before_handoff(tmp_path):
     result = subprocess.run([sys.executable, "-c", '''
 import sys
@@ -195,7 +198,7 @@ def test_migration_window_automatically_enters_dashboard_after_failure_cleared(m
     assert macos_shell.take_commands(tmp_path) == set()
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="需要真实 macOS Cocoa/PyObjC")
+@pytest.mark.skipif(sys.platform != "darwin" or not _CALLPILOT_GUI_TESTS, reason=_COCOA_GUI_REASON)
 @pytest.mark.parametrize("preloaded", [False, True])
 def test_real_cocoa_window_hooks_install_without_bad_prototype(tmp_path, preloaded):
     # 子进程隔离真实 ObjC 类修改，不启动窗口或事件循环。
