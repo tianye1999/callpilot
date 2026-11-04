@@ -36,7 +36,7 @@ def run() -> int:
             if platforms.IS_WINDOWS:
                 # Load the native/pythonnet assemblies but never construct a Form.
                 for name in ("clr", "webview.platforms.winforms", "webview.platforms.edgechromium",
-                             "pystray._win32", "PIL.Image", "agentcall.windows_runtime"):
+                             "pystray._win32", "PIL.Image", "agentcall.windows_runtime", "sherpa_onnx"):
                     importlib.import_module(name)
                     checked.append(name)
         result["defaults"] = {

@@ -820,6 +820,11 @@
   .setup-status.ok { color: var(--ok); border-color: rgba(48,209,88,.36); background: var(--ok-dim); }
   .setup-status.err { color: var(--err); border-color: rgba(255,69,58,.36); background: var(--err-dim); }
   .setup-status:empty { display: none; }
+  .model-download { margin-top: 14px; }
+  .model-download .dl-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .dl-bar { height: 6px; border-radius: 3px; background: var(--well); overflow: hidden; flex: 1; min-width: 120px; margin-top: 10px; }
+  .dl-bar > i { display: block; height: 100%; width: 0; background: var(--blue); transition: width .2s ease; }
+  .dl-meta { margin-top: 6px; font-size: 12px; color: var(--muted); line-height: 1.5; }
   .setup-actions {
     padding: 14px 24px 20px; display: flex; gap: 10px; justify-content: flex-end;
     border-top: 1px solid var(--border);
@@ -1206,6 +1211,15 @@
             <button class="btn danger sm" id="macosUninstall" type="button" hidden
                     data-i18n="macos_uninstall"></button>
           </div>
+          <div class="model-download" id="panelLocalModels" hidden>
+            <div class="dl-row">
+              <button class="btn primary sm" id="panelDownloadModels"></button>
+              <button class="btn ghost sm" id="panelCancelModels" hidden data-i18n="local_models_cancel"></button>
+            </div>
+            <div class="dl-bar" id="panelDlBar" hidden><i id="panelDlFill"></i></div>
+            <div class="dl-meta" id="panelDlMeta"></div>
+            <div class="setup-status" id="panelDlStatus"></div>
+          </div>
           <div id="configForm"><div class="empty" data-i18n="cfg_loading"></div></div>
           <div class="cfg-save">
             <button class="btn primary sm" id="configSave" data-i18n="cfg_save"></button>
@@ -1315,6 +1329,15 @@
           <p class="setup-key-help" id="setupDeepseekKeyHelp">
             <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener noreferrer" data-i18n="setup_deepseek_apply"></a>
           </p>
+          <div class="model-download" id="setupLocalModels" hidden>
+            <div class="dl-row">
+              <button class="btn primary sm" id="setupDownloadModels"></button>
+              <button class="btn ghost sm" id="setupCancelModels" hidden data-i18n="local_models_cancel"></button>
+            </div>
+            <div class="dl-bar" id="setupDlBar" hidden><i id="setupDlFill"></i></div>
+            <div class="dl-meta" id="setupDlMeta"></div>
+            <div class="setup-status" id="setupDlStatus"></div>
+          </div>
           <div style="margin-top:12px">
             <button class="btn ghost sm" id="setupValidateKey" data-i18n="setup_validate"></button>
           </div>
@@ -1691,6 +1714,14 @@ const I18N = {
     setup_validating: "Validating…", setup_key_valid: "Key is valid.", setup_key_invalid: "Key is invalid. Check that you copied all of it, or create a new one in the provider console.",
     setup_key_network: "Network unavailable or provider timed out.", setup_key_unsupported: "Online validation is not available for this provider.",
     setup_key_saved: "Provider settings saved.", setup_doubao_note: "Doubao is experimental. App ID and Access Key will be saved without online validation.",
+    local_models_missing: "The local speech models are not ready yet.",
+    local_models_ready: "Local speech models are ready.",
+    local_models_download: (mb) => `Download local speech models (~${mb} MB)`,
+    local_models_downloading: "Downloading local speech models…",
+    local_models_cancel: "Cancel",
+    local_models_cancelled: "Download cancelled. You can start it again.",
+    local_models_error: "Download failed: ",
+    local_models_progress: (done, total, file) => `${done} / ${total} MB${file ? " · " + file : ""}`,
     setup_person_title: "Personalize", setup_person_hint: "These values shape how the assistant introduces itself and which language it uses in calls.",
     setup_owner: "Owner name", setup_persona: "AI persona title", setup_call_lang: "Call language", setup_voice: "Voice",
     setup_person_saved: "Personalization saved.",
@@ -2022,6 +2053,14 @@ const I18N = {
     setup_validating: "正在校验…", setup_key_valid: "Key 有效。", setup_key_invalid: "Key 无效，请检查是否复制完整，或到对应平台后台重新生成一个。",
     setup_key_network: "网络不通或 provider 超时。", setup_key_unsupported: "该 provider 暂不支持在线校验。",
     setup_key_saved: "Provider 设置已保存。", setup_doubao_note: "Doubao 仍为实验支持，将保存 App ID 和 Access Key，但不做在线校验。",
+    local_models_missing: "本地语音模型尚未就绪。",
+    local_models_ready: "本地语音模型已就绪。",
+    local_models_download: (mb) => `下载本地语音模型（约 ${mb} MB）`,
+    local_models_downloading: "正在下载本地语音模型…",
+    local_models_cancel: "取消",
+    local_models_cancelled: "已取消，可重新下载。",
+    local_models_error: "下载失败：",
+    local_models_progress: (done, total, file) => `${done} / ${total} MB${file ? " · " + file : ""}`,
     setup_person_title: "个性化", setup_person_hint: "这些信息会影响 AI 如何介绍自己，以及通话时使用的语言。",
     setup_owner: "机主姓名", setup_persona: "AI 人设称谓", setup_call_lang: "通话语言", setup_voice: "音色",
     setup_person_saved: "个性化设置已保存。",
@@ -3974,6 +4013,7 @@ function renderSetupWizard() {
   renderSetupRecordingDetails();
   renderSetupReadySummary();
   renderSetupCall();
+  void refreshLocalModels();
   if (setupStep === 5) void refreshSetupNotifications();
 }
 
@@ -4062,6 +4102,77 @@ function setupStatus(id, kind, text) {
   const node = $(id);
   node.className = "setup-status" + (kind ? " " + kind : "");
   node.textContent = text;
+}
+
+/* ========= 本地语音模型下载 ========= */
+let localModelsTimer = null;
+function fmtMb(bytes) { return Math.max(1, Math.round((Number(bytes) || 0) / 1048576)); }
+async function fetchLocalModels() {
+  try {
+    const r = await fetch("/api/local_models", { cache: "no-store" });
+    if (r.ok) return await r.json();
+  } catch (e) { console.warn("[local-models] 读取状态失败", e); }
+  return null;
+}
+function renderLocalModels(prefix, info) {
+  const block = $(prefix + "LocalModels");
+  if (!block) return;
+  block.hidden = !(info && info.enabled);
+  if (!info || !info.enabled) return;
+  const ready = !!info.ready;
+  const progress = info.progress || {};
+  const running = progress.status === "running";
+  const downloadBtn = $(prefix + "DownloadModels");
+  const cancelBtn = $(prefix + "CancelModels");
+  const bar = $(prefix + "DlBar");
+  const fill = $(prefix + "DlFill");
+  const meta = $(prefix + "DlMeta");
+  const statusId = prefix + "DlStatus";
+  if (ready && !running) {
+    block.hidden = true;
+    return;
+  }
+  downloadBtn.textContent = t("local_models_download")(fmtMb(info.total_bytes));
+  downloadBtn.hidden = running;
+  cancelBtn.hidden = !running;
+  if (running) {
+    bar.hidden = false;
+    const total = progress.total_bytes || info.total_bytes || 0;
+    const received = progress.received_bytes || 0;
+    const pct = total ? Math.min(100, Math.round(received * 100 / total)) : 0;
+    fill.style.width = pct + "%";
+    meta.textContent = t("local_models_progress")(
+      (received / 1048576).toFixed(1), (total / 1048576).toFixed(1), progress.current_file || "");
+    setupStatus(statusId, "", t("local_models_downloading"));
+  } else {
+    bar.hidden = true; meta.textContent = "";
+    if (progress.error) setupStatus(statusId, "err", t("local_models_error") + progress.error);
+    else if (progress.status === "cancelled") setupStatus(statusId, "", t("local_models_cancelled"));
+    else setupStatus(statusId, "", t("local_models_missing"));
+  }
+}
+async function refreshLocalModels() {
+  const info = await fetchLocalModels();
+  if (!info) return;
+  renderLocalModels("setup", info);
+  renderLocalModels("panel", info);
+}
+function scheduleLocalModelsPoll() {
+  clearTimeout(localModelsTimer);
+  localModelsTimer = setTimeout(async () => {
+    await refreshLocalModels();
+    const info = await fetchLocalModels();
+    if (info && info.progress && info.progress.status === "running") scheduleLocalModelsPoll();
+  }, 1000);
+}
+async function startLocalModels() {
+  await postJson("/api/local_models/download", {});
+  await refreshLocalModels();
+  scheduleLocalModelsPoll();
+}
+async function cancelLocalModels() {
+  await postJson("/api/local_models/cancel", {});
+  await refreshLocalModels();
 }
 
 function statusWord(ok) {
@@ -4664,6 +4775,7 @@ async function loadConfig() {
     }
     cfgDirty = false;  // 刚从服务端同步，视为无未保存修改
     syncRecordingUi();
+    void refreshLocalModels();
   } catch (e) { console.warn("[config] 加载设置面板失败", e); }
 }
 // 手动重启按钮：确认后重启服务（可从界面重连模组/恢复，无需命令行）。
@@ -4785,6 +4897,11 @@ refreshQueue();
 loadConfig();
 loadDialPresets();
 loadRemoteDialerStatus();
+void refreshLocalModels();
+$("setupDownloadModels").addEventListener("click", startLocalModels);
+$("setupCancelModels").addEventListener("click", cancelLocalModels);
+$("panelDownloadModels").addEventListener("click", startLocalModels);
+$("panelCancelModels").addEventListener("click", cancelLocalModels);
 setInterval(refreshQueue, 2000);
 // 支持 /#metrics 直达指标面板（旧 /static/metrics.html 链接由后端 302 到这里）。
 if (location.hash === "#metrics") navTo("metrics");

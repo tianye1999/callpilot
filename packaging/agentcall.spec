@@ -75,15 +75,17 @@ hiddenimports += _keyring_hidden
 hiddenimports += collect_submodules("keyring.backends")
 
 # 三段式 local provider 的 sherpa-onnx（可选依赖）：装了才收进包。
-# 打包 venv 由 build_installer.sh 的 [local] extra 装入；缺失时静默跳过，
-# 产出仍是可用的 realtime-only 包（不硬依赖三段式）。
+# 打包 venv 由 build_installer.sh / Windows CI 的 [local] extra 装入。
+# Windows 绿色版默认 AGENT_PROVIDER=local，必须捆绑 sherpa-onnx，缺失即失败；
+# 其余平台缺失时静默跳过，产出仍是可用的 realtime-only 包。
 try:
     _sherpa_datas, _sherpa_binaries, _sherpa_hidden = collect_all("sherpa_onnx")
     datas += _sherpa_datas
     binaries += _sherpa_binaries
     hiddenimports += _sherpa_hidden
-except Exception:
-    pass
+except Exception as exc:
+    if IS_WINDOWS:
+        raise RuntimeError("Windows 绿色版必须捆绑 sherpa-onnx：先 pip install '.[local]'") from exc
 
 # 菜单栏图标资源随包内嵌（tray_app.icon_path 经 _MEIPASS/menubar 解析）
 _menubar_dir = project_root / "packaging" / "menubar"

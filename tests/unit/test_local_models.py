@@ -58,7 +58,7 @@ def test_ensure_asset_archive_download_and_extract(tmp_path, monkeypatch):
         required_files=("pkg/model.onnx", "pkg/tokens.txt"),
     )
 
-    def fake_download(url, dest):
+    def fake_download(url, dest, **kwargs):
         src = tmp_path / "src" / "pkg"
         src.mkdir(parents=True)
         (src / "model.onnx").write_bytes(b"m")

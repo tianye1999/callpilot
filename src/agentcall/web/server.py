@@ -25,7 +25,7 @@ from aiohttp import WSMsgType, web
 from aiohttp.web_log import AccessLogger
 from serial.tools import list_ports
 
-from .. import config, metrics_report, modem_hardware, platforms
+from .. import config, local_models, metrics_report, modem_hardware, platforms
 from ..audio_bridge import apply_pcm_gain
 from ..call_playbooks import list_playbooks, playbooks_enabled
 from ..contacts import is_reply_target_allowed
@@ -301,6 +301,7 @@ def build_app(
     app["remote_cloud_api"] = remote_cloud_api
     app["remote_cloud_store"] = remote_cloud_store
     app["remote_cloud_client"] = remote_cloud_client
+    app["local_models_downloader"] = local_models.ModelDownloadManager()
     if restart_event is not None and getattr(service, "_auto_modem", False):
         app.cleanup_ctx.append(_watch_modem_vendor)
 
@@ -365,6 +366,9 @@ def build_app(
     app.router.add_get("/api/config", _get_config)
     app.router.add_post("/api/config", _post_config)
     app.router.add_post("/api/config/validate_key", _validate_key)
+    app.router.add_get("/api/local_models", _local_models_status)
+    app.router.add_post("/api/local_models/download", _local_models_download)
+    app.router.add_post("/api/local_models/cancel", _local_models_cancel)
     app.router.add_post("/api/setup/complete", _setup_complete)
     app.router.add_post("/api/setup/test_sms", _setup_test_sms)
     app.router.add_post("/api/setup/test_call", _setup_test_call)
@@ -1542,6 +1546,44 @@ async def _validate_key(request: web.Request) -> web.Response:
     if result.message:
         payload["message"] = result.message
     return web.json_response(payload)
+
+
+def _local_models_payload(app: web.Application) -> dict:
+    """本地模型的就绪状态 + 后台下载进度，供向导与设置面板共用。"""
+    manager: local_models.ModelDownloadManager = app["local_models_downloader"]
+    enabled = config.get_str("AGENT_PROVIDER") == "local"
+    missing = local_models.missing_assets()
+    total = sum(asset.size or 0 for asset in missing)
+    return {
+        "ok": True,
+        "enabled": enabled,
+        "ready": not missing,
+        "total_bytes": total,
+        "missing": [{"id": asset.id, "description": asset.description, "size": asset.size or 0}
+                    for asset in missing],
+        "progress": manager.snapshot(),
+    }
+
+
+async def _local_models_status(request: web.Request) -> web.Response:
+    _require_local(request)
+    return web.json_response(_local_models_payload(request.app))
+
+
+async def _local_models_download(request: web.Request) -> web.Response:
+    _require_local(request)
+    manager: local_models.ModelDownloadManager = request.app["local_models_downloader"]
+    if manager.is_running():
+        return web.json_response(_local_models_payload(request.app))
+    started = manager.start()
+    status = 202 if started else 409
+    return web.json_response(_local_models_payload(request.app), status=status)
+
+
+async def _local_models_cancel(request: web.Request) -> web.Response:
+    _require_local(request)
+    request.app["local_models_downloader"].cancel()
+    return web.json_response({"ok": True})
 
 
 async def _setup_complete(request: web.Request) -> web.Response:

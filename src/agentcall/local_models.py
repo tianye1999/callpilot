@@ -18,14 +18,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
+import os
 import sys
 import tarfile
-import tempfile
+import threading
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import config
 
@@ -36,16 +38,23 @@ _RELEASE_BASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 
 @dataclass(frozen=True)
 class ModelAsset:
-    """一件模型资产：下载地址 + 解压后必须存在的文件（相对 models 根目录）。"""
+    """一件模型资产：下载地址 + 解压后必须存在的文件（相对 models 根目录）。
+
+    ``size``/``sha256`` 为可选的下载产物校验值；``size`` 同时用于进度合计与
+    断点续传（半成品超过该值即判损坏重下）。上游 GitHub Release 不发布哈希，
+    清单当前只填 ``size``，``sha256`` 保留为空以支持未来镜像侧校验。
+    """
 
     id: str
     description: str
     url: str
     # 归档内应出现的关键文件（相对 models_dir）；全部存在视为已就绪。
     required_files: tuple[str, ...]
-    # None = 单文件直下（存为 required_files[0]）；否则 tar.bz2 解压到 models_dir。
+    # False = 单文件直下（存为 required_files[0]）；否则 tar.bz2 解压到 models_dir。
     archive: bool = True
     required_dirs: tuple[str, ...] = ()
+    size: int | None = None
+    sha256: str | None = None
 
 
 MODEL_ASSETS: tuple[ModelAsset, ...] = (
@@ -55,6 +64,7 @@ MODEL_ASSETS: tuple[ModelAsset, ...] = (
         url=f"{_RELEASE_BASE}/asr-models/silero_vad.onnx",
         required_files=("silero_vad.onnx",),
         archive=False,
+        size=643854,
     ),
     ModelAsset(
         id="stt",
@@ -64,6 +74,7 @@ MODEL_ASSETS: tuple[ModelAsset, ...] = (
             "sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx",
             "sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt",
         ),
+        size=234051698,
     ),
     ModelAsset(
         id="tts",
@@ -74,6 +85,7 @@ MODEL_ASSETS: tuple[ModelAsset, ...] = (
             "vits-piper-zh_CN-chaowen-medium-int8/tokens.txt",
             "vits-piper-zh_CN-chaowen-medium-int8/lexicon.txt",
         ),
+        size=14011298,
     ),
 )
 
@@ -120,6 +132,7 @@ TTS_MODELS: dict[str, TtsModel] = {
                 id="vocoder", description="Vocos universal 22kHz vocoder",
                 url=f"{_RELEASE_BASE}/vocoder-models/vocos-22khz-univ.onnx",
                 required_files=("vocos-22khz-univ.onnx",), archive=False,
+                size=53884024,
             ),
         ),
         files={"acoustic_model": f"{_BAKER}/model-steps-3.onnx",
@@ -153,6 +166,7 @@ TTS_MODELS: dict[str, TtsModel] = {
                 "model.onnx", "lexicon.txt", "tokens.txt",
                 "phone.fst", "date.fst", "number.fst", "new_heteronym.fst",
             )),
+            size=31559701,
         ),),
         files={"model": f"{_AISHELL3}/model.onnx", "lexicon": f"{_AISHELL3}/lexicon.txt",
                "tokens": f"{_AISHELL3}/tokens.txt"},
@@ -171,6 +185,20 @@ def tts_model(name: str | None = None) -> TtsModel:
 
 def selected_assets() -> tuple[ModelAsset, ...]:
     return MODEL_ASSETS[:2] + tts_model().assets
+
+
+def resolved_url(asset: ModelAsset) -> str:
+    """按 LOCAL_MODELS_MIRROR 整体替换清单固定下载前缀；空镜像用原地址。
+
+    镜像只替换 ``_RELEASE_BASE`` 前缀，其后资产路径原样拼接；不接收前端传入的
+    任意 URL，也不会让配置项脱离固定清单地址。
+    """
+    mirror = config.get_str("LOCAL_MODELS_MIRROR").strip()
+    if not mirror:
+        return asset.url
+    if asset.url.startswith(_RELEASE_BASE):
+        return mirror.rstrip("/") + asset.url[len(_RELEASE_BASE):]
+    return asset.url
 
 
 def build_tts_config(sherpa: Any, root: Path, name: str | None = None) -> Any:
@@ -237,30 +265,75 @@ def missing_assets(base: Path | None = None) -> list[ModelAsset]:
     return [asset for asset in selected_assets() if not asset_ready(asset, base)]
 
 
-def _download(url: str, dest: Path) -> None:
-    """流式下载到临时文件后原子替换；进度按 10% 粒度打日志。"""
+class DownloadCancelled(Exception):
+    """后台下载被用户取消；调用方据此归为已取消而非错误。"""
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 256), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _download(
+    url: str,
+    dest: Path,
+    *,
+    size: int | None = None,
+    sha256: str | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    cancel: threading.Event | None = None,
+) -> None:
+    """流式下载到 ``<dest>.part`` 后原子替换，支持 Range 断点续传。
+
+    半成品留在 ``.part``：取消/网络中断下次从已有字节续传；校验失败则删除
+    半成品，避免把损坏文件当续传起点。
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("下载 %s", url)
-    with urllib.request.urlopen(url, timeout=60) as response:
-        total = int(response.headers.get("Content-Length") or 0)
-        received = 0
-        next_report = 10
-        with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            try:
-                while True:
-                    chunk = response.read(1024 * 256)
-                    if not chunk:
-                        break
-                    tmp.write(chunk)
-                    received += len(chunk)
-                    if total and received * 100 // total >= next_report:
-                        logger.info("  %d%% (%.1f/%.1f MB)", next_report, received / 1e6, total / 1e6)
-                        next_report += 10
-            except BaseException:
-                tmp_path.unlink(missing_ok=True)
-                raise
-    tmp_path.replace(dest)
+    partial = dest.with_name(dest.name + ".part")
+    headers: dict[str, str] = {}
+    received = 0
+    if partial.is_file():
+        received = partial.stat().st_size
+        if size is not None and received >= size:
+            partial.unlink(missing_ok=True)
+            received = 0
+        else:
+            headers["Range"] = f"bytes={received}-"
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=60) as response:
+        status = getattr(response, "status", 200)
+        if status == 206:
+            total = received + int(response.headers.get("Content-Length") or 0)
+            mode = "ab"
+        else:
+            total = int(response.headers.get("Content-Length") or 0)
+            received = 0
+            mode = "wb"
+        with partial.open(mode) as handle:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise DownloadCancelled(url)
+                chunk = response.read(1024 * 256)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                received += len(chunk)
+                if progress is not None:
+                    progress(received, total)
+    if size is not None and received != size:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"模型下载大小校验失败: {dest.name} 期望 {size} 字节，实际 {received} 字节"
+        )
+    if sha256 is not None:
+        actual = _sha256_file(partial)
+        if actual.lower() != sha256.lower():
+            partial.unlink(missing_ok=True)
+            raise RuntimeError(f"模型下载哈希校验失败: {dest.name} 期望 {sha256}，实际 {actual}")
+    os.replace(partial, dest)
 
 
 def _extract_archive(archive_path: Path, target_dir: Path) -> None:
@@ -270,7 +343,24 @@ def _extract_archive(archive_path: Path, target_dir: Path) -> None:
         tar.extractall(target_dir, filter="data")
 
 
-def ensure_asset(asset: ModelAsset, base: Path | None = None) -> bool:
+def _artifact_valid(path: Path, asset: ModelAsset) -> bool:
+    """已存在的归档/单文件是否与清单一致，一致则可免重下直接进入解压。"""
+    if not path.is_file():
+        return False
+    if asset.size is not None and path.stat().st_size != asset.size:
+        return False
+    if asset.sha256 is not None and _sha256_file(path).lower() != asset.sha256.lower():
+        return False
+    return True
+
+
+def ensure_asset(
+    asset: ModelAsset,
+    base: Path | None = None,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+    cancel: threading.Event | None = None,
+) -> bool:
     """确保一件资产就绪；返回是否发生了下载。失败抛异常（调用方决定降级）。"""
     root = base if base is not None else models_dir()
     if asset_ready(asset, root):
@@ -278,16 +368,18 @@ def ensure_asset(asset: ModelAsset, base: Path | None = None) -> bool:
     bundled = bundled_models_dir()
     if bundled is not None and root.resolve().is_relative_to(bundled.resolve()):
         raise RuntimeError("包内模型目录只读，请在用户数据目录准备缺失模型")
+    url = resolved_url(asset)
     if not asset.archive:
-        _download(asset.url, root / asset.required_files[0])
+        _download(url, root / asset.required_files[0], size=asset.size, sha256=asset.sha256,
+                  progress=progress, cancel=cancel)
     else:
-        archive_name = asset.url.rsplit("/", 1)[-1]
+        archive_name = url.rsplit("/", 1)[-1]
         archive_path = root / archive_name
-        _download(asset.url, archive_path)
-        try:
-            _extract_archive(archive_path, root)
-        finally:
-            archive_path.unlink(missing_ok=True)
+        if not _artifact_valid(archive_path, asset):
+            _download(url, archive_path, size=asset.size, sha256=asset.sha256,
+                      progress=progress, cancel=cancel)
+        _extract_archive(archive_path, root)
+        archive_path.unlink(missing_ok=True)
     still_missing = [rel for rel, path in asset_paths(asset, root).items() if not path.is_file()]
     still_missing.extend(rel for rel in asset.required_dirs if not (root / rel).is_dir())
     if still_missing:
@@ -308,6 +400,77 @@ def resolved_paths(base: Path | None = None) -> dict[str, Path]:
     """不下载，仅返回资产关键文件路径（调用方自查存在性）。"""
     root = base if base is not None else models_dir()
     return {asset.id: root / asset.required_files[0] for asset in selected_assets()}
+
+
+def _readable_error(exc: Exception) -> str:
+    text = str(exc).strip()
+    return text if text else type(exc).__name__
+
+
+class ModelDownloadManager:
+    """后台串行下载缺失模型，线程安全暴露进度供 Web 接口查询。"""
+
+    def __init__(self, base: Path | None = None) -> None:
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._base = base
+        self._state: dict[str, object] = {
+            "status": "idle", "received_bytes": 0, "total_bytes": 0,
+            "current_file": "", "current_asset": "", "error": "",
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return dict(self._state)
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._state["status"] == "running"
+
+    def start(self, base: Path | None = None) -> bool:
+        with self._lock:
+            if self._state["status"] == "running":
+                return False
+            self._cancel.clear()
+            self._thread = threading.Thread(
+                target=self._run, args=(base if base is not None else self._base,), daemon=True
+            )
+            self._thread.start()
+            return True
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def _set(self, **fields: object) -> None:
+        with self._lock:
+            self._state.update(fields)
+
+    def _run(self, base: Path | None) -> None:
+        root = base if base is not None else models_dir()
+        missing = missing_assets(root)
+        total = sum(asset.size or 0 for asset in missing)
+        self._set(status="running", received_bytes=0, total_bytes=total,
+                  current_file="", current_asset="", error="")
+        completed = 0
+        try:
+            for asset in missing:
+                name = (resolved_url(asset).rsplit("/", 1)[-1] if asset.archive
+                        else asset.required_files[0])
+                self._set(current_asset=asset.id, current_file=name)
+
+                def on_progress(received: int, _total: int) -> None:
+                    self._set(received_bytes=completed + received, current_file=name)
+
+                ensure_asset(asset, root, progress=on_progress, cancel=self._cancel)
+                completed += asset.size or 0
+        except DownloadCancelled:
+            self._set(status="cancelled", error="")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("本地模型下载失败: %s", exc)
+            self._set(status="error", error=_readable_error(exc))
+        else:
+            self._set(status="done", received_bytes=total, current_file="", current_asset="")
 
 
 def main(argv: list[str] | None = None) -> int:

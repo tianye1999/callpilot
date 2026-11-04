@@ -31,7 +31,8 @@ jobs:
             pyproject.toml
             .github/workflows/ci.yml
       - name: Install packaging dependencies
-        run: python -m pip install . "pyinstaller>=6.11,<7" "pyinstaller-hooks-contrib>=2025.1" "pillow>=11,<13" "pythonnet>=3,<4"
+        # [local] bundles sherpa-onnx into the portable Windows build (AGENT_PROVIDER=local default).
+        run: python -m pip install ".[local]" "pyinstaller>=6.11,<7" "pyinstaller-hooks-contrib>=2025.1" "pillow>=11,<13" "pythonnet>=3,<4"
       - name: Build
         run: |
           # CallPilot.ico is committed; its .icns source is a gitignored local asset
