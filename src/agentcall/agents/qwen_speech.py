@@ -38,6 +38,12 @@ _ASR_DEADLINE = 20.0
 # 网络级故障可以换连接重试一次；鉴权/协议错误（如 InvalidStatus）不是瞬态。
 _RETRYABLE = (OSError, TimeoutError, ConnectionClosed)
 
+# 保活：websockets 自带 keepalive ping；服务端若仍按空闲时长关闭，超过闲置阈值后
+# ensure_ready() 会在可能要说话前主动换新连接，真正合成时不付建连开销。
+_PING_INTERVAL = 20.0
+_PING_TIMEOUT = 20.0
+_IDLE_RECONNECT_AFTER = 30.0
+
 
 class QwenSpeechError(RuntimeError):
     """云端语音鉴权或协议错误；不重试，由调用方回落本地。"""
@@ -90,6 +96,14 @@ class _SyncWs:
         self._key = key
         self._ws: Any = None
         self._lock = threading.Lock()
+        self._last_used_at = 0.0
+        self._connecting = False
+        self._closing = False
+        self._ready_thread: threading.Thread | None = None
+        self._label = "qwen"
+
+    def _session_update(self) -> dict[str, Any]:
+        raise NotImplementedError
 
     def _connect(self) -> Any:
         try:
@@ -98,6 +112,8 @@ class _SyncWs:
                 additional_headers=_headers(self._key),
                 open_timeout=_OPEN_TIMEOUT,
                 close_timeout=_CLOSE_TIMEOUT,
+                ping_interval=_PING_INTERVAL,
+                ping_timeout=_PING_TIMEOUT,
             )
         except InvalidStatus as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -106,13 +122,34 @@ class _SyncWs:
             raise QwenSpeechError(f"云端语音连接失败: {type(exc).__name__}") from exc
         return ws
 
+    @staticmethod
+    def _safe_close(ws: Any) -> None:
+        try:
+            ws.close()
+        except Exception:  # noqa: BLE001 - 关闭失败不影响后续
+            pass
+
+    def _touch(self) -> None:
+        self._last_used_at = time.monotonic()
+
+    @staticmethod
+    def _is_open(ws: Any) -> bool:
+        state = getattr(ws, "state", None)
+        if state is None:
+            return True
+        try:
+            return int(state) == 1
+        except (TypeError, ValueError):
+            return True
+
     def _discard(self) -> None:
         ws, self._ws = self._ws, None
         if ws is not None:
-            try:
-                ws.close()
-            except Exception:  # noqa: BLE001 - 关闭失败不影响后续
-                pass
+            self._safe_close(ws)
+
+    def _establish(self, ws: Any) -> None:
+        ws.send(json.dumps({"type": "session.update", "session": self._session_update()}))
+        self._await_session_ready(ws)
 
     def _await_session_ready(self, ws: Any) -> None:
         """session.update 后读走初始事件，直到 session.updated 或静默超时。"""
@@ -134,9 +171,80 @@ class _SyncWs:
             if event.get("type") == "error":
                 raise QwenSpeechError(_error_message(event))
 
+    def _ensure_connected(self) -> Any:
+        """建立连接并安装；连接在锁外建立，安装时若已有新连接则放弃本次。"""
+        with self._lock:
+            ws = self._ws
+            if ws is not None:
+                return ws
+        ws = self._connect()
+        try:
+            self._establish(ws)
+        except Exception:
+            self._safe_close(ws)
+            raise
+        with self._lock:
+            existing = self._ws
+            if existing is not None:
+                self._safe_close(ws)
+                return existing
+            if self._closing:
+                self._safe_close(ws)
+                raise QwenSpeechError("连接已关闭")
+            self._ws = ws
+            self._touch()
+            return ws
+
+    def ensure_ready(self) -> None:
+        """异步预连；VAD 起话 / LLM 首字时调用，不阻塞调用线程。"""
+        with self._lock:
+            if self._closing:
+                return
+            ws = self._ws
+            if ws is not None and self._is_open(ws) and time.monotonic() - self._last_used_at <= _IDLE_RECONNECT_AFTER:
+                return
+            if self._connecting:
+                return
+            if ws is None:
+                reason = "missing"
+            elif self._is_open(ws):
+                reason = "idle"
+            else:
+                reason = "closed"
+            if ws is not None:
+                self._discard()
+            self._connecting = True
+            thread = threading.Thread(
+                target=self._ready_worker, args=(reason,), name=f"{self._label}-ready", daemon=True,
+            )
+            self._ready_thread = thread
+        thread.start()
+
+    def _ready_worker(self, reason: str) -> None:
+        started = time.monotonic()
+        try:
+            self._ensure_connected()
+            logger.info(
+                "[%s] ensure_ready reconnected reason=%s duration_ms=%.1f",
+                self._label, reason, (time.monotonic() - started) * 1000,
+            )
+        except Exception as exc:  # noqa: BLE001 - 真正合成时还会兜底重连
+            logger.warning(
+                "[%s] ensure_ready reconnect failed reason=%s error=%s",
+                self._label, reason, type(exc).__name__,
+            )
+        finally:
+            with self._lock:
+                self._connecting = False
+                self._ready_thread = None
+
     def close(self) -> None:
         with self._lock:
+            self._closing = True
             self._discard()
+            thread = self._ready_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=_CLOSE_TIMEOUT)
 
 
 class QwenTtsClient(_SyncWs):
@@ -146,6 +254,7 @@ class QwenTtsClient(_SyncWs):
         super().__init__(model, key)
         self._voice = voice
         self._sample_rate = sample_rate
+        self._label = "qwen_tts"
 
     def _session_update(self) -> dict[str, Any]:
         return {
@@ -155,19 +264,6 @@ class QwenTtsClient(_SyncWs):
             "sample_rate": self._sample_rate,
             "language_type": "Chinese",
         }
-
-    def _ensure_connected(self) -> Any:
-        with self._lock:
-            if self._ws is None:
-                ws = self._connect()
-                try:
-                    ws.send(json.dumps({"type": "session.update", "session": self._session_update()}))
-                    self._await_session_ready(ws)
-                except Exception:
-                    self._discard()
-                    raise
-                self._ws = ws
-            return self._ws
 
     def warmup(self) -> None:
         """会话开始就建好连接，首句不付建连开销。失败仅告警，首句再兜底重连。"""
@@ -186,7 +282,7 @@ class QwenTtsClient(_SyncWs):
         for attempt in (0, 1):
             ws = self._ensure_connected()
             try:
-                return self._generate(ws, text, on_audio, should_stop)
+                done = self._generate(ws, text, on_audio, should_stop)
             except _Cancelled:
                 self._discard()
                 return False
@@ -198,6 +294,8 @@ class QwenTtsClient(_SyncWs):
                 raise QwenSpeechError(f"云端 TTS 流式失败: {type(exc).__name__}") from exc
             except QwenSpeechError:
                 raise
+            self._touch()
+            return done
         return False
 
     def _generate(
@@ -205,6 +303,10 @@ class QwenTtsClient(_SyncWs):
     ) -> bool:
         ws.send(json.dumps({"type": "input_text_buffer.append", "text": text}))
         ws.send(json.dumps({"type": "input_text_buffer.commit"}))
+        # 一次合成必须读到本次响应的 response.done 才算完成；audio.done 只是音频段边界。
+        # 用 response id 过滤掉上一响应可能残留的 content_part/output_item/response.done。
+        response_id: str | None = None
+        audio_bytes = 0
         deadline = time.monotonic() + _TTS_DEADLINE
         while time.monotonic() < deadline:
             if should_stop():
@@ -215,15 +317,37 @@ class QwenTtsClient(_SyncWs):
                 continue
             if isinstance(message, bytes):
                 on_audio(message)
+                audio_bytes += len(message)
                 continue
             try:
                 event = json.loads(message)
             except json.JSONDecodeError:
                 continue
             event_type = event.get("type")
-            if event_type == "response.audio.delta":
-                on_audio(_decode_pcm(event.get("delta")))
-            elif event_type in ("response.audio.done", "response.done"):
+            if event_type == "response.created":
+                response_id = (event.get("response") or {}).get("id") or response_id
+            elif event_type == "response.audio.delta":
+                delta_id = event.get("response_id")
+                if response_id is None:
+                    response_id = delta_id
+                if response_id is not None and delta_id is not None and delta_id != response_id:
+                    continue
+                pcm = _decode_pcm(event.get("delta"))
+                if pcm:
+                    on_audio(pcm)
+                    audio_bytes += len(pcm)
+            elif event_type == "response.audio.done":
+                # 不是完成点，继续读到本次 response.done。
+                continue
+            elif event_type == "response.done":
+                done_id = (event.get("response") or {}).get("id")
+                if response_id is None:
+                    # 还没进入本次响应：这是上一响应残留的完成事件。
+                    continue
+                if done_id is not None and done_id != response_id:
+                    continue
+                if text and audio_bytes == 0:
+                    raise QwenSpeechError("云端 TTS 返回空音频")
                 return True
             elif event_type == "error":
                 raise QwenSpeechError(_error_message(event))
@@ -244,6 +368,7 @@ class QwenAsrClient(_SyncWs):
     def __init__(self, model: str, key: str, *, sample_rate: int = 8000) -> None:
         super().__init__(model, key)
         self._sample_rate = sample_rate
+        self._label = "qwen_asr"
 
     def _session_update(self) -> dict[str, Any]:
         # 必须显式关掉 turn_detection：不设时服务端默认 server_vad 自行判停，
@@ -254,19 +379,6 @@ class QwenAsrClient(_SyncWs):
             "turn_detection": None,
             "input_audio_transcription": {"language": "zh"},
         }
-
-    def _ensure_connected(self) -> Any:
-        with self._lock:
-            if self._ws is None:
-                ws = self._connect()
-                try:
-                    ws.send(json.dumps({"type": "session.update", "session": self._session_update()}))
-                    self._await_session_ready(ws)
-                except Exception:
-                    self._discard()
-                    raise
-                self._ws = ws
-            return self._ws
 
     def warmup(self) -> None:
         started = time.monotonic()
@@ -290,6 +402,7 @@ class QwenAsrClient(_SyncWs):
             # 断线时丢弃坏连接，下一轮 append 会重新建连；本轮由管线回落本地。
             self._discard()
             raise QwenSpeechError(f"云端 ASR 送段失败: {type(exc).__name__}") from exc
+        self._touch()
 
     def commit(self) -> str:
         ws = self._ensure_connected()
@@ -298,6 +411,7 @@ class QwenAsrClient(_SyncWs):
         except _RETRYABLE as exc:
             self._discard()
             raise QwenSpeechError(f"云端 ASR commit 失败: {type(exc).__name__}") from exc
+        self._touch()
         deadline = time.monotonic() + _ASR_DEADLINE
         while time.monotonic() < deadline:
             try:
@@ -315,6 +429,7 @@ class QwenAsrClient(_SyncWs):
                 continue
             event_type = event.get("type")
             if event_type == "conversation.item.input_audio_transcription.completed":
+                self._touch()
                 return str(event.get("transcript") or "").strip()
             if event_type == "error":
                 raise QwenSpeechError(_error_message(event))

@@ -115,6 +115,10 @@ class SpeechPipeline(Protocol):
         """释放本通持有的云端连接；本地实现为空。"""
         ...
 
+    def ensure_ready(self) -> None:
+        """异步预连云端连接；本地实现为空。VAD 起话 / LLM 首字时调用。"""
+        ...
+
 
 @dataclass
 class _SayRequest:
@@ -466,6 +470,13 @@ class _SherpaPipeline:
             self._asr_client.warmup()
         if self._tts_client is not None:
             self._tts_client.warmup()
+
+    def ensure_ready(self) -> None:
+        """异步预连 TTS/ASR；VAD 起话与 LLM 首字时调用，不阻塞调用线程。"""
+        if self._asr_client is not None:
+            self._asr_client.ensure_ready()
+        if self._tts_client is not None:
+            self._tts_client.ensure_ready()
 
     def close(self) -> None:
         if self._asr_client is not None:
@@ -1047,6 +1058,10 @@ class LocalPipelineAgent(VoiceAgent):
         detector = getattr(pipeline, "is_speech_detected", None)
         speaking = bool(detector()) if (self._streaming or self._segmented_asr
                                        or self._slow_filler_seconds) and detector else False
+        if speaking and not self._vad_speaking:
+            ready = getattr(pipeline, "ensure_ready", None)
+            if callable(ready):
+                ready()
         if self._speculative and speaking and not self._vad_speaking:
             with self._spec_lock:
                 self._speech_revision += 1
@@ -1335,6 +1350,9 @@ class LocalPipelineAgent(VoiceAgent):
                     return
                 batch.received_text = True
                 self._mark_latency(turn, "llm_first_token")
+                ready = getattr(self._pipeline, "ensure_ready", None)
+                if callable(ready):
+                    ready()
                 if self._streaming and not turn.silent:
                     for clause in batch.splitter.feed(text):
                         self._queue_clause(clause, batch)

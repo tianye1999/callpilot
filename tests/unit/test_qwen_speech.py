@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -27,6 +28,7 @@ class FakeWS:
         self.events = list(events)
         self.sent: list[str] = []
         self.closed = False
+        self.state = 1
 
     def send(self, message: str) -> None:
         self.sent.append(message)
@@ -59,14 +61,31 @@ def _sent_has(socket: FakeWS, fragment: str) -> bool:
     return any(fragment in message for message in socket.sent)
 
 
+def _eventually(cond, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _tts_response(delta: bytes | None = b"\x01\x02", response_id: str = "resp_1") -> list[str]:
+    events = [_msg("response.created", response={"id": response_id})]
+    if delta:
+        events.append(_msg("response.audio.delta", delta=base64.b64encode(delta).decode(), response_id=response_id))
+    events.append(_msg("response.audio.done", response_id=response_id))
+    events.append(_msg("response.content_part.done", response_id=response_id))
+    events.append(_msg("response.output_item.done", response_id=response_id))
+    events.append(_msg("response.done", response={"id": response_id}))
+    return events
+
+
 # ---- QwenTtsClient ----
 
 
 def test_tts_streams_first_packet(monkeypatch):
-    delta = base64.b64encode(b"\x01\x02").decode()
-    socket = FakeWS([_msg("session.updated"),
-                     _msg("response.audio.delta", delta=delta),
-                     _msg("response.audio.done")])
+    socket = FakeWS([_msg("session.updated"), *_tts_response(b"\x01\x02")])
     _connect_list(monkeypatch, socket)
     client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
 
@@ -93,11 +112,8 @@ def test_tts_cancellation_discards_socket_and_returns_false(monkeypatch):
 
 
 def test_tts_reconnects_once_then_streams(monkeypatch):
-    delta = base64.b64encode(b"\x03\x04").decode()
     first = FakeWS([_msg("session.updated"), FakeWS._FAIL])
-    second = FakeWS([_msg("session.updated"),
-                     _msg("response.audio.delta", delta=delta),
-                     _msg("response.audio.done")])
+    second = FakeWS([_msg("session.updated"), *_tts_response(b"\x03\x04")])
     queue = _connect_list(monkeypatch, first, second)
     client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
 
@@ -108,6 +124,150 @@ def test_tts_reconnects_once_then_streams(monkeypatch):
     assert chunks == [b"\x03\x04"]
     assert first.closed and not second.closed
     assert not queue
+
+
+def test_connect_passes_ping_keepalive(monkeypatch):
+    socket = FakeWS([_msg("session.updated"), *_tts_response(b"\x05\x06")])
+    captured: dict[str, float] = {}
+
+    def connect(*args, **kwargs):
+        captured.update(kwargs)
+        return socket
+
+    monkeypatch.setattr(qwen_speech, "connect", connect)
+    client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
+
+    chunks: list[bytes] = []
+    assert client.synthesize_stream("你好", chunks.append, lambda: False) is True
+    assert chunks == [b"\x05\x06"]
+    assert captured["ping_interval"] == qwen_speech._PING_INTERVAL
+    assert captured["ping_timeout"] == qwen_speech._PING_TIMEOUT
+
+
+def test_tts_ensure_ready_preconnects_after_idle_disconnect(monkeypatch):
+    first = FakeWS([_msg("session.updated")])
+    second = FakeWS([_msg("session.updated"), *_tts_response(b"\x01\x02")])
+    queue = _connect_list(monkeypatch, first, second)
+    client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
+    client.warmup()
+    assert client._ws is first
+
+    first.state = 3  # 服务端空闲关闭了连接
+    client.ensure_ready()
+    assert _eventually(lambda: client._ws is second)
+
+    chunks: list[bytes] = []
+    done = client.synthesize_stream("你好", chunks.append, lambda: False)
+
+    assert done is True
+    assert chunks == [b"\x01\x02"]
+    assert first.closed and not second.closed
+    assert not queue  # 预连后真正合成不再建连
+
+
+def test_tts_ensure_ready_reconnects_when_idle(monkeypatch):
+    first = FakeWS([_msg("session.updated")])
+    second = FakeWS([_msg("session.updated"), *_tts_response(b"\x03\x04")])
+    queue = _connect_list(monkeypatch, first, second)
+    client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
+    client.warmup()
+    client._last_used_at = time.monotonic() - qwen_speech._IDLE_RECONNECT_AFTER - 1
+
+    client.ensure_ready()
+    assert _eventually(lambda: client._ws is second)
+    assert first.closed
+
+    chunks: list[bytes] = []
+    assert client.synthesize_stream("你好", chunks.append, lambda: False) is True
+    assert chunks == [b"\x03\x04"]
+    assert not queue
+
+
+def test_tts_ensure_ready_keeps_fresh_connection(monkeypatch):
+    socket = FakeWS([_msg("session.updated")])
+    queue = _connect_list(monkeypatch, socket)
+    client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
+    client.warmup()
+
+    client.ensure_ready()
+
+    assert client._ws is socket
+    assert not queue
+
+
+def test_ensure_ready_worker_cleaned_up_on_close(monkeypatch):
+    monkeypatch.setattr(qwen_speech, "_CLOSE_TIMEOUT", 0.2)
+    first = FakeWS([_msg("session.updated")])
+    second = FakeWS([_msg("session.updated")])
+    entered = threading.Event()
+    release = threading.Event()
+    sockets = iter([first, second])
+
+    def connect(*args, **kwargs):
+        ws = next(sockets)
+        if ws is second:
+            entered.set()
+            release.wait(timeout=5)
+        return ws
+
+    monkeypatch.setattr(qwen_speech, "connect", connect)
+    client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
+    client.warmup()
+    first.state = 3
+    client.ensure_ready()
+    thread = client._ready_thread
+    assert thread is not None
+    assert entered.wait(2)
+
+    client.close()
+    release.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert client._ready_thread is None
+    assert client._connecting is False
+    assert second.closed
+
+
+def test_tts_waits_for_response_done_and_skips_stale_events(monkeypatch):
+    # 上一响应残留的 done 事件先于本次 response.created 到达，必须被跳过而不是当作完成。
+    stale = [
+        _msg("response.content_part.done", response_id="resp_old"),
+        _msg("response.output_item.done", response_id="resp_old"),
+        _msg("response.done", response={"id": "resp_old"}),
+    ]
+    socket = FakeWS([_msg("session.updated"), *stale, *_tts_response(b"\x01\x02", "resp_new")])
+    _connect_list(monkeypatch, socket)
+    client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
+
+    chunks: list[bytes] = []
+    done = client.synthesize_stream("你好", chunks.append, lambda: False)
+
+    assert done is True
+    assert chunks == [b"\x01\x02"]
+
+
+def test_tts_consecutive_syntheses_each_emit_audio(monkeypatch):
+    events = [_msg("session.updated")]
+    for index, pcm in enumerate((b"\x01", b"\x02", b"\x03"), start=1):
+        events += _tts_response(pcm, f"resp_{index}")
+    socket = FakeWS(events)
+    _connect_list(monkeypatch, socket)
+    client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
+
+    for expected in (b"\x01", b"\x02", b"\x03"):
+        chunks: list[bytes] = []
+        assert client.synthesize_stream("你好", chunks.append, lambda: False) is True
+        assert chunks == [expected]
+
+
+def test_tts_zero_audio_response_done_raises(monkeypatch):
+    socket = FakeWS([_msg("session.updated"), *_tts_response(None, "resp_1")])
+    _connect_list(monkeypatch, socket)
+    client = qwen_speech.QwenTtsClient("qwen3-tts-flash-realtime", "Ethan", "key")
+
+    with pytest.raises(qwen_speech.QwenSpeechError):
+        client.synthesize_stream("你好", lambda pcm: None, lambda: False)
 
 
 # ---- QwenAsrClient ----
