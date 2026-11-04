@@ -18,9 +18,21 @@ def test_explicit_provider_and_model_are_preserved(monkeypatch):
     monkeypatch.setenv("LOCAL_LLM_PROVIDER", "dashscope")
     monkeypatch.delenv("LOCAL_LLM_MODEL", raising=False)
     assert config.get_str("AGENT_PROVIDER") == "qwen"
-    assert config.get_str("LOCAL_LLM_MODEL") == "qwen-plus"
+    assert config.get_str("LOCAL_LLM_MODEL") == "qwen3.6-flash"
     monkeypatch.setenv("LOCAL_LLM_MODEL", "custom-model")
     assert config.get_str("LOCAL_LLM_MODEL") == "custom-model"
+
+
+def test_dashscope_remaps_deepseek_default_model(monkeypatch):
+    monkeypatch.setenv("LOCAL_LLM_PROVIDER", "dashscope")
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "deepseek-flash")
+    assert config.get_str("LOCAL_LLM_MODEL") == "qwen3.6-flash"
+
+
+def test_deepseek_keeps_deepseek_flash_model(monkeypatch):
+    monkeypatch.setenv("LOCAL_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "deepseek-flash")
+    assert config.get_str("LOCAL_LLM_MODEL") == "deepseek-flash"
 
 
 @pytest.mark.parametrize("body,status", [

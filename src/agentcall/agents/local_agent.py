@@ -2,7 +2,7 @@
 
 与 realtime provider 的分工差异：
 - 音频不出本机——本地 silero VAD 切句、本地 paraformer 转写、本地 piper 合成；
-  只有**转写文本**上云（LLM 脑默认 dashscope ``qwen-plus``，复用 DASHSCOPE_API_KEY，
+  只有**转写文本**上云（LLM 脑默认 DeepSeek，可选 DashScope 兼容流式接口，
   文本 token 成本比 realtime 音频低一个量级）。
 - 半双工/录音/摘要/工具审计等仍由 CallSession 统一编排，本类只实现 VoiceAgent 接口。
 
@@ -330,9 +330,11 @@ def _default_llm_chat(
     tools: list[dict] | None,
     timeout: float,
 ) -> dict[str, Any]:
-    """LLM 脑：dashscope 文本模型（默认 qwen-plus），返回 assistant message dict。
+    """Legacy dashscope SDK 非流式路径，仅供 ``scripts/local_pipeline_bench.py`` 使用。
 
-    与 summarizer 一样走守护线程 + 超时；含 tool_calls 时由调用方继续工具循环。
+    LocalPipelineAgent 已不再默认走此路径：无论 LOCAL_LLM_PROVIDER 是 deepseek
+    还是 dashscope，都经 DeepSeekChat 的 OpenAI 兼容流式客户端拿到首句提前。
+    保留本函数给基准脚本一个不计流式的同步替代实现。
     """
     import dashscope  # 项目核心依赖已有
 
@@ -403,6 +405,10 @@ class LocalPipelineAgent(VoiceAgent):
     # piper zh_CN chaowen medium 的输出采样率；真实管线加载后以实际值覆盖。
     output_rate = 22050
 
+    def initial_messages(self) -> list[dict[str, Any]]:
+        """Initial wire history, also used by hardware-free LLM turn replay."""
+        return [{"role": "system", "content": self._session_instructions or ""}]
+
     def __init__(
         self,
         *,
@@ -411,10 +417,9 @@ class LocalPipelineAgent(VoiceAgent):
         llm_stream: Callable[[list[dict], list[dict] | None, float, Callable[[str], None]], dict] | None = None,
     ) -> None:
         self._pipeline_factory = pipeline_factory or _SherpaPipeline
-        self._llm_chat = llm_chat or _default_llm_chat
+        self._llm_chat = llm_chat
         self._llm_stream = llm_stream
-        self._deepseek = (DeepSeekChat() if llm_chat is None and llm_stream is None
-                          and config.get_str("LOCAL_LLM_PROVIDER") == "deepseek" else None)
+        self._deepseek = DeepSeekChat() if llm_chat is None and llm_stream is None else None
         self._streaming = config.get_bool("LOCAL_TTS_STREAMING")
         # 外呼 IVR 循环播报没有句末：N 秒后把已识别的文本交给模型（0 = 关）。
         self._max_turn_samples = 0
@@ -653,6 +658,7 @@ class LocalPipelineAgent(VoiceAgent):
                 elif self._llm_stream is not None:
                     message = self._llm_stream(messages, None, timeout, lambda text: None)
                 else:
+                    assert self._llm_chat is not None
                     message = self._llm_chat(messages, None, timeout)
                 if message.get("tool_calls"):
                     raise ValueError("开场预合成不接受工具调用")
@@ -725,9 +731,7 @@ class LocalPipelineAgent(VoiceAgent):
         if rate > 0:
             self.output_rate = rate
         with self._messages_lock:
-            self._messages = [
-                {"role": "system", "content": self._session_instructions or ""}
-            ]
+            self._messages = self.initial_messages()
         self._running = True
         if self._speculative and self._deepseek is not None:
             self._spec_thread = threading.Thread(target=self._spec_worker, name="local-speculative", daemon=True)
@@ -1157,6 +1161,7 @@ class LocalPipelineAgent(VoiceAgent):
                 elif self._llm_stream is not None:
                     message = self._llm_stream(messages, tools, timeout, on_content)
                 else:
+                    assert self._llm_chat is not None
                     message = self._llm_chat(messages, tools, timeout)
             except InterruptedError:
                 self._discard_batch(batch)

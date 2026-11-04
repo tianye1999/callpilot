@@ -1,4 +1,4 @@
-"""DeepSeek's OpenAI-compatible SSE transport, with per-agent keep-alive."""
+"""DeepSeek / DashScope OpenAI-compatible SSE transport with per-agent keep-alive."""
 
 from __future__ import annotations
 
@@ -19,6 +19,35 @@ from urllib.parse import urlsplit
 from .. import config
 
 logger = logging.getLogger(__name__)
+
+
+def chat_endpoint() -> str:
+    dashscope = config.get_str("LOCAL_LLM_PROVIDER") == "dashscope"
+    setting = "LOCAL_LLM_DASHSCOPE_BASE_URL" if dashscope else "LOCAL_LLM_BASE_URL"
+    endpoint = config.get_str(setting).rstrip("/")
+    url = urlsplit(endpoint)
+    schemes = {"https"} if dashscope else {"http", "https"}
+    if url.scheme not in schemes or not url.hostname or url.username or url.query or url.fragment:
+        protocol = "HTTPS" if dashscope else "HTTP(S)"
+        raise ValueError(f"{setting} 必须为 {protocol} API 根地址")
+    return endpoint
+
+
+def chat_body(messages: list[dict], tools: list[dict] | None) -> dict[str, Any]:
+    provider = config.get_str("LOCAL_LLM_PROVIDER")
+    if provider == "deepseek":
+        return deepseek_body(messages, tools)
+    if provider != "dashscope":
+        raise ValueError("未知的 LOCAL_LLM_PROVIDER")
+    if config.get_str("LOCAL_LLM_THINKING") != "disabled":
+        raise ValueError("DashScope 仅支持 LOCAL_LLM_THINKING=disabled，不映射 low/high")
+    body: dict[str, Any] = {
+        "model": config.get_str("LOCAL_LLM_MODEL"), "stream": True, "enable_thinking": False,
+        "messages": [{k: v for k, v in m.items() if k != "reasoning_content"} for m in messages],
+    }
+    if tools:
+        body["tools"] = tools
+    return body
 
 
 class _FirstByteTimeout(TimeoutError):
@@ -81,7 +110,8 @@ def read_sse(
                                if isinstance(fields.get(name), (str, int, float)))
             # Whitelist diagnostic fields, not the event/request object. Servers
             # can reflect credentials or input, so redact before truncating.
-            for value in (config.get_str("DEEPSEEK_API_KEY"), *sensitive_texts, "".join(reasoning), *reasoning):
+            for value in (config.get_str("DEEPSEEK_API_KEY"), config.get_str("DASHSCOPE_API_KEY"),
+                          *sensitive_texts, "".join(reasoning), *reasoning):
                 if value:
                     detail = detail.replace(value, "[redacted]")
             detail = " ".join(detail.split())[:200]
@@ -136,7 +166,7 @@ class DeepSeekChat:
         if self._closed.is_set() or not self._lock.acquire(blocking=False):
             return False
         try:
-            endpoint = config.get_str("LOCAL_LLM_BASE_URL").rstrip("/")
+            endpoint = chat_endpoint()
             if (self._connection is not None and self._endpoint == endpoint
                     and time.monotonic() - self._last_used < idle_seconds):
                 return False
@@ -188,17 +218,20 @@ class DeepSeekChat:
         on_content: Callable[[str], None], cancelled: threading.Event | None = None,
         on_tools: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        payload = deepseek_body(messages, tools)
-        thinking_enabled = payload["thinking"]["type"] == "enabled"
+        payload = chat_body(messages, tools)
+        provider = config.get_str("LOCAL_LLM_PROVIDER")
+        label = "DeepSeek" if provider == "deepseek" else "DashScope"
+        thinking_enabled = payload.get("thinking", {}).get("type") == "enabled"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        endpoint = config.get_str("LOCAL_LLM_BASE_URL").rstrip("/")
+        endpoint = chat_endpoint()
         url = urlsplit(endpoint)
         if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.query or url.fragment:
             raise ValueError("LOCAL_LLM_BASE_URL 必须为 HTTP(S) API 根地址")
         hostname = url.hostname
-        key = config.get_str("DEEPSEEK_API_KEY").strip()
+        key_setting = "DEEPSEEK_API_KEY" if provider == "deepseek" else "DASHSCOPE_API_KEY"
+        key = config.get_str(key_setting).strip()
         if not key:
-            raise ValueError("缺少 DEEPSEEK_API_KEY")
+            raise ValueError(f"缺少 {key_setting}")
         abandoned, done = threading.Event(), threading.Event()
         box: dict[str, Any] = {}
         deadline = time.monotonic() + timeout
@@ -304,7 +337,7 @@ class DeepSeekChat:
                             else:
                                 response = connection.getresponse()
                             if response.status != 200:
-                                raise RuntimeError(f"DeepSeek HTTP {response.status}")
+                                raise RuntimeError(f"{label} HTTP {response.status}")
                             result = read_sse(response_lines(response), content, tool_event,
                                               sensitive_texts=sensitive_texts)
                             if not thinking_enabled:
@@ -370,7 +403,11 @@ class DeepSeekChat:
         if inactive():
             raise InterruptedError("local LLM 轮次已取消")
         if "error" in box:
-            raise RuntimeError(f"DeepSeek 请求失败: {box['error']}") from box["error"]
+            detail = str(box["error"])
+            for value in sensitive_texts:
+                if value:
+                    detail = detail.replace(value, "[redacted]")
+            raise RuntimeError(f"{label} 请求失败: {detail}") from box["error"]
         return dict(box["result"])
 
 

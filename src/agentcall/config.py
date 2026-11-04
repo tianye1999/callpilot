@@ -379,6 +379,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                choices=("dashscope", "deepseek"), requires_restart=True),
     ConfigSpec("LOCAL_LLM_BASE_URL", "三段式 DeepSeek API 地址", "str", "https://api.deepseek.com",
                requires_restart=True),
+    ConfigSpec("LOCAL_LLM_DASHSCOPE_BASE_URL", "三段式 DashScope HTTPS API 地址", "str",
+               "https://dashscope.aliyuncs.com/compatible-mode/v1", requires_restart=True),
     ConfigSpec("DEEPSEEK_API_KEY", "DeepSeek API Key", "str", "",
                secret=True, requires_restart=True),
     ConfigSpec("LOCAL_LLM_MODEL", "三段式 LLM 模型", "str", "deepseek-flash",
@@ -703,8 +705,13 @@ def is_explicit(key: str) -> bool:
 def get_str(key: str) -> str:
     """读取字符串配置（select 项同样用本函数读取）。"""
     spec = get_spec(key)
-    if key == "LOCAL_LLM_MODEL" and key not in os.environ and get_str("LOCAL_LLM_PROVIDER") == "dashscope":
-        return "qwen-plus"
+    if key == "LOCAL_LLM_MODEL" and get_str("LOCAL_LLM_PROVIDER") == "dashscope":
+        # 现有 .env 普遍显式写了 LOCAL_LLM_MODEL=deepseek-flash：只切 provider
+        # 到 dashscope 时若原样下发会失败，这里把「未设置」与「仍为 DeepSeek 默认值」
+        # 两种情况都映射到千问默认模型；自定义模型名不受影响。
+        explicit = os.environ.get(key)
+        if explicit is None or explicit.strip() == "deepseek-flash":
+            return "qwen3.6-flash"
     return os.environ.get(key, spec.default)
 
 

@@ -29,18 +29,18 @@ def test_product_defaults_pipeline_and_provider_dependency(
     try:
         assert agent._streaming and agent._segmented_asr and agent._metrics
         assert config.get_bool("LOCAL_FAST_OPENING") and config.get_bool("PARALLEL_AGENT_CONNECT")
-        assert (agent._spec_thread is not None) == (provider == "deepseek")
-        assert (agent._warm_thread is not None) == (provider == "deepseek")
+        # Both providers now share the OpenAI-compatible streaming client, so the
+        # speculative/prewarm threads are provider-independent.
+        assert agent._spec_thread is not None
+        assert agent._warm_thread is not None
         feed(agent, 2)
         assert _wait_until(lambda: agent._asr_queue.unfinished_tasks == 0)
-        if provider == "deepseek":
-            assert _wait_until(lambda: stream.calls and warmed)
-        else:
-            assert not stream.calls and not warmed and not requests
+        assert _wait_until(lambda: stream.calls and warmed)
+        assert not requests
         assert not audio
         end_turn(agent)
         assert _wait_until(lambda: audio)
-        assert len(stream.calls if provider == "deepseek" else requests) == 1
+        assert len(stream.calls) == 1
         assert not agent.fatal and events
     finally:
         asyncio.run(agent.stop())
