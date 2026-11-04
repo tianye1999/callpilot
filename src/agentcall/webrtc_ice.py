@@ -14,7 +14,7 @@ import random
 import socket
 import time
 from types import MethodType
-from typing import Any
+from typing import Any, Callable
 
 import aioice
 import ifaddr
@@ -451,6 +451,74 @@ def configure_peer(pc: Any) -> None:
     for connection in peer_connections(pc):
         logger.info("Direct ICE peer=%s connection=%s", id(pc), id(connection))
         configure_connection(connection)
+
+
+def observe_setup(pc: Any, observe: Callable[[str], None]) -> None:
+    """Best-effort, instance-local aiortc probes; never change transport decisions.
+
+    Private signatures are checked before wrapping. Missing hooks leave missing
+    timestamps, not a different ICE / DTLS / SCTP implementation.
+    """
+    def mark(name: str) -> None:
+        try:
+            observe(name)
+        except Exception:
+            pass  # Diagnostics must not escape into aiortc's receive loop.
+
+    try:
+        transceivers = pc.getTransceivers()
+        dtls_transports = {t.receiver.transport for t in transceivers if t.kind == "audio"}
+        if pc.sctp is not None:
+            dtls_transports.add(pc.sctp.transport)
+        for dtls in dtls_transports:
+            transport = dtls.transport
+
+            def ice_state(transport: Any = transport) -> None:
+                if transport.state == "completed":
+                    mark("ice_completed")
+
+            def dtls_state(dtls: Any = dtls) -> None:
+                if dtls.state == "connected":
+                    mark("dtls_connected")
+
+            transport.on("statechange", ice_state)
+            dtls.on("statechange", dtls_state)
+            original_recv = transport._recv
+            if list(inspect.signature(original_recv).parameters) == []:
+                async def recv(original: Any = original_recv) -> Any:
+                    data = await original()
+                    if data and 19 < data[0] < 64:  # Same DTLS demux as RTCDtlsTransport._recv_next.
+                        mark("dtls_handshake_start")
+                    return data
+
+                transport._recv = recv
+
+        for transceiver in transceivers:
+            if transceiver.kind != "audio":
+                continue
+            receiver = transceiver.receiver
+            original_rtp = receiver._handle_rtp_packet
+            if list(inspect.signature(original_rtp).parameters) == ["packet", "arrival_time_ms"]:
+                async def rtp(packet: Any, arrival_time_ms: int, original: Any = original_rtp) -> Any:
+                    # Already authenticated/decrypted and routed to the audio receiver, not RTCP/video.
+                    mark("first_rtp_received")
+                    return await original(packet, arrival_time_ms=arrival_time_ms)
+
+                receiver._handle_rtp_packet = rtp
+
+        sctp = pc.sctp
+        if sctp is not None:
+            original_state = sctp._set_state
+            established = sctp.State.ESTABLISHED
+            if list(inspect.signature(original_state).parameters) == ["state"]:
+                def sctp_state(state: Any) -> Any:
+                    if state == established:
+                        mark("sctp_connected")
+                    return original_state(state)
+
+                sctp._set_state = sctp_state
+    except Exception as error:
+        logger.debug("Direct setup probes unavailable: %s", type(error).__name__)
 
 
 async def stop_connection_checks(connection: Any) -> None:

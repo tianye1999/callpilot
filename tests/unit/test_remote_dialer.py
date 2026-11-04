@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from livekit import api
 
 from agentcall.audio_bridge import (
@@ -1390,18 +1391,30 @@ def _direct_coordinator(*, fail_direct: bool = False, audio_timeout: float = 0.0
     return coordinator, request, answers, made, modem
 
 
-def test_outbound_direct_answers_then_dials_over_the_direct_channel() -> None:
+@pytest.mark.parametrize("broken_probe", [False, True])
+def test_outbound_direct_answers_then_dials_over_the_direct_channel(broken_probe) -> None:
     async def run() -> None:
         coordinator, _request, answers, made, modem = _direct_coordinator()
         task = asyncio.create_task(coordinator.run())
         await _wait_for(lambda: coordinator.edge_ready.is_set())
         assert answers == [("v=0\r\nedge", None)]
+        notes = []
+
+        def note_dial_start():
+            assert made["direct"].media_ready
+            assert not any(name == "dial" for name, _ in modem.calls)
+            notes.append("dial_start")
+            if broken_probe:
+                raise RuntimeError("diagnostic failure")
+
+        made["direct"].note_dial_start = note_dial_start
         made["direct"].set_media_ready(True)
         await _wait_for(lambda: any(e.get("status") == "media_ready" for e in made["direct"].events))
         await made["direct"].commands.put({"type": "dial", "number": "10086", "idempotency_key": "direct-1"})
         await _wait_for(lambda: any(name == "dial" for name, _ in modem.calls))
         coordinator.request_stop("test_done")
         await task
+        assert notes == ["dial_start"]
         assert made["direct"].closed and "livekit" not in made
 
     asyncio.run(run())

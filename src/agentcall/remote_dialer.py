@@ -637,6 +637,12 @@ class RemoteWebDialerCoordinator:
             if (config.get_bool("MODEM_LOG_RELEASE_CAUSE") and isinstance(self.modem, SerialModem)
                     and not isinstance(self.modem, BluetoothModem)):
                 release_report = self.modem.begin_release_capture()
+            try:
+                note_dial_start = getattr(self.endpoint, "note_dial_start", None)
+                if callable(note_dial_start):
+                    note_dial_start()
+            except Exception:
+                pass  # Optional direct-media diagnostics cannot affect dialing.
             self.modem.dial(number)
             await self._send_status("dialing")
             self._publish({"type": "remote_call", "status": "dialing"})

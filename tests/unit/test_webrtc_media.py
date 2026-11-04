@@ -557,12 +557,13 @@ def test_failed_stats_reads_are_bounded_and_never_block_close():
            "(pytest-timeout dump: idle select, no aiortc frames); Windows 3.13 and all other legs run it. BACKLOG C11.",
 )
 @pytest.mark.parametrize("slow_start", [False, True], ids=["normal", "delayed-gather-dtls-consumer"])
-def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch, slow_start):
+def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch, caplog, slow_start):
     from aioice import ice
     from aiortc import RTCDtlsTransport
 
     from agentcall import webrtc_ice
 
+    caplog.set_level("INFO", logger="agentcall.webrtc_media")
     monkeypatch.setenv("REMOTE_DOWNLINK_GAIN", "1")
     # Upstream excludes loopback, while the product adapter enumerates separately.
     # Restrict both sources, not SDP after gathering: no real NIC/VPN/IPv6/mDNS I/O.
@@ -677,6 +678,24 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch,
                 await channel_open.wait()
                 assert media.media_ready and channel.readyState == "open"
 
+            # Diagnostic marker only: never dial a modem in the loopback test.
+            media.note_dial_start()
+            setup = setup_timing_logs(caplog)
+            assert len(setup) == 1
+            setup = setup[0]
+            assert setup["origin"] == "ice_completed" and setup["unit"] == "ms"
+            assert setup["local_candidate"] == setup["remote_candidate"] == "host"
+            assert setup["ice_completed"] == 0
+            for branch in (
+                ["ice_completed", "dtls_handshake_start", "dtls_connected", "sctp_connected",
+                 "control_channel_open", "media_ready", "dial_start"],
+                ["ice_completed", "dtls_connected", "first_rtp_received", "first_audio_frame_decoded",
+                 "media_ready", "dial_start"],
+            ):
+                values = [setup[key] for key in branch]
+                assert all(value >= 0 for value in values), setup
+                assert values == sorted(values), setup
+
             async with loopback_phase("non-silent uplink PCM", peers):
                 while True:
                     uplink = media.take_browser_audio()
@@ -742,8 +761,99 @@ def test_real_loopback_non_silent_pcm_both_ways_dtmf_and_hangup_ack(monkeypatch,
                 async with loopback_phase("phone close", peers):
                     await phone.close()
         assert not media.media_ready and not media.browser_connected
+        assert len(setup_timing_logs(caplog)) == 1
 
     asyncio.run(scenario())
+
+
+def setup_timing_logs(caplog):
+    prefix = "Direct setup timing "
+    return [json.loads(record.message.removeprefix(prefix)) for record in caplog.records
+            if record.name == "agentcall.webrtc_media" and record.message.startswith(prefix)]
+
+
+def test_setup_timing_missing_milestones_and_close_are_once_only(caplog):
+    caplog.set_level("INFO", logger="agentcall.webrtc_media")
+
+    async def scenario():
+        media = endpoint(FakePeer())
+        await media.connect()
+        await media.close()
+        await media.close()
+        media.note_dial_start()  # A late diagnostic call cannot produce a second summary.
+
+    asyncio.run(scenario())
+    logs = setup_timing_logs(caplog)
+    assert len(logs) == 1
+    summary = logs[0]
+    assert summary["local_candidate"] == summary["remote_candidate"] == "unknown"
+    for name in ("ice_completed", "dtls_handshake_start", "dtls_connected", "sctp_connected",
+                 "control_channel_open", "first_rtp_received", "first_audio_frame_decoded", "media_ready",
+                 "dial_start"):
+        assert summary[name] == -1
+    assert not any(secret in json.dumps(summary) for secret in ("test-call", "sdp", "fingerprint", "ice-pwd"))
+
+
+def test_setup_probes_preserve_results_and_upstream_errors_when_observer_fails(monkeypatch):
+    from agentcall.webrtc_ice import observe_setup
+
+    async def scenario():
+        peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        peer.addTransceiver("audio")
+        peer.createDataChannel(REMOTE_CONTROL_TOPIC)
+        receiver = peer.getTransceivers()[0].receiver
+        seen = []
+
+        def broken_observer(name):
+            seen.append(name)
+            raise RuntimeError("private diagnostic failure")
+
+        async def recv():
+            return b"\x16test-dtls-record"
+
+        async def rtp(packet, arrival_time_ms):
+            assert arrival_time_ms == 123
+            if packet is None:
+                raise ValueError("upstream error")
+            return packet
+
+        def state(state):
+            return state
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(receiver.transport.transport, "_recv", recv)
+                patch.setattr(receiver, "_handle_rtp_packet", rtp)
+                patch.setattr(peer.sctp, "_set_state", state)
+                observe_setup(peer, broken_observer)
+                assert await receiver.transport.transport._recv() == b"\x16test-dtls-record"
+                packet = object()
+                assert await receiver._handle_rtp_packet(packet, arrival_time_ms=123) is packet
+                with pytest.raises(ValueError, match="upstream error"):
+                    await receiver._handle_rtp_packet(None, arrival_time_ms=123)
+                assert peer.sctp._set_state(peer.sctp.State.ESTABLISHED) == peer.sctp.State.ESTABLISHED
+            assert {"dtls_handshake_start", "first_rtp_received", "sctp_connected"} <= set(seen)
+        finally:
+            await peer.close()
+
+    asyncio.run(scenario())
+
+
+def test_setup_partial_marks_keep_unobserved_values_missing(caplog):
+    caplog.set_level("INFO", logger="agentcall.webrtc_media")
+
+    async def scenario():
+        media = endpoint(FakePeer())
+        await media.connect()
+        media._mark_setup("ice_completed")
+        media._mark_setup("dtls_handshake_start")
+        media._mark_setup("dtls_handshake_start")
+        await media.close()
+
+    asyncio.run(scenario())
+    summary, = setup_timing_logs(caplog)
+    assert summary["ice_completed"] == 0 <= summary["dtls_handshake_start"]
+    assert summary["dtls_connected"] == summary["first_rtp_received"] == summary["dial_start"] == -1
 
 
 def test_loopback_timeout_reports_transport_state_and_drains_waiter():

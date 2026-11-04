@@ -199,6 +199,11 @@ class SwitchableInboundEndpoint:
         if self._inner is not None:
             attach_endpoint_timing(self._inner, timing)
 
+    def note_dial_start(self) -> None:
+        note = getattr(self._inner, "note_dial_start", None)
+        if callable(note):
+            note()
+
     @property
     def media_ready(self) -> bool:
         return bool(not self._closed and not self._switching and self.request.can_commit

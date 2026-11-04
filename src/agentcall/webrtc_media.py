@@ -40,6 +40,10 @@ _RTP_STATS_READ_MAX_SECONDS = 1.0  # Diagnostics cannot stall teardown or owners
 _warm_lock = threading.Lock()
 _warm_future: Future[Any] | None = None
 _stack: Any = None
+_SETUP_MARKS = (
+    "ice_completed", "dtls_handshake_start", "dtls_connected", "sctp_connected", "control_channel_open",
+    "first_rtp_received", "first_audio_frame_decoded", "media_ready", "dial_start",
+)
 
 
 def warm_webrtc_stack() -> Future[Any]:
@@ -231,6 +235,8 @@ class WebRtcRemoteMediaEndpoint:
         self._hangup_command: dict[str, Any] | None = None
         self._command_ready = asyncio.Event()
         self._timing = CallTiming()
+        self._setup_marks: dict[str, float] = {}
+        self._setup_logged = False
         self._pc: Any = None
         self._channel: Any = None
         self._local_track: Any = None
@@ -276,7 +282,42 @@ class WebRtcRemoteMediaEndpoint:
 
     def _mark_ready(self) -> None:
         if self.media_ready:
+            self._mark_setup("media_ready")
             self._timing.mark("media_ready")
+
+    def _mark_setup(self, name: str) -> None:
+        try:
+            if not self._setup_logged and name not in self._setup_marks:
+                self._setup_marks[name] = time.monotonic()
+        except Exception:
+            pass
+
+    def note_dial_start(self) -> None:
+        """Observe the existing dial boundary; never participate in its readiness gate."""
+        self._mark_setup("dial_start")
+        self._log_setup()
+
+    def _log_setup(self) -> None:
+        if self._setup_logged:
+            return
+        self._setup_logged = True
+        try:
+            origin = self._setup_marks.get("ice_completed")
+            fields: dict[str, Any] = {"origin": "ice_completed", "unit": "ms", "peer": id(self._pc)}
+            for name in _SETUP_MARKS:
+                stamp = self._setup_marks.get(name)
+                fields[name] = round((stamp - origin) * 1000, 3) if (
+                    stamp is not None and origin is not None) else -1
+            pair = None
+            try:
+                pair = _selected_pair(self._pc)
+            except Exception:
+                pass
+            fields["local_candidate"] = pair["localCandidate"] if pair else "unknown"
+            fields["remote_candidate"] = pair["remoteCandidate"] if pair else "unknown"
+            logger.info("Direct setup timing %s", json.dumps(fields, separators=(",", ":")))
+        except Exception:
+            pass
 
     async def _check_current(self, pc: Any) -> None:
         if self._closed or self._pc is not pc:
@@ -325,6 +366,7 @@ class WebRtcRemoteMediaEndpoint:
             @channel.on("open")
             def on_open() -> None:
                 if not self._closed:
+                    self._mark_setup("control_channel_open")
                     self._timing.mark("direct_control_ready")
                     self._mark_ready()
 
@@ -375,6 +417,7 @@ class WebRtcRemoteMediaEndpoint:
             self._local_track = _modem_track(self._modem_audio, self._downlink_gain)
             pc.addTrack(self._local_track)
             stack.ice.configure_peer(pc)
+            stack.ice.observe_setup(pc, self._mark_setup)
             stage_started = time.monotonic()
             answer = await pc.createAnswer()
             logger.info("Direct answer peer=%s stage=create_answer duration_ms=%.1f",
@@ -461,6 +504,7 @@ class WebRtcRemoteMediaEndpoint:
         try:
             while not self._closed:
                 frame = await track.recv()
+                self._mark_setup("first_audio_frame_decoded")
                 if self._closed:
                     return
                 for out in resampler.resample(frame):
@@ -483,6 +527,7 @@ class WebRtcRemoteMediaEndpoint:
 
     async def close(self) -> None:
         if self._close_task is None:
+            self._log_setup()
             self._closed = True
             self._connected = False
             self._received_audio = False
