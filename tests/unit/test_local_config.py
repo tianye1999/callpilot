@@ -24,6 +24,11 @@ from agentcall import config
     ("LOCAL_SLOW_REPLY_FILLER_SECONDS", "2.5"),
     ("LOCAL_SLOW_REPLY_FILLER", "嗯。"),
     ("LOCAL_TTS_PEAK", ""),
+    ("LOCAL_ASR_PROVIDER", "local"),
+    ("LOCAL_ASR_DASHSCOPE_MODEL", "qwen3-asr-flash-realtime"),
+    ("LOCAL_TTS_PROVIDER", "local"),
+    ("LOCAL_TTS_DASHSCOPE_MODEL", "qwen3-tts-flash-realtime"),
+    ("LOCAL_TTS_DASHSCOPE_VOICE", "Kai"),
     ("LOCAL_FAST_OPENING", "true"),
     ("LOCAL_INBOUND_GREETING", ""),
     ("LOCAL_LLM_PREWARM", "true"),
@@ -63,6 +68,22 @@ def test_deepseek_credentials_do_not_require_dashscope(monkeypatch):
     assert config.get_spec("DEEPSEEK_API_KEY").secret
     monkeypatch.setenv("LOCAL_LLM_PROVIDER", "dashscope")
     assert "DASHSCOPE_API_KEY" in config.validate_provider_credentials("local")[0]
+
+
+def test_dashscope_speech_with_deepseek_llm_requires_dashscope_key(monkeypatch):
+    monkeypatch.setenv("LOCAL_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.setenv("LOCAL_ASR_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_TTS_PROVIDER", "dashscope")
+    assert "DASHSCOPE_API_KEY" in config.validate_provider_credentials("local")[0]
+
+    monkeypatch.setenv("LOCAL_TTS_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_ASR_PROVIDER", "dashscope")
+    assert "DASHSCOPE_API_KEY" in config.validate_provider_credentials("local")[0]
+
+    monkeypatch.setenv("LOCAL_ASR_PROVIDER", "local")
+    assert config.validate_provider_credentials("local") == []
 
 
 def test_turn_silence_label_describes_physical_silence():

@@ -204,8 +204,17 @@ def tts_model(name: str | None = None) -> TtsModel:
 
 
 def selected_assets() -> tuple[ModelAsset, ...]:
-    return MODEL_ASSETS[:2] + tts_model().assets
+    """按语音提供方挑选需要就绪的资产。
 
+    本地 VAD（silero）始终需要；ASR/TTS 切到 DashScope 后对应模型不再要求
+    就绪、也不触发下载，避免把 paraformer / VITS 两件大模型当成本地依赖。
+    """
+    assets: list[ModelAsset] = [MODEL_ASSETS[0]]
+    if config.get_str("LOCAL_ASR_PROVIDER") == "local":
+        assets.append(MODEL_ASSETS[1])
+    if config.get_str("LOCAL_TTS_PROVIDER") == "local":
+        assets.extend(tts_model().assets)
+    return tuple(assets)
 
 def download_sources(asset: ModelAsset) -> tuple[tuple[str, str], ...]:
     """按 LOCAL_MODELS_MIRROR 拼出候选下载源：镜像在前，原地址兜底。

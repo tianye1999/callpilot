@@ -419,6 +419,17 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                requires_restart=True),
     ConfigSpec("LOCAL_SLOW_REPLY_FILLER", "三段式慢回复兜底短句", "str", "嗯。", requires_restart=True),
     ConfigSpec("LOCAL_TTS_PEAK", "三段式 TTS 目标峰值（空为关闭）", "str", "", requires_restart=True),
+    # 云端语音开关：ASR/TTS 可分别切到 DashScope realtime WS，默认仍走本地 sherpa。
+    ConfigSpec("LOCAL_ASR_PROVIDER", "三段式 ASR 提供方", "select", "local",
+               choices=("local", "dashscope"), requires_restart=True),
+    ConfigSpec("LOCAL_ASR_DASHSCOPE_MODEL", "三段式 DashScope ASR 模型", "str",
+               "qwen3-asr-flash-realtime", requires_restart=True),
+    ConfigSpec("LOCAL_TTS_PROVIDER", "三段式 TTS 提供方", "select", "local",
+               choices=("local", "dashscope"), requires_restart=True),
+    ConfigSpec("LOCAL_TTS_DASHSCOPE_MODEL", "三段式 DashScope TTS 模型", "str",
+               "qwen3-tts-flash-realtime", requires_restart=True),
+    ConfigSpec("LOCAL_TTS_DASHSCOPE_VOICE", "三段式 DashScope TTS 音色", "str", "Kai",
+               requires_restart=True),
     ConfigSpec("MANUAL_RESPONSE_CONTROL", "手动应答控制", "bool", "false"),
     # barge-in：对端开口即打断 AI（掐生成+清积压），代替半双工丢上行。开启前提：
     # 模组无下行→上行回采（SIM7600 CPCMREG 实测互相关 r=0.009，干净；Quectel UAC
@@ -756,7 +767,16 @@ def validate_provider_credentials(provider: str) -> list[str]:
         llm_provider = get_str("LOCAL_LLM_PROVIDER")
         if llm_provider not in {"dashscope", "deepseek"}:
             return [f"未知的 LOCAL_LLM_PROVIDER: {llm_provider}"]
+        asr_provider = get_str("LOCAL_ASR_PROVIDER")
+        tts_provider = get_str("LOCAL_TTS_PROVIDER")
+        if asr_provider not in {"local", "dashscope"}:
+            return [f"未知的 LOCAL_ASR_PROVIDER: {asr_provider}"]
+        if tts_provider not in {"local", "dashscope"}:
+            return [f"未知的 LOCAL_TTS_PROVIDER: {tts_provider}"]
         required = ("DEEPSEEK_API_KEY",) if llm_provider == "deepseek" else ("DASHSCOPE_API_KEY",)
+        if "dashscope" in {llm_provider, asr_provider, tts_provider} and "DASHSCOPE_API_KEY" not in required:
+            # 语音走千问、文本仍走 DeepSeek 时同样需要 DashScope Key。
+            required = (*required, "DASHSCOPE_API_KEY")
     if required is None:
         known = ", ".join(sorted(PROVIDER_REQUIRED_KEYS))
         return [f"未知的 Agent 提供方: {provider}（可选: {known}）"]

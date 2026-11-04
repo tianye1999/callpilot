@@ -222,6 +222,22 @@ def test_unknown_tts_model_fails_before_download(monkeypatch):
         local_models.selected_assets()
 
 
+def test_dashscope_providers_skip_corresponding_model_assets(monkeypatch):
+    monkeypatch.setenv("LOCAL_ASR_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_TTS_PROVIDER", "local")
+    assert [a.id for a in local_models.selected_assets()] == ["vad", "stt", "tts"]
+
+    monkeypatch.setenv("LOCAL_ASR_PROVIDER", "dashscope")
+    assert [a.id for a in local_models.selected_assets()] == ["vad", "tts"]
+
+    monkeypatch.setenv("LOCAL_ASR_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_TTS_PROVIDER", "dashscope")
+    assert [a.id for a in local_models.selected_assets()] == ["vad", "stt"]
+
+    monkeypatch.setenv("LOCAL_ASR_PROVIDER", "dashscope")
+    assert [a.id for a in local_models.selected_assets()] == ["vad"]
+
+
 def test_registry_can_add_kokoro_without_a_pipeline_branch(monkeypatch, tmp_path):
     model = local_models.TtsModel(
         kind="kokoro", config_class="OfflineTtsKokoroModelConfig",

@@ -34,7 +34,7 @@ from typing import Any, Callable, Protocol
 from weakref import WeakSet
 
 from .. import config
-from ..audio_bridge import AgentPcm
+from ..audio_bridge import AgentPcm, resample_pcm
 from ..prompts import agent_language, repeat_nudge_instructions
 from ..repeat_suppression import RepeatSuppressor
 from .base import VoiceAgent
@@ -72,6 +72,11 @@ class SpeechPipeline(Protocol):
     """三段式的本地管线接口：真实实现包 sherpa-onnx，测试注入 fake。"""
 
     sample_rate: int  # TTS 输出采样率
+    # dashscope 分段 ASR 使用「喂段 + 判停取 final」的流式接口。
+    streaming_asr: bool = False
+    streaming_tts: bool = False
+    local_asr_available: bool = False
+    local_tts_available: bool = False
 
     def vad_push(self, pcm16: bytes) -> list[bytes]:
         """喂 16k int16 PCM，返回已切出的完整语音段（可能为空）。"""
@@ -86,6 +91,28 @@ class SpeechPipeline(Protocol):
 
     def synthesize(self, text: str) -> bytes:
         """返回 ``sample_rate`` 采样率的 int16 mono PCM。"""
+        ...
+
+    def feed_segment(self, segment_pcm16: bytes) -> None:
+        """云端分段 ASR：把一段本地 VAD 切出的 16k PCM 送进云端缓冲。"""
+        ...
+
+    def end_turn(self) -> str:
+        """云端分段 ASR：本地判停后 commit 并返回 final 转写。"""
+        ...
+
+    def synthesize_stream(
+        self, text: str, on_audio: Callable[[bytes], None], should_stop: Callable[[], bool],
+    ) -> bool:
+        """流式合成：每个 delta 调 on_audio；True=完整，False=被取消。"""
+        ...
+
+    def warmup(self) -> None:
+        """会话开始建立云端连接；本地实现为空。"""
+        ...
+
+    def close(self) -> None:
+        """释放本通持有的云端连接；本地实现为空。"""
         ...
 
 
@@ -159,7 +186,7 @@ class _SharedSpeechModels:
     """Process-resident kernels and raw phrase PCM; VAD stays per call."""
 
     def __init__(
-        self, key: tuple[str, str, int, str], on_progress: Callable[[str], None] | None,
+        self, key: tuple[str, str, int, str, str, str], on_progress: Callable[[str], None] | None,
     ) -> None:
         try:
             import sherpa_onnx  # noqa: PLC0415 - 可选依赖，惰性导入
@@ -169,7 +196,8 @@ class _SharedSpeechModels:
             ) from exc
         from .. import local_models
 
-        # 首启自动下载缺失模型（~300MB，不进 DMG）；进度经 on_progress 播给 UI。
+        # 首启自动下载缺失模型；切到 DashScope 的那一半由 selected_assets() 过滤，
+        # 不再要求就绪也不会触发下载。进度经 on_progress 播给 UI。
         missing = local_models.missing_assets()
         if missing:
             ids = ", ".join(asset.id for asset in missing)
@@ -186,23 +214,39 @@ class _SharedSpeechModels:
         self.root = root = Path(key[0])
         self._asr_lock = threading.Lock()
         self._tts_lock = threading.Lock()
-        stt_dir = root / "sherpa-onnx-paraformer-zh-2023-09-14"
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
-            paraformer=str(stt_dir / "model.int8.onnx"),
-            tokens=str(stt_dir / "tokens.txt"),
-            num_threads=2,
-        )
-        tts_config = local_models.build_tts_config(sherpa_onnx, root, key[1])
-        self._tts = sherpa_onnx.OfflineTts(tts_config)
+        self._recognizer = None
+        self._tts = None
         self._speaker_id = key[2]
-        self.sample_rate = int(self._tts.sample_rate)
+        # 云端 TTS 输出 8k PCM 直出；本地 TTS 加载后按实际采样率覆盖。
+        self.sample_rate = 8000
         self.cached_phrases: dict[str, bytes] = {}
-        warmup = self.synthesize("你好。")
-        for phrase in key[3].split("|"):
-            if phrase.strip() and phrase not in self.cached_phrases:
-                self.cached_phrases[phrase] = warmup if phrase == "你好。" else self.synthesize(phrase)
+        if key[4] == "local":
+            stt_dir = root / "sherpa-onnx-paraformer-zh-2023-09-14"
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
+                paraformer=str(stt_dir / "model.int8.onnx"),
+                tokens=str(stt_dir / "tokens.txt"),
+                num_threads=2,
+            )
+        if key[5] == "local":
+            tts_config = local_models.build_tts_config(sherpa_onnx, root, key[1])
+            self._tts = sherpa_onnx.OfflineTts(tts_config)
+            self.sample_rate = int(self._tts.sample_rate)
+            warmup = self.synthesize("你好。")
+            for phrase in key[3].split("|"):
+                if phrase.strip() and phrase not in self.cached_phrases:
+                    self.cached_phrases[phrase] = warmup if phrase == "你好。" else self.synthesize(phrase)
+
+    @property
+    def has_asr(self) -> bool:
+        return self._recognizer is not None
+
+    @property
+    def has_tts(self) -> bool:
+        return self._tts is not None
 
     def transcribe(self, segment_pcm16: bytes) -> str:
+        if self._recognizer is None:
+            raise RuntimeError("本地 ASR 未加载，无法转写")
         with self._asr_lock:
             stream = self._recognizer.create_stream()
             stream.accept_waveform(16000, _to_float32(segment_pcm16))
@@ -212,6 +256,8 @@ class _SharedSpeechModels:
     def synthesize(self, text: str) -> bytes:
         import numpy as np
 
+        if self._tts is None:
+            raise RuntimeError("本地 TTS 未加载，无法合成")
         cached = self.cached_phrases.get(text)
         if cached is not None:
             return cached
@@ -222,7 +268,7 @@ class _SharedSpeechModels:
 
 
 _SHARED_MODELS_LOCK = threading.Lock()
-_SHARED_MODELS: tuple[tuple[str, str, int, str], _SharedSpeechModels] | None = None
+_SHARED_MODELS: tuple[tuple[str, str, int, str, str, str], _SharedSpeechModels] | None = None
 
 
 def reset_shared_speech_models() -> None:
@@ -239,6 +285,7 @@ def _get_shared_models(on_progress: Callable[[str], None] | None = None) -> _Sha
     key = (
         str(local_models.models_dir().resolve()), config.get_str("LOCAL_TTS_MODEL"),
         config.get_int("LOCAL_TTS_SPEAKER_ID"), _cache_phrases(),
+        config.get_str("LOCAL_ASR_PROVIDER"), config.get_str("LOCAL_TTS_PROVIDER"),
     )
     if on_progress is not None and (_SHARED_MODELS is None or _SHARED_MODELS[0] != key):
         on_progress("正在加载本地语音模型…")
@@ -272,7 +319,12 @@ def _to_float32(pcm16: bytes):
 
 
 class _SherpaPipeline:
-    """Per-call VAD backed by shared, lazily imported sherpa-onnx models."""
+    """Per-call VAD backed by shared sherpa-onnx；ASR/TTS 可分别切 DashScope。"""
+
+    streaming_asr = False
+    streaming_tts = False
+    local_asr_available = False
+    local_tts_available = False
 
     def __init__(self, on_progress: Callable[[str], None] | None = None) -> None:
         self._models = _get_shared_models(on_progress)
@@ -292,6 +344,29 @@ class _SherpaPipeline:
 
         self.sample_rate = self._models.sample_rate
         self.cached_phrases = self._models.cached_phrases
+        self._asr_provider = config.get_str("LOCAL_ASR_PROVIDER")
+        self._tts_provider = config.get_str("LOCAL_TTS_PROVIDER")
+        self.streaming_asr = self._asr_provider == "dashscope"
+        self.streaming_tts = self._tts_provider == "dashscope"
+        self.local_asr_available = bool(getattr(self._models, "has_asr", False))
+        self.local_tts_available = bool(getattr(self._models, "has_tts", False))
+        self._asr_segments: list[bytes] = []
+        self._asr_failed = False
+        self._asr_client: Any = None
+        self._tts_client: Any = None
+        if self.streaming_asr or self.streaming_tts:
+            from . import qwen_speech
+
+            key = qwen_speech.dashscope_api_key()
+            if self.streaming_asr:
+                self._asr_client = qwen_speech.QwenAsrClient(
+                    config.get_str("LOCAL_ASR_DASHSCOPE_MODEL"), key,
+                )
+            if self.streaming_tts:
+                self._tts_client = qwen_speech.QwenTtsClient(
+                    config.get_str("LOCAL_TTS_DASHSCOPE_MODEL"),
+                    config.get_str("LOCAL_TTS_DASHSCOPE_VOICE"), key,
+                )
 
     def is_speech_detected(self) -> bool:
         return bool(self._vad.is_speech_detected())
@@ -319,10 +394,84 @@ class _SherpaPipeline:
         return segments
 
     def transcribe(self, segment_pcm16: bytes) -> str:
-        return self._models.transcribe(segment_pcm16)
+        if not self.streaming_asr:
+            return self._models.transcribe(segment_pcm16)
+        assert self._asr_client is not None
+        try:
+            return self._asr_client.one_shot(resample_pcm(segment_pcm16, 16000, 8000))
+        except Exception as exc:  # noqa: BLE001 - 本轮回落本地
+            logger.warning("[qwen_asr] one-shot 识别失败，回落本地: %s", type(exc).__name__)
+            return self._fallback_transcribe([segment_pcm16])
+
+    def feed_segment(self, segment_pcm16: bytes) -> None:
+        assert self.streaming_asr and self._asr_client is not None
+        self._asr_segments.append(segment_pcm16)
+        if self._asr_failed:
+            return
+        try:
+            self._asr_client.append(resample_pcm(segment_pcm16, 16000, 8000))
+        except Exception as exc:  # noqa: BLE001 - 本轮回落本地
+            self._asr_failed = True
+            logger.warning("[qwen_asr] 送段失败，本轮回落本地: %s", type(exc).__name__)
+
+    def end_turn(self) -> str:
+        assert self.streaming_asr and self._asr_client is not None
+        segments, self._asr_segments = self._asr_segments, []
+        failed, self._asr_failed = self._asr_failed, False
+        if not failed:
+            try:
+                text = self._asr_client.commit()
+                self._asr_client.clear()
+                return text
+            except Exception as exc:  # noqa: BLE001 - 本轮回落本地
+                failed = True
+                logger.warning("[qwen_asr] 取 final 失败，本轮回落本地: %s", type(exc).__name__)
+        return self._fallback_transcribe(segments)
+
+    def _fallback_transcribe(self, segments: list[bytes]) -> str:
+        if not self.local_asr_available:
+            logger.warning("[qwen_asr] 本地 ASR 不可用，本轮识别为空")
+            return ""
+        return "".join(self._models.transcribe(segment) for segment in segments)
 
     def synthesize(self, text: str) -> bytes:
-        return self._models.synthesize(text)
+        if not self.streaming_tts:
+            return self._models.synthesize(text)
+        assert self._tts_client is not None
+        return self._tts_client.synthesize(text)
+
+    def synthesize_stream(
+        self, text: str, on_audio: Callable[[bytes], None], should_stop: Callable[[], bool],
+    ) -> bool:
+        if not self.streaming_tts:
+            # 本地 TTS 是整句合成；这里退化为一整段，保持接口一致。
+            if should_stop():
+                return False
+            on_audio(self.synthesize(text))
+            return True
+        assert self._tts_client is not None
+        try:
+            return self._tts_client.synthesize_stream(text, on_audio, should_stop)
+        except Exception as exc:  # noqa: BLE001 - 云端失败回落本地
+            if not self.local_tts_available:
+                raise
+            logger.warning("[qwen_tts] 云端流式合成失败，回落本地 TTS: %s", type(exc).__name__)
+            if should_stop():
+                return False
+            on_audio(self._models.synthesize(text))
+            return True
+
+    def warmup(self) -> None:
+        if self._asr_client is not None:
+            self._asr_client.warmup()
+        if self._tts_client is not None:
+            self._tts_client.warmup()
+
+    def close(self) -> None:
+        if self._asr_client is not None:
+            self._asr_client.close()
+        if self._tts_client is not None:
+            self._tts_client.close()
 
 
 def _default_llm_chat(
@@ -666,10 +815,20 @@ class LocalPipelineAgent(VoiceAgent):
             if not text or self._opening_cancelled.is_set():
                 return
             spoken = speech_text(text)
-            pipeline = self._pipeline or self._pipeline_factory()
+            pipeline = self._pipeline
+            created = pipeline is None
+            if pipeline is None:
+                pipeline = self._pipeline_factory()
             raw_peak = config.get_str("LOCAL_TTS_PEAK").strip()
-            pcm = (normalize_peak(pipeline.synthesize(spoken), float(raw_peak) if raw_peak else None)
-                   if spoken else b"")
+            try:
+                pcm = (normalize_peak(pipeline.synthesize(spoken), float(raw_peak) if raw_peak else None)
+                       if spoken else b"")
+            finally:
+                # 开场预合成单独建一条连接，用完即关；正式通话的管线由 start() 预热复用。
+                if created:
+                    close = getattr(pipeline, "close", None)
+                    if callable(close):
+                        close()
             with self._opening_lock:
                 if (pcm or not spoken) and not self._opening_cancelled.is_set():
                     self._opening = (instructions, system, text, pcm)
@@ -705,9 +864,15 @@ class LocalPipelineAgent(VoiceAgent):
                 pipeline = self._pipeline_factory()
             if self._segmented_asr and not callable(getattr(pipeline, "is_speech_detected", None)):
                 raise ValueError("分段识别管线需要 is_speech_detected()")
-            for phrase in [*_cache_phrases().split("|"), *self._fixed_phrases]:
-                if phrase.strip() and phrase not in self._tts_cache:
-                    self._tts_cache[phrase] = normalize_peak(pipeline.synthesize(phrase), self._peak)
+            # 云端 TTS 流式合成，预合成缓存无意义；只预热连接，别在会话开始逐句
+            # 打一串网络合成。固定句/垫话照常经流式路径实时下发。
+            if not getattr(pipeline, "streaming_tts", False):
+                for phrase in [*_cache_phrases().split("|"), *self._fixed_phrases]:
+                    if phrase.strip() and phrase not in self._tts_cache:
+                        self._tts_cache[phrase] = normalize_peak(pipeline.synthesize(phrase), self._peak)
+            warmup = getattr(pipeline, "warmup", None)
+            if callable(warmup):
+                warmup()
             return pipeline
         try:
             if config.get_bool("PARALLEL_AGENT_CONNECT"):
@@ -838,6 +1003,11 @@ class LocalPipelineAgent(VoiceAgent):
             self._cancel_turn()
         if self._deepseek is not None:
             self._deepseek.close()
+        pipeline = self._pipeline
+        if pipeline is not None:
+            close = getattr(pipeline, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
         # Never block the event loop while a model kernel / network call finishes.
         for thread in (self._vad_thread, self._asr_thread, self._brain_thread, self._tts_thread, self._warm_thread):
             if thread is not None:
@@ -942,6 +1112,7 @@ class LocalPipelineAgent(VoiceAgent):
     def _asr_worker(self) -> None:
         pipeline = self._pipeline
         assert pipeline is not None
+        streaming = bool(getattr(pipeline, "streaming_asr", False))
         texts: list[str] = []
         completed_at = 0.0
         failed = False
@@ -952,6 +1123,17 @@ class LocalPipelineAgent(VoiceAgent):
                 continue
             try:
                 if isinstance(item, bytes):
+                    if streaming:
+                        # 云端分段 ASR 只喂段、不做中间结果抢跑；本地判停时统一
+                        # commit 取 final，判停策略与 local 完全一致。
+                        try:
+                            pipeline.feed_segment(item)
+                        except Exception as exc:  # noqa: BLE001 - 本轮回落本地
+                            failed = True
+                            self._cancel_speculation()
+                            logger.warning("ASR 云端送段失败（跳过本轮）: %s", exc)
+                        completed_at = time.monotonic()
+                        continue
                     revision = self._speech_revision
                     try:
                         texts.append(pipeline.transcribe(item))
@@ -964,11 +1146,24 @@ class LocalPipelineAgent(VoiceAgent):
                     if not failed:
                         self._start_speculation("".join(texts), revision)
                 else:
-                    # The FIFO marker is a barrier after the last segment. If ASR
-                    # finished during speech, tail is zero, not marker scheduling time.
-                    self._mark_latency(item.turn, "asr_tail", at=completed_at)
-                    if not failed and self._running:
-                        self._brain_queue.put(_RecognizedSpeech("".join(texts), item.turn))
+                    if streaming:
+                        try:
+                            text = pipeline.end_turn()
+                            completed_at = time.monotonic()
+                        except Exception as exc:  # noqa: BLE001 - 本轮回落本地
+                            text = ""
+                            failed = True
+                            self._cancel_speculation()
+                            logger.warning("ASR 云端判停失败（跳过本轮）: %s", exc)
+                        self._mark_latency(item.turn, "asr_tail", at=completed_at)
+                        if not failed and self._running:
+                            self._brain_queue.put(_RecognizedSpeech(text, item.turn))
+                    else:
+                        # The FIFO marker is a barrier after the last segment. If ASR
+                        # finished during speech, tail is zero, not marker scheduling time.
+                        self._mark_latency(item.turn, "asr_tail", at=completed_at)
+                        if not failed and self._running:
+                            self._brain_queue.put(_RecognizedSpeech("".join(texts), item.turn))
                     texts = []
                     failed = False
             finally:
@@ -1283,11 +1478,15 @@ class LocalPipelineAgent(VoiceAgent):
             if stage == "first_pcm_written":
                 # 固定指标名的单行汇总：一眼看出这轮慢在识别尾、首字、首句还是合成。
                 summary = {name: turn.marks.get(name) for name in _TURN_SUMMARY_STAGES}
+                asr_provider = "dashscope" if getattr(self._pipeline, "streaming_asr", False) else "local"
+                tts_provider = "dashscope" if getattr(self._pipeline, "streaming_tts", False) else "local"
                 # 每条逐轮事件都带 stage，消费方按 stage 过滤不必特判类型。
                 self._turn_event(type="local_turn_summary", turn_id=turn.sequence, stage="summary",
-                                 at=measured_at, kind="user" if turn.is_user else "say", **summary)
-                logger.info("[local_turn] #%d %s", turn.sequence, " ".join(
-                    f"{name}={int(value)}" for name, value in summary.items() if value is not None))
+                                 at=measured_at, kind="user" if turn.is_user else "say",
+                                 asr_provider=asr_provider, tts_provider=tts_provider, **summary)
+                logger.info("[local_turn] #%d asr=%s tts=%s %s", turn.sequence,
+                            asr_provider, tts_provider,
+                            " ".join(f"{name}={int(value)}" for name, value in summary.items() if value is not None))
 
     def _discard_batch(self, batch: _SpeechBatch) -> None:
         with self._turn_lock:
@@ -1362,6 +1561,8 @@ class LocalPipelineAgent(VoiceAgent):
             batch.turn.reply_started = True
             if not filler:
                 self._mark_latency(batch.turn, "first_clause_ready")
+        if getattr(pipeline, "streaming_tts", False):
+            return self._speak_streaming(text, batch, filler=filler)
         try:
             pcm = self._tts_cache.get(text)
             if pcm is None:
@@ -1380,3 +1581,39 @@ class LocalPipelineAgent(VoiceAgent):
                 self._output_pcm(pcm, batch.turn, stage="slow_filler_written" if filler else "first_pcm_written")
                 return True
         return False
+
+    def _speak_streaming(self, text: str, batch: _SpeechBatch, *, filler: bool = False) -> bool:
+        """云端 TTS 流式下发：delta 直接写播放路径，barge-in 时丢弃未播音频。"""
+        pipeline = self._pipeline
+        assert pipeline is not None and self._on_audio_out is not None
+        first_audio = False
+        emitted = False
+
+        def on_audio(pcm: bytes) -> None:
+            nonlocal first_audio, emitted
+            if not pcm:
+                return
+            with self._turn_lock:
+                if not (self._running and not batch.cancelled.is_set()
+                        and not batch.turn.cancelled.is_set()):
+                    return
+                if not first_audio:
+                    first_audio = True
+                    if not filler:
+                        self._mark_latency(batch.turn, "tts_first_audio")
+                    batch.audio_emitted = True
+                emitted = True
+                # first_pcm_written 由 _mark_latency 去重，只记首帧。
+                self._output_pcm(pcm, batch.turn,
+                                 stage="slow_filler_written" if filler else "first_pcm_written")
+
+        def should_stop() -> bool:
+            return (not self._running or batch.cancelled.is_set()
+                    or batch.turn.cancelled.is_set())
+
+        try:
+            done = pipeline.synthesize_stream(text, on_audio, should_stop)
+        except Exception as exc:  # noqa: BLE001 - 云端失败且本地不可用
+            logger.warning("TTS 云端流式合成失败: %s", exc)
+            return False
+        return done and emitted
