@@ -150,6 +150,21 @@ def _skip_local_relay_condition(connection: Any, candidates: list[Any]) -> bool:
     return remote_candidates is not None and any(c.type == "relay" for c in remote_candidates)
 
 
+def _have_srflx_and_relay(candidates: list[Any]) -> bool:
+    """True when local gathering already has both a srflx and a relay candidate."""
+    return any(c.type == "srflx" for c in candidates) and any(c.type == "relay" for c in candidates)
+
+
+def _remote_candidate_type_counts(connection: Any) -> str:
+    """Count peer offer candidate types without exposing addresses."""
+    counts = {"host": 0, "srflx": 0, "relay": 0}
+    for candidate in getattr(connection, "remote_candidates", None) or []:
+        kind = getattr(candidate, "type", None)
+        if kind in counts:
+            counts[kind] += 1
+    return "host:%d,srflx:%d,relay:%d" % (counts["host"], counts["srflx"], counts["relay"])
+
+
 def _early_complete_hook(connection: Any, pair: Any) -> None:
     # Only the controlled agent waits for the peer's regular nomination; upstream
     # already uses aggressive nomination when controlling, so it needs no shortcut.
@@ -411,6 +426,9 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
                 pending = set(jobs)
                 while True:
                     _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    if _have_srflx_and_relay(candidates):
+                        reason = "have_srflx_and_relay"
+                        break
                     if _skip_local_relay_condition(connection, candidates):
                         reason = "skip_local_relay"
                         break
@@ -427,10 +445,11 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
             await asyncio.gather(*jobs, return_exceptions=True)
         connection._agentcall_gathers.discard(current)
         connection._agentcall_gather_ms = (time.monotonic() - started) * 1000
-        logger.info("Direct ICE gather connection=%s component=%s total_ms=%.1f reason=%s host=%s srflx=%s relay=%s",
+        logger.info("Direct ICE gather connection=%s component=%s total_ms=%.1f reason=%s "
+                    "host=%s srflx=%s relay=%s remote=%s",
                     id(connection), component, connection._agentcall_gather_ms, reason,
                     sum(c.type == "host" for c in candidates), sum(c.type == "srflx" for c in candidates),
-                    sum(c.type == "relay" for c in candidates))
+                    sum(c.type == "relay" for c in candidates), _remote_candidate_type_counts(connection))
     return candidates
 
 
