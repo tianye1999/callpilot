@@ -365,6 +365,123 @@ def test_download_against_local_http_server(tmp_path):
         server.server_close()
 
 
+# ---- 下载 User-Agent / 单飞并发 ----
+
+def test_download_sends_callpilot_edge_user_agent(tmp_path):
+    captured = {}
+
+    def fake_urlopen(request, timeout=60):
+        captured["ua"] = request.get_header("User-agent")
+        return _FakeResponse(b"x", status=200, headers={"Content-Length": "1"})
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    try:
+        _download("https://example.com/x.bin", tmp_path / "x.bin", size=1)
+    finally:
+        monkeypatch.undo()
+
+    assert captured["ua"] is not None
+    assert not captured["ua"].startswith("Python-urllib")
+    assert captured["ua"].startswith("CallPilot-Edge/")
+    assert captured["ua"] == f"CallPilot-Edge/{local_models.VERSION}"
+
+
+def test_user_agent_falls_back_to_1_when_version_unknown(monkeypatch):
+    monkeypatch.setattr(local_models, "VERSION", "unknown")
+    assert local_models._user_agent() == "CallPilot-Edge/1"
+
+
+def _single_flight_asset(asset_id: str) -> ModelAsset:
+    return ModelAsset(
+        id=asset_id, description=asset_id,
+        url=f"https://github.com/k2-fsa/sherpa-onnx/releases/download/{asset_id}/x.bin",
+        required_files=("x.bin",), archive=False, size=1,
+    )
+
+
+def _stub_download_from_sources(monkeypatch, download_calls, first_entered, finish):
+    def fake_download_from_sources(sources, dest, *, size=None, sha256=None,
+                                   progress=None, cancel=None, report_source=None):
+        download_calls.append(dest.name)
+        first_entered.set()
+        assert finish.wait(5)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"x")
+
+    monkeypatch.setattr(local_models, "_download_from_sources", fake_download_from_sources)
+
+
+def test_ensure_asset_single_flight_two_threads(tmp_path, monkeypatch):
+    asset = _single_flight_asset("single-flight")
+    download_calls = []
+    first_entered = threading.Event()
+    finish = threading.Event()
+    _stub_download_from_sources(monkeypatch, download_calls, first_entered, finish)
+
+    results: dict[str, object] = {}
+    errors: list[Exception] = []
+
+    def run(name: str) -> None:
+        try:
+            results[name] = local_models.ensure_asset(asset, tmp_path)
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=run, args=("first",))
+    first.start()
+    assert first_entered.wait(5)
+    second = threading.Thread(target=run, args=("second",))
+    second.start()
+    time.sleep(0.2)
+    finish.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert len(download_calls) == 1
+    assert (tmp_path / "x.bin").read_bytes() == b"x"
+    assert results == {"first": True, "second": False}
+
+
+def test_ensure_asset_cancel_while_waiting_for_lock_does_not_download(tmp_path, monkeypatch):
+    asset = _single_flight_asset("single-flight-cancel")
+    download_calls = []
+    first_entered = threading.Event()
+    finish = threading.Event()
+    _stub_download_from_sources(monkeypatch, download_calls, first_entered, finish)
+
+    first = threading.Thread(target=local_models.ensure_asset, args=(asset, tmp_path))
+    first.start()
+    assert first_entered.wait(5)
+
+    cancel = threading.Event()
+    second_outcome: list[str] = []
+
+    def run_second() -> None:
+        try:
+            local_models.ensure_asset(asset, tmp_path, cancel=cancel)
+            second_outcome.append("returned")
+        except local_models.DownloadCancelled:
+            second_outcome.append("cancelled")
+        except Exception as exc:
+            second_outcome.append(f"error:{exc}")
+
+    second = threading.Thread(target=run_second)
+    second.start()
+    time.sleep(0.2)
+    cancel.set()
+    finish.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert second_outcome == ["cancelled"]
+    assert len(download_calls) == 1
+    assert (tmp_path / "x.bin").read_bytes() == b"x"
+
+
 # ---- 后台下载管理器：进度快照 / 取消 ----
 
 def _fake_asset() -> ModelAsset:

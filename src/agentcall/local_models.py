@@ -32,10 +32,27 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import config
+from .app_version import VERSION
 
 logger = logging.getLogger(__name__)
 
 _RELEASE_BASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
+
+_asset_locks: dict[str, threading.Lock] = {}
+_asset_locks_guard = threading.Lock()
+
+
+def _user_agent() -> str:
+    """非 Python 默认 UA；Cloudflare 会按 urllib 默认 UA 直接 403。"""
+    version = str(VERSION).strip()
+    if not version or version == "unknown":
+        version = "1"
+    return f"CallPilot-Edge/{version}"
+
+
+def _asset_lock(asset_id: str) -> threading.Lock:
+    with _asset_locks_guard:
+        return _asset_locks.setdefault(asset_id, threading.Lock())
 
 
 @dataclass(frozen=True)
@@ -303,7 +320,7 @@ def _download(
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_name(dest.name + ".part")
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = {"User-Agent": _user_agent()}
     received = 0
     if partial.is_file():
         received = partial.stat().st_size
@@ -437,31 +454,34 @@ def ensure_asset(
 ) -> bool:
     """确保一件资产就绪；返回是否发生了下载。失败抛异常（调用方决定降级）。"""
     root = base if base is not None else models_dir()
-    if asset_ready(asset, root):
-        return False
-    bundled = bundled_models_dir()
-    if bundled is not None and root.resolve().is_relative_to(bundled.resolve()):
-        raise RuntimeError("包内模型目录只读，请在用户数据目录准备缺失模型")
-    url = resolved_url(asset)
-    sources = download_sources(asset)
-    if not asset.archive:
-        _download_from_sources(sources, root / asset.required_files[0], size=asset.size,
-                               sha256=asset.sha256, progress=progress, cancel=cancel,
-                               report_source=report_source)
-    else:
-        archive_name = url.rsplit("/", 1)[-1]
-        archive_path = root / archive_name
-        if not _artifact_valid(archive_path, asset):
-            _download_from_sources(sources, archive_path, size=asset.size, sha256=asset.sha256,
-                                   progress=progress, cancel=cancel, report_source=report_source)
-        _extract_archive(archive_path, root)
-        archive_path.unlink(missing_ok=True)
-    still_missing = [rel for rel, path in asset_paths(asset, root).items() if not path.is_file()]
-    still_missing.extend(rel for rel in asset.required_dirs if not (root / rel).is_dir())
-    if still_missing:
-        raise RuntimeError(f"模型资产 {asset.id} 下载后仍缺文件: {', '.join(still_missing)}")
-    logger.info("模型资产 %s 就绪", asset.id)
-    return True
+    with _asset_lock(asset.id):
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled(asset.id)
+        if asset_ready(asset, root):
+            return False
+        bundled = bundled_models_dir()
+        if bundled is not None and root.resolve().is_relative_to(bundled.resolve()):
+            raise RuntimeError("包内模型目录只读，请在用户数据目录准备缺失模型")
+        url = resolved_url(asset)
+        sources = download_sources(asset)
+        if not asset.archive:
+            _download_from_sources(sources, root / asset.required_files[0], size=asset.size,
+                                   sha256=asset.sha256, progress=progress, cancel=cancel,
+                                   report_source=report_source)
+        else:
+            archive_name = url.rsplit("/", 1)[-1]
+            archive_path = root / archive_name
+            if not _artifact_valid(archive_path, asset):
+                _download_from_sources(sources, archive_path, size=asset.size, sha256=asset.sha256,
+                                       progress=progress, cancel=cancel, report_source=report_source)
+            _extract_archive(archive_path, root)
+            archive_path.unlink(missing_ok=True)
+        still_missing = [rel for rel, path in asset_paths(asset, root).items() if not path.is_file()]
+        still_missing.extend(rel for rel in asset.required_dirs if not (root / rel).is_dir())
+        if still_missing:
+            raise RuntimeError(f"模型资产 {asset.id} 下载后仍缺文件: {', '.join(still_missing)}")
+        logger.info("模型资产 %s 就绪", asset.id)
+        return True
 
 
 def ensure_all(base: Path | None = None) -> dict[str, Path]:
