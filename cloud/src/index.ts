@@ -2,7 +2,7 @@ import { authenticateDevice, authenticateDeviceWithReads, authenticateEdge } fro
 import { inboundOwnerAction, notifyOwnerDecision, rejectOwnerDecision } from "./inbound-owner";
 import { ClaimTiming } from "./claim-timing";
 import { claimInboundFastpathV2, fallbackInboundLivekit, inboundIce, completeInboundSdp, endInboundMedia } from "./inbound-fastpath-v2";
-import { turnConfigured } from "./turn";
+import { issueIceServers, turnConfigured } from "./turn";
 import { fallbackOutboundLivekit, outboundDirectAvailable, outboundIce, outboundPayload, startOutboundDirect } from "./outbound-direct";
 import {
   contentReadEnabled,
@@ -469,6 +469,16 @@ async function createCall(request: Request, env: Env, timing: ClaimTiming, ctx?:
   const edgeIdentity = randomId("edgepart", 12);
   const expiresAt = now + 5 * 60 * 1000;
   const direct = input.sdpOffer !== undefined && outboundDirectAvailable(env, state);
+  // Edge-side TURN credentials are independent of the idempotency INSERT, so
+  // start that external round trip before awaiting the D1 write. Failures are
+  // captured here (never as an unhandled rejection) and handled by the LiveKit
+  // fallback inside startOutboundDirect.
+  const turnTask = direct
+    ? timing.measure("turn", () => issueIceServers(env)).then(
+        value => ({ value }),
+        (failure: unknown) => ({ failure })
+      )
+    : null;
   const inserted = await timing.measure("call_insert", () => env.DB.prepare(
     "INSERT OR IGNORE INTO calls(call_id, edge_id, device_id, idempotency_key, room_name, phone_identity, edge_identity, status, created_at, expires_at, updated_at, media_transport) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?8, ?10)"
   ).bind(callId, input.edgeId, device.device_id, input.idempotencyKey, roomName, phoneIdentity, edgeIdentity, now, expiresAt,
@@ -506,11 +516,14 @@ async function createCall(request: Request, env: Env, timing: ClaimTiming, ctx?:
   if (direct) {
     const started = await startOutboundDirect(env, command as Parameters<typeof startOutboundDirect>[1], input.sdpOffer!,
       input.edgeId, async update => {
+        // The UPDATE is conditional on status='pending' so a concurrent
+        // call.status from the Edge (e.g. dialing/ended) is not overwritten; the
+        // paired SELECT reports that true final status in the same D1 round trip.
         const rows = await timing.measure("call_finalize_read", () => env.DB.batch([
           update, env.DB.prepare("SELECT * FROM calls WHERE call_id = ?1").bind(callId)
         ]));
         return callPayload(rows[1]!.results[0] as CallRecord);
-      }, timing);
+      }, timing, turnTask ?? undefined);
     if (started) {
       await recordAudit();
       return started;

@@ -22,7 +22,7 @@ type Command = { type: string; commandId: string; callId: string; direct?: { sdp
   session: { token: string; roomName: string; browserIdentity: string; edgeIdentity: string } };
 
 async function fixture(options: { edgeDirect?: boolean; enabled?: boolean; rateGate?: Promise<void>;
-  auditGate?: Promise<void>; failAudit?: boolean } = {}) {
+  auditGate?: Promise<void>; failAudit?: boolean; insertGate?: Promise<void> } = {}) {
   const db = new DatabaseSync(":memory:");
   databases.push(db);
   for (const name of readdirSync(new URL("../migrations/", import.meta.url)).filter(n => n.endsWith(".sql")).sort()) {
@@ -56,6 +56,7 @@ async function fixture(options: { edgeDirect?: boolean; enabled?: boolean; rateG
           },
           all: async () => ({ results: db.prepare(sql).all(params) }),
           run: async () => {
+            if (sql.startsWith("INSERT OR IGNORE INTO calls")) await options.insertGate;
             if (sql.startsWith("INSERT INTO audit_events")) {
               await options.auditGate;
               if (options.failAudit) throw new Error("synthetic private audit failure");
@@ -264,6 +265,23 @@ describe("outbound direct create", () => {
     } finally {
       releaseAuth();
       releasePresence(Response.json({ connected: true, modemOnline: true, outboundDirectV1: true }));
+      await pending;
+    }
+    expect((await pending).status).toBe(202);
+  });
+
+  it("starts TURN issuance before the idempotency INSERT completes", async () => {
+    let releaseInsert!: () => void;
+    const insertGate = new Promise<void>(resolve => { releaseInsert = resolve; });
+    const f = await fixture({ insertGate });
+    const pending = f.request("/v1/calls", create());
+    try {
+      await vi.waitFor(() => expect(f.turn).toHaveBeenCalledOnce());
+      expect(f.env.DB.batch).toHaveBeenCalledTimes(1);
+      expect(f.relay).toHaveBeenCalledExactlyOnceWith("https://edge-room/presence");
+      expect(f.commands).toHaveLength(0);
+    } finally {
+      releaseInsert();
       await pending;
     }
     expect((await pending).status).toBe(202);

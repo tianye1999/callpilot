@@ -6,13 +6,16 @@ import { HttpError, json, readJson, requireSameOrigin } from "./http";
 import { issueParticipantToken, LIVEKIT_PARTICIPANT_TOKEN_TTL_SECONDS } from "./livekit";
 import { callAnswerSchema, outboundIceSchema } from "./schemas";
 import { randomId } from "./security";
-import { issueIceServers, turnConfigured } from "./turn";
+import { issueIceServers, turnConfigured, type IceCredentials } from "./turn";
 import type { CallRecord, EdgePresence, Env } from "./types";
 
 type StartCommand = {
   v: 1; type: "session.start"; commandId: string; callId: string; expiresAt: string;
   session: Record<string, unknown>;
 };
+
+/** A speculative TURN fetch started before the idempotency INSERT so the two RTTs overlap. */
+type TurnTask = Promise<{ value: IceCredentials } | { failure: unknown }>;
 
 function edgeRoom(env: Env, edgeId: string) { return env.EDGE_ROOMS.get(env.EDGE_ROOMS.idFromName(edgeId)); }
 function unavailable() { return new HttpError("CALL_UNAVAILABLE", "Call is no longer available", 409); }
@@ -49,12 +52,23 @@ export function outboundPayload(call: CallRecord, base: Record<string, unknown>)
  * Deliver session.start with the phone's offer and wait for the Edge answer.
  * Returns null when Edge-side TURN credentials are unavailable, so the caller
  * can start the same call as a plain LiveKit session instead.
+ *
+ * `turnTask` is an optional speculative TURN fetch started before the
+ * idempotency INSERT. Its external round trip overlaps the D1 write instead of
+ * adding serial time to the outbound-create critical path.
  */
 export async function startOutboundDirect(env: Env, command: StartCommand, sdpOffer: string,
-  edgeId: string, payload: (update: D1PreparedStatement) => Promise<Record<string, unknown>>, timing = new ClaimTiming()): Promise<Response | null> {
+  edgeId: string, payload: (update: D1PreparedStatement) => Promise<Record<string, unknown>>,
+  timing = new ClaimTiming(), turnTask?: TurnTask): Promise<Response | null> {
   let iceServers;
   try {
-    iceServers = (await timing.measure("turn", () => issueIceServers(env))).iceServers;
+    if (turnTask) {
+      const result = await turnTask;
+      if ("failure" in result) throw result.failure;
+      iceServers = result.value.iceServers;
+    } else {
+      iceServers = (await timing.measure("turn", () => issueIceServers(env))).iceServers;
+    }
   } catch {
     await timing.measure("call_finalize", () => env.DB.prepare("UPDATE calls SET media_transport = NULL, updated_at = ?1 WHERE call_id = ?2 AND status = 'pending'")
       .bind(Date.now(), command.callId).run());
