@@ -34,8 +34,8 @@ android {
         applicationId = "ai.bondings.callpilot"
         minSdk = 26
         targetSdk = 35
-        versionCode = 70007
-        versionName = "0.7.7"
+        versionCode = 70008
+        versionName = "0.7.8"
     }
 
     buildTypes {
