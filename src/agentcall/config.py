@@ -311,6 +311,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("INBOUND_FASTPATH_V2_ENABLED", "来电接管 V2 实验路径", "bool", "false"),
     ConfigSpec("OUTBOUND_DIRECT_ENABLED", "App 外呼走直连（LiveKit 兜底）", "bool", "true"),
     ConfigSpec("DIRECT_ICE_EARLY_COMPLETE_ENABLED", "直连 ICE 首对成功后提前完成（未真机验收）", "bool", "false"),
+    ConfigSpec(
+        "DIRECT_GATHER_SKIP_LOCAL_RELAY_ENABLED",
+        "对端已带 relay 且本端 srflx 就绪时跳过本端 relay 等待（未真机验收）",
+        "bool", "false",
+    ),
     ConfigSpec("INBOUND_PCM_PRE_ATA_PROBE_ENABLED", "响铃期 PCM 诊断探针", "bool", "false"),
     ConfigSpec("INBOUND_EARLY_ANSWER_ENABLED", "认领后立即接通运营商通话（与手机连媒体并行）", "bool", "false"),
     ConfigSpec("INBOUND_PHONE_FIRST_RING_SECONDS", "串口模组先响手机等待（1–15 秒）", "int", "15"),

@@ -132,6 +132,24 @@ def _early_complete_enabled() -> bool:
         return False
 
 
+def _skip_local_relay_enabled() -> bool:
+    try:
+        from . import config
+        return config.get_bool("DIRECT_GATHER_SKIP_LOCAL_RELAY_ENABLED")
+    except Exception:
+        return False
+
+
+def _skip_local_relay_condition(connection: Any, candidates: list[Any]) -> bool:
+    """True when the peer already offers a relay and a local srflx proves outbound UDP."""
+    if not _skip_local_relay_enabled():
+        return False
+    if not any(c.type == "srflx" for c in candidates):
+        return False
+    remote_candidates = getattr(connection, "remote_candidates", None)
+    return remote_candidates is not None and any(c.type == "relay" for c in remote_candidates)
+
+
 def _early_complete_hook(connection: Any, pair: Any) -> None:
     # Only the controlled agent waits for the peer's regular nomination; upstream
     # already uses aggressive nomination when controlling, so it needs no shortcut.
@@ -308,6 +326,7 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
     current = asyncio.current_task()
     connection._agentcall_gathers.add(current)
     started = time.monotonic()
+    reason = "complete"
 
     def milestone(kind: str, outcome: str, launched: float) -> None:
         now = time.monotonic()
@@ -365,6 +384,7 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
     try:
         async with asyncio.timeout(GATHER_MAX_SECONDS):
             if connection._agentcall_stopping:
+                reason = "stopped"
                 return candidates
             if connection.turn_server:
                 launch(ice.relayed_candidate(
@@ -388,8 +408,16 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
                 if source in protocols:
                     launch(_server_reflexive(protocols[source], target), "srflx")
             if jobs:
-                await asyncio.gather(*jobs)
+                pending = set(jobs)
+                while True:
+                    _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    if _skip_local_relay_condition(connection, candidates):
+                        reason = "skip_local_relay"
+                        break
+                    if not pending:
+                        break
     except TimeoutError:
+        reason = "budget"
         logger.info("Direct ICE gather reached caller budget; retaining completed candidates")
     finally:
         for task in jobs:
@@ -399,8 +427,8 @@ async def _gather_component(connection: Any, component: int, addresses: list[str
             await asyncio.gather(*jobs, return_exceptions=True)
         connection._agentcall_gathers.discard(current)
         connection._agentcall_gather_ms = (time.monotonic() - started) * 1000
-        logger.info("Direct ICE gather connection=%s component=%s total_ms=%.1f host=%s srflx=%s relay=%s",
-                    id(connection), component, connection._agentcall_gather_ms,
+        logger.info("Direct ICE gather connection=%s component=%s total_ms=%.1f reason=%s host=%s srflx=%s relay=%s",
+                    id(connection), component, connection._agentcall_gather_ms, reason,
                     sum(c.type == "host" for c in candidates), sum(c.type == "srflx" for c in candidates),
                     sum(c.type == "relay" for c in candidates))
     return candidates

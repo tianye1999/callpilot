@@ -140,6 +140,236 @@ def test_dead_stun_is_bounded_and_cancelled_before_return(monkeypatch):
     asyncio.run(scenario())
 
 
+def _srflx_candidate(local):
+    from aioice import Candidate
+
+    return Candidate(foundation="srflx", component=local.component, transport="udp", priority=2,
+                     host="203.0.113.9", port=45678, type="srflx",
+                     related_address=local.host, related_port=local.port)
+
+
+def test_skip_local_relay_ends_gather_with_peer_relay_and_srflx_ready(monkeypatch, caplog):
+    from aioice import Candidate, Connection
+
+    relay_cancelled = asyncio.Event()
+
+    async def stalled_relay(**_):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            relay_cancelled.set()
+
+    async def reflexive(protocol, target):
+        await asyncio.sleep(0.01)
+        return _srflx_candidate(protocol.local_candidate), None
+
+    async def scenario():
+        monkeypatch.setenv("DIRECT_GATHER_SKIP_LOCAL_RELAY_ENABLED", "true")
+        monkeypatch.setattr(webrtc_ice, "GATHER_MAX_SECONDS", 0.5)
+        monkeypatch.setattr(webrtc_ice, "physical_host_addresses", lambda: ["127.0.0.1"])
+        monkeypatch.setattr(webrtc_ice, "default_stun_sources", lambda _: {"127.0.0.1": ("127.0.0.1", 9)})
+        monkeypatch.setattr(webrtc_ice.ice, "relayed_candidate", stalled_relay)
+        monkeypatch.setattr(webrtc_ice, "_server_reflexive", reflexive)
+        connection = Connection(ice_controlling=False, stun_server=("unused", 9), turn_server=("unused", 9),
+                                turn_username="private-user", turn_password="private-secret")
+        webrtc_ice.configure_connection(connection)
+        try:
+            await connection.add_remote_candidate(Candidate(
+                foundation="relay", component=1, transport="udp", priority=1,
+                host="104.30.0.1", port=3478, type="relay"))
+            started = time.monotonic()
+            await connection.gather_candidates()
+            assert time.monotonic() - started < 0.25
+            assert {c.type for c in connection.local_candidates} == {"host", "srflx"}
+            assert relay_cancelled.is_set()
+        finally:
+            await connection.close()
+
+    with caplog.at_level("INFO", logger="agentcall.webrtc_ice"):
+        asyncio.run(scenario())
+    assert "reason=skip_local_relay" in caplog.text
+    assert "private-user" not in caplog.text and "private-secret" not in caplog.text
+
+
+def test_skip_local_relay_waits_budget_without_remote_relay(monkeypatch, caplog):
+    from aioice import Candidate, Connection
+
+    relay_cancelled = asyncio.Event()
+
+    async def stalled_relay(**_):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            relay_cancelled.set()
+
+    async def reflexive(protocol, target):
+        await asyncio.sleep(0.01)
+        return _srflx_candidate(protocol.local_candidate), None
+
+    async def scenario():
+        monkeypatch.setenv("DIRECT_GATHER_SKIP_LOCAL_RELAY_ENABLED", "true")
+        monkeypatch.setattr(webrtc_ice, "GATHER_MAX_SECONDS", 0.05)
+        monkeypatch.setattr(webrtc_ice, "physical_host_addresses", lambda: ["127.0.0.1"])
+        monkeypatch.setattr(webrtc_ice, "default_stun_sources", lambda _: {"127.0.0.1": ("127.0.0.1", 9)})
+        monkeypatch.setattr(webrtc_ice.ice, "relayed_candidate", stalled_relay)
+        monkeypatch.setattr(webrtc_ice, "_server_reflexive", reflexive)
+        connection = Connection(ice_controlling=False, stun_server=("unused", 9), turn_server=("unused", 9),
+                                turn_username="private-user", turn_password="private-secret")
+        webrtc_ice.configure_connection(connection)
+        try:
+            await connection.add_remote_candidate(Candidate(
+                foundation="host", component=1, transport="udp", priority=1,
+                host="192.0.2.1", port=9, type="host"))
+            started = time.monotonic()
+            await connection.gather_candidates()
+            assert time.monotonic() - started >= 0.04
+            assert relay_cancelled.is_set()
+            assert "relay" not in {c.type for c in connection.local_candidates}
+        finally:
+            await connection.close()
+
+    with caplog.at_level("INFO", logger="agentcall.webrtc_ice"):
+        asyncio.run(scenario())
+    assert "reason=budget" in caplog.text
+
+
+def test_skip_local_relay_requires_local_srflx_ready(monkeypatch, caplog):
+    from aioice import Candidate, Connection
+
+    relay_cancelled = asyncio.Event()
+    srflx_cancelled = asyncio.Event()
+
+    async def stalled_relay(**_):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            relay_cancelled.set()
+
+    async def stalled_srflx(*_):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            srflx_cancelled.set()
+
+    async def scenario():
+        monkeypatch.setenv("DIRECT_GATHER_SKIP_LOCAL_RELAY_ENABLED", "true")
+        monkeypatch.setattr(webrtc_ice, "GATHER_MAX_SECONDS", 0.05)
+        monkeypatch.setattr(webrtc_ice, "physical_host_addresses", lambda: ["127.0.0.1"])
+        monkeypatch.setattr(webrtc_ice, "default_stun_sources", lambda _: {"127.0.0.1": ("127.0.0.1", 9)})
+        monkeypatch.setattr(webrtc_ice.ice, "relayed_candidate", stalled_relay)
+        monkeypatch.setattr(webrtc_ice, "_server_reflexive", stalled_srflx)
+        connection = Connection(ice_controlling=False, stun_server=("unused", 9), turn_server=("unused", 9),
+                                turn_username="private-user", turn_password="private-secret")
+        webrtc_ice.configure_connection(connection)
+        try:
+            await connection.add_remote_candidate(Candidate(
+                foundation="relay", component=1, transport="udp", priority=1,
+                host="104.30.0.1", port=3478, type="relay"))
+            started = time.monotonic()
+            await connection.gather_candidates()
+            assert time.monotonic() - started >= 0.04
+            assert srflx_cancelled.is_set() and relay_cancelled.is_set()
+        finally:
+            await connection.close()
+
+    with caplog.at_level("INFO", logger="agentcall.webrtc_ice"):
+        asyncio.run(scenario())
+    assert "reason=budget" in caplog.text
+
+
+def test_skip_local_relay_flag_off_keeps_budget_behavior(monkeypatch, caplog):
+    from aioice import Candidate, Connection
+
+    relay_cancelled = asyncio.Event()
+
+    async def stalled_relay(**_):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            relay_cancelled.set()
+
+    async def reflexive(protocol, target):
+        await asyncio.sleep(0.01)
+        return _srflx_candidate(protocol.local_candidate), None
+
+    async def scenario():
+        monkeypatch.setenv("DIRECT_GATHER_SKIP_LOCAL_RELAY_ENABLED", "false")
+        monkeypatch.setattr(webrtc_ice, "GATHER_MAX_SECONDS", 0.05)
+        monkeypatch.setattr(webrtc_ice, "physical_host_addresses", lambda: ["127.0.0.1"])
+        monkeypatch.setattr(webrtc_ice, "default_stun_sources", lambda _: {"127.0.0.1": ("127.0.0.1", 9)})
+        monkeypatch.setattr(webrtc_ice.ice, "relayed_candidate", stalled_relay)
+        monkeypatch.setattr(webrtc_ice, "_server_reflexive", reflexive)
+        connection = Connection(ice_controlling=False, stun_server=("unused", 9), turn_server=("unused", 9),
+                                turn_username="private-user", turn_password="private-secret")
+        webrtc_ice.configure_connection(connection)
+        try:
+            await connection.add_remote_candidate(Candidate(
+                foundation="relay", component=1, transport="udp", priority=1,
+                host="104.30.0.1", port=3478, type="relay"))
+            started = time.monotonic()
+            await connection.gather_candidates()
+            assert time.monotonic() - started >= 0.04
+            assert relay_cancelled.is_set()
+            assert "relay" not in {c.type for c in connection.local_candidates}
+        finally:
+            await connection.close()
+
+    with caplog.at_level("INFO", logger="agentcall.webrtc_ice"):
+        asyncio.run(scenario())
+    assert "reason=budget" in caplog.text
+
+
+def test_gather_wait_loop_does_not_busy_spin_when_relay_pends(monkeypatch, caplog):
+    import asyncio as _asyncio
+
+    from aioice import Candidate, Connection
+
+    real_wait = _asyncio.wait
+    wait_calls = 0
+
+    async def counting_wait(fs, *args, **kwargs):
+        nonlocal wait_calls
+        wait_calls += 1
+        return await real_wait(fs, *args, **kwargs)
+
+    relay_cancelled = asyncio.Event()
+
+    async def stalled_relay(**_):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            relay_cancelled.set()
+
+    async def reflexive(protocol, target):
+        await asyncio.sleep(0.01)
+        return _srflx_candidate(protocol.local_candidate), None
+
+    async def scenario():
+        monkeypatch.setenv("DIRECT_GATHER_SKIP_LOCAL_RELAY_ENABLED", "true")
+        monkeypatch.setattr(webrtc_ice, "GATHER_MAX_SECONDS", 0.05)
+        monkeypatch.setattr(webrtc_ice, "physical_host_addresses", lambda: ["127.0.0.1"])
+        monkeypatch.setattr(webrtc_ice, "default_stun_sources", lambda _: {"127.0.0.1": ("127.0.0.1", 9)})
+        monkeypatch.setattr(webrtc_ice.ice, "relayed_candidate", stalled_relay)
+        monkeypatch.setattr(webrtc_ice, "_server_reflexive", reflexive)
+        monkeypatch.setattr(_asyncio, "wait", counting_wait)
+        connection = Connection(ice_controlling=False, stun_server=("unused", 9), turn_server=("unused", 9),
+                                turn_username="private-user", turn_password="private-secret")
+        webrtc_ice.configure_connection(connection)
+        try:
+            await connection.add_remote_candidate(Candidate(
+                foundation="host", component=1, transport="udp", priority=1,
+                host="192.0.2.1", port=9, type="host"))
+            await connection.gather_candidates()
+            assert relay_cancelled.is_set()
+        finally:
+            await connection.close()
+
+    with caplog.at_level("INFO", logger="agentcall.webrtc_ice"):
+        asyncio.run(scenario())
+    assert wait_calls < 10
+    assert "reason=budget" in caplog.text
+
+
 def test_endpoint_produces_answer_while_stun_never_replies(monkeypatch):
     from aiortc import RTCConfiguration, RTCPeerConnection
 
