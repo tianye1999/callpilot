@@ -462,6 +462,27 @@ final class HostedCloudClientTests: XCTestCase {
         }
     }
 
+    func testCreateDirectCallSubmitsAndValidatesDialNumber() async throws {
+        var bodies: [[String: Any]] = []
+        let client = try makeClient { request in
+            XCTAssertEqual(request.url?.path, "/v1/calls")
+            bodies.append(try XCTUnwrap(JSONSerialization.jsonObject(with: try Self.requestBody(request)) as? [String: Any]))
+            return Self.response(for: request, status: 202,
+                json: #"{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"ready","createdAt":1,"expiresAt":9999,"directAttempted":true,"transports":[{"kind":"webrtc","sdpAnswer":"v=0\r\nanswer"}]}"#)
+        }
+        _ = try await client.createDirectCall(edgeId: "edge_abcdefghijkl", sdpOffer: "v=0\r\noffer",
+                                              idempotencyKey: "ios-test-key-1234", dialNumber: "+8610010086")
+        XCTAssertEqual(bodies[0]["dialNumber"] as? String, "+8610010086")
+
+        do {
+            _ = try await client.createDirectCall(edgeId: "edge_abcdefghijkl", sdpOffer: "v=0\r\noffer",
+                                                  idempotencyKey: "ios-test-key-5678", dialNumber: "10086-")
+            XCTFail("an invalid dial number must be rejected locally")
+        } catch let error as HostedCloudError {
+            XCTAssertEqual(error.code, "INVALID_REQUEST")
+        }
+    }
+
     func testCreateDirectCallReplayWaitsForThePendingCreateToSettle() async throws {
         var paths: [String] = []
         let client = try makeClient { request in

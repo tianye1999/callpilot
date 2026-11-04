@@ -362,6 +362,34 @@ describe("outbound direct create", () => {
     expect(polled.session).toBeUndefined();
   });
 
+  it("validates dialNumber and forwards it on the direct session.start", async () => {
+    const f = await fixture();
+    const response = await f.request("/v1/calls", create("idempotency-key-dial", {
+      mediaTransport: "webrtc", sdpOffer: sdp, dialNumber: "+8610010086"
+    }));
+    expect(response.status).toBe(202);
+    const start = f.commands[0]!;
+    expect(start.type).toBe("session.start");
+    expect((start as unknown as { dialNumber?: string }).dialNumber).toBe("+8610010086");
+    expect(callMediaCommandSchema.safeParse(start).success).toBe(true);
+
+    const invalid = await f.request("/v1/calls", create("idempotency-key-bad", {
+      mediaTransport: "webrtc", sdpOffer: sdp, dialNumber: "10086-"
+    }));
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: { code: "VALIDATION_ERROR" } });
+  });
+
+  it("forwards dialNumber on a plain LiveKit session.start as well", async () => {
+    const f = await fixture({ edgeDirect: false });
+    const body = await (await f.request("/v1/calls", create("idempotency-key-lk", {
+      mediaTransport: "webrtc", sdpOffer: sdp, dialNumber: "10086"
+    }))).json() as Record<string, unknown>;
+    expect(body.directAttempted).toBeUndefined();
+    expect(f.commands[0]!.direct).toBeUndefined();
+    expect((f.commands[0] as unknown as { dialNumber?: string }).dialNumber).toBe("10086");
+  });
+
   it("starts a plain LiveKit session when the Edge does not advertise outbound direct", async () => {
     const f = await fixture({ edgeDirect: false });
     const body = await (await f.request("/v1/calls", create())).json() as Record<string, unknown>;

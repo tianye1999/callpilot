@@ -314,12 +314,11 @@ class CallManager(
             }
             session = s
             outbound = context
-            pendingDial = number
         }
         eventJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { s.events.collect { handleEvent(number, it) } }
         onForeground(true)
         timing.mark(CallTiming.Mark.CLAIM_START)
-        val created = gateway.create(edgeId, idempotencyKey, offer)
+        val created = gateway.create(edgeId, idempotencyKey, offer, number)
         timing.mark(CallTiming.Mark.CLAIM_RESPONSE)
         context.callId = created.callId
         currentCoroutineContext().ensureActive()
@@ -360,8 +359,8 @@ class CallManager(
     private suspend fun outboundFallback(context: OutboundContext) {
         val callId = context.callId ?: return
         synchronized(commandLock) {
-            // 回落资格只看 dial 是否已交出（pendingDial 在交出时清空），不看远端确认后才变的界面状态。
-            if (context.fallbackStarted || hangupRequested || outbound !== context || pendingDial == null ||
+            // 回落资格只看呼叫是否已创建（号码已随 create 预带给 Edge），不看远端确认后才变的界面状态。
+            if (context.fallbackStarted || hangupRequested || outbound !== context || context.callId == null ||
                 _state.value !is CallState.WaitingMedia
             ) {
                 return
@@ -385,7 +384,7 @@ class CallManager(
     }
 
     private fun outboundFallbackIfPossible(context: OutboundContext, number: String, reason: String) {
-        val eligible = synchronized(commandLock) { pendingDial != null }
+        val eligible = synchronized(commandLock) { context.callId != null }
         if (!eligible || context.fallbackStarted || _state.value !is CallState.WaitingMedia) return
         context.fallbackJob = scope.launch {
             try {
@@ -871,8 +870,8 @@ class CallManager(
                 if (out != null && (event.reason.startsWith("direct_") || event.reason == "channel_closed")) {
                     // 回落进行中的旧对等连接尾随事件与本通无关；dial 交出前直连断开则同一通回落，交出后按结束处理。
                     if (out.fallbackStarted) return
-                    val dialPending = synchronized(commandLock) { pendingDial != null }
-                    if (dialPending && _state.value is CallState.WaitingMedia) {
+                    val callCreated = synchronized(commandLock) { out.callId != null }
+                    if (callCreated && _state.value is CallState.WaitingMedia) {
                         outboundFallbackIfPossible(out, number, event.reason)
                         return
                     }

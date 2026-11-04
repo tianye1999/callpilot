@@ -4,6 +4,9 @@ import { dataResponseSchema } from "./content-sync";
 
 const opaqueId = z.string().regex(/^[a-z]+_[A-Za-z0-9_-]{12,80}$/);
 const sdp = z.string().startsWith("v=0").max(16 * 1024).refine(value => new TextEncoder().encode(value).byteLength <= 16 * 1024);
+// Same number grammar as the Edge dial guard: an optional leading '+' plus
+// digits/*/# up to 32 chars. Kept trim-aware so a surrounding space is tolerated.
+export const phoneNumberSchema = z.string().trim().regex(/^\+?[0-9*#]{1,32}$/);
 export const iceServerSchema = z.object({
   urls: z.array(z.string().min(1).max(512)).min(1).max(16),
   username: z.string().max(1024).optional(), credential: z.string().max(1024).optional()
@@ -119,13 +122,16 @@ export const createCallSchema = z.object({
   idempotencyKey: z.string().min(16).max(128).regex(/^[A-Za-z0-9._:-]+$/),
   // A8: a phone offering direct media sends its complete (non-trickle) offer.
   mediaTransport: z.literal("webrtc").optional(),
-  sdpOffer: sdp.optional()
+  sdpOffer: sdp.optional(),
+  // J15: app-dialed outbound pre-carries the number so the Edge dials at media_ready.
+  dialNumber: phoneNumberSchema.optional()
 }).strict().refine(value => value.sdpOffer === undefined || value.mediaTransport === "webrtc");
 export const outboundIceSchema = z.object({ edgeId: opaqueId }).strict();
 const outboundStartSchema = z.object({
   v: z.literal(1), type: z.literal("session.start"), commandId: opaqueId, callId: opaqueId,
   expiresAt: z.string().datetime(), session: inboundSessionSchema,
-  direct: z.object({ sdpOffer: sdp, iceServers: z.array(iceServerSchema).max(16) }).strict()
+  direct: z.object({ sdpOffer: sdp, iceServers: z.array(iceServerSchema).max(16) }).strict(),
+  dialNumber: phoneNumberSchema.optional()
 }).strict();
 const outboundFallbackSchema = z.object({
   v: z.literal(1), type: z.literal("call.media.livekit"), commandId: opaqueId, callId: opaqueId,

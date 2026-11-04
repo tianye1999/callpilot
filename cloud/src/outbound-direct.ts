@@ -11,7 +11,7 @@ import type { CallRecord, EdgePresence, Env } from "./types";
 
 type StartCommand = {
   v: 1; type: "session.start"; commandId: string; callId: string; expiresAt: string;
-  session: Record<string, unknown>;
+  session: Record<string, unknown>; dialNumber?: string;
 };
 
 /** A speculative TURN fetch started before the idempotency INSERT so the two RTTs overlap. */

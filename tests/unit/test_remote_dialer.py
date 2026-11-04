@@ -358,7 +358,8 @@ async def _wait_for(predicate, timeout: float = 1.0) -> None:
 
 
 def _runtime(
-    *, dtmf_mode: str = "inband", grace: float = 0.05, connect_timeout: float = 0.2
+    *, dtmf_mode: str = "inband", grace: float = 0.05, connect_timeout: float = 0.2,
+    phone_connect_timeout: float = 0.0
 ) -> RemoteDialerRuntimeConfig:
     return RemoteDialerRuntimeConfig(
         audio_mode="uac",
@@ -370,6 +371,7 @@ def _runtime(
         outbound_max_seconds=2.0,
         connect_timeout_seconds=connect_timeout,
         dtmf_mode=dtmf_mode,
+        phone_connect_timeout_seconds=phone_connect_timeout,
     )
 
 
@@ -383,6 +385,8 @@ def _coordinator(
     grace: float = 0.05,
     connect_timeout: float = 0.2,
     dial_guard=None,
+    dial_number: str | None = None,
+    phone_connect_timeout: float = 0.0,
 ) -> RemoteWebDialerCoordinator:
     return RemoteWebDialerCoordinator(
         session_id="session-test",
@@ -390,13 +394,15 @@ def _coordinator(
         modem=modem,  # type: ignore[arg-type]
         endpoint=endpoint,
         runtime=_runtime(
-            dtmf_mode=dtmf_mode, grace=grace, connect_timeout=connect_timeout
+            dtmf_mode=dtmf_mode, grace=grace, connect_timeout=connect_timeout,
+            phone_connect_timeout=phone_connect_timeout,
         ),
         bridge_factory=lambda **_kwargs: bridge,  # type: ignore[arg-type]
         call_logger=call_logger,
         reserve_line=lambda _owner: None,
         release_line=lambda _owner: None,
         dial_guard=dial_guard,
+        dial_number=dial_number,
     )
 
 
@@ -481,6 +487,80 @@ def test_media_must_be_ready_before_dial() -> None:
         assert not any(name == "dial" for name, _args in modem.calls)
         assert endpoint.closed is True
 
+    asyncio.run(run())
+
+
+def test_armed_session_autodials_once_at_media_ready() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=True)
+        modem = FakeModem()
+        coordinator = _coordinator(endpoint, modem, FakeBridge(), dial_number="10086")
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: any(name == "dial" for name, _args in modem.calls))
+        await asyncio.sleep(0.05)
+        assert [name for name, _args in modem.calls].count("dial") == 1
+        assert ("dial", ("10086",)) in modem.calls
+        coordinator.request_stop("test_done")
+        await task
+    asyncio.run(run())
+
+
+def test_armed_session_guard_rejection_reports_failed_without_dialing() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=True)
+        modem = FakeModem()
+        coordinator = _coordinator(
+            endpoint,
+            modem,
+            FakeBridge(),
+            dial_number="10086",
+            dial_guard=lambda _number: DialGuardFailure("SIM_NOT_READY", "SIM 卡尚未就绪"),
+        )
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(
+            lambda: any(e.get("code") == "SIM_NOT_READY" for e in endpoint.events)
+        )
+        coordinator.request_stop("test_done")
+        await task
+        assert not any(name == "dial" for name, _args in modem.calls)
+    asyncio.run(run())
+
+
+def test_armed_session_fails_when_media_ready_never_arrives() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=False)
+        modem = FakeModem()
+        coordinator = _coordinator(
+            endpoint, modem, FakeBridge(), dial_number="10086", phone_connect_timeout=0.1
+        )
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(
+            lambda: any(e.get("code") == "phone_not_connected" for e in endpoint.events)
+        )
+        await task
+        assert not any(name == "dial" for name, _args in modem.calls)
+    asyncio.run(run())
+
+
+def test_explicit_dial_after_autodial_replays_status_without_redial() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=True)
+        modem = FakeModem()
+        coordinator = _coordinator(endpoint, modem, FakeBridge(), dial_number="10086")
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: any(name == "dial" for name, _args in modem.calls))
+        await endpoint.commands.put(
+            {"type": "dial", "number": "10086", "idempotency_key": "request-1"}
+        )
+        await _wait_for(
+            lambda: any(e.get("replayed") is True for e in endpoint.events)
+        )
+        coordinator.request_stop("test_done")
+        await task
+        assert [name for name, _args in modem.calls].count("dial") == 1
+        replayed = [e for e in endpoint.events if e.get("replayed") is True]
+        assert replayed and replayed[-1].get("status") != "failed"
+        assert not any(e.get("code") == "call_already_started" for e in endpoint.events)
     asyncio.run(run())
 
 

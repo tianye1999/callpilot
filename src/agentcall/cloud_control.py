@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_JSON_BYTES = 16 * 1024
 _ID_RE = r"[a-z]+_[A-Za-z0-9_-]{12,80}"
+_DIAL_NUMBER_RE = re.compile(r"\+?[0-9*#]{1,32}")
 _USER_AGENT = "CallPilot-Edge/1"
 _PING_INTERVAL_SECONDS = 20.0
 _PING_TIMEOUT_SECONDS = 20.0
@@ -829,12 +830,17 @@ def _parse_session_command(raw: str) -> dict[str, Any]:
 
 
 def _validate_session_command(value: dict[str, Any]) -> dict[str, Any]:
-    if set(value) - {"direct"} != {
+    if set(value) - {"direct", "dialNumber"} != {
         "v", "type", "commandId", "callId", "expiresAt", "session"
     }:
         raise ValueError("invalid command")
     if "direct" in value:
         _validate_direct_offer(value["direct"])
+    if "dialNumber" in value:
+        number = value["dialNumber"]
+        if (not isinstance(number, str)
+                or _DIAL_NUMBER_RE.fullmatch(number.strip()) is None):
+            raise ValueError("invalid command")
     if value.get("v") != 1 or value.get("type") != "session.start":
         raise ValueError("invalid command")
     if not _valid_id(value.get("commandId"), "command") or not _valid_id(

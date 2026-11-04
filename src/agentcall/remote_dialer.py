@@ -264,6 +264,7 @@ class RemoteWebDialerCoordinator:
         release_line: Callable[[RemoteWebDialerCoordinator], None] | None = None,
         publish_event: Callable[[dict[str, Any]], None] | None = None,
         dial_guard: Callable[[str | None], DialGuardFailure | None] | None = None,
+        dial_number: str | None = None,
     ) -> None:
         self.session_id = session_id
         self.expires_at = expires_at
@@ -276,6 +277,10 @@ class RemoteWebDialerCoordinator:
         self._release_line = release_line or (lambda _owner: None)
         self._publish_event = publish_event
         self._dial_guard = dial_guard or (lambda _number: None)
+        self._dial_number = (dial_number or "").strip() or None
+        if self._dial_number is not None:
+            # 号码只做存在性记录，绝不进日志。
+            logger.info("armed: session_id=%s", self.session_id)
 
         self.edge_ready = threading.Event()
         self.finished = threading.Event()
@@ -295,6 +300,7 @@ class RemoteWebDialerCoordinator:
         attach_endpoint_timing(endpoint, self._timing)
         self._line_reserved = False
         self._dial_attempted = False
+        self._autodial_attempted = False
         self._idempotency_key: str | None = None
         self._last_status: dict[str, Any] = {"type": "status", "status": "starting"}
         self._local_commands: Queue[dict[str, Any]] = Queue(maxsize=16)
@@ -370,6 +376,7 @@ class RemoteWebDialerCoordinator:
                     self._timing.mark("media_ready")
                     media_was_ready = True
                     await self._send_status("media_ready")
+                    await self._maybe_autodial()
                 elif not self.endpoint.media_ready and media_was_ready:
                     media_was_ready = False
 
@@ -480,14 +487,44 @@ class RemoteWebDialerCoordinator:
             )
             return
         if self._idempotency_key == idempotency_key:
-            replay = dict(self._last_status)
-            replay["replayed"] = True
-            await self.endpoint.send_event(replay)
+            await self._replay_status()
+            return
+        if self._autodial_attempted:
+            # 自动拨号已拥有本通：迟到的显式 dial 按幂等重放当前状态，
+            # 不发 failed，也绝不重拨。
+            await self._replay_status()
             return
         if self._dial_attempted:
             await self._send_status(
                 "failed", code="call_already_started", reason="call_already_started"
             )
+            return
+        await self._commit_dial(number, idempotency_key)
+
+    async def _replay_status(self) -> None:
+        """Re-send the last committed status with a replay marker, without mutating state."""
+
+        replay = dict(self._last_status)
+        replay["replayed"] = True
+        await self.endpoint.send_event(replay)
+
+    async def _maybe_autodial(self) -> None:
+        """Pre-armed auto dial: fires once at the media_ready false->true edge."""
+
+        number = self._dial_number
+        if number is None or self._autodial_attempted or self._dial_attempted or self._call_task is not None:
+            return
+        self._autodial_attempted = True
+        if _NUMBER_RE.fullmatch(number) is None:
+            await self._send_status("failed", code="invalid_number", reason="invalid_number")
+            return
+        logger.info("auto dial: session_id=%s", self.session_id)
+        await self._commit_dial(number, None)
+
+    async def _commit_dial(self, number: str, idempotency_key: str | None) -> None:
+        """Shared dial commit path for explicit and pre-armed auto dials."""
+
+        if self._dial_attempted or self._call_task is not None:
             return
         guard_failure = self._dial_guard(number.strip())
         if guard_failure is not None:

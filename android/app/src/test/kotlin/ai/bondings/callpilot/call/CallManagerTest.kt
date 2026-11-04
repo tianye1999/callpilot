@@ -168,6 +168,7 @@ class CallManagerTest {
         var fallbackGate: CompletableDeferred<Unit>? = null
         var fallbackError: Exception? = null
         var offer: String? = null
+        var dialNumber: String? = null
 
         override suspend fun iceServers(edgeId: String): List<IceServer> {
             calls += "ice"
@@ -175,9 +176,10 @@ class CallManagerTest {
             return listOf(IceServer(listOf("turn:turn.example:3478"), "u", "c"))
         }
 
-        override suspend fun create(edgeId: String, idempotencyKey: String, sdpOffer: String): OutboundCall {
+        override suspend fun create(edgeId: String, idempotencyKey: String, sdpOffer: String, dialNumber: String?): OutboundCall {
             calls += "create"
             offer = sdpOffer
+            this.dialNumber = dialNumber
             createGate?.await()
             createError?.let { throw it }
             return created
@@ -1372,7 +1374,7 @@ class CallManagerTest {
 
 
     @Test
-    fun `外呼直连 带 offer 建呼叫后用 answer 连通 media_ready 后经直连发 dial`() = runTest {
+    fun `外呼直连 号码随 create 提交 media_ready 后不再经直连发 dial`() = runTest {
         val h = Harness(this)
         val direct = FakeDirectSession()
         val gateway = FakeOutboundGateway()
@@ -1383,6 +1385,7 @@ class CallManagerTest {
 
         assertEquals(listOf("ice", "create"), gateway.calls)
         assertEquals("v=0\r\nfake-offer typ relay", gateway.offer)
+        assertEquals("10086", gateway.dialNumber)
         assertEquals("v=0\r\nedge-answer", direct.answer)
         assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
         assertEquals(1, h.outboundLogs.size)
@@ -1391,7 +1394,7 @@ class CallManagerTest {
         assertFalse(h.outboundLogs.single().contains("fake-offer"))
         direct.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
         runCurrent()
-        assertTrue(direct.commands.single().contains("10086"))
+        assertTrue(direct.commands.isEmpty())
         assertFalse(direct.connected)
         h.close()
     }
@@ -1535,7 +1538,7 @@ class CallManagerTest {
     }
 
     @Test
-    fun `外呼直连 dial 已交出但 Edge 确认未到时断开按结束处理不回落`() = runTest {
+    fun `外呼直连 Edge 未报 dialing 时断开按同一通回落不结束`() = runTest {
         val h = Harness(this)
         val direct = FakeDirectSession()
         val gateway = FakeOutboundGateway()
@@ -1544,14 +1547,15 @@ class CallManagerTest {
         runCurrent()
         direct.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
         runCurrent()
-        assertTrue(direct.commands.single().contains("10086"))
+        assertTrue(direct.commands.isEmpty())
         assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
 
         direct.emit(SessionEvent.Disconnected("direct_failed"))
         runCurrent()
 
-        assertEquals(listOf("ice", "create"), gateway.calls)
-        assertEquals(CallState.Ended("10086", "direct_failed"), manager.state.value)
+        assertEquals(listOf("ice", "create", "fallback:call_abcdefghijkl"), gateway.calls)
+        assertEquals("fallback-token", direct.connectedToken)
+        assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
         h.close()
     }
 
@@ -1595,12 +1599,12 @@ class CallManagerTest {
         direct.emit(SessionEvent.Edge(Signaling.Event.Status("connected")))
         runCurrent()
         assertTrue("edge_connected" in sentMarks(direct))
-        assertTrue(direct.commands.single().contains("10086"))
+        assertTrue(direct.commands.isEmpty())
 
         manager.hangup()
         runCurrent()
         assertTrue("hangup_intent" in sentMarks(direct))
-        assertTrue(direct.commands.last().contains("\"hangup\""))
+        assertTrue(direct.commands.single().contains("\"hangup\""))
         val seqs = direct.timings.map {
             (kotlinx.serialization.json.Json.parseToJsonElement(it) as kotlinx.serialization.json.JsonObject)["seq"].toString().toInt()
         }

@@ -63,7 +63,7 @@ object OutboundIcePrefetch { val cache = OutboundIceCache() }
 interface OutboundMediaGateway {
     fun observeOutboundTiming(timing: OutboundTiming) = Unit
     suspend fun iceServers(edgeId: String): List<IceServer>
-    suspend fun create(edgeId: String, idempotencyKey: String, sdpOffer: String): OutboundCall
+    suspend fun create(edgeId: String, idempotencyKey: String, sdpOffer: String, dialNumber: String? = null): OutboundCall
     suspend fun awaitSession(edgeId: String, call: OutboundCall): HostedCallSession
     suspend fun fallbackLiveKit(callId: String): HostedCallSession
 }
@@ -80,8 +80,8 @@ class HostedOutboundMediaGateway(
     override suspend fun iceServers(edgeId: String): List<IceServer> =
         OutboundIcePrefetch.cache.get(pairing) { withContext(io) { client().outboundIceCredentials(edgeId) } }
 
-    override suspend fun create(edgeId: String, idempotencyKey: String, sdpOffer: String): OutboundCall =
-        withContext(io) { client().createDirectCall(edgeId, sdpOffer, idempotencyKey, outboundTiming) }
+    override suspend fun create(edgeId: String, idempotencyKey: String, sdpOffer: String, dialNumber: String?): OutboundCall =
+        withContext(io) { client().createDirectCall(edgeId, sdpOffer, idempotencyKey, outboundTiming, dialNumber) }
 
     override suspend fun awaitSession(edgeId: String, call: OutboundCall): HostedCallSession =
         withContext(io) { client().awaitCallSession(edgeId, call) }

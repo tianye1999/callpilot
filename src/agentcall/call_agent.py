@@ -6384,6 +6384,7 @@ class CallAgentService:
             return False, guard_failure.code
         session = command["session"]
         expires_at = float(command["expiresAtUnix"])
+        dial_number = command.get("dialNumber")
         issued = IssuedLiveKitSession(
             invite=RemoteDialerInvite(
                 session_id=session["sessionId"],
@@ -6410,9 +6411,10 @@ class CallAgentService:
                     worker = self._build_remote_worker_for_issued(
                         issued, endpoint=SwitchableInboundEndpoint(request),
                         phone_connect_timeout=_OUTBOUND_DIRECT_PHONE_CONNECT_SECONDS,
-                        phone_audio_timeout=_EARLY_ANSWER_CONNECTED_WAIT_SECONDS)
+                        phone_audio_timeout=_EARLY_ANSWER_CONNECTED_WAIT_SECONDS,
+                        dial_number=dial_number)
                 else:
-                    worker = self._build_remote_worker_for_issued(issued)
+                    worker = self._build_remote_worker_for_issued(issued, dial_number=dial_number)
                 self._remote_worker = worker
                 self._remote_invite = issued.invite
                 self._remote_session_device_id = f"cloud:{command['callId']}"
@@ -6580,6 +6582,7 @@ class CallAgentService:
     def _build_remote_worker_for_issued(
         self, issued: IssuedLiveKitSession, *, endpoint: RemoteMediaEndpoint | None = None,
         phone_connect_timeout: float = 0.0, phone_audio_timeout: float = 0.0,
+        dial_number: str | None = None,
     ) -> RemoteDialerWorker:
         from .livekit_media import LiveKitRemoteMediaEndpoint
 
@@ -6618,6 +6621,7 @@ class CallAgentService:
             release_line=self._release_remote_line,
             publish_event=self._publish,
             dial_guard=self._dial_guard,
+            dial_number=dial_number,
         )
         return RemoteDialerWorker(coordinator)
 

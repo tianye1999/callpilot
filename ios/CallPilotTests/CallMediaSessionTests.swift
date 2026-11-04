@@ -881,7 +881,7 @@ final class CallMediaSessionTests: XCTestCase {
             directTransportFactory: { direct })
     }
 
-    func testOutboundDirectAnswersInCreateAndDialsOverDirectAfterMediaReady() async throws {
+    func testOutboundDirectSubmitsDialNumberAndDoesNotDialOverDirect() async throws {
         var created: [String: Any] = [:]
         let client = try makeOutboundClient(onCreate: { created = $0 }, onFallback: { XCTFail("no fallback") })
         let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
@@ -889,11 +889,11 @@ final class CallMediaSessionTests: XCTestCase {
         await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086", direct: true)
         XCTAssertEqual(created["mediaTransport"] as? String, "webrtc")
         XCTAssertEqual(created["sdpOffer"] as? String, "v=0\r\noffer")
+        XCTAssertEqual(created["dialNumber"] as? String, "10086")
         XCTAssertEqual(direct.activations, 1, "app-dialed direct audio activates without CallKit")
         XCTAssertTrue(livekit.connectedTokens.isEmpty)
         await direct.eventHandler?(.data(Data(#"{"type":"status","status":"media_ready"}"#.utf8), topic: CallPilotTopic.status))
-        await waitUntil { direct.packets.contains { String(decoding: $0, as: UTF8.self).contains("10086") } }
-        XCTAssertTrue(direct.packets.contains { String(decoding: $0, as: UTF8.self).contains("10086") })
+        XCTAssertFalse(direct.packets.contains { String(decoding: $0, as: UTF8.self).contains("10086") })
         await media.stop()
     }
 
@@ -953,17 +953,18 @@ final class CallMediaSessionTests: XCTestCase {
         await media.stop()
     }
 
-    func testOutboundDirectLossAfterDialEndsTheCallInsteadOfSwitching() async throws {
-        let client = try makeOutboundClient(onFallback: { XCTFail("a dialed call cannot switch transports") })
+    func testOutboundDirectLossAfterMediaReadyFallsBackToTheSameCall() async throws {
+        var fallbacks = 0
+        let client = try makeOutboundClient(onFallback: { fallbacks += 1 })
         let direct = FakeDirectTransport(), livekit = FakeCallMediaTransport()
         var states: [CallState] = []
         let media = outboundMedia(direct, livekit) { states.append($0) }
         await media.startOutbound(client: client, edgeId: "edge_abcdefghijkl", number: "10086", direct: true)
         await direct.eventHandler?(.data(Data(#"{"type":"status","status":"media_ready"}"#.utf8), topic: CallPilotTopic.status))
-        await waitUntil { !direct.packets.isEmpty }
         await direct.eventHandler?(.disconnected(reason: "ICE failed while ringing"))
-        XCTAssertTrue(states.last?.isTerminal == true)
-        XCTAssertTrue(livekit.connectedTokens.isEmpty)
+        await waitUntil { livekit.connectedTokens == ["fallback-token"] }
+        XCTAssertEqual(fallbacks, 1)
+        XCTAssertFalse(states.contains { $0.isTerminal })
         await media.stop()
     }
 

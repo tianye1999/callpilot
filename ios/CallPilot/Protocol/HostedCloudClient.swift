@@ -29,6 +29,7 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
     private static var offerIdRE: Regex<Substring> { /^offer_[A-Za-z0-9_-]{12,80}$/ }
     private static var claimIdRE: Regex<Substring> { /^claim_[A-Za-z0-9_-]{12,80}$/ }
     private static var idempotencyKeyRE: Regex<Substring> { /^[A-Za-z0-9._:-]{16,128}$/ }
+    private static var dialNumberRE: Regex<Substring> { /^\+?[0-9*#]{1,32}$/ }
 
     init(
         baseURL: String,
@@ -243,15 +244,19 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
 
     /// Create the call with the phone's offer; the Edge answer returns in the same response.
     func createDirectCall(edgeId: String, sdpOffer: String,
-                          idempotencyKey: String = "ios-\(UUID().uuidString)") async throws -> HostedOutboundCall {
+                          idempotencyKey: String = "ios-\(UUID().uuidString)",
+                          dialNumber: String? = nil) async throws -> HostedOutboundCall {
         guard edgeId.wholeMatch(of: Self.edgeIdRE) != nil,
               idempotencyKey.wholeMatch(of: Self.idempotencyKeyRE) != nil,
-              sdpOffer.hasPrefix("v=0"), sdpOffer.utf8.count <= 16 * 1024 else {
+              sdpOffer.hasPrefix("v=0"), sdpOffer.utf8.count <= 16 * 1024,
+              dialNumber == nil || dialNumber?.wholeMatch(of: Self.dialNumberRE) != nil else {
             throw HostedCloudError(statusCode: 0, code: "INVALID_REQUEST", message: "外呼直连参数不合法")
         }
-        let body = try JSONSerialization.data(withJSONObject: [
+        var fields: [String: Any] = [
             "edgeId": edgeId, "idempotencyKey": idempotencyKey, "mediaTransport": "webrtc", "sdpOffer": sdpOffer,
-        ])
+        ]
+        if let dialNumber { fields["dialNumber"] = dialNumber }
+        let body = try JSONSerialization.data(withJSONObject: fields)
         let (call, payload, statusCode) = try await createCallWithRetry(body: body, expectedEdgeId: edgeId)
         try throwIfTerminal(call)
         let flag = payload["directAttempted"] as? NSNumber

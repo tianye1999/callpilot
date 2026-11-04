@@ -428,7 +428,7 @@ final class CallMediaSession {
             try checkCurrent(attempt)
             let packet = try CallSignaling.encodeDial(number: number, idempotencyKey: UUID().uuidString)
             if direct, directTransportFactory != nil {
-                if try await startOutboundDirect(client: client, edgeId: edgeId, packet: packet, attempt: attempt) {
+                if try await startOutboundDirect(client: client, edgeId: edgeId, number: number, attempt: attempt) {
                     return
                 }
             }
@@ -444,9 +444,10 @@ final class CallMediaSession {
         await finishSetup(task, attempt: attempt)
     }
 
-    /// A8: app-dialed call over direct WebRTC with one same-call LiveKit fallback before dialing.
+    /// A8: app-dialed call over direct WebRTC with one same-call LiveKit fallback. The Edge arms
+    /// auto-dial from the number submitted with the call and dials at its own media_ready.
     /// Returns false while no call exists yet (direct unavailable), so the caller keeps LiveKit.
-    private func startOutboundDirect(client: HostedCloudClient, edgeId: String, packet: Data,
+    private func startOutboundDirect(client: HostedCloudClient, edgeId: String, number: String,
                                      attempt: UInt64) async throws -> Bool {
         guard let directTransportFactory else { return false }
         let connection = directTransportFactory()
@@ -470,14 +471,13 @@ final class CallMediaSession {
         timing.mark(.preconnectReady)
         connection.captureAudioDiagnostic(stage: .preconnectReady)
         timing.mark(.claimStart)
-        let call = try await client.createDirectCall(edgeId: edgeId, sdpOffer: offer)
+        let call = try await client.createDirectCall(edgeId: edgeId, sdpOffer: offer, dialNumber: number)
         timing.mark(.claimResponse)
         try checkCurrent(attempt)
         outboundCallId = call.callId
-        pendingDialPacket = packet
         onState(.waitingMedia(label: activeLabel ?? ""))
         directFallbackHandler = { [weak self] in
-            guard let self, isCurrent(attempt), pendingDialPacket != nil, !directFallbackStarted else { return }
+            guard let self, isCurrent(attempt), outboundCallId != nil, !directFallbackStarted else { return }
             directFallbackHandler = nil
             let fallback = Task { try await self.connectOutboundFallback(client: client, attempt: attempt) }
             setupTask = fallback
@@ -516,7 +516,7 @@ final class CallMediaSession {
 
     private func connectOutboundFallback(client: HostedCloudClient, attempt: UInt64) async throws {
         try checkCurrent(attempt)
-        guard !directFallbackStarted, pendingDialPacket != nil, let callId = outboundCallId else { return }
+        guard !directFallbackStarted, let callId = outboundCallId else { return }
         directFallbackStarted = true
         directFallbackHandler = nil
         if let direct = transport as? any CallDirectMediaTransport { detachDirect(direct) }
@@ -915,9 +915,8 @@ final class CallMediaSession {
                 }
             }
         case let .disconnected(reason):
-            // After an outbound dial the call cannot switch transports; a lost peer ends it.
-            if connection is any CallDirectMediaTransport, !edgeCommitted,
-               outboundCallId == nil || pendingDialPacket != nil {
+            // Before the Edge commits the call, a lost direct peer can switch to its LiveKit room.
+            if connection is any CallDirectMediaTransport, !edgeCommitted {
                 directSetupFailure = CallAudioError.answerExpired
                 if roomConnected { directFallbackHandler?() }
                 return

@@ -51,6 +51,7 @@ class HostedCloudClient(
         private val CLAIM_ID = Regex("^claim_[A-Za-z0-9_-]{12,80}$")
         private const val MAX_SDP_BYTES = 16 * 1024
         private val IDEMPOTENCY_KEY = Regex("^[A-Za-z0-9._:-]{16,128}$")
+        private val DIAL_NUMBER = Regex("^\\+?[0-9*#]{1,32}$")
         private const val CONTENT_RESPONSE_MAX_BYTES = 16_384
     }
 
@@ -181,15 +182,18 @@ class HostedCloudClient(
         sdpOffer: String,
         idempotencyKey: String = "android-${UUID.randomUUID()}",
         outboundTiming: OutboundTiming? = null,
+        dialNumber: String? = null,
     ): OutboundCall {
         require(EDGE_ID.matches(edgeId)) { "云配对缺少有效的 Edge ID" }
         require(IDEMPOTENCY_KEY.matches(idempotencyKey)) { "idempotency key 格式不合法" }
         require(sdpOffer.startsWith("v=0") && sdpOffer.toByteArray().size <= MAX_SDP_BYTES) { "sdp offer 不合法" }
+        require(dialNumber == null || DIAL_NUMBER.matches(dialNumber)) { "拨号号码格式不合法" }
         val body = buildJsonObject {
             put("edgeId", edgeId)
             put("idempotencyKey", idempotencyKey)
             put("mediaTransport", "webrtc")
             put("sdpOffer", sdpOffer)
+            if (dialNumber != null) put("dialNumber", dialNumber)
         }.toString()
         val created = createCallWithRetry(body, edgeId, outboundTiming)
         val call = created.call

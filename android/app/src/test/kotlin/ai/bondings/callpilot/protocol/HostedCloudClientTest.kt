@@ -780,6 +780,19 @@ class HostedCloudClientTest {
     }
 
     @Test
+    fun `createDirectCall 预带 dialNumber 并校验号码格式`() {
+        server.enqueue(MockResponse().setResponseCode(202).setBody(directCreated))
+        client.createDirectCall("edge_abcdefghijkl", "v=0\r\noffer", "android-idempotency-0011", dialNumber = "+8610010086")
+
+        val body = server.takeRequest().body.readUtf8()
+        assertTrue(body.contains("\"dialNumber\":\"+8610010086\""))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            client.createDirectCall("edge_abcdefghijkl", "v=0\r\noffer", "android-idempotency-0012", dialNumber = "10086-")
+        }
+    }
+
+    @Test
     fun `createDirectCall 旧中转不走直连 Edge 拒绝带失败码 自相矛盾的响应不信`() {
         server.enqueue(MockResponse().setResponseCode(202)
             .setBody("""{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"pending","createdAt":1,"expiresAt":9999999999999}"""))

@@ -498,6 +498,7 @@ async function createCall(request: Request, env: Env, timing: ClaimTiming, ctx?:
     commandId,
     callId,
     expiresAt: new Date(expiresAt).toISOString(),
+    ...(input.dialNumber !== undefined ? { dialNumber: input.dialNumber } : {}),
     session: {
       sessionId,
       roomName,

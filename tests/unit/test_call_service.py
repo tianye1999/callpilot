@@ -614,7 +614,7 @@ def test_cloud_remote_session_uses_server_token_without_local_signing_secret(mon
     worker = FakeRemoteWorker(FakeRemoteCoordinator())
     issued: list[IssuedLiveKitSession] = []
 
-    def build(server_issued: IssuedLiveKitSession):
+    def build(server_issued: IssuedLiveKitSession, dial_number=None):
         issued.append(server_issued)
         return worker
 
