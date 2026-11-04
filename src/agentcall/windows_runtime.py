@@ -15,6 +15,9 @@ from pathlib import Path
 from . import config
 
 ROLES = ('tray', 'service', 'window')
+STABLE_RUNTIME_SECONDS = 10 * 60
+SLOW_RETRY_SECONDS = 60
+FAST_RETRY_DELAYS = (0, 1, 2, 4, 8, 16)
 logger = logging.getLogger(__name__)
 
 
@@ -106,17 +109,20 @@ def shutdown(support: Path, timeout: float = 45) -> int:
 
 
 class RestartBudget:
-    """Initial start plus five retries; manual restart replenishes the budget."""
+    """Initial start plus five fast retries, followed by unlimited slow retries."""
 
     def __init__(self) -> None:
         self.attempts = 0
 
-    def next_delay(self) -> float | None:
-        if self.attempts >= 6:
-            return None
-        delay = 0 if self.attempts == 0 else 2 ** (self.attempts - 1)
+    def next_delay(self) -> float:
+        delay = (FAST_RETRY_DELAYS[self.attempts]
+                 if self.attempts < len(FAST_RETRY_DELAYS) else SLOW_RETRY_SECONDS)
         self.attempts += 1
         return delay
+
+    @property
+    def mode(self) -> str:
+        return 'slow' if self.attempts > len(FAST_RETRY_DELAYS) else 'fast'
 
 
 def run_service(support: Path, *, smoke: bool = False) -> None:
@@ -223,7 +229,9 @@ def run_tray(support: Path) -> None:
     def supervise():
         nonlocal service
         budget = RestartBudget()
-        due = time.monotonic()
+        due: float | None = None
+        started_at: float | None = None
+        delay = 0.0
         while not stop.wait(0.25):
             if (support / 'tray.stop').exists():
                 stop.set()
@@ -237,22 +245,37 @@ def run_tray(support: Path) -> None:
                     continue
                 restart.clear()
                 budget = RestartBudget()
-                due = time.monotonic()
+                due = None
+                started_at = None
+            now = time.monotonic()
             if service is None or service.poll() is not None:
-                if time.monotonic() >= due:
+                started_at = None
+                if due is None:
                     delay = budget.next_delay()
-                    if delay is None:
-                        icon.title = 'CallPilot: service stopped (retry limit)'
-                        continue
-                    if stop.wait(delay) or (support / 'tray.stop').exists():
+                    due = now + delay
+                if now >= due:
+                    if stop.is_set() or (support / 'tray.stop').exists():
                         break
+                    logger.info('Starting backend: attempt=%d delay=%g mode=%s',
+                                budget.attempts, delay, budget.mode)
                     try:
                         service = subprocess.Popen([sys.executable, '--service'], cwd=support)
+                        started_at = time.monotonic()
                     except OSError:
                         logger.exception('Could not start backend')
-                    due = time.monotonic() + 1
+                    due = None
+            elif started_at is not None and now - started_at >= STABLE_RUNTIME_SECONDS:
+                logger.info('Stable backend runtime; resetting restart budget after %g seconds',
+                            now - started_at)
+                budget = RestartBudget()
+                started_at = None
             online = tray.probe_online(tray.web_url(), timeout=0.5)
-            icon.title = 'CallPilot: running' if online else 'CallPilot: starting / offline'
+            if online:
+                icon.title = 'CallPilot: running'
+            elif budget.mode == 'slow':
+                icon.title = 'CallPilot: service error, retrying'
+            else:
+                icon.title = 'CallPilot: starting / offline'
         for role in ('window', 'service'):
             (support / f'{role}.stop').touch()
         # Never release tray ownership while a child still holds installed files.

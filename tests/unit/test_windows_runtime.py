@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -30,7 +31,198 @@ def test_windows_seed_removes_mac_hardware_overrides(tmp_path):
 
 def test_restart_budget_and_backoff():
     policy = runtime.RestartBudget()
-    assert [policy.next_delay() for _ in range(7)] == [0, 1, 2, 4, 8, 16, None]
+    assert [policy.next_delay() for _ in range(9)] == [0, 1, 2, 4, 8, 16, 60, 60, 60]
+
+
+@pytest.fixture
+def tray_harness(monkeypatch, tmp_path):
+    import sys
+
+    state = SimpleNamespace(now=0.0, launches=[], children=[], titles=[], tick=lambda: None,
+                            icon=None, fail_launches=False)
+
+    class Event:
+        def __init__(self):
+            self.value = False
+
+        def set(self):
+            self.value = True
+
+        def clear(self):
+            self.value = False
+
+        def is_set(self):
+            return self.value
+
+        def wait(self, delay):
+            if not self.value:
+                state.now += delay
+                assert state.now < 2000, 'Supervisor did not stop'
+                state.tick()
+            return self.value
+
+    class Child:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            assert (tmp_path / 'service.stop').exists()
+            self.returncode = 0
+
+    def popen(command, **kwargs):
+        assert command == [sys.executable, '--service']
+        assert kwargs == {'cwd': tmp_path}
+        state.launches.append(state.now)
+        if state.fail_launches:
+            raise OSError('Temporary startup failure')
+        child = Child()
+        state.children.append(child)
+        return child
+
+    class Icon:
+        def __init__(self, *args, menu):
+            self.menu = {item.text: item.action for item in menu()}
+            state.icon = self
+
+        @property
+        def title(self):
+            return state.titles[-1]
+
+        @title.setter
+        def title(self, value):
+            state.titles.append(value)
+
+        def run(self, setup):
+            setup(self)
+
+        def stop(self):
+            state.stopped = True
+
+    monkeypatch.setattr(runtime, '_require_frozen', lambda: None)
+    monkeypatch.setattr(runtime.threading, 'Event', Event)
+    monkeypatch.setattr(runtime.time, 'monotonic', lambda: state.now)
+    monkeypatch.setattr(runtime.subprocess, 'Popen', popen)
+    monkeypatch.setattr(sys, 'argv', ['CallPilot', '--login'])
+    monkeypatch.setitem(sys.modules, 'pystray', SimpleNamespace(
+        Icon=Icon, Menu=lambda builder: builder,
+        MenuItem=lambda text, action, **kwargs: SimpleNamespace(text=text, action=action),
+    ))
+    monkeypatch.setitem(sys.modules, 'PIL', SimpleNamespace(Image=SimpleNamespace(open=lambda path: None)))
+    monkeypatch.setitem(sys.modules, 'tray_app', SimpleNamespace(
+        icon_path=lambda online: 'fake.ico', web_url=lambda: 'fake://backend',
+        probe_online=lambda *args, **kwargs: False,
+    ))
+    from agentcall import windows_autostart
+
+    monkeypatch.setattr(windows_autostart, 'stale_run_target', lambda: None)
+    state.run = lambda: runtime.run_tray(tmp_path)
+    state.stop = lambda: (tmp_path / 'tray.stop').touch()
+    return state
+
+
+@pytest.mark.parametrize('fail_launches', [False, True])
+def test_tray_fast_then_repeated_slow_retries(tray_harness, caplog, fail_launches):
+    state = tray_harness
+    state.fail_launches = fail_launches
+
+    def tick():
+        if state.children:
+            state.children[-1].returncode = 1
+        if len(state.launches) == 9:
+            state.stop()
+
+    state.tick = tick
+    with caplog.at_level('INFO', logger=runtime.__name__):
+        state.run()
+    gaps = [b - a for a, b in zip(state.launches, state.launches[1:])]
+    assert gaps == [1.25, 2.25, 4.25, 8.25, 16.25, 60.25, 60.25, 60.25]
+    assert 'CallPilot: service error, retrying' in state.titles
+    assert 'attempt=9 delay=60 mode=slow' in caplog.text
+    assert state.stopped
+
+
+@pytest.mark.parametrize('crash_after', [599.75, 600.25, 601])
+def test_tray_stable_runtime_resets_budget_once(tray_harness, caplog, crash_after):
+    state = tray_harness
+
+    def tick():
+        if len(state.launches) == 1:
+            state.children[-1].returncode = 1
+        elif len(state.launches) == 2 and state.now - state.launches[-1] >= crash_after:
+            state.children[-1].returncode = 1
+        elif len(state.launches) == 3:
+            state.stop()
+
+    state.tick = tick
+    with caplog.at_level('INFO', logger=runtime.__name__):
+        state.run()
+    stable = crash_after >= 600
+    assert state.launches[2] - state.launches[1] == crash_after + (0 if stable else 2)
+    assert caplog.text.count('Stable backend runtime; resetting restart budget') == int(stable)
+    assert caplog.text.count('attempt=1 delay=0 mode=fast') == 1 + int(stable)
+
+
+def test_tray_manual_restart_resets_slow_budget(tray_harness, tmp_path):
+    state = tray_harness
+    requested_at = []
+
+    def tick():
+        if state.children:
+            state.children[-1].returncode = 1
+        if len(state.launches) == 6 and state.now - state.launches[-1] >= 10 and not requested_at:
+            requested_at.append(state.now)
+            state.icon.menu['Restart service']()
+        elif len(state.launches) == 7:
+            state.stop()
+
+    state.tick = tick
+    state.run()
+    assert state.launches[-1] == requested_at[0]
+    assert (tmp_path / 'service.stop').exists()
+
+
+def test_tray_manual_restart_waits_for_running_child(tray_harness, tmp_path, caplog):
+    state = tray_harness
+    requested_at = []
+
+    def tick():
+        if len(state.launches) == 1 and not requested_at:
+            requested_at.append(state.now)
+            state.icon.menu['Restart service']()
+        elif len(state.launches) == 1 and state.now - requested_at[0] >= 2:
+            assert (tmp_path / 'service.stop').exists()
+            state.children[-1].returncode = 0
+        elif len(state.launches) == 2:
+            state.stop()
+
+    state.tick = tick
+    with caplog.at_level('INFO', logger=runtime.__name__):
+        state.run()
+    assert state.launches[1] == requested_at[0] + 2
+    assert caplog.text.count('attempt=1 delay=0 mode=fast') == 2
+
+
+@pytest.mark.parametrize('quit_mode', ['stop_file', 'menu'])
+def test_tray_does_not_launch_during_exit(tray_harness, quit_mode):
+    state = tray_harness
+
+    def tick():
+        if state.children:
+            state.children[-1].returncode = 1
+        if state.now >= 40:
+            # Both requests in the same iteration: exit must win over restart.
+            state.icon.menu['Restart service']()
+            if quit_mode == 'stop_file':
+                state.stop()
+            else:
+                state.icon.menu['Quit CallPilot']()
+
+    state.tick = tick
+    state.run()
+    assert len(state.launches) == 6
+    assert state.stopped
 
 
 def test_role_lock_and_bounded_shutdown(tmp_path):
