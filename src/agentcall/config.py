@@ -385,7 +385,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                help="0 关闭；1–20 秒无响应字节时换连接重试一次，仍受整轮超时限制。"),
     ConfigSpec("LOCAL_MODELS_DIR", "三段式模型目录", "str", "",
                editable=False, hidden=True, requires_restart=True),
-    ConfigSpec("LOCAL_MODELS_MIRROR", "三段式模型下载镜像前缀", "str", "",
+    ConfigSpec("LOCAL_MODELS_MIRROR", "三段式模型下载镜像前缀", "str",
+               "https://sim-dl.bondings.ai/models",
                editable=False, hidden=True),
     # physical-sim owner 决定提速默认开启；发包前仍须完成真机验收。
     ConfigSpec("LOCAL_FAST_OPENING", "三段式预合成开场", "bool", "true", requires_restart=True),

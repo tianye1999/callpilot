@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import logging
 import os
 import sys
 import tarfile
 import threading
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -187,18 +189,22 @@ def selected_assets() -> tuple[ModelAsset, ...]:
     return MODEL_ASSETS[:2] + tts_model().assets
 
 
-def resolved_url(asset: ModelAsset) -> str:
-    """按 LOCAL_MODELS_MIRROR 整体替换清单固定下载前缀；空镜像用原地址。
+def download_sources(asset: ModelAsset) -> tuple[tuple[str, str], ...]:
+    """按 LOCAL_MODELS_MIRROR 拼出候选下载源：镜像在前，原地址兜底。
 
     镜像只替换 ``_RELEASE_BASE`` 前缀，其后资产路径原样拼接；不接收前端传入的
-    任意 URL，也不会让配置项脱离固定清单地址。
+    任意 URL，也不会让配置项脱离固定清单地址。空镜像只返回原地址。
     """
     mirror = config.get_str("LOCAL_MODELS_MIRROR").strip()
-    if not mirror:
-        return asset.url
-    if asset.url.startswith(_RELEASE_BASE):
-        return mirror.rstrip("/") + asset.url[len(_RELEASE_BASE):]
-    return asset.url
+    if mirror and asset.url.startswith(_RELEASE_BASE):
+        return (("mirror", mirror.rstrip("/") + asset.url[len(_RELEASE_BASE):]),
+                ("origin", asset.url))
+    return (("origin", asset.url),)
+
+
+def resolved_url(asset: ModelAsset) -> str:
+    """首选下载地址（镜像可用时即镜像，否则清单原地址）。"""
+    return download_sources(asset)[0][1]
 
 
 def build_tts_config(sherpa: Any, root: Path, name: str | None = None) -> Any:
@@ -269,6 +275,10 @@ class DownloadCancelled(Exception):
     """后台下载被用户取消；调用方据此归为已取消而非错误。"""
 
 
+class DownloadVerifyError(RuntimeError):
+    """下载产物大小或哈希校验失败；``.part`` 已删除，回退时可从头下载。"""
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -325,14 +335,16 @@ def _download(
                     progress(received, total)
     if size is not None and received != size:
         partial.unlink(missing_ok=True)
-        raise RuntimeError(
+        raise DownloadVerifyError(
             f"模型下载大小校验失败: {dest.name} 期望 {size} 字节，实际 {received} 字节"
         )
     if sha256 is not None:
         actual = _sha256_file(partial)
         if actual.lower() != sha256.lower():
             partial.unlink(missing_ok=True)
-            raise RuntimeError(f"模型下载哈希校验失败: {dest.name} 期望 {sha256}，实际 {actual}")
+            raise DownloadVerifyError(
+                f"模型下载哈希校验失败: {dest.name} 期望 {sha256}，实际 {actual}"
+            )
     os.replace(partial, dest)
 
 
@@ -354,12 +366,74 @@ def _artifact_valid(path: Path, asset: ModelAsset) -> bool:
     return True
 
 
+def _http_miss(exc: BaseException) -> bool:
+    """镜像返回 404/403：文件不在镜像，可回退原地址。"""
+    return isinstance(exc, urllib.error.HTTPError) and exc.code in (404, 403)
+
+
+def _connection_error(exc: BaseException) -> bool:
+    """连接类错误（排除 HTTP 状态码错误）；是否续传取决于本次是否收到字节。"""
+    return (isinstance(exc, (urllib.error.URLError, TimeoutError, OSError,
+                             http.client.HTTPException))
+            and not isinstance(exc, urllib.error.HTTPError))
+
+
+def _partial_size(dest: Path) -> int:
+    partial = dest.with_name(dest.name + ".part")
+    return partial.stat().st_size if partial.is_file() else 0
+
+
+def _download_from_sources(
+    sources: tuple[tuple[str, str], ...],
+    dest: Path,
+    *,
+    size: int | None = None,
+    sha256: str | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    cancel: threading.Event | None = None,
+    report_source: Callable[[str], None] | None = None,
+) -> None:
+    """依次尝试候选源；镜像缺文件/零字节连接失败/校验失败时回退原地址。
+
+    镜像与原地址内容相同，回退保留 ``.part`` 由原地址 Range 续传；校验失败时
+    ``_download`` 已删除 ``.part``，原地址从头下载。
+    """
+    for index, (label, url) in enumerate(sources):
+        if report_source is not None:
+            report_source(label)
+        before = _partial_size(dest)
+        try:
+            _download(url, dest, size=size, sha256=sha256, progress=progress, cancel=cancel)
+            return
+        except DownloadCancelled:
+            raise
+        except DownloadVerifyError as exc:
+            if index == len(sources) - 1:
+                raise
+            logger.info("镜像校验失败（%s），回退原地址从头下载: %s -> %s",
+                        _readable_error(exc), url, sources[index + 1][1])
+            continue
+        except Exception as exc:  # noqa: BLE001
+            if index == len(sources) - 1:
+                raise
+            if _http_miss(exc):
+                logger.info("镜像缺少文件（%s），回退原地址: %s -> %s",
+                            _readable_error(exc), url, sources[index + 1][1])
+                continue
+            if _connection_error(exc) and _partial_size(dest) == before:
+                logger.info("镜像连接失败且未收到字节（%s），回退原地址: %s -> %s",
+                            _readable_error(exc), url, sources[index + 1][1])
+                continue
+            raise
+
+
 def ensure_asset(
     asset: ModelAsset,
     base: Path | None = None,
     *,
     progress: Callable[[int, int], None] | None = None,
     cancel: threading.Event | None = None,
+    report_source: Callable[[str], None] | None = None,
 ) -> bool:
     """确保一件资产就绪；返回是否发生了下载。失败抛异常（调用方决定降级）。"""
     root = base if base is not None else models_dir()
@@ -369,15 +443,17 @@ def ensure_asset(
     if bundled is not None and root.resolve().is_relative_to(bundled.resolve()):
         raise RuntimeError("包内模型目录只读，请在用户数据目录准备缺失模型")
     url = resolved_url(asset)
+    sources = download_sources(asset)
     if not asset.archive:
-        _download(url, root / asset.required_files[0], size=asset.size, sha256=asset.sha256,
-                  progress=progress, cancel=cancel)
+        _download_from_sources(sources, root / asset.required_files[0], size=asset.size,
+                               sha256=asset.sha256, progress=progress, cancel=cancel,
+                               report_source=report_source)
     else:
         archive_name = url.rsplit("/", 1)[-1]
         archive_path = root / archive_name
         if not _artifact_valid(archive_path, asset):
-            _download(url, archive_path, size=asset.size, sha256=asset.sha256,
-                      progress=progress, cancel=cancel)
+            _download_from_sources(sources, archive_path, size=asset.size, sha256=asset.sha256,
+                                   progress=progress, cancel=cancel, report_source=report_source)
         _extract_archive(archive_path, root)
         archive_path.unlink(missing_ok=True)
     still_missing = [rel for rel, path in asset_paths(asset, root).items() if not path.is_file()]
@@ -417,7 +493,7 @@ class ModelDownloadManager:
         self._base = base
         self._state: dict[str, object] = {
             "status": "idle", "received_bytes": 0, "total_bytes": 0,
-            "current_file": "", "current_asset": "", "error": "",
+            "current_file": "", "current_asset": "", "error": "", "source": "",
         }
 
     def snapshot(self) -> dict[str, object]:
@@ -451,7 +527,7 @@ class ModelDownloadManager:
         missing = missing_assets(root)
         total = sum(asset.size or 0 for asset in missing)
         self._set(status="running", received_bytes=0, total_bytes=total,
-                  current_file="", current_asset="", error="")
+                  current_file="", current_asset="", error="", source="")
         completed = 0
         try:
             for asset in missing:
@@ -462,15 +538,17 @@ class ModelDownloadManager:
                 def on_progress(received: int, _total: int) -> None:
                     self._set(received_bytes=completed + received, current_file=name)
 
-                ensure_asset(asset, root, progress=on_progress, cancel=self._cancel)
+                ensure_asset(asset, root, progress=on_progress, cancel=self._cancel,
+                             report_source=lambda source: self._set(source=source))
                 completed += asset.size or 0
         except DownloadCancelled:
-            self._set(status="cancelled", error="")
+            self._set(status="cancelled", error="", source="")
         except Exception as exc:  # noqa: BLE001
             logger.warning("本地模型下载失败: %s", exc)
-            self._set(status="error", error=_readable_error(exc))
+            self._set(status="error", error=_readable_error(exc), source="")
         else:
-            self._set(status="done", received_bytes=total, current_file="", current_asset="")
+            self._set(status="done", received_bytes=total, current_file="", current_asset="",
+                      source="")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -9,11 +9,12 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import urllib.error
 from pathlib import Path
 
 import pytest
 
-from agentcall import local_models
+from agentcall import config, local_models
 from agentcall.local_models import MODEL_ASSETS, ModelAsset, ModelDownloadManager, _download
 
 
@@ -57,7 +58,7 @@ def test_resolved_url_mirror_prefix(monkeypatch):
 
 
 def test_resolved_url_empty_mirror_uses_manifest(monkeypatch):
-    monkeypatch.delenv("LOCAL_MODELS_MIRROR", raising=False)
+    monkeypatch.setenv("LOCAL_MODELS_MIRROR", "")
     assert local_models.resolved_url(MODEL_ASSETS[0]) == MODEL_ASSETS[0].url
 
 
@@ -66,6 +67,197 @@ def test_resolved_url_mirror_only_replaces_known_prefix(monkeypatch):
                        required_files=("x.bin",), archive=False)
     monkeypatch.setenv("LOCAL_MODELS_MIRROR", "https://r2.example.com")
     assert local_models.resolved_url(asset) == "https://evil.example.com/x.bin"
+
+
+# ---- 镜像回退 ----
+
+def _default_mirror() -> str:
+    return config.get_spec("LOCAL_MODELS_MIRROR").default
+
+
+def _mirror_asset() -> ModelAsset:
+    return ModelAsset(
+        id="x", description="x",
+        url=f"{local_models._RELEASE_BASE}/x/model.bin",
+        required_files=("model.bin",), archive=False,
+    )
+
+
+def _mirror_for(asset: ModelAsset) -> str:
+    return _default_mirror().rstrip("/") + asset.url[len(local_models._RELEASE_BASE):]
+
+
+def test_default_mirror_is_r2_registry():
+    assert _default_mirror() == "https://sim-dl.bondings.ai/models"
+
+
+def test_default_mirror_resolves_when_env_unset(monkeypatch):
+    monkeypatch.delenv("LOCAL_MODELS_MIRROR", raising=False)
+    assert local_models.resolved_url(_mirror_asset()) == _mirror_for(_mirror_asset())
+
+
+def test_ensure_asset_mirror_200_uses_mirror_only(tmp_path, monkeypatch):
+    asset = _mirror_asset()
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"ok")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    assert local_models.ensure_asset(asset, tmp_path) is True
+    assert calls == [_mirror_for(asset)]
+    assert (tmp_path / "model.bin").read_bytes() == b"ok"
+
+
+def test_ensure_asset_mirror_404_falls_back_to_origin(tmp_path, monkeypatch):
+    asset = _mirror_asset()
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        if url.startswith(_default_mirror()):
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"ok")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    assert local_models.ensure_asset(asset, tmp_path) is True
+    assert calls == [_mirror_for(asset), asset.url]
+
+
+def test_ensure_asset_mirror_connection_failure_falls_back(tmp_path, monkeypatch):
+    asset = _mirror_asset()
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        if url.startswith(_default_mirror()):
+            raise urllib.error.URLError("connection reset")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"ok")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    assert local_models.ensure_asset(asset, tmp_path) is True
+    assert calls == [_mirror_for(asset), asset.url]
+
+
+def test_ensure_asset_both_sources_fail_raises_origin_error(tmp_path, monkeypatch):
+    asset = _mirror_asset()
+
+    def fake_download(url, dest, **kwargs):
+        if url.startswith(_default_mirror()):
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+        raise OSError("origin unavailable")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    with pytest.raises(OSError, match="origin unavailable"):
+        local_models.ensure_asset(asset, tmp_path)
+
+
+def test_ensure_asset_empty_mirror_uses_origin_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_MODELS_MIRROR", "")
+    asset = _mirror_asset()
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"ok")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    assert local_models.ensure_asset(asset, tmp_path) is True
+    assert calls == [asset.url]
+
+
+def test_mirror_partial_connection_error_does_not_fallback(tmp_path, monkeypatch):
+    """镜像已收到字节后断线：不回退，保留 .part 供下次从镜像续传。"""
+    asset = _mirror_asset()
+    dest = tmp_path / "model.bin"
+    part = dest.with_name(dest.name + ".part")
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"mirror-partial")
+        raise urllib.error.URLError("mirror reset")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    with pytest.raises(urllib.error.URLError, match="mirror reset"):
+        local_models.ensure_asset(asset, tmp_path)
+    assert calls == [_mirror_for(asset)]
+    assert part.read_bytes() == b"mirror-partial"
+
+
+def test_mirror_zero_byte_connection_error_falls_back(tmp_path, monkeypatch):
+    """镜像连接失败且本次零字节：回退原地址，且不删除镜像已有的 .part。"""
+    asset = _mirror_asset()
+    dest = tmp_path / "model.bin"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(b"previous-run")
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        if url.startswith(_default_mirror()):
+            raise urllib.error.URLError("mirror reset")
+        assert part.exists(), "回退到原地址不应删除镜像的 .part"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"ok")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    assert local_models.ensure_asset(asset, tmp_path) is True
+    assert calls == [_mirror_for(asset), asset.url]
+    assert dest.read_bytes() == b"ok"
+
+
+def test_mirror_verify_failure_falls_back_to_origin(tmp_path, monkeypatch):
+    """镜像大小/哈希校验失败：回退原地址从头下载。"""
+    asset = _mirror_asset()
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        if url.startswith(_default_mirror()):
+            raise local_models.DownloadVerifyError("模型下载大小校验失败")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"ok")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    assert local_models.ensure_asset(asset, tmp_path) is True
+    assert calls == [_mirror_for(asset), asset.url]
+
+
+def test_mirror_cancel_does_not_fallback(tmp_path, monkeypatch):
+    """取消不回退：原样向上抛 DownloadCancelled。"""
+    asset = _mirror_asset()
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        raise local_models.DownloadCancelled(url)
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    with pytest.raises(local_models.DownloadCancelled):
+        local_models.ensure_asset(asset, tmp_path)
+    assert calls == [_mirror_for(asset)]
+
+
+def test_ensure_asset_reports_source_labels(tmp_path, monkeypatch):
+    asset = _mirror_asset()
+
+    def fake_download(url, dest, **kwargs):
+        if url.startswith(_default_mirror()):
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"ok")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    labels = []
+    assert local_models.ensure_asset(asset, tmp_path, report_source=labels.append) is True
+    assert labels == ["mirror", "origin"]
 
 
 # ---- 下载与校验 ----
@@ -96,7 +288,7 @@ def test_download_size_mismatch_raises_and_cleans_partial(tmp_path):
                         lambda request, timeout=60: _FakeResponse(b"short", status=200))
     try:
         dest = tmp_path / "m.onnx"
-        with pytest.raises(RuntimeError, match="大小校验失败"):
+        with pytest.raises(local_models.DownloadVerifyError, match="大小校验失败"):
             _download("https://example.com/m.onnx", dest, size=100)
         assert not (tmp_path / "m.onnx.part").exists()
         assert not dest.exists()
@@ -187,7 +379,7 @@ def test_download_manager_progress_snapshot_and_done(tmp_path, monkeypatch):
     entered = threading.Event()
     release = threading.Event()
 
-    def fake_ensure(asset, base, *, progress=None, cancel=None):
+    def fake_ensure(asset, base, *, progress=None, cancel=None, report_source=None):
         entered.set()
         assert release.wait(5)
         if progress:
@@ -215,7 +407,7 @@ def test_download_manager_cancel_sets_cancelled(tmp_path, monkeypatch):
     monkeypatch.setattr(local_models, "selected_assets", lambda: (asset,))
     entered = threading.Event()
 
-    def fake_ensure(asset, base, *, progress=None, cancel=None):
+    def fake_ensure(asset, base, *, progress=None, cancel=None, report_source=None):
         entered.set()
         assert cancel is not None
         assert cancel.wait(5)
@@ -240,7 +432,7 @@ def test_download_manager_rejects_second_start_while_running(tmp_path, monkeypat
     entered = threading.Event()
     release = threading.Event()
 
-    def fake_ensure(asset, base, *, progress=None, cancel=None):
+    def fake_ensure(asset, base, *, progress=None, cancel=None, report_source=None):
         entered.set()
         assert release.wait(5)
 
@@ -253,6 +445,32 @@ def test_download_manager_rejects_second_start_while_running(tmp_path, monkeypat
     deadline = time.monotonic() + 5
     while manager.is_running() and time.monotonic() < deadline:
         time.sleep(0.01)
+
+
+def test_download_manager_exposes_current_source(tmp_path, monkeypatch):
+    asset = _fake_asset()
+    monkeypatch.setattr(local_models, "selected_assets", lambda: (asset,))
+    entered = threading.Event()
+    release = threading.Event()
+    captured = {}
+
+    def fake_ensure(asset, base, *, progress=None, cancel=None, report_source=None):
+        captured["report_source"] = report_source
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(local_models, "ensure_asset", fake_ensure)
+    manager = ModelDownloadManager(base=tmp_path)
+    assert manager.start()
+    assert entered.wait(5)
+    assert callable(captured["report_source"])
+    captured["report_source"]("mirror")
+    assert manager.snapshot()["source"] == "mirror"
+    release.set()
+    deadline = time.monotonic() + 5
+    while manager.is_running() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.snapshot()["source"] == ""
 
 
 # ---- Mac 包内模型就绪：不触发下载 ----
