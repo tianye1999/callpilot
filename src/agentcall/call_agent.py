@@ -190,6 +190,11 @@ _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
 _REASON_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _PHONE_FIRST_MEDIA_TIMEOUT_SECONDS = 20.0
 _EARLY_ANSWER_CONNECTED_WAIT_SECONDS = 8.0
+# 直连 connected 后首个上行音频帧都没有的判定窗口。判定只看「帧/包有没有到」，
+# 不看音量：静音帧（含 Opus DTX 的舒适噪声帧）同样算收到，只有一条包/帧都没到
+# 才提前回落。实测直连 connected 到手机上行首帧最慢 1966ms（近 10 通），
+# Opus DTX 静音约 400ms 一帧；3.0s 给慢网/慢机留出余量，又远短于旧 8s。
+_EARLY_ANSWER_NO_PHONE_AUDIO_SECONDS = 3.0
 _INBOUND_TRIAGE_CLARIFY_TEXT = {
     "zh": "请简单确认一下，您是有具体事情找机主，还是一般业务介绍？",
     "en": "Just to confirm — do you have a specific matter for them personally, or is this a general offer?",
@@ -2488,10 +2493,11 @@ class CallSession:
                             break
                 if (fastpath_v2 and isinstance(endpoint, SwitchableInboundEndpoint)
                         and endpoint.no_phone_audio_expired(self._phone_first_clock(),
-                                                            _EARLY_ANSWER_CONNECTED_WAIT_SECONDS)):
+                                                            _EARLY_ANSWER_NO_PHONE_AUDIO_SECONDS)):
+                    probe = endpoint.phone_audio_probe(self._phone_first_clock())
                     if await endpoint.fail_no_phone_audio() and record is not None:
                         record.log_event("takeover_rollback", reason="NO_PHONE_AUDIO", provisional=True,
-                                         generation=generation)
+                                         generation=generation, **probe)
                 if (isinstance(endpoint, SwitchableInboundEndpoint) and endpoint.no_phone_audio
                         and provisional_agent is None and bridge is not None):
                     if not coordinator.begin_provisional_ai(claimed.fence).accepted:

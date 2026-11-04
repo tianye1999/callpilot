@@ -247,6 +247,27 @@ class SwitchableInboundEndpoint:
             self._timing.mark("media_failed_delivery_failed")
         return True
 
+    def phone_audio_probe(self, now: float) -> dict[str, Any]:
+        """上行判定依据：只留包/帧计数与首包时延，不落音频内容或号码。"""
+        inner = self._inner
+        connected_at = getattr(inner, "direct_connected_at", None)
+        received = bool(getattr(inner, "phone_audio_received", False))
+        connected_elapsed_ms = (
+            round((now - connected_at) * 1000)
+            if isinstance(connected_at, (int, float)) else None
+        )
+        first_frame_ms = self._timing.mark_ms("phone_first_frame")
+        connected_mark_ms = self._timing.mark_ms("direct_connected")
+        first_frame_elapsed_ms = (
+            round(first_frame_ms - connected_mark_ms, 3)
+            if first_frame_ms is not None and connected_mark_ms is not None else None
+        )
+        return {
+            "received_packets": 1 if received else 0,
+            "connected_elapsed_ms": connected_elapsed_ms,
+            "first_frame_elapsed_ms": first_frame_elapsed_ms,
+        }
+
     async def connect(self) -> None:
         if self._closed:
             raise ConnectionError("media closed")

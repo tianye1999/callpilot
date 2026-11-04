@@ -2237,7 +2237,7 @@ def test_http_client_timing_is_same_winner_fenced_and_received_before_end(rig, m
 
 @pytest.mark.parametrize("outcome", ["lease", "repair", "repair_failed", "hangup"])
 @pytest.mark.parametrize("preparation_yields", [0, 20, 700])
-def test_no_phone_audio_starts_ai_at_eight_seconds_and_preserves_same_claim_pcm(rig, monkeypatch, outcome):
+def test_no_phone_audio_starts_ai_at_three_seconds_and_preserves_same_claim_pcm(rig, monkeypatch, outcome):
     from agentcall.inbound_direct import SwitchableInboundEndpoint
 
     monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
@@ -2342,7 +2342,7 @@ def test_no_phone_audio_starts_ai_at_eight_seconds_and_preserves_same_claim_pcm(
         running = asyncio.create_task(session._handle_call())
         await failed.wait()
         await spoken.wait()
-        assert 8 <= ai_times[0] - direct.direct_connected_at < 8.2
+        assert 3 <= ai_times[0] - direct.direct_connected_at < 3.2
         assert session.takeover_state is TakeoverState.WAITING_OWNER
         if outcome in {"repair", "repair_failed"}:
             assert rig.service.fallback_inbound_direct(fence, rig.issued, lambda *_: None)
@@ -2354,10 +2354,62 @@ def test_no_phone_audio_starts_ai_at_eight_seconds_and_preserves_same_claim_pcm(
     assert len(created) == len(agent.said) == 1 and agent.stopped
     assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
     assert rig.bridge.max_writers == 1 and rig.bridge.downlink
+    provisional = [event for event in phone_first_events(rig)
+                   if event.get("type") == "takeover_rollback"
+                   and event.get("reason") == "NO_PHONE_AUDIO"
+                   and event.get("provisional") is True]
+    assert len(provisional) == 1
+    assert provisional[0]["received_packets"] == 0
+    assert provisional[0]["first_frame_elapsed_ms"] is None
+    assert provisional[0]["connected_elapsed_ms"] >= 3000
     if outcome == "lease":
         assert finalized.is_set() and rig.clock.now >= session._phone_first_claim_deadline
     elif outcome == "repair_failed":
         assert finalized.is_set() and rig.clock.now < session._phone_first_claim_deadline
+
+
+def test_silent_phone_frame_inside_window_skips_early_fallback(rig, monkeypatch):
+    from agentcall.inbound_direct import SwitchableInboundEndpoint
+
+    monkeypatch.setenv("INBOUND_FASTPATH_V2_ENABLED", "true")
+    monkeypatch.setenv("MODEM_ANSWER_GREETING", "")
+    monkeypatch.setattr("agentcall.call_agent.create_agent",
+                        lambda *_: pytest.fail("silent frame must not start AI"))
+    session = rig.session
+    direct = rig.endpoint
+    direct.media_ready = False
+    direct.phone_audio_received = False
+    direct.browser_connected = True
+    direct.answer = {"sdp": "answer"}
+
+    async def connect():
+        # 用户接起后沉默几秒是正常的：静音帧也算「收到上行包」，不得提前回落。
+        direct.direct_connected_at = rig.clock.now
+        direct.phone_audio_received = True
+        direct.media_ready = True
+
+    direct.connect = connect
+    session._takeover_endpoint_factory = lambda issued: SwitchableInboundEndpoint(
+        issued.direct, direct_factory=lambda *_args, **_kw: direct)
+
+    def claim():
+        rig.clock.tick = lambda: None
+        offer = session.next_takeover_offer()
+        assert offer is not None
+        request = InboundDirectRequest(offer.offer_id, "claim_silent", "sdp", [], lambda *_: None)
+        assert session.accept_takeover_claim(
+            offer_id=offer.offer_id, call_id=offer.call_id, claim_id="claim_silent",
+            generation=offer.generation, nonce=offer.nonce,
+            issued=replace(rig.issued, direct=request),
+        ).accepted
+
+    rig.clock.tick = claim
+    rig.ring()
+    asyncio.run(session._handle_call())
+    events = phone_first_events(rig)
+    assert not any(event.get("type") == "takeover_rollback"
+                   and event.get("reason") == "NO_PHONE_AUDIO" for event in events)
+    assert rig.commands.count("ATA") == rig.commands.count("PCM") == 1
 
 
 @pytest.mark.parametrize("media_state", ["no_sdp", "ice_stalled", "livekit_connecting"])

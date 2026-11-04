@@ -125,6 +125,27 @@ def test_any_first_audio_frame_or_existing_fallback_disables_no_audio_deadline()
     assert not endpoint.no_phone_audio_expired(1000, 8)
 
 
+def test_no_phone_audio_expires_at_three_seconds_without_frames():
+    from agentcall.call_agent import _EARLY_ANSWER_NO_PHONE_AUDIO_SECONDS
+
+    assert _EARLY_ANSWER_NO_PHONE_AUDIO_SECONDS == 3.0
+    request = InboundDirectRequest("offer", "claim", "sdp", [], lambda *_: None)
+    endpoint = SwitchableInboundEndpoint(request)
+    endpoint._inner = SimpleNamespace(direct_connected_at=100.0, phone_audio_received=False)
+    assert not endpoint.no_phone_audio_expired(102.999, _EARLY_ANSWER_NO_PHONE_AUDIO_SECONDS)
+    assert endpoint.no_phone_audio_expired(103.0, _EARLY_ANSWER_NO_PHONE_AUDIO_SECONDS)
+
+
+def test_first_frame_at_2_9s_disables_early_fallback():
+    request = InboundDirectRequest("offer", "claim", "sdp", [], lambda *_: None)
+    endpoint = SwitchableInboundEndpoint(request)
+    endpoint._inner = SimpleNamespace(direct_connected_at=100.0, phone_audio_received=False)
+    assert not endpoint.no_phone_audio_expired(102.9, 3.0)
+    endpoint._inner.phone_audio_received = True
+    assert not endpoint.no_phone_audio_expired(103.0, 3.0)
+    assert not endpoint.no_phone_audio_expired(200.0, 3.0)
+
+
 @pytest.mark.parametrize("progress", ["sdp", "fallback_pending", "livekit"])
 def test_initial_silence_cap_does_not_expire_media_already_started(progress):
     request = InboundDirectRequest("offer", "claim", None, [], lambda *_: None)

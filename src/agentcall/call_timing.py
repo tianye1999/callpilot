@@ -229,6 +229,10 @@ class CallTiming:
     def mark(self, stage: str) -> None:
         self._emit("edge_" + stage, round((self._clock() - self._origin) * 1000, 3))
 
+    def mark_ms(self, stage: str) -> float | None:
+        """Elapsed milliseconds since timing origin for a recorded stage, if any."""
+        return self._marks.get("edge_" + stage)
+
     def summary(self) -> dict[str, float | None]:
         """Durations only within one clock domain; a renderer frame may be silent."""
         intervals = {
