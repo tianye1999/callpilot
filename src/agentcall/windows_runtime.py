@@ -23,6 +23,26 @@ def _require_frozen() -> None:
         raise RuntimeError('Windows tray runtime requires a frozen executable; use app.py for source development')
 
 
+def _report_portable_error(support: Path, exc: BaseException, role: str) -> None:
+    """只读便携目录无法落数据时，给出托盘弹窗与日志，不静默改写到别处。"""
+    message = (
+        'CallPilot 便携数据目录不可写：\n'
+        f'{support}\n\n'
+        '请把 CallPilot 解压到可写目录（如桌面）后重试。'
+    )
+    logger.error('Portable data root is not writable (%s): %s', exc, support)
+    if sys.platform == 'win32' and role != 'service':
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, message, 'CallPilot', 0x10)  # MB_ICONERROR
+        except Exception:
+            logger.exception('Could not show portable-directory error dialog')
+    stderr = getattr(sys, 'stderr', None)
+    if stderr is not None:
+        print(message, file=stderr)
+
+
 def seed_env(support: Path, template: Path) -> None:
     from dotenv import unset_key
 
@@ -136,6 +156,8 @@ def run_tray(support: Path) -> None:
     import pystray
     from PIL import Image
 
+    from . import windows_autostart
+
     tray = importlib.import_module('tray_app')
 
     stop = threading.Event()
@@ -151,6 +173,52 @@ def run_tray(support: Path) -> None:
 
     def quit_tray(*_):
         stop.set()
+
+    def restart_service(*_):
+        restart.set()
+
+    def autostart_enabled(_item=None):
+        try:
+            return windows_autostart.is_enabled()
+        except windows_autostart.AutostartUnavailable:
+            return False
+
+    def toggle_autostart(_icon, _item):
+        try:
+            windows_autostart.set_enabled(not windows_autostart.is_enabled())
+        except windows_autostart.AutostartUnavailable:
+            logger.exception('Could not toggle autostart')
+
+    def fix_autostart(_icon, _item):
+        try:
+            windows_autostart.set_enabled(True)
+        except windows_autostart.AutostartUnavailable:
+            logger.exception('Could not repair autostart')
+
+    def quit_with_autostart_off(_icon, _item):
+        try:
+            windows_autostart.set_enabled(False)
+        except windows_autostart.AutostartUnavailable:
+            logger.exception('Could not disable autostart on quit')
+        quit_tray()
+
+    def stale_autostart_target():
+        try:
+            return windows_autostart.stale_run_target()
+        except windows_autostart.AutostartUnavailable:
+            return None
+
+    def build_menu():
+        items = [
+            pystray.MenuItem('Open dashboard', open_window, default=True),
+            pystray.MenuItem('Restart service', restart_service),
+            pystray.MenuItem('开机自动启动', toggle_autostart, checked=autostart_enabled),
+        ]
+        if stale_autostart_target() is not None:
+            items.append(pystray.MenuItem('开机自启指向旧路径，点击修正', fix_autostart))
+        items.append(pystray.MenuItem('退出并关闭开机自启', quit_with_autostart_off))
+        items.append(pystray.MenuItem('Quit CallPilot', quit_tray))
+        return items
 
     def supervise():
         nonlocal service
@@ -193,14 +261,14 @@ def run_tray(support: Path) -> None:
                 child.wait()
         icon.stop()
 
-    icon = pystray.Icon('CallPilot', Image.open(tray.icon_path(True)), 'CallPilot', menu=pystray.Menu(
-        pystray.MenuItem('Open dashboard', open_window, default=True),
-        pystray.MenuItem('Restart service', lambda *_: restart.set()),
-        pystray.MenuItem('Quit CallPilot', quit_tray),
-    ))
+    icon = pystray.Icon('CallPilot', Image.open(tray.icon_path(True)), 'CallPilot', menu=pystray.Menu(build_menu))
 
     def setup(icon):
         icon.visible = True
+        stale = stale_autostart_target()
+        if stale is not None:
+            message = f'开机自启仍指向旧路径：\n{stale}\n请在托盘菜单中点「开机自启指向旧路径，点击修正」。'
+            icon.notify(message, 'CallPilot')
         if '--login' not in sys.argv:
             open_window()
         supervise()
@@ -214,13 +282,20 @@ def main() -> None:
         from .windows_selftest import run
 
         raise SystemExit(run())
+    role = 'service' if '--service' in sys.argv else 'window' if '--window' in sys.argv else 'tray'
     support = config.app_support_dir()
-    support.mkdir(parents=True, exist_ok=True)
+    if config.is_portable_mode():
+        try:
+            config.ensure_dir_writable(support, verify=True)
+        except config.DataRootNotWritable as exc:
+            _report_portable_error(support, exc, role)
+            raise SystemExit(1) from exc
+    else:
+        support.mkdir(parents=True, exist_ok=True)
     if '--shutdown' in sys.argv:
         raise SystemExit(shutdown(support))
     resources = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parents[2]))
     seed_env(support, resources / '.env.example')
-    role = 'service' if '--service' in sys.argv else 'window' if '--window' in sys.argv else 'tray'
     logs = config.log_dir()
     logs.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, handlers=[logging.handlers.RotatingFileHandler(

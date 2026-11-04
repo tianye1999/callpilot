@@ -80,6 +80,8 @@ def test_windows_pcm_native_com_without_pty_fallback(monkeypatch, error):
 def test_frozen_windows_support_path(monkeypatch, tmp_path):
     monkeypatch.setattr(platforms, "IS_WINDOWS", True)
     monkeypatch.setattr(config, "_is_frozen", lambda: True)
+    exe_dir = tmp_path / "CallPilot"
+    exe_dir.mkdir()
+    monkeypatch.setattr("sys.executable", str(exe_dir / "CallPilot.exe"), raising=False)
     monkeypatch.delenv("AGENTCALL_APP_SUPPORT_DIR", raising=False)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    assert config.app_support_dir() == tmp_path / "CallPilot"
+    assert config.app_support_dir() == exe_dir / config.PORTABLE_DATA_DIR

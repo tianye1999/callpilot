@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WINDOWS_DIR = PROJECT_ROOT / "scripts" / "windows"
 INSTALL_PS1 = WINDOWS_DIR / "install.ps1"
 BUILD_PS1 = WINDOWS_DIR / "build_app.ps1"
+TEST_PORTABLE_PS1 = WINDOWS_DIR / "test_portable.ps1"
 README = WINDOWS_DIR / "README.md"
 SPEC = PROJECT_ROOT / "packaging" / "agentcall.spec"
 
@@ -106,7 +107,7 @@ def test_spec_bundle_only_on_macos():
 # ---- pwsh 语法检查（本机有 pwsh 才跑）----
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="本机无 PowerShell（pwsh）")
-@pytest.mark.parametrize("script", [INSTALL_PS1, BUILD_PS1], ids=lambda p: p.name)
+@pytest.mark.parametrize("script", [INSTALL_PS1, BUILD_PS1, TEST_PORTABLE_PS1], ids=lambda p: p.name)
 def test_ps1_syntax_parses(script):
     check = (
         "$errs = $null; "

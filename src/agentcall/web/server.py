@@ -323,6 +323,8 @@ def build_app(
     app.router.add_post("/api/updates/resume", _resume_update)
     app.router.add_get("/api/notify/feed", _notification_feed)
     app.router.add_post("/api/macos/autostart", _macos_autostart)
+    app.router.add_get("/api/autostart", _autostart_get)
+    app.router.add_post("/api/autostart", _autostart_post)
     app.router.add_get("/ws", _websocket)
     app.router.add_get("/ws/audio", _audio_websocket)
     app.router.add_post("/api/sms/send", _send_sms)
@@ -683,6 +685,10 @@ def _macos_shell_available() -> bool:
     return platforms.IS_MACOS and bool(getattr(sys, "frozen", False))
 
 
+def _windows_autostart_available() -> bool:
+    return platforms.IS_WINDOWS and bool(getattr(sys, "frozen", False))
+
+
 async def _macos_autostart(request: web.Request) -> web.Response:
     if not _macos_shell_available():
         raise web.HTTPNotFound()
@@ -701,6 +707,29 @@ async def _macos_autostart(request: web.Request) -> web.Response:
         macos_launchd.set_autostart, macos_launchd.make_layout(sys.executable), data["enabled"],
     )
     return web.json_response({"ok": True, "enabled": data["enabled"]})
+
+
+async def _autostart_get(request: web.Request) -> web.Response:
+    _require_local(request)
+    if not _windows_autostart_available():
+        return web.json_response({"supported": False})
+    from .. import windows_autostart
+
+    enabled = await asyncio.to_thread(windows_autostart.is_enabled)
+    return web.json_response({"supported": True, "enabled": enabled})
+
+
+async def _autostart_post(request: web.Request) -> web.Response:
+    _require_local(request)
+    if not _windows_autostart_available():
+        return web.json_response({"supported": False})
+    data = await read_json(request)
+    if not isinstance(data, dict) or type(data.get("enabled")) is not bool:
+        raise web.HTTPBadRequest(text="enabled 必须为布尔值")
+    from .. import windows_autostart
+
+    await asyncio.to_thread(windows_autostart.set_enabled, data["enabled"])
+    return web.json_response({"supported": True, "enabled": data["enabled"]})
 
 
 async def _websocket(request: web.Request) -> web.WebSocketResponse:

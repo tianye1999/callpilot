@@ -32,6 +32,10 @@ _ENV_WRITE_LOCK = threading.RLock()
 
 APP_NAME = "CallPilot"
 
+# 冻结 Windows 版只发绿色版：用户根目录固定为 exe 同目录下的 data-root，
+# 不写 %LOCALAPPDATA%，也不读任何标记文件（便携即默认）。
+PORTABLE_DATA_DIR = "data-root"
+
 # get_bool 认定为真的取值（大小写不敏感）。
 _TRUTHY = {"true", "1", "yes"}
 
@@ -45,8 +49,56 @@ _ENV_LINE_RE = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _NEEDS_QUOTING_RE = re.compile(r"[\s#\"']")
 
 
+class DataRootNotWritable(RuntimeError):
+    """选定的数据根目录无法创建或写入。
+
+    便携模式必须响亮失败，而不是静默改写到用户目录，那会把用户数据撕成两处。
+    """
+
+
 def _is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False) or getattr(sys, "_MEIPASS", None))
+
+
+def _frozen_exe_dir() -> Path | None:
+    """冻结可执行文件所在目录；源码运行返回 None。"""
+    if not _is_frozen():
+        return None
+    try:
+        return Path(sys.executable).resolve().parent
+    except OSError:
+        return None
+
+
+def portable_root() -> Path | None:
+    """冻结 Windows 的数据根目录：exe 旁 data-root，无回退、无标记文件。"""
+    if not platforms.IS_WINDOWS:
+        return None
+    exe_dir = _frozen_exe_dir()
+    if exe_dir is None:
+        return None
+    return exe_dir / PORTABLE_DATA_DIR
+
+
+def is_portable_mode() -> bool:
+    return portable_root() is not None
+
+
+def ensure_dir_writable(root: Path, *, verify: bool) -> None:
+    """创建 ``root``；``verify`` 为真时再以探针文件证明可写。"""
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DataRootNotWritable(str(root)) from exc
+    if not verify:
+        return
+    probe = root / ".write-probe"
+    try:
+        probe.touch()
+    except OSError as exc:
+        raise DataRootNotWritable(str(root)) from exc
+    else:
+        probe.unlink(missing_ok=True)
 
 
 def app_support_dir() -> Path:
@@ -54,9 +106,12 @@ def app_support_dir() -> Path:
     override = os.environ.get("AGENTCALL_APP_SUPPORT_DIR", "").strip()
     if override:
         return Path(override).expanduser()
+    if _is_frozen() and platforms.IS_WINDOWS:
+        root = portable_root()
+        if root is None:
+            raise DataRootNotWritable("无法定位 CallPilot.exe 所在目录")
+        return root
     if _is_frozen():
-        if platforms.IS_WINDOWS:
-            return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / APP_NAME
         return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path.cwd()
 
@@ -1145,7 +1200,9 @@ __all__ = [
     "APP_NAME",
     "CONFIG_SPECS",
     "ConfigSpec",
+    "DataRootNotWritable",
     "KeyValidationResult",
+    "PORTABLE_DATA_DIR",
     "PROVIDER_REQUIRED_KEYS",
     "any_provider_credentials_ready",
     "app_support_dir",
@@ -1153,13 +1210,16 @@ __all__ = [
     "complete_setup",
     "credential_status",
     "data_dir",
+    "ensure_dir_writable",
     "env_file_path",
     "get_bool",
     "get_float",
     "get_int",
     "get_spec",
     "get_str",
+    "is_portable_mode",
     "log_dir",
+    "portable_root",
     "read_panel_values",
     "runtime_meta",
     "setup_required",

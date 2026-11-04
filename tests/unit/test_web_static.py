@@ -142,6 +142,19 @@ def test_setup_requires_explicit_recording_choice_and_shows_storage_details():
     assert 'cfgVal("RECORDING_RETENTION_DAYS")' in text
 
 
+def test_setup_autostart_defaults_checked_and_is_bilingual():
+    text = INDEX.read_text(encoding="utf-8")
+
+    assert 'id="setupAutostartRow" hidden' in text
+    assert 'id="setupAutostart" checked' in text
+    assert 'setup_autostart: "Start automatically when I sign in (recommended)"' in text
+    assert 'setup_autostart: "开机自动启动（推荐）"' in text
+    assert 'fetch("/api/autostart")' in text
+    assert "await saveSetupAutostart();" in text
+    assert "void refreshSetupAutostart();" in text
+    assert 'setup_autostart_fail' in text
+
+
 def test_recording_setting_and_active_call_show_context():
     text = INDEX.read_text(encoding="utf-8")
 

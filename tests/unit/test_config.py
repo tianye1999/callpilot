@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -14,15 +15,20 @@ import pytest
 from agentcall import config, platforms
 from agentcall.config import (
     CONFIG_SPECS,
+    DataRootNotWritable,
     app_support_dir,
     call_log_dir,
     data_dir,
+    ensure_dir_writable,
     env_file_path,
     get_bool,
     get_float,
     get_int,
     get_spec,
     get_str,
+    is_portable_mode,
+    log_dir,
+    portable_root,
     read_panel_values,
     update_env_file,
     validate_provider_credentials,
@@ -1078,3 +1084,71 @@ def test_dtmf_tone_numeric_ranges_rejected_on_write(tmp_path):
     assert set(updated) == {"DTMF_TONE_MS", "DTMF_TONE_AMPLITUDE"}
     os.environ.pop("DTMF_TONE_MS", None)
     os.environ.pop("DTMF_TONE_AMPLITUDE", None)
+
+
+# ---- 便携模式（Windows 绿色版）路径判定 ----
+
+def test_frozen_windows_defaults_to_data_root_next_to_exe(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "_is_frozen", lambda: True)
+    monkeypatch.setattr(platforms, "IS_WINDOWS", True)
+    exe_dir = tmp_path / "CallPilot"
+    exe_dir.mkdir()
+    monkeypatch.setattr(sys, "executable", str(exe_dir / "CallPilot.exe"))
+    _unset(monkeypatch, "AGENTCALL_APP_SUPPORT_DIR", "AGENTCALL_ENV_FILE",
+           "AGENTCALL_DATA_DIR", "AGENTCALL_LOG_DIR", "CALL_LOG_DIR")
+
+    expected = exe_dir / config.PORTABLE_DATA_DIR
+    assert portable_root() == expected
+    assert is_portable_mode()
+    assert app_support_dir() == expected
+    assert env_file_path() == expected / ".env"
+    assert data_dir() == expected / "data"
+    assert log_dir() == expected / "logs"
+    assert call_log_dir() == expected / "data" / "recordings"
+
+
+def test_frozen_non_windows_keeps_application_support(monkeypatch):
+    monkeypatch.setattr(config, "_is_frozen", lambda: True)
+    monkeypatch.setattr(platforms, "IS_WINDOWS", False)
+    monkeypatch.setattr(platforms, "IS_MACOS", True)
+    monkeypatch.setattr(sys, "executable", "/Applications/CallPilot.app/Contents/MacOS/CallPilot")
+    _unset(monkeypatch, "AGENTCALL_APP_SUPPORT_DIR")
+
+    assert portable_root() is None
+    assert not is_portable_mode()
+    assert app_support_dir() == Path.home() / "Library" / "Application Support" / config.APP_NAME
+
+
+def test_source_run_keeps_cwd_without_portable_mode(monkeypatch, tmp_path):
+    exe_dir = tmp_path / "CallPilot"
+    exe_dir.mkdir()
+    monkeypatch.setattr(platforms, "IS_WINDOWS", True)
+    monkeypatch.setattr(config, "_is_frozen", lambda: False)
+    monkeypatch.setattr(sys, "executable", str(exe_dir / "CallPilot.exe"))
+    monkeypatch.chdir(tmp_path)
+    _unset(monkeypatch, "AGENTCALL_APP_SUPPORT_DIR")
+
+    assert portable_root() is None
+    assert not is_portable_mode()
+    assert app_support_dir() == tmp_path
+
+
+def test_ensure_dir_writable_creates_and_probes(tmp_path):
+    root = tmp_path / "nested" / config.PORTABLE_DATA_DIR
+    ensure_dir_writable(root, verify=True)
+    assert root.is_dir()
+    assert not (root / ".write-probe").exists()
+
+
+def test_portable_readonly_dir_reports_error_without_fallback(monkeypatch, tmp_path):
+    real_touch = Path.touch
+
+    def deny_probe(self, *args, **kwargs):
+        if self.name == ".write-probe":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_touch(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "touch", deny_probe)
+    with pytest.raises(DataRootNotWritable):
+        ensure_dir_writable(tmp_path / config.PORTABLE_DATA_DIR, verify=True)
+    assert not (tmp_path / config.PORTABLE_DATA_DIR / ".write-probe").exists()

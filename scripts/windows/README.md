@@ -1,24 +1,35 @@
 # CallPilot Windows
 
 状态：SIM7600G 驱动、真实 COM 口与双向音频均**待硬件验证**。打包与无界面自检由 CI 验证。
-第二阶段代码已加入随包后端、托盘与 Inno Setup 安装器，Windows CI 首次验收待完成。
-不提供 MSI、签名或自动安装驱动，不携带 API 密钥与模型资产。
+Windows 只发**绿色版（便携 ZIP）**：不签名、不上微软商店、不做 setup.exe。用户下载 zip、
+解压后双击 `CallPilot.exe` 即用。
 
-## 成品安装与升级
+## 绿色版安装与使用
 
-CI artifact 同时包含 `CallPilot-<version>-setup.exe`、便携 ZIP 和安装后自检 JSON。
-setup 按当前用户安装到 `%LOCALAPPDATA%\Programs\CallPilot`，无需管理员。
-可选登录自启写入 HKCU Run；默认启动托盘，托盘管理 `--service` 后端并按需启动
-`--window` 面板，关闭面板不会停止服务。自动重启最多五次，退避 1/2/4/8/16 秒。
+CI artifact 只含 `CallPilot-windows-x64.zip`。所有用户数据（`.env`、`data`、`logs`）固定落在
+exe 同目录的 `data-root`，不写 `%LOCALAPPDATA%\CallPilot`，也不读任何标记文件。
 
-配置在 `%LOCALAPPDATA%\CallPilot\.env`，数据与日志分别在该目录的 `data` 与 `logs`。
-首次配置来自包内 `.env.example`，移除三个 Mac 端口/音频覆盖项，让 Windows 默认值生效；
-已有用户配置不覆盖。SIM7600 用户仍须按下文选择厂商并填写 AI 凭证。
-升级/卸载先通过旧 EXE 的 `--shutdown` 优雅停止；超时中止，不强杀。
-卸载保留用户数据，并提示可手动删除。旧源码计划任务不自动迁移，须先手动注销，
-第一阶段薄前端也须先关闭，避免与成品后端争用端口。
+1. 下载 `CallPilot-windows-x64.zip`，右键文件 → 属性 → 勾选「解除锁定」（若存在该选项）。
+2. 解压到可写目录（如桌面或 `D:\CallPilot`，路径可含空格与中文）。
+3. 双击 `CallPilot.exe`。首次启动生成 `data-root\.env`，接着按需要填写 AI 凭证与调制解调器厂商。
+4. 托盘右键 →「开机自动启动」写入/删除 HKCU Run；状态实时读注册表。若 exe 被移动后 Run 仍指向
+   旧路径，托盘会提示，并可在菜单点「开机自启指向旧路径，点击修正」一键修正。
+   首次启动向导默认勾选「开机自动启动（推荐）」，完成向导即写入 HKCU Run，与托盘开关同源、状态一致。
 
-完整协议与 CI 验收范围见 [任务 P](../../docs/task-p-windows-installer.md)。
+只读位置（如光盘、只读共享）无法落数据时，托盘会弹窗报错并退出，不会静默改写到别处。
+默认启动托盘，托盘管理 `--service` 后端并按需启动 `--window` 面板，关闭面板不停止服务；
+后端自动重启最多五次，退避 1/2/4/8/16 秒。
+
+### 升级（保留配置）
+
+1. 右键托盘 →「Quit CallPilot」退出（后端与窗口一并停止）。
+2. 用新版解压覆盖原程序文件，保留 `data-root` 目录不动。
+3. 重新双击 `CallPilot.exe`。`data-root` 里的 `.env` 与数据保持不变。
+
+### 卸载
+
+1. 右键托盘 →「退出并关闭开机自启」（删除 HKCU Run 项），随后程序退出。
+2. 删除整个 CallPilot 解压目录（含 `data-root`）。
 
 ## SIM7600G 驱动与端口
 
@@ -76,15 +87,16 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1 status
 
 `restart` 重启，`uninstall` 停止并移除任务；它不是 exe 安装器。
 任务登录自启、失败重启；源码日志在 `data\app_console.log`，面板为 http://127.0.0.1:47100。
-冻结版可写数据默认在 `%LOCALAPPDATA%\CallPilot`；源码后端 `.env` 仍在项目根目录。
+绿色版可写数据固定落在 exe 旁 `data-root`；源码后端 `.env` 仍在项目根目录。
 
 ## CI 与本地打包
 
 `windows-package` 仅在 main push 和 PR 自动运行，无手动触发入口。
 GitHub Actions → CI → 对应成功 run → Artifacts → `CallPilot-windows-x64`，
 下载解压 artifact，再解压其中的 `CallPilot-windows-x64.zip`，保留整个 CallPilot 目录，不能只拷 exe。
-包内 `selftest.json` 是重定位自检报告，artifact 的 `installer-selftest.json` 是安装后报告；
-安装验收还检查安全后端版本、覆盖升级及卸载保留数据，不证明 GUI、常驻或真实通话已验收。
+包内 `selftest.json` 是重定位自检报告；便携冒烟脚本 `test_portable.ps1` 解压到含空格临时目录后
+启动后端、校验版本、优雅停机并确认三角色锁释放，再以同版本覆盖程序文件模拟升级并断言
+`data-root\.env` 哈希不变，且 `%LOCALAPPDATA%\CallPilot` 未被创建。这不证明 GUI、常驻或真实通话已验收。
 目标机仍需 Microsoft Edge WebView2 Runtime 与 .NET Framework（pywebview WinForms 要求）。
 
 本地复现（只在 Windows 构建 Windows 产物）：
@@ -117,4 +129,5 @@ EC20/EG25 使用 Quectel 官方驱动，`MODEM_VENDOR=quectel`、`MODEM_PORT=aut
 - 设备管理器/pyserial 实际 VID、PID、描述、AT/Audio 对照及热插拔。
 - SIM7600G 来去电、PCM 双向录音、长通话、挂断/重连恢复（需另行授权硬件操作）。
 - 计划任务登录自启、退出/重启、路径含中文与空格。
-- MSI/安装器、内置后端、升级/卸载/回滚；代码签名由机主决定证书与发布策略。
+- 托盘开机自启开关与旧路径一键修正的真机行为（注册表写删、移动 exe 后提示）。
+- 绿色版覆盖升级/删除目录卸载的真机验收；代码签名由机主决定证书与发布策略。

@@ -68,12 +68,15 @@ def test_frozen_default_report_and_import_cwd_are_outside_install(monkeypatch, t
     assert import_cwds and set(import_cwds) == {support}
 
 
-def test_installer_smoke_logs_only_allowlisted_meta_and_waits_for_cleanup():
+def test_portable_smoke_logs_only_allowlisted_meta_and_asserts_data_root():
     root = Path(__file__).resolve().parents[2]
-    script = (root / 'scripts/windows/test_installer.ps1').read_text(encoding='utf-8')
+    script = (root / 'scripts/windows/test_portable.ps1').read_text(encoding='utf-8')
     assert '$meta |' not in script
     assert '$($meta' not in script
-    assert 'versionMatches=$versionMatches' in script
-    assert 'AddSeconds(30)' in script
-    assert 'Get-ChildItem $install -Recurse -Force' in script
-    assert '-WorkingDirectory $root' in script
+    assert 'VersionMatches=$versionMatches' in script
+    assert 'LocalAppDataCreated=' in script
+    assert 'EnvPreserved=' in script
+    assert 'data-root' in script
+    assert "Join-Path $env:LOCALAPPDATA 'CallPilot'" in script
+    assert '--hardware-selftest' in script
+    assert '--shutdown' in script

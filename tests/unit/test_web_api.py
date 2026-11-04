@@ -260,6 +260,59 @@ def test_macos_autostart_only_packaged_and_validated(monkeypatch):
     api(build_app(None, None), fn)
 
 
+def test_autostart_unsupported_returns_supported_false_without_side_effects(monkeypatch):
+    from agentcall import windows_autostart
+
+    monkeypatch.setattr(server, "_windows_autostart_available", lambda: False)
+    monkeypatch.setattr(windows_autostart, "is_enabled", lambda: pytest.fail("unexpected registry read"))
+    monkeypatch.setattr(windows_autostart, "set_enabled", lambda enabled: pytest.fail("unexpected registry write"))
+
+    async def fn(client):
+        response = await client.get("/api/autostart")
+        assert response.status == 200
+        assert await response.json() == {"supported": False}
+        response = await client.post("/api/autostart", json={"enabled": True})
+        assert response.status == 200
+        assert await response.json() == {"supported": False}
+
+    api(make_app(FakeService()), fn)
+
+
+def test_autostart_windows_reads_and_writes_run_value(monkeypatch):
+    from agentcall import windows_autostart
+
+    state = {"enabled": False}
+    calls = []
+
+    def fake_is_enabled():
+        return state["enabled"]
+
+    def fake_set_enabled(enabled):
+        calls.append(enabled)
+        state["enabled"] = enabled
+
+    monkeypatch.setattr(server, "_windows_autostart_available", lambda: True)
+    monkeypatch.setattr(windows_autostart, "is_enabled", fake_is_enabled)
+    monkeypatch.setattr(windows_autostart, "set_enabled", fake_set_enabled)
+
+    async def fn(client):
+        response = await client.get("/api/autostart")
+        assert response.status == 200
+        assert await response.json() == {"supported": True, "enabled": False}
+        response = await client.get("/api/autostart", headers={"Origin": "https://evil.test"})
+        assert response.status == 403
+        response = await client.post("/api/autostart", json={"enabled": "true"})
+        assert response.status == 400
+        assert calls == []
+        response = await client.post("/api/autostart", json={"enabled": True})
+        assert response.status == 200
+        assert await response.json() == {"supported": True, "enabled": True}
+        assert calls == [True]
+        assert state["enabled"] is True
+
+    api(make_app(FakeService()), fn)
+
+
 @pytest.mark.parametrize("active", [False, True])
 def test_meta_reports_current_call_state(active, monkeypatch):
     monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)

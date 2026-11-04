@@ -149,7 +149,25 @@ def test_packaging_contract():
     spec = (root / 'packaging/agentcall.spec').read_text(encoding='utf-8')
     assert '"tray_app.py" if IS_MACOS or IS_WINDOWS' in spec
     assert '".env.example"' in spec
-    installer = (root / 'packaging/windows/CallPilot.iss').read_text(encoding='utf-8')
-    assert 'PrivilegesRequired=lowest' in installer
-    assert '--shutdown' in installer
-    assert '[UninstallDelete]' not in installer
+    assert not (root / 'packaging/windows/CallPilot.iss').exists(), '绿色版不应再发安装器'
+    assert not (root / 'scripts/windows/test_installer.ps1').exists(), '安装器冒烟脚本应已移除'
+    assert (root / 'scripts/windows/test_portable.ps1').is_file()
+    workflow = (root / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+    assert 'ISCC' not in workflow
+    assert 'setup.exe' not in workflow
+    assert 'test_portable.ps1' in workflow
+
+
+def test_portable_readonly_runtime_exits_without_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime.config, '_is_frozen', lambda: True)
+    monkeypatch.setattr(runtime.config, 'is_portable_mode', lambda: True)
+    monkeypatch.setattr(runtime.config, 'app_support_dir', lambda: tmp_path / 'data-root')
+    monkeypatch.setattr(runtime.config, 'ensure_dir_writable',
+                        Mock(side_effect=runtime.config.DataRootNotWritable('read-only')))
+    monkeypatch.setattr(runtime, '_report_portable_error', Mock())
+    monkeypatch.setattr('sys.argv', ['CallPilot', '--service'])
+
+    with pytest.raises(SystemExit) as exc:
+        runtime.main()
+    assert exc.value.code == 1
+    assert not (tmp_path / 'data-root').exists()
