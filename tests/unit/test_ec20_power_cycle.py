@@ -1,7 +1,6 @@
 """桥恢复提示：只用 USB 替身，不打开真实 PTY 或串口。"""
 
 import sys
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,10 +33,8 @@ class Stop:
 @pytest.fixture(autouse=True)
 def isolate_bridge(monkeypatch, tmp_path):
     hardware = bridge.modem_hardware
-    request = str(tmp_path / "request")
-    monkeypatch.setattr(hardware, "PRESETS", tuple(
-        replace(p, recovery_request_path=request) if p.recovery_request_path else p for p in hardware.PRESETS
-    ))
+    monkeypatch.setattr(hardware, "recovery_request_path", lambda: tmp_path / "request")
+    monkeypatch.setattr(hardware, "LEGACY_RECOVERY_REQUEST_PATH", str(tmp_path / "legacy-request"))
     monkeypatch.setattr(bridge, "acquire_instance_lock", lambda: object())
     monkeypatch.setattr(bridge.signal, "signal", lambda *args: None)
 

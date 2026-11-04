@@ -2028,9 +2028,10 @@ class Sim7600Modem(SerialModem):
     # 来电常在第二次 CPCMREG 才就绪，不能套用外呼「一次即成」的健康阈值，
     # 否则每通正常来电后都会误触发约 100 秒组合切换自愈。第三次起才判劣化。
     _DEGRADED_ENABLE_ATTEMPTS = 3
-    # 通话结束后写这个哨兵文件，由 USB 桥进程读到后执行组合切换自愈（WIL-109）。
-    # 只报告不自己动手：桥才是 USB 设备的持有者。
-    RECOVERY_REQUEST_PATH = modem_hardware.RECOVERY_REQUEST_PATH
+    # 通话结束后写哨兵文件，由 USB 桥进程读到后执行组合切换自愈（WIL-109）；
+    # Windows/无桥平台改由 ``_on_self_heal`` 在服务内执行 CFUN 自愈。
+    # 测试替身可覆写为固定路径；生产为 None 时回落到跨平台数据目录。
+    RECOVERY_REQUEST_PATH: str | None = None
 
     # 刚接通瞬间 CPCMREG=1 偶发未就绪（真机实测：同样接通，有时首发 OK、有时 ERROR）。
     # 音频桥一旦 start() 就持续往 iface4 写 PCM，若此刻 CPCMREG 未生效、模组不排空该
@@ -2053,6 +2054,7 @@ class Sim7600Modem(SerialModem):
         self._reset_access = threading.local()
         self._on_post_call_reset: Callable[[], None] | None = None
         self._on_network_failure: Callable[[], None] | None = None
+        self._on_self_heal: Callable[[str], object] | None = None
         self._answer_greeting_route_ready = False
 
     @property
@@ -2087,6 +2089,10 @@ class Sim7600Modem(SerialModem):
 
     def on_post_call_reset(self, callback: Callable[[], None]) -> None:
         self._on_post_call_reset = callback
+
+    def on_self_heal(self, callback: Callable[[str], object]) -> None:
+        """注册服务内自愈入口；无桥平台由服务在空闲时执行 CFUN 恢复。"""
+        self._on_self_heal = callback
 
     def _arm_voice_call(self) -> None:
         if self._reset_in_progress:
@@ -2336,9 +2342,10 @@ class Sim7600Modem(SerialModem):
         self._request_recovery_if_degraded()
 
     def _request_recovery_if_degraded(self) -> None:
-        """通话结束时，若本通判定过劣化就写哨兵文件请求桥执行自愈。
+        """通话结束时，若本通判定过劣化就请求自愈。
 
-        写文件而非直接动手：USB 设备由桥进程持有，组合切换必须由它来做。
+        有服务内自愈入口（Windows/无桥）且开关打开时交服务在空闲时执行；
+        否则写哨兵文件，由 USB 桥进程读到后执行组合切换（WIL-109，macOS）。
         写失败不致命（下通若仍劣化会再写），绝不因此影响挂断流程。
         """
         if not self._pcm_degraded:
@@ -2349,11 +2356,21 @@ class Sim7600Modem(SerialModem):
             # hangup 随后取得 CRESET 所有权；不能同时让桥拆掉它正在使用的 AT 口。
             logger.info("PCM 劣化由通话后 CRESET 接管，不并发请求 USB 组合恢复")
             return
+        if self._on_self_heal is not None and config.get_bool("MODEM_SELF_HEAL_ENABLED"):
+            logger.info("PCM 劣化交由服务内自愈（线路空闲时执行）")
+            self._on_self_heal("pcm_degraded")
+            return
         try:
-            Path(self.RECOVERY_REQUEST_PATH).write_text(
-                f"degraded at {time.time():.0f}\n", encoding="utf-8"
-            )
-            logger.warning("已请求 USB 桥执行 PCM 自愈: %s", self.RECOVERY_REQUEST_PATH)
+            if self.RECOVERY_REQUEST_PATH:
+                request = Path(self.RECOVERY_REQUEST_PATH)
+                request.parent.mkdir(parents=True, exist_ok=True)
+                request.write_text(f"degraded at {time.time():.0f}\n", encoding="utf-8")
+                logger.warning("已请求 USB 桥执行 PCM 自愈: %s", request)
+            else:
+                modem_hardware.write_recovery_request("degraded")
+                logger.warning(
+                    "已请求 USB 桥执行 PCM 自愈: %s", modem_hardware.recovery_request_path()
+                )
         except OSError as exc:
             logger.warning("写恢复请求失败（不影响挂断）: %s", exc)
 

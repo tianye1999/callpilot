@@ -816,9 +816,9 @@ def run_auto(stop: threading.Event, *, once: bool = False, poll_seconds: float =
         if first_selection:
             failures = 0
         selected_vendor = preset.vendor
-        request = Path(preset.recovery_request_path) if preset.recovery_request_path else None
+        request = modem_hardware.recovery_request_path() if preset.recovery_request else None
         if request is not None:
-            request.unlink(missing_ok=True)
+            modem_hardware.clear_recovery_request()
         last_write = 0.0
 
         def heartbeat() -> None:
@@ -923,6 +923,7 @@ def main(
     )
     if recovery_request is not None:
         recovery_request.unlink(missing_ok=True)  # 启动时清掉陈旧请求
+        Path(modem_hardware.LEGACY_RECOVERY_REQUEST_PATH).unlink(missing_ok=True)
 
     # 未显式给 --map 时用厂商默认映射（Quectel 默认为空，仍要求显式 --map）。
     if not args.map and default_maps:

@@ -21,8 +21,43 @@ SIM7600_VID = 0x1E0E
 SIM7600_PID = 0x9001
 SIM7600_ALT_PID = 0x9011
 SIM7600_MAPS = ["2:/tmp/sim7600-at", "4:/tmp/sim7600-pcm"]
-RECOVERY_REQUEST_PATH = "/tmp/sim7600-recover-request"
+LEGACY_RECOVERY_REQUEST_PATH = "/tmp/sim7600-recover-request"
 STATE_PATH = Path("/tmp/callpilot-modem.json")
+
+
+def recovery_request_path() -> Path:
+    """App 与 USB 桥共用的自愈哨兵路径；跨平台（旧值仅 POSIX /tmp 可写）。
+
+    写方（modem._request_recovery_if_degraded）与消费方（ec20_usb_pty 桥）
+    都必须经此函数解析，不得各自硬编码：冻结版 macOS 用 ``AGENTCALL_DATA_DIR``
+    指向同一个数据目录，开发版靠双方相同的 ``WorkingDirectory`` 落在同一
+    ``data/`` 下。旧 ``/tmp/sim7600-recover-request`` 保留为迁移兼容，
+    桥启动时清掉陈旧哨兵。
+    """
+    return config.data_dir() / "sim7600-recover-request"
+
+
+def write_recovery_request(reason: str) -> Path:
+    """原子写入自愈请求哨兵；父目录不存在时创建，保证 Windows 数据目录可用。"""
+    path = recovery_request_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".sim7600-recover-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(f"{reason} at {time.time():.0f}\n")
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+    return path
+
+
+def clear_recovery_request() -> None:
+    """消费/清理新旧两代自愈哨兵；桥启动时调用，避免陈旧请求反复触发。"""
+    for candidate in (recovery_request_path(), Path(LEGACY_RECOVERY_REQUEST_PATH)):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("清自愈哨兵失败: %s", candidate)
 NEEDS_POWER_CYCLE_PATH = Path("/tmp/callpilot-modem-needs-power-cycle")
 STATE_MAX_AGE = 15.0
 # 服务初始化识别与 meta 观测扫描互斥，不能同时枚举同一设备。
@@ -42,7 +77,7 @@ class ModemPreset:
     audio_mode: str
     reset_on_start: bool = False  # 仅控制首次启动；快速失败恢复由桥入口单独决定
     recover_alt_pid: int | None = None
-    recovery_request_path: str | None = None
+    recovery_request: bool = False
     serial_at_pattern: str = r"\bAT\b"
     serial_pcm_pattern: str | None = None
 
@@ -62,7 +97,7 @@ PRESETS = (
     ModemPreset("simcom", "SIM7600", SIM7600_VID, SIM7600_PID, tuple(SIM7600_MAPS),
                 SIM7600_MAPS[0].split(":", 1)[1], SIM7600_MAPS[1].split(":", 1)[1],
                 # 启动复位会导致首通 PCM 数据面起不来，默认仅快速失败后复位。
-                "nmea", False, SIM7600_ALT_PID, RECOVERY_REQUEST_PATH,
+                "nmea", False, SIM7600_ALT_PID, True,
                 serial_pcm_pattern=r"\b(?:Audio|PCM)\b"),
 )
 

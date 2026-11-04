@@ -102,8 +102,10 @@ def test_stats_five_second_active_summary_and_ten_second_ring(monkeypatch, caplo
 def test_auto_sim7600_startup_reset_mode(monkeypatch, tmp_path, caplog, setting, reset):
     from dataclasses import replace
 
-    preset = replace(bridge.modem_hardware.PRESETS[1], recovery_request_path=str(tmp_path / "request"))
+    preset = replace(bridge.modem_hardware.PRESETS[1], recovery_request=True)
     monkeypatch.setattr(bridge.modem_hardware, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(bridge.modem_hardware, "recovery_request_path", lambda: tmp_path / "request")
+    monkeypatch.setattr(bridge.modem_hardware, "LEGACY_RECOVERY_REQUEST_PATH", str(tmp_path / "legacy-request"))
     monkeypatch.delenv("CALLPILOT_BRIDGE_RESET_ON_START", raising=False)
     if setting is not None:
         monkeypatch.setenv("CALLPILOT_BRIDGE_RESET_ON_START", setting)
@@ -128,10 +130,10 @@ def test_bridge_entry_reset_policy_on_start_fast_failure_and_normal_reconnect(
     from scripts import sim7600_usb_pty
 
     sim7600 = entry.endswith("sim7600")
-    preset = replace(bridge.modem_hardware.PRESETS[int(sim7600)],
-                     recovery_request_path=str(tmp_path / "request") if sim7600 else None)
+    preset = replace(bridge.modem_hardware.PRESETS[int(sim7600)], recovery_request=sim7600)
     assert preset.reset_on_start is False
-    monkeypatch.setattr(sim7600_usb_pty, "RECOVERY_REQUEST_PATH", str(tmp_path / "request"))
+    monkeypatch.setattr(sim7600_usb_pty, "recovery_request_path", lambda: tmp_path / "request")
+    monkeypatch.setattr(bridge.modem_hardware, "LEGACY_RECOVERY_REQUEST_PATH", str(tmp_path / "legacy-request"))
     if setting is not None:
         monkeypatch.setenv("CALLPILOT_BRIDGE_RESET_ON_START", setting)
     monkeypatch.setattr(bridge, "find_auto_device", lambda: (object(), preset))

@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from queue import Empty, Full, Queue
 from typing import Any, Awaitable, Callable
 
-from . import call_playbooks, config, modem_hardware, platforms
+from . import call_playbooks, config, modem_hardware, platforms, port_detect
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.local_agent import LocalPipelineAgent
@@ -81,6 +81,7 @@ from .result_verification import (
     select_task_relevant_evidence,
 )
 from .sim7600_reset import Sim7600CallReset
+from .sim7600_self_heal import Sim7600SelfHeal
 from .sim_identity import SimIdentity
 from .sms_email_forwarder import SmsEmailForwarder
 from .summarizer import judge_wrap_up, summarize_call
@@ -5792,6 +5793,7 @@ class CallAgentService:
         self._service_running = False
         self._supervisor_thread: threading.Thread | None = None
         self._sim7600_reset: Sim7600CallReset | None = None
+        self._sim7600_self_heal: Sim7600SelfHeal | None = None
         self._reset_queue_pending = False
         self.sms_email_forwarder = (
             sms_email_forwarder if sms_email_forwarder is not None else SmsEmailForwarder()
@@ -5835,6 +5837,16 @@ class CallAgentService:
             self._sim7600_reset = Sim7600CallReset(
                 self.modem, audio_mode, pcm_port, self._set_modem_connected,
             )
+        if isinstance(self.modem, Sim7600Modem) and config.get_bool("MODEM_SELF_HEAL_ENABLED"):
+            self._sim7600_self_heal = Sim7600SelfHeal(
+                self.modem,
+                audio_mode,
+                pcm_port,
+                self._detect_sim7600_ports,
+                self._close_sim7600_pcm,
+                self._on_sim7600_self_heal_result,
+            )
+            self.modem.on_self_heal(self._sim7600_self_heal.request)
 
     @staticmethod
     def _create_monitor() -> MonitorPlayback | None:
@@ -5876,6 +5888,23 @@ class CallAgentService:
             if not hold or not succeeded:
                 with self._ring_lock:
                     self._hardware_maintenance = False
+
+    def _detect_sim7600_ports(self) -> tuple[str | None, str | None]:
+        """自愈时重新探测 SIM7600 的 AT/PCM 串口；按 VID/PID 与描述识别，不猜 COM 序号。"""
+        return port_detect.detect_serial_ports("simcom")
+
+    def _close_sim7600_pcm(self) -> None:
+        """关闭尚未随挂断释放的 PCM 数据口；空闲时通常已由会话停掉，这里兜底。"""
+        bridge = self.session._hangup_bridge
+        if isinstance(bridge, SerialPcmAudioBridge):
+            bridge.stop()
+
+    def _on_sim7600_self_heal_result(self, result: dict) -> None:
+        """记录服务内自愈结果；连接状态经 modem 的连接回调统一广播。"""
+        if result.get("ok"):
+            logger.info("SIM7600 服务内自愈完成")
+        else:
+            logger.warning("SIM7600 服务内自愈未完成，交回看门狗: error=%s", result.get("error"))
 
     def check_modem_vendor(self, restart: Callable[[], None]) -> bool:
         if not self._auto_modem:
@@ -6168,7 +6197,9 @@ class CallAgentService:
             return False, message
         self._remember_outbound_task(task)
         with self._ring_lock:
-            if self._hardware_maintenance or getattr(self.modem, "recovery_in_progress", False):
+            if getattr(self.modem, "recovery_in_progress", False):
+                return False, "模组恢复中，请稍后再拨"
+            if self._hardware_maintenance:
                 return False, "模组维护中，请稍后再拨"
             if self._sim7600_reset is not None:
                 guard_failure = self._dial_guard(number)
@@ -6626,7 +6657,9 @@ class CallAgentService:
         return None
 
     def _dial_guard(self, number: str | None) -> DialGuardFailure | None:
-        if self._hardware_maintenance or getattr(self.modem, "recovery_in_progress", False):
+        if getattr(self.modem, "recovery_in_progress", False):
+            return DialGuardFailure("MODEM_OFFLINE", "模组恢复中，请稍后再拨")
+        if self._hardware_maintenance:
             return DialGuardFailure("MODEM_OFFLINE", "模组维护中，请稍后再拨")
         if isinstance(self.modem, BluetoothModem) and not self.modem.is_connected():
             return DialGuardFailure("MODEM_OFFLINE", "手机未连接，请检查手机蓝牙与 HFP 连接")
@@ -6896,6 +6929,8 @@ class CallAgentService:
         self._service_running = False
         if self._sim7600_reset is not None:
             self._sim7600_reset.stop()
+        if self._sim7600_self_heal is not None:
+            self._sim7600_self_heal.stop()
         worker = self._remote_worker
         if worker is not None:
             worker.stop("service_shutdown")

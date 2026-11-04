@@ -12,14 +12,9 @@ from scripts import ec20_usb_pty
 @pytest.fixture(autouse=True)
 def isolate_recovery_request(monkeypatch, tmp_path):
     """自动识别测试不能清除真实桥正在等待的恢复哨兵。"""
-    from dataclasses import replace
-
     hardware = ec20_usb_pty.modem_hardware
-    request = str(tmp_path / "recover-request")
-    monkeypatch.setattr(hardware, "RECOVERY_REQUEST_PATH", request)
-    monkeypatch.setattr(hardware, "PRESETS", tuple(
-        replace(p, recovery_request_path=request) if p.recovery_request_path else p for p in hardware.PRESETS
-    ))
+    monkeypatch.setattr(hardware, "recovery_request_path", lambda: tmp_path / "recover-request")
+    monkeypatch.setattr(hardware, "LEGACY_RECOVERY_REQUEST_PATH", str(tmp_path / "legacy-recover-request"))
 
 
 def _flush_rescue_pty(fd):
@@ -351,7 +346,7 @@ def test_auto_bridge_reselects_after_unplug(monkeypatch, tmp_path):
         seen.append(hardware.read_state()["vendor"])
         if len(seen) == 2:
             assert kwargs["reset_first"] is False
-            assert str(kwargs["recovery_request"]) == hardware.RECOVERY_REQUEST_PATH
+            assert str(kwargs["recovery_request"]) == str(hardware.recovery_request_path())
             stop.set()
         return False
     monkeypatch.setattr(ec20_usb_pty, "run_bridges_once", bridge)

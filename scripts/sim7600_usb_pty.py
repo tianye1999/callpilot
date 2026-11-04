@@ -34,10 +34,10 @@ if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from agentcall.modem_hardware import (  # noqa: E402
-    RECOVERY_REQUEST_PATH,
     SIM7600_ALT_PID,
     SIM7600_PID,
     SIM7600_VID,
+    recovery_request_path,
 )
 from agentcall.modem_hardware import (  # noqa: E402
     SIM7600_MAPS as DEFAULT_MAPS,
@@ -57,7 +57,7 @@ def main() -> int:
         # CRESET/CFUN 均无效，见 WIL-109）。免去人工物理拔插。
         recover_alt_pid=SIM7600_ALT_PID,
         # app 侧检测到劣化后写此文件请求自愈（覆盖「收数据但播放卡」形态）。
-        recovery_request_path=RECOVERY_REQUEST_PATH,
+        recovery_request_path=str(recovery_request_path()),
     )
 
 
