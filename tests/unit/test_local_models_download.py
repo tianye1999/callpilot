@@ -172,7 +172,7 @@ def test_ensure_asset_empty_mirror_uses_origin_only(tmp_path, monkeypatch):
 
 
 def test_mirror_partial_connection_error_does_not_fallback(tmp_path, monkeypatch):
-    """镜像已收到字节后断线：不回退，保留 .part 供下次从镜像续传。"""
+    """镜像已收到字节后断线：不回退，同一源自动续传重试，连续零进展后原样抛出。"""
     asset = _mirror_asset()
     dest = tmp_path / "model.bin"
     part = dest.with_name(dest.name + ".part")
@@ -185,10 +185,109 @@ def test_mirror_partial_connection_error_does_not_fallback(tmp_path, monkeypatch
         raise urllib.error.URLError("mirror reset")
 
     monkeypatch.setattr(local_models, "_download", fake_download)
+    monkeypatch.setattr(local_models, "_wait_before_retry", lambda delay, cancel, url: None)
     with pytest.raises(urllib.error.URLError, match="mirror reset"):
         local_models.ensure_asset(asset, tmp_path)
-    assert calls == [_mirror_for(asset)]
+    assert calls == [_mirror_for(asset)] * 4
     assert part.read_bytes() == b"mirror-partial"
+
+
+def test_resume_retry_succeeds_after_one_interruption(tmp_path, monkeypatch):
+    """中途断线一次后在同一源自动续传成功。"""
+    asset = _mirror_asset()
+    dest = tmp_path / "model.bin"
+    part = dest.with_name(dest.name + ".part")
+    sources = local_models.download_sources(asset)
+    calls = []
+    waits = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            part.write_bytes(b"half")
+            raise urllib.error.URLError("read timed out")
+        part.unlink(missing_ok=True)
+        dest.write_bytes(b"half-whole")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    monkeypatch.setattr(local_models, "_wait_before_retry",
+                        lambda delay, cancel, url: waits.append(delay))
+
+    local_models._download_from_sources(sources, dest)
+
+    assert calls == [sources[0][1]] * 2
+    assert waits == [1.0]
+    assert dest.read_bytes() == b"half-whole"
+    assert not part.exists()
+
+
+def test_resume_retry_raises_after_three_zero_progress_and_keeps_part(tmp_path, monkeypatch):
+    """连续 3 次零进展后放弃并原样抛出，保留 .part。"""
+    asset = _mirror_asset()
+    dest = tmp_path / "model.bin"
+    part = dest.with_name(dest.name + ".part")
+    sources = local_models.download_sources(asset)
+    calls = []
+    waits = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        part.write_bytes(b"partial")
+        raise urllib.error.URLError("read timed out")
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    monkeypatch.setattr(local_models, "_wait_before_retry",
+                        lambda delay, cancel, url: waits.append(delay))
+
+    with pytest.raises(urllib.error.URLError, match="read timed out"):
+        local_models._download_from_sources(sources, dest)
+
+    assert calls == [sources[0][1]] * 4
+    assert waits == [1.0, 2.0, 4.0]
+    assert part.read_bytes() == b"partial"
+
+
+def test_resume_retry_resets_budget_on_progress(tmp_path, monkeypatch):
+    """有进展时重置零进展计数：断 5 次但每次都有进展最终成功。"""
+    asset = _mirror_asset()
+    dest = tmp_path / "model.bin"
+    part = dest.with_name(dest.name + ".part")
+    sources = local_models.download_sources(asset)
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        if len(calls) <= 5:
+            part.write_bytes(b"x" * len(calls))
+            raise urllib.error.URLError("read timed out")
+        part.unlink(missing_ok=True)
+        dest.write_bytes(b"x" * len(calls))
+
+    monkeypatch.setattr(local_models, "_download", fake_download)
+    monkeypatch.setattr(local_models, "_wait_before_retry", lambda delay, cancel, url: None)
+
+    local_models._download_from_sources(sources, dest)
+
+    assert len(calls) == 6
+    assert dest.read_bytes() == b"x" * 6
+    assert not part.exists()
+
+
+def test_wait_before_retry_cancels_immediately():
+    """等待期间 cancel 触发：立即抛 DownloadCancelled，不睡满整个超时。"""
+    cancel = threading.Event()
+
+    def set_cancel() -> None:
+        time.sleep(0.02)
+        cancel.set()
+
+    thread = threading.Thread(target=set_cancel, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    with pytest.raises(local_models.DownloadCancelled):
+        local_models._wait_before_retry(60.0, cancel, "https://example.com/x.bin")
+    assert time.monotonic() - started < 1.0
+    thread.join(5)
 
 
 def test_mirror_zero_byte_connection_error_falls_back(tmp_path, monkeypatch):

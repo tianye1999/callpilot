@@ -25,6 +25,7 @@ import os
 import sys
 import tarfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -400,6 +401,19 @@ def _partial_size(dest: Path) -> int:
     return partial.stat().st_size if partial.is_file() else 0
 
 
+_MAX_RESUME_RETRIES = 3
+_RESUME_RETRY_BACKOFFS = (1.0, 2.0, 4.0)
+
+
+def _wait_before_retry(delay: float, cancel: threading.Event | None, url: str) -> None:
+    """自动续传重试前的等待；cancel 触发时立即抛出 DownloadCancelled。"""
+    if cancel is not None:
+        if cancel.wait(delay):
+            raise DownloadCancelled(url)
+    else:
+        time.sleep(delay)
+
+
 def _download_from_sources(
     sources: tuple[tuple[str, str], ...],
     dest: Path,
@@ -413,7 +427,8 @@ def _download_from_sources(
     """依次尝试候选源；镜像缺文件/零字节连接失败/校验失败时回退原地址。
 
     镜像与原地址内容相同，回退保留 ``.part`` 由原地址 Range 续传；校验失败时
-    ``_download`` 已删除 ``.part``，原地址从头下载。
+    ``_download`` 已删除 ``.part``，原地址从头下载。已收到字节后的连接类错误
+    在同一源上做有限次自动续传重试，连续零进展才放弃并原样抛出。
     """
     for index, (label, url) in enumerate(sources):
         if report_source is not None:
@@ -431,17 +446,56 @@ def _download_from_sources(
                         _readable_error(exc), url, sources[index + 1][1])
             continue
         except Exception as exc:  # noqa: BLE001
-            if index == len(sources) - 1:
-                raise
             if _http_miss(exc):
+                if index == len(sources) - 1:
+                    raise
                 logger.info("镜像缺少文件（%s），回退原地址: %s -> %s",
                             _readable_error(exc), url, sources[index + 1][1])
                 continue
-            if _connection_error(exc) and _partial_size(dest) == before:
+            if not _connection_error(exc):
+                raise
+            if _partial_size(dest) == before:
+                if index == len(sources) - 1:
+                    raise
                 logger.info("镜像连接失败且未收到字节（%s），回退原地址: %s -> %s",
                             _readable_error(exc), url, sources[index + 1][1])
                 continue
-            raise
+            zero_streak = 0
+            attempt = 0
+            while True:
+                attempt += 1
+                logger.info("%s 下载中断（%s），已下 %s 字节，第 %s 次续传重试: %s",
+                            label, _readable_error(exc), _partial_size(dest), attempt, url)
+                _wait_before_retry(_RESUME_RETRY_BACKOFFS[zero_streak], cancel, url)
+                before_retry = _partial_size(dest)
+                try:
+                    _download(url, dest, size=size, sha256=sha256, progress=progress,
+                              cancel=cancel)
+                    return
+                except DownloadCancelled:
+                    raise
+                except DownloadVerifyError as verify_exc:
+                    if index == len(sources) - 1:
+                        raise
+                    logger.info("镜像校验失败（%s），回退原地址从头下载: %s -> %s",
+                                _readable_error(verify_exc), url, sources[index + 1][1])
+                    break
+                except Exception as retry_exc:  # noqa: BLE001
+                    if _http_miss(retry_exc):
+                        if index == len(sources) - 1:
+                            raise
+                        logger.info("镜像缺少文件（%s），回退原地址: %s -> %s",
+                                    _readable_error(retry_exc), url, sources[index + 1][1])
+                        break
+                    if not _connection_error(retry_exc):
+                        raise
+                    exc = retry_exc
+                    if _partial_size(dest) > before_retry:
+                        zero_streak = 0
+                    else:
+                        zero_streak += 1
+                        if zero_streak >= _MAX_RESUME_RETRIES:
+                            raise exc
 
 
 def ensure_asset(
