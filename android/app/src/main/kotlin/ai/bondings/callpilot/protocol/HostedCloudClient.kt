@@ -1,5 +1,7 @@
 package ai.bondings.callpilot.protocol
 
+import ai.bondings.callpilot.call.OutboundTiming
+
 import java.io.IOException
 import java.net.URI
 import java.util.UUID
@@ -178,6 +180,7 @@ class HostedCloudClient(
         edgeId: String,
         sdpOffer: String,
         idempotencyKey: String = "android-${UUID.randomUUID()}",
+        outboundTiming: OutboundTiming? = null,
     ): OutboundCall {
         require(EDGE_ID.matches(edgeId)) { "云配对缺少有效的 Edge ID" }
         require(IDEMPOTENCY_KEY.matches(idempotencyKey)) { "idempotency key 格式不合法" }
@@ -188,7 +191,7 @@ class HostedCloudClient(
             put("mediaTransport", "webrtc")
             put("sdpOffer", sdpOffer)
         }.toString()
-        val created = createCallWithRetry(body, edgeId)
+        val created = createCallWithRetry(body, edgeId, outboundTiming)
         val call = created.call
         val payload = created.payload
         val code = created.statusCode
@@ -622,11 +625,19 @@ class HostedCloudClient(
 
     private class CreatedCall(val call: HostedCallResponse, val payload: JsonObject, val statusCode: Int)
 
-    private fun createCallWithRetry(body: String, edgeId: String): CreatedCall {
+    private fun createCallWithRetry(body: String, edgeId: String, timing: OutboundTiming? = null): CreatedCall {
+        // newBuilder shares the existing pool/dispatcher; diagnostics must not force a new TLS connection.
+        val http = if (timing == null) client else client.newBuilder().eventListener(OutboundHttpTiming(timing)).build()
         repeat(2) { attempt ->
             try {
-                return request("POST", "v1/calls", body).use { response ->
-                    val payload = parseOrThrow(response)
+                timing?.postAttempt()
+                timing?.mark(OutboundTiming.Mark.POST_START)
+                return request("POST", "v1/calls", body, http = http).use { response ->
+                    val payload = try {
+                        parseOrThrow(response)
+                    } finally {
+                        timing?.mark(OutboundTiming.Mark.RESPONSE)
+                    }
                     val call = decodeCall(payload, response.code).also {
                         validateCall(it, expectedEdgeId = edgeId, statusCode = response.code)
                     }

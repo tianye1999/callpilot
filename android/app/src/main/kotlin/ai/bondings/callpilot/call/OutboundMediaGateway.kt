@@ -61,6 +61,7 @@ object OutboundIcePrefetch { val cache = OutboundIceCache() }
 
 /** A8：外呼直连的中转接口（TURN / 带 offer 建呼叫 / 轮询 / 回落），抽成接口便于状态机单测。 */
 interface OutboundMediaGateway {
+    fun observeOutboundTiming(timing: OutboundTiming) = Unit
     suspend fun iceServers(edgeId: String): List<IceServer>
     suspend fun create(edgeId: String, idempotencyKey: String, sdpOffer: String): OutboundCall
     suspend fun awaitSession(edgeId: String, call: OutboundCall): HostedCallSession
@@ -71,6 +72,8 @@ class HostedOutboundMediaGateway(
     private val pairing: StoredPairing,
     private val io: CoroutineDispatcher = Dispatchers.IO,
 ) : OutboundMediaGateway {
+    private var outboundTiming: OutboundTiming? = null
+    override fun observeOutboundTiming(timing: OutboundTiming) { outboundTiming = timing }
     private fun client(): HostedCloudClient =
         HostedCloudClient(pairing.gatewayUrl).also { it.credential = pairing.credential }
 
@@ -78,7 +81,7 @@ class HostedOutboundMediaGateway(
         OutboundIcePrefetch.cache.get(pairing) { withContext(io) { client().outboundIceCredentials(edgeId) } }
 
     override suspend fun create(edgeId: String, idempotencyKey: String, sdpOffer: String): OutboundCall =
-        withContext(io) { client().createDirectCall(edgeId, sdpOffer, idempotencyKey) }
+        withContext(io) { client().createDirectCall(edgeId, sdpOffer, idempotencyKey, outboundTiming) }
 
     override suspend fun awaitSession(edgeId: String, call: OutboundCall): HostedCallSession =
         withContext(io) { client().awaitCallSession(edgeId, call) }

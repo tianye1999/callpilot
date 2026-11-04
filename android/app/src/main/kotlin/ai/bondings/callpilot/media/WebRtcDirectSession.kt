@@ -3,6 +3,8 @@ package ai.bondings.callpilot.media
 import ai.bondings.callpilot.protocol.IceServer
 import ai.bondings.callpilot.protocol.Signaling
 import ai.bondings.callpilot.protocol.Topics
+import ai.bondings.callpilot.call.OutboundTiming
+import ai.bondings.callpilot.call.OutboundTiming.Mark
 import android.content.Context
 import android.media.AudioManager
 import android.util.Log
@@ -85,6 +87,10 @@ class WebRtcDirectSession(
     @Volatile
     private var closed = false
 
+    @Volatile private var outboundTiming: OutboundTiming? = null
+
+    override fun observeOutboundTiming(timing: OutboundTiming) { outboundTiming = timing }
+
     private val _events = MutableSharedFlow<SessionEvent>(extraBufferCapacity = 32)
     override val events: SharedFlow<SessionEvent> = _events
 
@@ -94,6 +100,7 @@ class WebRtcDirectSession(
         override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
         override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
             if (state == PeerConnection.IceGatheringState.COMPLETE) {
+                outboundTiming?.mark(Mark.ICE_COMPLETE)
                 gathered.complete(Unit)
                 gatherComplete.complete(Unit)
             }
@@ -101,7 +108,10 @@ class WebRtcDirectSession(
 
         override fun onIceCandidate(candidate: IceCandidate?) {
             // 与 iOS 一致：拿到第一个 relay 候选就可以发 offer，不等完整收集。
-            if (candidate?.sdp?.contains(" typ relay") == true) gathered.complete(Unit)
+            if (candidate?.sdp?.contains(" typ relay") == true) {
+                outboundTiming?.mark(Mark.RELAY_SEEN)
+                gathered.complete(Unit)
+            }
         }
 
         override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) = Unit
@@ -150,6 +160,7 @@ class WebRtcDirectSession(
     override suspend fun prepareDirect(iceServers: List<IceServer>): String = withContext(native) {
         val pc = run {
             check(!closed && peer == null) { "direct session already used" }
+            outboundTiming?.mark(Mark.FACTORY_START)
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(appContext).createInitializationOptions(),
             )
@@ -158,8 +169,10 @@ class WebRtcDirectSession(
                 .setUseHardwareNoiseSuppressor(true)
                 .createAudioDeviceModule()
             audioModule = module
+            outboundTiming?.mark(Mark.ADM)
             val f = PeerConnectionFactory.builder().setAudioDeviceModule(module).createPeerConnectionFactory()
             factory = f
+            outboundTiming?.mark(Mark.FACTORY)
             val config = PeerConnection.RTCConfiguration(
                 iceServers.map { server ->
                     PeerConnection.IceServer.builder(server.urls).apply {
@@ -180,13 +193,16 @@ class WebRtcDirectSession(
             val dc = created.createDataChannel(Topics.CONTROL, DataChannel.Init()) ?: error("data channel unavailable")
             dc.registerObserver(channelObserver)
             channel = dc
+            outboundTiming?.mark(Mark.PEER_READY)
             created
         }
         val deadline = System.nanoTime() + GATHER_TIMEOUT_MS * 1_000_000
         fun remainingMs() = ((deadline - System.nanoTime()) / 1_000_000).coerceAtLeast(1)
         val offer = pc.awaitCreateOffer()
+        outboundTiming?.mark(Mark.OFFER_CREATED)
         ensureOpen()
         pc.awaitSetLocalDescription(offer)
+        outboundTiming?.mark(Mark.LOCAL_SET)
         ensureOpen()
         // 与 iOS 一致：第一个 relay 候选或收集完成即可；候选回调可能早于 localDescription 更新，
         // 这时在同一预算内继续等收集完成，绝不发一份没有候选的 SDP。
@@ -195,7 +211,14 @@ class WebRtcDirectSession(
         if (pc.localDescription?.description?.contains(" typ relay") != true &&
             pc.iceGatheringState() != PeerConnection.IceGatheringState.COMPLETE
         ) {
-            withTimeoutOrNull(remainingMs()) { gatherComplete.await() }
+            awaitRelayPublication(
+                gatherComplete,
+                { ensureOpen(); pc.localDescription?.description?.contains(" typ relay") == true },
+                { ensureOpen(); pc.iceGatheringState() == PeerConnection.IceGatheringState.COMPLETE },
+                ::remainingMs,
+                // This experiment is outbound-only; inbound preparation is unchanged.
+                enabled = outboundTiming != null && DirectSetupExperiments.POLL_PUBLISHED_RELAY,
+            )
         }
         ensureOpen()
         val local = pc.localDescription?.description ?: error("no local description")
@@ -203,6 +226,7 @@ class WebRtcDirectSession(
             error("ICE gathering produced no relay candidate")
         }
         check(local.toByteArray().size <= MAX_SDP_BYTES) { "local SDP too large" }
+        outboundTiming?.mark(Mark.GATHER_DONE)
         local
     }
 

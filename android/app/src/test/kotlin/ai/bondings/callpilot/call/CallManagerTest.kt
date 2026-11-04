@@ -227,6 +227,7 @@ class CallManagerTest {
         val dispatcher = StandardTestDispatcher(testScope.testScheduler)
         val scope = CoroutineScope(SupervisorJob() + dispatcher)
         val foreground = mutableListOf<Boolean>()
+        val outboundLogs = mutableListOf<String>()
 
         fun manager(
             session: RemoteSession,
@@ -265,6 +266,7 @@ class CallManagerTest {
             mediaGatewayFactory = gatewayFactory,
             outboundGatewayFactory = { outboundGateway ?: error("outbound gateway should not be used") },
             outboundDirectProvider = outboundDirectProvider,
+            outboundTimingLog = { outboundLogs += it },
             clockMs = clockMs,
             timingClockMs = timingClockMs,
         )
@@ -1383,6 +1385,10 @@ class CallManagerTest {
         assertEquals("v=0\r\nfake-offer typ relay", gateway.offer)
         assertEquals("v=0\r\nedge-answer", direct.answer)
         assertEquals(CallState.WaitingMedia("10086"), manager.state.value)
+        assertEquals(1, h.outboundLogs.size)
+        assertTrue(h.outboundLogs.single().startsWith("outbound_timing tap=0 "))
+        assertFalse(h.outboundLogs.single().contains("10086"))
+        assertFalse(h.outboundLogs.single().contains("fake-offer"))
         direct.emit(SessionEvent.Edge(Signaling.Event.Status("media_ready")))
         runCurrent()
         assertTrue(direct.commands.single().contains("10086"))

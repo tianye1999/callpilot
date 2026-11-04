@@ -26,6 +26,8 @@ interface RemoteSession {
 
 /** 支持直连的会话：先 TURN 建对等连接产出 offer，再用 Edge 的 answer 连通；失败后 `connect()` 回落 LiveKit。 */
 interface DirectCapableSession : RemoteSession {
+    fun observeOutboundTiming(timing: ai.bondings.callpilot.call.OutboundTiming) = Unit
+
     /** 建对等连接与控制数据通道，返回含 relay 候选的本地 SDP（不超过 16 KiB）。 */
     suspend fun prepareDirect(iceServers: List<IceServer>): String
 

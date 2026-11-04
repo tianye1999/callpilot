@@ -19,6 +19,29 @@ import org.junit.Before
 import org.junit.Test
 
 class HostedCloudClientTest {
+    @Test fun `outbound diagnostics preserve wire payload and reuse pooled connection`() {
+        val body = """{"callId":"call_abcdefghijkl","edgeId":"edge_abcdefghijkl","status":"ready","createdAt":1,"expiresAt":9999999999999,"directAttempted":false}"""
+        server.enqueue(MockResponse().setBody(body))
+        client.createDirectCall("edge_abcdefghijkl", "v=0\r\nsynthetic-sdp", "android-synthetic-key")
+        val timing = ai.bondings.callpilot.call.OutboundTiming()
+        server.enqueue(MockResponse().setBody(body).addHeader("Server-Timing", "edge_wait;dur=180;desc=\"secret-token\""))
+        client.createDirectCall("edge_abcdefghijkl", "v=0\r\nsynthetic-sdp", "android-synthetic-key", timing)
+        val first = server.takeRequest()
+        val second = server.takeRequest()
+        assertEquals(first.body.readUtf8(), second.body.readUtf8())
+        assertEquals(1, second.sequenceNumber)
+        val log = timing.line()
+        assertFalse(log.contains("post_sent=-1"))
+        assertFalse(log.contains("response_headers=-1"))
+        assertFalse(log.contains("response=-1"))
+        assertTrue(log.contains("tcp_start=-1"))
+        assertTrue(log.contains("attempts=1"))
+        assertTrue(log.endsWith("server_timing=edge_wait:180.0"))
+        for (secret in listOf("secret-token", "synthetic-sdp", "android-synthetic-key", "edge_abcdefghijkl")) {
+            assertFalse(log.contains(secret))
+        }
+    }
+
     private lateinit var server: MockWebServer
     private lateinit var client: HostedCloudClient
     private var nowMs = 1_000L

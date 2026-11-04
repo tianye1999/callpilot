@@ -103,6 +103,7 @@ class CallManager(
     private val outboundDirectProvider: (StoredPairing) -> Boolean = {
         DirectCallCapabilities.cache.cached(it).outboundDirectV1
     },
+    private val outboundTimingLog: (String) -> Unit = { android.util.Log.i("CallPilotDirect", it); Unit },
 ) {
     // 单线程：建连、回落、挂断收尾、事件处理全部串行，没有「检查完再动手」的窗口。
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -196,8 +197,9 @@ class CallManager(
             it !is CallState.Idle && it !is CallState.Ended && it !is CallState.Failed
         }
 
-    fun startCall(pairing: StoredPairing, number: String) {
+    fun startCall(pairing: StoredPairing, number: String, outboundTiming: OutboundTiming = OutboundTiming()) {
         if (isActive) return
+        outboundTiming.mark(OutboundTiming.Mark.START)
         synchronized(commandLock) {
             takeoverMediaTimeoutJob?.cancel()
             takeoverMediaTimeoutJob = null
@@ -207,6 +209,7 @@ class CallManager(
         val idempotencyKey = idempotencyKeyProvider()
         timing = CallTiming(timingClockMs).also { it.restartAt(CallTiming.Mark.DIAL_START) }
         setupJob = scope.launch {
+            var directAttempted = false
             try {
                 val direct = if (pairing.protocol == PairingProtocol.HOSTED && directSessionFactory != null) {
                     try {
@@ -218,8 +221,9 @@ class CallManager(
                     }
                 } else false
                 currentCoroutineContext().ensureActive()
+                directAttempted = direct
                 if (direct &&
-                    startOutboundDirect(pairing, number, idempotencyKey)
+                    startOutboundDirect(pairing, number, idempotencyKey, outboundTiming)
                 ) {
                     setupJob = null
                     return@launch
@@ -260,6 +264,8 @@ class CallManager(
                 setupJob = null
                 cleanup()
                 _state.value = CallState.Failed(number, e.message ?: "拨号失败")
+            } finally {
+                if (directAttempted) outboundTimingLog(outboundTiming.line())
             }
         }
     }
@@ -268,19 +274,25 @@ class CallManager(
      * A8：外呼直连。取 TURN → 建对等连接收集完整 offer → 建呼叫时把 offer 交给 Edge，answer 随响应返回 → 连通。
      * 建呼叫之前任何一步不可用都返回 false，由调用方照旧走 LiveKit；建呼叫之后的失败都在同一通里回落 LiveKit。
      */
-    private suspend fun startOutboundDirect(pairing: StoredPairing, number: String, idempotencyKey: String): Boolean {
+    private suspend fun startOutboundDirect(pairing: StoredPairing, number: String, idempotencyKey: String, outboundTiming: OutboundTiming): Boolean {
         val edgeId = pairing.edgeId ?: return false
         val factory = directSessionFactory ?: return false
         val gateway = outboundGatewayFactory(pairing)
+        gateway.observeOutboundTiming(outboundTiming)
         timing.mark(CallTiming.Mark.PREPARE_START)
+        outboundTiming.mark(OutboundTiming.Mark.ICE_START)
         val servers = try {
-            gateway.iceServers(edgeId).also { timing.mark(CallTiming.Mark.PREPARE_RESPONSE) }
+            gateway.iceServers(edgeId).also {
+                timing.mark(CallTiming.Mark.PREPARE_RESPONSE)
+                outboundTiming.mark(OutboundTiming.Mark.ICE_READY)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             return false
         }
         val s = factory()
+        s.observeOutboundTiming(outboundTiming)
         timing.mark(CallTiming.Mark.PRECONNECT_START)
         val offer = try {
             withTimeout(directSetupMs) { s.prepareDirect(servers) }.also { timing.mark(CallTiming.Mark.PRECONNECT_READY) }

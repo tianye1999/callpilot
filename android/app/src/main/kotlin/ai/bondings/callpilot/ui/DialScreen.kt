@@ -97,21 +97,26 @@ fun DialScreen(
     var lineStatusError by remember(pairing) { mutableStateOf(cachedStatus?.error) }
     var number by remember { mutableStateOf("") }
     var message by remember { mutableStateOf<String?>(null) }
+    var dialTiming by remember { mutableStateOf<ai.bondings.callpilot.call.OutboundTiming?>(null) }
 
     val micPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        if (granted) manager.startCall(pairing, number) else message = "需要麦克风权限才能通话"
+        if (granted) manager.startCall(pairing, number, dialTiming ?: ai.bondings.callpilot.call.OutboundTiming())
+        else message = "需要麦克风权限才能通话"
+        dialTiming = null
     }
 
     fun dial() {
+        val tapTiming = ai.bondings.callpilot.call.OutboundTiming()
         message = null
         val granted = ContextCompat.checkSelfPermission(
             context, Manifest.permission.RECORD_AUDIO,
         ) == PackageManager.PERMISSION_GRANTED
         if (granted) {
-            manager.startCall(pairing, number)
+            manager.startCall(pairing, number, tapTiming)
         } else {
+            dialTiming = tapTiming
             micPermission.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
