@@ -100,4 +100,7 @@ jobs:
 
       - name: Test
         # 挂死/极慢的腿要在 10 分钟内以失败收场并打印用例名，而不是占满 6 小时
+        # 真实 Cocoa 子进程测试默认跳过（开发机上会闪窗口），CI 里显式打开以保留覆盖。
+        env:
+          CALLPILOT_GUI_TESTS: "1"
         run: pytest -q --timeout 600 --durations=25

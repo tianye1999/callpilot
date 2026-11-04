@@ -313,8 +313,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("DIRECT_ICE_EARLY_COMPLETE_ENABLED", "直连 ICE 首对成功后提前完成（未真机验收）", "bool", "false"),
     ConfigSpec(
         "DIRECT_GATHER_SKIP_LOCAL_RELAY_ENABLED",
-        "对端已带 relay 且本端 srflx 就绪时跳过本端 relay 等待（未真机验收）",
-        "bool", "false",
+        "对端已带 relay 且本端 srflx 就绪时跳过本端 relay 等待",
+        "bool", "true",
     ),
     ConfigSpec("INBOUND_PCM_PRE_ATA_PROBE_ENABLED", "响铃期 PCM 诊断探针", "bool", "false"),
     ConfigSpec("INBOUND_EARLY_ANSWER_ENABLED", "认领后立即接通运营商通话（与手机连媒体并行）", "bool", "false"),
