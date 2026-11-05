@@ -436,12 +436,8 @@ class QwenAsrClient(_SyncWs):
         raise QwenSpeechError("云端 ASR 等待 final 超时")
 
     def clear(self) -> None:
-        if self._ws is None:
-            return
-        try:
-            self._ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-        except Exception:  # noqa: BLE001 - 清理是尽力而为
-            self._discard()
+        """丢弃未提交音频：qwen3-asr realtime 不接受 input_audio_buffer.clear，直接断开会话，下次重连。"""
+        self._discard()
 
     def one_shot(self, pcm8k: bytes) -> str:
         self.append(pcm8k)

@@ -424,12 +424,14 @@ class _SherpaPipeline:
         failed, self._asr_failed = self._asr_failed, False
         if not failed:
             try:
-                text = self._asr_client.commit()
-                self._asr_client.clear()
-                return text
+                # commit 即清空服务端缓冲；再发 input_audio_buffer.clear 会被 qwen3-asr 判非法，
+                # 残留的 error 事件让下一轮 commit 失败、悄悄回落本地（11-05 评测发现）。
+                return self._asr_client.commit()
             except Exception as exc:  # noqa: BLE001 - 本轮回落本地
                 failed = True
                 logger.warning("[qwen_asr] 取 final 失败，本轮回落本地: %s", type(exc).__name__)
+        if failed:
+            self._asr_client.clear()  # 失败后缓冲状态不明：断开会话，下一轮重连即是干净缓冲
         return self._fallback_transcribe(segments)
 
     def _fallback_transcribe(self, segments: list[bytes]) -> str:
