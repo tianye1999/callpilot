@@ -2184,6 +2184,44 @@ def test_restart_sets_event_and_returns_ok():
     assert ev.is_set()
 
 
+@pytest.fixture(autouse=True)
+def _treat_test_client_as_lan(monkeypatch, request):
+    """测试客户端走 127.0.0.1；鉴权用例默认按局域网访问处理，本机放行另有专门用例。"""
+    if "local_client_exemption" not in request.node.name:
+        monkeypatch.setattr(server, "_is_local_client", lambda _request: False)
+
+
+def test_local_client_exemption_requires_loopback_peer_and_host(monkeypatch):
+    app = build_app(hub=None, modem=None, service=FakeService(), meta={"provider": "qwen"},  # type: ignore[arg-type]
+                    auth_token="secret-token")
+
+    async def fn(client):
+        assert (await client.get("/api/meta")).status == 200  # update.sh 等本机脚本
+        lan = await client.get("/api/meta", headers={"Host": "192.168.9.219:47100"})
+        assert lan.status == 401  # 回环对端但 Host 非回环名（DNS 重绑定）仍要登录
+        return True
+
+    assert api(app, fn)
+
+
+@pytest.mark.parametrize(("remote", "host", "headers", "expected"), [
+    ("127.0.0.1", "127.0.0.1:47100", {}, True),
+    ("::1", "[::1]:47100", {}, True),
+    ("127.0.0.1", "localhost:47100", {}, True),
+    ("192.168.9.20", "localhost:47100", {}, False),          # 局域网对端伪造 Host
+    ("127.0.0.1", "evil.example:47100", {}, False),           # DNS 重绑定
+    ("127.0.0.1", "127.0.0.1:47100", {"Origin": "http://evil.example"}, False),   # 本机浏览器跨站 WS
+    ("127.0.0.1", "127.0.0.1:47100", {"Origin": "http://127.0.0.1:47100"}, False),  # 浏览器同源也走登录
+    ("127.0.0.1", "127.0.0.1:47100", {"Sec-Fetch-Site": "cross-site"}, False),
+    ("", "127.0.0.1:47100", {}, False),
+])
+def test_local_client_exemption_rules(remote, host, headers, expected):
+    from types import SimpleNamespace
+
+    request = SimpleNamespace(remote=remote, host=host, headers=headers)
+    assert server._is_local_client(request) is expected  # type: ignore[arg-type]
+
+
 def test_auth_middleware_rejects_without_token_and_accepts_bearer_or_query():
     """非 loopback 部署时的访问令牌闸（T9）：无/错 token 401，Bearer 头或 ?token= 放行。"""
     app = build_app(

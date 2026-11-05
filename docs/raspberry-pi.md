@@ -125,6 +125,20 @@ sudo systemctl start callpilot-edge.service
 在无通话窗口显式执行 `sudo systemctl restart callpilot-edge.service`。
 不要同时启动手工 `app.py` 和 systemd 服务，否则串口和监听端口会冲突。
 
+### 局域网打开控制台（要密码）
+
+Pi 没有屏幕。要在同一 Wi-Fi 下用 Mac / 手机浏览器打开控制台，在 `.env` 设：
+
+```dotenv
+WEB_HOST=0.0.0.0
+WEB_AUTH_TOKEN=<登录密码，建议 20 位以上随机串>
+```
+
+重启 Edge 后访问 `http://<Pi 局域网 IP>:47100/`，先显示密码页，登录后浏览器记住会话（服务重启需重新登录）。
+本机脚本（`update.sh` 健康检查、`curl http://127.0.0.1:47100/...`）在「对端为回环、Host 为回环名、且不带
+`Origin`」时免登录；浏览器发起的请求一律要登录。**不要**在 Pi 上用会把 Host 改成 `127.0.0.1`/`localhost`
+的反向代理（如 nginx `proxy_set_header Host $proxy_host`）把外部流量转给 47100，否则会绕过登录。
+
 ## 更新
 
 以下命令均在 **Pi** 上、以服务所属的普通用户执行，不是在 Mac 上运行，也不要用

@@ -251,6 +251,19 @@ def _login_page() -> web.FileResponse:
     return web.FileResponse(STATIC_DIR / "login.html", headers={"Cache-Control": "no-store"})
 
 
+def _is_local_client(request: web.Request) -> bool:
+    try:
+        local = ipaddress.ip_address(request.remote or "").is_loopback
+        host = urlsplit(f"//{request.host}").hostname
+    except ValueError:
+        return False
+    # 浏览器的 WebSocket / 跨站请求必带 Origin；本机脚本（curl）不带。带 Origin 的一律走登录，
+    # 防 Pi 本机浏览器里的恶意页面连 /ws、/ws/audio 读事件与实时音频。
+    if request.headers.get("Origin") or request.headers.get("Sec-Fetch-Site") == "cross-site":
+        return False
+    return local and host in {"localhost", "127.0.0.1", "::1"}
+
+
 def _auth_middleware_factory(token: str):
     """非 loopback 监听时校验会话 Cookie、Bearer 头或 ?token=。
 
@@ -302,6 +315,9 @@ def _auth_middleware_factory(token: str):
             response = web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
             response.del_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="Strict")
             return response
+        if _is_local_client(request):
+            # 本机进程（update.sh 健康检查、运维脚本）本就能读 .env 里的令牌；Host 也须是回环名，防 DNS 重绑定。
+            return await handler(request)
         supplied = ""
         authorization = request.headers.get("Authorization", "")
         if authorization.startswith("Bearer "):
