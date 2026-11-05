@@ -25,8 +25,14 @@ GATHER_MAX_SECONDS = 1.5
 TURN_DELETE_MAX_SECONDS = 0.25  # Local teardown cannot wait for a disappeared TURN server.
 CONSENT_MAX_AGE = 30.0
 CONSENT_RESPONSE_SECONDS = 4.0
+# Container / VM bridges never reach the phone; their pairs only fail slowly and hold ICE completion
+# until every check times out. Linux/macOS match the interface name; on Windows ifaddr's name is the
+# adapter GUID and nice_name is the hardware Description (not the "vEthernet (WSL)" friendly name), so
+# Hyper-V / VirtualBox / VMware are matched by their Description. A plain "br0" is deliberately kept:
+# a host bridge usually carries the machine's real LAN address.
 _VIRTUAL_PREFIXES = ("utun", "ipsec", "tun", "tap", "awdl", "llw", "bridge", "ppp", "wg", "gif", "stf", "lo",
-                     "tailscale", "wireguard", "wintun")
+                     "tailscale", "wireguard", "wintun", "docker", "br-", "veth", "virbr", "vmnet",
+                     "vboxnet", "lxc", "lxd", "cni", "podman", "zt", "hyper-v", "virtualbox", "vmware")
 
 
 def physical_host_addresses(adapters: Any = None) -> list[str]:

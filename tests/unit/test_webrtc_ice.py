@@ -56,6 +56,27 @@ def test_only_physical_routable_host_addresses():
     assert webrtc_ice.physical_host_addresses(interfaces) == ["192.168.1.2", "240e::1", "100.64.0.1"]
 
 
+def test_container_and_vm_bridges_are_not_host_candidates():
+    interfaces = [adapter("wlan0", "192.168.9.219"), adapter("docker0", "172.17.0.1"),
+                  adapter("br-agentnet", "172.18.0.1"), adapter("veth3e7c5fc", ("fe80::5c", 0, 9)),
+                  adapter("virbr0", "192.168.122.1"), adapter("vmnet8", "192.168.56.1"),
+                  adapter("ztabcdef12", "10.147.17.5"), adapter("br0", "192.168.1.20")]
+    # A plain host bridge (br0) usually carries the real LAN address and stays.
+    assert webrtc_ice.physical_host_addresses(interfaces) == ["192.168.9.219", "192.168.1.20"]
+
+
+def test_windows_virtual_adapters_are_matched_by_description():
+    # ifaddr on Windows: name = adapter GUID, nice_name = hardware Description.
+    def win(description, address):
+        return SimpleNamespace(name="{6F1E2A3B-0000-4C5D-8E9F-000000000001}", nice_name=description,
+                               ips=[SimpleNamespace(ip=address)])
+    interfaces = [win("Intel(R) Wi-Fi 6 AX201 160MHz", "192.168.1.12"),
+                  win("Hyper-V Virtual Ethernet Adapter", "172.22.0.1"),
+                  win("VirtualBox Host-Only Ethernet Adapter", "192.168.56.1"),
+                  win("VMware Virtual Ethernet Adapter for VMnet8", "192.168.75.1")]
+    assert webrtc_ice.physical_host_addresses(interfaces) == ["192.168.1.12"]
+
+
 def test_no_physical_interface_falls_back_to_every_routable_address(caplog):
     interfaces = [adapter("utun3", "10.8.0.2", ("fd00::2", 0, 0)), adapter("lo0", "127.0.0.1"),
                   adapter("awdl0", ("fe80::9", 0, 7))]
