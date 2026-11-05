@@ -305,6 +305,7 @@ def test_edge_credential_parser_rejects_malformed_values() -> None:
 def test_keychain_store_keeps_credential_and_private_key_outside_files(monkeypatch) -> None:
     import keyring
 
+    monkeypatch.setattr("agentcall.platforms.IS_LINUX", False)
     values: dict[tuple[str, str], str] = {}
     monkeypatch.setattr(
         keyring, "get_password", lambda service, account: values.get((service, account))

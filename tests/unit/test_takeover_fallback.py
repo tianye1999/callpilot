@@ -16,6 +16,11 @@ from agentcall.triage_judge import TriageVerdict
 _EDGE_CREDENTIAL = "edge_abcdefghijkl." + "s" * 40
 
 
+@pytest.fixture(autouse=True)
+def _use_keyring_backend(monkeypatch):
+    monkeypatch.setattr("agentcall.platforms.IS_LINUX", False)
+
+
 def _register(monkeypatch) -> None:
     monkeypatch.setattr("keyring.get_password", lambda *_args: _EDGE_CREDENTIAL)
 
