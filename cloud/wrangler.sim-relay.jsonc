@@ -11,6 +11,9 @@
   ],
   "compatibility_date": "2026-07-11",
   "compatibility_flags": ["nodejs_compat"],
+  // D1 与 EdgeRoom DO 在 SIN；中国大陆手机请求经 Cloudflare 落在 LAX，默认在 LAX 执行时每次 D1/DO 往返 ~190 ms，
+  // 建呼叫要 4–5 次。指定在新加坡执行：入口到 SIN 只跨洋一次，D1/DO 变为本地往返（11-05 实测定位）。
+  "placement": { "mode": "targeted", "region": "aws:ap-southeast-1" },
   "observability": {
     "enabled": false
   },
