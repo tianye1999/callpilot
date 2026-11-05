@@ -59,8 +59,8 @@ def default_pcm_pin_8k() -> bool:
 
 
 def default_reset_after_call() -> bool:
-    """Linux SIM7600 每通后复位；其他平台默认保持原有行为。"""
-    return IS_LINUX
+    """每通后复位默认关闭（11-05 树莓派真机：不复位连拨两通，第二通 PCM 正常）。"""
+    return False
 
 
 def default_parallel_agent_connect() -> bool:

@@ -248,3 +248,22 @@ def test_self_heal_keeps_transport_open_when_registration_never_completes(monkey
     assert modem.refresh_sim_identity_called == 0
     assert modem.emitted[-1] is True
 
+
+
+def test_linux_port_detection_keeps_stable_udev_links(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from agentcall import call_agent, platforms
+
+    monkeypatch.setattr(platforms, "IS_WINDOWS", False)
+    monkeypatch.setattr(call_agent.port_detect, "detect_serial_ports",
+                        lambda *_: (_ for _ in ()).throw(AssertionError("Windows-only probe used on Linux")))
+    at, pcm = tmp_path / "callpilot-sim7600-at", tmp_path / "callpilot-sim7600-pcm"
+    service = SimpleNamespace(modem=SimpleNamespace(port=str(at)), pcm_port=str(pcm))
+    detect = call_agent.CallAgentService._detect_sim7600_ports
+
+    assert detect(service) == (None, None)  # links gone during re-enumeration
+    at.touch()
+    assert detect(service) == (str(at), None)  # PCM link not back yet
+    pcm.touch()
+    assert detect(service) == (str(at), str(pcm))  # stable paths, never /dev/ttyUSB*

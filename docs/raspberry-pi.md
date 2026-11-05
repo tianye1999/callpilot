@@ -5,8 +5,8 @@
 部署、重启与双向通话仍须由真机执行者确认。
 
 不使用 SIM 卡上网，Pi 通过有线网络或 Wi-Fi 联网。不安装 macOS USB→PTY 桥，
-也不改变 macOS / Windows 的默认行为。按 owner 决定，每通后自动重启 SIM7600 的 #121
-自愈提前纳入 Phase 1；VoLTE-only 外呼注册判定仍留 Phase 2，不承诺稳定外呼。
+也不改变 macOS / Windows 的默认行为。每通后自动重启 SIM7600（#121）自 2026-11-05 起默认关闭，
+见下文第 4 节；VoLTE-only 外呼注册判定仍留 Phase 2，不承诺稳定外呼。
 
 ## 硬件与系统
 
@@ -88,7 +88,6 @@ MODEM_AUDIO_MODE=nmea
 MODEM_PCM_PORT=/dev/callpilot-sim7600-pcm
 MODEM_PCM_BAUD=115200
 MODEM_PCM_PIN_8K=true
-MODEM_RESET_AFTER_CALL=true
 WEB_OPEN_BROWSER=false
 WEB_HOST=127.0.0.1
 WEB_PORT=47100
@@ -108,7 +107,7 @@ WEB_PORT=47100
 | 配置项 | Linux 默认 | macOS 默认 | Windows 默认 | 用途 |
 | --- | --- | --- | --- | --- |
 | `MODEM_PCM_PIN_8K` | true | false | false | SIM7600 每通在 `CPCMREG=1` 前发 `CPCMBANDWIDTH=1,1` |
-| `MODEM_RESET_AFTER_CALL` | true | false | false | 仅 SIM7600：本通成功启用过 PCM 时，收尾后重启模组；修改需重启 Edge |
+| `MODEM_RESET_AFTER_CALL` | false | false | false | 仅 SIM7600：本通成功启用过 PCM 时，收尾后重启模组；修改需重启 Edge |
 | `WEB_OPEN_BROWSER` | true | true | true | 源码入口启动时打开浏览器；frozen 原有不打开逻辑不变 |
 
 根 `.env.example` 将 PCM 与通话后重启开关保留为注释，避免覆盖平台默认值。
@@ -260,10 +259,17 @@ curl --fail --silent --show-error http://127.0.0.1:47100/api/meta
 记录脱敏的命令顺序、PCM 字节率与双向可闻结论，不用本机单测结果替代。
 supervisor 无活跃通话时尝试 `CPCMREG=1` 返回 ERROR 属预期，重点检查接通后的 per-call 成功。
 
-### 4. 每通后重启自愈（#121，真机验收）
+### 4. 每通后重启（#121，2026-11-05 起默认关闭）
+
+2026-11-05 树莓派真机：关闭每通后重启，连拨两通 10086，第二通 `CPCMREG=1` 首次 OK，上下行与对话均正常，
+#121 未复现；每通后重启会让线路离线约 30 秒（期间来电接不到），故默认关闭。若再遇第二通零上行，
+可在 `.env` 设 `MODEM_RESET_AFTER_CALL=true` 恢复下述行为，或开 `PCM_STALL_RECOVERY` / `MODEM_SELF_HEAL_ENABLED`
+走通话内重开 PCM + 空闲时 CFUN 自愈。Linux 自愈按 udev 固定链接（`install.sh` 安装的
+`/dev/callpilot-sim7600-*`）是否消失/重现判断重枚举；11-05 实测 `AT+CFUN=1,1` 后链接 5.3 s 消失、13.3 s 重现。
+未用 `install.sh`、直接写 `/dev/ttyUSB*` 时编号可能漂移，不保证自愈后重连。以下为该开关打开时的行为：
 
 已实测的跨通劣化可能在第二通 `CPCMREG=1` 首次就回 OK，但 PCM 上行零字节、下行写超时，
-因此不能只靠原有「CPCMREG 重试才判劣化」哨兵。Linux 默认启用 `MODEM_RESET_AFTER_CALL`：
+因此不能只靠原有「CPCMREG 重试才判劣化」哨兵。打开 `MODEM_RESET_AFTER_CALL` 后：
 仅当本通接听/拨号后成功启用过 PCM，挂断与关闭语音通道完成后发送一次 `AT+CRESET`。
 未启用 PCM 的未接通呼叫、启动期 supervisor 单独启用 PCM 都不会触发。
 该策略仅对 SIM7600 生效，其他厂商不受影响；原有哨兵写入机制保留不变。
@@ -306,7 +312,7 @@ journalctl -u callpilot-edge.service -b --no-pager | grep -E '#121|phase=|重连
 | `CREG: 0,3` 且 `CEREG: 0,1` | 在此已验证卡/网络组合上属于 VoLTE-only 正常态：CS 拒绝但 LTE 已注册，不据此断言 SIM 不可用。仍需实际来电确认 IMS；当前外呼守卫只看 CS 注册，可能拦截外呼，Phase 2 再处理。 |
 | 通话接通但噪声、变速或单向无声 | 核对 Linux 配置与本通带宽钉定日志；出厂 VoLTE PCM 常为 16k，不能按 8k 解码。确认 PCM 链接为接口 `04`，不要把接口 `01` 的 NMEA 当 PCM，也不要只调串口波特率。 |
 | USB 掉线、通话时重新枚举 | 在通话前后检查 `vcgencmd get_throttled`（需 Pi 固件工具），理想为 `0x0`；非零时区分当前/历史欠压或降频位，检查电源、供电线、有源 Hub 和散热。命令缺失不代表供电正常。 |
-| 第二通 PCM 零上行、下行写超时 | 确认 `MODEM_RESET_AFTER_CALL=true` 且已重启 Edge，核对上一通的四阶段日志。CPCMREG 首次 OK 不代表端点健康。原有 `/tmp/sim7600-recover-request` 哨兵在 Linux 无消费者，本功能独立于哨兵主动重启；systemd 进程重启不等于模组重启。 |
+| 第二通 PCM 零上行、下行写超时 | 在 `.env` 设 `MODEM_RESET_AFTER_CALL=true` 并重启 Edge，核对上一通的四阶段日志。CPCMREG 首次 OK 不代表端点健康。原有 `/tmp/sim7600-recover-request` 哨兵在 Linux 无消费者，本功能独立于哨兵主动重启；systemd 进程重启不等于模组重启。 |
 | 服务起不来或启动限流 | 看 journald；重点排查未合并 Linux `.env`（根模板是其他平台配置）、凭证、Python/系统库、端口占用。修正后在空闲窗口执行 `sudo systemctl reset-failed callpilot-edge.service` 再 start。 |
 
 规则匹配依据：[udev 官方说明](https://www.freedesktop.org/software/systemd/man/latest/udev.html)

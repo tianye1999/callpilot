@@ -212,7 +212,7 @@ def test_pcm_pin_platform_default(monkeypatch, is_linux, is_macos, is_windows, e
     monkeypatch.setattr(platforms, "IS_MACOS", is_macos)
     monkeypatch.setattr(platforms, "IS_WINDOWS", is_windows)
     assert platforms.default_pcm_pin_8k() is expected
-    assert platforms.default_reset_after_call() is expected
+    assert platforms.default_reset_after_call() is False
 
 
 def test_pcm_pin_config_uses_platform_default_and_allows_override(monkeypatch):

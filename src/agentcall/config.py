@@ -472,8 +472,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("MODEM_LOG_RELEASE_CAUSE", "记录通话释放原因", "bool", "true"),
     ConfigSpec("MODEM_NETWORK_RECOVERY", "SIM7600 无服务自动恢复（实验）", "bool", "false",
                editable=False, hidden=True, requires_restart=True),
-    # Windows/无桥平台：PCM 劣化后由服务在线路空闲时执行 CFUN 软复位（真机验收前关闭）。
-    # Windows 无 USB 桥，默认服务内自愈；macOS 由桥负责恢复，默认不在服务内做 CFUN。
+    # Windows/无桥平台：PCM 劣化后由服务在线路空闲时执行 CFUN 软复位。
+    # Windows 已真机验收，默认开；Linux 未真机触发过，默认关（可在 .env 打开）；macOS 由桥负责恢复。
     ConfigSpec("MODEM_SELF_HEAL_ENABLED", "SIM7600 服务内自愈", "bool",
                "true" if platforms.IS_WINDOWS else "false",
                editable=False, hidden=True, requires_restart=True),

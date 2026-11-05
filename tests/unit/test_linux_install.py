@@ -44,7 +44,6 @@ def test_linux_env_example_and_shared_default_isolation():
         "MODEM_VENDOR": "simcom", "MODEM_PORT": "/dev/callpilot-sim7600-at",
         "MODEM_AUDIO_MODE": "nmea", "MODEM_PCM_PORT": "/dev/callpilot-sim7600-pcm",
         "MODEM_PCM_BAUD": "115200", "MODEM_PCM_PIN_8K": "true", "WEB_OPEN_BROWSER": "false",
-        "MODEM_RESET_AFTER_CALL": "true",
         "WEB_HOST": "127.0.0.1", "WEB_PORT": "47100",
     }
     for key, value in expected.items():

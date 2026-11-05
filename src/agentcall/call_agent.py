@@ -5890,8 +5890,16 @@ class CallAgentService:
                     self._hardware_maintenance = False
 
     def _detect_sim7600_ports(self) -> tuple[str | None, str | None]:
-        """自愈时重新探测 SIM7600 的 AT/PCM 串口；按 VID/PID 与描述识别，不猜 COM 序号。"""
-        return port_detect.detect_serial_ports("simcom")
+        """自愈时重新探测 SIM7600 的 AT/PCM 串口。
+
+        Windows 按 VID/PID 与驱动描述识别，不猜 COM 序号。Linux 的 option 驱动不带描述，端口是
+        udev 固定链接（/dev/callpilot-sim7600-*）：按链接是否存在判断重枚举，并保持稳定路径，
+        不改写成会漂移的 /dev/ttyUSB*。
+        """
+        if platforms.IS_WINDOWS:
+            return port_detect.detect_serial_ports("simcom")
+        at, pcm = self.modem.port, self.pcm_port
+        return (at if os.path.exists(at) else None, pcm if pcm and os.path.exists(pcm) else None)
 
     def _close_sim7600_pcm(self) -> None:
         """关闭尚未随挂断释放的 PCM 数据口；空闲时通常已由会话停掉，这里兜底。"""
