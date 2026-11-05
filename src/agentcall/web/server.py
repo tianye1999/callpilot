@@ -243,22 +243,83 @@ async def _error_middleware(request: web.Request, handler):
         return web.json_response({"ok": False, "error": exc.reason}, status=400)
 
 
+_SESSION_COOKIE = "agentcall_session"
+_login_time = time.monotonic
+
+
+def _login_page() -> web.FileResponse:
+    return web.FileResponse(STATIC_DIR / "login.html", headers={"Cache-Control": "no-store"})
+
+
 def _auth_middleware_factory(token: str):
-    """非 loopback 监听时的访问令牌校验（Bearer 头或 ?token= 查询参数）。
+    """非 loopback 监听时校验会话 Cookie、Bearer 头或 ?token=。
 
     Web API 能拨号/发短信，暴露到网段必须带闸；loopback 部署不启用本中间件，
     行为与历史完全一致。WS 客户端无法自定义头，故同时接受查询参数。
     """
+    session = secrets.token_urlsafe(32)
+    failures: dict[str, tuple[int, float]] = {}
+
+    async def login(request: web.Request) -> web.Response:
+        now = _login_time()
+        # 只信任连接的远端地址，不接受客户端可伪造的 X-Forwarded-For。
+        for ip, (_, failed_at) in list(failures.items()):
+            if now - failed_at >= 60:
+                del failures[ip]
+        remote = request.remote or "unknown"
+        limited = web.json_response({"ok": False, "error": "尝试过多，请稍后重试"}, status=429,
+                                    headers={"Retry-After": "60", "Cache-Control": "no-store"})
+        count, _ = failures.get(remote, (0, now))
+        if count >= 5:
+            return limited
+        try:
+            if request.content_type != "application/json":
+                raise ValueError
+            data = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            return web.json_response({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
+        # 读取请求体会让出事件循环；重新读取计数，避免并发失败覆盖彼此。
+        count, _ = failures.get(remote, (0, now))
+        if count >= 5:
+            return limited
+        password = data.get("password") if isinstance(data, dict) else None
+        if not isinstance(password, str) or not secrets.compare_digest(password.encode(), token.encode()):
+            failures[remote] = (count + 1, _login_time())
+            return web.json_response({"ok": False, "error": "密码错误"}, status=401,
+                                     headers={"Cache-Control": "no-store"})
+        failures.pop(remote, None)
+        response = web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
+        response.set_cookie(_SESSION_COOKIE, session, httponly=True, samesite="Strict", path="/", secure=False)
+        return response
 
     @web.middleware
     async def _auth_middleware(request: web.Request, handler):
+        if request.path == "/login" and request.method in {"GET", "HEAD"}:
+            return _login_page()
+        if request.path == "/api/login" and request.method == "POST":
+            return await login(request)
+        if request.path == "/api/logout" and request.method == "POST":
+            response = web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
+            response.del_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="Strict")
+            return response
         supplied = ""
         authorization = request.headers.get("Authorization", "")
         if authorization.startswith("Bearer "):
             supplied = authorization[len("Bearer "):].strip()
         if not supplied:
             supplied = request.query.get("token", "")
-        if not supplied or not secrets.compare_digest(supplied, token):
+        cookie = request.cookies.get(_SESSION_COOKIE, "")
+        authorized = (bool(supplied) and secrets.compare_digest(supplied.encode(), token.encode())) or (
+            bool(cookie) and secrets.compare_digest(cookie.encode(), session.encode())
+        )
+        if not authorized:
+            is_api_or_ws = request.path.startswith(("/api/", "/ws"))
+            if request.method in {"GET", "HEAD"} and not is_api_or_ws and (
+                request.path in {"/", "/remote-dialer", "/remote-dialer/"}
+                or request.path.endswith(".html")
+                or "text/html" in request.headers.get("Accept", "")
+            ):
+                return _login_page()
             return web.json_response({"ok": False, "error": "未授权：缺少或错误的访问令牌"}, status=401)
         return await handler(request)
 

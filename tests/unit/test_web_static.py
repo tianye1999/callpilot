@@ -19,6 +19,36 @@ REMOTE_MANIFEST = INDEX.with_name("manifest.webmanifest")
 REMOTE_SW = INDEX.with_name("remote_dialer_sw.js")
 
 
+def test_fetch_redirects_any_401_to_login():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 执行 fetch 包装器")
+    text = INDEX.read_text(encoding="utf-8")
+    source = text[text.index("const originalFetch ="):text.index("const $ =")]
+    script = r'''
+const assert = require('node:assert/strict');
+let status = 200;
+let redirected = null;
+let received = null;
+const location = {replace(path) { redirected = path; }};
+const window = {fetch: async (...args) => { received = args; return {status}; }};
+'''
+    script += source + r'''
+(async () => {
+  const options = {method: 'POST', body: '{}'};
+  assert.equal((await window.fetch('/api/config', options)).status, 200);
+  assert.deepEqual(received, ['/api/config', options]);
+  assert.equal(redirected, null);
+  status = 401;
+  assert.equal((await window.fetch('/api/meta')).status, 401);
+  assert.equal(redirected, '/login');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+    result = subprocess.run([node, "-"], input=script, capture_output=True,
+                            text=True, encoding="utf-8", timeout=NODE_TIMEOUT)
+    assert result.returncode == 0, result.stderr
+
+
 def test_browser_language_defaults_and_saved_override():
     node = shutil.which("node")
     if node is None:

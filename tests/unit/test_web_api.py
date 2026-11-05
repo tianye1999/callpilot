@@ -2217,10 +2217,123 @@ def test_auth_disabled_when_token_none_keeps_loopback_behavior():
     )
 
     async def fn(client):
+        assert len(app.middlewares) == 1
+        assert app.middlewares[0] is server._error_middleware
+        assert 'id="login"' not in await (await client.get("/")).text()
         resp = await client.get("/api/meta")
         return resp.status
 
     assert api(app, fn) == 200
+
+
+def test_password_login_cookie_allows_api_and_websocket_then_logout():
+    from agentcall.events import EventHub
+
+    async def run():
+        app = build_app(hub=EventHub(asyncio.get_running_loop()), modem=None,
+                        service=FakeService(), auth_token="登录密码")
+        async with TestClient(TestServer(app)) as client:
+            for path in ("/", "/static/index.html", "/login", "/remote-dialer/"):
+                response = await client.get(path)
+                assert response.status == 200
+                assert 'type="password"' in await response.text()
+                assert response.headers["Cache-Control"] == "no-store"
+            for path in ("/api/meta", "/ws", "/ws/audio"):
+                response = await client.get(path, headers={"Accept": "text/html"})
+                assert response.status == 401
+                assert (await response.json())["ok"] is False
+            assert (await client.post("/api/login", json={"password": "wrong"})).status == 401
+            response = await client.post("/api/login", json={"password": "登录密码"})
+            assert response.status == 200
+            assert (await response.json())["ok"] is True
+            cookie = response.cookies["agentcall_session"]
+            assert cookie.value != "登录密码"
+            assert cookie["httponly"] and cookie["samesite"] == "Strict"
+            assert cookie["path"] == "/" and not cookie["secure"]
+            assert (await client.get("/api/meta")).status == 200
+            response = await client.get("/")
+            assert 'id="login"' not in await response.text()
+            async with client.ws_connect("/ws") as ws:
+                assert not ws.closed
+            response = await client.post("/api/logout")
+            assert response.status == 200
+            assert response.cookies["agentcall_session"]["max-age"] == "0"
+            assert (await client.get("/api/meta")).status == 401
+            assert (await client.get("/api/meta", headers={
+                "Cookie": "agentcall_session=wrong",
+            })).status == 401
+
+    asyncio.run(run())
+
+
+def test_login_rate_limit_expires_and_success_resets_failures(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(server, "_login_time", lambda: clock[0])
+    app = build_app(hub=None, modem=None, service=FakeService(), auth_token="secret-token")
+
+    async def fn(client):
+        for _ in range(4):
+            assert (await client.post("/api/login", json={"password": "wrong"})).status == 401
+        assert (await client.post("/api/login", json={"password": "secret-token"})).status == 200
+        for _ in range(5):
+            assert (await client.post("/api/login", json={"password": "wrong"})).status == 401
+        response = await client.post("/api/login", json={"password": "secret-token"})
+        assert response.status == 429
+        assert response.headers["Retry-After"] == "60"
+        assert (await client.post("/api/login", json={"password": "secret-token"},
+                                  headers={"X-Forwarded-For": "192.168.1.99"})).status == 429
+        clock[0] += 60
+        assert (await client.post("/api/login", json={"password": "secret-token"})).status == 200
+
+    api(app, fn)
+
+
+@pytest.mark.parametrize("body", [None, [], {}, {"password": 1}, {"password": "错误"}])
+def test_login_invalid_password_input_is_rejected(body):
+    app = build_app(hub=None, modem=None, service=FakeService(), auth_token="secret-token")
+
+    async def fn(client):
+        response = await client.post("/api/login", json=body)
+        assert response.status in (400, 401)
+        assert not response.cookies
+
+    api(app, fn)
+
+
+def test_login_concurrent_failures_are_counted_per_remote_ip(monkeypatch):
+    async def run():
+        middleware = server._auth_middleware_factory("secret-token")
+        ready = asyncio.Event()
+        readers = 0
+
+        async def read_password():
+            nonlocal readers
+            readers += 1
+            if readers == 8:
+                ready.set()
+            await ready.wait()
+            return {"password": "wrong"}
+
+        async def handler(request):
+            raise AssertionError("login must not reach the protected handler")
+
+        async def attempt(remote, password_reader):
+            request = make_mocked_request("POST", "/api/login", headers={
+                "Content-Type": "application/json",
+            }).clone(remote=remote)
+            monkeypatch.setattr(request, "json", password_reader)
+            return await middleware(request, handler)
+
+        responses = await asyncio.gather(*(attempt("192.168.1.2", read_password) for _ in range(8)))
+        assert sorted(response.status for response in responses) == [401] * 5 + [429] * 3
+
+        async def correct_password():
+            return {"password": "secret-token"}
+
+        assert (await attempt("192.168.1.3", correct_password)).status == 200
+        assert (await attempt("192.168.1.2", correct_password)).status == 429
+
+    asyncio.run(run())
 
 
 def test_meta_omits_sim_when_no_modem():

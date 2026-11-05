@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>控制台登录</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; min-height: 100svh; display: grid; place-items: center; }
+    main { width: min(320px, calc(100% - 48px)); }
+    h1 { font-size: 24px; margin: 0 0 24px; }
+    label { display: block; margin-bottom: 8px; }
+    input, button { box-sizing: border-box; width: 100%; font: inherit; padding: 10px 12px; border-radius: 4px; }
+    input { margin-bottom: 16px; border: 1px solid GrayText; }
+    button { cursor: pointer; }
+    #error { min-height: 3em; font-size: 14px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>控制台登录</h1>
+    <form id="login">
+      <label for="password">密码</label>
+      <input id="password" type="password" autocomplete="current-password" required autofocus>
+      <button type="submit">登录</button>
+      <p id="error" role="alert"></p>
+    </form>
+  </main>
+  <script>
+    document.getElementById("login").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = event.currentTarget.querySelector("button");
+      const error = document.getElementById("error");
+      button.disabled = true;
+      error.textContent = "";
+      try {
+        const response = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: document.getElementById("password").value })
+        });
+        if (response.ok) {
+          location.replace("/");
+          return;
+        }
+        error.textContent = response.status === 429 ? "尝试过多，请 60 秒后重试" : "密码错误，请重试";
+      } catch {
+        error.textContent = "连接失败，请重试";
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

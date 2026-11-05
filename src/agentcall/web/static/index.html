@@ -1452,6 +1452,12 @@
   </div>
 
 <script>
+const originalFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const response = await originalFetch(...args);
+  if (response.status === 401) location.replace("/login");
+  return response;
+};
 const $ = (id) => document.getElementById(id);
 /* ========= i18n（默认英文，localStorage 记忆） ========= */
 const I18N = {
