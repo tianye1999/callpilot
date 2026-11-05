@@ -37,6 +37,8 @@ object HttpClients {
 
     /** 锁屏 / 切网络后池里的连接可能已失效：请求失败时清掉，下一次重新建连。 */
     fun dropPooledConnections() {
-        shared.connectionPool.evictAll()
+        // evictAll() 会关闭 TLS 套接字（发 close_notify），在主线程调用抛 NetworkOnMainThreadException 让 App 崩溃
+        // （11-05 真机：OfferWatchService 轮询失败后在主线程清池，外呼进行中 App 被杀）。调用方多在主线程，统一放后台线程。
+        Thread({ shared.connectionPool.evictAll() }, "http-pool-evict").apply { isDaemon = true }.start()
     }
 }
