@@ -55,6 +55,7 @@ class WebRtcDirectSession(
         const val CONNECT_TIMEOUT_MS = 15_000L
         const val TRACK_ID = "phone-uplink"
         const val STREAM_ID = "callpilot"
+        const val NOMINATION_PING_INTERVAL_MS = 250
     }
 
     private val appContext = context.applicationContext
@@ -183,6 +184,14 @@ class WebRtcDirectSession(
             ).apply {
                 sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
                 continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
+                // libwebrtc (controlling) only sends USE-CANDIDATE on its next ping of the selected pair;
+                // the default writable-pair ping interval (900 ms, 2.5 s once stable) held Edge's ICE
+                // completion ~2.4 s after the pair already worked (Pi, 11-05). A short interval nominates
+                // at once; the cost is a few ~100-byte STUN pings per second during the call.
+                // libwebrtc rejects the config (createPeerConnection -> null) unless the stable interval is
+                // >= the strong-connectivity interval (default 480 ms), so both are set together.
+                iceCheckIntervalStrongConnectivityMs = NOMINATION_PING_INTERVAL_MS
+                stableWritableConnectionPingIntervalMs = NOMINATION_PING_INTERVAL_MS
             }
             val created = f.createPeerConnection(config, observer) ?: error("peer connection unavailable")
             peer = created
