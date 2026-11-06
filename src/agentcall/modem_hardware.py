@@ -219,16 +219,45 @@ def detect_modem() -> dict:
             return preset.state()
     except Exception as exc:  # noqa: BLE001
         logger.warning("模组自动检测失败，沿用 Quectel: %s", type(exc).__name__)
-    return PRESETS[0].state()
+    # 默认值不代表识别到了硬件，不能拿它判断用户配置不兼容。
+    return {**PRESETS[0].state(), "detected": False}
+
+
+def audio_mode_warning(state: dict, audio_mode: str) -> str | None:
+    """对照已有模组预设；UAC 的两种宿主实现视为同一音频路径。"""
+    if not config.is_explicit("MODEM_AUDIO_MODE") or state.get("detected") is False:
+        return None
+    preset = next((p for p in PRESETS if p.vendor == state.get("vendor")), None)
+    if preset is None:
+        return None
+    mode = audio_mode.strip().lower()
+    expected = preset.audio_mode
+    if mode == expected or (mode.startswith("uac") and expected.startswith("uac")):
+        return None
+    suggested = platforms.default_audio_mode() if expected.startswith("uac") else expected
+    return (f"识别到模组厂商 {preset.vendor}（{preset.model}），显式音频模式 "
+            f"MODEM_AUDIO_MODE={audio_mode} 与该模组预设不匹配，可能导致通话无声；"
+            f"建议改为 {suggested}。请在设置页修改模组音频模式，或启用模组自动识别并删除 .env 中的 "
+            "MODEM_AUDIO_MODE 这一行后重启。未自动修改用户配置。")
 
 
 def resolve_settings(
     vendor: str, port: str, audio_mode: str, pcm_port: str | None,
+    *, warnings: list[str] | None = None,
 ) -> tuple[str, str, str, str | None]:
+    normalized = vendor.strip().lower()
+    # 显式厂商不是硬件识别结果；也必须检测实际接入的模组。
+    state = (detect_modem() if normalized == "auto" or (
+        normalized != "bluetooth" and config.is_explicit("MODEM_AUDIO_MODE")) else {})
+    warning = audio_mode_warning(state, audio_mode)
+    if warning:
+        logger.warning("%s", warning)
+        if warnings is not None:
+            warnings.append(warning)
     if platforms.IS_WINDOWS and vendor.strip().lower() in {"auto", "simcom"}:
         from .port_detect import detect_serial_ports
 
-        selected = detect_modem()["vendor"] if vendor.strip().lower() == "auto" else "simcom"
+        selected = state["vendor"] if normalized == "auto" else "simcom"
         if selected == "simcom":
             if not config.is_explicit("MODEM_AUDIO_MODE"):
                 audio_mode = platforms.default_audio_mode("simcom")
@@ -242,7 +271,6 @@ def resolve_settings(
             return selected, port, audio_mode, pcm_port
     if vendor.strip().lower() != "auto":
         return vendor, port, audio_mode, pcm_port
-    state = detect_modem()
     if state["vendor"] == "simcom":
         # /tmp 路径属于 Mac 桥；其他平台只扫描厂商，保留原生端口配置。
         bridge_ports = platforms.IS_MACOS or state.get("online") is True

@@ -241,6 +241,19 @@ for (LANG of ['zh', 'en']) {
   renderSetupHardware();
   assert.equal($('modemState').textContent, t('modem_on'));
   assert.equal($('setupHwStatus').textContent, t('setup_hint_ready'));
+  const audioWarning = '识别到模组厂商 simcom，显式音频模式 uac 与预设不匹配，建议改为 nmea';
+  lastMeta.hardware.warnings = [audioWarning];
+  setModem(true);
+  renderSetupHardware();
+  assert.equal($('modemAudioWarning').textContent, audioWarning);
+  assert.equal($('modemAudioWarning').hidden, false);
+  assert.equal($('setupHwStatus').textContent, audioWarning);
+  assert.equal($('modemDot').classList.on, false);
+  lastMeta.hardware.warnings = [];
+  setModem(true);
+  renderSetupHardware();
+  assert.equal($('modemAudioWarning').hidden, true);
+  assert.equal($('setupHwStatus').textContent, t('setup_hint_ready'));
 }
 '''
     # 整个 I18N 字典超过 Windows 命令行 32K 上限（WinError 206），脚本改从 stdin 传给 node。

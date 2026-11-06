@@ -1,11 +1,68 @@
 """自动模组识别不依赖真机。"""
 
 import json
+import logging
 
 import pytest
 
 from agentcall import config, platforms
 from agentcall import modem_hardware as hardware
+
+
+@pytest.mark.parametrize("platform", ["macos", "windows", "linux"])
+@pytest.mark.parametrize("configured_vendor", ["auto", "quectel", "simcom"])
+@pytest.mark.parametrize("detected,mode,mismatch", [
+    ("simcom", "uac", True), ("simcom", "uac_ffmpeg", True),
+    ("quectel", "nmea", True), ("simcom", "nmea", False),
+    ("quectel", "uac", False), ("quectel", "uac_ffmpeg", False),
+])
+def test_explicit_audio_mode_warning(monkeypatch, caplog, platform, configured_vendor, detected, mode, mismatch):
+    monkeypatch.setattr(platforms, "IS_WINDOWS", platform == "windows")
+    monkeypatch.setattr(platforms, "IS_MACOS", platform == "macos")
+    monkeypatch.setattr(platforms, "IS_LINUX", platform == "linux")
+    state = next(p.state() for p in hardware.PRESETS if p.vendor == detected)
+    monkeypatch.setattr(hardware, "detect_modem", lambda: state)
+    monkeypatch.setenv("MODEM_AUDIO_MODE", mode)
+    warnings = []
+    with caplog.at_level(logging.WARNING, logger=hardware.__name__):
+        result = hardware.resolve_settings(configured_vendor, "fixed", mode, "pcm", warnings=warnings)
+    assert result[2] == mode
+    assert bool(warnings) is mismatch
+    assert bool(caplog.records) is mismatch
+    if mismatch:
+        assert detected in warnings[0] and mode in warnings[0]
+        assert "设置页" in warnings[0] and ".env" in warnings[0]
+        assert "MODEM_AUDIO_MODE" in warnings[0]
+        suggested = "nmea" if detected == "simcom" else platforms.default_audio_mode()
+        assert f"建议改为 {suggested}" in warnings[0]
+
+
+@pytest.mark.parametrize("explicit,detected", [(False, True), (True, False)])
+def test_audio_warning_skips_defaults_and_detection_failure(monkeypatch, caplog, explicit, detected):
+    monkeypatch.setattr(hardware, "read_state", lambda: None)
+    monkeypatch.setattr(hardware, "scan_preset", lambda: hardware.PRESETS[1] if detected else None)
+    if explicit:
+        monkeypatch.setenv("MODEM_AUDIO_MODE", "nmea")
+    else:
+        monkeypatch.delenv("MODEM_AUDIO_MODE", raising=False)
+    warnings = []
+    hardware.resolve_settings("quectel", "fixed", "nmea", None, warnings=warnings)
+    assert warnings == []
+    assert not caplog.records
+
+
+def test_audio_warning_skips_scan_exception(monkeypatch, caplog):
+    monkeypatch.setenv("MODEM_AUDIO_MODE", "nmea")
+    monkeypatch.setattr(hardware, "read_state", lambda: None)
+
+    def fail():
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(hardware, "scan_preset", fail)
+    warnings = []
+    hardware.resolve_settings("auto", "fixed", "nmea", None, warnings=warnings)
+    assert warnings == []
+    assert "预设不匹配" not in caplog.text
 
 
 @pytest.mark.parametrize("devices,vendor", [

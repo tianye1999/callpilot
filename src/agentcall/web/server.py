@@ -479,6 +479,7 @@ def build_app(
     app.router.add_post("/api/setup/test_call", _setup_test_call)
     app.router.add_post("/api/restart", _restart)
     app.router.add_post("/api/modem/reread_sim", _reread_sim)
+    app.router.add_get("/api/modem/selftest", _modem_selftest)
     app.router.add_static("/static/", STATIC_DIR)
     return app
 
@@ -730,6 +731,12 @@ def _tray_usb_online(app: web.Application, source: str = "tray") -> bool | None:
     return cache["online"]
 
 
+async def _modem_selftest(request: web.Request) -> web.Response:
+    """只读启动硬件诊断，不枚举 USB、不干扰正在进行的通话。"""
+    warnings = getattr(request.app.get("service"), "hardware_warnings", [])
+    return web.json_response({"ok": not warnings, "warnings": warnings})
+
+
 async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
     meta["auth_enabled"] = request.app["auth_enabled"]
@@ -780,6 +787,7 @@ async def _meta(request: web.Request) -> web.Response:
         await asyncio.shield(task)
         usb_online = _tray_usb_online(request.app, "meta")
     meta["hardware"] = {
+        "warnings": getattr(service, "hardware_warnings", []),
         "needs_power_cycle": bool(modem_hardware.read_needs_power_cycle())
         if platforms.IS_MACOS or platforms.IS_LINUX else False,
         "usb_online": usb_online,

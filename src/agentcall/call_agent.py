@@ -5758,8 +5758,9 @@ class CallAgentService:
     ) -> None:
         # modem/call_logger 参数供测试注入；默认按串口/环境配置自建。
         self._auto_modem = vendor.strip().lower() == "auto"
+        self.hardware_warnings: list[str] = []
         vendor, modem_port, audio_mode, pcm_port = modem_hardware.resolve_settings(
-            vendor, modem_port, audio_mode, pcm_port,
+            vendor, modem_port, audio_mode, pcm_port, warnings=self.hardware_warnings,
         )
         self.modem = modem or create_modem(modem_port, baudrate, vendor)
         self._modem_vendor = getattr(self.modem, "vendor", vendor)

@@ -824,6 +824,10 @@
   .setup-status.ok { color: var(--ok); border-color: rgba(48,209,88,.36); background: var(--ok-dim); }
   .setup-status.err { color: var(--err); border-color: rgba(255,69,58,.36); background: var(--err-dim); }
   .setup-status:empty { display: none; }
+  #modemAudioWarning {
+    margin: 0; border-width: 0 0 1px; border-radius: 0; flex-shrink: 0;
+    line-height: 1.6; overflow-wrap: anywhere;
+  }
   .model-download { margin-top: 14px; }
   .model-download .dl-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .dl-bar { height: 6px; border-radius: 3px; background: var(--well); overflow: hidden; flex: 1; min-width: 120px; margin-top: 10px; }
@@ -933,6 +937,8 @@
       <span>PROVIDER <b id="provider">-</b></span>
     </div>
   </header>
+
+  <p id="modemAudioWarning" class="setup-status err" hidden role="status"></p>
 
   <aside id="updateBanner" class="update-banner" hidden aria-live="polite">
     <span id="updateTitle"></span>
@@ -2368,7 +2374,10 @@ function setModem(connected, resetting = false) {
   modemConnected = connected;
   modemResetting = resetting;
   const needsPowerCycle = !!lastMeta?.hardware?.needs_power_cycle;
-  $("modemDot").classList.toggle("on", connected && !resetting && !needsPowerCycle);
+  const audioWarning = (lastMeta?.hardware?.warnings || []).join("\n");
+  $("modemAudioWarning").textContent = audioWarning;
+  $("modemAudioWarning").hidden = !audioWarning;
+  $("modemDot").classList.toggle("on", connected && !resetting && !needsPowerCycle && !audioWarning);
   $("modemDot").classList.toggle("resetting", resetting);
   const phoneLine = lastMeta?.hardware?.line_kind === "bluetooth";
   $("modemState").textContent = phoneLine
@@ -4382,6 +4391,10 @@ function renderSetupHardware() {
   }
   if (hw.needs_power_cycle) {
     setupStatus("setupHwStatus", "err", t("modem_power_cycle"));
+    return;
+  }
+  if (hw.warnings?.length) {
+    setupStatus("setupHwStatus", "err", hw.warnings.join("\n"));
     return;
   }
   const hint = hw.modem_resetting ? "reset" : !hw.usb_online ? "usb"

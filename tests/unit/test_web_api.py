@@ -705,6 +705,7 @@ def test_meta_includes_setup_and_hardware_status(monkeypatch):
     meta = api(app, fn)
     assert meta["setup_required"] is True
     assert meta["hardware"] == {
+        "warnings": [],
         "usb_online": True,
         "modem_connected": False,
         "modem_resetting": False,
@@ -1698,9 +1699,41 @@ def test_meta_returns_injected_metadata(monkeypatch):
     assert meta["credentials"]["ok"] is False
     assert meta["setup_required"] is True
     assert set(meta["hardware"]) == {
+        "warnings",
         "usb_online", "modem_connected", "modem_resetting", "needs_power_cycle",
         "port", "vendor", "model", "firmware", "signal",
     }
+
+
+@pytest.mark.parametrize("mismatch", [True, False])
+def test_audio_mode_warning_in_meta_and_selftest(monkeypatch, mismatch):
+    from agentcall import modem_hardware
+    from agentcall.call_agent import CallAgentService
+    from agentcall.modem import Sim7600Modem
+
+    monkeypatch.setenv("MODEM_AUDIO_MODE", "uac" if mismatch else "nmea")
+    monkeypatch.setattr(modem_hardware, "detect_modem", lambda: modem_hardware.PRESETS[1].state())
+    monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: True)
+    mode = config.get_str("MODEM_AUDIO_MODE")
+    service = CallAgentService("fixed", "unused", vendor="auto", audio_mode=mode,
+                               modem=Sim7600Modem("unused"))
+    assert service.audio_mode == mode
+    assert config.get_str("MODEM_AUDIO_MODE") == mode
+    app = build_app(hub=None, modem=None, service=service, meta={})
+
+    async def fn(client):
+        meta = await (await client.get("/api/meta")).json()
+        report = await (await client.get("/api/modem/selftest")).json()
+        assert meta["hardware"]["warnings"] == report["warnings"] == service.hardware_warnings
+        assert report["ok"] is not mismatch
+        if mismatch:
+            assert "simcom" in report["warnings"][0]
+            assert "建议改为 nmea" in report["warnings"][0]
+
+    try:
+        api(app, fn)
+    finally:
+        service.stop_service()
 
 
 @pytest.mark.parametrize("simcom", [False, True])
