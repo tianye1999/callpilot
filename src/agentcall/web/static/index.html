@@ -880,6 +880,9 @@
     height: 24px; background: var(--bg); z-index: 31; }
   .dock { bottom: 30px; }
   #appVersion { overflow-wrap: anywhere; }
+  #linuxUpdate { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  #linuxUpdate p { margin: 8px 0; overflow-wrap: anywhere; }
+  #linuxUpdateActions { display: flex; flex-wrap: wrap; gap: 8px; }
   @media (max-width: 520px) {
     .version-footer { height: 40px; }
     .dock { bottom: 46px; }
@@ -1225,6 +1228,16 @@
             <div class="dl-meta" id="panelDlMeta"></div>
             <div class="setup-status" id="panelDlStatus"></div>
           </div>
+          <div id="linuxUpdate" hidden>
+            <strong data-i18n="linux_update_title"></strong>
+            <p id="linuxUpdateVersion"></p>
+            <p id="linuxUpdateStatus" role="status"></p>
+            <p id="linuxUpdateResult"></p>
+            <div id="linuxUpdateActions">
+              <button class="btn primary sm" id="linuxUpdateStart" type="button" disabled data-i18n="linux_update_start"></button>
+              <button class="btn ghost sm" id="linuxUpdateCheck" type="button" data-i18n="linux_update_check"></button>
+            </div>
+          </div>
           <div id="configForm"><div class="empty" data-i18n="cfg_loading"></div></div>
           <div class="cfg-save">
             <button class="btn primary sm" id="configSave" data-i18n="cfg_save"></button>
@@ -1465,6 +1478,10 @@ const I18N = {
     app_name: "KinyAI SIM Assistant",
     slogan: "Your calls, handled by AI",
     nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_metrics: "Metrics", nav_profiles: "Presets", nav_settings: "Settings",
+    linux_update_title: "Linux Update", linux_update_start: "Upgrade Now", linux_update_check: "Check for Updates",
+    linux_update_running: "Upgrading. The service will restart for about 1 minute.",
+    linux_update_failed: "Update failed. Check journalctl -u callpilot-update.service on the Pi.",
+    linux_update_timeout: "Update has not completed. Check the update service on the Pi before retrying.",
     st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
     conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
     modem_on: "Modem ready", modem_off: "Modem offline",
@@ -1804,6 +1821,10 @@ const I18N = {
     app_name: "KinyAI-SIM助手",
     slogan: "电话，交给 AI",
     nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_metrics: "指标", nav_profiles: "任务库", nav_settings: "设置",
+    linux_update_title: "Linux 升级", linux_update_start: "立即升级", linux_update_check: "检查更新",
+    linux_update_running: "升级中，服务会重启约 1 分钟。",
+    linux_update_failed: "升级失败，请在 Pi 上检查 journalctl -u callpilot-update.service。",
+    linux_update_timeout: "升级尚未完成，请在 Pi 上检查升级服务后再重试。",
     st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
     conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
     modem_on: "模组就绪", modem_off: "模组未连接",
@@ -2650,6 +2671,8 @@ async function loadMeta() {
   try {
     const m = await (await fetch("/api/meta")).json();
     lastMeta = m;
+    $("linuxUpdate").hidden = !m.linux_update_enabled;
+    if (m.linux_update_enabled) loadLinuxUpdate();
     renderRelease();
     $("macosAutostartRow").hidden = typeof m.macos_autostart !== "boolean";
     if (!$("macosAutostart").disabled) $("macosAutostart").checked = m.macos_autostart === true;
@@ -2679,6 +2702,80 @@ async function loadMeta() {
     }
   } catch (e) { console.warn("[meta] 加载运行信息失败", e); }
 }
+
+let linuxUpdatePending = false;
+let linuxUpdateRunning = false;
+let linuxUpdateData = null;
+async function loadLinuxUpdate() {
+  if (linuxUpdatePending || linuxUpdateRunning) return;
+  linuxUpdatePending = true;
+  try {
+    const response = await fetch("/api/linux_update/status");
+    const data = await response.json();
+    linuxUpdateData = data;
+    $("linuxUpdateVersion").textContent = `${LANG === "zh" ? "当前版本" : "Current version"}: ${data.build || "-"} (${data.sha || "-"})`;
+    const unit = data.last_result || {};
+    const running = ["activating", "active", "deactivating"].includes(unit.ActiveState);
+    $("linuxUpdateStatus").textContent = running ? t("linux_update_running") : data.error || (data.ahead > 0
+      ? (LANG === "zh" ? `有 ${data.ahead} 个新提交（最新：${data.latest}）` : `${data.ahead} new commits (latest: ${data.latest})`)
+      : (LANG === "zh" ? "已是最新版本" : "Up to date"));
+    if (!data.installed) $("linuxUpdateStatus").textContent = LANG === "zh"
+      ? "请先在 Pi 上运行：bash scripts/linux/install.sh --update-components"
+      : "Run on the Pi first: bash scripts/linux/install.sh --update-components";
+    $("linuxUpdateResult").textContent = unit.InactiveEnterTimestamp
+      ? `${LANG === "zh" ? "上次升级" : "Last update"}: ${unit.Result || "-"} (${unit.ExecMainStatus || "0"}) · ${unit.InactiveEnterTimestamp}` : "";
+    $("linuxUpdateStart").disabled = !response.ok || !data.installed || !data.ahead || !!data.error || running
+      || !!lastMeta?.call_active || !!lastMeta?.dial_queue_busy;
+    if (running) pollLinuxUpdate(unit.InactiveEnterTimestamp || "");
+  } catch (e) {
+    $("linuxUpdateStatus").textContent = String(e);
+    $("linuxUpdateStart").disabled = true;
+  } finally { linuxUpdatePending = false; }
+}
+async function pollLinuxUpdate(previousTime) {
+  linuxUpdateRunning = true;
+  $("linuxUpdateStart").disabled = true;
+  $("linuxUpdateCheck").disabled = true;
+  $("linuxUpdateStatus").textContent = t("linux_update_running");
+  const deadline = Date.now() + 16 * 60 * 1000;
+  const poll = async () => {
+    try {
+      const meta = await fetch("/api/meta", { cache: "no-store", signal: AbortSignal.timeout(5000) });
+      if (meta.ok) {
+        const response = await fetch("/api/linux_update/status", { cache: "no-store", signal: AbortSignal.timeout(20000) });
+        const data = await response.json();
+        const unit = data.last_result || {};
+        if (response.ok && ["inactive", "failed"].includes(unit.ActiveState)
+            && unit.InactiveEnterTimestamp && unit.InactiveEnterTimestamp !== previousTime) {
+          if (unit.Result === "success") { location.reload(); return; }
+          $("linuxUpdateStatus").textContent = t("linux_update_failed");
+          linuxUpdateRunning = false;
+          $("linuxUpdateCheck").disabled = false;
+          return;
+        }
+      }
+    } catch (e) { /* Service restart temporarily disconnects the browser. */ }
+    if (Date.now() < deadline) setTimeout(poll, 2000);
+    else {
+      $("linuxUpdateStatus").textContent = t("linux_update_timeout");
+      linuxUpdateRunning = false;
+      $("linuxUpdateCheck").disabled = false;
+    }
+  };
+  setTimeout(poll, 2000);
+}
+$("linuxUpdateCheck").addEventListener("click", loadLinuxUpdate);
+$("linuxUpdateStart").addEventListener("click", async () => {
+  $("linuxUpdateStart").disabled = true;
+  try {
+    const { httpOk, res } = await postJson("/api/linux_update/start", {});
+    if (!httpOk) throw new Error(res.error || t("linux_update_failed"));
+    pollLinuxUpdate(linuxUpdateData?.last_result?.InactiveEnterTimestamp || "");
+  } catch (e) {
+    $("linuxUpdateStatus").textContent = String(e);
+    $("linuxUpdateStart").disabled = false;
+  }
+});
 
 function renderRelease() {
   const meta = lastMeta || {};

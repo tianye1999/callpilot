@@ -172,7 +172,7 @@ case "$tool" in
                 mkdir -p -- "${target%/*}"
                 cp -- "${args[$(($# - 2))]}" "$target"
                 ;;
-            usermod|true|systemctl|apt-get) exec "$executable" "${@:2}" ;;
+            usermod|true|systemctl|apt-get|visudo) exec "$executable" "${@:2}" ;;
         esac
         ;;
 esac
@@ -204,7 +204,7 @@ def installer(tmp_path, fake_tool):
     for name in (
         "uname", "id", "getent", "sudo", "true", "uv", "ffmpeg", "systemctl",
         "udevadm", "usermod", "git", "curl",
-        "wireplumber", "apt-get",
+        "wireplumber", "apt-get", "visudo",
     ):
         (bin_dir / name).symlink_to(fake_tool)
     venv = root / ".venv" / "bin"
@@ -303,6 +303,35 @@ def test_install_is_repeatable_and_now_is_explicit(installer):
     calls = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     assert ["sudo", "systemctl", "enable", "--now", "callpilot-edge.service"] in calls
     assert f"Using uv: {_bin / 'uv'}" in result.stdout
+
+
+def test_update_components_only_are_repeatable_and_least_privilege(installer):
+    root, trace, system, _, run = installer
+    for _ in range(2):
+        result = run('--update-components')
+        assert result.returncode == 0, result.stdout + result.stderr
+    unit = (system / 'etc/systemd/system/callpilot-update.service').read_text(encoding='utf-8')
+    assert 'Type=oneshot\nUser=edge\n' in unit
+    assert f'WorkingDirectory={root}\n' in unit
+    assert f'ExecStart=/bin/bash "{root}/scripts/linux/update.sh"' in unit
+    assert 'ExecStartPost=+/usr/bin/systemctl restart callpilot-edge.service' in unit
+    assert '--health-check' in unit
+    assert 'PartOf=' not in unit and 'Requires=callpilot-edge' not in unit
+    rule = (system / 'etc/sudoers.d/callpilot-update').read_text(encoding='utf-8')
+    assert rule == 'edge ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block callpilot-update.service\n'
+    calls = _calls(trace)
+    validation = next(i for i, c in enumerate(calls) if c[:3] == ['sudo', 'visudo', '-cf'])
+    install = next(i for i, c in enumerate(calls) if c[:4] == ['sudo', 'install', '-D', '-m'])
+    assert validation < install
+    assert any(c[:5] == ['sudo', 'install', '-D', '-m', '0440'] for c in calls)
+    assert not any(c[0] in {'uv', 'pip', 'udevadm'} or 'restart' in c or 'start' in c for c in calls)
+
+
+def test_invalid_sudoers_is_not_installed(installer):
+    _, _, system, _, run = installer
+    result = run('--update-components', FAIL_TOOL='visudo')
+    assert result.returncode != 0 and 'validation failed' in result.stderr
+    assert not system.exists()
 
 
 def test_install_finds_uv_in_local_bin_outside_path(installer, tmp_path):
@@ -602,6 +631,20 @@ def test_update_legacy_edge_requires_force_but_can_bootstrap(updater):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "unknown" in result.stdout
     assert _git(root, "rev-parse", "HEAD") == new
+
+
+def test_systemd_update_prepares_without_sudo_and_health_is_separate(updater):
+    root, trace, _system, _bin, run, _old, new, _remote = updater
+    result = run(CALLPILOT_UPDATE_SYSTEMD='1')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _git(root, 'rev-parse', 'HEAD') == new
+    assert not any(c[0] == 'sudo' for c in _calls(trace))
+    before = len(_calls(trace))
+    result = run('--health-check', CALLPILOT_UPDATE_SYSTEMD='1')
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = _calls(trace)[before:]
+    assert not any(c[0] in {'sudo', 'uv', 'pip'} or 'fetch' in c for c in calls)
+    assert ['systemctl', 'is-active', '--quiet', 'callpilot-edge.service'] in calls
 
 
 def test_update_rechecks_busy_before_restart(updater):

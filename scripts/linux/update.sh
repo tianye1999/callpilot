@@ -9,6 +9,7 @@ ADOPT=false
 FORCE=false
 DRY_RUN=false
 BLUETOOTH=false
+HEALTH_ONLY=false
 BRANCH=""
 TMP=""
 BACKUP=""
@@ -54,6 +55,7 @@ while [ "$#" -gt 0 ]; do
         --force) FORCE=true ;;
         --dry-run) DRY_RUN=true ;;
         --bluetooth) BLUETOOTH=true ;;
+        --health-check) HEALTH_ONLY=true ;;
         --branch)
             [ "$#" -ge 2 ] && [ -n "$2" ] || die "--branch requires a branch name."
             BRANCH="$2"; shift ;;
@@ -138,6 +140,23 @@ print(int(port))
 PY
 )"
 BASE_URL="http://127.0.0.1:$PORT"
+check_health() {
+    local deadline code
+    deadline=$((SECONDS + HEALTH_TIMEOUT))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if code="$(curl --noproxy '*' --silent --show-error --connect-timeout 1 --max-time 2 --output /dev/null --write-out '%{http_code}' "$BASE_URL/api/meta" 2>/dev/null)" \
+            && [ "$code" = 200 ] && systemctl is-active --quiet "$SERVICE"; then
+            info "Service active; loopback /api/meta HTTP 200. Hardware/audio acceptance is still separate."
+            return 0
+        fi
+        sleep 1
+    done
+    die "Health check failed after about $HEALTH_TIMEOUT seconds; expected HTTP 200 and active $SERVICE. Inspect journalctl -u callpilot-update.service; roll back to the old SHA printed there if necessary."
+}
+if [ "$HEALTH_ONLY" = true ]; then
+    check_health
+    exit 0
+fi
 check_idle() {
     local meta queue remote state
     meta="$(curl --noproxy '*' --fail --silent --show-error --connect-timeout 2 --max-time 3 "$BASE_URL/api/meta" 2>/dev/null)" || meta=""
@@ -286,7 +305,9 @@ if [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ]; then
 fi
 [ -n "$UV_BIN" ] || die "uv is required. Install explicitly: https://docs.astral.sh/uv/getting-started/installation/ ; then export PATH=\"\$HOME/.local/bin:\$PATH\"."
 info "Using uv: $UV_BIN"
-sudo true || die "sudo command authentication failed. Run from an interactive terminal to enter a password, or check this user's sudo command permissions."
+if [ "${CALLPILOT_UPDATE_SYSTEMD:-}" != 1 ]; then
+    sudo true || die "sudo command authentication failed. Run from an interactive terminal to enter a password, or check this user's sudo command permissions."
+fi
 check_idle
 check_clean
 [ "$(git rev-parse HEAD)" = "$OLD_SHA" ] || die "HEAD changed during update; retry after inspecting the worktree."
@@ -313,15 +334,11 @@ expected = set(dotenv_values(".env.example")) | set(dotenv_values("scripts/linux
 print("\n".join(sorted(expected - present)) or "(none)")
 PY
 check_idle
+info "Update code: $OLD_SHA -> $NEW_SHA (use the old SHA for manual rollback if restart/health fails)."
+if [ "${CALLPILOT_UPDATE_SYSTEMD:-}" = 1 ]; then
+    info "Prepared; the independent systemd unit will restart Edge and check health."
+    exit 0
+fi
 sudo systemctl restart "$SERVICE"
-DEADLINE=$((SECONDS + HEALTH_TIMEOUT))
-while [ "$SECONDS" -lt "$DEADLINE" ]; do
-    if CODE="$(curl --noproxy '*' --silent --show-error --connect-timeout 1 --max-time 2 --output /dev/null --write-out '%{http_code}' "$BASE_URL/api/meta" 2>/dev/null)" \
-        && [ "$CODE" = 200 ] && sudo systemctl is-active --quiet "$SERVICE"; then
-        info "Update successful: $OLD_SHA -> $NEW_SHA"
-        info "Service active; loopback /api/meta HTTP 200. Hardware/audio acceptance is still separate."
-        exit 0
-    fi
-    sleep 1
-done
-die "Health check failed after about $HEALTH_TIMEOUT seconds; expected HTTP 200 and active $SERVICE."
+check_health
+info "Update successful: $OLD_SHA -> $NEW_SHA"

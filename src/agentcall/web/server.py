@@ -369,6 +369,9 @@ def build_app(
     app["build"] = BUILD
     app["release_notes"] = RELEASE_NOTES
     app["updates"] = UpdateChecker(config.data_dir() / "updates.json")
+    from ..linux_update import LinuxUpdater
+
+    app["linux_update"] = LinuxUpdater(Path(__file__).resolve().parents[3])
     app.cleanup_ctx.append(watch_updates)
     app["tray_usb"] = {"task": None, "online": None, "checked": -float("inf")}
     # 由 app.py 传入的 threading.Event；置位后主循环停止、清理并按运行方式重启。
@@ -395,6 +398,8 @@ def build_app(
     app.router.add_get("/callpilot-192.png", _remote_dialer_asset)
     app.router.add_get("/callpilot-512.png", _remote_dialer_asset)
     app.router.add_get("/api/meta", _meta)
+    app.router.add_get("/api/linux_update/status", _linux_update_status)
+    app.router.add_post("/api/linux_update/start", _linux_update_start)
     app.router.add_post("/api/updates/dismiss", _dismiss_update)
     app.router.add_post("/api/updates/claim-notification", _claim_update_notification)
     app.router.add_post("/api/updates/check", _check_update)
@@ -477,6 +482,30 @@ def _require_local(request: web.Request) -> None:
             or (origin and origin != f"{request.scheme}://{request.host}")
             or request.headers.get("Sec-Fetch-Site") == "cross-site"):
         raise web.HTTPForbidden()
+
+
+async def _linux_update_status(request: web.Request) -> web.Response:
+    if not platforms.IS_LINUX:
+        return web.json_response({"available": False, "error": "Linux only"}, status=503)
+    return web.json_response(await request.app["linux_update"].status())
+
+
+async def _linux_update_start(request: web.Request) -> web.Response:
+    from ..linux_update import INSTALL_HINT
+
+    if not platforms.IS_LINUX:
+        return web.json_response({"available": False, "error": "Linux only"}, status=503)
+    if (request.headers.get("Origin") != f"{request.scheme}://{request.host}"
+            or request.headers.get("Sec-Fetch-Site") == "cross-site"):
+        raise web.HTTPForbidden()
+    service = request.app.get("service")
+    queue_status = getattr(service, "dial_queue_status", None)
+    queue = queue_status() if callable(queue_status) else {}
+    if _line_busy(request.app) or queue.get("active") or queue.get("pending") or queue.get("current") is not None:
+        return web.json_response({"error": "线路或拨号队列忙，请空闲后再升级。"}, status=409)
+    if not await request.app["linux_update"].start():
+        return web.json_response({"error": INSTALL_HINT}, status=503)
+    return web.json_response({"ok": True}, status=202)
 
 
 def _updates_enabled() -> bool:
@@ -679,6 +708,7 @@ async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
     meta["version"] = request.app["version"]
     meta["build"] = request.app["build"]
+    meta["linux_update_enabled"] = platforms.IS_LINUX
     meta["release_notes"] = request.app["release_notes"]
     meta["update"] = request.app["updates"].snapshot() if _updates_enabled() else None
     meta["executable"] = sys.executable

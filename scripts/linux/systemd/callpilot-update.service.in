@@ -1,0 +1,19 @@
+[Unit]
+Description=CallPilot one-shot worktree update
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@REPO@
+Environment=CALLPILOT_UPDATE_SYSTEMD=1
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+ExecStart=/bin/bash "@REPO@/scripts/linux/update.sh"
+# Only this fixed command runs as root, never repository code.
+ExecStartPost=+/usr/bin/systemctl restart callpilot-edge.service
+ExecStartPost=/bin/bash "@REPO@/scripts/linux/update.sh" --health-check
+TimeoutStartSec=15min
+StandardOutput=journal
+StandardError=journal
+UMask=0077

@@ -475,3 +475,49 @@ restart Edge; remove the **helper-owned** Lua file and
 `/etc/dbus-1/system.d/callpilot-ofono.conf`, reload D-Bus and restart user
 WirePlumber. Disable oFono only if nothing else uses it. Do not remove unrelated
 WirePlumber configuration or automatically unpair the phone.
+
+## 控制台一键升级（Linux）
+
+在设置页的「Linux 升级」区查看当前 build、工作区 HEAD、上游新提交数和最新提交标题，
+点击「立即升级」后页面等待独立升级单元完成，并在服务恢复后刷新。Git 检查结果缓存
+3 分钟（失败也缓存），单条命令超时 15 秒；「检查更新」不会绕过缓存。
+仅支持 origin 跟踪分支，不做定时升级。macOS 打包版更新逻辑不受影响。
+
+首次安装 `bash scripts/linux/install.sh` 会一并安装升级组件。已经安装的设备，先让工作区
+包含本次代码，然后在 Pi 上以 **Edge 服务用户**（例如 pi）执行一次：
+
+```bash
+cd /path/to/AgentCall
+bash scripts/linux/install.sh --update-components
+```
+
+Edge 也必须运行本次代码才会提供新 API。如果只是拉取文件而未重启进程，请在空闲维护
+窗口另行执行 `sudo systemctl restart callpilot-edge.service`；补装命令本身不会重启 Edge。
+
+不要整条命令加 sudo。此补装模式只更新 `callpilot-update.service` 和
+`/etc/sudoers.d/callpilot-update`，并 daemon-reload；不会装依赖、重启 Edge 或操作 udev。
+sudoers 先经 `sudo visudo -cf` 校验，再以 0440 安装，只允许免密执行：
+
+```text
+/usr/bin/systemctl start --no-block callpilot-update.service
+```
+
+升级单元是独立 oneshot，不属于 Edge 的 cgroup。更新脚本以服务用户运行；单元仅对
+固定的 `systemctl restart callpilot-edge.service` 使用特权 ExecStartPost，随后以服务用户
+检查回环 `/api/meta` 和服务状态。因此不需要授予 pi 更宽的免密 sudo 权限。
+单元没有 enable 或 timer，重启不会自动触发升级。
+
+局域网控制台仍需密码登录，升级 POST 额外强制同源 Origin 校验；本机回环免登录不变。
+API 和脚本都拒绝忙线，拨号队列未清空也不能升级。没有安装组件或免密规则时，API 会
+提示补装，不会返回 500。升级会短暂中断控制台，通常约一分钟；依赖安装较慢时可能更久。
+
+上次升级结果来自 systemd 的 Result、ExecMainStatus 和 InactiveEnterTimestamp，机器重启后
+可能丢失，不是持久升级历史。失败时在 Pi 上检查：
+
+```bash
+systemctl status callpilot-update.service
+journalctl -u callpilot-update.service -b --no-pager
+```
+
+不会自动回滚。日志包含旧 SHA 与新 SHA；确认空闲后按日志指引回退代码并重启 Edge。
+依赖需单独回退。真实 Pi 的安装、升级、音频和通话验收仍需机主在维护窗口完成。

@@ -7,6 +7,7 @@ LINUX="$ROOT/scripts/linux"
 SERVICE=callpilot-edge.service
 START_NOW=false
 BLUETOOTH=false
+UPDATE_ONLY=false
 
 info() { printf '[linux-install] %s\n' "$*"; }
 die() { printf '[linux-install] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -15,8 +16,9 @@ for arg in "$@"; do
     case "$arg" in
         --now) START_NOW=true ;;
         --bluetooth) BLUETOOTH=true ;;
+        --update-components) UPDATE_ONLY=true ;;
         -h|--help)
-            printf 'Usage: bash scripts/linux/install.sh [--now] [--bluetooth]\n'
+            printf 'Usage: bash scripts/linux/install.sh [--now] [--bluetooth] [--update-components]\n'
             printf '%s\n' '--bluetooth explicitly confirms the phone is idle and enables optional HFP setup.'
             printf 'Install and enable on boot; --now also starts the service. Run without sudo.\n'
             exit 0 ;;
@@ -34,6 +36,28 @@ esac
 case "$RUN_USER" in
     *[!a-zA-Z0-9_.-]*|'') die "Unsupported service username." ;;
 esac
+
+install_update_components() (
+    local unit_tmp sudo_tmp
+    unit_tmp="$(mktemp)"
+    sudo_tmp="$(mktemp)"
+    trap 'rm -f "$unit_tmp" "$sudo_tmp"' EXIT
+    sed -e "s|@USER@|$RUN_USER|g" -e "s|@REPO@|$ROOT|g" \
+        "$LINUX/systemd/callpilot-update.service.in" > "$unit_tmp"
+    printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block callpilot-update.service\n' \
+        "$RUN_USER" > "$sudo_tmp"
+    sudo visudo -cf "$sudo_tmp" || die "Update sudoers validation failed; no update components installed."
+    sudo install -D -m 0644 "$unit_tmp" /etc/systemd/system/callpilot-update.service
+    sudo install -D -m 0440 "$sudo_tmp" /etc/sudoers.d/callpilot-update
+    sudo systemctl daemon-reload
+)
+
+if [ "$UPDATE_ONLY" = true ]; then
+    [ "$START_NOW" = false ] && [ "$BLUETOOTH" = false ] || die "Use --update-components alone."
+    install_update_components
+    info "Upgrade components installed; Edge was not restarted."
+    exit 0
+fi
 
 UV_BIN="$(command -v uv || true)"
 if [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ]; then
@@ -92,6 +116,7 @@ sudo install -D -m 0644 "$UNIT_TMP" "/etc/systemd/system/$SERVICE"
 sudo install -D -m 0644 "$LINUX/systemd/90-callpilot.conf" "/etc/systemd/journald.conf.d/90-callpilot.conf"
 sudo systemctl restart systemd-journald
 sudo systemctl daemon-reload
+install_update_components
 if [ "$START_NOW" = true ]; then
     sudo systemctl enable --now "$SERVICE"
 else

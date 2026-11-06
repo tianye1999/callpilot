@@ -19,6 +19,70 @@ REMOTE_MANIFEST = INDEX.with_name("manifest.webmanifest")
 REMOTE_SW = INDEX.with_name("remote_dialer_sw.js")
 
 
+def test_linux_update_render_and_restart_polling():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute frontend update behavior")
+    text = INDEX.read_text(encoding="utf-8")
+    source = text[text.index("let linuxUpdatePending ="):text.index("function renderRelease()")]
+    script = r'''
+const assert = require('node:assert/strict');
+const nodes = new Map();
+const $ = id => {
+  if (!nodes.has(id)) nodes.set(id, {textContent: '', disabled: false, addEventListener() {}});
+  return nodes.get(id);
+};
+const LANG = 'zh';
+const t = key => key;
+let lastMeta = {call_active: false, dial_queue_busy: false};
+let scheduled;
+const setTimeout = fn => { scheduled = fn; };
+let reloads = 0;
+const location = {reload() { reloads++; }};
+let data = {installed: true, build: '26.11.6', sha: 'abcdef0', ahead: 2, latest: '<img onerror=bad()>',
+  last_result: {ActiveState: 'inactive', Result: 'success', InactiveEnterTimestamp: 'old'}};
+let urls = [];
+const fetch = async url => { urls.push(url); return {ok: true, json: async () => data}; };
+'''
+    script += source + r'''
+(async () => {
+  await loadLinuxUpdate();
+  assert.equal($('linuxUpdateStart').disabled, false);
+  assert.match($('linuxUpdateStatus').textContent, /<img onerror=bad\(\)>/);
+  lastMeta.dial_queue_busy = true;
+  await loadLinuxUpdate();
+  assert.equal($('linuxUpdateStart').disabled, true);
+  lastMeta.dial_queue_busy = false;
+  data.ahead = 0;
+  await loadLinuxUpdate();
+  assert.equal($('linuxUpdateStart').disabled, true);
+  data.installed = false;
+  await loadLinuxUpdate();
+  assert.match($('linuxUpdateStatus').textContent, /install.sh --update-components/);
+  data.installed = true;
+  data.last_result.ActiveState = 'activating';
+  pollLinuxUpdate('old');
+  await scheduled();
+  assert.equal(reloads, 0);
+  data.last_result.ActiveState = 'inactive';
+  await scheduled();
+  assert.equal(reloads, 0); // Old HTTP 200 / old result is not completion.
+  data.last_result.InactiveEnterTimestamp = 'new';
+  await scheduled();
+  assert.equal(reloads, 1);
+  assert.ok(urls.includes('/api/meta'));
+  data.last_result.Result = 'exit-code';
+  pollLinuxUpdate('old');
+  await scheduled();
+  assert.equal(reloads, 1);
+  assert.equal($('linuxUpdateStatus').textContent, 'linux_update_failed');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+    result = subprocess.run([node, '-'], input=script, capture_output=True,
+                            text=True, encoding='utf-8', timeout=NODE_TIMEOUT)
+    assert result.returncode == 0, result.stderr
+
+
 def test_fetch_redirects_any_401_to_login():
     node = shutil.which("node")
     if node is None:
