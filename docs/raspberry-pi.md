@@ -483,6 +483,9 @@ WirePlumber configuration or automatically unpair the phone.
 3 分钟（失败也缓存），单条命令超时 15 秒；「检查更新」不会绕过缓存。
 仅支持 origin 跟踪分支，不做定时升级。macOS 打包版更新逻辑不受影响。
 
+真机验收方式：推送一个新提交后，在控制台点「立即升级」（或回环 `POST /api/linux_update/start`），
+确认 `journalctl -u callpilot-update.service` 依次出现拉取新 SHA、重启 Edge、健康检查通过，且 `/api/meta` 的 build 变为新 SHA。
+
 首次安装 `bash scripts/linux/install.sh` 会一并安装升级组件。已经安装的设备，先让工作区
 包含本次代码，然后在 Pi 上以 **Edge 服务用户**（例如 pi）执行一次：
 
