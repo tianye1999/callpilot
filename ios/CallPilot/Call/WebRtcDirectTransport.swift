@@ -52,6 +52,8 @@ final class WebRtcDirectTransport: CallDirectMediaTransport {
         let configuration = LKRTCConfiguration()
         configuration.sdpSemantics = .unifiedPlan
         configuration.continualGatheringPolicy = .gatherOnce
+        // Edge (aiortc) only uses the first BUNDLE m-section's candidates; gather one shared transport.
+        configuration.bundlePolicy = .maxBundle
         configuration.iceServers = servers.map {
             LKRTCIceServer(urlStrings: $0.urls, username: $0.username, credential: $0.credential)
         }

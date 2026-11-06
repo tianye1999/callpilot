@@ -184,6 +184,10 @@ class WebRtcDirectSession(
             ).apply {
                 sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
                 continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
+                // Edge (aiortc) only takes the first BUNDLE m-section's candidates; under the default
+                // BALANCED policy the data channel gathered its own set (and TURN allocation), so the
+                // relay candidate sometimes existed only there and Edge never saw it (Pi, 11-06).
+                bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
                 // libwebrtc (controlling) only sends USE-CANDIDATE on its next ping of the selected pair;
                 // the default writable-pair ping interval (900 ms, 2.5 s once stable) held Edge's ICE
                 // completion ~2.4 s after the pair already worked (Pi, 11-05). A short interval nominates
