@@ -158,10 +158,9 @@ def main(*, stop_requested: Callable[[], bool] | None = None, hardware_selftest:
     log_dir = config.log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "app.log"
-    file_handler = (
-        logging.handlers.RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
-        if config._is_frozen() else logging.FileHandler(log_file, encoding="utf-8")
-    )
+    # 源码运行也要轮转：树莓派按 systemd 源码常驻，原来的 FileHandler 4 天长到 38 MB、只增不减。
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     )

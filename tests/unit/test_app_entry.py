@@ -127,7 +127,7 @@ def test_main_serves_meta_while_local_models_preload(monkeypatch, tmp_path, prov
     monkeypatch.setattr(app, "load_dotenv", lambda *a: None)
     monkeypatch.setattr(app.config, "data_dir", lambda: tmp_path)
     monkeypatch.setattr(app.config, "log_dir", lambda: tmp_path)
-    monkeypatch.setattr(app.logging, "FileHandler", lambda *a, **kw: app.logging.NullHandler())
+    monkeypatch.setattr(app.logging.handlers, "RotatingFileHandler", lambda *a, **kw: app.logging.NullHandler())
     monkeypatch.setattr(app.number_profiles, "ensure_seeded", lambda: None)
     monkeypatch.setattr(app.call_playbooks, "ensure_seeded", lambda: None)
     monkeypatch.setattr(server, "detect_quectel_usb_online", lambda **kwargs: False)
