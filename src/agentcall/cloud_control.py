@@ -43,6 +43,8 @@ class CloudSessionService(Protocol):
 
     def line_busy(self) -> bool: ...
 
+    def next_remote_status_report(self) -> dict[str, Any] | None: ...
+
     def start_cloud_remote_session(
         self, command: dict[str, Any], reply: Callable[[str | None, str | None], None] | None = None
     ) -> tuple[bool, str | None]: ...
@@ -223,6 +225,7 @@ class CloudEdgeClient:
         self._last_disconnect_at: float | None = None
         self._reconnect_started_at: float | None = None
         self._connect_attempt = 0
+        self._pending_remote_status: dict[str, Any] | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -687,6 +690,7 @@ class CloudEdgeClient:
                         # Track the values actually sent, not a second service sample.
                         last_presence = presence
                         next_heartbeat = now + self._heartbeat_seconds
+                self._drain_remote_status_reports(websocket.send)
                 self._drain_takeover_events(websocket.send)
                 from .remote_alert_push import drain
 
@@ -697,6 +701,16 @@ class CloudEdgeClient:
                     continue
                 if isinstance(message, str):
                     self.handle_message(message, websocket.send)
+
+    def _drain_remote_status_reports(self, send: Callable[[str], None]) -> None:
+        for _ in range(32):
+            if self._pending_remote_status is None:
+                self._pending_remote_status = self.service.next_remote_status_report()
+            if self._pending_remote_status is None:
+                return
+            # Retain a report across a failed send and the next WS connection.
+            send(json.dumps(self._pending_remote_status, separators=(",", ":")))
+            self._pending_remote_status = None
 
     def _websocket_headers(self, credential: EdgeCredential) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {credential.value}"}

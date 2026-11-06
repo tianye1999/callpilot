@@ -40,6 +40,9 @@ class _Service:
     def remote_dialer_status(self) -> dict:
         return {"active": False}
 
+    def next_remote_status_report(self):
+        return None
+
     def line_busy(self) -> bool:
         return bool(self.remote_dialer_status().get("active"))
 
@@ -60,6 +63,27 @@ class _Service:
     def accept_inbound_takeover_claim(self, **fields) -> TakeoverResult:
         self.claims.append(fields)
         return TakeoverResult.success()
+
+
+def test_remote_timeout_status_retries_after_send_failure():
+    report = {"v": 1, "type": "call.status", "callId": "call_abcdefghijkl", "status": "failed"}
+    reports = [report]
+
+    class Service(_Service):
+        def next_remote_status_report(self):
+            return reports.pop(0) if reports else None
+
+    client = CloudEdgeClient("https://relay.example.test", Service(), _Store())
+
+    def broken_send(_message):
+        raise ConnectionError("disconnected")
+
+    with pytest.raises(ConnectionError):
+        client._drain_remote_status_reports(broken_send)
+    sent = []
+    client._drain_remote_status_reports(sent.append)
+    client._drain_remote_status_reports(sent.append)
+    assert [json.loads(message) for message in sent] == [report]
 
 
 class _Store:

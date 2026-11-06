@@ -132,9 +132,8 @@ class RemoteDialerRuntimeConfig:
     dtmf_tone_ms: int = 200
     dtmf_tone_amplitude: float = 0.50
     recording_enabled: bool = True
-    # A8: a direct session ends when the phone never reaches media_ready, across
-    # the direct attempt and its one fallback (one total budget, not per attempt).
-    phone_connect_timeout_seconds: float = 0.0
+    # One total budget across direct setup and its LiveKit fallback.
+    phone_connect_timeout_seconds: float = 60.0
     # A8: direct connected but no phone audio within this window → tell the phone
     # to fall back before dialing (same rule as the inbound direct path).
     phone_audio_timeout_seconds: float = 0.0
@@ -276,6 +275,7 @@ class RemoteWebDialerCoordinator:
         self._reserve_line = reserve_line or (lambda _owner: None)
         self._release_line = release_line or (lambda _owner: None)
         self._publish_event = publish_event
+        self.on_status: Callable[[dict[str, Any]], None] | None = None
         self._dial_guard = dial_guard or (lambda _number: None)
         self._dial_number = (dial_number or "").strip() or None
         if self._dial_number is not None:
@@ -349,7 +349,8 @@ class RemoteWebDialerCoordinator:
             self.edge_ready.set()
             await self._send_status("waiting_for_phone")
             phone_timeout = self.runtime.phone_connect_timeout_seconds
-            phone_deadline = time.monotonic() + phone_timeout if phone_timeout > 0 else None
+            phone_wait_started = time.monotonic()
+            phone_deadline = phone_wait_started + phone_timeout if phone_timeout > 0 else None
             while not self._stop_requested.is_set():
                 now = time.time()
                 if not self._dial_attempted and now >= self.expires_at:
@@ -367,6 +368,12 @@ class RemoteWebDialerCoordinator:
                         phone_deadline = None
                     elif time.monotonic() >= phone_deadline:
                         # Nobody to talk to: release the line instead of holding it to invite expiry.
+                        logger.info(
+                            "Remote phone join timeout: session_id=%s waited_seconds=%.3f "
+                            "browser_connected=%s media_ready=%s",
+                            self.session_id, time.monotonic() - phone_wait_started,
+                            self.endpoint.browser_connected, self.endpoint.media_ready,
+                        )
                         await self._send_status(
                             "failed", code="phone_not_connected", reason="phone_not_connected"
                         )
@@ -865,6 +872,8 @@ class RemoteWebDialerCoordinator:
         event = {"type": "status", "status": status}
         event.update({key: value for key, value in fields.items() if value is not None})
         self._last_status = event
+        if self.on_status is not None:
+            self.on_status(dict(event))
         try:
             await self.endpoint.send_event(event)
         except Exception as exc:  # noqa: BLE001

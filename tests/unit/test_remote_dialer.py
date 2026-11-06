@@ -1411,17 +1411,44 @@ def test_all_real_audio_bridges_satisfy_remote_full_duplex_contract() -> None:
     )
 
 
-def test_direct_session_releases_the_line_when_the_phone_never_connects() -> None:
+def test_direct_session_releases_the_line_when_the_phone_never_connects(caplog) -> None:
     async def run() -> None:
         endpoint = FakeRemoteEndpoint(media_ready=False)
         modem = FakeModem()
         coordinator = _coordinator(endpoint, modem, FakeBridge())
+        reported = []
+        coordinator.on_status = reported.append
         coordinator.runtime = dataclasses.replace(coordinator.runtime, phone_connect_timeout_seconds=0.1)
-        await asyncio.wait_for(coordinator.run(), 2.0)
+        with caplog.at_level("INFO", logger="agentcall.remote_dialer"):
+            await asyncio.wait_for(coordinator.run(), 2.0)
         failed = [e for e in endpoint.events if e.get("status") == "failed"]
         assert failed and failed[-1].get("code") == "phone_not_connected"
         assert modem.calls == []
+        assert coordinator.finished.is_set() and endpoint.closed
+        assert reported[-1]["status"] == "failed"
+        assert reported[-1]["code"] == "phone_not_connected"
+        assert "session_id=session-test" in caplog.text
+        assert "waited_seconds=" in caplog.text
+        assert "browser_connected=False media_ready=False" in caplog.text
 
+    asyncio.run(run())
+
+
+def test_dialed_session_is_not_ended_by_phone_connect_deadline() -> None:
+    async def run() -> None:
+        endpoint = FakeRemoteEndpoint(media_ready=True)
+        coordinator = _coordinator(
+            endpoint, FakeModem(), FakeBridge(), dial_number="10086",
+            phone_connect_timeout=0.05, grace=1.0,
+        )
+        task = asyncio.create_task(coordinator.run())
+        await _wait_for(lambda: coordinator._dial_attempted)
+        endpoint._media_ready = False
+        await asyncio.sleep(0.2)
+        assert not task.done()
+        assert not any(e.get("code") == "phone_not_connected" for e in endpoint.events)
+        coordinator.request_stop("test_done")
+        await task
     asyncio.run(run())
 
 

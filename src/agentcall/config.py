@@ -663,6 +663,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                editable=False, hidden=True),
     ConfigSpec("REMOTE_CONNECT_TIMEOUT_SECONDS", "远程外呼接通超时（秒）", "float", "45",
                editable=False, hidden=True),
+    ConfigSpec("REMOTE_PHONE_CONNECT_TIMEOUT_SECONDS", "手机入会媒体就绪超时（秒）", "float", "60",
+               editable=False, hidden=True),
     ConfigSpec("SETUP_DONE", "首次启动向导完成", "bool", "false",
                editable=False, hidden=True),
     # 预热调优项：单次握手超时与保活周期（秒），一般无需改动，不进面板。

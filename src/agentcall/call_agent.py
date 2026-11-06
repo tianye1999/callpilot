@@ -108,8 +108,6 @@ from .triage_judge import (
 
 logger = logging.getLogger(__name__)
 _MOSS_PREBRIEF_TIMEOUT = 30.0
-# A8: direct setup (phone ~20 s) plus one LiveKit fallback must finish within this.
-_OUTBOUND_DIRECT_PHONE_CONNECT_SECONDS = 60.0
 
 # 上行「有声」判定峰值（int16）。真机实测（2026-08-12）上行静音是纯数字零
 # （峰值中位 2、p90 13）——modem 不给底噪，所以阈值可以放得很低；而对端小声
@@ -5777,6 +5775,7 @@ class CallAgentService:
         self._bluetooth_incoming_records: dict[str, CallRecord] = {}
         self._remote_setup_lock = threading.Lock()
         self._remote_worker: RemoteDialerWorker | None = None
+        self._remote_status_reports: Queue[dict[str, Any]] = Queue()
         self._remote_invite: RemoteDialerInvite | None = None
         self._remote_session_device_id: str | None = None
         # A8: the direct request of the current app-dialed session, for its one LiveKit fallback.
@@ -6418,11 +6417,19 @@ class CallAgentService:
                                                    direct["iceServers"], reply)
                     worker = self._build_remote_worker_for_issued(
                         issued, endpoint=SwitchableInboundEndpoint(request),
-                        phone_connect_timeout=_OUTBOUND_DIRECT_PHONE_CONNECT_SECONDS,
                         phone_audio_timeout=_EARLY_ANSWER_CONNECTED_WAIT_SECONDS,
                         dial_number=dial_number)
                 else:
                     worker = self._build_remote_worker_for_issued(issued, dial_number=dial_number)
+                call_id = command["callId"]
+
+                def report_status(event: dict[str, Any]) -> None:
+                    if event.get("code") == "phone_not_connected":
+                        self._remote_status_reports.put_nowait({
+                            "v": 1, "type": "call.status", "callId": call_id, "status": "failed",
+                        })
+
+                worker.coordinator.on_status = report_status
                 self._remote_worker = worker
                 self._remote_invite = issued.invite
                 self._remote_session_device_id = f"cloud:{command['callId']}"
@@ -6440,6 +6447,12 @@ class CallAgentService:
                 )
                 return False, "MEDIA_FAILED"
         return True, None
+
+    def next_remote_status_report(self) -> dict[str, Any] | None:
+        try:
+            return self._remote_status_reports.get_nowait()
+        except Empty:
+            return None
 
     def fallback_outbound_direct(self, call_id: str, issued: IssuedLiveKitSession, reply: Reply) -> bool:
         """Switch the current direct app-dialed session to its LiveKit room (idempotent)."""
@@ -6589,7 +6602,7 @@ class CallAgentService:
 
     def _build_remote_worker_for_issued(
         self, issued: IssuedLiveKitSession, *, endpoint: RemoteMediaEndpoint | None = None,
-        phone_connect_timeout: float = 0.0, phone_audio_timeout: float = 0.0,
+        phone_audio_timeout: float = 0.0,
         dial_number: str | None = None,
     ) -> RemoteDialerWorker:
         from .livekit_media import LiveKitRemoteMediaEndpoint
@@ -6615,7 +6628,9 @@ class CallAgentService:
             dtmf_tone_ms=config.get_int("DTMF_TONE_MS"),
             dtmf_tone_amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
             recording_enabled=config.get_bool("REMOTE_HUMAN_RECORDING_ENABLED"),
-            phone_connect_timeout_seconds=phone_connect_timeout,
+            phone_connect_timeout_seconds=max(
+                1.0, config.get_float("REMOTE_PHONE_CONNECT_TIMEOUT_SECONDS")
+            ),
             phone_audio_timeout_seconds=phone_audio_timeout,
         )
         coordinator = RemoteWebDialerCoordinator(

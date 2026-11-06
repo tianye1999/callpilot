@@ -1097,6 +1097,58 @@ def test_opening_mode_reset_across_calls_no_leak(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.parametrize("direct", [False, True])
+def test_cloud_phone_join_timeout_releases_line_and_reports_failure(monkeypatch, direct):
+    class Endpoint:
+        media_ready = False
+        browser_connected = False
+        closed = False
+
+        async def connect(self):
+            pass
+
+        async def close(self):
+            self.closed = True
+
+        async def send_event(self, event):
+            pass
+
+        async def next_command(self, timeout):
+            await asyncio.sleep(timeout)
+            return None
+
+    monkeypatch.setenv("REMOTE_WEB_DIALER_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_CLOUD_ENABLED", "true")
+    monkeypatch.setenv("OUTBOUND_DIRECT_ENABLED", "true")
+    monkeypatch.setenv("REMOTE_PHONE_CONNECT_TIMEOUT_SECONDS", "1")
+    endpoint = Endpoint()
+    monkeypatch.setattr("agentcall.livekit_media.LiveKitRemoteMediaEndpoint", lambda _: endpoint)
+    monkeypatch.setattr("agentcall.call_agent.SwitchableInboundEndpoint", lambda _: endpoint)
+    service = make_service(FakeModem())
+    command = _outbound_direct_command()
+    if not direct:
+        del command["direct"]
+    ok, error = service.start_cloud_remote_session(command, reply=lambda *_: None)
+    assert ok and error is None
+    worker = service._remote_worker
+    try:
+        assert service.line_busy()
+        assert worker.coordinator.runtime.phone_connect_timeout_seconds == 1
+        assert worker.coordinator.finished.wait(3)
+        worker._thread.join(1)
+        assert not service.line_busy()
+        assert endpoint.closed
+        assert service.remote_dialer_status()["code"] == "phone_not_connected"
+        assert service.next_remote_status_report() == {
+            "v": 1, "type": "call.status", "callId": command["callId"], "status": "failed",
+        }
+        assert service.next_remote_status_report() is None
+        # The released slot accepts a fresh call, not LINE_BUSY.
+        assert service.start_cloud_remote_session(command, reply=lambda *_: None) == (True, None)
+    finally:
+        service.cancel_remote_dialer()
+
+
 def _outbound_direct_command() -> dict:
     return {
         "callId": "call_abcdefghijkl",
@@ -1136,7 +1188,7 @@ def test_outbound_direct_session_uses_switchable_endpoint_and_one_fallback(monke
     endpoint = built[0]["endpoint"]
     assert isinstance(endpoint, SwitchableInboundEndpoint)
     assert endpoint.request.media_offer() == ("v=0\r\ns=phone\r\n", [])
-    assert built[0]["phone_connect_timeout"] > 0
+    assert "phone_connect_timeout" not in built[0]  # Both transports use the configured budget.
     endpoint.request.reply("v=0\r\nanswer", None)
     assert answers == [("v=0\r\nanswer", None)]
 

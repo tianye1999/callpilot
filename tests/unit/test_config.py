@@ -49,6 +49,15 @@ def _unset(monkeypatch, *keys):
 # ---- 类型化读取与默认值 ----
 
 
+def test_phone_connect_timeout_default_matches_env_example(monkeypatch):
+    from dotenv import dotenv_values
+
+    key = "REMOTE_PHONE_CONNECT_TIMEOUT_SECONDS"
+    monkeypatch.delenv(key, raising=False)
+    example = dotenv_values(Path(__file__).resolve().parents[2] / ".env.example")
+    assert get_float(key) == float(example[key]) == 60.0
+
+
 def test_get_str_default_and_env_override(monkeypatch):
     _unset(monkeypatch, "QWEN_VOICE")
     assert get_str("QWEN_VOICE") == "Raymond"
