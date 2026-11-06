@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -29,14 +30,42 @@ class FakeTimer:
         self.callback()
 
 
+@pytest.mark.parametrize("verbose,level", [(None, logging.WARNING), ("false", logging.WARNING), ("true", logging.INFO)])
+def test_ice_logging_only_changes_dependency_loggers(monkeypatch, verbose, level):
+    if verbose is None:
+        monkeypatch.delenv("DIRECT_ICE_VERBOSE_LOG", raising=False)
+    else:
+        monkeypatch.setenv("DIRECT_ICE_VERBOSE_LOG", verbose)
+    names = ["aioice", "aiortc", "agentcall.webrtc_ice", "agentcall.webrtc_media"]
+    for name in names:
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.INFO)
+    app._configure_ice_logging()
+    for name in names[:2]:
+        assert logging.getLogger(name).level == level
+    for name in names[2:]:
+        assert logging.getLogger(name).level == logging.INFO
+
+
 @pytest.mark.parametrize("provider", ["local", "qwen", "openai", "doubao", "moss"])
 def test_main_serves_meta_while_local_models_preload(monkeypatch, tmp_path, provider):
     entered, release = threading.Event(), threading.Event()
     threads, sites = [], []
+    notifications = []
     loop = asyncio.new_event_loop()
     original_forever = loop.run_forever
     original_preload = local_agent.start_model_preload
     site_type = app.web.TCPSite
+
+    class Watchdog:
+        def __init__(self, actual_loop):
+            assert actual_loop is loop
+
+        def start(self):
+            assert sites[0]._server.is_serving()
+            notifications.append("ready")
+
+        def stop(self):
+            notifications.append("stop")
 
     def blocked_load(**kwargs):
         entered.set()
@@ -73,6 +102,7 @@ def test_main_serves_meta_while_local_models_preload(monkeypatch, tmp_path, prov
     monkeypatch.setattr(local_agent, "start_model_preload", preload)
     monkeypatch.setattr(app.asyncio, "new_event_loop", lambda: loop)
     monkeypatch.setattr(app.web, "TCPSite", site)
+    monkeypatch.setattr(app, "SystemdWatchdog", Watchdog)
     monkeypatch.setattr(app, "_open_browser_later", lambda _: monkeypatch.setattr(loop, "run_forever", run_forever))
     monkeypatch.setattr(app, "_force_utf8", lambda: None)
     monkeypatch.setattr(app, "_enable_thread_dump", lambda: None)
@@ -94,6 +124,7 @@ def test_main_serves_meta_while_local_models_preload(monkeypatch, tmp_path, prov
         monkeypatch.setenv(key, value)
     try:
         app.main()
+        assert notifications == ["ready", "stop"]
     finally:
         release.set()
         for thread in threads:

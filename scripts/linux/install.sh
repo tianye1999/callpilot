@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run as the service user. Only udev/systemd/group installation uses sudo.
+# Run as the service user. System configuration installation uses sudo.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -76,7 +76,7 @@ trap 'rm -f "$UNIT_TMP"' EXIT
 sed -e "s|@USER@|$RUN_USER|g" -e "s|@REPO@|$ROOT|g" \
     "$LINUX/systemd/$SERVICE.in" > "$UNIT_TMP"
 
-info "sudo is required now: install udev rules, grant dialout access, and install/enable $SERVICE."
+info "sudo is required now: install udev/unit/journal config, grant dialout access, and enable $SERVICE."
 info "Rules are re-triggered for USB serial devices; do this only outside an active call."
 # Check command rules, not sudo -v's verifypw policy for mixed password/NOPASSWD entries.
 sudo true || die "sudo command authentication failed. Run from an interactive terminal to enter a password, or check this user's sudo command permissions."
@@ -89,6 +89,8 @@ sudo udevadm trigger --action=add --subsystem-match=usb --attr-match=idVendor=1e
 sudo udevadm trigger --action=add --subsystem-match=tty --sysname-match='ttyUSB*'
 sudo udevadm settle --timeout=10
 sudo install -D -m 0644 "$UNIT_TMP" "/etc/systemd/system/$SERVICE"
+sudo install -D -m 0644 "$LINUX/systemd/90-callpilot.conf" "/etc/systemd/journald.conf.d/90-callpilot.conf"
+sudo systemctl restart systemd-journald
 sudo systemctl daemon-reload
 if [ "$START_NOW" = true ]; then
     sudo systemctl enable --now "$SERVICE"

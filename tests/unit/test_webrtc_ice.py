@@ -8,6 +8,31 @@ from types import SimpleNamespace
 from agentcall import webrtc_ice
 
 
+def test_ice_completed_summary_survives_dependency_log_suppression(monkeypatch, caplog):
+    import logging
+
+    from aiortc import RTCPeerConnection
+
+    async def scenario():
+        pc = RTCPeerConnection()
+        pc.addTransceiver("audio")
+        marks = []
+        try:
+            webrtc_ice.observe_setup(pc, marks.append)
+            transport = pc.getTransceivers()[0].receiver.transport.transport
+            transport._RTCIceTransport__state = "completed"
+            transport.emit("statechange")
+            assert "ice_completed" in marks
+        finally:
+            await pc.close()
+
+    for name in ("aioice", "aiortc"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.WARNING)
+    with caplog.at_level("INFO", logger="agentcall.webrtc_ice"):
+        asyncio.run(scenario())
+    assert "Direct ICE completed peer=" in caplog.text
+
+
 def test_candidate_timings_distinguish_ready_relay_from_stalled_stun(monkeypatch, caplog):
     from aioice import Candidate, Connection
 

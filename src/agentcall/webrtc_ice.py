@@ -500,6 +500,7 @@ def observe_setup(pc: Any, observe: Callable[[str], None]) -> None:
 
             def ice_state(transport: Any = transport) -> None:
                 if transport.state == "completed":
+                    logger.info("Direct ICE completed peer=%s transport=%s", id(pc), id(transport))
                     mark("ice_completed")
 
             def dtls_state(dtls: Any = dtls) -> None:

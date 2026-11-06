@@ -4,7 +4,9 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 User=@USER@
 SupplementaryGroups=dialout
 # WorkingDirectory takes the whole path, without quote removal (systemd 252).

@@ -26,10 +26,17 @@ from agentcall.cloud_credentials import CloudCredentialStore
 from agentcall.content_sync import ContentSyncRepository
 from agentcall.events import EventHub
 from agentcall.remote_pairing import RemotePairingStore
+from agentcall.systemd_watchdog import SystemdWatchdog
 from agentcall.web.remote_gateway import build_remote_gateway
 from agentcall.web.server import TrayAccessLogger, build_app
 
 logger = logging.getLogger("app")
+
+
+def _configure_ice_logging() -> None:
+    level = logging.INFO if config.get_bool("DIRECT_ICE_VERBOSE_LOG") else logging.WARNING
+    for name in ("aioice", "aiortc"):
+        logging.getLogger(name).setLevel(level)
 
 
 def _open_browser_later(url: str, delay: float = 1.0) -> threading.Timer | None:
@@ -161,6 +168,7 @@ def main(*, stop_requested: Callable[[], bool] | None = None, hardware_selftest:
         # 冻结入口或依赖可能已配置 root logger；服务必须接管自己的文件 handler。
         force=config._is_frozen(),
     )
+    _configure_ice_logging()
     logger.info("日志文件: %s", log_file)
     from agentcall.app_version import BUILD
 
@@ -350,11 +358,14 @@ def main(*, stop_requested: Callable[[], bool] | None = None, hardware_selftest:
     if stop_requested is not None:
         loop.call_later(0.25, check_stop)
 
+    watchdog = SystemdWatchdog(loop)
     try:
+        watchdog.start()
         loop.run_forever()
     except KeyboardInterrupt:
         logger.info("收到退出信号，正在关闭…")
     finally:
+        watchdog.stop()
         if prewarm_thread is not None:
             prewarm_thread.stop_event.set()
         if cloud_client is not None:

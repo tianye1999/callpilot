@@ -275,7 +275,12 @@ def test_install_is_repeatable_and_now_is_explicit(installer):
     assert ["uv", "python", "install", "3.13"] in calls
     assert ["uv", "python", "find", "3.13"] in calls
     assert ["sudo", "systemctl", "enable", "callpilot-edge.service"] in calls
-    assert not any("--now" in call or "start" in call or "restart" in call for call in calls)
+    assert not any("--now" in call or "start" in call for call in calls)
+    assert [call for call in calls if call[:3] == ["sudo", "systemctl", "restart"]] == [
+        ["sudo", "systemctl", "restart", "systemd-journald"],
+    ]
+    journal_path = system_root / "etc/systemd/journald.conf.d/90-callpilot.conf"
+    assert journal_path.read_text(encoding="utf-8") == "[Journal]\nSystemMaxUse=200M\n"
     assert ["sudo", "udevadm", "control", "--reload-rules"] in calls
     assert any(call[:3] == ["sudo", "udevadm", "trigger"] for call in calls)
     assert any(call[:2] == ["pip", "install"] for call in calls)  # Real setup.sh, fake pip.
@@ -287,11 +292,13 @@ def test_install_is_repeatable_and_now_is_explicit(installer):
         "After=network-online.target", "Wants=network-online.target", "Restart=on-failure",
         "RestartSec=5", "StandardOutput=journal", "StandardError=journal",
         "SupplementaryGroups=dialout", "Environment=WEB_OPEN_BROWSER=false", "KillSignal=SIGINT",
+        "Type=notify", "WatchdogSec=60", "NotifyAccess=main",
     ):
         assert line in unit
     result = run("--now")
     assert result.returncode == 0, result.stdout + result.stderr
     assert unit_path.read_text(encoding="utf-8") == unit
+    assert journal_path.read_text(encoding="utf-8") == "[Journal]\nSystemMaxUse=200M\n"
     assert (root / ".env").read_text(encoding="utf-8") == "KEEP_EXISTING=secret-placeholder\n"
     calls = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     assert ["sudo", "systemctl", "enable", "--now", "callpilot-edge.service"] in calls

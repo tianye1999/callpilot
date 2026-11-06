@@ -311,6 +311,7 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("INBOUND_FASTPATH_V2_ENABLED", "来电接管 V2 实验路径", "bool", "false"),
     ConfigSpec("OUTBOUND_DIRECT_ENABLED", "App 外呼走直连（LiveKit 兜底）", "bool", "true"),
     ConfigSpec("DIRECT_ICE_EARLY_COMPLETE_ENABLED", "直连 ICE 首对成功后提前完成（未真机验收）", "bool", "false"),
+    ConfigSpec("DIRECT_ICE_VERBOSE_LOG", "ICE 依赖详细日志（排障用）", "bool", "false"),
     ConfigSpec(
         "DIRECT_GATHER_SKIP_LOCAL_RELAY_ENABLED",
         "对端已带 relay 且本端 srflx 就绪时跳过本端 relay 等待",

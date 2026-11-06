@@ -66,18 +66,54 @@ bash scripts/linux/install.sh
 已有 `.env` 原样保留；不存在时由原 setup 复制根目录 `.env.example`，**它不是 Pi 配置**，
 必须完成下一步再启动或重启 Pi。旧的 Python 3.11 虚拟环境会被拒绝，需人工移走后重跑，不会自动删除。
 
-sudo 步骤只安装这两个规则和一个 unit、追加用户的 dialout 组权限、重载/触发 udev、enable 服务：
+sudo 步骤安装两个规则、一个 unit 和 journald drop-in，追加用户的 dialout 组权限、
+重载/触发 udev、重启 journald、enable 服务：
 
 - `/etc/udev/rules.d/77-callpilot-mm-ignore-sim7600.rules`：仅忽略此 VID/PID，不全局禁用 ModemManager。
 - `/etc/udev/rules.d/99-callpilot-sim7600.rules`：接口 `02` → `/dev/callpilot-sim7600-at`，
   接口 `04` → `/dev/callpilot-sim7600-pcm`，串口归 `dialout`、权限 `0660`。
 - `/etc/systemd/system/callpilot-edge.service`：普通用户、仓库工作目录、`.venv/bin/python app.py`，
-  等待网络、失败后 5 秒重启、输出到 journald。停止时发 SIGINT，复用入口已有的清理逻辑。
+  等待网络、`Type=notify`、`NotifyAccess=main`、`WatchdogSec=60`，失败后 5 秒重启、
+  输出到 journald。停止时发 SIGINT，复用入口已有的清理逻辑。
+- `/etc/systemd/journald.conf.d/90-callpilot.conf`：`[Journal]` 下设置 `SystemMaxUse=200M`，
+  随后重启 `systemd-journald`。重复安装覆盖同一文件，内容不累加；这是整机默认 namespace 的
+  **持久 journal** 限额，不仅限于 CallPilot；内存 journal 不受此项限制。
 
 默认只 **enable 开机启动，不立即启动**；这不停止已经运行的旧服务。
 `--now` 会执行 `systemctl enable --now`，仅在 `.env` 已准备好时使用；它不会重启已运行的服务。
 安装器重复运行不会覆盖 `.env`，不会重建有效 `.venv`，但会重新执行依赖安装及部署文件更新。
 仓库迁移路径后必须重跑安装器并安排服务重启，不能只移动文件。
+
+### 长期运行：日志与看门狗
+
+默认将第三方 `aioice`、`aiortc` logger 设为 WARNING，不再逐对输出 ICE 检查的 INFO 日志。
+我们自己的 `agentcall.webrtc_ice` / `agentcall.webrtc_media` gather、setup timing 与
+`Direct ICE completed` 汇总仍保留 INFO。排障时在 `.env` 设置 `DIRECT_ICE_VERBOSE_LOG=true`
+并重启 Edge 可恢复依赖 INFO；排障结束改回 `false` 再重启，避免持续写 SD 卡。
+
+启动完成且 HTTP 已监听后，主进程向 systemd 的 `NOTIFY_SOCKET` 发送 `READY=1`；
+同一事件循环通过 `call_later` 每 20 秒发送 `WATCHDOG=1`（若 supervisor 的超时更短，
+取超时的三分之一）。仅同时存在有效 `NOTIFY_SOCKET`、`WATCHDOG_USEC` 且 PID 匹配时启用，
+无这些变量的手工运行、macOS/Windows 不启用。不使用独立线程喂狗：事件循环卡死则心跳停止，
+60 秒未收到心跳后 systemd 判失败并按 `Restart=on-failure` 重启。该机制检查的是事件循环活性，
+不代表模组或所有业务线程健康；恢复时间还包括进程终止和重新启动时间，不保证通话不中断。
+通知格式与就绪语义见 [systemd sd_notify](https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html)。
+
+**已安装设备**：`update.sh` 不改 unit 或系统配置。更新代码后，在 Pi 的无通话窗口、仓库目录
+执行 `bash scripts/linux/install.sh && sudo systemctl restart callpilot-edge.service`，部署新 unit
+和 journal 上限并重启 Edge；这会复用安装流程（含依赖安装、udev 重触发），不覆盖 `.env`。
+如果只需手动安装 journal 上限，可执行一行：
+
+```bash
+sudo install -D -m 0644 scripts/linux/systemd/90-callpilot.conf /etc/systemd/journald.conf.d/90-callpilot.conf && sudo systemctl restart systemd-journald
+```
+
+`SystemMaxUse` 按 journal 文件粒度回收归档日志，不是绝对磁盘硬配额；现有 1.1 GB 不保证立即
+缩到 200M。先用 `journalctl --disk-usage` 检查；若明确允许删除旧日志，可另外执行
+`sudo journalctl --rotate --vacuum-size=200M`，该操作会删除整机旧归档，不能恢复。
+规则与回收限制见 [journald.conf](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)。
+此上限不涵盖源码运行额外写入的 `logs/app.log`（当前未轮转），也不涵盖录音；
+录音继续沿用 `RECORDING_RETENTION_DAYS`（默认 30 天），本任务不改其清理逻辑。
 
 编辑仓库 `.env`，将现有同名键改为下列值（不要用 Linux 示例覆盖整个文件，也不要追加重复键）：
 
