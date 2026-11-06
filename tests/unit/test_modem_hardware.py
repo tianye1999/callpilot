@@ -131,7 +131,16 @@ def test_vendor_scan_uses_platform_transport(monkeypatch, mac):
 ])
 def test_packaged_macos_defaults(monkeypatch, mac, frozen, vendor, interval):
     monkeypatch.setattr(platforms, "IS_MACOS", mac)
+    monkeypatch.setattr(platforms, "IS_LINUX", False)
     monkeypatch.setattr(platforms.sys, "frozen", frozen, raising=False)
     monkeypatch.delattr(platforms.sys, "_MEIPASS", raising=False)
     assert platforms.default_modem_vendor() == vendor
     assert platforms.default_signal_poll_seconds() == interval
+
+
+def test_linux_polls_signal_and_hardware_info_by_default(monkeypatch):
+    monkeypatch.setattr(platforms, "IS_MACOS", False)
+    monkeypatch.setattr(platforms, "IS_LINUX", True)
+    monkeypatch.setattr(platforms.sys, "frozen", False, raising=False)
+    monkeypatch.delattr(platforms.sys, "_MEIPASS", raising=False)
+    assert platforms.default_signal_poll_seconds() == 60

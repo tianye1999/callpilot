@@ -882,3 +882,20 @@ def test_loopback_timeout_reports_transport_state_and_drains_waiter():
             await peer.close()
 
     asyncio.run(scenario())
+
+
+def test_offer_candidate_summary_counts_without_addresses():
+    from agentcall.webrtc_media import offer_candidate_summary
+
+    sdp = "\r\n".join([
+        "v=0",
+        "a=candidate:1 1 udp 2122260223 192.0.2.10 50000 typ host generation 0",
+        "a=candidate:2 1 udp 1686052607 198.51.100.7 40000 typ srflx raddr 0.0.0.0 rport 0",
+        "a=candidate:3 1 udp 41885439 203.0.113.9 60000 typ relay raddr 198.51.100.7 rport 40000",
+        "a=candidate:4 1 udp 41885183 2001:db8::9 60001 typ relay raddr :: rport 0",
+        "a=candidate:5 1 tcp 1518280447 192.0.2.10 9 typ host tcptype active",
+    ])
+    summary = offer_candidate_summary(sdp)
+    assert summary == "host/tcp/v4:1,host/udp/v4:1,relay/udp/v4:1,relay/udp/v6:1,srflx/udp/v4:1"
+    assert "192.0.2.10" not in summary and "2001:db8" not in summary
+    assert offer_candidate_summary("v=0") == "none"

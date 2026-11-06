@@ -24,7 +24,8 @@ def default_modem_vendor() -> str:
 
 def default_signal_poll_seconds() -> int:
     frozen = bool(getattr(sys, "frozen", False) or getattr(sys, "_MEIPASS", None))
-    return 60 if IS_MACOS and frozen else 0
+    # Linux（树莓派）11-06 真机验证：型号/固件/CSQ 正常显示，空闲轮询不干扰通话。
+    return 60 if (IS_MACOS and frozen) or IS_LINUX else 0
 
 
 def default_modem_port() -> str:

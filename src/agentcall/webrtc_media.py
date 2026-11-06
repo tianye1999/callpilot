@@ -23,6 +23,26 @@ from .remote_dialer import REMOTE_AUDIO_RATE, REMOTE_CONTROL_TOPIC
 
 logger = logging.getLogger(__name__)
 
+
+def offer_candidate_summary(sdp: str) -> str:
+    """Raw offer candidates as typ/transport/family counts (no addresses), e.g. relay/udp/v4:1.
+
+    Compared with the parsed remote counts in the ICE gather log, this shows candidates aioice
+    dropped (IPv6 without local IPv6, TCP, ...), which otherwise look like "the phone sent none".
+    """
+    counts: dict[str, int] = {}
+    for line in sdp.splitlines():
+        if not line.startswith("a=candidate:"):
+            continue
+        parts = line.split()
+        if len(parts) < 8 or "typ" not in parts:
+            continue
+        kind = parts[parts.index("typ") + 1] if parts.index("typ") + 1 < len(parts) else "?"
+        family = "v6" if ":" in parts[4] else "v4"
+        key = f"{kind}/{parts[2].lower()}/{family}"
+        counts[key] = counts.get(key, 0) + 1
+    return ",".join(f"{key}:{counts[key]}" for key in sorted(counts)) or "none"
+
 _FRAME_SAMPLES = REMOTE_AUDIO_RATE // 50
 _FRAME_BYTES = _FRAME_SAMPLES * 2
 _FRAME_SECONDS = _FRAME_SAMPLES / REMOTE_AUDIO_RATE
@@ -411,8 +431,9 @@ class WebRtcRemoteMediaEndpoint:
         try:
             stage_started = time.monotonic()
             await pc.setRemoteDescription(stack.rtc.RTCSessionDescription(**self._offer))
-            logger.info("Direct answer peer=%s stage=remote_description duration_ms=%.1f",
-                        id(pc), (time.monotonic() - stage_started) * 1000)
+            logger.info("Direct answer peer=%s stage=remote_description duration_ms=%.1f offer_candidates=%s",
+                        id(pc), (time.monotonic() - stage_started) * 1000,
+                        offer_candidate_summary(str(self._offer.get("sdp", ""))))
             await self._check_current(pc)
             self._local_track = _modem_track(self._modem_audio, self._downlink_gain)
             pc.addTrack(self._local_track)
