@@ -3,6 +3,7 @@ package ai.bondings.callpilot.ui
 import ai.bondings.callpilot.R
 import androidx.compose.ui.res.stringResource
 import ai.bondings.callpilot.call.CallManager
+import ai.bondings.callpilot.diagnostics.DiagLog
 import ai.bondings.callpilot.pairing.StoredPairing
 import ai.bondings.callpilot.protocol.DeviceStatus
 import ai.bondings.callpilot.protocol.GatewayClient
@@ -71,9 +72,7 @@ private const val LINE_STATUS_REFRESH_MS = 15_000L
 private object LineStatusCache {
     data class Entry(
         val pairing: StoredPairing,
-        val ready: Boolean?,
-        val label: String,
-        val error: String?,
+        val state: LineStatusState,
     )
 
     @Volatile
@@ -92,9 +91,10 @@ fun DialScreen(
 ) {
     val context = LocalContext.current
     val cachedStatus = remember(pairing) { LineStatusCache.entry?.takeIf { it.pairing == pairing } }
-    var lineReady by remember(pairing) { mutableStateOf(cachedStatus?.ready) }
-    var lineStatusLabel by remember(pairing) { mutableStateOf(cachedStatus?.label ?: "线路状态获取中…") }
-    var lineStatusError by remember(pairing) { mutableStateOf(cachedStatus?.error) }
+    var lineStatus by remember(pairing) { mutableStateOf(cachedStatus?.state ?: LineStatusState()) }
+    val lineReady = lineStatus.ready
+    val lineStatusLabel = lineStatus.label
+    val lineStatusError = lineStatus.error
     var number by remember { mutableStateOf("") }
     var message by remember { mutableStateOf<String?>(null) }
     var dialTiming by remember { mutableStateOf<ai.bondings.callpilot.call.OutboundTiming?>(null) }
@@ -162,36 +162,44 @@ fun DialScreen(
                     HttpClients.dropPooledConnections()
                     fetchLineStatus()
                 }
-                when (status) {
+                currentCoroutineContext().ensureActive()
+                lineStatus = when (status) {
                     is DeviceStatus -> {
-                        lineReady = status.edgeEnabled && status.modemOnline
-                        lineStatusLabel = when {
-                            !status.edgeEnabled -> "远程拨号未启用"
-                            !status.modemOnline -> "SIM 线路离线"
-                            else -> "远程拨号已就绪"
-                        }
+                        lineStatus.onSuccess(
+                            ready = status.edgeEnabled && status.modemOnline,
+                            label = when {
+                                !status.edgeEnabled -> "远程拨号未启用"
+                                !status.modemOnline -> "SIM 线路离线"
+                                else -> "远程拨号已就绪"
+                            },
+                        )
                     }
                     is HostedDeviceStatus -> {
-                        lineReady = status.connected && status.modemOnline
-                        lineStatusLabel = when {
-                            !status.connected -> "电脑端离线"
-                            !status.modemOnline -> "SIM 线路离线"
-                            else -> "远程拨号已就绪"
-                        }
+                        lineStatus.onSuccess(
+                            ready = status.connected && status.modemOnline,
+                            label = when {
+                                !status.connected -> "电脑端离线"
+                                !status.modemOnline -> "SIM 线路离线"
+                                else -> "远程拨号已就绪"
+                            },
+                        )
                     }
+                    else -> error("Unexpected line status type")
                 }
-                lineStatusError = null
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 // 阻塞的 OkHttp 请求不随协程取消而中断：离开页面后才返回的超时 / HTTP 错误
                 // 不能把状态（及进程缓存）改成「暂不可用」。
                 currentCoroutineContext().ensureActive()
-                lineReady = false
-                lineStatusLabel = "线路状态暂不可用"
-                lineStatusError = "获取线路状态失败：${e.message}"
+                lineStatus = lineStatus.onFailure(e)
+                DiagLog.event(
+                    "line_status_error",
+                    detail = "exception=${e.javaClass.name} tolerated=${lineStatus.failureTolerated}",
+                    callId = null,
+                )
             }
-            LineStatusCache.entry = LineStatusCache.Entry(pairing, lineReady, lineStatusLabel, lineStatusError)
+            LineStatusCache.entry = LineStatusCache.Entry(pairing, lineStatus)
         }
 
         val lifecycleOwner = context as? LifecycleOwner

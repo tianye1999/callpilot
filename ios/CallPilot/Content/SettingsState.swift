@@ -16,6 +16,7 @@ struct DeviceStatusStateMachine {
     private(set) var status: HostedDeviceStatus?
     private(set) var syncStatus: DeviceStatusSyncState = .idle
     private var generation = 0
+    private var consecutiveFailures = 0
 
     mutating func beginRefresh() -> DeviceStatusRefresh {
         generation += 1
@@ -30,6 +31,7 @@ struct DeviceStatusStateMachine {
     ) -> Bool {
         guard refresh.generation == generation else { return false }
         self.status = status
+        consecutiveFailures = 0
         syncStatus = .live
         return true
     }
@@ -37,7 +39,8 @@ struct DeviceStatusStateMachine {
     @discardableResult
     mutating func fail(for refresh: DeviceStatusRefresh) -> Bool {
         guard refresh.generation == generation else { return false }
-        syncStatus = status == nil ? .offline : .stale
+        consecutiveFailures = min(consecutiveFailures + 1, 2)
+        syncStatus = status == nil ? .offline : (consecutiveFailures < 2 ? .live : .stale)
         return true
     }
 
@@ -51,6 +54,7 @@ struct DeviceStatusStateMachine {
     mutating func reset() {
         generation += 1
         status = nil
+        consecutiveFailures = 0
         syncStatus = .idle
     }
 }
