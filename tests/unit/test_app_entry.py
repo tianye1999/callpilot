@@ -15,7 +15,7 @@ from aiohttp import ClientSession
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import app
-from agentcall.agents import local_agent
+from agentcall.agents import local_agent, local_llm
 from agentcall.web import server
 
 
@@ -118,6 +118,8 @@ def test_main_serves_meta_while_local_models_preload(monkeypatch, tmp_path, prov
 
     monkeypatch.setattr(local_agent, "_get_shared_models", blocked_load)
     monkeypatch.setattr(local_agent, "start_model_preload", preload)
+    # 启动时的模型名核对会真的请求供应方（假 key → HTTPError），其后台线程的 WARNING 曾串进别的用例。
+    monkeypatch.setattr(local_llm, "start_model_check", lambda *a, **kw: None)
     monkeypatch.setattr(app.asyncio, "new_event_loop", lambda: loop)
     monkeypatch.setattr(app.web, "TCPSite", site)
     monkeypatch.setattr(app, "SystemdWatchdog", Watchdog)
