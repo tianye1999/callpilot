@@ -2,6 +2,9 @@ package ai.bondings.callpilot.ui
 
 import ai.bondings.callpilot.R
 import ai.bondings.callpilot.BuildConfig
+import ai.bondings.callpilot.diagnostics.DiagLog
+import android.content.Intent
+import android.widget.Toast
 import ai.bondings.callpilot.updates.AppUpdates
 import ai.bondings.callpilot.content.CallHistoryState
 import ai.bondings.callpilot.content.CallHistorySyncStatus
@@ -20,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -44,6 +48,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 
 @Composable
 fun SettingsScreen(
@@ -56,6 +61,7 @@ fun SettingsScreen(
     val scope = rememberCoroutineScope()
     var confirmingClear by remember { mutableStateOf(false) }
     var confirmingUnpair by remember { mutableStateOf(false) }
+    var exporting by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val updates = remember(context) { AppUpdates.get(context) }
     val latest by updates.latest.collectAsState()
@@ -165,6 +171,30 @@ fun SettingsScreen(
         }
 
         item { SettingsSectionLabel(stringResource(R.string.settings_privacy_section)) }
+        item {
+            OutlinedButton(
+                onClick = {
+                    scope.launch {
+                        exporting = true
+                        try {
+                            context.startActivity(Intent.createChooser(DiagLog.export(context), context.getString(R.string.diagnostics_export)))
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            DiagLog.event("export_failed", error = e)
+                            Toast.makeText(context, R.string.diagnostics_export_failed, Toast.LENGTH_LONG).show()
+                        } finally {
+                            exporting = false
+                        }
+                    }
+                },
+                enabled = !exporting,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp).heightIn(min = 48.dp),
+            ) {
+                Icon(Icons.Filled.Share, contentDescription = null)
+                Text(stringResource(R.string.diagnostics_export), Modifier.padding(start = 8.dp))
+            }
+        }
         item {
             Column(
                 Modifier.padding(horizontal = 20.dp, vertical = 8.dp),

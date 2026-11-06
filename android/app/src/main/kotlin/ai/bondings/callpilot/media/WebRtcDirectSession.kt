@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.media
 
+import ai.bondings.callpilot.diagnostics.DiagLog
 import ai.bondings.callpilot.protocol.IceServer
 import ai.bondings.callpilot.protocol.Signaling
 import ai.bondings.callpilot.protocol.Topics
@@ -7,7 +8,6 @@ import ai.bondings.callpilot.call.OutboundTiming
 import ai.bondings.callpilot.call.OutboundTiming.Mark
 import android.content.Context
 import android.media.AudioManager
-import android.util.Log
 import java.nio.ByteBuffer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -47,7 +47,6 @@ class WebRtcDirectSession(
 ) : DirectCapableSession {
 
     private companion object {
-        const val TAG = "CallPilotDirect"
         const val MAX_SDP_BYTES = 16 * 1024
         const val MAX_CONTROL_BYTES = 4096
         // 都留在 CallManager 的阶段上限（20 s）之内，超时由本层先报错、上层回落。
@@ -89,6 +88,7 @@ class WebRtcDirectSession(
     private var closed = false
 
     @Volatile private var outboundTiming: OutboundTiming? = null
+    @Volatile private var diagnosticCallId: String? = null
 
     override fun observeOutboundTiming(timing: OutboundTiming) { outboundTiming = timing }
 
@@ -121,7 +121,7 @@ class WebRtcDirectSession(
         override fun onDataChannel(channel: DataChannel?) = Unit
         override fun onRenegotiationNeeded() = Unit
         override fun onConnectionChange(state: PeerConnection.PeerConnectionState?) {
-            Log.i(TAG, "peer state=$state")
+            DiagLog.event("direct_peer_state", "state=$state", callId = diagnosticCallId)
             when (state) {
                 PeerConnection.PeerConnectionState.CONNECTED -> connected.complete(Unit)
                 PeerConnection.PeerConnectionState.FAILED,
@@ -244,6 +244,7 @@ class WebRtcDirectSession(
     }
 
     override suspend fun connectDirect(sdpAnswer: String): Unit = withContext(native) {
+        diagnosticCallId = DiagLog.activeCallId
         require(sdpAnswer.isNotEmpty() && sdpAnswer.toByteArray().size <= MAX_SDP_BYTES) { "remote SDP invalid" }
         val pc = peer ?: error("prepareDirect first")
         ensureOpen()
@@ -256,7 +257,7 @@ class WebRtcDirectSession(
         }
         ensureOpen()
         directActive = true
-        Log.i(TAG, "direct media connected")
+        DiagLog.event("direct_media_connected", callId = diagnosticCallId)
         Unit
     }
 

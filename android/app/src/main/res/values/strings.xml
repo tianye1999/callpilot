@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="diagnostics_export">Export diagnostic logs</string>
+    <string name="diagnostics_export_failed">Could not export diagnostic logs</string>
     <string name="call_error_edge_offline">The computer is offline.</string>
     <string name="call_error_modem_offline">The phone line is unavailable. Check the computer connection or try again later.</string>
     <string name="call_error_sim_not_ready">The SIM is missing or not ready. Check the SIM and try again.</string>

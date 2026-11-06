@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="diagnostics_export">导出诊断日志</string>
+    <string name="diagnostics_export_failed">诊断日志导出失败</string>
     <string name="call_error_edge_offline">电脑端不在线。</string>
     <string name="call_error_modem_offline">电话线路暂不可用，请检查电脑端连接或稍后再试。</string>
     <string name="call_error_sim_not_ready">SIM 卡未插入或尚未就绪，请检查后重试。</string>

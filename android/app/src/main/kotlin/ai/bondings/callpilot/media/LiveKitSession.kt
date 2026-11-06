@@ -3,7 +3,7 @@ package ai.bondings.callpilot.media
 import ai.bondings.callpilot.protocol.Signaling
 import ai.bondings.callpilot.protocol.Topics
 import android.content.Context
-import android.util.Log
+import ai.bondings.callpilot.diagnostics.DiagLog
 import com.twilio.audioswitch.AudioDevice
 import io.livekit.android.AudioOptions
 import io.livekit.android.AudioType
@@ -26,10 +26,6 @@ class LiveKitSession(
     private val scope: CoroutineScope,
 ) : RemoteSession {
 
-    private companion object {
-        const val TAG = "CallPilotLiveKit"
-    }
-
     private val appContext = context.applicationContext
     private val audioHandler = AudioSwitchHandler(appContext)
     private val room: Room = LiveKit.create(
@@ -42,11 +38,13 @@ class LiveKitSession(
         ),
     )
     private var eventJob: Job? = null
+    private var diagnosticCallId: String? = null
 
     private val _events = MutableSharedFlow<SessionEvent>(extraBufferCapacity = 32)
     override val events: SharedFlow<SessionEvent> = _events
 
     override suspend fun connect(livekitUrl: String, token: String) {
+        diagnosticCallId = DiagLog.activeCallId
         eventJob = scope.launch {
             room.events.collect { event ->
                 when (event) {
@@ -57,7 +55,7 @@ class LiveKitSession(
                         }
                     }
                     is RoomEvent.Disconnected -> {
-                        Log.w(TAG, "room disconnected reason=${event.reason?.name}")
+                        DiagLog.event("livekit_disconnected", "reason=${DiagLog.code(event.reason?.name)}", callId = diagnosticCallId)
                         _events.tryEmit(
                             SessionEvent.Disconnected(event.reason?.name ?: "disconnected")
                         )
@@ -66,14 +64,16 @@ class LiveKitSession(
                 }
             }
         }
-        // token 不入日志；仅记录连接目标与结果，供真机排障
-        Log.i(TAG, "connecting room=$livekitUrl")
+        DiagLog.event("livekit_connect_start", callId = diagnosticCallId)
+        var phase = "room_connect"
         try {
             room.connect(livekitUrl, token)
+            phase = "microphone_publish"
+            DiagLog.event("livekit_room_connected", callId = diagnosticCallId)
             room.localParticipant.setMicrophoneEnabled(true)
-            Log.i(TAG, "connected, microphone published")
+            DiagLog.event("livekit_microphone_published", callId = diagnosticCallId)
         } catch (e: Exception) {
-            Log.e(TAG, "connect failed: ${e.message}", e)
+            DiagLog.event("livekit_failed", "phase=$phase", e, diagnosticCallId)
             throw e
         }
     }

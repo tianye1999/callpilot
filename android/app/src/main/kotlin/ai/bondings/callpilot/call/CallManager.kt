@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.call
 
+import ai.bondings.callpilot.diagnostics.DiagLog
 import ai.bondings.callpilot.media.DirectCapableSession
 import ai.bondings.callpilot.media.RemoteSession
 import ai.bondings.callpilot.media.SessionEvent
@@ -103,7 +104,7 @@ class CallManager(
     private val outboundDirectProvider: (StoredPairing) -> Boolean = {
         DirectCallCapabilities.cache.cached(it).outboundDirectV1
     },
-    private val outboundTimingLog: (String) -> Unit = { android.util.Log.i("CallPilotDirect", it); Unit },
+    private val outboundTimingLog: (String) -> Unit = { DiagLog.event("outbound_timing", it) },
 ) {
     // 单线程：建连、回落、挂断收尾、事件处理全部串行，没有「检查完再动手」的窗口。
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -198,7 +199,10 @@ class CallManager(
         }
 
     fun startCall(pairing: StoredPairing, number: String, outboundTiming: OutboundTiming = OutboundTiming()) {
-        if (isActive) return
+        if (isActive) { DiagLog.event("dial_ignored", "reason=call_active"); return }
+        DiagLog.bindCall(null)
+        lastEdgeStatusLog = null
+        DiagLog.event("dial_action", "number=${DiagLog.phone(number)} protocol=${pairing.protocol}")
         outboundTiming.mark(OutboundTiming.Mark.START)
         synchronized(commandLock) {
             takeoverMediaTimeoutJob?.cancel()
@@ -210,28 +214,41 @@ class CallManager(
         timing = CallTiming(timingClockMs).also { it.restartAt(CallTiming.Mark.DIAL_START) }
         setupJob = scope.launch {
             var directAttempted = false
+            var stage = "capability"
             try {
                 val direct = if (pairing.protocol == PairingProtocol.HOSTED && directSessionFactory != null) {
                     try {
                         outboundDirectProvider(pairing)
                     } catch (error: CancellationException) {
                         throw error
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        DiagLog.event("capability_failed", error = e)
                         false
                     }
                 } else false
                 currentCoroutineContext().ensureActive()
                 directAttempted = direct
+                DiagLog.event("outbound_path", "directAttempted=$direct reason=" +
+                    if (direct) "capability_enabled" else "protocol_factory_or_capability_unavailable")
+                stage = "direct_setup"
                 if (direct &&
                     startOutboundDirect(pairing, number, idempotencyKey, outboundTiming)
                 ) {
                     setupJob = null
                     return@launch
                 }
+                stage = "livekit_create"
+                DiagLog.event("path_livekit", "reason=direct_unavailable_or_precreate_failure directAttempted=$directAttempted")
                 val (livekitUrl, token) = withContext(ioDispatcher) {
                     when (pairing.protocol) {
-                        PairingProtocol.TUNNEL -> connectionFromInvite(inviteProvider(pairing))
+                        PairingProtocol.TUNNEL -> inviteProvider(pairing).let {
+                            DiagLog.bindCall(it.sessionId)
+                            DiagLog.event("session_created", "protocol=tunnel")
+                            connectionFromInvite(it)
+                        }
                         PairingProtocol.HOSTED -> hostedSessionProvider(pairing, idempotencyKey).let {
+                            DiagLog.bindCall(it.sessionId)
+                            DiagLog.event("session_created")
                             it.livekitUrl to it.token
                         }
                     }
@@ -248,19 +265,24 @@ class CallManager(
                     pendingDial = number
                 }
                 timing.mark(CallTiming.Mark.CONNECT_START)
+                stage = "livekit_connect_publish"
                 s.connect(livekitUrl, token)
+                DiagLog.event("livekit_connected", "microphone=published waiting=edge_media_ready")
                 timing.mark(CallTiming.Mark.CONNECT_RETURN)
                 currentCoroutineContext().ensureActive()
                 _state.value = CallState.WaitingMedia(number)
                 flushTiming(s)
                 setupJob = null
             } catch (e: CancellationException) {
+                DiagLog.event("outbound_cancelled", "phase=$stage directAttempted=$directAttempted", e)
                 throw e
             } catch (e: HostedCloudException) {
+                DiagLog.event("outbound_abandon", "phase=$stage http=${e.statusCode} code=${DiagLog.code(e.errorCode)} directAttempted=$directAttempted", e)
                 setupJob = null
                 cleanup()
                 _state.value = CallState.Failed(number, e.message, e.errorCode)
             } catch (e: Exception) {
+                DiagLog.event("outbound_abandon", "phase=$stage directAttempted=$directAttempted", e)
                 setupJob = null
                 cleanup()
                 _state.value = CallState.Failed(number, e.message ?: "拨号失败")
@@ -275,8 +297,9 @@ class CallManager(
      * 建呼叫之前任何一步不可用都返回 false，由调用方照旧走 LiveKit；建呼叫之后的失败都在同一通里回落 LiveKit。
      */
     private suspend fun startOutboundDirect(pairing: StoredPairing, number: String, idempotencyKey: String, outboundTiming: OutboundTiming): Boolean {
-        val edgeId = pairing.edgeId ?: return false
-        val factory = directSessionFactory ?: return false
+        val edgeId = pairing.edgeId ?: run { DiagLog.event("direct_skipped", "reason=no_edge_id"); return false }
+        val factory = directSessionFactory ?: run { DiagLog.event("direct_skipped", "reason=no_factory"); return false }
+        DiagLog.event("direct_ice_start")
         val gateway = outboundGatewayFactory(pairing)
         gateway.observeOutboundTiming(outboundTiming)
         timing.mark(CallTiming.Mark.PREPARE_START)
@@ -288,21 +311,25 @@ class CallManager(
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            DiagLog.event("direct_failed", "phase=ice action=livekit", e)
             return false
         }
         val s = factory()
         s.observeOutboundTiming(outboundTiming)
         timing.mark(CallTiming.Mark.PRECONNECT_START)
         val offer = try {
+            DiagLog.event("direct_prepare_start")
             withTimeout(directSetupMs) { s.prepareDirect(servers) }.also { timing.mark(CallTiming.Mark.PRECONNECT_READY) }
         } catch (e: TimeoutCancellationException) {
+            DiagLog.event("direct_failed", "phase=prepare action=livekit", e)
             s.disconnect()
             return false
         } catch (e: CancellationException) {
             s.disconnect()
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            DiagLog.event("direct_failed", "phase=prepare action=livekit", e)
             s.disconnect()
             return false
         }
@@ -318,36 +345,53 @@ class CallManager(
         eventJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { s.events.collect { handleEvent(number, it) } }
         onForeground(true)
         timing.mark(CallTiming.Mark.CLAIM_START)
-        val created = gateway.create(edgeId, idempotencyKey, offer, number)
+        DiagLog.event("direct_create_start")
+        val created = try {
+            gateway.create(edgeId, idempotencyKey, offer, number)
+        } catch (e: Exception) {
+            DiagLog.event("direct_failed", "phase=create_call action=abandon", e)
+            throw e
+        }
         timing.mark(CallTiming.Mark.CLAIM_RESPONSE)
         context.callId = created.callId
+        DiagLog.bindCall(created.callId)
+        DiagLog.event("direct_create_result", "directAttempted=${created.directAttempted} answer=${created.sdpAnswer != null}")
         currentCoroutineContext().ensureActive()
         _state.value = CallState.WaitingMedia(number)
         armTakeoverMediaTimeout(s, number, directMediaTimeoutMs, "通话媒体建立超时", "CALL_MEDIA_TIMEOUT")
         val answer = created.sdpAnswer
         when {
             answer != null -> try {
+                DiagLog.event("path_direct", "phase=connect reason=answer_present")
                 timing.mark(CallTiming.Mark.CONNECT_START)
                 withTimeout(directSetupMs) { s.connectDirect(answer) }
                 timing.mark(CallTiming.Mark.CONNECT_RETURN)
                 timing.mark(CallTiming.Mark.DIRECT_CONTROL_READY)
+                DiagLog.event("direct_control_ready", "waiting=edge_media_ready")
                 flushTiming(s)
             } catch (e: TimeoutCancellationException) {
+                DiagLog.event("direct_failed", "phase=connect action=fallback", e)
                 // 阶段超时是直连失败，不是整通被取消：同一通回落。
                 outboundFallback(context)
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                DiagLog.event("direct_failed", "phase=connect action=fallback", e)
                 outboundFallback(context)
             }
-            created.directAttempted -> outboundFallback(context)
+            created.directAttempted -> {
+                DiagLog.event("direct_failed", "phase=create reason=missing_answer action=fallback")
+                outboundFallback(context)
+            }
             else -> {
+                DiagLog.event("path_livekit", "phase=poll reason=server_direct_not_attempted")
                 // 中转没走直连（未开启或旧 Edge）：这条对等连接用不上，照旧轮询拿 LiveKit 凭证。
                 s.closeDirect()
                 val legacy = gateway.awaitSession(edgeId, created)
                 currentCoroutineContext().ensureActive()
                 timing.mark(CallTiming.Mark.CONNECT_START)
                 s.connect(legacy.livekitUrl, legacy.token)
+                DiagLog.event("livekit_connected", "microphone=published waiting=edge_media_ready")
                 timing.mark(CallTiming.Mark.CONNECT_RETURN)
                 flushTiming(s)
             }
@@ -368,8 +412,14 @@ class CallManager(
             context.fallbackStarted = true
         }
         timing.mark(CallTiming.Mark.COLD_FALLBACK)
+        DiagLog.event("outbound_fallback", "path=livekit reason=direct_failed", callId = callId)
         context.session.closeDirect()
-        val fallback = context.gateway.fallbackLiveKit(callId)
+        val fallback = try {
+            context.gateway.fallbackLiveKit(callId)
+        } catch (e: Exception) {
+            DiagLog.event("fallback_failed", "phase=request_livekit", e, callId)
+            throw e
+        }
         currentCoroutineContext().ensureActive()
         val stillCurrent = synchronized(commandLock) {
             outbound === context && session === context.session && !hangupRequested && _state.value is CallState.WaitingMedia
@@ -377,13 +427,20 @@ class CallManager(
         if (!stillCurrent) return
         // 每个里程碑只记首次（同 iOS）：直连已记过的 connect_start 保留，这里补齐缺的那端。
         timing.mark(CallTiming.Mark.CONNECT_START)
-        context.session.connect(fallback.livekitUrl, fallback.token)
+        try {
+            context.session.connect(fallback.livekitUrl, fallback.token)
+        } catch (e: Exception) {
+            DiagLog.event("fallback_failed", "phase=connect_publish", e, callId)
+            throw e
+        }
+        DiagLog.event("livekit_connected", "microphone=published waiting=edge_media_ready", callId = callId)
         timing.mark(CallTiming.Mark.CONNECT_RETURN)
         timing.mark(CallTiming.Mark.ROOM_CONNECTED)
         flushTiming(context.session)
     }
 
     private fun outboundFallbackIfPossible(context: OutboundContext, number: String, reason: String) {
+        DiagLog.event("outbound_fallback_decision", "reason=${DiagLog.code(reason)} started=${context.fallbackStarted}", callId = context.callId)
         val eligible = synchronized(commandLock) { context.callId != null }
         if (!eligible || context.fallbackStarted || _state.value !is CallState.WaitingMedia) return
         context.fallbackJob = scope.launch {
@@ -392,6 +449,7 @@ class CallManager(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                DiagLog.event("outbound_abandon", "phase=fallback", e, context.callId)
                 val captured = synchronized(commandLock) {
                     if (outbound !== context || hangupRequested || !isActive) return@launch
                     _state.value = CallState.Failed(number, e.message ?: reason, (e as? HostedCloudException)?.errorCode)
@@ -423,16 +481,19 @@ class CallManager(
             val preconnectStartAt = timingClockMs()
             val readyAt = AtomicReference<Double?>()
             val sdp = scope.async {
+                DiagLog.event("inbound_preconnect_start", "offerId=${offer.offerId}", callId = null)
                 try {
                     val servers = gateway.iceServers(offer.offerId)
                     val sdpOffer = withTimeout(directSetupMs) { session.prepareDirect(servers) }
                     readyAt.set(timingClockMs())
                     sdpOffer
-                } catch (_: TimeoutCancellationException) {
+                } catch (e: TimeoutCancellationException) {
+                    DiagLog.event("inbound_preconnect_failed", "offerId=${offer.offerId} phase=prepare", e, null)
                     null // 收集超时等同预备失败：接听时回落，不另起一份
                 } catch (e: CancellationException) {
                     throw e
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    DiagLog.event("inbound_preconnect_failed", "offerId=${offer.offerId} phase=ice_or_prepare", e, null)
                     null // 预备失败不影响接听：接听时走现有流程
                 }
             }
@@ -497,8 +558,10 @@ class CallManager(
     }
 
     fun answerTakeover(pairing: StoredPairing, offerId: String, direct: Boolean = false) {
-        if (isActive) return
-        if (pairing.protocol != PairingProtocol.HOSTED) return
+        if (isActive) { DiagLog.event("answer_ignored", "reason=call_active"); return }
+        if (pairing.protocol != PairingProtocol.HOSTED) { DiagLog.event("answer_ignored", "reason=not_hosted"); return }
+        DiagLog.bindCall(null)
+        DiagLog.event("answer_action", "offerId=$offerId directRequested=$direct")
         val label = incomingCallLabel()
         synchronized(commandLock) {
             takeoverMediaTimeoutJob?.cancel()
@@ -518,6 +581,7 @@ class CallManager(
         context.prepared = ready
         synchronized(commandLock) { takeover = context }
         setupJob = scope.launch {
+            var stage = "claim"
             try {
                 val gateway = context.gateway
                 // 响铃期预备仍在收集中：有界等它拿到 SDP，随 claim 一次提交；超时/失败/未开始都不等。
@@ -537,8 +601,11 @@ class CallManager(
                     withContext(ioDispatcher) { takeoverClaimProvider(pairing, offerId) }
                 }
                 context.claimId = claimed.sessionId
+                DiagLog.bindCall(claimed.sessionId)
+                DiagLog.event("claim_result", "offerId=$offerId directAttempted=${claimed.directAttempted} sdpPending=${claimed.sdpPending} answer=${claimed.sdpAnswer != null}")
                 timing.mark(CallTiming.Mark.CLAIM_RESPONSE)
                 val useDirect = wantDirect && claimed.directAttempted
+                DiagLog.event("inbound_path", "path=${if (useDirect) "direct" else "livekit"} reason=request_and_server_decision wantDirect=$wantDirect")
                 if (!useDirect && ready != null) {
                     context.prepared = null
                     release(ready)
@@ -558,19 +625,24 @@ class CallManager(
                 _state.value = CallState.WaitingMedia(label)
                 armTakeoverMediaTimeout(s, label, if (useDirect) directMediaTimeoutMs else takeoverMediaTimeoutMs)
                 if (useDirect && s is DirectCapableSession) {
+                    stage = "direct_setup"
                     context.direct = s
                     runDirect(context, claimed, s, label, ready?.offer)
                 } else {
+                    stage = "livekit_connect_publish"
                     timing.mark(CallTiming.Mark.CONNECT_START)
                     s.connect(claimed.livekitUrl, claimed.token)
+                    DiagLog.event("livekit_connected", "microphone=published waiting=edge_media_ready")
                     timing.mark(CallTiming.Mark.CONNECT_RETURN)
                     timing.mark(CallTiming.Mark.ROOM_CONNECTED)
                 }
                 flushTiming(s)
                 setupJob = null
             } catch (e: CancellationException) {
+                DiagLog.event("inbound_cancelled", "phase=$stage", e)
                 throw e
             } catch (e: HostedCloudException) {
+                DiagLog.event("inbound_abandon", "phase=$stage http=${e.statusCode} code=${DiagLog.code(e.errorCode)}", e)
                 setupJob = null
                 cleanup()
                 _state.value = when (e.errorCode) {
@@ -580,6 +652,7 @@ class CallManager(
                     else -> CallState.Failed(label, e.message, e.errorCode)
                 }
             } catch (e: Exception) {
+                DiagLog.event("inbound_abandon", "phase=$stage", e)
                 setupJob = null
                 cleanup()
                 _state.value = CallState.Failed(label, e.message ?: "接管失败")
@@ -599,6 +672,7 @@ class CallManager(
         preparedOffer: Deferred<String?>? = null,
     ) {
         val gateway = context.gateway ?: return
+        var stage = "prepare"
         try {
             var answer = claimed.sdpAnswer
             if (answer == null) {
@@ -612,23 +686,31 @@ class CallManager(
                 }
                 currentCoroutineContext().ensureActive()
                 timing.mark(CallTiming.Mark.SDP_SUBMIT_START)
+                stage = "sdp_submit"
+                DiagLog.event("inbound_sdp_submit")
                 answer = gateway.completeSdp(context.offerId, claimed.sessionId, offer).sdpAnswer
                 timing.mark(CallTiming.Mark.SDP_SUBMIT_RESPONSE)
             }
             val sdp = answer ?: throw IllegalStateException("Edge 未给出直连 answer")
             timing.mark(CallTiming.Mark.CONNECT_START)
+            stage = "connect"
+            DiagLog.event("inbound_direct_connect")
             withTimeout(directSetupMs) { s.connectDirect(sdp) }
             timing.mark(CallTiming.Mark.CONNECT_RETURN)
             timing.mark(CallTiming.Mark.DIRECT_CONTROL_READY)
+            DiagLog.event("direct_control_ready", "waiting=edge_media_ready")
         } catch (e: TimeoutCancellationException) {
+            DiagLog.event("inbound_direct_failed", "phase=$stage action=fallback", e)
             // 阶段超时是直连失败，不是整通被取消：同 claim 回落。
             startFallback(context, s, label)
         } catch (e: CancellationException) {
             throw e
         } catch (e: HostedCloudException) {
+            DiagLog.event("inbound_direct_failed", "phase=$stage http=${e.statusCode} code=${DiagLog.code(e.errorCode)}", e)
             if (e.statusCode == 401 || e.statusCode == 409) throw e
             startFallback(context, s, label)
         } catch (e: Exception) {
+            DiagLog.event("inbound_direct_failed", "phase=$stage action=fallback", e)
             startFallback(context, s, label)
         }
     }
@@ -645,21 +727,34 @@ class CallManager(
             context.fallbackStarted = true
         }
         timing.mark(CallTiming.Mark.COLD_FALLBACK)
+        DiagLog.event("inbound_fallback", "path=livekit reason=direct_failed", callId = claimId)
         s.closeDirect()
-        val fallback = gateway.fallbackLiveKit(context.offerId, claimId, timing.httpBatches())
+        val fallback = try {
+            gateway.fallbackLiveKit(context.offerId, claimId, timing.httpBatches())
+        } catch (e: Exception) {
+            DiagLog.event("fallback_failed", "phase=request_livekit", e, claimId)
+            throw e
+        }
         currentCoroutineContext().ensureActive()
         val stillCurrent = synchronized(commandLock) {
             takeover === context && session === s && !hangupRequested && _state.value is CallState.WaitingMedia
         }
         if (!stillCurrent) return
         timing.mark(CallTiming.Mark.CONNECT_START)
-        s.connect(fallback.livekitUrl, fallback.token)
+        try {
+            s.connect(fallback.livekitUrl, fallback.token)
+        } catch (e: Exception) {
+            DiagLog.event("fallback_failed", "phase=connect_publish", e, claimId)
+            throw e
+        }
+        DiagLog.event("livekit_connected", "microphone=published waiting=edge_media_ready", callId = claimId)
         timing.mark(CallTiming.Mark.CONNECT_RETURN)
         timing.mark(CallTiming.Mark.ROOM_CONNECTED)
         flushTiming(s)
     }
 
     private fun fallbackIfPossible(reason: String) {
+        DiagLog.event("inbound_fallback_decision", "reason=${DiagLog.code(reason)}")
         val context = takeover ?: return
         val direct = context.direct ?: return
         val label = currentNumber() ?: return
@@ -670,6 +765,7 @@ class CallManager(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                DiagLog.event("inbound_abandon", "phase=fallback", e)
                 val captured = synchronized(commandLock) {
                     if (takeover !== context || hangupRequested || !isActive) return@launch
                     _state.value = CallState.Failed(label, e.message ?: reason, (e as? HostedCloudException)?.errorCode)
@@ -725,6 +821,7 @@ class CallManager(
     }
 
     fun hangup() {
+        DiagLog.event("hangup_action", "reason=owner_requested")
         val deadline = timingClockMs() + HANGUP_ACK_BUDGET_MS
         val commandId = UUID.randomUUID().toString()
         val acknowledged = CompletableDeferred<Unit>()
@@ -815,7 +912,26 @@ class CallManager(
         }
     }
 
+    @Volatile private var lastEdgeStatusLog: String? = null
+
     private fun handleEvent(number: String, event: SessionEvent) {
+        when (event) {
+            is SessionEvent.Disconnected -> DiagLog.event("media_disconnected", "reason=${DiagLog.code(event.reason)}")
+            is SessionEvent.Edge -> when (val edge = event.event) {
+                is Signaling.Event.Status -> {
+                    // Edge repeats "connected" every second during a call; log only changes.
+                    val line = "status=${DiagLog.code(edge.status)} reason=${DiagLog.code(edge.reason)} code=${DiagLog.code(edge.code)}"
+                    if (line != lastEdgeStatusLog) {
+                        lastEdgeStatusLog = line
+                        DiagLog.event("edge_status", line)
+                    }
+                }
+                is Signaling.Event.Ended -> DiagLog.event("call_ended", "reason=${DiagLog.code(edge.reason)}")
+                is Signaling.Event.MediaFailed -> DiagLog.event("media_failed", "reason=${DiagLog.code(edge.reason)}")
+                is Signaling.Event.RemoteCall -> DiagLog.event("edge_remote_call", "status=${DiagLog.code(edge.status)}")
+                is Signaling.Event.HangupAck -> DiagLog.event("hangup_ack")
+            }
+        }
         val ack = (event as? SessionEvent.Edge)?.event as? Signaling.Event.HangupAck
         if (ack != null) {
             // 挂断确认要在「已请求挂断」的过滤之前处理：它正是挂断之后才到的事件。
@@ -908,11 +1024,14 @@ class CallManager(
             scope.launch(start = CoroutineStart.LAZY) {
                 if (!dialIsActive()) return@launch
                 try {
+                    DiagLog.event("dial_command_send")
                     s.sendCommand(Signaling.encodeDial(number, UUID.randomUUID().toString()))
+                    DiagLog.event("dial_command_sent")
                     if (!dialIsActive()) return@launch
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    DiagLog.event("outbound_abandon", "phase=dial_command", e)
                     synchronized(commandLock) { dialJob = null }
                     cleanup()
                     _state.value = CallState.Failed(number, e.message ?: "拨号失败")
@@ -955,6 +1074,7 @@ class CallManager(
                     }
                 } ?: return@launch
 
+                DiagLog.event("media_abandon", "reason=$code timeoutMs=$timeoutMs")
                 release(captured)
                 // Failed 的自动回 Idle 由 state 收集器按 failedVisibleMs 统一调度。
             }.also { takeoverMediaTimeoutJob = it }

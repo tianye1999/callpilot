@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.protocol
 
+import ai.bondings.callpilot.diagnostics.DiagLog
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
@@ -82,6 +83,7 @@ class GatewayClient(
     /** POST /api/session —— 创建一次性拨号会话，返回邀请（fragment 内含 LiveKit 连接信息）。 */
     fun createSession(): Invite {
         request("POST", "api/session", "{}").use { resp ->
+            DiagLog.event("tunnel_create_response", "http=${resp.code} transports=false directAttempted=false")
             val obj = parseOrThrow(resp)
             val invite = obj["invite"]
                 ?: throw GatewayException(resp.code, "会话响应缺少 invite 字段")

@@ -1,5 +1,6 @@
 package ai.bondings.callpilot.protocol
 
+import ai.bondings.callpilot.diagnostics.DiagLog
 import ai.bondings.callpilot.call.OutboundTiming
 
 import java.io.IOException
@@ -605,12 +606,14 @@ class HostedCloudClient(
         val payload = try {
             json.parseToJsonElement(text).jsonObject
         } catch (_: Exception) {
+            logMediaResponse(response, null)
             throw HostedCloudException(
                 response.code,
                 "INVALID_RESPONSE",
                 "云控制面响应不是合法 JSON（HTTP ${response.code}）",
             )
         }
+        logMediaResponse(response, payload)
         if (!response.isSuccessful) {
             val error = payload["error"]?.jsonObject
             val code = error?.get("code")?.jsonPrimitive?.contentOrNull ?: "HTTP_${response.code}"
@@ -619,6 +622,25 @@ class HostedCloudClient(
             throw HostedCloudException(response.code, code, message)
         }
         return payload
+    }
+
+    private fun logMediaResponse(response: Response, payload: JsonObject?) {
+        val parts = response.request.url.pathSegments
+        // Never log content endpoints, URLs, request/response bodies, SDP or credentials.
+        if (parts.getOrNull(0) != "v1" || parts.getOrNull(1) !in setOf("calls", "inbound-offers")) return
+        if (parts[1] == "inbound-offers" && parts.size == 2) return
+        fun scalar(key: String) = (payload?.get(key) as? JsonPrimitive)?.contentOrNull
+        val error = payload?.get("error") as? JsonObject
+        val errorCode = (error?.get("code") as? JsonPrimitive)?.contentOrNull ?: scalar("errorCode")
+        val callId = scalar("callId") ?: scalar("claimId") ?:
+            parts.getOrNull(2)?.takeIf { parts[1] == "calls" } ?: DiagLog.activeCallId
+        DiagLog.event(
+            "http_media_response",
+            "resource=${parts[1]} operation=${if (parts.size <= 2) "create" else if (parts.size == 3) "fetch_or_claim" else DiagLog.code(parts.last())} " +
+                "http=${response.code} code=${DiagLog.code(errorCode)} status=${DiagLog.code(scalar("status"))} " +
+                "transports=${payload?.containsKey("transports") == true} directAttempted=${DiagLog.code(scalar("directAttempted"))}",
+            callId = callId,
+        )
     }
 
     private fun decodeCall(payload: JsonObject, statusCode: Int): HostedCallResponse = try {
@@ -645,9 +667,11 @@ class HostedCloudClient(
                     val call = decodeCall(payload, response.code).also {
                         validateCall(it, expectedEdgeId = edgeId, statusCode = response.code)
                     }
+                    DiagLog.bindCall(call.callId)
                     CreatedCall(call, payload, response.code)
                 }
             } catch (e: IOException) {
+                DiagLog.event("create_request_failed", "phase=http attempt=${attempt + 1} retry=${attempt == 0}", e)
                 if (attempt == 1) throw e
             }
         }
