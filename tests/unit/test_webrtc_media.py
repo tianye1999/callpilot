@@ -894,6 +894,8 @@ def test_offer_candidate_summary_counts_without_addresses():
         "a=candidate:3 1 udp 41885439 203.0.113.9 60000 typ relay raddr 198.51.100.7 rport 40000",
         "a=candidate:4 1 udp 41885183 2001:db8::9 60001 typ relay raddr :: rport 0",
         "a=candidate:5 1 tcp 1518280447 192.0.2.10 9 typ host tcptype active",
+        "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
+        "a=candidate:3 1 udp 41885439 203.0.113.9 60000 typ relay raddr 198.51.100.7 rport 40000",
     ])
     summary = offer_candidate_summary(sdp)
     assert summary == "host/tcp/v4:1,host/udp/v4:1,relay/udp/v4:1,relay/udp/v6:1,srflx/udp/v4:1"

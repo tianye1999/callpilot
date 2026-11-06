@@ -31,6 +31,7 @@ def offer_candidate_summary(sdp: str) -> str:
     dropped (IPv6 without local IPv6, TCP, ...), which otherwise look like "the phone sent none".
     """
     counts: dict[str, int] = {}
+    seen: set[tuple[str, ...]] = set()
     for line in sdp.splitlines():
         if not line.startswith("a=candidate:"):
             continue
@@ -38,6 +39,11 @@ def offer_candidate_summary(sdp: str) -> str:
         if len(parts) < 8 or "typ" not in parts:
             continue
         kind = parts[parts.index("typ") + 1] if parts.index("typ") + 1 < len(parts) else "?"
+        # BUNDLE offers repeat the same candidate in every m-section; count each address once.
+        identity = (kind, parts[2].lower(), parts[4], parts[5], parts[1])
+        if identity in seen:
+            continue
+        seen.add(identity)
         family = "v6" if ":" in parts[4] else "v4"
         key = f"{kind}/{parts[2].lower()}/{family}"
         counts[key] = counts.get(key, 0) + 1
