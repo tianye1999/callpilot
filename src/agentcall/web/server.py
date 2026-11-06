@@ -272,8 +272,12 @@ def _auth_middleware_factory(token: str):
     """
     session = secrets.token_urlsafe(32)
     failures: dict[str, tuple[int, float]] = {}
+    password_lock = asyncio.Lock()
 
-    async def login(request: web.Request) -> web.Response:
+    async def login(request: web.Request, *, changing: bool = False) -> web.Response:
+        nonlocal token, session
+        if changing:
+            _require_same_origin(request)
         now = _login_time()
         # 只信任连接的远端地址，不接受客户端可伪造的 X-Forwarded-For。
         for ip, (_, failed_at) in list(failures.items()):
@@ -295,11 +299,24 @@ def _auth_middleware_factory(token: str):
         count, _ = failures.get(remote, (0, now))
         if count >= 5:
             return limited
-        password = data.get("password") if isinstance(data, dict) else None
+        password = data.get("current" if changing else "password") if isinstance(data, dict) else None
         if not isinstance(password, str) or not secrets.compare_digest(password.encode(), token.encode()):
             failures[remote] = (count + 1, _login_time())
             return web.json_response({"ok": False, "error": "密码错误"}, status=401,
                                      headers={"Cache-Control": "no-store"})
+        if changing:
+            new = data.get("new")
+            if (not isinstance(new, str) or len(new) < 8 or new == password
+                    or new != new.strip() or new.splitlines() != [new] or "\x00" in new):
+                return web.json_response({
+                    "ok": False, "error": "新密码至少 8 个字符，不能与当前密码相同，不能含换行或首尾空白",
+                }, status=400)
+            try:
+                await asyncio.to_thread(config.update_env_file, {"WEB_AUTH_TOKEN": new}, allow_hidden=True)
+            except (OSError, ValueError):
+                return web.json_response({"ok": False, "error": "密码保存失败，请检查配置文件权限后重试"}, status=500)
+            token = new
+            session = secrets.token_urlsafe(32)
         failures.pop(remote, None)
         response = web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
         response.set_cookie(_SESSION_COOKIE, session, httponly=True, samesite="Strict", path="/", secure=False)
@@ -315,7 +332,8 @@ def _auth_middleware_factory(token: str):
             response = web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
             response.del_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="Strict")
             return response
-        if _is_local_client(request):
+        changing = request.path == "/api/auth/password" and request.method == "POST"
+        if _is_local_client(request) and not changing:
             # 本机进程（update.sh 健康检查、运维脚本）本就能读 .env 里的令牌；Host 也须是回环名，防 DNS 重绑定。
             return await handler(request)
         supplied = ""
@@ -337,6 +355,9 @@ def _auth_middleware_factory(token: str):
             ):
                 return _login_page()
             return web.json_response({"ok": False, "error": "未授权：缺少或错误的访问令牌"}, status=401)
+        if changing:
+            async with password_lock:
+                return await login(request, changing=True)
         return await handler(request)
 
     return _auth_middleware
@@ -362,6 +383,7 @@ def build_app(
     app["modem"] = modem
     app["service"] = service
     app["meta"] = meta or {}
+    app["auth_enabled"] = bool(auth_token)
     from ..app_updates import UpdateChecker, watch_updates
     from ..app_version import BUILD, RELEASE_NOTES, VERSION
 
@@ -490,14 +512,18 @@ async def _linux_update_status(request: web.Request) -> web.Response:
     return web.json_response(await request.app["linux_update"].status())
 
 
+def _require_same_origin(request: web.Request) -> None:
+    if (request.headers.get("Origin") != f"{request.scheme}://{request.host}"
+            or request.headers.get("Sec-Fetch-Site") == "cross-site"):
+        raise web.HTTPForbidden()
+
+
 async def _linux_update_start(request: web.Request) -> web.Response:
     from ..linux_update import INSTALL_HINT
 
     if not platforms.IS_LINUX:
         return web.json_response({"available": False, "error": "Linux only"}, status=503)
-    if (request.headers.get("Origin") != f"{request.scheme}://{request.host}"
-            or request.headers.get("Sec-Fetch-Site") == "cross-site"):
-        raise web.HTTPForbidden()
+    _require_same_origin(request)
     service = request.app.get("service")
     queue_status = getattr(service, "dial_queue_status", None)
     queue = queue_status() if callable(queue_status) else {}
@@ -706,6 +732,7 @@ def _tray_usb_online(app: web.Application, source: str = "tray") -> bool | None:
 
 async def _meta(request: web.Request) -> web.Response:
     meta = dict(request.app["meta"])
+    meta["auth_enabled"] = request.app["auth_enabled"]
     meta["version"] = request.app["version"]
     meta["build"] = request.app["build"]
     meta["linux_update_enabled"] = platforms.IS_LINUX

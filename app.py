@@ -17,7 +17,7 @@ import webbrowser
 from collections.abc import Callable
 
 from aiohttp import web
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from agentcall import call_playbooks, config, number_profiles
 from agentcall.call_agent import CallAgentService
@@ -146,7 +146,13 @@ def main(*, stop_requested: Callable[[], bool] | None = None, hardware_selftest:
 
         run(stop_requested)
         return
-    load_dotenv(config.env_file_path())
+    env_path = config.env_file_path()
+    # 密码按字面值读取，不能把 ${...} 当配置变量展开；显式进程环境仍优先。
+    if "WEB_AUTH_TOKEN" not in os.environ:
+        password = dotenv_values(env_path, interpolate=False).get("WEB_AUTH_TOKEN")
+        if password is not None:
+            os.environ["WEB_AUTH_TOKEN"] = password
+    load_dotenv(env_path)
     _force_utf8()
 
     log_dir = config.log_dir()

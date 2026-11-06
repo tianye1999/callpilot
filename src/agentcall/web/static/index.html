@@ -502,6 +502,10 @@
   /* ========= 设置面板 ========= */
   #page-settings .wrap { max-width: 760px; margin: 0 auto; }
   #configForm { padding: 4px 20px 12px; }
+  #passwordForm { margin: 0 20px 20px; }
+  #passwordForm input { max-width: 100%; min-width: 0; }
+  #passwordForm .cfg-save { padding: 14px 0; flex-wrap: wrap; }
+  #passwordSubmit { flex-shrink: 0; white-space: nowrap; }
   .cfg-group { margin-top: 16px; }
   .cfg-group > .gname {
     font-size: 11.5px; color: var(--blue); letter-spacing: .16em; font-weight: 700;
@@ -1245,6 +1249,18 @@
             <button class="btn ghost sm" id="setupRerunBtn" data-i18n="setup_rerun"></button>
             <span class="toast" id="configToast" style="margin:0"></span>
           </div>
+        </section>
+        <section class="card" id="passwordCard" hidden>
+          <h2>修改控制台密码</h2>
+          <form id="passwordForm">
+            <div class="cfg-row"><label for="passwordCurrent">当前密码</label><input id="passwordCurrent" type="password" autocomplete="current-password" required></div>
+            <div class="cfg-row"><label for="passwordNew">新密码</label><input id="passwordNew" type="password" autocomplete="new-password" minlength="8" required></div>
+            <div class="cfg-row"><label for="passwordConfirm">确认新密码</label><input id="passwordConfirm" type="password" autocomplete="new-password" minlength="8" required></div>
+            <div class="cfg-save">
+              <button class="btn primary sm" id="passwordSubmit" type="submit">修改密码</button>
+              <span class="toast" id="passwordStatus" role="status" style="margin:0"></span>
+            </div>
+          </form>
         </section>
       </div>
     </div>
@@ -2671,6 +2687,7 @@ async function loadMeta() {
   try {
     const m = await (await fetch("/api/meta")).json();
     lastMeta = m;
+    $("passwordCard").hidden = m.auth_enabled !== true;
     $("linuxUpdate").hidden = !m.linux_update_enabled;
     if (m.linux_update_enabled) loadLinuxUpdate();
     renderRelease();
@@ -4068,6 +4085,38 @@ document.addEventListener("mouseover", (e) => {
 });
 
 /* ========= 设置 ========= */
+$("passwordForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const current = $("passwordCurrent").value;
+  const next = $("passwordNew").value;
+  if (next !== $("passwordConfirm").value) {
+    setToast("passwordStatus", "err", "两次输入的新密码不一致");
+    return;
+  }
+  if (Array.from(next).length < 8 || next === current || next.trim() !== next || /[\r\n\v\f\x00\x1c-\x1e\x85\u2028\u2029]/.test(next)) {
+    setToast("passwordStatus", "err", "新密码至少 8 个字符，不能与当前密码相同，不能含换行或首尾空白");
+    return;
+  }
+  $("passwordSubmit").disabled = true;
+  try {
+    // 当前密码错误也返回 401，不能走全局 fetch 的会话失效跳转。
+    const response = await originalFetch("/api/auth/password", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current, new: next }),
+    });
+    const res = await response.json();
+    if (!response.ok || !res.ok) {
+      setToast("passwordStatus", "err", res.error || "修改失败，请重新登录后重试");
+      return;
+    }
+    $("passwordForm").reset();
+    setToast("passwordStatus", "ok", "密码已修改并立即生效，其他浏览器需重新登录");
+  } catch (_) {
+    setToast("passwordStatus", "err", "修改失败，请检查网络或重新登录后重试");
+  } finally {
+    $("passwordSubmit").disabled = false;
+  }
+});
 let cfgSpecs = [];
 let cfgDirty = false;  // 设置有未保存修改（离开页面时据此提示）
 // 音色建议：datalist 非限制性，仅作下拉便利；provider 新增音色仍可手打。

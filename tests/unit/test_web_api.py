@@ -2338,6 +2338,133 @@ def test_login_invalid_password_input_is_rejected(body):
     api(app, fn)
 
 
+@pytest.mark.parametrize("new", [
+    "short", "secret-token", " password123", "password123 ", "pass\nword123", "pass\rword123",
+    "pass\u2028word123", "pass\x00word123", "pass\vword123",
+])
+def test_password_change_rejects_invalid_new_password(monkeypatch, tmp_path, new):
+    monkeypatch.setenv("AGENTCALL_ENV_FILE", str(tmp_path / ".env"))
+    app = build_app(hub=None, modem=None, service=FakeService(), auth_token="secret-token")
+
+    async def fn(client):
+        headers = {"Origin": str(client.make_url("/")).rstrip("/"), "Authorization": "Bearer secret-token"}
+        response = await client.post("/api/auth/password", json={"current": "secret-token", "new": new},
+                                     headers=headers)
+        assert response.status == 400
+        assert not (tmp_path / ".env").exists()
+
+    api(app, fn)
+
+
+def test_password_change_rotates_credentials_and_persists(monkeypatch, tmp_path):
+    from dotenv import dotenv_values
+
+    env = tmp_path / ".env"
+    env.write_text("# keep\nWEB_AUTH_TOKEN=secret-token\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTCALL_ENV_FILE", str(env))
+    monkeypatch.setenv("WEB_AUTH_TOKEN", "secret-token")
+    app = build_app(hub=None, modem=None, service=FakeService(), auth_token="secret-token")
+
+    async def fn(client):
+        body = {"current": "secret-token", "new": '新密码 # "test" 123'}
+        headers = {"Origin": str(client.make_url("/")).rstrip("/")}
+        assert (await client.post("/api/auth/password", json=body, headers=headers)).status == 401
+        response = await client.post("/api/login", json={"password": "secret-token"})
+        old = response.cookies["agentcall_session"].value
+        for origin in (None, "https://evil.test"):
+            assert (await client.post("/api/auth/password", json=body,
+                                      headers={"Origin": origin} if origin else {})).status == 403
+        assert (await client.post("/api/auth/password", json=body,
+                                  headers={**headers, "Sec-Fetch-Site": "cross-site"})).status == 403
+        response = await client.post("/api/auth/password", json=body, headers=headers)
+        assert response.status == 200
+        assert await response.json() == {"ok": True}
+        fresh = response.cookies["agentcall_session"]
+        assert fresh.value != old and fresh["httponly"] and fresh["samesite"] == "Strict"
+        assert (await client.get("/api/meta")).status == 200
+        client.session.cookie_jar.clear()
+        assert (await client.get("/api/meta", headers={"Cookie": f"agentcall_session={old}"})).status == 401
+        assert (await client.get("/api/meta", headers={"Cookie": f"agentcall_session={fresh.value}"})).status == 200
+        assert (await client.get("/api/meta?token=secret-token")).status == 401
+        assert (await client.post("/api/login", json={"password": "secret-token"})).status == 401
+        assert (await client.post("/api/login", json={"password": body["new"]})).status == 200
+        assert dotenv_values(env)["WEB_AUTH_TOKEN"] == body["new"]
+        assert config.get_str("WEB_AUTH_TOKEN") == body["new"]
+        assert env.read_text(encoding="utf-8").startswith("# keep\n")
+
+    api(app, fn)
+
+
+def test_password_change_shares_login_failure_limit(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(server, "_login_time", lambda: clock[0])
+    app = build_app(hub=None, modem=None, service=FakeService(), auth_token="secret-token")
+
+    async def fn(client):
+        headers = {"Origin": str(client.make_url("/")).rstrip("/"), "Authorization": "Bearer secret-token"}
+        for _ in range(3):
+            assert (await client.post("/api/login", json={"password": "wrong"})).status == 401
+        for _ in range(2):
+            response = await client.post("/api/auth/password", json={"current": "wrong", "new": "password123"},
+                                         headers=headers)
+            assert response.status == 401
+        response = await client.post("/api/auth/password", json={"current": "secret-token", "new": "password123"},
+                                     headers=headers)
+        assert response.status == 429 and response.headers["Retry-After"] == "60"
+        assert (await client.post("/api/login", json={"password": "secret-token"})).status == 429
+        clock[0] += 60
+        assert (await client.post("/api/login", json={"password": "secret-token"})).status == 200
+
+    api(app, fn)
+
+
+def test_password_change_disabled_without_auth():
+    app = build_app(hub=None, modem=None, service=FakeService())
+
+    async def fn(client):
+        assert (await client.post("/api/auth/password", json={})).status == 404
+        assert (await (await client.get("/api/meta")).json())["auth_enabled"] is False
+
+    api(app, fn)
+
+
+def test_password_change_save_failure_keeps_credentials(monkeypatch):
+    def fail_save(*args, **kwargs):
+        raise OSError("private failure detail")
+
+    monkeypatch.setattr(config, "update_env_file", fail_save)
+    app = build_app(hub=None, modem=None, service=FakeService(), auth_token="secret-token")
+
+    async def fn(client):
+        response = await client.post("/api/login", json={"password": "secret-token"})
+        old = response.cookies["agentcall_session"].value
+        response = await client.post("/api/auth/password", json={"current": "secret-token", "new": "password123"},
+                                     headers={"Origin": str(client.make_url("/")).rstrip("/")})
+        assert response.status == 500
+        assert "private failure detail" not in await response.text()
+        assert not response.cookies
+        assert (await client.get("/api/meta", headers={"Cookie": f"agentcall_session={old}"})).status == 200
+        assert (await client.post("/api/login", json={"password": "secret-token"})).status == 200
+
+    api(app, fn)
+
+
+def test_password_change_concurrent_requests_only_accept_current_password_once(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTCALL_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("WEB_AUTH_TOKEN", "secret-token")
+    app = build_app(hub=None, modem=None, service=FakeService(), auth_token="secret-token")
+
+    async def fn(client):
+        headers = {"Origin": str(client.make_url("/")).rstrip("/"), "Authorization": "Bearer secret-token"}
+        responses = await asyncio.gather(*(client.post(
+            "/api/auth/password", json={"current": "secret-token", "new": f"new-password-{i}"}, headers=headers,
+        ) for i in range(3)))
+        assert sorted(response.status for response in responses) == [200, 401, 401]
+        assert (await client.post("/api/login", json={"password": config.get_str("WEB_AUTH_TOKEN")})).status == 200
+
+    api(app, fn)
+
+
 def test_login_concurrent_failures_are_counted_per_remote_ip(monkeypatch):
     async def run():
         middleware = server._auth_middleware_factory("secret-token")

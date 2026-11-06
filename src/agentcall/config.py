@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.parse
@@ -1217,7 +1218,19 @@ def update_env_file(
         rendered = newline.join(lines) + newline
         if has_bom:
             rendered = "\ufeff" + rendered
-        path.write_text(rendered, encoding="utf-8", newline="")
+        # 同目录临时文件 + replace，失败时保留原配置，且不提前修改进程环境。
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+                stream.write(rendered)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if path.exists():
+                os.chmod(temporary, path.stat().st_mode & 0o777)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         for key, value in updates.items():
             os.environ[key] = value
     logger.info("已更新 %s: %s", path, ", ".join(updates))

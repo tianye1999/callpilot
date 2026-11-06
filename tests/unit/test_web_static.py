@@ -19,6 +19,62 @@ REMOTE_MANIFEST = INDEX.with_name("manifest.webmanifest")
 REMOTE_SW = INDEX.with_name("remote_dialer_sw.js")
 
 
+def test_password_form_handles_wrong_current_without_login_redirect():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute password form behavior")
+    text = INDEX.read_text(encoding="utf-8")
+    assert '$("passwordCard").hidden = m.auth_enabled !== true' in text
+    source = text[text.index('$("passwordForm").addEventListener'):text.index("let cfgSpecs =")]
+    script = r'''
+const assert = require('node:assert/strict');
+const nodes = new Map();
+let submit;
+const $ = id => {
+  if (!nodes.has(id)) nodes.set(id, {value:'', disabled:false,
+    addEventListener(event, fn) { submit = fn; },
+    reset() { for (const name of ['passwordCurrent','passwordNew','passwordConfirm']) $(name).value = ''; }
+  });
+  return nodes.get(id);
+};
+let status;
+const setToast = (id, cls, text) => { status = {cls, text}; };
+let successful = false;
+let calls = 0;
+const originalFetch = async (url, options) => {
+  calls++;
+  assert.equal(url, '/api/auth/password');
+  assert.deepEqual(JSON.parse(options.body), {current:'old-password', new:'new-password'});
+  return {ok:successful, status:successful ? 200 : 401,
+    json:async () => successful ? {ok:true} : {ok:false, error:'密码错误'}};
+};
+const fetch = () => { throw new Error('must not use redirecting fetch wrapper'); };
+'''
+    script += source + r'''
+(async () => {
+  $('passwordCurrent').value = 'old-password';
+  $('passwordNew').value = 'new-password';
+  $('passwordConfirm').value = 'mismatch-password';
+  await submit({preventDefault() {}});
+  assert.equal(calls, 0);
+  assert.equal(status.text, '两次输入的新密码不一致');
+  $('passwordConfirm').value = 'new-password';
+  await submit({preventDefault() {}});
+  assert.equal(status.text, '密码错误');
+  assert.equal($('passwordCurrent').value, 'old-password');
+  assert.equal($('passwordSubmit').disabled, false);
+  successful = true;
+  await submit({preventDefault() {}});
+  assert.equal(status.cls, 'ok');
+  assert.match(status.text, /立即生效/);
+  assert.equal($('passwordCurrent').value, '');
+  assert.equal($('passwordNew').value, '');
+  assert.equal($('passwordConfirm').value, '');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+    subprocess.run([node, "-e", script], check=True, capture_output=True, text=True, timeout=NODE_TIMEOUT)
+
+
 def test_linux_update_render_and_restart_polling():
     node = shutil.which("node")
     if node is None:

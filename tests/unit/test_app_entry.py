@@ -30,6 +30,24 @@ class FakeTimer:
         self.callback()
 
 
+@pytest.mark.parametrize("override", [None, "environment-password"])
+def test_main_loads_literal_password_without_dotenv_interpolation(monkeypatch, tmp_path, override):
+    env = tmp_path / ".env"
+    env.write_text('WEB_AUTH_TOKEN="literal-${HOME}-password"\n', encoding="utf-8")
+    monkeypatch.setenv("AGENTCALL_ENV_FILE", str(env))
+    monkeypatch.delenv("WEB_AUTH_TOKEN", raising=False)
+    if override is not None:
+        monkeypatch.setenv("WEB_AUTH_TOKEN", override)
+
+    def after_loading():
+        assert app.config.get_str("WEB_AUTH_TOKEN") == (override or "literal-${HOME}-password")
+        raise RuntimeError("stop before hardware startup")
+
+    monkeypatch.setattr(app, "_force_utf8", after_loading)
+    with pytest.raises(RuntimeError, match="stop before hardware startup"):
+        app.main()
+
+
 @pytest.mark.parametrize("verbose,level", [(None, logging.WARNING), ("false", logging.WARNING), ("true", logging.INFO)])
 def test_ice_logging_only_changes_dependency_loggers(monkeypatch, verbose, level):
     if verbose is None:

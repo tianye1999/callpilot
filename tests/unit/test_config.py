@@ -640,6 +640,22 @@ def test_update_replaces_in_place_and_keeps_comments(tmp_path, monkeypatch):
     assert os.environ["QWEN_VOICE"] == "Raymond"
 
 
+def test_update_replace_failure_preserves_file_and_environment(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("QWEN_VOICE=Cherry\n", encoding="utf-8")
+    monkeypatch.setenv("QWEN_VOICE", "Cherry")
+
+    def fail_replace(*args):
+        raise OSError("cannot replace")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError):
+        update_env_file({"QWEN_VOICE": "Raymond"}, env_path=env)
+    assert env.read_text(encoding="utf-8") == "QWEN_VOICE=Cherry\n"
+    assert os.environ["QWEN_VOICE"] == "Cherry"
+    assert list(tmp_path.iterdir()) == [env]
+
+
 def test_update_appends_new_key_at_end(tmp_path, monkeypatch):
     _unset(monkeypatch, "MODEM_TX_GAIN")
     env = tmp_path / ".env"
